@@ -1,0 +1,37 @@
+{
+  "name": "cozy-island-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "2.5D 绘本风多人开放世界沙盒 —— 细化设计与共享契约实现层",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "verify": "node scripts/verify.ts",
+    "verify:all": "node scripts/verify.ts --all",
+    "verify:frozen": "node scripts/verify.ts --frozen",
+    "verify:docs": "node scripts/verify.ts --docs",
+    "verify:content": "node scripts/verify.ts --content",
+    "verify:integration": "node scripts/verify.ts --integration",
+    "backlog": "node scripts/backlog.ts",
+    "backlog:blocking": "node scripts/backlog.ts --blocking",
+    "content": "node scripts/content-lock.ts",
+    "content:capacity": "node scripts/content-lock.ts --capacity",
+    "content:audit": "node scripts/content-lock.ts --audit",
+    "content:update": "node scripts/content-lock.ts --update",
+    "test": "node scripts/verify.ts --all",
+    "sim": "node server/src/sim/demo.ts",
+    "typecheck": "node scripts/typecheck.ts"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "@colyseus/schema": "^2.0.34",
+    "better-sqlite3": "^11.3.0",
+    "colyseus": "^0.15.17",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

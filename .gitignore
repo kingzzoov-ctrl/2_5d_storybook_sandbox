@@ -1,0 +1,25 @@
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 运行时产物
+*.log
+*.txt
+*.db
+*.sqlite
+*.sqlite3
+
+# 临时/诊断脚本(Lead 与复核者在会话中产生)
+_*.ts
+_*.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 环境
+.env
+.env.*
