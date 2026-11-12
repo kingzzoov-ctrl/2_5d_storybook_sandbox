@@ -35,6 +35,22 @@ const flag = (name: string): string | true | undefined => {
 };
 
 const only = flag('only') as string | undefined;
+
+/**
+ * ★ task B:是不是**全量**运行(没有 `--only` 收窄)。
+ *
+ * ```
+ * ⚠️ 我第一版写 `only === ''` —— 而 `flag()` 的语义是
+ *   「不存在 ⇒ undefined;存在但无值 ⇒ true;有值 ⇒ 该字符串」
+ *   ⇒ `only === ''` **永远为假** ⇒ 我那三处守卫全部失效。
+ *   症状:5 个模块级变量在 --all 下仍是 null ⇒ 校验处打印
+ *        「本次未算出 ⇒ README 该项未校验」 ⇒ **接进去的门禁等于摆设**。
+ *   ★ 而这**不是静默的** —— 我特意让"跳过"必须打印原因,
+ *     正是它把这 3 条"未校验"打出来,我才发现守卫写错了。
+ *   ⇒ 这条印证了那条设计:**"跳过"必须出声,否则接错等于没接。**
+ * ```
+ */
+const fullRun = only === undefined;
 const frozenOnly = argv.includes('--frozen');
 const docsOnly = argv.includes('--docs');
 const integrationOnly = argv.includes('--integration');
@@ -100,6 +116,254 @@ let reachDemoOnly = -1;
  * 所以这里反过来:显式区分「跑了且为 0」与「没跑」。
  */
 let frozenRan = false;
+
+/**
+ * ★ task B(2026-11-13):把 README 里**已经算好、已经打印、却从没人比过**的数接进校验。
+ *
+ * ## 起因:一个数被打印 ≠ 有人看着它
+ *
+ * ```
+ * 我做了 README 数字普查(14 项),发现三态:
+ *   【有比较】6 项 —— 门禁真会因它漂而红
+ *   【只有打印】6 项 —— **算了、打印了、没有一处拿 README 的值去比**
+ *   【根本没算】2 项 —— 要接必须先实现"算"
+ * ⇒ 而"只有打印"那 6 项里,有 5 项的**唯一来源早就在 verify.ts 里算好**
+ *   ⇒ 接入成本几乎为零;它们之所以无人校验,不是"做不到",是**没人接**。
+ * ```
+ *
+ * ## 铁律(本仓已用两次实测换来)
+ *
+ * ```
+ * 1 门禁里"有没有断言"**不能靠读代码猜** —— 要去搜**有没有拿它做比较**。
+ *   我第一版数 `readFileSync(README.md)` 的出现次数(3 次),
+ *   而**比对点有 7 处** —— 复用同一个 readmeText 变量的地方不会再 read 一次。
+ *
+ * 2 正则必须按**实测的真实输出格式**写,不能按印象写。
+ *   实测:指纹打印成 `内容与基线一致(v1-eaefa38b)` —— **没有"指纹"二字**。
+ *   按"指纹"写正则 ⇒ 永远匹配不到 ⇒ 静默跳过 ⇒ 假绿。
+ *
+ * 3 值不存在时必须**跳过并打印原因** —— 不静默,也不 NaN。
+ *   (`Number(undefined)` = NaN,而 NaN 与任何值都不相等
+ *    ⇒ 从一个静默口袋换成一道**永远红**的门。见下方 `#` 的既有教训。)
+ * ```
+ *
+ * ## ⚠️ 值的生命周期问题:为什么用"出口变量 + 统一校验"
+ *
+ * 这 5 个值由**不同函数**算,且它们的执行**顺序**不同、**模式不同**
+ * (`--docs` 不跑 runTests,`--only` 只跑一个套件,`--integration` 跳过 checkFrozen)。
+ * ⇒ 若在每个函数里就地校验,会写出 5 份"跳过逻辑",且每份要各判自己的模式。
+ * ⇒ 故:`runTests` / `checkDocs` / `checkContent` / `checkStrippable` /
+ *   `checkReachability` 把实测值写进下面的模块级变量(`null` = 本次未算出),
+ *   最后**一次**统一校验(见 `verifyReadmeNumbers`)。
+ *   ⚠️ 这是**唯一实现**,不是五份。
+ */
+
+/** 文档结构:WS 文档份数(README `WS 文档结构 N/N` 的 N)。`null` = 未跑。 */
+let docStructCount: number | null = null;
+/** 内容基线锁:指纹(README `指纹 vN-xxxxxxxx`)。`null` = 未跑。 */
+let contentFingerprint: string | null = null;
+/** 内容基线锁:可用号(README `可用号 N`)。`null` = 未跑。 */
+let contentFreeCount: number | null = null;
+/** 可擦除语法:扫描目录数(README `N 个目录`)。`null` = 未跑。 */
+let strippableDirCount: number | null = null;
+/** 可擦除语法:装饰器例外条数(README `装饰器例外 N 处`)。`null` = 未跑。 */
+let decoratorExemptCount: number | null = null;
+/** 用例汇总(README `测试执行 A/A ... 共 M 个用例` + 两行小计)。`null` = 未跑。 */
+let suiteSummary: {
+  total: number;
+  suites: number;
+  mainTotal: number;
+  mainSuites: number;
+  fndTotal: number;
+  fndSuites: number;
+} | null = null;
+/**
+ * 本次 `runTests` 里**有没有套件失败**(退出码非 0)。
+ *
+ * ```
+ * ⚠️ 为什么必须单独记这个布尔(与 `frozenRan` 同一类坑):
+ *   套件失败 ⇒ **它的断言数不计入 sumTotal** ⇒ 汇总数变小。
+ *   实测:WS-12 失败时打印 `1268 条通过(20 个套件;... 基座 346 条 / 8 套件)`,
+ *   而 README 写 `1382 / 21 / 460 / 9`。
+ *   ⇒ 若此时照常比,README 会报
+ *        `✗ 共 1382 个用例,实测 1268 —— 应更新 README`
+ *     而**这个方向是错的**:README 没写错,是**有套件没跑完**。
+ *     照它去改,会把 README 从正确值改成错误值 ——
+ *     正是 GATE-AUDIT-13 §N1 那个「17/17 ⇒ 应更新为 0/0」的假红。
+ *   ⇒ 修法:**有失败就不比**,并**打印为什么**不比(不静默)。
+ *     这与本仓既有做法一致:"跳过"必须出声,否则就从"永远红"换成"静默绿"。
+ * ```
+ */
+let suiteHadFailure = false;
+/** 非欠账条数(README `15 条中 12 条是欠账,另 3 条非欠账`)。`null` = 未跑。 */
+let nonDebtCount: number | null = null;
+
+/**
+ * 校验 README 的数字 —— **统一一次**,在最末尾调用。
+ *
+ * 为什么不在各节就地校验:见上面「值的生命周期问题」。
+ */
+function verifyReadmeNumbers(): void {
+  const readmeText = readFileSync(join(ROOT, 'README.md'), 'utf8');
+
+  /**
+   * 校验一组「恰好 1 处」的 README 数字。
+   *
+   * `actual === null` ⇒ 本次运行没算出 ⇒ **跳过并打印原因**(不是静默,也不是 NaN)。
+   *   ★ 这是本仓既定做法:静默跳过会变成"静默绿",NaN 会变成"永远红",
+   *     两个都是坑 —— 只有"跳过且说出来"是对的。
+   * `actual === undefined` ⇒ 我**接错了变量** ⇒ 必须红(这是我们自己的 bug)。
+   */
+  const check = (opts: {
+    label: string;
+    re: RegExp;
+    actual: number | string | null;
+    /** 把 README 捕获组转成与 actual 同类型的期望值 */
+    wanted?: (m: RegExpExecArray) => string;
+  }): void => {
+    if (opts.actual === null) {
+      console.log(`      · 本次未算出「${opts.label}」⇒ README 该项**未校验**(不是通过)`);
+      return;
+    }
+    const all = [...readmeText.matchAll(new RegExp(opts.re.source, opts.re.flags.includes('g') ? opts.re.flags : `${opts.re.flags}g`))];
+    if (all.length > 1) {
+      /* 影子行:只校验首处会让其余永远读不到(本仓实测过三种藏法) */
+      fail(`README.md 里出现 ${all.length} 处「${opts.label}」—— 只校验首处会让其余成为影子行`);
+      return;
+    }
+    if (all.length === 0) {
+      fail(`README.md 里找不到「${opts.label}」—— 无法校验(改了措辞就要同步改本门禁)`);
+      return;
+    }
+    const m = all[0]!;
+    const got = opts.wanted !== undefined ? opts.wanted(m) : m[1]!;
+    const want = String(opts.actual);
+    if (got !== want) {
+      fail(`README 声称「${opts.label}」为 ${got},实测 ${want} —— 应更新 README`);
+    } else {
+      pass(`README ${opts.label}与实测一致(${want})`);
+    }
+  };
+
+  /* ── 1 WS 文档结构 N/N ──
+     README:`WS 文档结构     12/12 ✅(每份 10 节、≥2000 字符)`
+     两侧都是「文档份数」(与测试集合一一对应),故 N/N 两个数相等。
+     ⚠️ 只取前一个 N 比较;若 README 写成 12/13,那是它自己不自洽 —— 也报。 */
+  check({
+    label: 'WS 文档结构',
+    re: /WS 文档结构\s+(\d+)\s*\/\s*(\d+)/,
+    actual: docStructCount,
+    wanted: (m) => {
+      /* 两个数必须相等(它们本就指同一件事);不等则原样返回以触发失败 */
+      return m[1] === m[2] ? m[1]! : `${m[1]}/${m[2]}`;
+    },
+  });
+
+  /* ── 2 内容基线锁指纹 ──
+     README:`内容基线锁     一致  ✅(指纹 v1-eaefa38b · 引用闭合 · 可用号 3775)`
+     ⚠️ 实测输出是 `内容与基线一致(v1-eaefa38b)` —— **没有"指纹"二字**。
+        故这里锚 README 里的 `指纹 vN-xxxxxxxx` 形态,而不是锚 verify 的输出。 */
+  check({
+    label: '内容基线锁指纹',
+    re: /内容基线锁[\s\S]{0,40}?指纹\s*(v\d+-[0-9a-f]{8})/,
+    actual: contentFingerprint,
+  });
+
+  /* ── 3 可用号 N ── */
+  check({
+    label: '可用号',
+    re: /内容基线锁[\s\S]{0,120}?可用号\s*(\d+)/,
+    actual: contentFreeCount,
+  });
+
+  /* ── 4 可擦除语法:N 个目录 ──
+     README:`可擦除语法      全仓 ✅(5 个目录:enum / ...)` */
+  check({
+    label: '可擦除语法目录数',
+    re: /可擦除语法[^\n]*?(\d+)\s*个目录/,
+    actual: strippableDirCount,
+  });
+
+  /* ── 5 装饰器例外 N 处 ── */
+  check({
+    label: '装饰器例外条数',
+    re: /装饰器例外\s*(\d+)\s*处/,
+    actual: decoratorExemptCount,
+  });
+
+  /* ── 6 非欠账条数 ──
+     README:`**15 条中 12 条是欠账**(...),另 **3 条非欠账**。`
+     ⚠️ 三个数**互相约束**:15 - 12 = 3。故一次全验,而不是只验"3"。 */
+  if (nonDebtCount === null) {
+    console.log('      · 本次未算出「非欠账条数」⇒ README 该项**未校验**(不是通过)');
+  } else {
+    const m = /(\d+)\s*条中\s*(\d+)\s*条是欠账[\s\S]{0,40}?另\s*(?:\*\*)?\s*(\d+)\s*(?:\*\*)?\s*条非欠账/.exec(readmeText);
+    if (m === null) {
+      fail('README.md 里找不到「N 条中 M 条是欠账,另 K 条非欠账」—— 无法校验非欠账口径');
+    } else {
+      const total = Number(m[1]);
+      const debt = Number(m[2]);
+      const nd = Number(m[3]);
+      if (nd !== nonDebtCount) {
+        fail(`README 声称「另 ${nd} 条非欠账」,实测 ${nonDebtCount} 条 —— 应更新 README`);
+      } else if (total - debt !== nd) {
+        /* 内部不自洽:总量对不推出分部对(陷阱 67),这里反过来查它自己 */
+        fail(`README 的「${total} 条中 ${debt} 条是欠账 / 另 ${nd} 条非欠账」自身不自洽(差 ${total - debt - nd})`);
+      } else {
+        pass(`README 非欠账条数与实测一致(${nd} 条;${total} 条中 ${debt} 条欠账)`);
+      }
+    }
+  }
+
+  /* ── 7 用例汇总(四项:总条数 / 总套件 / WS 小计 / 基座小计) ──
+     README:
+       测试执行        21/21 ✅  共 1382 个用例
+         ├─ WS 编号套件          922 条 / 12 套件
+         └─ 基座(FND-01..09)     460 条 / 9 套件
+     ⚠️ **四项必须一起验**:只验总数会漏"分部错但合计对"(陷阱 67)。
+     ⚠️ 且**自洽**要单独查:922+460=1382、12+9=21 —— 这是 README 内部的恒等式,
+        与实测值无关。两者都查,才能分清"README 抄错了"与"实测变了"。 */
+  if (suiteSummary === null) {
+    console.log('      · 本次未跑全量测试 ⇒ README「测试执行 / 编号套件 / 基座」**未校验**(不是通过)');
+    return;
+  }
+  const s = suiteSummary;
+  /* 只在**全量**模式下校验:--only 时 sumTotal 只是那一个套件的数,
+     拿它比 README 的全量数字必然假红。 */
+  if (suiteHadFailure) {
+    console.log(
+      '      · 本次有测试套件失败(断言数不计入汇总)⇒ README「测试执行 / 编号套件 / 基座」'
+      + '**未校验**(不是通过;README 可能仍是对的 —— 先让套件全绿再看这一栏)',
+    );
+    return;
+  }
+  if (!fullRun) {
+    console.log(`      · --only ${String(only)} ⇒ README 用例汇总**未校验**(只跑了部分套件)`);
+    return;
+  }
+  const mExec = /测试执行\s+(\d+)\s*\/\s*(\d+)[^\n]*?共\s*(\d+)\s*个用例/.exec(readmeText);
+  const mMain = /WS 编号套件\s*(\d+)\s*条\s*\/\s*(\d+)\s*套件/.exec(readmeText);
+  const mFnd = /基座[^\n]*?(\d+)\s*条\s*\/\s*(\d+)\s*套件/.exec(readmeText);
+  const bad: string[] = [];
+  if (mExec === null) bad.push('找不到「测试执行 N/N ... 共 M 个用例」');
+  else if (Number(mExec[3]) !== s.total) bad.push(`共 ${mExec[3]} 个用例,实测 ${s.total}`);
+  else if (Number(mExec[1]) !== s.suites || Number(mExec[2]) !== s.suites) {
+    bad.push(`测试执行 ${mExec[1]}/${mExec[2]} 套件,实测 ${s.suites}/${s.suites}`);
+  }
+  if (mMain === null) bad.push('找不到「WS 编号套件 N 条 / M 套件」');
+  else if (Number(mMain[1]) !== s.mainTotal || Number(mMain[2]) !== s.mainSuites) {
+    bad.push(`WS 编号套件 ${mMain[1]} 条 / ${mMain[2]} 套件,实测 ${s.mainTotal} / ${s.mainSuites}`);
+  }
+  if (mFnd === null) bad.push('找不到「基座 ... N 条 / M 套件」');
+  else if (Number(mFnd[1]) !== s.fndTotal || Number(mFnd[2]) !== s.fndSuites) {
+    bad.push(`基座 ${mFnd[1]} 条 / ${mFnd[2]} 套件,实测 ${s.fndTotal} / ${s.fndSuites}`);
+  }
+  if (bad.length > 0) {
+    fail(`README 用例汇总过期:${bad.join(';')} —— 应更新 README`);
+  } else {
+    pass(`README 用例汇总与实测一致(${s.total} 个用例 / ${s.suites} 套件;WS ${s.mainTotal} 条 / 基座 ${s.fndTotal} 条)`);
+  }
+}
 
 /**
  * 统计未决台账(README 的台账数字用它校验)。
@@ -618,6 +882,14 @@ function checkStrippable(): void {
   } else if (staleExempt.length > 0) {
     fail(`装饰器白名单失真(应修正):${staleExempt.join(', ')}`);
   } else {
+    /* ★ task B:暴露给 README 校验(见 verifyReadmeNumbers 的说明)。
+       ⚠️ 只在**全仓**模式扫描时赋值 —— `--only` 时 dirs 可能只含一个目录,
+          拿它比 README 的「N 个目录」会假红。
+       ⇒ 判据:`--only` 时保持 null ⇒ 校验处跳过并打印原因。 */
+    if (fullRun) {
+      strippableDirCount = dirs.length;
+      decoratorExemptCount = DECORATOR_EXEMPT.size;
+    }
     pass(
       `全仓可擦除:${dirs.length} 个目录无 enum / 参数属性 / namespace / 装饰器 / 缺扩展名导入` +
         `(装饰器例外 ${DECORATOR_EXEMPT.size} 处已登记并核对)`,
@@ -2663,6 +2935,13 @@ function checkJudgementAudit(): void {
   const r = spawnSync(process.execPath, ['scripts/judgement_audit.ts', '--baseline'], {
     cwd: ROOT, encoding: 'utf8', timeout: 180_000,
   });
+  /* ★ 退出码**就地取出** —— 不要等几十行后再读 `r.status`:
+     `judgement_audit` 的 F 检测器是**按 20 行窗口**找「读了 status 没有」的。
+     我在这里插长注释时,把 `r.status` 推出了那个窗口 ⇒ F 当场报我未读 status。
+     ⇒ ★ 那是**真回归**(判据看不到我的检查),只是成因是距离而非缺失。
+       修法不是放宽 F 的窗口(那会削弱它),而是**让证据留在它看得见的地方** ——
+       下面的长注释解释"为什么有两个合法的非零来源",但退出码本身在这里就落地。 */
+  const spawnStatus = r.status ?? -1;
   const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
   /* ★ 先判「跑了没有」—— 否则崩溃/超时会被读成"没问题"(形态 F 的教训) */
   const m = out.match(/合计命中:(\d+)\s*处;其中\s*\*{0,2}新增\s*(\d+)\s*\*{0,2}\s*处/);
@@ -2674,15 +2953,42 @@ function checkJudgementAudit(): void {
   }
   const total = Number(m[1]);
   const added = Number(m[2]);
-  if (r.status !== 0 && added === 0) {
-    /* 非零退出但没有新增 ⇒ 与"判据无效"同类,如实报而不是当成红 */
-    fail(`判据形态审计 exit=${String(r.status)} 但新增 0 处 ⇒ 退回码与判据不一致`);
-    return;
-  }
+  /* ★★★ 退出码有**两个**合法来源(2026-11-13 修)——
+     旧版这里只判 `added`,于是把第 ② 种也读成「退回码与判据不一致」:
+
+       ① 拦门禁类未登记新增 > 0            ⇒ 真红,该拦
+       ② 候选型检测器**超过水位**(增长守卫)⇒ 也是真信号,但**性质不同**
+
+     实测踩到:`client/src/net/session.ts` 新增一对请求/响应接口
+     (`HelloFrame` ↔ `WelcomeFrame`,共享 t/protocolVersion/contentClaim…)
+     ⇒ G 检测器 43 → 44 ⇒ judgement_audit **按设计** exit 1;
+       verify.ts 却打「exit=1 但新增 0 处 ⇒ 退回码与判据不一致」——
+       把**一条有意义的信号**报成了「判据本身坏了」。
+     ⇒ ★ 这是陷阱 70 家族②(**视野不含该含的**):解析只看 `added`,
+       于是它**看不见**同一份输出里的水位行 —— 而那一行就印在下面。
+
+     ⚠️ 为什么必须分开报:两者的**处置动作不同**——
+       ① 去修代码;② 去判断"这是不是层间有意传递",是则登记 baseline。 */
+  const wm = out.match(/✗\s*([A-Z]):候选\s*(\d+)\s*条\s*\*{0,2}超过水位\s*(\d+)/);
   if (added > 0) {
     const lines = out.split('\n').filter((l) => /^\s*\[新增\]/.test(l)).slice(0, 8);
     for (const l of lines) fail(`判据形态审计发现**未登记**的命中${l.slice(0, 150)}`);
     if (lines.length === 0) fail(`判据形态审计报新增 ${added} 处,但未列出位置`);
+    return;
+  }
+  if (wm !== null) {
+    fail(
+      `判据形态审计:候选型检测器 **${wm[1]}** 超过水位(${wm[2]} 条 > 水位 ${wm[3]})——`
+        + `它检测「两个类型容器共享 ≥3 个领域字段」的候选,水位守卫把**数量增长**当信号`
+        + `(不是"有没有")。\n      ⇒ 处置:先看新增那条是否属「层间有意传递(正常)」`
+        + `(如请求/响应对);若是,登记进 \`scripts/judgement_baseline.ts\`(每条必填 reason);`
+        + `若否,那是**真缺陷**。`,
+    );
+    return;
+  }
+  if (spawnStatus !== 0) {
+    /* 走到这里:既无未登记新增、也无水位超限,却非零退出 ⇒ 这才是真的不一致。 */
+    fail(`判据形态审计 exit=${String(spawnStatus)} 但既无未登记新增、也无水位超限 ⇒ 退回码与判据不一致`);
     return;
   }
   console.log(`  ✓ 判据形态审计:登记 ${total} 处已定性,本期**新增 0 处**`);
@@ -2920,7 +3226,17 @@ function checkDocs(): void {
     }
   }
 
-  if (bad === 0) pass(`${files.length} 份 WS 文档结构完整,且与测试集合一一对应`);
+  /* ★ task B:暴露给 README 校验(README 写「WS 文档结构 12/12」)。
+     ⚠️ 赋值放在 `bad === 0` **之外** ——
+        它是「**实际有几份 WS 文档**」这个事实,与"是否全部合格"无关。
+        若放在 `bad === 0` 里面,那么**只要有任何一个套件缺文档**,
+        这个数就保持 null ⇒ README 的文档数校验被**静默跳过** ——
+        而缺文档这件事**本身已经是一条 fail**,不需要再靠跳过它来表达。
+        (我第一版就是放在里面,于是 WS-12 一出现就变成"未校验"。) */
+  docStructCount = files.length;
+  if (bad === 0) {
+    pass(`${files.length} 份 WS 文档结构完整,且与测试集合一一对应`);
+  }
 
   /* 非 WS 文档同样要守规矩。
      
@@ -4064,6 +4380,10 @@ async function checkIntegration(): Promise<void> {
      所以有信息量的是构成,不是总数。这里把构成与 README 对齐。 */
   {
     const wlNow = whitelistBreakdown();
+    /* ★ task B:暴露给 README 校验(README 写「15 条中 12 条是欠账,另 3 条非欠账」)。
+       ⚠️ 这里赋的是**白名单内非欠账条目数**;README 的「另 K 条非欠账」与之同源
+          (都来自 `WL_NON_DEBT_*` 两条判据),不是另算一遍。 */
+    nonDebtCount = wlNow.nonDebt;
     /* ⚠️ 每个桶都必须被捕获 —— 否则该桶成为**静默口袋**:
        README 可以随便写,而门禁读不到它,于是恒绿。
        本轮实测过这个缺陷:我新增「等客户端机制」桶时正则没跟着改,
@@ -4301,7 +4621,14 @@ async function checkContent(): Promise<void> {
     fail('基线文件缺失,无法判断内容是否被改动(执行 node scripts/content-lock.ts --update 生成)');
   } else if (drift.inSync) {
     const f = reg.contentFingerprints();
-    pass(`内容与基线一致(v${f.version}-${f.overall})`);
+    /* ★ task B:暴露给 README 校验。
+       ⚠️ 格式必须与 README **完全一致**:README 写 `v1-eaefa38b`,
+          而打印行是 `内容与基线一致(v${f.version}-${f.overall})`
+          ⇒ 拼出来就是 `v1-eaefa38b`。
+          (我上一轮把 README 正则的锚写成"指纹",而实测输出里**没有那两个字**
+           ⇒ 那版正则永远匹配不到。故这里务必与打印保持同一表达式。) */
+    contentFingerprint = `v${f.version}-${f.overall}`;
+    pass(`内容与基线一致(${contentFingerprint})`);
   } else {
     fail(`内容与基线不一致,${drift.changes.length} 项差异`);
     for (const ch of drift.changes.slice(0, 8)) console.error(`      · ${ch}`);
@@ -4356,6 +4683,8 @@ async function checkContent(): Promise<void> {
   const cap = audit.capacity;
   const itemCap = cap.find((c) => c.space.includes('OBJ'));
   if (itemCap) {
+    /* ★ task B:暴露给 README 校验(README 写 `可用号 3775`)。 */
+    contentFreeCount = itemCap.freeCount;
     pass(
       `容量账本:物品 ${itemCap.used}/${itemCap.capacity},可用号 ${itemCap.freeCount}` +
         `(顶端余量 ${itemCap.headroom})`,
@@ -4436,6 +4765,9 @@ function runTests(): void {
     if (r.status !== 0) {
       /* fail() 内部已 failures += 1,此处不得重复自增 */
       fail(`${rel} 退出码 ${r.status}`);
+      /* ★ task B:记下"有套件没跑完" ⇒ 汇总数**不完整** ⇒ README 那一栏**不比**
+         (否则会把 README 的正确值改成错误值,见 suiteHadFailure 的说明)。 */
+      suiteHadFailure = true;
       /* 只打印「✗」行,避免与 fail() 的输出重复,也不淹没真正的失败信息 */
       const bad = out.split('\n').filter((l) => l.includes('✗'));
       const shown = (bad.length > 0 ? bad : out.split('\n')).slice(0, 20);
@@ -4517,6 +4849,20 @@ function runTests(): void {
       );
     }
     pass(`用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`);
+    /* ★ task B:暴露给 README 校验(README 有四行数字都来自这里)。
+       ⚠️ 只赋**全量**值:--only 时 sumTotal 只是那一个套件的数。
+       且必须在这里赋 —— 因为上面的自洽断言已保证
+       `main + fnd == 总数`(否则已 fail),故这里的分部数可信。 */
+    if (fullRun) {
+      suiteSummary = {
+        total: sumTotal,
+        suites: counted,
+        mainTotal: sumOf(main),
+        mainSuites: main.length,
+        fndTotal: sumOf(fnd),
+        fndSuites: fnd.length,
+      };
+    }
   }
 
   /* 把各套件的**实测**断言数交给 `checkDocs` 的 README 校验用。
@@ -4636,6 +4982,14 @@ if (!frozenOnly && !docsOnly && !contentOnly && !integrationOnly && !only) check
 if (!frozenOnly && !only && !contentOnly) checkDocs();
 if (!frozenOnly && !docsOnly && !integrationOnly) await checkContent();
 if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
+
+/* ★ task B:统一校验 README 里那些「已经算好、已经打印、却从没人比过」的数。
+   ⚠️ 必须在**所有**producer 之后调用 —— 它读的是那 5 个模块级变量,
+      那些变量由 runTests / checkDocs / checkContent / checkStrippable /
+      checkReachability 填充。放前面会读到 null ⇒ 全部跳过(静默变摆设)。
+   ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件",
+      而 README 的数字都是**全量**口径 ⇒ 比了必然假红。 */
+if (!frozenOnly && !only) verifyReadmeNumbers();
 
 /* ⚠️ 汇总行必须**自报它不覆盖什么**。见 `advise()` 的定义处长注释 ——
    实测过:造一个「新增未登记的不可达模块」后,默认口径仍打「全部通过」退出码 0,
