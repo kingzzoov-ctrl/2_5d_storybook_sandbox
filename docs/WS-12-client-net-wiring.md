@@ -42,9 +42,26 @@ createSession(opts: { url, store?, makeSocket?, events }): SessionHandle
 
 ```
 上行帧 = [u8 tag][payload]        tag: 0x01 文本(握手 JSON) / 0x02 二进制(协议包)
-下行帧 = 同形态(服务端不必加 tag,客户端两种都接受)
+下行帧 = **服务端发裸协议字节(无 tag)**;客户端四种形态都认(见下方分派)
 HelloFrame   = { t:'hello', protocolVersion, contentClaim: null }
 WelcomeFrame = { t:'welcome', playerId, roomId, protocolVersion, contentClaim: string }
+```
+
+**★ 下行分派不能用 tag 判 —— 这里有一个**值碰撞**(实测抓到过的真缺陷):**
+```
+FRAME_TEXT(0x01) == PROTOCOL_VERSION(1)
+而服务端下行是**裸包** ⇒ 首字节就是 1 = 0x01
+⇒ 初版写 `if (bytes[0] === FRAME_TEXT) 当 JSON 解析`
+  ⇒ 裸包首字节恰好命中 ⇒ 被当 JSON ⇒ JSON.parse 抛 ⇒ 端到端**全线失败**
+⇒ 而初版 WS-12 **没测到** —— 夹具 `binaryFrame()` **人为加了 0x02 tag**,
+  而真服务端不加 ⇒ **声明的形态与夹具的形态不一致**。
+⇒ 现改为按**内容特征**判(`classifyDownlink`,纯函数、已导出、可测):
+    · 首字节 `{`(0x7B)             ⇒ 文本(裸 JSON)
+    · 首字节 0x01 **且次字节 `{`**   ⇒ 文本(带 tag 的 JSON)
+      ★ 看第 2 字节才能与裸包区分:裸包第 2 字节是 op(0/1),不是 `{`
+    · 其余 ⇒ 二进制(**原样**,即服务端真实行为)
+⇒ ⚠️ 残留歧义(如实):若 `PROTOCOL_VERSION` 将来等于 **2**(== FRAME_BINARY),
+  则"裸包首字节"与"tag"**无法区分** ⇒ 规则③**主动不猜**,那时需重测。
 ```
 
 `RoomState` 的**空 base** 由 `emptyRoomState()` 给(客户端造不出 `createRoomState` ——

@@ -468,10 +468,18 @@ const CASES: Case[] = [
        它**随 PROD_ENTRIES 增删而变**,是本用例唯一需要手工跟的数字。
        本轮实测修正:task-57 补入 `server/src/index.ts` 后
          PROD_ENTRIES 3 → 4 ⇒ 摘掉客户端出口后由 `2 个` 变 **`3 个`**。
+       2026-11-13 task-69 再补入 `server/src/sim/ws_demo.ts`
+         PROD_ENTRIES 4 → 5 ⇒ 摘掉客户端出口后 `3 个` 变 **`4 个`**(本轮改)。
        与 T32-d「白名单条数必须取实测」是**同一类要求**,只是这一条自带一个常量。
        ⇒ 维护规则:改了 `PROD_ENTRIES` 的**条数**,就回来改这里;
-         忘了改的表现是「消息未命中 ✗」(而 `expect: 'any'` 会让它看起来像软失败)。 */
-    wantMsg: /入口 3 个/,
+         忘了改的表现是「消息未命中 ✗」(而 `expect: 'any'` 会让它看起来像软失败)。
+       ★★ 为什么会连着两轮都要手工跟这个数 —— 这本身是**设计味道**:
+         一个常量跟着另一个常量变,而两个文件不互相 import
+         ⇒ 只能靠"谁改了记得回来改"。
+         ⇒ 但**现在不改结构**:本文件是"给门禁上牙"的自检夹具,
+           它**刻意**不 import `verify.ts`(否则被测物与夹具同源)。
+         ⇒ 代价就是这个手工数字。已记入 `docs/PROGRESS.md`(与陷阱 80「有通道 vs 无通道」同族)。 */
+    wantMsg: /入口 4 个/,
     args: ['--frozen'],
   },
 
@@ -507,8 +515,46 @@ const CASES: Case[] = [
            只断言 N,N 对了门禁就放行,而 M 可以随便写。
          窄词在此**重复一份而非 import** —— 本文件的职责是**独立复算**;
          若 import verify.ts 的正则,正则写错时两边一起错,自检就失去意义。 */
-      const reasons = [...body.matchAll(/^\s*\['[^']+',\s*'([^']+)'/gm)].map((m) => m[1]!);
-      const nonDebt = reasons.filter((r) => /gate-only/.test(r) || /差集/.test(r)).length;
+      /* ⚠️ 2026-11-13 修(Lead,第二次):
+         **只取到「路径后第一个字符串字面量」是不够的** —— 理由**可以是多行拼接**:
+         ```
+           ['shared/testing/harness.ts',
+             '测试夹具(...)。生产侧真 importer = **0** —— '
+             + '它**只被 tests/** 消费**(21 个测试文件的公共 harness)。'
+             + '属「gate-only」家族:...'
+             + '...']
+         ```
+         ⇒ 原先那条正则只抓到**第一段**(`'测试夹具(...)。生产侧真 importer = **0** —— '`)
+           ⇒ 而 `gate-only` 出现在**第三段** ⇒ **漏判** ⇒ nonDebt 算成 2,而 verify 打印 **3**。
+         ⇒ 表现:本用例「消息未命中 ✗」;而 `expect: 'any'` 让它看起来像软失败
+           ⇒ 所以它**从 HEAD 起就一直红着**(实测:HEAD 与工作区都得 2 ⇒ 非本轮引入)。
+         ★★ 这是我在此文件上一处修复的**同族残留**:那次修的是「条目数 N」漏计多行,
+            这次是「非欠账数 M」漏计多行的**理由** —— 同一个病换了字段。
+            ⇒ 教训:**"多行能力"要一次贯通到这一段的每个抽取点**,不能只修当时报错的那个。
+
+         ★ 而我的**第一次修法也是错的**(留档):我按「本条到下一个 `['` 之间」切段,
+           把条目之间的**说明性块注释**一并吞进来了 ⇒ 那些注释里讨论着 `gate-only`/`差集`
+           ⇒ 算成 **5**(真值 3)⇒ 从"漏计"变成"多计"。
+           ⇒ ⇒ 教训:**切段法在多段落里天生会吃到段间内容。**
+           正确做法是**先剥注释**,让条目边界重新变得可靠 —— 见下。
+         ⇒ 剥注释时**必须保留换行**(替换成同数量的换行,而不是一个空格):
+           否则后面所有行下标前移 —— 这与 `assertion-audit` 那个"行号最多偏 -103"的
+           真 bug 是**同一个形态**(net-persist 同日抓到),我在同一轮里犯了同一个错。 */
+      const clean = body.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''));
+      const entries = [...clean.matchAll(/^\s*\['([^']+)',\s*([\s\S]*?)'\]/gm)];
+      if (entries.length !== n) {
+        throw new Error(
+          `gate-selfcheck: 剥注释后抽到的条目数(${entries.length})与上面算的 n(${n})不一致 —— 不许静默继续`,
+        );
+      }
+      const nonDebt = entries.filter((e) => /gate-only/.test(e[2]!) || /差集/.test(e[2]!)).length;
+      /* ★ 自证:跨行理由的那条(harness.ts)必须被计入,否则说明这次修法没生效。
+         实测:3 条非欠账 = baseline.ts(gate-only) / registry.ts(差集) / harness.ts(gate-only,跨行)。 */
+      if (nonDebt !== 3) {
+        throw new Error(
+          `gate-selfcheck: nonDebt=${nonDebt},期望 3 —— 若为 2 则跨行理由又被漏计;若为 5 则又吃到了段间注释`,
+        );
+      }
       const rules = src.slice(
         src.indexOf('const WL_NON_DEBT_GATE'),
         src.indexOf('const WL_BLOCK_MECHANISM'),
@@ -760,7 +806,32 @@ let passed = 0;
      即使 finally 会删,「在真仓库里创建文件」本身就违反本脚本自己的第 1 条铁律。
      ⇒ 用 `makeLab()`(它已复制整棵树)⇒ 一切都发生在临时副本里。 */
   const labRoot = makeLab();
-  const labFile = join(labRoot, 'tests', '__T35_PROBE.test.ts');
+  /* ★★★ 2026-11-13 修(Lead):文件名**不能**以 `_` 开头 —— 探针会被静默跳过
+   *
+   * ```
+   * judgement_audit.ts:1650
+   *   .filter((f) => !rel(f).split('/').some((seg) => seg.startsWith('_')));
+   * ⇒ 它**刻意**跳过 `_` 前缀路径(理由见该处注释:.gitignore:37 把 `_` 声明为非交付物)
+   * ⇒ 而本用例原先把探针命名成 `__T35_PROBE.test.ts`
+   *   ⇒ 「文件数:140」注入前后**一模一样**(实测)
+   *   ⇒ 探针**从未被扫描** ⇒ A 计数 1→1 ⇒ 判成「接线没牙 ✗」
+   * ```
+   * ⇒ ⇒ ★★★ 这是**假阴性**:判据(judgement_audit)是好的,是**探针被过滤掉了**。
+   *   而它的表现与"接线没牙"**完全一致**(注入后仍绿)—— 两种解释:
+   *     ① 判据没牙  ② 注入没生效
+   *   本仓把这一对写进过陷阱 31「注入不生效 ≠ 判据没牙」,
+   *   而**此用例自己就踩了它**,且因为报出的结论"听起来对"而长期没被发现。
+   *
+   * ★ 为什么会这样:原命名者按本仓的**通用**约定("临时探针一律用 `_` 前缀")
+   *   来命名 —— 那条约定在**大多数**工具那里是对的(clean-temp 会清掉它们),
+   *   但**对 judgement_audit 恰好相反**:它就是靠这个前缀来排除非交付物的。
+   *   ⇒ ⇒ 教训:**"用 `_` 前缀"不是全局规则,它是一条**局部**约定;
+   *     凡是要"让某工具看见"的探针,必须先确认该工具**不跳过 `_`。**
+   * ⇒ 修法:改名成 `T35_PROBE.test.ts`(**不带下划线**)。
+   *   ⚠️ 副作用检查:`makeLab()` 是临时副本 ⇒ 探针在副本里,
+   *     不会落进真仓库 ⇒ 不影响 `clean-temp.ts` 的残留口径。
+   *     而 `finally` 里仍按新名字删除。 */
+  const labFile = join(labRoot, 'tests', 'T35_PROBE.test.ts');
   const runAudit = (): { exit: number; added: number; listed: boolean; out: string } => {
     const r = spawnSync(process.execPath, ['scripts/judgement_audit.ts', '--baseline'], {
       cwd: labRoot, encoding: 'utf8', timeout: 180_000,
@@ -808,8 +879,11 @@ let passed = 0;
   } finally {
     try { if (existsSync(labFile)) rmSync(labFile, { force: true }); } catch { /* 忽略 */ }
     const restored = !existsSync(labFile);
-    /* ⚠️ 真仓库里**本来就不该有**这个文件 —— 一并自证没污染真仓库 */
-    const realClean = !existsSync(join(ROOT, 'tests', '__T35_PROBE.test.ts'));
+    /* ⚠️ 真仓库里**本来就不该有**这个文件 —— 一并自证没污染真仓库。
+       ★ 两个名字都查:因为历史版本用过 `__T35_PROBE.test.ts`,
+         若某次运行中途死掉,可能在真仓库里留下**旧名字**的残留。 */
+    const realClean = !existsSync(join(ROOT, 'tests', 'T35_PROBE.test.ts'))
+      && !existsSync(join(ROOT, 'tests', '__T35_PROBE.test.ts'));
     console.log(`  还原:临时副本已清=${restored ? '✓' : '✗✗'}  真仓库未被污染=${realClean ? '✓' : '✗✗ **污染了真仓库!**'}`);
     if (!restored || !realClean) failures += 1;
   }

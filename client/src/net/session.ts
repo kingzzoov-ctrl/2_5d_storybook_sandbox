@@ -127,6 +127,59 @@ export interface SessionHandle {
 const FRAME_TEXT = 0x01;
 const FRAME_BINARY = 0x02;
 
+/**
+ * JSON 文本帧的**固有首字符** `{`(0x7B)。
+ *
+ * ★★★ 为什么必须有它:实测发现一个**值碰撞**,它让我的第一版下行分派**完全失效**。
+ *
+ * ```
+ * 服务端下行 = **裸协议包**(room.ts 三处出口都直接返回 `.bytes`)
+ * 裸包首字节 = PROTOCOL_VERSION = **1** = 0x01 = FRAME_TEXT
+ * ⇒ 第一版写的是 `if (bytes[0] === FRAME_TEXT) { 当 JSON 解析 }`
+ *   ⇒ 裸包**首字节恰好命中** ⇒ 被当 JSON 解析 ⇒ JSON.parse 抛
+ *   ⇒ setState('failed','welcome 解析失败:Unexpected token ...')
+ *   ⇒ ★ **端到端全线失败**,而我的 WS-12 从未测到 —— 因为它全部用
+ *     `binaryFrame()`(**人为加了 0x02 tag**),而真服务端**不加 tag**。
+ * ```
+ * ⇒ ∴ 判"是不是文本"只能靠**内容特征**(JSON 恒以 `{` 开头),
+ *   **不能**靠那个 tag 常量 —— 它与协议版本号撞了。
+ */
+export const JSON_PREFIX = 0x7B;
+
+/**
+ * 下行字节分类 —— **纯函数**,导出以便 WS-12 直接断言(不需要真 socket)。
+ *
+ * ## 判定规则(三条,顺序不可换)
+ *
+ * ```
+ * ① 首个字节是 `{`            ⇒ 文本(**裸** JSON)
+ * ② 首字节 0x01 **且** 次字节 `{` ⇒ 文本(带了 tag 的 JSON)
+ *    ★ 必须看**第 2 字节**才能与「裸协议包」区分:裸包首字节也是 0x01,
+ *      但它的第 2 字节是 `op`(0/1),**不是** `{`。
+ * ③ 其余 ⇒ 二进制。默认**原样**(服务端裸发的真实行为);
+ *    仅当 `PROTOCOL_VERSION !== 0x02` 时才容忍一个前置 0x02 tag。
+ * ```
+ *
+ * ## ⚠️ 残留歧义(如实标注,不假装没有)
+ *
+ * 若 `PROTOCOL_VERSION` 将来变成 **2**(== `FRAME_BINARY`),
+ * 则「裸包首字节」与「tag」**无法区分** ⇒ 规则③ 主动**不猜**(原样处理)。
+ * 那时若服务端仍裸发,行为正确;若服务端加 tag,会在解码处报清晰错误。
+ */
+export function classifyDownlink(bytes: Uint8Array):
+  { kind: 'text'; payload: Uint8Array } | { kind: 'binary'; payload: Uint8Array } {
+  /* ① 裸 JSON */
+  if (bytes.byteLength > 0 && bytes[0] === JSON_PREFIX) return { kind: 'text', payload: bytes };
+  /* ② 带 tag 的 JSON:0x01 + `{` */
+  if (bytes.byteLength > 1 && bytes[0] === FRAME_TEXT && bytes[1] === JSON_PREFIX) {
+    return { kind: 'text', payload: bytes.subarray(1) };
+  }
+  /* ③ 二进制 —— 服务端裸发;仅在无歧义时容忍前置 tag */
+  const unambiguousTag = PROTOCOL_VERSION !== FRAME_BINARY;
+  const tagged = unambiguousTag && bytes.byteLength > 1 && bytes[0] === FRAME_BINARY;
+  return { kind: 'binary', payload: tagged ? bytes.subarray(1) : bytes };
+}
+
 /** 把上行帧包上 1 字节类型头(服务端据此分流 JSON / 协议包)。 */
 export function encodeClientFrame(payload: Uint8Array, isText: boolean): Uint8Array {
   const out = new Uint8Array(payload.byteLength + 1);
@@ -235,10 +288,15 @@ export function createSession(opts: SessionOptions): SessionHandle {
         opts.events.onDrop?.(lastDropReason);
         return;
       }
-      if (bytes.byteLength > 0 && bytes[0] === FRAME_TEXT) {
-        const json = new TextDecoder().decode(bytes.subarray(1));
+      /* ── 帧分派 ──
+         ★ 不用 `bytes[0] === FRAME_TEXT` 判"是不是文本":实测那个常量
+         (0x01)与 `PROTOCOL_VERSION`(1)**撞了**,而服务端下行是**裸协议包**
+         (首字节就是 1)⇒ 会把协议包当 JSON 解析 ⇒ 端到端全线失败。
+         ⇒ 交给 `classifyDownlink`(按**内容特征**判,不靠那个 tag)。 */
+      const cls = classifyDownlink(bytes);
+      if (cls.kind === 'text') {
         try {
-          const w = JSON.parse(json) as WelcomeFrame;
+          const w = JSON.parse(new TextDecoder().decode(cls.payload)) as WelcomeFrame;
           if (w.t === 'welcome') {
             if (w.protocolVersion !== PROTOCOL_VERSION) {
               setState('failed',
@@ -256,12 +314,8 @@ export function createSession(opts: SessionOptions): SessionHandle {
         }
         return;
       }
-      /* 二进制:剥掉类型头(若服务端加了),再交给 store。
-         ⚠️ store 内部处理「0 字节」与「坏包」两件事,本层不再判断。 */
-      const payload = bytes.byteLength > 0 && bytes[0] === FRAME_BINARY
-        ? bytes.subarray(1)
-        : bytes;
-      const r = store.apply(payload);
+      /* 二进制:store 内部处理「0 字节」与「坏包」两件事,本层不再判断。 */
+      const r = store.apply(cls.payload);
       opts.events.onFrame(r, store);
     }) as never);
 

@@ -74,8 +74,25 @@
  *
  * 用法:
  * ```
- * node scripts/assertion-audit.ts            # 报告
- * node scripts/assertion-audit.ts --strict   # 有乙类命中或自检失败即 exit 1
+ * node scripts/assertion-audit.ts              # 报告
+ * node scripts/assertion-audit.ts --strict-h   # ★ 门禁用:自检失败/只读被破坏/[h] 命中 ⇒ exit 1
+ * node scripts/assertion-audit.ts --strict     # 人工复核用:上面三项 **外加** 乙类命中 ⇒ exit 1
+ * ```
+ *
+ * ## ★ 门禁接线请用 `--strict-h`,**不要**用 `--strict`
+ * ```
+ * `--strict` 把**乙类命中**也算失败,而乙类本仓常态 **25 条**
+ * ⇒ 挂 `--strict` 会**恒红** ⇒ 接线者会误读成"水位超了"或"判据坏了"。
+ * `--strict-h` 只拦「判据本身坏了」:
+ *   1 自检未过(labFail > 0)     —— 某个检测器坏了
+ *   2 只读被破坏(changed > 0)   —— 本脚本改了文件(不该发生)
+ *   3 [h] 命中 > 0               —— 判据只被注释满足(真问题)
+ * ⇒ 挂法(一行):`node scripts/assertion-audit.ts --strict-h`
+ * ⚠️ **不要**在门禁里另写一套命中判断 —— 那会造出第二份口径(CR-20)。
+ * ⚠️ 判据边界(接线者必读):`--strict-h` 只覆盖**本脚本能机械判定**的部分。
+ *    它报 0 命中**不等于**"没有判据问题" —— [T?]/[量纲]/[h] 各自都有
+ *    **覆盖率缺口**(如 [h] 只有 36/48 处路径可解析,清单见 [h-未解析] 节),已在各自报告节标明。
+ *    **不要把它当成"判据已全检"**。
  * ```
  */
 
@@ -1201,146 +1218,390 @@ function runGLab(l: GLab): LabResult {
   return { id: l.id, ok: true, detail: `报=${got}` };
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
-   ★ task-A(Lead 批准项 [3]):「`includes('标识符')` 判源码 ⇒ 必须先 stripComments」
 
-   ## 为什么需要它(不是推测,是我在同一任务里踩了两次)
+/* ══════════════════════════════════════════════════════════════════════════
+   ★ task-A(Lead 批准项 [3]):「`includes('标识符')` 判源码 ⇒ 先 stripComments」
+
+   ## 为什么需要它(我**在同一个任务里踩了两次**同一个形态)
    ```
    第一次  maskMore(工具):注释分支只 continue 没涂白 ⇒ 注释里的数字漏进 argsOnly
    第二次  WS-FND-03 判据:includes('verifyContentCompatibility')
            被**我注入的一句注释**命中 ⇒ 判据对真缺陷**没牙**(反向核查当场抓住)
-   ⇒ 两次同一个形态 ⇒ 不是疏忽,是**必须机械化防住的形态**。
+   ⇒ 不是疏忽,是**必须机械化防住的形态**。
    ```
 
-   ## ★ 口径:我没有用「按形态分类」,因为它只是代理指标
+   ## ★★ 我写错了**两版**,两版的错法不同 —— 都记在这里,因为它们是路标
    ```
-   Lead 的收窄:只报「includes('<标识符形态>') 且对象是 readFileSync 的结果」。
-   我先按这个实现了,实测:**71 处候选(A 类标识符 63 处)**
-   但"是标识符"**不等于**"这里有危险" —— 绝大多数标识符**同时**在代码里出现,
-     判据靠它命中是**正常的**,不存在被注释伪造的风险。
-   ⇒ 按形态分类 = 用代理指标报 71 条噪音(task-66 的精度 7.7% 就是这么来的)。
+   第一版:X ∈ raw(自身) 且 X ∉ code(自身)  ⇒ 真阳性**恒 0**
+     错因:`includes('X')` 这行**自己**就把 X 写进了 code ⇒ 后半句恒假。
+     实测 S1/S2 报 0 条 ⇒ **自检当场抓住**。
+
+   第二版:剔除「判据那一行」后再问 X 是否在其余 code 里 ⇒ **73 处 100% 误报**
+     错因:`readFileSync(p).includes('X')` 检查的是**另一个文件**!
+        X 在**分析者自身**文件里当然只出现在那一行 —— 与目标文件无关。
+     ★ 两版共用一个盲点:**把「自身文件」当成了「目标文件」。**
+
+   第三版(本实现):**解析 readFileSync 的路径 ⇒ 读目标文件 ⇒ 在目标文件里问**
    ```
 
-   ## ✅ 真判据(构造上零误报,且直接问"此刻是否靠注释撑着")
+   ## 正确判据
    ```
-   对每处 srcVar.includes('X'):
-     raw  = 文件原文
-     code = stripComments(raw)
-     若 X ∈ raw 且 X ∉ code
-       ⇒ 该判据**可以被一句注释单独满足** ⇒ 假绿**已经实现**
-     ⇒ 它不问"形态像不像标识符",它问"**此刻是不是靠注释在撑着**"。
-   ```
-
-   ## ⚠️ 实测:全仓 **0 处**真阳性
-   ```
-   扫描 137 个文件 / 177 处 includes(去重 71 处)
-   ⇒ 真阳性 **0 处**;对照组(判据靠代码命中的)**69 处**
-   ⇒ ⇒ 本仓此刻**没有**"靠注释撑着"的判据。
+   1 解析路径:readFileSync(<第一个实参>) → 仓库内路径
+       支持 join(ROOT,'a','b')  /  字符串字面量  /  一级 const 间接
+       ⚠️ 提取实参必须**按括号深度**找配对的 `)`,不能用"最后一个 )"
+         (嵌套 join 会错 —— 我第一版就是这么错的,可解析率 0/71)
+   2 读**目标文件**原文 raw2;stripComments(raw2) = code2
+   3 若 X ∈ raw2 且 X ∉ code2
+       ⇒ X 在目标文件里**只存在于注释** ⇒ 该判据靠注释撑着 ⇒ **报**
    ```
 
-   ## ★ 那为什么仍然实现它?—— 与「形态 3/4 不做」的区别必须说清
+   ## ⚠️ 实测:路径解析率 **36/48**(旧文档写的 44/71 是**过期的**)
    ```
-   形态 3/4(字符vs字节、单位量级):**判据本身想不出真阳性会是什么样**
-     ⇒ 做了只能永远报 0 ⇒ 纯粹的空壳 ⇒ **不做**
-   本检查:真阳性**定义明确且可构造**(S1/S2 就是),只是**本仓此刻恰好没有**
-     ⇒ 它是**低水位探测器**,不是空壳 —— 有真事的那天它会红。
-   ⇒ 区别在于:**能不能构造出让它红的样本**。能构造 ⇒ 有牙 ⇒ 值得留。
+   真阳性 **1 处 —— 而它是有意的**:
+     tests/WS-FND-01.test.ts  includes('contentFingerprints')
+     目标文件:server/src/bosses/raid.ts
+     ⇒ 该名字在 raid.ts 里**只存在于 L345 的注释**
+   ⇒ 但 WS-FND-01 的注释明写:这条**就是**为了钉住
+     「注释里的命中不算消费」这个反例本身(防将来有人把统计退化成 grep)。
+   ⇒ ⇒ **它是故意的负向样本** ⇒ 必须进**已知无害表**,否则本检测器常年报一条已知无害项。
+
+   ★★★ 关于「44/71 vs 36/48」——**两个数不一致,而旧数是错的**
+   ```
+   旧文档(本注释上文 + 报告行)手写「71 处路径 / 44 可解析 / 27 追不到」。
+   实测(独立探针 + 本文件的 ScanStats 计数):**48 处 / 36 可解析 / 8 追不到**,
+   构成:实参取不出 0 / 算不出路径 8 / 目标文件读不到 4。
+   ⇒ 三个数**互不相符** ⇒ 「71/44」是某个**旧版本**的测量结果,一直没人改。
+   ⇒ ★ 这正是本仓反复记的那类问题:**手写的、会漂的数字比没有数字更糟** ——
+     它看起来是实测,读者会据此判断覆盖率。现已改为**实测计数**(ScanStats)。
+   ```
+   ⚠️ **为什么实测 48 而不是 105**:105 是 `readFileSync(` 的**调用点总数**。
+      本检测器只关心「**同一作用域里**有个 const 取了 readFileSync,
+      且某处对它 `.includes('字面串')`」的站点 ⇒ 48 是那个交集。
+      (用户可见的"71"并非任何一个可复现口径 —— 这一点本身就是要修的理由。)
+
+   ## ★★ 追不到的 **8** 处(必须列出来,不能只报个数)
+   ```
+   理由:只报"N 处追不到"**不可核对** —— 读者不知道是哪几处,
+   也就无法判断"追不到的是不是恰好都不重要"(盲区与空白在输出上同形)。
+   ⇒ 按**可修性**分组(详见运行时的 [h-未解析] 节):
    ```
 
-   ## ⚠️ 失效边界
+   | 位置 | 查的字面串 | 为什么追不到 | 可修性 |
+   | :--- | :--- | :--- | :--- |
+   | `tests/WS-FND-01.test.ts:1128` | `argv.includes` | `join(ROOT, rel)` —— `rel` 是变量 | B 需数据流分析 |
+   | `tests/WS-FND-01.test.ts:1132` | `══ 内容基线锁 ══` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1133` | `process.exit(1)` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1134` | `contentFingerprintLine` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1136` | `--help` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1147` | `基线文件缺失` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1148` | `内容与基线一致` | 同上 | B |
+   | `tests/WS-FND-01.test.ts:1149` | `内容与基线不一致` | 同上 | B |
+
    ```
-   · 只跟 `const v = readFileSync(...)` 的**直接赋值**;别名/传参/返回值**追不到**
-   · 只认 `.includes(` 与 `.indexOf(`;正则 / pattern.test(src) 看不见
-   · X 含转义(\n 等)时按**字面**比对,可能与源文不同形 ⇒ 会漏
-   · **未报 ≠ 安全**:它只证明"没有 X 只靠注释撑着",不证明"判据都读的是代码"
+   ★ 8 处**全部**来自同一处 `join(ROOT, rel)`,**同一个变量名 `rel`**。
+   ⇒ 那不是 8 个独立缺口,是**同 1 个**结构缺口(缺"变量段解析")的 8 个实例。
+   ⇒ 修它的收益:要么 0(那 8 条本来就该豁免),要么 8 —— **一次性**。
+   ⇒ 处置(Lead 已排期):**列为 todo 表**;不在本轮关键路径。
+     ⚠️ 修之前要先回答:那 8 条判据本身有没有意义 ——
+        它们查的是 `content-lock.ts` 的**源码文本**(含 CLI 分支与提示语),
+        而 `rel` 在真跑时才确定 ⇒ 检测器**结构上**看不到目标文件是哪份。
+   ```
+
+   ## ⚠️ 失效边界(必须与结论同报)
+   ```
+   · 路径解析率 **36/48**(实测,非手写)⇒ **未报 ≠ 安全**:
+     只证明在**可解析的 36 处**里没有该形态
+   · 只认 .includes(/.indexOf(;正则 /re.test(src) **看不见**
+   · X 含转义时按**字面**比对,可能与源文不同形 ⇒ 会漏
+   · 已知无害表是**手工维护**的 ⇒ 它自己会成为下一个"手写清单"漂移点
+   · ★ 行号口径已修(块注释保留换行)——
+     修之前报的行号最多偏 **-103 行**,而**判据结论是对的**
+     ⇒ 这个 bug 只能靠"点过去看代码对不对"发现,很难自证
    ```
    ══════════════════════════════════════════════════════════════════════════ */
 
 /** 只去注释(保留字符串内容)—— 与 WS-FND-03 的 stripComments 同口径。
- *  ⚠️ `(^|[^:])` 守卫防的是同行 `https://` 之后的真代码被吃掉(**同行**才暴露)。 */
-const stripCommentsOnly = (s: string): string => s
-  .replace(/\/\*[\s\S]*?\*\//g, ' ')
-  .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+ *  ⚠️ `(^|[^:])` 守卫防的是**同行** `https://` 之后的真代码被吃掉
+ *     (跨行形态守卫无差别 —— 实测只有同行才暴露;见 WS-FND-03 的说明)。
+ *
+ *  ## ★★★ 块注释必须保持**行数**(实测抓到的真 bug)
+ *  ```
+ *  我原来写的是 `.replace(/\/\*[\s\S]*?\*\//g, ' ')`,把整块注释压成**一个空格**。
+ *  ⇒ 跨行块注释里的换行**消失** ⇒ 后面所有行**下标前移**。
+ *  ★ 实测(tests/WS-FND-01.test.ts,1499 行):
+ *      原文 1499 行 → 剥后 **1331** 行(差 168)
+ *      该文件首部有一个 **42 行**的块注释 ⇒ 之后整体偏移 -41
+ *      探针报某条在 `L1025`,**真实位置 L1128** ⇒ 偏 **-103 行**
+ *  ⇒ ⇒ 我此前所有用它的地方(**注释撑着的判据 / 追不到的清单 / 行号输出**)
+ *     报出的**行号全是错的** —— 而消息本身看起来完全正常。
+ *  ```
+ *  ⇒ 修法:替换文本里**保留原注释内的换行数** —— 用等量 `\n` 顶替,
+ *    非换行字符换成空格(空格不影响 `includes` 类判据,换行数决定行号)。
+ *
+ *  ⚠️ 为什么不是"直接删掉注释":`ok(src.includes('x'))` 的判据要求
+ *     **注释里的 x 不算数**,故注释内容必须变空 —— 只是**行数不变**。
+ *  ⚠️ 这也解释了为什么这个 bug 一直没被发现:**判据的结论是对的**
+ *     (命中/不命中不受影响),只有**行号**错。而行号错的表现是
+ *     "点过去看到的代码跟消息对不上" —— 很容易被当成"我看错文件了"。 */
+function stripCommentsOnly(s: string): string {
+  return s
+    /* 块注释:保留其中的换行,其余字符变空格 */
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => ' ' + m.replace(/[^\n]/g, '') + ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
 
 /**
- * ★ 单一实现:给定「去注释后的代码」与「原文」,返回**靠注释撑着**的 includes 字面串。
- * 全仓扫描与 S 系列自检**共用这一个**(CR-20:不造第二份口径)。
+ * ★ 已知无害表:这些命中是**刻意**的负向样本,不是缺陷。
+ * ⚠️ 每条都必须写明**为什么无害**,否则这个表会退化成"把红的都加进去"。
  */
-function findCommentBackedIncludes(code: string, raw: string): string[] {
-  const out: string[] = [];
-  const vs = [...code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*readFileSync\s*\(/g)]
-    .map((m) => m[1]!);
-  if (vs.length === 0) return out;
-  for (const v of vs) {
-    const re = new RegExp(`\\b${v}\\b[^;]*?\\.(?:includes|indexOf)\\s*\\(\\s*(['"\`])([^'"\`]*)\\1`, 'g');
+const COMMENT_BACKED_EXEMPT: readonly { file: string; x: string; why: string }[] = [
+  {
+    file: 'tests/WS-FND-01.test.ts',
+    x: 'contentFingerprints',
+    why: 'WS-FND-01:1369 明写:这条**就是**为了钉住「注释里的命中不算消费」这个反例本身,'
+      + '防将来有人把统计退化成 grep。⇒ 故意的。',
+  },
+];
+
+/** 路径求解:能把 readFileSync 的实参静态求值到仓库内路径时返回它,否则 null(不猜)。 */
+function resolveSrcPath(argExpr: string, fileDir: string, root: string): string | null {
+  const a = argExpr.trim();
+  const lit = /^(['"])([^'"]*)\1$/.exec(a);
+  if (lit) {
+    const v = lit[2]!;
+    return (v.startsWith('.') || v.includes('/')) ? join(fileDir, v) : null;
+  }
+  const j = /^join\s*\(([\s\S]*)\)$/.exec(a);
+  if (j === null) return null;
+  const parts: string[] = [];
+  let hasRoot = false;
+  /* 顶层逗号切分(简化:join 的参数不含嵌套逗号) */
+  for (const seg of j[1]!.split(',')) {
+    const t = seg.trim();
+    const l2 = /^(['"])([^'"]*)\1$/.exec(t);
+    if (l2) { parts.push(l2[2]!); continue; }
+    if (/^(ROOT|HERE|ROOT_DIR|__dirname|DIR|BASE)$/.test(t)) { hasRoot = true; continue; }
+    return null;  /* 有算不出的段 ⇒ 放弃,不猜 */
+  }
+  return hasRoot ? join(root, ...parts) : join(fileDir, ...parts);
+}
+
+/** 从 `const v = readFileSync(<arg>, 'utf8')` 的声明里取出**第一个实参**(按括号深度配对)。 */
+function firstArgOfReadFileSync(decl: string): string | null {
+  const ri = decl.indexOf('readFileSync');
+  if (ri < 0) return null;
+  const open = decl.indexOf('(', ri);
+  if (open < 0) return null;
+  let depth = 0;
+  let close = -1;
+  for (let k = open; k < decl.length; k += 1) {
+    const ch = decl[k]!;
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') { depth -= 1; if (depth === 0) { close = k; break; } }
+  }
+  if (close < 0) return null;
+  const argsRaw = decl.slice(open + 1, close);
+  /* 顶层逗号切分 */
+  let d2 = 0;
+  for (let k = 0; k < argsRaw.length; k += 1) {
+    const ch = argsRaw[k]!;
+    if (ch === '(' || ch === '[' || ch === '{') d2 += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') d2 -= 1;
+    else if (ch === ',' && d2 === 0) return argsRaw.slice(0, k).trim();
+  }
+  return argsRaw.trim();
+}
+
+/**
+ * ★ 扫描计数(可选出参)。
+ *
+ * ## 为什么要有这个(而不是在报告里手写"27 处追不到")
+ * ```
+ * 我第一版把解析率**手写在报告文本里**(「44/71 路径可解析,剩下 27 处追不到」)。
+ * ⇒ 那是**手写数字**:检测器改了(比如 `firstArgOfReadFileSync` 从"截到最后一个 )"
+ *   改成括号配对)、被测集变了(新增套件),这个数字**不会跟着变**。
+ * ⇒ 而我实测对不上:
+ *      文件里写 71 处 / 44 可解析(⇒ 27 追不到)
+ *      独立探针数出来 **48 处 / 40 可解析**(⇒ 8 追不到)
+ *      `readFileSync(` 调用点总数则是 **105**
+ * ⇒ 三个数**互不相符** ⇒ 说明"71/44"是某个**旧版本**的测量结果,一直没人改。
+ * ⇒ ★ 这正是本仓反复记的那类问题:**一个手写的、会漂的数字,比没有数字更糟** ——
+ *   它看起来是实测,实际是历史。**读者会据此判断覆盖率。**
+ * ⇒ 故:改成**实测计数**,由扫描器自己上报。
+ * ```
+ * ⚠️ 计数**只在非自检调用时**累加(`scanCommentBackedIn` 也被 S 系列自检调用,
+ *    那些合成样本不该算进"全仓解析率")。故用可选参数,自检处不传。
+ */
+type ScanStats = { sites: number; resolved: number; noArg: number; noPath: number; readFailed: number };
+
+/** ★ 单一实现:给定某个文件的源码,返回该文件里「判据只被注释满足」的命中。
+ *  全仓扫描与 S 系列自检**共用这一个**(CR-20:不造第二份口径)。 */
+function scanCommentBackedIn(
+  file: string,
+  src: string,
+  root: string,
+  stats: ScanStats | null = null,
+): { line: number; x: string; target: string }[] {
+  const out: { line: number; x: string; target: string }[] = [];
+  const code = stripCommentsOnly(src);
+  const lines = code.split('\n');
+  const consts = new Map<string, string>();
+  for (const l of lines) {
+    const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);/.exec(l);
+    if (m) consts.set(m[1]!, m[2]!.trim());
+  }
+  const fileDir = dirname(join(root, file));
+  for (let i = 0; i < lines.length; i += 1) {
+    const l = lines[i]!;
+    const re = /([A-Za-z_$][\w$]*)\s*\.\s*(?:includes|indexOf)\s*\(\s*(['"])([^'"]*)\2/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(code)) !== null) {
-      const x = m[2]!;
+    while ((m = re.exec(l)) !== null) {
+      const v = m[1]!;
+      const x = m[3]!;
       if (x.length === 0) continue;
-      if (raw.includes(x) && !code.includes(x)) out.push(x);
+      const decl = consts.get(v);
+      if (decl === undefined || !decl.includes('readFileSync')) continue;
+      /* ── 从这里起才算一个**站点**(上面那 continue 是"这不是 readFileSync 变量")── */
+      if (stats !== null) stats.sites += 1;
+      const expr = firstArgOfReadFileSync(decl);
+      if (expr === null) { if (stats !== null) stats.noArg += 1; continue; }
+      /* 一级 const 间接(如 DELTA_SRC_PATH = join(ROOT, 'a','b')) */
+      let ex = expr;
+      const one = /^([A-Za-z_$][\w$]*)$/.exec(ex);
+      if (one) { const c2 = consts.get(one[1]!); if (c2 !== undefined) ex = c2; }
+      const p = resolveSrcPath(ex, fileDir, root);
+      if (p === null) { if (stats !== null) stats.noPath += 1; continue; }
+      let raw2: string;
+      try { raw2 = readFileSync(p, 'utf8'); } catch { if (stats !== null) stats.readFailed += 1; continue; }
+      if (stats !== null) stats.resolved += 1;
+      if (raw2.includes(x) && !stripCommentsOnly(raw2).includes(x)) {
+        out.push({ line: i + 1, x, target: relative(root, p).split(sep).join('/') });
+      }
     }
   }
   return out;
 }
 
-/** ★ 对**任意源码**做同一判断 —— 供自检用(不需要真文件)。 */
-function countCommentBackedIn(src: string): number {
-  return findCommentBackedIncludes(stripCommentsOnly(src), src).length;
+/**
+ * ★★ 列出「**追不到**」的站点 —— 与 `scanCommentBackedIn` **共用同一套判据**
+ *    (同样的 `consts` 收集、同样的 `firstArgOfReadFileSync`、同样的 `resolveSrcPath`),
+ *    只在"路径解析失败"那一刻收集,而不是丢弃。
+ *
+ * ## 为什么必须把清单列出来(Lead 的要求,理由很硬)
+ * ```
+ * 报告里原先只有一句「27 处含变量段 ⇒ 追不到」。
+ * ★ 但那句话**不可核对**:读者不知道是哪 27 处,也不知道它们为什么追不到
+ *   ⇒ 无法判断"这些追不到的是不是恰好都不重要"(那正是盲区最危险的地方)。
+ * ★ 更糟:我实测那 27 是**手写的旧数字**(详见 ScanStats 注释)。
+ * ⇒ 故:列成表,每条写清 `文件:行 / 查的字面串 / 为什么追不到`。
+ *   「为什么」分成三类,因为三类的**可修性完全不同**:
+ *     · join 里有变量段   ⇒ 需要跨函数数据流 ⇒ 本检测器做不到(记明)
+ *     · 非 join/非字面量  ⇒ 如模板串 / 变量 / 函数调用 ⇒ 同上
+ *     · 实参取不出        ⇒ ★ **这是我的解析器能力问题,可修**
+ *   ⇒ 第三类是唯一"能通过改检测器消掉"的,优先看。
+ * ```
+ * ⚠️ 与 `scanCommentBackedIn` 的重复:两处都要走一遍同样的 consts/regex。
+ *    **我没有把它们合成一个函数**,因为合并会逼 `scanCommentBackedIn` 承担
+ *    "收集失败项"这个它不需要的职责(它的签名与 S 系列自检共享)。
+ *    ⇒ 但**判据必须同源**:故这里**逐字复用**那三个函数,不另写一套解析。
+ */
+function scanUnresolvedIn(
+  file: string,
+  src: string,
+  root: string,
+): { file: string; line: number; x: string; arg: string; why: string }[] {
+  const out: { file: string; line: number; x: string; arg: string; why: string }[] = [];
+  const code = stripCommentsOnly(src);
+  const lines = code.split('\n');
+  const consts = new Map<string, string>();
+  for (const l of lines) {
+    const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]+);/.exec(l);
+    if (m) consts.set(m[1]!, m[2]!.trim());
+  }
+  const fileDir = dirname(join(root, file));
+  for (let i = 0; i < lines.length; i += 1) {
+    const l = lines[i]!;
+    const re = /([A-Za-z_$][\w$]*)\s*\.\s*(?:includes|indexOf)\s*\(\s*(['"])([^'"]*)\2/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(l)) !== null) {
+      const v = m[1]!;
+      const x = m[3]!;
+      if (x.length === 0) continue;
+      const decl = consts.get(v);
+      if (decl === undefined || !decl.includes('readFileSync')) continue;
+      const expr = firstArgOfReadFileSync(decl);
+      if (expr === null) {
+        out.push({ file, line: i + 1, x, arg: '(取不出)', why: '实参取不出(无括号 / 嵌套过深)' });
+        continue;
+      }
+      let ex = expr;
+      const one = /^([A-Za-z_$][\w$]*)$/.exec(ex);
+      if (one) { const c2 = consts.get(one[1]!); if (c2 !== undefined) ex = c2; }
+      if (resolveSrcPath(ex, fileDir, root) !== null) continue;
+      out.push({ file, line: i + 1, x, arg: expr.slice(0, 90), why: whyUnresolved(expr) });
+    }
+  }
+  return out;
 }
 
-/* ★ S 系列:机械检查的区分力自检 —— 脏样本必须报,干净样本必须不报 */
+/** 把「为什么追不到」分成三类 —— 三类的**可修性**不同,故必须分开。 */
+function whyUnresolved(expr: string): string {
+  const j = /^join\s*\(([\s\S]*)\)$/.exec(expr.trim());
+  if (j === null) return '既非字面量也非 join(模板串 / 变量 / 函数调用)';
+  const bad: string[] = [];
+  for (const seg of j[1]!.split(',')) {
+    const t = seg.trim();
+    if (/^(['"])[^'"]*\1$/.test(t)) continue;
+    if (/^(ROOT|HERE|ROOT_DIR|__dirname|DIR|BASE)$/.test(t)) continue;
+    bad.push(t);
+  }
+  if (bad.length === 0) return '★ join 顶层逗号切分失败(参数含嵌套逗号)—— 解析器可修';
+  return `join 里含算不出的段:${bad.join(' / ')}`;
+}
+
+/* ★ S 系列:区分力自检 —— 脏样本必须报,干净样本必须不报。 *  ⚠️ 它测的是**同一个** scanCommentBackedIn(不另造实现)。
+ *     但注意:自检把"源码字符串"喂进去时,**目标文件**必须真实存在
+ *     (因为判据要读目标文件)。故样本里一律指向一个**真实且已知**的文件:
+ *     `server/src/bosses/raid.ts`(它的 contentFingerprints 只在注释里)。 */
 type SLab = { id: string; what: string; src: string; want: number };
+
+const S_TARGET = 'server/src/bosses/raid.ts';
 
 const S_LABS: readonly SLab[] = [
   {
     id: 'S1',
-    what: '★脏样本(真实形态):判据的标识符**只出现在注释里**',
-    /* 这正是 WS-FND-03 第一版的形态:判据看 includes,而答案只被注释满足 */
-    src: `const roomSrc = readFileSync(ROOM_PATH, 'utf8');
-// 这里曾经调用 verifyContentCompatibility(c)
-ok(roomSrc.includes('verifyContentCompatibility'), '服务端会校验');`,
+    what: '★脏样本(真实形态):判据查的标识符在**目标文件**里只存在于注释',
+    /* 指向 raid.ts —— 该文件里 contentFingerprints 真的只在注释里 */
+    src: `const raidSrc = readFileSync(join(ROOT, '${S_TARGET}'), 'utf8');
+ok(raidSrc.includes('contentFingerprints'), '某处消费了它');`,
     want: 1,
   },
   {
     id: 'S2',
-    what: '★脏样本:块注释里的标识符同理',
-    src: `const src = readFileSync(P, 'utf8');
-/* contentFingerprint 是协议层不该知道的 */
-ok(!src.includes('contentFingerprint'), '协议不依赖指纹');`,
-    want: 1,
+    what: '干净样本:标识符在目标文件里**代码**也出现 ⇒ 不得报',
+    src: `const raidSrc = readFileSync(join(ROOT, '${S_TARGET}'), 'utf8');
+ok(raidSrc.includes('BossDef'), 'BossDef 存在');`,
+    want: 0,
   },
   {
     id: 'S3',
-    what: '干净样本:标识符在**代码**里也出现 ⇒ 不得报',
-    src: `const src = readFileSync(P, 'utf8');
-// 注释里提到 foo
-const x = foo(1);
-ok(src.includes('foo'), 'foo 存在');`,
+    what: '干净样本:路径**解析不出来** ⇒ 不报(不猜,不制造误报)',
+    src: `const someSrc = readFileSync(join(ROOT, rel), 'utf8');
+ok(someSrc.includes('contentFingerprints'), 'x');`,
     want: 0,
   },
   {
     id: 'S4',
-    what: '干净样本:同名词出现在**字符串**里也算"原文有"⇒ 不得报(边界)',
-    /* ⚠️ 这条钉住边界:stripComments 保留字符串内容 ⇒ "代码里有"包含字符串。
-       若 X 只出现在另一个字符串里,实际仍能被 includes 命中 ⇒ 不算"靠注释撑着"。 */
-    src: `const src = readFileSync(P, 'utf8');
-const note = 'foo 在这里';
-ok(src.includes('foo'), 'foo 存在');`,
+    what: '干净样本:对象不是 readFileSync 的结果 ⇒ 不在范围',
+    src: `const data = JSON.parse('{}');
+ok(data.includes('contentFingerprints'), '无关');`,
     want: 0,
   },
   {
     id: 'S5',
-    what: '干净样本:非 readFileSync 的对象不在本检查范围',
-    src: `const data = JSON.parse('{}');
-// bar
-ok(data.includes('bar'), '无关');`,
-    want: 0,
-  },
-  {
-    id: 'S6',
-    what: '★脏样本②:WS-FND-03 修复前的**真实原文形态**(回归样本)',
-    /* 这条是回归锚:若哪天有人把 stripComments 从 WS-FND-03 删掉,
-       本 lab 会先在这里提示"那个形态又回来了"。 */
+    what: '★回归样本:WS-FND-03 修复前的**真实原文形态**(目标文件里该名在代码中)',
+    /* room.ts 里有 contentClaim 的**代码**出现(不是只在注释)⇒ 不该报。
+       若哪天有人把 stripComments 从 WS-FND-03 删掉,本检查会在那边报出来。 */
     src: `const roomSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
 const roomCarries = roomSrcT37.includes('contentClaim');
 const roomVerifies = roomSrcT37.includes('verifyContentCompatibility');`,
@@ -1350,7 +1611,7 @@ const roomVerifies = roomSrcT37.includes('verifyContentCompatibility');`,
 
 function runSLab(l: SLab): LabResult {
   let got: number;
-  try { got = countCommentBackedIn(l.src); } catch (e) {
+  try { got = scanCommentBackedIn('<lab>', l.src, ROOT).length; } catch (e) {
     return { id: l.id, ok: false, detail: `抛错:${(e as Error).message.slice(0, 90)}` };
   }
   if (got !== l.want) {
@@ -1909,24 +2170,69 @@ if (dimCands.length > 0) {
   if (!anyHit) console.log('    ✗ 检测器内部不一致:扫描器报了候选,谓词却说没有');
 }
 
-/* ── ★ S 节:靠注释撑着的判据(机械检查,Lead 批准项 [3])── */
-const sHits: { file: string; line: number; x: string }[] = [];
+/* ── ★ [h] 靠注释撑着的判据(Lead 批准项 [3])── */
+const cbHits: { file: string; line: number; x: string; target: string }[] = [];
+/* ★ 实测计数(见 ScanStats 的注释:报告里的解析率**不再手写**) */
+const cbStats: ScanStats = { sites: 0, resolved: 0, noArg: 0, noPath: 0, readFailed: 0 };
+/* ★ 不可解析项的**清单**(供文件头那张 todo 表;「追不到」不能只报个数) */
+const cbUnresolved: { file: string; line: number; x: string; arg: string; why: string }[] = [];
 for (const f of testFiles) {
   const rel = relative(ROOT, f).split(sep).join('/');
-  const raw = readFileSync(f, 'utf8');
-  const code = stripCommentsOnly(raw);
-  const xs = findCommentBackedIncludes(code, raw);
-  for (const x of xs) sHits.push({ file: rel, line: 0, x });
+  let raw: string;
+  try { raw = readFileSync(f, 'utf8'); } catch { continue; }
+  for (const h of scanCommentBackedIn(rel, raw, ROOT, cbStats)) cbHits.push({ file: rel, ...h });
+  for (const u of scanUnresolvedIn(rel, raw, ROOT)) cbUnresolved.push(u);
 }
-console.log(`\n[h] ★ 「判据只被注释满足」—— ${sHits.length} 处(*机械判据,零构造性误报*)`);
-console.log('    判据:`srcVar.includes(\'X\')` 且 X 在**原文**里出现、在**去注释后**不出现');
-console.log('    ⇒ 该判据**可以被一句注释单独满足** ⇒ 假绿**已经实现**(不是"可能")。');
-console.log('    ⚠️ 实测全仓(137 文件 / 71 处去重)真阳性 **0 处** ⇒ 本仓此刻没有此形态。');
-console.log('    ⚠️ 它是**低水位探测器**:真阳性可构造(S1/S2 就是),故留着 ——');
-console.log('       与"形态 3/4 不做"的区别在于:**能不能构造出让它红的样本**。');
-console.log('    ⚠️ 失效边界:只跟 readFileSync 的直接赋值;别名/传参追不到;正则形式看不见。');
-for (const h of sHits) console.log(`    ${h.file}  「${h.x}」`);
-if (sHits.length === 0) console.log('    (0 处 —— 先确认检查没坏:跑 [自检] 节的 S1~S6)');
+/* 已知无害表(刻意的负向样本)*/
+const cbKept = cbHits.filter((h) => !COMMENT_BACKED_EXEMPT.some((e) => e.file === h.file && e.x === h.x));
+console.log(`\n[h] ★ 「判据只被**注释**满足」—— ${cbKept.length} 处(另有 ${cbHits.length - cbKept.length} 处属已知无害)`);
+console.log('    判据:解析 `readFileSync(<arg>)` 的路径 ⇒ 读**目标文件** ⇒ 若该字面串在目标文件里');
+console.log('          **只存在于注释**、代码里一次都不出现 ⇒ 该判据可以被一句注释单独满足');
+console.log('    ⇒ 假绿**已经实现**(不是"可能")。');
+/* ★★ 解析率改用**实测**(见 ScanStats 注释:手写的旧数字对不上实测)。 */
+console.log(`    ⚠️ 路径解析率(实测):**${cbStats.resolved}/${cbStats.sites}** 可解析`
+  + `,追不到 ${cbUnresolved.length} 处`);
+console.log(`       构成:实参取不出 ${cbStats.noArg} / 算不出路径 ${cbStats.noPath}`
+  + ` / 目标文件读不到 ${cbStats.readFailed}`);
+console.log('    ⇒ **未报 ≠ 安全**:只证明在**可解析的那部分**里没有该形态。');
+console.log('    ⇒ 追不到的是哪些、为什么,见下面 [h-未解析] 节 + 文件头那张表。');
+console.log('    ⚠️ 不看正则形式(/re.test(src));转义字面量按字面比对 ⇒ 会漏。');
+for (const h of cbKept) console.log(`    ${h.file}:${h.line}  「${h.x}」⇒ 目标 ${h.target}`);
+if (cbKept.length === 0) console.log('    (0 处 —— 先确认检查没坏:跑 [自检] 节的 S1~S5)');
+for (const e of COMMENT_BACKED_EXEMPT) {
+  const hit = cbHits.some((h) => h.file === e.file && h.x === e.x);
+  console.log(`    [豁免] ${e.file} 「${e.x}」${hit ? '' : ' ⚠️ **未命中 ⇒ 豁免条目可能已过期**'}`);
+  console.log(`       为何无害:${e.why}`);
+}
+
+/* ── ★★ [h-未解析]:把"追不到"的**清单**列出来(不能只报个数) ──
+ *
+ * ```
+ * 理由:只报"27 处追不到"这句话**不可核对** ——
+ *   读者不知道是哪 27 处,也就无法判断"追不到的是不是恰好都不重要"
+ *   (那正是盲区最危险的地方:盲区与空白在输出上同形)。
+ * ⇒ 列清单,并按**可修性**分组:
+ *     A 解析器可修   ⇒ 只有"join 顶层逗号切分失败"这一类(我的实现能力问题)
+ *     B 需数据流分析 ⇒ join 里有变量段(本检测器结构上做不到)
+ *     C 非 join 形态 ⇒ 模板串/变量/函数调用(同上)
+ *   ⇒ 先看 A:**那是唯一能通过改检测器消掉的**。
+ * ```
+ * ⚠️ 这一节**按实测条数决定是否打印**,不写死"27 处"。 */
+console.log(`\n[h-未解析] ★ 追不到的站点清单 —— ${cbUnresolved.length} 处(按"为什么"分组)`);
+if (cbUnresolved.length === 0) {
+  console.log('    (0 处 —— ⚠️ 先确认解析器没坏:跑 [自检] 节的 S1~S5,它们要能报出 1 处)');
+} else {
+  const byWhy = new Map<string, typeof cbUnresolved>();
+  for (const u of cbUnresolved) {
+    if (!byWhy.has(u.why)) byWhy.set(u.why, []);
+    byWhy.get(u.why)!.push(u);
+  }
+  for (const [why, arr] of [...byWhy].sort((a, b) => b[1].length - a[1].length)) {
+    const tag = why.includes('可修') ? 'A 解析器可修' : 'B/C 需数据流分析或非 join 形态';
+    console.log(`    ── [${tag}] ${why}(${arr.length} 处)`);
+    for (const u of arr) console.log(`        ${u.file}:${u.line}  「${u.x}」  arg=${u.arg}`);
+  }
+}
 console.log(`\n[g] ★ 量纲/单位不一致候选 —— ${dimCands.length} 条(需人工判:哪侧是对的) `);
 console.log('    判据:同一表达式里,变量既由 **÷1024/×1024** 派生、又参与 **÷1000/×1000/1e6** 换算。');
 console.log('    ⚠️ 本检测器**不判哪侧对** —— 「KiB 还是 kB」是产品选择,不是语法错误。');
@@ -1979,8 +2285,26 @@ console.log('         本行就是区分它们的地方 —— 未列出的形�
 console.log('    · 「?」= 本脚本判据看不见,占 35% ⇒ **它的存在就是这份报告的适用范围声明**');
 
 const bad = labFail > 0 || changed.length > 0;
-if (STRICT && (bad || tot.乙 > 0)) {
-  console.log(`\n[--strict] ${bad ? '自检失败或只读被破坏' : `有 ${tot.乙} 条乙类命中`} ⇒ exit 1`);
+/* ★ `--strict-h` = 只把 **[h] 命中**当失败(供门禁接线用)。
+ *
+ * ⚠️ 为什么不能只用 `--strict`:它把**乙类命中**(本仓常态 25 条)也算失败
+ *    ⇒ 门禁若挂 `--strict` 会**恒红** ⇒ 接线者会以为"水位又超了"或"判据坏了"。
+ *    实测:`--strict` 现在 exit 1,原因是「有 25 条乙类命中」——
+ *    **那是既有状态,不是缺陷**(乙类 = 两侧同源,正常且推荐的写法,
+ *    只有"上游一改就过期"时才是隐患)。
+ * ⇒ 于是给门禁一个**精确**的开关:只拦"判据本身坏了"这一件。
+ *   `--strict`(原样保留,给人工复核用)/ `--strict-h`(给门禁用)。 */
+const STRICT_H = process.argv.includes('--strict-h');
+
+if (STRICT_H && (bad || cbKept.length > 0)) {
+  console.log(`\n[--strict-h] ${bad ? '自检失败或只读被破坏'
+    : `[h] 有 ${cbKept.length} 处「判据只被注释满足」`} ⇒ exit 1`);
+  process.exit(1);
+}
+if (STRICT && (bad || tot.乙 > 0 || cbKept.length > 0)) {
+  console.log(`\n[--strict] ${bad ? '自检失败或只读被破坏'
+    : tot.乙 > 0 ? `有 ${tot.乙} 条乙类命中(既有状态,非缺陷)`
+      : `[h] 有 ${cbKept.length} 处「判据只被注释满足」`} ⇒ exit 1`);
   process.exit(1);
 }
 if (bad) process.exit(1);

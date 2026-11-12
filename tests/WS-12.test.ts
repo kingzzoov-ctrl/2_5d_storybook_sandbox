@@ -38,7 +38,7 @@ import { join } from 'node:path';
 import { telegraphCenterOf } from '../client/src/net/telegraph_center.ts';
 import { ClientStateStore, emptyRoomState } from '../client/src/net/state_store.ts';
 import {
-  encodeClientFrame, decodeClientFrame, createSession,
+  encodeClientFrame, decodeClientFrame, createSession, classifyDownlink,
 } from '../client/src/net/session.ts';
 
 /* ── 夹具:服务端侧(用来造**真实**字节流,不手搓协议)── */
@@ -416,6 +416,102 @@ test('帧头 · 空帧与未知 tag ⇒ null(不崩)', () => {
   eq(decodeClientFrame(new Uint8Array([9, 1])), null, '未知 tag ⇒ null');
 });
 
+/* ═══════════ 5b. ★★★ 下行帧分派:值碰撞回归守卫 ═══════════ */
+
+console.log('\n— 下行帧分派(★ 含一处真实的值碰撞回归)—');
+
+/**
+ * ★★★ 这一节守的是一个**已被抓到过的真缺陷**,不是假想:
+ *
+ * ```
+ * 服务端下行 = **裸协议包**(room.ts 三处出口都直接返回 `.bytes`)
+ * 裸包首字节 = PROTOCOL_VERSION = **1** = 0x01 = FRAME_TEXT
+ * ⇒ 第一版分派写的是 `if (bytes[0] === FRAME_TEXT) { 当 JSON 解析 }`
+ *   ⇒ 裸包首字节恰好命中 ⇒ 被当 JSON ⇒ JSON.parse 抛 ⇒ state='failed'
+ *   ⇒ ★ **端到端全线失败**
+ * ⇒ 而本套件**从未测到** —— 因为原用例全部走 `binaryFrame()`(人为加了 0x02 tag),
+ *   而真服务端**不加 tag**。
+ * ```
+ * ⇒ ∴ 本节同时钉两件事:① 四种下行形态都能通;② 那次碰撞的**具体值**被记住。
+ */
+test('分派 · ★ 裸协议包(真服务端行为)必须能通 —— 这是碰撞点', () => {
+  const st = createRoomState('r');
+  st.players.push(createPlayerState('p1', { name: 'n', x: 1, y: 2 }));
+  const bare = encodeFull(st, 7).bytes;
+  /* 先钉住碰撞的前提:裸包首字节 == FRAME_TEXT 的值(0x01) */
+  eq(bare[0], 0x01, '★ 裸包首字节是 1');
+  eq(bare[0], PROTOCOL_VERSION, '★ 它就是 PROTOCOL_VERSION');
+  ok(bare[0] === 0x01, '★ 而与 FRAME_TEXT(0x01)**同值** —— 这就是碰撞');
+
+  const d = classifyDownlink(bare);
+  eq(d.kind, 'binary', '★ 必须判成 binary(不能因为首字节是 0x01 就当文本)');
+  eq(d.payload.length, bare.length, '★ 且**不切字节**(裸包没有 tag 可切)');
+  const pkt = decodePacket(d.payload);
+  eq(pkt.tick, 7, '原样解码后 tick 正确');
+});
+
+test('分派 · 四种下行形态全部可通', () => {
+  const st = createRoomState('r');
+  st.players.push(createPlayerState('p1', { name: 'n', x: 1, y: 2 }));
+  const bare = encodeFull(st, 7).bytes;
+  const taggedBin = new Uint8Array(bare.length + 1);
+  taggedBin[0] = 0x02; taggedBin.set(bare, 1);
+  const json = new TextEncoder().encode(JSON.stringify({
+    t: 'welcome', playerId: 'p1', roomId: 'r', protocolVersion: PROTOCOL_VERSION, contentClaim: 'v1-a',
+  }));
+  const taggedTxt = new Uint8Array(json.length + 1);
+  taggedTxt[0] = 0x01; taggedTxt.set(json, 1);
+
+  /* ① 裸包 ② 0x02+包 ⇒ binary;③ 裸 JSON ④ 0x01+JSON ⇒ text */
+  const b1 = classifyDownlink(bare);
+  eq(b1.kind, 'binary', '① 裸包 ⇒ binary');
+  eq(b1.payload.length, bare.length, '① 不切字节');
+  const b2 = classifyDownlink(taggedBin);
+  eq(b2.kind, 'binary', '② tag+包 ⇒ binary');
+  eq(b2.payload.length, bare.length, '② 切掉 1 字节');
+  eq(decodePacket(b2.payload).tick, 7, '② 内容正确');
+  eq(classifyDownlink(json).kind, 'text', '③ 裸 JSON ⇒ text');
+  eq(classifyDownlink(taggedTxt).kind, 'text', '④ tag+JSON ⇒ text');
+  eq(classifyDownlink(taggedTxt).payload.length, json.length, '④ 切掉 1 字节');
+});
+
+test('分派 · 空/极短输入不崩且归入 binary', () => {
+  eq(classifyDownlink(new Uint8Array(0)).kind, 'binary', '空 ⇒ binary(长度 0,交给 store 按空帧处理)');
+  eq(classifyDownlink(new Uint8Array(0)).payload.length, 0, '空 ⇒ 载荷 0 字节');
+  eq(classifyDownlink(new Uint8Array([0x01])).kind, 'binary',
+    '只有 0x01(无第 2 字节)⇒ binary —— 不能当成"带 tag 的空 JSON"');
+  eq(classifyDownlink(new Uint8Array([0x7B])).kind, 'text',
+    '只有 `{` ⇒ text(交给 JSON.parse 去报清晰错误)');
+  /* ★ 长度守卫:切 tag 前必须确认"后面真有东西"。
+     故障注入实测抓到过:去掉 `&& bytes.byteLength > 1` 后,`[0x02]` 会被切成
+     **空载荷** ⇒ 于是它会被误当成「本 tick 无差量」的**空帧**而静默通过,
+     而它其实是**无法解释的 1 字节输入** ⇒ 应归坏包(decode-failed),不该被吞。
+     ⇒ 两种处置的可见性完全不同:空帧是"正常",坏包是"留痕"。 */
+  eq(classifyDownlink(new Uint8Array([0x02])).payload.length, 1,
+    '★ 1 字节 `[0x02]` ⇒ **不切**(长度守卫:后面没有可切的内容)');
+  eq(classifyDownlink(new Uint8Array([0x02])).kind, 'binary', '且归 binary ⇒ 由 store 报坏包');
+});
+
+test('分派 · 真事件流:裸包与裸 JSON 都能被正确处理', () => {
+  const st = createRoomState('r');
+  st.players.push(createPlayerState('p1', { name: 'n', x: 1, y: 2 }));
+  const bare = encodeFull(st, 7).bytes;
+  const cp = (b: Uint8Array): ArrayBuffer => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+
+  /* 空 store 从 0 开始 ⇒ 证明裸包真的被合入了 */
+  const { sock, fire } = fakeSocket();
+  const store = new ClientStateStore();
+  createSession({
+    url: 'ws://x/', makeSocket: () => sock as never, store,
+    events: { onFrame: () => {} },
+  });
+  fire('open', {});
+  fire('message', { data: cp(bare) });
+  eq(store.state.meta.tick, 7, '★ 裸包进了 store(碰撞前这里会失败)');
+  eq(store.state.players.length, 1, '玩家进状态');
+  eq(store.decodeErrors, 0, '不是坏包');
+});
+
 /* ═══════════ 6. 契约容纳两侧(为 registry 上移留位) ═══════════ */
 
 console.log('\n— 握手契约:收必做、发留空(上移后只需填发的那半)—');
@@ -615,7 +711,14 @@ test('会话 · 二进制帧 ⇒ 字节进 store,状态真的推进', () => {
   eq(frames.length, 1, 'onFrame 回调被调了一次');
 });
 
-test('会话 · ★ 0 字节二进制帧(带 tag)⇒ 不崩,且不误报为坏包', () => {
+test('会话 · ★ 0 字节帧(真·零字节)⇒ 不崩,且不误报为坏包', () => {
+  /* ⚠️ 本用例被**改过一次**,原因值得记:
+     初版写的是 `binaryFrame(new Uint8Array(0))` —— 即 `[0x02]`(一个 tag + 零载荷)。
+     ⇒ 但**服务端真实发的 0 字节帧是"真的 0 字节"**(room.ts:1154 `new Uint8Array(0)`),
+       **不带任何 tag** ⇒ 初版那个形态在线上**不会出现**。
+     ⇒ 修复值碰撞后,`[0x02]` 被判为"1 字节裸包" ⇒ 走 decodePacket ⇒ 抛(归坏包)。
+       这**是对的**:1 字节在真协议里不可能合法(协议头就要 6 字节)。
+     ⇒ ∴ 本用例改为喂**真·零字节** —— 那才是线上形态。 */
   const { sock, fire } = fakeSocket();
   const store = new ClientStateStore();
   createSession({
@@ -623,12 +726,16 @@ test('会话 · ★ 0 字节二进制帧(带 tag)⇒ 不崩,且不误报为坏�
     events: { onFrame: () => {} },
   });
   fire('open', {});
-  /* 只带 tag、无负载 ⇒ 剥掉 tag 后是 0 字节 = 「本 tick 无差量」 */
   let threw = false;
-  try { fire('message', { data: binaryFrame(new Uint8Array(0)) }); } catch { threw = true; }
+  try { fire('message', { data: new ArrayBuffer(0) }); } catch { threw = true; }
   ok(!threw, '不抛');
   eq(store.emptyFrames, 1, '★ 认成空帧(不是 decode-failed)');
   eq(store.decodeErrors, 0, '★ 不误报为坏包');
+
+  /* 对照:`[0x02]` 这种"带 tag 但无载荷"的形态 ⇒ 归坏包(它在线上不出现,且确实无意义) */
+  const store2 = new ClientStateStore();
+  const r2 = store2.apply(new Uint8Array([0x02]));
+  eq(r2.skipped, 'decode-failed', '对照:[0x02] 单字节 ⇒ 坏包(协议头长度不足)');
 });
 
 test('会话 · ★★ 没设 binaryType ⇒ 数据被丢,但**必须留痕**(不许静默)', () => {
