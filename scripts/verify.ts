@@ -1386,8 +1386,121 @@ function findFileByName(name: string): string | null {
  * 数字只在两种情况下允许变化:(a) 出白名单;(b) 真的接入编排。
  * 新造一个没人 import 的模块会让数字 +1,当场可察觉。
  */
+/**
+ * ★★★ 「按路径读 .ts」的目标必须存在 —— 把陷阱 68 的**洞类**做成门禁。
+ *
+ * ## 洞是什么
+ *
+ * 全仓有 **83 处** `readFileSync(join(ROOT|ROOT_DIR, ...))` 形态的**路径读**。
+ * 它们与被读文件构成**最硬的依赖**(文件不在就 `ENOENT`),却:
+ *
+ *   1. **不进依赖图** —— 可达性/孤儿审计跟的是 `import` 边,这条路**不产生边**
+ *      ⇒ 两个门禁**结构上看不到它**;
+ *   2. 失败形态最差 —— 若那行在**模块顶层**,`ENOENT` 未被捕获 ⇒
+ *      **进程直接退出,`exit≠0` 且没有任何断言输出** ⇒ 你连哪条挂了都看不到。
+ *      对照 `scoreA` 那类(文件在、内容不在)⇒ 断言变红,**可读**。
+ *      ⇒ ★ 同族根因,两种硬度:**可见的红 vs 不可见的崩**。
+ *
+ * 实测案例(2026-11-13):`tests/WS-FND-03.test.ts` 两处硬编码
+ * `join(ROOT,'server','src','net','delta.ts')`;`delta.ts` 上移 `shared/net/` 后
+ * 该路径不存在 ⇒ 反向验证确认:**EXIT=1 + ENOENT + 零条断言输出**。
+ * 修法当时是"抽常量 + 行为判据",但那只解决了**那一处** ——
+ * 下一次移动仍会以同样方式崩在别处。**所以这里加一条全仓检查。**
+ *
+ * ## 为什么是"检查"而不是"每处加断言"
+ *
+ * 83 处散在 13 个文件、跨 4 个写域 ⇒ 逐处加断言的成本高、且**会随新增代码腐化**。
+ * 而本检查是**从全仓现算**:新写的路径读自动被覆盖,不需要谁记得加。
+ *
+ * ## 判据(以及它看不见什么 —— 如实)
+ *
+ * - **可静态解析** = `join(ROOT|<根变量白名单>, 'a', 'b.ts')` 形态。实测 **74/83**。
+ * - **不可解析** = 路径由变量/模板/参数决定(实测 **9 处**)⇒ 静态门禁**无法**验证。
+ *   ⇒ 这 9 处**如实计数并打印**,不假装覆盖了。
+ * - ★ **根变量必须枚举**:本仓有 `ROOT`(37)与 `ROOT_DIR`(37)两种。
+ *   实测我第一版探针只认字面 `ROOT` ⇒ 把 37 处误判成"不可解析" ⇒ **假阴性**。
+ *   ⇒ 故用白名单 + **未知根变量单独报**,否则新增一个根名会静默漏掉。
+ * - **否定式 `!existsSync(x)` 要单独分类**:它断言的是"x **不**存在"
+ *   ⇒ 目标不存在**正是它的正确状态**,把它当"缺失"是假阳性
+ *   (实测:`gate-selfcheck.ts:812` 的 `!existsSync(join(ROOT,'tests','__T35_PROBE.test.ts'))`
+ *    是自证"没把探针污染到真仓库" ⇒ 我起初误判它"早就失效",已收回)。
+ */
+function checkPathReadTargets(): void {
+  /* 根变量白名单 —— **枚举**,不是模式匹配。新增根名会被"未知根"分支接住。 */
+  const ROOTS = new Set(['ROOT', 'ROOT_DIR', 'REPO_ROOT', 'HERE', 'root']);
+  const resolved: string[] = [];
+  let total = 0;
+  let unresolvable = 0;
+  const missing: string[] = [];
+  const unknownRoot: string[] = [];
+  const rootUsage = new Map<string, number>();
+
+  const scanDir = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) {
+        if (name === 'node_modules' || name.startsWith('.')) continue;
+        scanDir(p);
+      } else if (name.endsWith('.ts')) {
+        const rel = relative(ROOT, p).split(sep).join('/');
+        /* ⚠️ 跳过 `_` 前缀的临时探针(`.gitignore:37` 已忽略它们)——
+           否则探针里写的路径会被当成仓库事实。 */
+        if (basename(p).startsWith('_')) continue;
+        /* ⚠️ 跳过本门禁自身:本函数里就含这些字形,不自扫 */
+        if (rel === 'scripts/verify.ts') continue;
+        const lines = readFileSync(p, 'utf8').split('\n');
+        for (let i = 0; i < lines.length; i += 1) {
+          const l = lines[i]!;
+          if (/^\s*(\*|\/\/)/.test(l)) continue;                  /* 注释不算 */
+          if (!/readFileSync|readFile\(|existsSync|createReadStream/.test(l)) continue;
+          if (!/\.ts/.test(l)) continue;
+          total += 1;
+          const m = l.match(/join\(\s*([A-Za-z_$][\w$]*)\s*,\s*((?:'[^']+'\s*,\s*)*'[^']+')\)/);
+          if (m === null) { unresolvable += 1; continue; }
+          const rootVar = m[1]!;
+          rootUsage.set(rootVar, (rootUsage.get(rootVar) ?? 0) + 1);
+          if (!ROOTS.has(rootVar)) { unknownRoot.push(`${rel}:${i + 1}(根=${rootVar})`); continue; }
+          const target = [...m[2]!.matchAll(/'([^']+)'/g)].map((x) => x[1]!).join('/');
+          if (!target.endsWith('.ts')) { unresolvable += 1; continue; }
+          resolved.push(`${rel}:${i + 1}`);
+          const ex = existsSync(target);
+          if (/!\s*existsSync/.test(l)) {
+            /* 否定式:目标**应当**不存在。存在了才是失效。 */
+            if (ex) missing.push(`${rel}:${i + 1} → ${target}(否定式断言,但文件存在 ⇒ 该断言已失效)`);
+          } else if (!ex) {
+            missing.push(`${rel}:${i + 1} → ${target}(读取但目标不存在)`);
+          }
+        }
+      }
+    }
+  };
+  scanDir(ROOT);
+
+  const rootsDesc = [...rootUsage.entries()].sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} ${v}`).join(' / ');
+  if (unknownRoot.length > 0) {
+    /* 未知根名 ⇒ 那些处数**没被校验** ⇒ 必须报,否则白名单会静默漏 */
+    fail(
+      `路径读用了**未列在白名单里的根变量** ${unknownRoot.length} 处 —— `
+        + `这些处数**没有被校验**(把它们加进 ROOTS 或改写形态):${unknownRoot.slice(0, 5).join(', ')}`,
+    );
+  } else if (missing.length > 0) {
+    fail(
+      `「按路径读 .ts」的目标不存在 ${missing.length} 处 —— `
+        + `这类依赖**不进依赖图**,且文件被移走时会以 **ENOENT 崩**(不是断言红):`
+        + `\n      ${missing.join('\n      ')}`,
+    );
+  } else {
+    pass(
+      `路径读目标全部存在(${resolved.length}/${total} 处可静态解析,根变量 ${rootsDesc};`
+        + `另 ${unresolvable} 处路径由变量/模板决定 ⇒ **静态门禁看不见**,如实计数)`,
+    );
+  }
+}
+
 function checkReachability(): void {
   console.log('\n[生产可达性]');
+  checkPathReadTargets();
   /* ⚠️⚠️ `shared` 必须在列 —— 这不是风格问题,是一个**曾经的真实覆盖空洞**。
    *
    * 2026-11-13 由 client-stage 发现、Lead 带对照实测确认:
@@ -1938,6 +2051,87 @@ function extractCallArgs(src: string, start: number): string {
     else if (src[i] === ')') { depth -= 1; if (depth === 0) return src.slice(start, i + 1); }
   }
   return src.slice(start);
+}
+
+/**
+ * ★★★ 客户端**能不能构建** —— 补上一个真实的覆盖缺口。
+ *
+ * ## 缺口是什么(2026-11-13 由 client-stage 自报,Lead 实测确认)
+ *
+ * ```
+ * tests/ 里引用 boot.ts 的套件数:**0**
+ * client/ 里 import boot.ts 的:`client/src/main.ts`(唯一)
+ * ```
+ * `boot.ts` 是**客户端主装配文件**(1298→1313 行),却是:
+ *
+ *   1. **零测试覆盖** —— 没有任何套件 import 它,因为它的依赖是 `three` + DOM,
+ *      Node 里直接 `import` 会失败 ⇒ **它进不了门禁套件**;
+ *   2. 于是「改完还能不能编译」**没有任何自动化验证** ——
+ *      `verify.ts` 的 1382 条全绿**不覆盖它**。
+ *
+ * ⇒ ★ 这是「测试全绿 ≠ 这个文件是好的」的**结构性**版本:
+ *   前面的门禁条目都在查"产物对不对",而这里的问题是
+ *   **有一个产物根本不在任何门禁的视野里**。
+ *
+ * ## 为什么用 `vite build` 而不是 `tsc`
+ *
+ * ```
+ * node scripts/typecheck.ts  ⇒ **exit 2**,既有错误一片:
+ *     client/src/three/boot.ts(22,24) TS7016: 找不到 'three' 的声明文件
+ *     client/src/thread/boot.ts(332,36) TS2339: 'x0' 不存在于 never
+ *     client/src/audio.ts(242,11) TS2564: 'level' 没有初始化
+ *     scripts/data-conformance.ts 多处…
+ * ⇒ tsc **本来就红** ⇒ 拿它当门禁 = 一个永远红的门 ⇒ 没人会看它。
+ *   (而且它不在 `verify.ts` 里 —— grep 实测 0 命中。)
+ * ```
+ * `vite build` 实测 **exit 0 / 1.2s / 31 modules transformed**
+ * ⇒ 它能回答**唯一需要回答的那个问题**:「这份客户端代码能不能被打包」。
+ *   ⚠️ 它**不做类型检查**(esbuild 转译即走)——
+ *      所以它覆盖的是**语法与模块解析**,不是类型。这是它的边界,如实写明。
+ *
+ * ## 为什么它不需要 `--strict-*` 开关
+ *
+ * 它**不是**一个新判据口径,而是补上一个**本来就没有的验证**。
+ * 默认跑、默认失败即红 —— 否则又变成"没人开就不查"的摆设。
+ *
+ * ## 边界(如实)
+ *
+ * - 产物写到 `dist/`(已在 `.gitignore:7`),**不污染仓库**;
+ * - 需要 `node_modules/vite` 存在。若不存在 ⇒ **跳过并说明**,
+ *   而不是报假红 —— 与 `scripts/typecheck.ts` 的取舍一致
+ *   (「没装可选开发依赖」不是代码缺陷)。
+ * - 它**不验证运行时行为**(渲染对不对、圆心对不对)⇒ 那是套件的职责。
+ */
+function checkClientBuild(): void {
+  console.log('\n[客户端构建]');
+  const viteJs = join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
+  if (!existsSync(viteJs)) {
+    console.log('      · 未装 vite(node_modules/vite 不存在)⇒ 客户端构建检查跳过');
+    return;
+  }
+  /* ⚠️ `spawnSync` 必须读 `status` —— 本仓踩过:
+     「spawnSync 不读 status」是 judgement_audit 的 F 类检测器之一,
+     即"跑了子进程但没看退出码" ⇒ 门禁恒绿。 */
+  const r = spawnSync(process.execPath, [viteJs, 'build'], {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 67108864, timeout: 300000,
+  });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  if (r.status !== 0) {
+    const tail = out.split('\n').filter((l) => l.trim() !== '').slice(-8).join('\n      ');
+    fail(`客户端无法构建(vite build 退出码 ${r.status})—— boot.ts 零测试覆盖,本检查是它唯一的自动化验证:\n      ${tail}`);
+    return;
+  }
+  /* 正向证据:必须真的转换了模块。否则"exit 0 但什么都没做"也会被当成通过。 */
+  const m = out.match(/(\d+)\s+modules?\s+transformed/);
+  const n = m === null ? -1 : Number(m[1]);
+  if (n <= 0) {
+    fail(
+      '客户端构建退出码 0,但**没有转换任何模块** —— 无法区分「构建成功」与「什么都没做」'
+        + `(输出尾:${out.trim().split('\n').slice(-3).join(' / ').slice(0, 160)})`,
+    );
+    return;
+  }
+  pass(`客户端可构建(vite build:${n} 个模块转译通过,退出码 0;产物在 gitignore 的 dist/)`);
 }
 
 /**
@@ -4433,6 +4627,12 @@ checkJudgementAudit();
 checkTempResidue();
 checkTautology();
 checkClientTrust();
+/* ★ 客户端构建 —— 补「boot.ts 零测试覆盖」这个结构性缺口。
+   ⚠️ 只在**全量或客户端相关**模式下跑:它是慢操作(~1.2s)且会写 dist/,
+      而 --frozen / --docs / --content 的运行不需要它。
+   ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件"，
+      在这里跑全量客户端构建会让它变得比全量还慢。 */
+if (!frozenOnly && !docsOnly && !contentOnly && !integrationOnly && !only) checkClientBuild();
 if (!frozenOnly && !only && !contentOnly) checkDocs();
 if (!frozenOnly && !docsOnly && !integrationOnly) await checkContent();
 if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
