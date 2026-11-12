@@ -73,6 +73,16 @@ interface Case {
    * 此时改用 `notMsg` 精确断言**那一条**消息已消失 —— 这才是本用例要测的东西。
    */
   notMsg?: RegExp;
+  /**
+   * 运行时自取锚点的标记。
+   *
+   * `from` / `to` 留空时,由 `resolveAnchors()` 按此标记从**活文件**里取值。
+   * 为什么必须自取:本仓的清单(白名单 / orphan 表)会随接线**单调收缩**,
+   * 写死锚点必然过期 —— 而过期后的表现是「锚点命中 0 次」,
+   * 看起来像「门禁没问题」,实际是**用例根本没测到**。
+   * 这个坑本轮已踩过两次(T32 的理由锚点 + Lead 注入时用错缩进)。
+   */
+  mark?: string;
 }
 
 /**
@@ -106,6 +116,43 @@ function pickServerReason(src: string): string {
 }
 
 const CASES: Case[] = [
+  /* ═══ T34:新增的「生产零引用」门禁必须能失败 ═══
+   *
+   * 这道门禁的核心不变量是 `orphan ⊆ 可达性白名单`。
+   * 它把「两套判据是否自洽」变成了机器可检查的东西 —— 但**只有它能红才算**。
+   *
+   * ⚠️ 锚点从 `orphan-audit.ts` 的活清单里**自取**(与 `pickServerReason` 同一理由):
+   * 那张表里的条目会随接线被摘除,写死锚点必然过期。
+   * **这个教训本轮已经验证过两次**(T32 的理由锚点、以及我第一版注入用错缩进空跑)。 */
+  {
+    group: 'T34',
+    name: 'orphan 清单里混入一个**可达**模块 ⇒ 两套判据矛盾',
+    file: 'scripts/orphan-audit.ts',
+    /* `from` 由 pickOrphanRow() 运行时填入(见下方 CASES 后处理),
+       这里留空串占位,与既有 T32 的自取机制同构。 */
+    from: '',
+    to: '',
+    expect: 'red',
+    wantMsg: /两套判据矛盾/,
+    /* `--frozen` 而非 `--all`:`checkOrphanList()` 在 main 里是**无条件调用**的
+       (不被 `frozenOnly` 门控),所以 `--frozen` 足以触发它,
+       又避开了跑全部测试带来的无关噪音(实验室副本里 WS-07 会因缺文件而红)。 */
+    args: ['--frozen'],
+    /* 标记:本条需要运行时自取锚点 */
+    mark: 'orphan-subset',
+  } as Case,
+  {
+    group: 'T34',
+    name: 'orphan 清单里理由被清空 ⇒ 未写明理由',
+    file: 'scripts/orphan-audit.ts',
+    from: '',
+    to: '',
+    expect: 'red',
+    wantMsg: /未写明理由/,
+    args: ['--frozen'],
+    mark: 'orphan-blank-reason',
+  } as Case,
+
   /* ═══ D1:整体透传必须回退接口级并报红 ═══ */
   {
     group: 'D1',
@@ -403,6 +450,52 @@ const CASES: Case[] = [
     args: ['--frozen'],
   },
 ];
+
+/* ══════════════ 运行时自取锚点(避免写死后过期)══════════════
+ *
+ * 为什么需要:本仓的清单会随接线**单调收缩**,写死锚点的探针到期后
+ * 报「锚点命中 0 次」—— 那看起来像「门禁没问题」,实际是**用例没测到**。
+ * 这个坑本轮踩过两次(T32 的理由锚点、Lead 注入时写错缩进)。
+ *
+ * 做法:**从活文件里解析出真实条目**,再用它构造 `from`。
+ * 解析失败时**不静默跳过** —— 抛错,因为「拿不到锚点」等于这道用例不存在。 */
+function resolveAnchors(): void {
+  const src = readFileSync(join(ROOT, 'scripts/orphan-audit.ts'), 'utf8');
+  const a = src.indexOf('export const ORPHAN_KNOWN');
+  const b = src.indexOf(']);', a);
+  if (a < 0 || b < 0) {
+    throw new Error('gate-selfcheck: 无法解析 ORPHAN_KNOWN(锚点自取失败,用例等于不存在)');
+  }
+  /* 缩进也自取 —— 我第一版按 4 空格写锚点,表里是 2 空格,3/3 注入空跑。 */
+  const rows = [...src.slice(a, b).matchAll(/^(\s*)\['([^']+)',\s*'([^']*)'\]/gm)];
+  if (rows.length === 0) {
+    throw new Error('gate-selfcheck: ORPHAN_KNOWN 解析出 0 条(正则与形态不符)');
+  }
+  const ind = rows[0]![1]!;
+  const path = rows[0]![2]!;
+  const reason = rows[0]![3]!;
+  const rowText = `${ind}['${path}', '${reason}'],`;
+  if (src.split(rowText).length - 1 !== 1) {
+    throw new Error(`gate-selfcheck: 锚点行不唯一或形态不符: ${JSON.stringify(rowText)}`);
+  }
+  const badRow = `${ind}['${path}', ''],`;
+  /* 刻意保留 4 空格 —— 与同行**不同缩进**才能精确命中,且不与真行混淆 */
+  const injectRow = `${ind}${ind}['server/src/sim/world_sim.ts', 'probe:可达模块'],\n`;
+
+  for (const c of CASES) {
+    if (c.mark === 'orphan-subset') {
+      /* 插入一个必然可达的模块 —— 它不在 UNREACHABLE_EXEMPT 里,
+         于是触发「是 orphan 却不在可达性白名单 —— 两套判据矛盾」 */
+      c.from = rowText;
+      c.to = injectRow + rowText;
+    } else if (c.mark === 'orphan-blank-reason') {
+      c.from = rowText;
+      c.to = badRow;
+    }
+  }
+  console.log(`  · 锚点自取:orphan-audit.ts 的「${path}」(缩进 ${ind.length} 空格)\n`);
+}
+resolveAnchors();
 
 /* ═══════════════════════ 执行 ═══════════════════════ */
 
