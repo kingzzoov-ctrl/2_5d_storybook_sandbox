@@ -2691,3 +2691,154 @@ schema.ts 46 个导出
 - CR-20(同一判据多份实现 —— 本 CR 说明它**不适用**于此,并给出适用版本)
 - CR-22(`.gitignore` 的 `_*` 让自证失效 —— 同族:门禁的**名字**与它**实际拦的东西**不一致)
 - 陷阱 60(守错对象)· `shared/contracts/FREEZE.md:5`(冻结层的正式扩展流程)
+---
+
+## [CR-25] 2026-11-13 Lead — 我的「谁 import 谁」探针**漏掉了「经函数返回可达」**,差点把三张线上字段表判出 shared
+
+- **发现者**:`client-stage`(task-67 §10 复核,纠正 Lead 的 CR-24 §4 分类)
+- **性质**:**这是我的探针错误**,不是它的报告错误
+- **影响**:CR-24 的**结论**(取 (b) 切分上移)不变;**依据**要改写
+
+### 1. 它指出的事实(我独立复核,全部成立)
+
+```
+schema.ts
+  export 声明行     46        ← 我的口径
+  唯一符号名        43        ← 它的口径
+  同名对 3 组:FieldType ×2 / TelegraphShape ×2 / EntityKind ×2
+  ⇒ 两个口径都对,差 3 = 那三组同名对(const X + type X,TS 合法)
+```
+**⇒ 我采信 43 这个口径(唯一符号名),以后一律用它。**
+
+### 2. ★★ 我真正的错:分不清「import 了」与「体内真用了」
+
+**我的探针 `usersOf(f)` 扫的是整个文件文本:**
+```ts
+for (const sym of schemaExports) {
+  if (new RegExp('(^|[^A-Za-z0-9_$])' + sym + '([^A-Za-z0-9_$]|$)').test(s)) set.add(sym);
+}
+```
+```
+而 import 语句**自己就写了符号名**:
+  L26-L48  import { BOSS_FIELD_TABLE, ..., FIELD_TABLE, ..., ROOM_FIELD_TABLE, ... } from './schema.ts'
+⇒ "import 了" 必然被算成 "用了" ⇒ **我的 18 个「只被编码器用」里混了 3 个假的**
+```
+**实测(`import 区 = L26..L48`,体内 = 其余):**
+```
+delta.ts 体内**真用**  18 个;  import 了但体内 0 次 = **3 个**:
+  FIELD_TABLE · WILDLIFE_FIELD_TABLE · BOSS_FIELD_TABLE
+```
+
+### ★ 3. 但 client-stage 的**机制说明**是错的(结论对)
+
+```
+它写:「那 1 次命中是 `ROOM_FIELD_TABLE` 的**子串**」
+⇒ 实测不成立:我的原探针**带词边界**,`ROOM_FIELD_TABLE` 里 `FIELD_TABLE` 前面是 `_`
+   而 `_` 属 `\w` ⇒ 词边界不匹配 ⇒ **不可能因子串命中**
+⇒ 真正的机制:**那唯一命中在 L30 `  FIELD_TABLE,` —— 是 import 列表里的一行**
+⇒ ★ **结论对、机制错。** 这种纠正必须按机制重述,否则下次会照着错的机制去修。
+```
+
+### ★★ 4. 我的探针还有第二个洞 —— 而它比第一个更重要
+
+```
+我据此把 FIELD_TABLE / WILDLIFE_FIELD_TABLE / BOSS_FIELD_TABLE 判成
+「只被编码器用」→ 后来又判成「两边体内都不用」→ 看起来像"没人用的死表"
+
+★ 而真相:它们**经 `tableFor(kind)` 返回可达**:
+   schema.ts:398  export function tableFor(kind: EntityKind): readonly FieldSpec[] {
+   L400  case EntityKind.ROOM:     return ROOM_FIELD_TABLE;
+   L401  case EntityKind.PLAYER:   return FIELD_TABLE;
+   L402  case EntityKind.WILDLIFE: return WILDLIFE_FIELD_TABLE;
+   L403  case EntityKind.BOSS:     return BOSS_FIELD_TABLE;
+
+  实测(运行时):
+   EntityKind.ROOM(1)     ⇒ tableFor ⇒ ROOM_FIELD_TABLE
+   EntityKind.PLAYER(2)   ⇒ tableFor ⇒ FIELD_TABLE
+   EntityKind.WILDLIFE(3) ⇒ tableFor ⇒ WILDLIFE_FIELD_TABLE
+   EntityKind.BOSS(4)     ⇒ tableFor ⇒ BOSS_FIELD_TABLE
+
+  而 delta.ts 体内**确实调用 tableFor** ⇒ 它**间接**依赖全部四张表
+⇒ ★ 我的「体内直接引用」判据**结构上看不见「经函数返回可达」这一层**。
+⇒ 这与陷阱 63 同族:**判据的视野决定了它能看见什么**,
+  而"看不见"在输出上表现为「0 次」—— 与「真的死代码」**完全无法区分**。
+```
+
+### 5. 修正后的完整分类(唯一名 43,体内真用 + 经函数可达)
+
+```
+① 只编码器体内直接用   15 个
+   BossState · ENTITY_KIND_LABEL · EntityKind · FIELD_TYPE_BYTES · FieldSpec
+   FieldType · POS_SCALE · ROOM_FIELD_TABLE · WildlifeState · chunkKey
+   dequantizePos · parseChunkVersions · quantizePos · serializeChunkVersions · tableFor
+② 只房间体内用          3 个  → 留 server/
+   createPlayerState · createRoomState · removePlayer
+③ 两边都用              3 个  → shared/
+   PlayerState · RoomState · cloneRoomState
+④ 体内都不用           22 个  → ★ 逐个判,不能一律当"没人用"
+```
+
+**④ 那 22 个里,client-stage 判定的归属(我采信,它的判据更强):**
+```
+→ shared(6): StateFlagIndex · STATE_FLAG_NAMES · FsmIndex · FSM_NAMES
+             · TelegraphShape · RoomMetaState
+→ server(13): MAX_FIELDS_PER_TABLE · createWildlifeState · createBossState
+             · upsertPlayer · upsertWildlife · upsertBoss · removeWildlife · removeBoss
+             · bumpChunkVersion · fullMask · validateFieldTable
+             · fieldBytes · entityPayloadBytes
+→ 未判(3): BOSS_FIELD_TABLE · FIELD_TABLE · WILDLIFE_FIELD_TABLE
+           ⇒ ★ **经 tableFor 可达 ⇒ 必须进 shared**(见 §4)
+           ⇒ 22 = 6 + 13 + 3 ⇒ 闭合 ✓
+```
+
+### ★★ 6. client-stage 的第二条判据(我认为它比我的更对)
+
+> **不是「谁在用」,而是「谁**将要必须**用」。**
+
+```
+它说:`StateFlagIndex` / `STATE_FLAG_NAMES` / `FsmIndex` / `FSM_NAMES`
+      现在**只有 tests 引用**(或完全没人引用),**是因为客户端还没解码**;
+      一旦接线,**必须**被客户端用。
+⇒ 若按「当前引用者」判定,这 4 个会留在 server/,客户端接线时只能自己抄一份
+  ⇒ **制造真 CR-20**
+⇒ ★ 而 `TelegraphShape` 更硬:阶段 2 实测 **5/5 下标与客户端冲突**
+  ⇒ 两侧只能有**一份**词表,不存在"各留一份"的选项
+```
+
+**⇒ 这条判据我采纳为准:分类的判据是「**客户端必须用它解释收到的字节**」,
+   而不是「它现在被谁 import」。**
+
+### 7. CR-24 的结论不变,依据改写
+
+```
+不变:(b) 切分上移 ✓;② 那 3 个留 server ✓;新增门禁(client/src 不得 import server/**)✓
+改写:上移集合从「① ∪ ③ = 21」改为
+       ① 15 + ③ 3 + ④ 中判 shared 的 6 + 经 tableFor 可达的 3 = **27 个**(唯一名口径)
+      ⇒ 留 server = ② 3 + ④ 中判 server 的 13 = **16 个**
+      ⇒ 27 + 16 = 43 ✓ 与唯一名总数闭合
+```
+
+### 8. client-stage 提的后果(我认可,已列入切分后的必跑项)
+
+```
+切分后新增 shared/** 文件 ⇒ 会被 PROD_ENTRIES 闭包(verify.ts:630)重算可达性
+⇒ ★ 切分落地后**必须立刻**跑 `--strict-reach`,
+   确认新文件在闭包内、没变成「未登记不可达」
+⇒ 它如实说「我没实测这一步(需要真动 shared)」—— 标注正确
+```
+
+### 9. 未实测
+
+```
+[ ] 上述 27/16 的切分**未实际执行** ⇒ 拆完必须跑全量四旗
+[ ] client 侧解码器仍不存在 ⇒ 「客户端必须用」是**设计推断**,尚无代码验证
+[ ] 经 tableFor 可达的 3 张表:若将来有人改成 `const TABLES = {...}` 查表,
+    可达性判据会变 ⇒ 本 CR 的 §4 结论有时效性
+```
+
+### 10. 关联
+
+- CR-24(本 CR 是它的依据修正,结论不变)
+- **陷阱 63**(工具的红绿都是关于工具的说法)· **陷阱 65**(假阳性压掉的办法是让判据恒真)
+- **陷阱 66**(新:The 判据的**视野**决定它看得见什么;「0 次」与「死代码」不可区分)
+- `docs/CLIENT-NET-CONTRACT.md` §10(client-stage 的复核)

@@ -456,3 +456,136 @@ node _nc_lines.ts    # 行号(★ 用 Node 取,不用 PowerShell —— 陷阱 6
 §2 的「契约型风险 R1/R2/R3」应更新为「**已接线,风险由作者自行钳住**」——
 但 `docs/GUARD-CONTRACTS.md` 是 task-56 的交付物、已 complete,
 **要不要改由你定**(我不擅自 reopen)。
+
+---
+
+## 10. ★ 切分线复核(CR-24 授权,只读)
+
+> Lead 裁决:(b) 按**实测消费者**把 `schema.ts` 的导出切分上移,而不是整文件搬 (a)、
+> 也不是客户端手抄 (c)。本节是他要求的**只读复核**,未动任何文件。
+> 复核工具:`_sp_a.ts`(消费者矩阵)、`_sp_b.ts`(符号闭包)、`_sp_c.ts`(C4 归属)、
+> `_sp_d/e.ts`(口径与未用导入)、`_sp_f/g.ts`(冻结层扫描)。
+
+### 10.1 ★★ 先说一个数字口径差(不查清它,C4 的条数永远对不上)
+
+```
+`export` 声明行命中        **46**
+其中同名对                **3** 组:FieldType ×2、TelegraphShape ×2、EntityKind ×2
+                          (`export const X` + `export type X`,TS 里是合法的一对)
+⇒ **唯一符号名 = 43**
+```
+| | 计数对象 | 结果 |
+| :--- | :--- | :--- |
+| Lead | 「导出条目」(含同名对) | **46** |
+| 我 | 「唯一符号名」(去重) | **43** |
+| **★ 影响** | Lead 算 `46 − 18 − 3 − 3 = 22` 得 **C4 = 22**;用唯一名算是 `43 − 24 =` **C4 = 19** | **差 3 = 那三组同名对** |
+
+**⇒ 两个口径都对,但必须说清是哪一个**,否则「C4 有 22 个还是 19 个」会各说各话。
+**下面我用唯一名口径 = 19**,并逐条给出归属(§10.3)。
+
+### 10.2 ✅ 切分线自洽性:**成立**(我独立复算,不采信结论)
+
+**Lead 的关键核对**——「`decodePacket` 体内用到的符号是否全落在 C1 ∪ C3」——我**扩到整套编解码**复核:
+
+```
+delta.ts 从 schema.ts 导入 **21** 个符号
+  ⇒ 落在 C1∪C3(应上移 shared):**21 / 21**
+  ⇒ 落在 C2(纯服务端状态管理):**0** ✓
+  ⇒ 落在 C4:                 **0**
+```
+逐函数复核(全部 ✓,无一落在 C1∪C3 之外):
+
+| 函数 | 行 | 用到的 schema 符号 |
+| :--- | :--- | :--- |
+| `decodePacket` | 422-448 | `EntityKind`, `tableFor` |
+| `applyPacket` | 451-488 | `EntityKind` `ROOM_FIELD_TABLE` `cloneRoomState` `tableFor` `BossState` `PlayerState` `RoomState` `WildlifeState` |
+| `mergeEntity` / `defaultFor` | 490-517 | `FieldSpec`, `FieldType` |
+| `encodeDelta` / `planFor` | 299-391 | `EntityKind`, `RoomState`, `tableFor`, `FieldSpec` |
+| `normalized` / `writeField` / `readField` | 162-234 | `FieldType` `quantizePos` `dequantizePos` `FieldSpec` `ENTITY_KIND_LABEL` `EntityKind` |
+| `roomToFlat` / `applyFlatToRoom` | 259-275 | `serializeChunkVersions`, `parseChunkVersions`, `RoomState` |
+
+**⇒ Lead 的切分线自洽,`C2` 三个符号确实只需服务端。这一条我确认成立。**
+
+**反向核对**:`room.ts` 从 schema 只导入 5 个(`createPlayerState` `createRoomState` `cloneRoomState`
+`PlayerState` `RoomState`),其中 3 个(`PlayerState`/`RoomState`/`cloneRoomState`)来自 shared
+⇒ **切分后 room.ts 的 import 需要拆成两行(shared + server),这是预期的、不是缺陷。**
+
+### 10.3 ⚠️ 我对 C1 命名的一处修正(归属不变,但「理由」要改)
+
+矩阵显示:**`FIELD_TABLE` 被 `delta.ts` 导入,但体内使用 0 次**(裸 `FIELD_TABLE` 在 import 块后出现 0 次;
+1 次命中是 `ROOM_FIELD_TABLE` 的子串)。同样 `WILDLIFE_FIELD_TABLE`、`BOSS_FIELD_TABLE` 也是 **未使用导入**。
+
+```
+⇒ 三张表的真实消费者是 schema.colyseus(4/1/1)+ tests + scripts,**不是** delta
+⇒ C1 的标题「只被编码器用」对这三张表**不准确**
+⇒ 但**归属建议不变**:客户端解码要靠 tableFor(kind) 拿到表,三张表都必须在 shared
+⇒ 精确说法:C1 = 「**线上格式的一部分**(被编码器**或它的同类消费者**用)」
+```
+
+### 10.4 ★ C4 的 19 个:归属建议(**按判据,不按「谁引用它」**)
+
+**判据**:符号属于 `shared` ⟺ **客户端必须用它解释收到的字节**
+(枚举索引要能解成语义、状态结构要能装下、定标要能换算)。
+
+| 归属 | 符号 | 理由 |
+| :--- | :--- | :--- |
+| **→ shared(6)** | `StateFlagIndex` | 解 `player.stateFlag`(u8 0..6)→ 语义。不上移 ⇒ 客户端只能自己抄索引 = **真 CR-20** |
+| | `STATE_FLAG_NAMES` | 同上(且**当前无人引用** —— 与 shared 的 `BODY_STATES` 冗余) |
+| | `FsmIndex` | 解 `wildlife.fsm`(u8)→ 语义 |
+| | `FSM_NAMES` | 同上(**当前无人引用**) |
+| | `TelegraphShape` | ★ 解 `boss.telegraphShape`(u8 0..4)。**§4.1 实测 5/5 下标与客户端冲突** ⇒ 两侧必须只有**一份**词表 |
+| | `RoomMetaState` | 是 `RoomState` 的字段,而 `RoomState` 已在 C3 ⇒ 必须随之 |
+| **→ server(13)** | `MAX_FIELDS_PER_TABLE` | 掩码宽度;仅 `validateFieldTable` 用,是**服务端自检**常量 |
+| | `createWildlifeState` / `createBossState` | 构造器 = 建实体,只在服务端发生 |
+| | `upsertPlayer` / `upsertWildlife` / `upsertBoss` | 变更 `RoomState` = **服务端写操作** |
+| | `removeWildlife` / `removeBoss` | 同上(两者**当前无人引用**) |
+| | `bumpChunkVersion` | 变更 `meta.chunkVersions` = 服务端写操作 |
+| | `fullMask` | spawn 时算全字段掩码;**客户端只读掩码** |
+| | `validateFieldTable` | 字段表自检(服务端 CI) |
+| | `fieldBytes` / `entityPayloadBytes` | **带宽估算**(文档 §5/§6),不参与编解码 |
+
+**合计 shared 6 / server 13 = 19** ✓ 覆盖 C4 全部。
+
+### 10.5 ★★ 我的关键论点:为什么不能只按「谁引用它」定归属
+
+```
+阶段 2 找到的两处「同名不同物」——`telegraphShape` 与 `stateFlag` ——
+它们的符号(`TelegraphShape` / `StateFlagIndex`)在 C4 里,而 C4 是「两边都不用」那批。
+```
+**⇒ 当前无人引用 ≠ 客户端不需要。** 恰恰相反:
+`StateFlagIndex`/`STATE_FLAG_NAMES`/`FsmIndex`/`FSM_NAMES` 现在**只有 tests 引用**(或完全没人引用),
+是因为**客户端还没解码**;一旦接线,它们**必须**被客户端用。
+**若按「当前引用者」判定,这 4 个会被留在 `server/` ⇒ 客户端接线时只能自己抄一份 ⇒ 制造真 CR-20。**
+
+⇒ **所以我给 C4 加了第二条判据:不是「谁在用」,而是「谁**将要**必须用」。**
+这条判据也解释了我为什么建议它们进 shared 而不是 server。
+
+### 10.6 ✅ 冻结层扫描:我扩面复核,结论与 Lead 一致
+
+Lead 扫的是 `tests/` + `scripts/` 里 `shared` 与 `readdirSync`/`.length ===` 的组合。我**扩面**重扫:
+
+```
+扫描面:tests + scripts 共 **40** 个 .ts
+「shared + 计数/枚举」同时出现:**10 处**,逐个看过 ——
+  8 处是 `import { ITEM_LIST/ITEM_BY_ID/... } from '../shared/...'`(读内容,不是数文件)
+  1 处 tests/WS-10.test.ts:661 是局部变量名 `shared1`(巧合,与本议题无关)
+  1 处 tests/WS-FND-01.test.ts:1280 是**全仓 .ts 遍历**
+★ 决定性:该遍历的产物 `T43_FILES` 只被用作**过滤基**(`:1308 return T43_FILES.filter(...)`),
+  **没有任何 `.length === N` 断言**
+```
+**⇒ 未发现「shared 文件数 = N」这类硬断言。Lead 的预期成立,我独立确认。**
+
+**另查了两处更深的**:
+- `checkFrozen()`(`scripts/verify.ts:206`)按**具名路径** `import` 7 个 shared 模块并断言内容
+  (320 项、ID 唯一、分表 10/320……),**不扫描目录** ⇒ 新增 shared 文件不影响它。
+- 「冻结层不变量 17/17」那个门禁(`verify.ts:3935`)比的是**实测通过条数**,不是文件数 ⇒ 同样不受影响。
+
+**⚠️ 一处后果我要提前说明**:切分后新增 `shared/**` 文件,会被 `PROD_ENTRIES` 闭包
+(`verify.ts:630`)重新计算可达性。**我没有实测「切分后门禁是否仍全绿」**(那需要真的动 shared)。
+⇒ **建议切分落地后立刻跑一次 `--strict-reach`**,确认新文件在闭包内、没有变成「未登记不可达」。
+
+### 10.7 我没做的
+
+- **未修改 `shared/**`、`server/**`、`client/**` 任何一行**(本轮纯只读复核)。
+- **未改 CR-24**、未动 `docs/CHANGE_REQUESTS.md`(Lead 写域)。
+- 临时探针 `_sp_*.ts` 全在仓库根,**已删除**;未写入 `scripts/`。
