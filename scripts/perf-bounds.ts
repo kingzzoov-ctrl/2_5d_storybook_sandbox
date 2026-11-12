@@ -42,7 +42,7 @@ import { PhysicsWorld } from '../server/src/physics/world.ts';
 import { SignalGraph } from '../server/src/wiring/graph.ts';
 import { AoiManager, AOI_WAKE_DISTANCE } from '../server/src/mobs/aoi.ts';
 import { WireColor } from '../shared/types/tile.ts';
-import { estimateBandwidth, bandwidthTable, encodeDelta } from '../server/src/net/delta.ts';
+import { estimateBandwidth, bandwidthTable, encodeDelta } from '../shared/net/delta.ts';
 import {
   createRoomState, createPlayerState, createWildlifeState, createBossState,
 } from '../server/src/net/schema.ts';

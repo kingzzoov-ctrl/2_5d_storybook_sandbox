@@ -105,7 +105,7 @@ import {
   encodeFull,
   estimateBandwidth,
   chunkWireBytes,
-} from '../server/src/net/delta.ts';
+} from '../shared/net/delta.ts';
 
 import {
   RECONCILE_DEADZONE,

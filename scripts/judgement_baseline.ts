@@ -202,11 +202,102 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
     verdict: '已定性无害',
     reason: '同上,定向断言(门禁是否 import 了豁免模块)。',
   },
+  {
+    detector: 'C',
+    file: 'scripts/assertion-teeth-report.ts',
+    needle: 'const re = /import\\s+([\\s\\S]*?)\\s+from\\s+',
+    verdict: '已定性无害',
+    reason:
+      '★ **这是 C 的已知覆盖边界,不是缺陷**(2026-11-13 登记)。'
+      + 'L367 的 `re` 本身就是**一个做 import 解析的正则** ⇒ 被 C 检测器命中'
+      + '(C 探的是"只认 from")。'
+      + '但 C 报的是"**该站点未覆盖裸/动态 import**"—— 那对该站点**不适用**:'
+      + '它的用途是解析**已存在的 import 语句里的绑定名**(为断言定位置),'
+      + '不是做依赖图遍历;裸 `import \'x\'` 没有绑定名,动态 `import()` 不在其解析目标内。'
+      + '⇒ 处置:**登记为边界**,不修。若将来它真的承担了依赖图职责,此条应重新定性。',
+  },
 
-  /* ─────────── D:对原文计数(0 处)─────────── */
-  /* 无命中。留此段说明「0 处」是**真 0** 而非漏扫:
-     D 的脏样本自检通过(见 --selftest 的 E 段),且本仓 `@type` 计数
-     (docs/ARCH-GAPS.md:211-213)已改为剥注释后计数 —— 修复于 task-57 前后。*/
+  /* ─────────── D:对原文计数(7 处,全为假阳性)─────────── */
+  /* ★ 2026-11-13:**这一段此前写的是「0 处」,而那是**假 0**,不是真 0**。
+     ```
+     D 的探测正则要求字面 `.match(` 后**紧跟** `(` —— 而 `matchAll(` 里
+     紧跟的是字母 `A` ⇒ **结构上不可能匹配**
+     ⇒ D 整类漏掉了 matchAll 写法(本仓自己在用),
+       所以「0 处」是**判据太窄**的产物,不是"干净"的证据。
+     ⇒ 这正是我在 task-60 写过的那条:**空结果不是「没问题」,可能是判据没运行**。
+     ```
+     D 放宽为认 `match` 与 `matchAll`、flags 用 `[a-z]*` 之后,报出 7 处。
+     逐条定性如下 —— **全是假阳性,但逐条登记**(「都是假的」本身也是要被登记的对象,
+     否则下一个人要重做这 7 次判定)。 */
+  {
+    detector: 'D',
+    file: 'scripts/deadcode-audit.ts',
+    needle: 'for (const cm of s.code.matchAll(',
+    verdict: '假阳性',
+    reason:
+      '`s.code` 来自 `stripCommentsAndStrings(raw)`(L154)⇒ **注释与字符串都已剥**'
+      + '⇒ 注释里的词不会污染计数。'
+      + '⚠️ D 误报的机制:它只在**±10 行窗口**里找「剥注释关键词」,'
+      + '而这次剥注释发生在**约 200 行之外**的定义处 ⇒ 窗口够不到 ⇒ 误报。'
+      + '⇒ 与 A/F 同族:判据看「窗口内有没有关键词」,不看「语义上有没有剥」。',
+  },
+  {
+    detector: 'D',
+    file: 'scripts/deadcode-audit.ts',
+    needle: 'for (const fm of s.code.matchAll(',
+    verdict: '假阳性',
+    reason: '同上:`s.code = stripCommentsAndStrings(raw)` ⇒ 已剥注释 ⇒ 非缺陷。',
+  },
+  {
+    detector: 'D',
+    file: 'scripts/live-path-audit.ts',
+    needle: 'for (const m of src.matchAll(',
+    verdict: '假阳性',
+    reason:
+      '`src = mask(readFileSync(...), false)`(L167),而 `mask` 的第二个参数名是 '
+      + '**`blankStrings`** —— 它只控制**字符串**是否也抹;'
+      + '**注释无条件被抹**(`inLine`/`inBlock` 分支里 `out[i] = \' \'` 无 `if`)'
+      + '⇒ `mask(src, false)` = 剥注释、保留字符串 ⇒ 注释不污染计数。'
+      + '2026-11-13 读实现确认,非缺陷。',
+  },
+  {
+    detector: 'D',
+    file: 'scripts/live-path-audit.ts',
+    needle: 'for (const m of src.matchAll(/^export\\s+const',
+    verdict: '假阳性',
+    reason: '同上:同一行 `src` 已经过 `mask(..., false)` 剥注释 ⇒ 非缺陷。',
+  },
+  {
+    detector: 'D',
+    file: 'tests/WS-07.test.ts',
+    needle: 'const literal = [...src.matchAll',
+    verdict: '假阳性',
+    reason:
+      '★ **故意在原文上数**:紧接着 L3118-3120 就**显式减去**注释提及数 '
+      + '(`eq(literal, 44 + inComments, ...)`)——'
+      + '它要验的正是「字面计数 = 真注解数 + 注释提及数」这个恒等式,'
+      + '**用注释提及数反推**,防止有人在注释里多加 `@type(` 把等式搞成巧合。'
+      + '⇒ 在原文上数是**设计意图**,不是疏忽 ⇒ 假阳性。',
+  },
+  {
+    detector: 'D',
+    file: 'tests/WS-07.test.ts',
+    needle: 'const ownDecos = [...rcSrc.matchAll',
+    verdict: '假阳性',
+    reason:
+      '★ **故意**:正则用 `^` **行首锚定**(`/^\\s*@(\\w+)/gm`),'
+      + '注释里的 `@type(` 若不在行首对齐则不匹配;'
+      + '且 L4037-4039 的注释**明确写出**两个口径的差'
+      + '(「行首计数 = 真实生效 44;含注释为 45,差 1 处在注释里,不生效」)。'
+      + '⇒ 口径是**选定的**,并在注释里论证过 ⇒ 假阳性。',
+  },
+  {
+    detector: 'D',
+    file: 'tests/WS-07.test.ts',
+    needle: 'const depDecos = [...scSrc.matchAll',
+    verdict: '假阳性',
+    reason: '同上:行首锚定 + 注释里已写明「44 生效 / 45 含注释」的口径选择 ⇒ 假阳性。',
+  },
 
   /* ─────────── F:spawnSync 不读 status(1 处)─────────── */
   {
@@ -280,8 +371,16 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
  *
  * 实测记录:
  * ```
- * 2026-11-13  42 对  G 初版判据(通用词表 94 条;跨文件过滤已去掉)
- *                   去掉「跳过同文件」过滤 +0 对(同文件那组本就是 42 里的 15 对)
+ * 2026-11-13  42 对  G 初版判据(通用词表 94 条)
+ * 2026-11-13  43 对  ★ **水位守卫自己抓到的第一次增长** ——
+ *                   `deadcode-audit.ts:289 Finding` ↔ `live-path-audit.ts:66 DeadSymbol`
+ *                   定性:**层间传递,非重复实现**。理由:
+ *                   `live-path-audit` 走 **spawnSync + --json** 取数据
+ *                   (实测:它只 import node:fs / node:path / node:child_process,
+ *                    **不 import** deadcode-audit)⇒ **没有类型传递通道**
+ *                   ⇒ 只能本地复制一份结构来接 JSON ⇒ 这是**进程边界导致的必然重复**。
+ *                   早已注意:它连 ROOT 都刻意不复制(见本仓"两份实现"教训)。
+ *                   ⇒ 按规则**上调水位并把理由写清**(这正是水位守卫的用途)。
  * ```
  */
-export const G_CANDIDATE_WATERMARK = 42;
+export const G_CANDIDATE_WATERMARK = 43;

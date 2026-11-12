@@ -20,7 +20,7 @@ import {
   encodeDelta,
   encodeFull,
   PROTOCOL_VERSION,
-} from './delta.ts';
+} from '../../../shared/net/delta.ts';
 import {
   AntiCheatRoom,
   type Clock,

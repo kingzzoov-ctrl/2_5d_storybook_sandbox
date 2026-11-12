@@ -37,7 +37,7 @@ import { AoiManager, AOI_WAKE_DISTANCE } from '../server/src/mobs/aoi.ts';
 import { WireColor } from '../shared/types/tile.ts';
 import {
   estimateBandwidth, encodeDelta,
-} from '../server/src/net/delta.ts';
+} from '../shared/net/delta.ts';
 import {
   createRoomState, createPlayerState, createWildlifeState, createBossState,
 } from '../server/src/net/schema.ts';

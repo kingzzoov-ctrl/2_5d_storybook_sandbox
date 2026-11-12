@@ -695,9 +695,61 @@ shared/types/wire.ts          {NONE:0, CIRCLE:1, SECTOR:2, RECT:3, RING:4}
 `facing`/`spreadRad`/`innerRadius`/`length`/`width` 都不在 `BOSS_FIELD_TABLE` 里(§3.3)。
 ⇒ 接线时 ANNULUS 的 `innerRadius` 只能由客户端自定,**这是玩法参数,不是同步字段**。
 
+---
+
+## 12. ★★★ 一条系统性风险:「按路径读 .ts 文本」是**不进依赖图**的依赖
+
+> 起因:我数 `delta.ts` 的改动面时数成「1 文件 + 3 import 点」,真值是 5 处。
+> **根因不是粗心,是我的判据把「依赖」默认成了「import 语句」。**
+
+### 12.1 反例:`WS-FND-03` 依赖 delta.ts,但**没有** import 它
+
 ```
-client/src/ui/boss_hud.ts:26  {CIRCLE:0, ANNULUS:1, CONE:2, LINE:3, CROSS:4}
-shared/types/wire.ts          {NONE:0, CIRCLE:1, SECTOR:2, RECT:3, RING:4}
-⇒ **5 个下标全部冲突** —— 切分**不解决**它,要等阶段 3 让 boss_hud 改从 shared 取
+tests/WS-FND-03.test.ts:249  readFileSync(join(ROOT,'server','src','net','delta.ts'),'utf8')
+tests/WS-FND-03.test.ts:300  readFileSync(join(ROOT,'server','src','net','delta.ts'),'utf8')
+该文件的 import 目标实测:["node:fs","node:path","node:url","../server/src/content/handshake.ts",
+  "../server/src/content/registry.ts","../shared/constants/items.ts"] ⇒ **不含 delta**
+⇒ 它**是**依赖(文件不在就崩),却**完全不在 import 判据的视野里**
 ```
-（`client/src/net/prediction.ts:13` 提到 `POS_SCALE` 但**只是注释**,不是第二份定义。）
+
+### 12.2 三条后果(比「假红」严重)
+
+```
+1 **不进依赖图** ⇒ 可达性门禁 / 孤儿审计**结构上看不到它**(它们跟的是 import 边)
+2 文件一移动 ⇒ readFileSync **抛 ENOENT** ⇒ 套件**进程崩**
+3 ★ 崩溃的形式最差:exit≠0 且**没有任何断言输出**
+   ⇒ WS-11 的 scoreA:文件在、内容不在 ⇒ **可见的红**
+   ⇒ 路径读:文件**根本不在**     ⇒ **不可见的崩**
+   ⇒ 修 scoreA 时我以为处理完了同族问题 —— **其实只处理了轻的那一半**
+```
+
+### 12.3 全仓实测(判据覆盖每一种读取方式)
+
+**判据**:`readFileSync` / `readFile` / `existsSync` / `createReadStream` 里出现指向 `.ts` 的路径;
+**排除注释行**(否则会把说明文字算成依赖)。
+
+```
+tests/WS-07.test.ts 32 · WS-FND-01 12 · **scripts/verify.ts 9(门禁自己)**
+WS-11 7 · WS-04 6 · WS-FND-03 4 · WS-FND-09-wiring 4 · WS-FND-08 3
+gate-selfcheck 3 · orphan-audit 2 · live-path-audit 1 · WS-10 1 · WS-FND-07 1
+⇒ 合计 **85 处 / 13 个文件**;按目标目录:server/ 50 · client/ 5 · 其他 30
+```
+
+### 12.4 建议(治本)
+
+```
+对每一处 readFileSync 的 .ts 路径,**在读取前先断言它存在**:
+  ok(existsSync(path), '目标存在')
+⇒ 「文件被移走」会在**原地立刻变红**(可读),而不是等下一个人**崩**(不可读)
+⇒ 成本:每处 1 行;可先只加在 tests/
+```
+
+### 12.5 阶段 3 的直接影响
+
+```
+上移 delta.ts 前必须改两类(**判据不同,不能只改一类**):
+  import 形态   4 个文件(room.ts · WS-07 · WS-FND-05 · perf-bounds)⇒ 改 from
+  ★ 路径读形态  **WS-FND-03 两处** ⇒ 改 readFileSync 里的路径,**否则崩**
+⇒ 并且建议把该路径收敛到**一个常量**,下次再移只改一行
+⇒ ⚠️ 任何 server/** 上移都要过这 50 处 server/ 的路径读 ⇒ **这不是 delta.ts 独有的问题**
+```

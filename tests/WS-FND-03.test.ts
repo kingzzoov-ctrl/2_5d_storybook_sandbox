@@ -12,8 +12,24 @@ import { fileURLToPath } from 'node:url';
 import * as h from '../server/src/content/handshake.ts';
 import { contentFingerprintLine, contentFingerprints, fnv1a32 } from '../server/src/content/registry.ts';
 import { ITEM_LIST } from '../shared/constants/items.ts';
+import * as DELTA from '../shared/net/delta.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * ★ delta 编解码器的**源码路径唯一定义点**(task-68 上移后)。
+ *
+ * 为什么要有这个常量(而不是像别处那样直接在断言里 `join(...)`):
+ * ```
+ * 本文件对 delta.ts 有两类依赖:
+ *   1 **行为依赖** —— `import * as DELTA`(上移前是路径读文本 ⇒ 上移即崩 ENOENT)
+ *   2 ★ **否定依赖** —— 「delta 未 import 内容指纹」这类断言**没有行为对应物**
+ *      (你无法在一次 import 里证明「它没有引用别的东西」)
+ *      ⇒ 只能保留源码扫描 ⇒ 就需要路径
+ * ⇒ 路径抽成常量:上移/改名时**只改这一处**,不会出现「改了两处漏一处 ⇒ 崩」
+ * 承 `verify.ts` 抽 `extractRelativeImports` 的先例(CR-20:两份实现两份口径)。
+ */
+const DELTA_SRC_PATH = join(ROOT, 'shared', 'net', 'delta.ts');
 
 let pass = 0;
 let fail = 0;
@@ -246,8 +262,18 @@ okHas(breakdown, `v${contentFingerprints().version}`, '分区视图含算法版�
 /* ═══════════ 11. 约束:不改线格式 ═══════════ */
 
 console.log('\n— 与既有线格式解耦 —');
-const deltaSrc = readFileSync(join(ROOT, 'server', 'src', 'net', 'delta.ts'), 'utf8');
-okHas(deltaSrc, 'PROTOCOL_VERSION', 'delta.ts 仍有协议版本常量');
+/**
+ * ★ task-68:原判据是 `readFileSync(join(ROOT,'server','src','net','delta.ts'))` ——
+ * **硬编码路径**。delta.ts 上移 `shared/net/` 后该路径不存在 ⇒ `readFileSync`
+ * 在**模块顶层**抛 ENOENT ⇒ 未捕获 ⇒ **进程直接退出**,
+ * 表现为「exit≠0 且没有任何断言输出」—— 比断言变红**更难排查**(看不到哪条挂了)。
+ *
+ * ⇒ 拆成两条**口径不同**的断言,各自用它能用的最强形式:
+ *   1 「协议版本常量还在」⇒ 换**行为判据**(更强:文本里有 ≠ 真的导出成功)
+ *   2 「未 import 内容指纹」⇒ **否定**断言,无行为对应物 ⇒ 保留源码扫描,路径由常量给
+ */
+ok(typeof DELTA.PROTOCOL_VERSION === 'number', 'delta 仍有协议版本常量(行为判据:真的导出成功)');
+const deltaSrc = readFileSync(DELTA_SRC_PATH, 'utf8');
 ok(
   !deltaSrc.includes('contentFingerprint'),
   'delta.ts 未 import 内容指纹(内容协商与线格式解耦)',
@@ -297,7 +323,7 @@ const clientNet = walkClient(join(ROOT, 'client')).filter((f) =>
 eq(clientNet.length, 0, '客户端零网络能力 ⇒ 无通道发送 contentClaim(接线需先补网络层)');
 
 /* 三项合起来:现状**没有**替代机制在做内容一致性校验 —— 缺口是真实的。 */
-const deltaSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'delta.ts'), 'utf8');
+const deltaSrcT37 = readFileSync(DELTA_SRC_PATH, 'utf8');
 ok(!deltaSrcT37.includes('contentFingerprint'),
   'delta.ts 也不做内容校验 ⇒ 两端内容错配在生产上确实无人拦截');
 

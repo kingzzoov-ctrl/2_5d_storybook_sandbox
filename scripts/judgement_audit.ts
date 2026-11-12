@@ -296,42 +296,226 @@ type Detector = {
   detectAll?: (files: readonly string[]) => string[];
   /** 在给定源码文本上找命中项(返回人可读的定位串) */
   detect: (source: string, path: string) => string[];
-  /** ★ 区分力自检:脏样本必须命中,干净样本必须不命中 */
-  dirty: string;
-  clean: string;
+  /**
+   * ★★ 区分力自检样本组(**同类多写法**,task-68 修的根因)
+   *
+   * ```
+   * 旧的 `dirty: string` 只有**一个**样本 ⇒ 自检只问「这个样本报吗?」
+   * ⇒ **结构上无法**发现「某类真缺陷不再被命中」,
+   *   因为自检不知道"还有哪些样本也该报"。
+   *
+   * ⇒ 一般化:**单样本自检只能证明「能报」,不能证明「不会漏」。**
+   * ⇒ 2026-11-13 实例(陷阱 65):我把 F 的豁免条件放宽到含 `return`,
+   *   本机的单样本自检照样 ✓,而实测从 6/8 掉到 3/8。
+   * ```
+   *
+   * ⇒ 故现在两样都必须是**样本组**:
+   *   · 脏 ≥3 个,语义相同、**写法不同**(否则测不出"某类漏了")
+   *   · 干净 ≥2 个,且必须与被报形态**只差一处**(太"干净"的样本只证明非恒真)
+   */
+  dirty: string | readonly string[];
+  clean: string | readonly string[];
   /** 脏样本里期望被报出的条数(至少这么多) */
   minDirtyHits: number;
+  /**
+   * ★ 成对区分力断言(task-68 交付 2):每组给出「等效安全写法」与「真缺陷写法」,
+   * 二者**只差一处** ⇒ 断言 `safe` 不报 ∧ `defect` 报。
+   *
+   * ```
+   * 为什么必须成对:本次 F 回归的 Z 与 B 只差 return/throw 一个词。
+   * 单独验任何一个都过得去 —— 只有**并排**才看得出判据到底认的是哪一半。
+   * ```
+   */
+  pairs?: readonly { safe: string; defect: string; note: string }[];
 };
+
+/** 样本组归一:字符串 = 单元素组(向后兼容),数组 = 原样。 */
+function asSamples(s: string | readonly string[]): readonly string[] {
+  return typeof s === 'string' ? [s] : s;
+}
+
+/* ══════════════════ ★ 行尾鲁棒性(task A:判据的**量词**)══════════════════ */
+
+/**
+ * ## 为什么单列一节:这是「判据的量词错了」这一族
+ *
+ * ```
+ * Lead 2026-11-13 的原话(我把它升级成本仓第 4 个方向):
+ *   我的判据是「**是否含** \r\n」—— 一个**存在性**判据;
+ *   而我要的答案是「**这个文件的主流是哪种**」—— 一个**多数性**判据。
+ *   ⇒ 存在性判据在"只有一行是 CRLF"与"全部是 CRLF"上给出**同一个答案**,
+ *     而这两种情况下正确的动作**相反**。
+ * ```
+ *
+ * 本文件自己的实测事故(我把两文件行尾从 LF 翻成 CRLF):
+ * ```
+ * `edit` 插入的行带了 \r ⇒ 文件混行尾
+ * ⇒ 我的生成器看到「含 \r\n」⇒ 判定"本文件是 CRLF" ⇒ 给**每一行**补 \r
+ * ⇒ 全文件 CRLF ⇒ git diff 从 485 行暴涨到 2732 行(整文件重写,不可评审)
+ * ```
+ *
+ * 对**检测器**而言,同一个量词错误的形态是:
+ * ```
+ * 判据里写 `$` 锚定 ⇒ 在 CRLF 下 `$` 停在 \n 之前,而 \r 挡在那里 ⇒ **失配**
+ * ⇒ 判据实际上退化成"这个文件是不是 LF"
+ * ⇒ 一个它从来没打算问的问题,而它**不会报错** —— 只是命中数变了
+ * ```
+ * ⇒ 故:每个判据必须证明它在 4 种行尾下**给出同一个答案**。
+ */
+
+/** 把源码转成指定行尾形态。 */
+function withEol(src: string, kind: 'lf' | 'crlf' | 'cr' | 'mixed'): string {
+  const lf = src.split('\r\n').join('\n').split('\r').join('\n');
+  if (kind === 'lf') return lf;
+  if (kind === 'crlf') return lf.split('\n').join('\r\n');
+  if (kind === 'cr') return lf.split('\n').join('\r');
+  /* ⚠️ **本变换的两个已知死角**(实测,不掩饰):
+     ① **单行样本**:没有第二行可混 ⇒ `mixed` 与 `lf` 完全等价 ⇒ 白测
+     ② **两行样本**:`half = 1` ⇒ 第 1 行 CRLF、最后一行无尾 ⇒ 与 `crlf` 等价
+     ⇒ 故 `mixed` 只在 **≥3 行**的样本上真的产生混合。
+     实测各检测器的多行样本数:A 2 / B 1 / C 3 / D 3 / F 10 / G 5
+     ⇒ **每个检测器都 ≥1 个多行样本** ⇒ mixed 这一档在所有检测器上都是有效输入。
+     ⚠️ 但那条"≥1 个"是**当前样本组**的性质 —— 若日后有人把某检测器的样本
+        全改成单行,`mixed` 会**静默退化**成 lf 而不报错。
+        ⇒ 这是本检查的**结构性边界**:它测的是「同一判据在 4 种行尾下是否一致」,
+          而"4 种里有 1 种其实等于另一种"这件事,**检查本身看不出来**。 */
+  const lines = lf.split('\n');
+  const half = Math.floor(lines.length / 2);
+  return lines.map((l, i) => (i < lines.length - 1 ? l + (i < half ? '\r\n' : '\n') : l)).join('');
+}
+
+const EOL_KINDS = ['lf', 'crlf', 'cr', 'mixed'] as const;
+
+/**
+ * 同一判据在 4 种行尾下命中数是否一致。
+ *
+ * ★ **唯一实现** —— 真检测器与下面的「有牙探针」共用它。
+ * ```
+ * 为什么强调唯一:本仓反复踩「同一判据两份实现」。
+ * 若我给探针另写一套比较逻辑,那么"探针能抓到敏感判据"就不能证明
+ * "真检测器的检查能抓到" —— 那是两份实现各自的结论。
+ * ```
+ */
+function eolConsistency(
+  detectFn: (src: string, path: string) => string[],
+  samples: readonly string[],
+): { bad: string[]; checked: number } {
+  const bad: string[] = [];
+  for (let i = 0; i < samples.length; i += 1) {
+    const counts = EOL_KINDS.map((k) => {
+      try { return detectFn(withEol(samples[i]!, k), `<eol-${k}-${i + 1}>`).length; }
+      catch { return -1; }
+    });
+    const base = counts[0];
+    if (counts.some((c) => c !== base)) {
+      bad.push(`#${i + 1} 行尾敏感:${EOL_KINDS.map((k, j) => `${k}=${counts[j]}`).join(' ')}`);
+    }
+  }
+  return { bad, checked: samples.length };
+}
+
+/**
+ * ★★ 「这条检查**有牙**吗」—— 用一个**故意行尾敏感**的判据跑同一套比较。
+ *
+ * ```
+ * 若它**没被**判为敏感,说明 eolConsistency 本身失效(恒真/恒假)
+ * ⇒ 那所有检测器的「行尾一致 ✓」都是废话。
+ *
+ * ⚠️ 这一条是必需的,因为我自己就差点栽在这里:
+ *    我的第一版探针把「两边都 ERR」读成了「行为一致」;
+ *    第二版把「G 样本两边都报 0」读成了「G 行尾无关」——
+ *    ★ 「一致」有两种:**有意义的相等** 与 **双方都没跑**。
+ *      本探针正是用来把后者钉死的。
+ * ```
+ */
+function eolCheckHasTeeth(): boolean {
+  /* `$` 锚定 —— 在 CRLF 下必然失配,故这个判据**一定**行尾敏感 */
+  const deliberatelySensitive = (src: string): string[] => {
+    const out: string[] = [];
+    for (const l of src.split('\n')) if (/\w+:$/.test(l)) out.push(l);
+    return out;
+  };
+  return eolConsistency(deliberatelySensitive, ['name:\n']).bad.length > 0;
+}
+
 
 type SelfTestResult = { id: string; ok: boolean; detail: string };
 
-/** 跑一个检测器的区分力自检。**这是本脚本的骨架**:不过自检的检测器结果不可信。 */
+/**
+ * 跑一个检测器的区分力自检。**这是本脚本的骨架**:不过自检的检测器结果不可信。
+ *
+ * ★ 2026-11-13 改(task-68):从「单样本 ∧ 布尔」改成「**样本组 ∧ 报通过数**」。
+ * ```
+ * 为什么必须报数:布尔 ✓ 看不出"漏了几类"。
+ *   本次 F 回归里,自检一直 ✓ —— 因为它的 1 个脏样本仍被命中,
+ *   而**4 类真缺陷样本已经不再被命中**,自检对此一无所知。
+ * ```
+ * 三道检查,任一道不过就红:
+ * ```
+ * ① 每个**脏样本**都必须被报(逐样本,不是聚合)
+ * ② 每个**干净样本**都必须不被报
+ * ③ 每对 (safe, defect) 必须满足 `safe` 不报 ∧ `defect` 报
+ * ```
+ */
 function selfTest(d: Detector): SelfTestResult {
-  let dirtyHits: string[] = [];
-  let cleanHits: string[] = [];
-  try {
-    dirtyHits = d.detect(d.dirty, '<dirty-sample>');
-  } catch (e) {
-    return { id: d.id, ok: false, detail: `脏样本上抛错:${(e as Error).message.slice(0, 80)}` };
+  const dirtySamples = asSamples(d.dirty);
+  const cleanSamples = asSamples(d.clean);
+  const pairs = d.pairs ?? [];
+
+  /* ── ① 脏样本逐个 ── */
+  const dirtyBad: string[] = [];
+  let dirtyHitTotal = 0;
+  for (let i = 0; i < dirtySamples.length; i += 1) {
+    let hits: string[] = [];
+    try {
+      hits = d.detect(dirtySamples[i]!, `<dirty-${i + 1}>`);
+    } catch (e) {
+      dirtyBad.push(`#${i + 1} 抛错:${(e as Error).message.slice(0, 50)}`);
+      continue;
+    }
+    dirtyHitTotal += hits.length;
+    if (hits.length < d.minDirtyHits) dirtyBad.push(`#${i + 1} 只报 ${hits.length}(应 ≥${d.minDirtyHits})`);
   }
-  try {
-    cleanHits = d.detect(d.clean, '<clean-sample>');
-  } catch (e) {
-    return { id: d.id, ok: false, detail: `干净样本上抛错:${(e as Error).message.slice(0, 80)}` };
+
+  /* ── ② 干净样本逐个 ── */
+  const cleanBad: string[] = [];
+  for (let i = 0; i < cleanSamples.length; i += 1) {
+    let hits: string[] = [];
+    try {
+      hits = d.detect(cleanSamples[i]!, `<clean-${i + 1}>`);
+    } catch (e) {
+      cleanBad.push(`#${i + 1} 抛错:${(e as Error).message.slice(0, 50)}`);
+      continue;
+    }
+    if (hits.length > 0) cleanBad.push(`#${i + 1} 误报 ${hits.length} 条(${hits.slice(0, 1).join('')})`);
   }
-  if (dirtyHits.length < d.minDirtyHits) {
-    return {
-      id: d.id, ok: false,
-      detail: `脏样本只报 ${dirtyHits.length} 条(应 ≥${d.minDirtyHits})⇒ **该检测器抓不到它声称要抓的东西**`,
-    };
+
+  /* ── ③ 成对区分力 ── */
+  const pairBad: string[] = [];
+  for (let i = 0; i < pairs.length; i += 1) {
+    const p = pairs[i]!;
+    const sHits = d.detect(p.safe, `<pair-safe-${i + 1}>`);
+    const dHits = d.detect(p.defect, `<pair-defect-${i + 1}>`);
+    if (sHits.length > 0) pairBad.push(`#${i + 1} 等效安全写法**被误报** ${sHits.length} 条(${p.note})`);
+    if (dHits.length < d.minDirtyHits) pairBad.push(`#${i + 1} 真缺陷写法**未报**(应 ≥${d.minDirtyHits})(${p.note})`);
   }
-  if (cleanHits.length > 0) {
-    return {
-      id: d.id, ok: false,
-      detail: `干净样本误报 ${cleanHits.length} 条(${cleanHits.slice(0, 2).join(' | ')})⇒ 噪音检测器`,
-    };
-  }
-  return { id: d.id, ok: true, detail: `脏样本 ${dirtyHits.length} 条 / 干净样本 0 条` };
+
+  /* ── 4 行尾鲁棒性(task A):判据不得依赖"这文件是哪种行尾" ── */
+  const eol = eolConsistency(
+    d.detect,
+    [...dirtySamples, ...cleanSamples, ...pairs.flatMap((p) => [p.safe, p.defect])],
+  );
+  const eolBad = eol.bad;
+
+  const ok = dirtyBad.length === 0 && cleanBad.length === 0 && pairBad.length === 0 && eolBad.length === 0;
+  /* ★ 明细**总是**报通过数 —— 即使全过也要看到 4/4,否则看不出覆盖了几类 */
+  const detail = `脏 ${dirtySamples.length - dirtyBad.length}/${dirtySamples.length}`
+    + ` / 干净 ${cleanSamples.length - cleanBad.length}/${cleanSamples.length}`
+    + (pairs.length > 0 ? ` / 成对 ${pairs.length - new Set(pairBad.map((s) => s.split(' ')[0]!)).size}/${pairs.length}` : '')
+    + ` / 行尾 ${eol.checked - eolBad.length}/${eol.checked}`
+    + ` (命中 ${dirtyHitTotal} 条)`
+    + (ok ? '' : ` ⇒ ${[...dirtyBad, ...cleanBad, ...pairBad, ...eolBad].join(' ; ')}`);
+  return { id: d.id, ok, detail };
 }
 
 /* ══════════════════ 六个检测器(A/B/C/D/F 检测 + E 自检框架)══════════════════ */
@@ -340,6 +524,21 @@ function selfTest(d: Detector): SelfTestResult {
    那两个函数**位置保持**,所以行号可靠;且正则字面量被当代码保留,
    于是「扫描剥注释代码」不会再把自己剥掉(我第一版正是这么失效的)。 */
 
+// task-68:简写处理的行为判据(替代原来的字面量判据)。
+//
+// 原判据只认「反斜杠-w+ 后跟逗号 且行尾美元号」这一种字面写法
+// ⇒ 等价写法认不出来 ⇒ 假阳性。与本次 F 失效同族:只认字面形态、不认等效写法。
+//
+// 同时删掉「简写 / shorthand」关键词判据:
+//   clean-1 原本是靠在注释里写「简写属性」四个字通过的,
+//   而 near 是未剥注释的文本 ⇒ 判据看的不是代码(陷阱 60)。
+//   靠关键词过自检 = 「改完仍绿」而实际是靠注释过的。
+function handlesShorthandWide(near: string): boolean {
+  const B = String.fromCharCode(92);
+  const flat = near.split(B).join("");
+  // 去反斜杠后,两种等价写法都认:(w+), 与 (w+)s*,
+  return flat.includes("(w+),") || flat.includes("(w+)s*,");
+}
 /** A:对象字面量键提取只认 `k:`,未处理简写 `k,`。 */
 const DET_A: Detector = {
   id: 'A',
@@ -355,21 +554,41 @@ const DET_A: Detector = {
       if (!looksLikeKeyExtract) return;
       /* 就近 ±14 行内是否有「行首 k 加逗号」的简写处理或明示注释 */
       const near = lines.slice(Math.max(0, i - 14), i + 14).join('\n');
-      const handlesShorthand = /\\w\+\)\\s\*,\s*\\s\*\$/.test(near) || /简写|shorthand/i.test(near);
+      // task-68 放宽:改为行为判据(见上方 helper)。
+      const handlesShorthand = handlesShorthandWide(near);
       if (handlesShorthand) return;
       out.push(`${path}:${i + 1}  ${(source.split('\n')[i] ?? '').trim().slice(0, 92)}`);
     });
     return out;
   },
-  dirty: 'const ks = [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1]);',
+  /* ★ task-68:样本组(≥3 脏 + ≥2 干净),写法各异但语义相同。
+     语义都是「键提取只认 `k:`,不处理简写 `k,`」,而三处写法不同:
+       D1 只认冒号(最直接)
+       D2 锚了 `^` 且用 `\\w+` — 仍不含 `,` 分支
+       D3 `(\\w+)\\s*:` 带 \\s* —— 看起来更宽,但**仍只认冒号**
+     ⚠️ 三处都必须报:若哪一类不报,说明判据只认某种写法(这正是本次 F 回归的形态)。 */
+  dirty: [
+    'const ks = [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1]);',
+    'const ks = [...body.matchAll(/^\\s*(\\w+):\\s*/gm)].map((m) => m[1]);',
+    'const ks = [...body.matchAll(/(\\w+)\\s*:/g)].map((m) => m[1]);',
+  ],
   clean: [
-    'const ks = [',
-    '  ...[...body.matchAll(/^\\s*(\\w+)\\s*:/gm)].map((m) => m[1]),',
-    '  ...[...body.matchAll(/^\\s*(\\w+)\\s*,\\s*$/gm)].map((m) => m[1]), // 简写属性',
-    '];',
-  ].join('\n'),
+    [
+      'const ks = [',
+      '  ...[...body.matchAll(/^\\s*(\\w+)\\s*:/gm)].map((m) => m[1]),',
+      '  ...[...body.matchAll(/^\\s*(\\w+)\\s*,\\s*$/gm)].map((m) => m[1]), // 简写属性',
+      '];',
+    ].join('\n'),
+    /* C2 与 D1 只差一处:多了简写分支 */
+    [
+      'const ks = [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1])',
+      '  .concat([...body.matchAll(/^\\s*(\\w+),/gm)].map((m) => m[1]));',
+    ].join('\n'),
+  ],
   minDirtyHits: 1,
 };
+
+/** B:剥行注释的正则缺 `(^|[^:])` 前缀。 */
 
 /** B:剥行注释的正则缺 `(^|[^:])` 前缀。 */
 /**
@@ -422,8 +641,21 @@ const DET_B: Detector = {
     });
     return out;
   },
-  dirty: `const a = src.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ')${NEEDLE_LINE_COMMENT}, '');`,
-  clean: `const a = src.replace(/(^|[^:])${NEEDLE_LINE_COMMENT}, '$1');`,
+  /* ★ task-68:样本组。语义都是「剥行注释时没排除 URL 的 `//`」,
+     三处写法不同 —— 无论剥注释的正则怎么写,只要缺 `[^:]` 防护就该报。 */
+  dirty: [
+    `const a = src.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ')${NEEDLE_LINE_COMMENT}, '');`,
+    `let out = src${NEEDLE_LINE_COMMENT}, '');`,
+    `function strip(s) { return s${NEEDLE_LINE_COMMENT}, ''); }`,
+  ],
+  clean: [
+    `const a = src.replace(/(^|[^:])${NEEDLE_LINE_COMMENT}, '$1');`,
+    /* C2 与 D1 只差一处:把防护写在上一行(多行链式)—— 检测器看 ±1 行窗口 */
+    [
+      `const RE = /(^|[^:])\\/\\/[^\\n]*/g;`,
+      `const a = src${NEEDLE_LINE_COMMENT}, '$1');`,
+    ].join('\n'),
+  ],
   minDirtyHits: 1,
 };
 
@@ -508,14 +740,39 @@ const DET_C: Detector = {
     });
     return out;
   },
-  dirty: `if (/from\\s*['"]/.test(line)) inImport = false;`,
+  /* ★ task-68:样本组。语义都是「import 探测只认 from:
+     裸副作用导入 `import 'x'` 与动态 `import()` 都没覆盖」。
+     ⚠️ 这三处的**差异不在写法技巧**,而在**覆盖缺口的组合**:
+       D1 只从 from 取路径(裸缺、动态缺)
+       D2 也只从 from 取 ⇒ 同一缺口
+       D3 从 from 取且自带裸导入但**漏动态** ⇒ **半个覆盖**也该报 */
+  dirty: [
+    `if (/from\\s*['"]/.test(line)) inImport = false;`,
+    `const m = /from\\s*['"]([^'"]+)/.exec(line);`,
+    [
+      `const RE = /from\\s*['"]|import\\s*['"]/;`,
+      `if (RE.test(line)) inImport = false;`,
+    ].join('\n'),
+  ],
   clean: [
-    `const RE = /import[^;]*from\\s*['"]|import\\s*['"]|import\\s*\\(/;`,
-    `if (RE.test(line)) inImport = false;`,
-  ].join('\n'),
+    [
+      `const RE = /import[^;]*from\\s*['"]|import\\s*['"]|import\\s*\\(/;`,
+      `if (RE.test(line)) inImport = false;`,
+    ].join('\n'),
+    /* C2 与 D3 只差一处:补上动态 import() */
+    [
+      `const RE = /from\\s*['"]|import\\s*['"]|import\\s*\\(/;`,
+      `if (RE.test(line)) inImport = false;`,
+    ].join('\n'),
+  ],
   minDirtyHits: 1,
 };
 
+// task-68:认点-match 与点-matchAll 两种拼写。
+//   原正则要求点-match 后紧跟左括号;而 matchAll 里紧跟的是字母 A
+//   ⇒ 结构上不可能匹配 ⇒ 漏掉整整一类现代写法(本仓 WS-07 自己在用)。
+//   flags 也用 [a-z]* 放宽(matchAll 必带 g,但也可能 gm/gi)。
+const MATCH_CALL_RE = new RegExp(".match(?:All)?\\(\\s*\\/([^/\\n]{2,})\\/[a-z]*\\s*\\)");
 /** D:对未剥注释的原文做计数。 */
 const DET_D: Detector = {
   id: 'D',
@@ -527,7 +784,7 @@ const DET_D: Detector = {
     const lines = masked.split('\n');
     const srcLines = source.split('\n');
     lines.forEach((l, i) => {
-      const m = /\.match\(\s*\/([^/\n]{2,})\/g\s*\)/.exec(l);
+      const m = MATCH_CALL_RE.exec(l);
       if (m === null) return;
       const pat = m[1] ?? '';
       /* 只关心易被注释污染的计数:装饰器/类型/导出/字段 */
@@ -539,11 +796,55 @@ const DET_D: Detector = {
     });
     return out;
   },
-  dirty: 'const n = (src.match(/@type/g) ?? []).length;',
+  /**
+   * ## ⚠️ 已知误报形态(2026-11-13,task-68 放宽正则后暴露的 7 处)
+   *
+   * ```
+   * 本检测器只在 ±10 行窗口内找「剥注释关键词」⇒ 两类场景会误报:
+   *   (a) 剥注释发生在**窗口之外**:如 `s.code = stripCommentsAndStrings(raw)`
+   *       在 ~200 行前的定义处,而计数处窗口够不到 ⇒ 误报
+   *   (b) 站点**故意**在原文上数,另有正确性机制:
+   *       · 行首锚定 `^`(注释里的词不对齐则不匹配)
+   *       · 或**显式减去**注释提及数(WS-07:3117 的恒等式断言)
+   * ⇒ 与 A/F **同族**:判据看「窗口内有没有关键词」,不看「语义上有没有剥」。
+   * ```
+   *
+   * ★ 另一个必须记住的事实:**本检测器此前长期报「0 处」,而那是假 0。**
+   * ```
+   * 原正则要求字面 `.match(` 后**紧跟** `(` —— 而 `matchAll(` 里紧跟的是 `A`
+   * ⇒ **结构上不可能匹配** ⇒ 整类漏掉(本仓自己在用 matchAll)
+   * ⇒ 「0 处」是**判据太窄**的产物,不是"干净"的证据
+   * ⇒ 这正是那条老规矩:**空结果不是「没问题」,可能是判据没运行**。
+   * ```
+   */
+  heuristic:
+    '本检测器只在 **±10 行窗口**内找「剥注释」关键词 ⇒ 两类已知误报:'
+    + '(a) 剥注释发生在窗口之外(如变量在几百行外的定义处剥);'
+    + '(b) 站点**故意**在原文上数,另有正确性机制(行首锚定 `^` / 显式减去注释提及数)。'
+    + '⇒ 7 处已全部逐条登记为假阳性(2026-11-13)。命中仍需人工确认。',
+  /* ★ task-68:样本组。语义都是「对**未剥注释**的原文做计数」 ⇒ 注释里的词被算进去。
+     三处写法不同(直接 match / 建数组 / 用 for-of 循环)——
+     ⚠️ **D2/D3 用的 matchAll 正是原正则漏掉的那一类**:
+     样本组一上线就把这个历史性假 0 暴露出来了。 */
+  dirty: [
+    'const n = (src.match(/@type/g) ?? []).length;',
+    'const hits = [...src.matchAll(/@type/g)].map((m) => m[0]);',
+    [
+      'let n = 0;',
+      'for (const _ of src.matchAll(/@type/g)) n += 1;',
+    ].join('\n'),
+  ],
   clean: [
-    'const code = stripCommentsOnly(src);',
-    'const n = (code.match(/@type/g) ?? []).length;',
-  ].join('\n'),
+    [
+      'const code = stripCommentsOnly(src);',
+      'const n = (code.match(/@type/g) ?? []).length;',
+    ].join('\n'),
+    /* C2 与 D1 只差一处:先剥注释再数 */
+    [
+      'const code = stripCommentsOnly(src);',
+      'const hits = [...code.matchAll(/@type/g)].map((m) => m[0]);',
+    ].join('\n'),
+  ],
   minDirtyHits: 1,
 };
 
@@ -628,7 +929,26 @@ const isGenericField = (f: string): boolean => GENERIC_FIELDS.has(f);
  * 位置靠 `codeOnlyMask`(位置保持)保证 ⇒ 行号可靠。
  */
 function collectContainers(source: string, path: string): GContainer[] {
-  const text = codeOnlyMask(source);
+  /**
+   * ★★ task A:先把行尾**归一化**成 LF,再切行。
+   *
+   * ```
+   * 为什么必须:本函数**逐行**解析字段(`/^([A-Za-z_$][\w$]*)\??\s*:/`),
+   * 行是按 `\n` 切的。若源码是 **CR-only**(老 Mac),`\n` 不是分隔符
+   * ⇒ 整份源码成了**一段** ⇒ RE_DECL 的 `(?:^|\n)` 找不到第二个容器
+   * ⇒ 只收到一个容器 ⇒ 无从配对 ⇒ **命中数塌成 0**。
+   *
+   * 实测(行尾鲁棒性自检抓到的):
+   *   lf=1  crlf=1  **cr=0**  mixed=1     ← 只有 CR 塌掉
+   * ⇒ 这就是判据里「量词错了」的又一形态:它实际上在问
+   *   「**这份源码的行尾是不是含 \n**」,而它从没打算问这个。
+   *
+   * ⚠️ 归一化必须放在**这里**(唯一入口),而不是在每个 `split('\n')` 处 ——
+   *   那会变成多处实现,而本仓反复踩「同一判据两份实现」。
+   *   `lineOf` 依赖 `\n` 计行,归一化后行号仍然正确(CR 与 LF 都是"换一行")。
+   * ```
+   */
+  const text = codeOnlyMask(source).split('\r\n').join('\n').split('\r').join('\n');
   const out: GContainer[] = [];
   const RE_DECL = /(?:^|\n)\s*(?:export\s+)?(?:declare\s+)?(interface|type)\s+([A-Za-z_$][\w$]*)[^\n{]*\{/g;
 
@@ -773,18 +1093,221 @@ const DET_F: Detector = {
       const isSpawnProc = /\bspawn\s*\(/.test(l) && /process\.execPath/.test(l);
       if (!isSpawnSync && !isSpawnProc) return;
       const block = lines.slice(i, Math.min(lines.length, i + 20)).join('\n');
-      /* 读 status / error / signal / killed 任意一个都算检查了 */
-      const checks = /\bstatus\b|\.error\b|\bsignal\b|\.killed\b/.test(block);
-      if (checks) return;
+
+      /* ── 检查 1:读 status / error / signal / killed 任意一个 ── */
+      if (/\bstatus\b|\.error\b|\bsignal\b|\.killed\b/.test(block)) return;
+
+      /* ── ★ 检查 2:**等效安全写法**(2026-11-13 加,修 `live-path-audit.ts:111` 假阳性)
+         ```
+         F 的**实质缺陷**是「把空输出读成『没问题』」。
+         「读 status」只是达成安全的一种写法,**不是唯一写法**:
+           子进程崩溃 ⇒ stdout 为 null/空 ⇒ 若代码**据此拒绝继续**,
+           效果与「读 status 再拒绝」**等效安全**。
+         ⇒ 只认 `status` 字面词会漏掉这一形态
+           —— 与本仓陷阱 57「语法形态 ≠ 语义性质」同族。
+         ```
+         ⚠️ **实现有三个坑,我全踩过**:
+         ```
+         坑 1 本检测器跑在 `codeOnlyMask` 上,而它把**字符串内容擦成空格**
+              ⇒ `=== ''` 在掩码文本里是 `=== `(后面全是空格)
+              ⇒ **不能靠匹配 `''` 字面量**,必须用**结构**判据:
+                「stdout 与某个比较运算符相邻」
+         坑 2 「有 throw」不等于「那个 throw 在守这个分支」
+              ⇒ 故要求早退出现在 **guard 之后**的同一窗口内(取 guardIdx 之后的切片)
+         坑 3 ★★ **`return` 不是失败信号 —— 这一条我第一版写错了,是回归**
+              ```
+              我曾把豁免条件写成 `throw | return | process.exit`,
+              理由是"早退就算处理了错误"。**这是错的**:
+                if (r.stdout === null) return [];   ← 子进程崩了 ⇒ 返回"没有失败项"
+              `return []` / `return 0` / `return ''` 正是「把空读成没问题」**本身** ——
+              它把错误**翻译成正常值**,而不是拒绝继续。
+              ⇒ 加上 `return` 等于:「只要代码认真比较了 stdout 就放行」
+              ⇒ 而"认真比较了 stdout"恰恰是这类缺陷**最常见的表现形式**。
+              ```
+            实测(7 个构造样本,A~E + Z/Y):
+              只认 status 字面词(原版)          6/7
+              我第一版(+return)                 3/7   ← **回归,比原版更差**
+              只认 throw/process.exit(现在)      6/7
+            结论:`return` 必须排除。**"数字变好看"不等于"判据变好"** ——
+            我从 1 个假阳性换成了 4 类假阴性,而假阴性是**看不见**的。
+         ``` */
+      const guardIdx = block.search(/stdout[^\n]{0,60}?(?:===|!==|==|!=)|!\s*\w*\.?stdout/);
+      if (guardIdx >= 0) {
+        const afterGuard = block.slice(guardIdx);
+        /* ★ 只认**失败信号**:`return` 不算 —— `return []` 正是「把空读成没问题」本身 */
+        if (/\bthrow\b|\bprocess\.exit\b/.test(afterGuard)) return;
+      }
+
       out.push(`${path}:${i + 1}  ${(srcLines[i] ?? '').trim().slice(0, 88)}`);
     });
     return out;
   },
-  dirty: `const r = spawnSync(process.execPath, [file], { encoding: 'utf8' });\nconst failed = parse(r.stdout);\nif (failed.length === 0) console.log('ok');`,
+  /**
+   * ## ⚠️ 已知误报形态(2026-11-13,`live-path-audit.ts:111`,Lead 复刻确认)
+   *
+   * ```
+   * F 描述的**实质缺陷**是「把空输出读成『没问题』」。
+   * 但「读 status」只是达成它的**一种写法**,不是唯一写法 ——
+   * 下面这种写法**等效安全**,而本检测器会误报:
+   *
+   *   const r = spawnSync(process.execPath, [...], { ... });
+   *   if (r.stdout === null || r.stdout.trim() === '') {
+   *     throw new Error(`... (status=${String(r.status)}) ...`);   // ← status 在**模板字符串**里
+   *   }
+   * ⇒ 子进程崩溃 ⇒ stdout 空 ⇒ **直接 throw** ⇒ 不会把崩溃读成通过
+   * ⇒ 与「读 status 再 throw」在本场景下**等效**。
+   * ```
+   *
+   * ★ 双层成因,两层都要记住:
+   * ```
+   * ① **语义层**:判据只认字面词 `status`,不认「空输出 ⇒ 早退」这种等效写法
+   *    —— 与本仓陷阱 57「语法形态 ≠ 语义性质」、CR-20「同一判据多份实现」同族
+   * ② **词法层**:唯一出现 `status` 的地方在**模板字符串内**,
+   *    而本检测器跑在 `codeOnlyMask` 上(它把字符串内容擦成空格)
+   *    ⇒ `status` 被擦掉 ⇒ `checks=false` ⇒ 报红
+   *    (实测:mask 后 checks=false,原文 checks=true;窗口内 status 仅 L115,在字符串内)
+   * ```
+   *
+   * ⇒ **已按「甲」修**:新增检查 2,接受「检查 stdout 为 null/空 ⇒ 早退」这一等效写法。
+   *   选择甲而非乙(降级为 advise)的理由:**F 的实质缺陷(静默假绿)是真问题**,
+   *   降级会让它从门禁里消失;而等效写法可以**结构性地**识别出来。
+   *
+   * ⚠️ 修完仍有**残留边界**(静态文本看不出控制流):
+   * ```
+   * 假阴:guard 与早退**看似相邻实则不同分支**(guard 在 if 里、
+   *       throw 在被 catch 吞掉的 try 里)⇒ 当成安全 ⇒ **漏报**
+   * 假阳:站点确实没守空输出,但窗口内**恰好**有别的 stdout 比较与 return
+   *       ⇒ 当成安全 ⇒ **同样漏报**
+   * ⇒ **"没读到 status"是语法事实;"会不会静默假绿"是语义性质** ——
+   *   两者只在**常见写法**下重合 ⇒ 命中/不命中都仍需人工看一眼。
+   * ```
+   *
+   * ⚠️ 另一个值得记住的事实:**本检测器至今只有 2 处命中,且真缺陷 0 处**
+   * (`extension-drill.ts:707` 已定性假阳性;`live-path-audit.ts:111` 是本处)。
+   * ⇒ 它的判据**尚未被任何真实缺陷验证过** ⇒ 更不能当成确证。
+   */
+  heuristic:
+    '本检测器接受两种安全写法:(a) 读 status/error/signal/killed;'
+    + '(b) 检查 stdout 为 null/空 ⇒ 早退(**2026-11-13 修 live-path-audit.ts:111 假阳性时新增**)。'
+    + '仍是启发式:静态文本看不出「那个早退是否真在守这个分支」⇒ 命中仍需人工确认。',
+  /**
+   * ## ★ 脏/干净样本组(task-68:从 1 个样本扩成**同类多写法**)
+   *
+   * ```
+   * 旧版只有 1 个脏样本 ⇒ 自检只问「这个样本报吗?」
+   * ⇒ 我把豁免条件放宽到含 return 后,那 1 个样本**仍然报** ⇒ 自检 ✓
+   *   而 4 类真缺陷已经不再被报 —— **自检对此一无所知**。
+   * ⇒ 这正是「单样本自检只能证明能报,不能证明不会漏」的实例(陷阱 65)。
+   * ```
+   *
+   * ⇒ 现在:
+   * ```
+   * 脏样本 4 个 —— 语义相同(空输出被读成"没问题"),**写法各不相同**:
+   *   D1 不比较 stdout,直接 parse ⇒ 靠 parse 空串抛?(其实不会,是静默 0 条)
+   *   D2 比较了 stdout,但只**存进变量**、无早退
+   *   D3 ★ `if (r.stdout === null) return []` —— 把空读成"没有失败项"
+   *   D4 完全不读 status、也不比 stdout
+   * 干净样本 2 个 —— 与被报形态**只差一处**:
+   *   C1 读 status(差在:多了 status 检查)
+   *   C2 空输出 ⇒ **throw**(差在:D3 的 return 换成 throw)
+   * ```
+   *
+   * ⚠️ **窗口隔离**(实测踩到):判据窗口是 `spawn` 行起 **20 行** ⇒
+   * 两个 case 挨着写时,前一个的窗口会**吃到后一个的 guard** ⇒ 自检假绿。
+   * ⇒ 故每个样本是**独立字符串**,由框架逐样本调用 `detect` —— 结构上无法互相污染。
+   *   (旧的 `clean` 是**一个**长字符串里塞两个 case,只能靠手写填充分隔 ——
+   *    那是脆的;现在框架逐样本跑,不需要填充。)
+   */
+  dirty: [
+    /* D1 真缺陷:不比较 stdout,把空输出读成"0 条失败" */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      '  const failed = parse(r.stdout);',
+      "  if (failed.length === 0) console.log('ok');",
+      '  return failed;',
+      '}',
+    ].join('\n'),
+    /* D2 真缺陷:比较了 stdout,但只存变量、无早退 */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      '  const empty = r.stdout === null;',
+      '  const failed = parse(r.stdout);',
+      "  if (failed.length === 0) console.log('ok');",
+      '  return failed;',
+      '}',
+    ].join('\n'),
+    /* D3 ★ 真缺陷:`return []` —— 把空读成"没有失败项"(本次回归的核心形态) */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      '  if (r.stdout === null) return [];',
+      '  return JSON.parse(r.stdout);',
+      '}',
+    ].join('\n'),
+    /* D4 真缺陷:完全不读 status、也不比 stdout */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      '  return r.stdout;',
+      '}',
+    ].join('\n'),
+  ],
   clean: [
-    `const r = spawnSync(process.execPath, [file], { encoding: 'utf8' });`,
-    `if (r.status !== 0) fail('子进程退出码 ' + r.status);`,
-  ].join('\n'),
+    /* C1 安全:读 status(与被报形态只差一处:多了 status 检查) */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      "  if (r.status !== 0) throw new Error('子进程退出码 ' + r.status);",
+      '  return JSON.parse(r.stdout);',
+      '}',
+    ].join('\n'),
+    /* C2 安全:空输出 ⇒ throw(与 D3 只差一处:return → throw) */
+    [
+      'function f() {',
+      "  const r = spawnSync(process.execPath, ['x.ts'], { encoding: 'utf8' });",
+      '  if (r.stdout === null || r.stdout.trim() === \'\') {',
+      "    throw new Error('no output (status=' + String(r.status) + ')');",
+      '  }',
+      '  return JSON.parse(r.stdout);',
+      '}',
+    ].join('\n'),
+  ],
+  /**
+   * ## ★ 成对区分力断言(task-68 交付 2):每对**只差一处**
+   *
+   * ```
+   * 为什么必须成对:本次回归的 Z 与 B **只差 return/throw 一个词**。
+   * 单独验任何一个都过得去 —— 只有并排才看得出判据到底认的是哪一半。
+   * ⇒ 这一条就是「回归自锁」:若有人再把 `return` 加回豁免条件,
+   *   pair-2 的 defect 侧立刻不报 ⇒ 自检红(验收里那条反向验证就是它)。
+   * ```
+   */
+  pairs: [
+    {
+      note: '差异只在「空输出时 throw 还是 return」—— return 是把空读成没问题',
+      safe: [
+        'const r = spawnSync(process.execPath, [f], { encoding: "utf8" });',
+        'if (r.stdout === null) throw new Error("null stdout");',
+      ].join('\n'),
+      defect: [
+        'const r = spawnSync(process.execPath, [f], { encoding: "utf8" });',
+        'if (r.stdout === null) return [];',
+      ].join('\n'),
+    },
+    {
+      note: '差异只在「空输出时 throw 还是返回哨兵值 0」',
+      safe: [
+        'const r = spawnSync(process.execPath, [f], { encoding: "utf8" });',
+        'if (r.stdout.trim() === "") throw new Error("empty stdout");',
+      ].join('\n'),
+      defect: [
+        'const r = spawnSync(process.execPath, [f], { encoding: "utf8" });',
+        'if (r.stdout.trim() === "") return 0;',
+      ].join('\n'),
+    },
+  ],
   minDirtyHits: 1,
 };
 
@@ -888,9 +1411,57 @@ const DET_G: Detector = {
    * ```
    */
   clean: [
-    'interface PlayerRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
-    'interface MobRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
-  ].join('\n'),
+    /* C1 两容器字段集**完全相同** + 全是通用词 ⇒ 两条守卫都不报 */
+    [
+      'interface PlayerRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
+      'interface MobRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
+    ].join('\n'),
+    /* C2 与脏样本只差一处:共享字段只有 **2** 个领域字段(< 阈值 3)⇒ 不报
+       ⇒ 这条守的是**阈值边界**,防止判据退化成"有共享就报"。 */
+    [
+      'interface A1 { critDmg: number; moveMul: number; onlyA: string; }',
+      'interface B1 { critDmg: number; moveMul: number; onlyB: string; }',
+    ].join('\n'),
+  ],
+  /**
+   * ★ 成对:差异只在**共享的领域字段数**(3 = 报 / 2 = 不报)⇒ 钉住阈值边界。
+   *
+   * ⚠️ 必须**多行**写:`collectContainers` 是**逐行**解析字段的
+   *    (`/^([A-Za-z_$][\w$]*)\??\s*:/` 要求字段名在**行首**)
+   *    ⇒ 单行 `interface X { a: number; b: number; }` 解析不到任何字段 ⇒ 0 对。
+   *    我第一版就写成单行,结果是「成对 0/1」——**那是样本的错,不是判据的错**。
+   */
+  pairs: [
+    {
+      note: '共享 3 个领域字段 ⇒ 报;共享 2 个 ⇒ 不报(阈值边界)',
+      safe: [
+        'interface A2 {',
+        '  critDmg: number;',
+        '  moveMul: number;',
+        '  onlyA: string;',
+        '}',
+        'interface B2 {',
+        '  critDmg: number;',
+        '  moveMul: number;',
+        '  onlyB: string;',
+        '}',
+      ].join('\n'),
+      defect: [
+        'interface A3 {',
+        '  critDmg: number;',
+        '  moveMul: number;',
+        '  armorPen: number;',
+        '  onlyA: string;',
+        '}',
+        'interface B3 {',
+        '  critDmg: number;',
+        '  moveMul: number;',
+        '  armorPen: number;',
+        '  onlyB: string;',
+        '}',
+      ].join('\n'),
+    },
+  ],
   minDirtyHits: 1,
 };
 
@@ -900,7 +1471,21 @@ const DETECTORS: readonly Detector[] = [DET_A, DET_B, DET_C, DET_D, DET_F, DET_G
 /* ══════════════════ 运行 ══════════════════ */
 
 const SCAN_ROOTS = ['scripts', 'tests', 'server/src', 'client/src', 'shared'];
-const scanFiles = SCAN_ROOTS.flatMap((r) => walk(join(ROOT, r), ['.ts']));
+const scanFiles = SCAN_ROOTS.flatMap((r) => walk(join(ROOT, r), ['.ts']))
+  /* ★ 跳过 `_` 前缀路径(.gitignore:37 声明 `_*` = 非交付物)。
+     ```
+     理由(三条,任一条都够):
+     ① 一个被 .gitignore 忽略的文件**不可能是交付物里的缺陷**
+     ② 实测:放一个临时探针 ⇒ 判据审计报「新增 +1」⇒ **假红**
+        而假红比脏更坏 —— 第 N 次假红之后,真红也会被忽略(狼来了)
+     ③ 与 `clean-temp.ts` 的 SKIP 口径统一 —— 这正是 CR-20「同一判据多份实现」
+        的解法:**一处定义,多处引用**
+     ```
+     ⚠️ **边界(必须让人看到,不只写在这里)**:若有人把**真交付物**命名成
+        `_xxx.ts`,它会被**静默漏掉**。本仓已把它写成规则:
+        临时探针一律用 `_` 前缀,交付物不用。
+     `_` 前缀**按路径段**判定,不只判文件名 —— 目录名带 `_` 也一并跳过。 */
+  .filter((f) => !rel(f).split('/').some((seg) => seg.startsWith('_')));
 const allFiles = scanFiles;
 
 const before = snapshot(allFiles);
@@ -908,6 +1493,8 @@ const before = snapshot(allFiles);
 console.log('[判据审计] 只读扫描,不修改任何文件');
 console.log(`  扫描根:${SCAN_ROOTS.join(' / ')}`);
 console.log(`  文件数:${scanFiles.length}\n`);
+console.log('  ⚠️ 跳过 `_` 前缀路径(.gitignore:37 声明为非交付物/工作现场)。');
+console.log('     边界:若真交付物被命名成 `_xxx.ts`,会被**静默漏掉** —— 本仓规则是"临时探针用 `_`,交付物不用"。');
 
 /* ★ 覆盖面自检:扫到 0 个文件时**必须失败**,不能「顺利完成并报 0 处命中」。
    我第一版用 `new URL(...).pathname` 拼 ROOT,Windows 下得到 `/C:/…`,
@@ -925,7 +1512,20 @@ if (missingRoots.length > 0) {
 }
 
 /* ── 1. 区分力自检:先证明检测器本身有效 ── */
-console.log('[E] 检测器区分力自检(脏样本必须命中 / 干净样本必须不报)');
+console.log('[E] 检测器区分力自检(样本组:每个脏样本都要报 / 每个干净样本都不报 / 成对区分力 / 行尾鲁棒)');
+
+/* ★ 先证**这条检查有牙** —— 否则下面所有「行尾 N/N」都是废话。
+   ```
+   用一个**故意**行尾敏感的判据跑同一套比较:它必须被判为敏感。
+   若不敏感 ⇒ eolConsistency 恒真/恒假 ⇒ 检测器的「行尾一致」不构成证据。
+   ⚠️ 我自己差点栽在这里:把「两边都 ERR」和「两边都报 0」都读成了"一致"。
+   ```
+   「一致」有两种:**有意义的相等** 与 **双方都没跑**。 */
+const eolTeeth = eolCheckHasTeeth();
+console.log(eolTeeth
+  ? '  ✓ 行尾检查自证:故意敏感的判据**被抓到了** ⇒ 该检查有牙'
+  : '  ✗ 行尾检查**没有牙**(故意敏感的判据没被抓到)⇒ 下面所有"行尾 N/N"都不可信');
+
 const selfResults = DETECTORS.map(selfTest);
 let selfFail = 0;
 for (const r of selfResults) {
@@ -936,8 +1536,23 @@ for (const r of selfResults) {
     console.log(`  ✗ ${r.id}:${r.detail}`);
   }
 }
+if (!eolTeeth) selfFail += 1;
 if (selfFail > 0) {
   console.log(`\n  ⚠️ ${selfFail} 个检测器未通过自检 —— **其扫描结果不可信**,下面仍打印但请先修检测器`);
+}
+
+/* ★ `--selftest`:只跑样本组,**不扫全仓** ⇒ 一秒内跑完。
+   ```
+   为什么必须有这个开关(task-68 交付 4):
+     验证必须**便宜**,否则没人跑。
+     本次 F 回归之所以没被发现,就是因为验证需要跑整个审计(~9s)+ 手写样本。
+     ⇒ 便宜到"改完顺手就敲一下",样本组才会真的被用起来。
+   ```
+   ⚠️ 它**不读任何文件**,所以可在审计自身有语法问题时仍然运行。 */
+if (process.argv.includes('--selftest')) {
+  console.log(`\n[--selftest] 样本组自检:${DETECTORS.length} 个检测器,`
+    + `${selfResults.filter((r) => r.ok).length} 通过 / ${selfFail} 失败`);
+  process.exit(selfFail > 0 ? 1 : 0);
 }
 
 /* ── 2. 逐形态扫描 ── */
@@ -1129,3 +1744,4 @@ if (USE_BASELINE) {
 } else {
   console.log('\n✓ 审计完成(未加 --strict / --baseline,命中不导致失败)');
 }
+
