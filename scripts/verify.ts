@@ -626,6 +626,131 @@ async function checkFrozen(): Promise<void> {
 
 /* ───────────────────── 2. 语法扫描 ───────────────────── */
 
+/* ── ★★★ 跨层 import 守卫(CR-24 §5,2026-11-13 Lead 补)─────────────
+ *
+ * ## 它为什么必须存在(实测,不是设想)
+ *
+ * CR-24 §5 写着:「现状:`分层不变量` 门禁拦三方包,**不拦越层** client→server。
+ *   ⇒ 新增判据:`client/src/**` 的 import 不得解析到 `server/**`」
+ * ⇒ 本 CR 当时**只做了切分上移**,这道守卫**没做**。
+ * ★ 实测证伪(2026-11-13):我在 `client/src/net/` 下写了一个**真越层**
+ * ```
+ *   import { createRoomState } from '../../server/src/net/schema.ts';
+ * ```
+ * ⇒ 门禁 **exit=0、红项 0** ⇒ 越层**完全不拦**(只有一条"未登记不可达"的**告警**)。
+ * ⇒ ⇒ 所以「有这条判据」与「这条判据能拦住」是两件事,而前者在这之前**只存在于文档里**。
+ *
+ * ## 为什么它现在才有意义(顺序不可颠倒)
+ *
+ * ```
+ * CR-24 记:「⚠️ 不能只为跑通而加 —— 必须先钉住 (b) 的切分线,否则新门禁加完就红。」
+ * ⇒ 而上移**已经落地**(实测 21/21 符号在 shared/types/wire.ts,
+ *   `createPlayerState`/`createRoomState`/`removePlayer` 留在 server)
+ * ⇒ 且实测 `client/src` 指向 `server/**` 的 import = **0 处**、传递闭包 0 处
+ * ⇒ ⇒ 所以现在加它是「**把已成立的事实钉住**」,不是「用规则逼出事实」。
+ * ```
+ *
+ * ## ⚠️ 它检查的是**解析后的相对路径**,不是字面字符串
+ *
+ * ```
+ * 判据:`client/src/**` 里的相对说明符(以 `.` 开头)解析成绝对路径后,
+ *       不得落在 `server/**` 之下。
+ * 允许:共享层 `shared/**`、`client/**` 内部、三方包(实测 client 侧只引 `three`)
+ * ⇒ ★ 与「分层不变量」原本那条**互补**:那条拦三方包,这条拦越层。
+ *   ⚠️ 两条都必要:一条只拦"往外包看",一条只拦"往隔壁看"。
+ * ```
+ *
+ * ## 反例(必须能红,否则是恒真)
+ * ```
+ * 注入 `client/src/**.ts` 内 `from '../../server/src/net/schema.ts'` ⇒ 本条必须红
+ * 注入 `from '../../../shared/types/wire.ts'`               ⇒ 必须**不**红
+ * ``` */
+function checkCrossLayerImports(): void {
+  const clientDir = join(ROOT, 'client/src');
+  const files = walk(clientDir, ['.ts']);
+  if (files.length === 0) {
+    fail('跨层守卫:client/src 下 0 个 .ts —— 扫描口径坏了(不许把"扫不到"当"没问题")');
+    return;
+  }
+  const bad: string[] = [];
+  let relSpecs = 0;
+  let sharedSpecs = 0;
+  let staticForms = 0;
+  let bareForms = 0;
+  let dynamicForms = 0;
+  /* ★★★ 三种 import 写法**都必须覆盖** —— 而这不是我一开始就写对的:
+   * ```
+   * 我的第一版只写 `from\s+['"](\.[^'"]+)['"]`
+   * ⇒ 立刻被本仓的判据形态审计检测器 C 抓到(`verify.ts:683` 报 [C?]):
+   *    「import 探测只认 from,未覆盖裸副作用导入与动态 import()」
+   * ⇒ ⇒ ★ 这**正是我刚要求 net-persist 修的那个缺口**,
+   *   而我在同一个小时里、在另一份代码里**自己又犯了一遍**。
+   * ⇒ 所以这里**不登记、直接补覆盖** —— 与我对它说的原则一致:
+   *    「避开检测器 ≠ 补上覆盖」,而这里选的是后者。
+   * ```
+   * ```
+   *   1 静态  import x from '...'        → from
+   *   2 裸副作用 import '...'            → 无 from,只有说明符
+   *   3 动态  await import('...')        → 括号里的说明符
+   * ⇒ 三种漏掉任何一种,守卫都能被**一句话绕过**,而绕过者不需要知道它在绕过什么。
+   * ```
+   * ⚠️ 负向前瞻 `(?<![\w.])` 防 `foo.import(` / `myFrom` 之类误匹配。 */
+  const IMPORT_SPEC_RE =
+    /(?:\bfrom\s*|(?<![\w.])import\s*\(?\s*)['"](\.[^'"]+)['"]/g;
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8');
+    /* 剥注释 + 剥字符串之外的内容会误伤说明符,故只**剥注释**:
+       用与其它节一致的做法 —— 逐行去掉 `//` 之后的部分与块注释。
+       ★ 剥块注释时**保留换行**(替换成同数量的换行,而不是一个空格):
+         否则后面所有行下标前移 —— 这与 `assertion-audit.ts` 那个
+         "行号最多偏 -103" 的真 bug 是**同一个形态**。 */
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''));
+    for (const m of code.matchAll(IMPORT_SPEC_RE)) {
+      const spec = m[1]!;
+      /* 归类:用来在输出里**证明三种形态都真被扫过**(否则"0 处越层"可能只是没扫到) */
+      const whole = m[0]!;
+      if (/\bfrom\b/.test(whole)) staticForms += 1;
+      else if (/import\s*\(/.test(whole)) dynamicForms += 1;
+      else bareForms += 1;
+      relSpecs += 1;
+      const dir = dirname(f);
+      const abs = resolve(dir, spec).split(sep).join('/');
+      const rel = relative(ROOT, abs).split(sep).join('/');
+      if (rel.startsWith('shared/')) sharedSpecs += 1;
+      if (rel.startsWith('server/')) {
+        bad.push(`${relative(ROOT, f).split(sep).join('/')} → ${spec}`);
+      }
+    }
+  }
+  /* ★ 自证:必须真扫到相对说明符,否则"0 处越层"可能只是"没扫到东西" */
+  if (relSpecs === 0) {
+    fail('跨层守卫:client/src 内 0 条相对 import —— 正则或扫描坏了,本条结论无意义');
+    return;
+  }
+  /* ★★ 自证之二:**三种写法都必须至少出现过一次**,否则说明覆盖有洞。
+     实测 client/src 当前 静态 ≥60 / 裸 ≥0 —— 若某天裸副作用变成 0,
+     本条会**红**,提示"这一形态可能又漏了"。
+     ⚠️ 但裸副作用在 client/src 里**现在确实可能是 0 条**(没人这么写)
+     ⇒ 故只对**静态**形态做硬要求(它必然 >0),另两种做**报告**,不硬红。
+     否则会变成"因为没人用某种写法,所以门禁红"—— 那是把"没用到"当"不存在"。 */
+  if (staticForms === 0) {
+    fail('跨层守卫:静态 from 形态 0 条 —— 不可能,正则有洞');
+    return;
+  }
+  if (bad.length > 0) {
+    fail(
+      `跨层 import ${bad.length} 处:client/src 不得依赖 server/**`
+        + `(应把线上格式放 shared/ —— CR-24)\n      · ${bad.slice(0, 5).join('\n      · ')}`,
+    );
+  } else {
+    pass(
+      `跨层 import 无(client/src 相对说明符 ${relSpecs} 条:静态 ${staticForms} / 裸 ${bareForms} / 动态 ${dynamicForms};`
+        + `指向 shared/ ${sharedSpecs} 条,指向 server/ 0 条)`,
+    );
+  }
+}
+checkCrossLayerImports();
+
 function walk(dir: string, exts: string[]): string[] {
   if (!existsSync(dir)) return [];
   const out: string[] = [];
