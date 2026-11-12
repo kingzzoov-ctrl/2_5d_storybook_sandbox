@@ -338,13 +338,31 @@ export class VitalsSystem {
     return this.players.size;
   }
 
-  /** 复活(满血,清无敌)。 */
-  revive(id: string, hp?: number): boolean {
+  /**
+   * 复活(满血)。
+   *
+   * ## `invulnSec` 参数(task-64)
+   *
+   * **此前这里无条件 `v.iframeSec = 0`** —— 复活后玩家**没有任何宽限无敌**,
+   * 起手就会被下一拳打死。实测(修前):复活后第 1 拳 `applied=14`(期望 0)。
+   *
+   * 根因不是「忘了写无敌」,而是**无敌有两套,写错了那一套**:
+   * ```
+   * downedStates[i].invulnSec   ← revive.ts 把 MANUAL_REVIVE_INVULN / FEATHER_INVULN 写进这里
+   *                              ⚠️ 而读它的 isInvulnerable() 生产 0 调用 ⇒ **到不了玩家身上**
+   * vitals[i].iframeSec        ← 受击判定真正读的是这个(vitals.ts:397 / world_sim.ts:2718)
+   *                              ⚠️ 而 revive() 把它显式置 0 ⇒ 反方向抹掉
+   * ```
+   * ⇒ 所以修法是**把复活的无敌写进活的那一套**(本参数),而不是给死的那套加递减。
+   *
+   * 默认 `0` = 保持原语义(重连/读档导入 HP 时不该给无敌帧)。
+   */
+  revive(id: string, hp?: number, invulnSec = 0): boolean {
     const v = this.players.get(id);
     if (!v) return false;
     v.hp = hp ?? v.maxHp;
     v.downed = false;
-    v.iframeSec = 0;
+    v.iframeSec = Math.max(0, invulnSec);
     v.sinceHurtSec = PLAYER_REGEN_DELAY_SEC;
     return true;
   }

@@ -73,7 +73,20 @@ export interface DownedState {
   rescuerId: string | null;
   /** 已叠加的泡泡层数(227 泡泡水枪) */
   bubbleStacks: number;
-  /** 是否处于 3 秒无敌 */
+  /**
+   * 是否处于 3 秒无敌。
+   *
+   * ## ⚠️ 死字段警告(CR-19 / task-64,2026-11-13 定性)
+   *
+   * **本字段生产无读者** —— 读它的只有 `isInvulnerable()`,而那个函数生产 0 调用。
+   * 玩家受击判定读的是**另一个字段** `Vitals.iframeSec`(`vitals.ts:397`)。
+   *
+   * ```
+   * ⇒ 把无敌秒数写进本字段 = **写进一个没人看的地方**(改前 touchRevive 就是这样)
+   * ⇒ task-64 已让复活路径改走 `vitals.revive(id, hp, invulnSec)` 转写 iframeSec
+   * ```
+   * 完整对照见下方 `tickInvuln` 的注释。
+   */
   invulnSec: number;
   state: BodyState;
 }
@@ -328,10 +341,49 @@ export function flagRevive(input: {
 
 /* ───────────────────────────── 无敌计时 ───────────────────────────── */
 
+/**
+ * ## ⚠️ 死实现警告(CR-19 / task-64,2026-11-13 定性)
+ *
+ * **本函数与其同组的 `isInvulnerable`、`DownedState.invulnSec` 是一份
+ * 从未被接线的实现 —— 生产调用点 0。** 不要以为「加了 `tickInvuln` 就有无敌了」。
+ *
+ * ```
+ * 死的那一套(本组):
+ *   revive.ts      把 MANUAL_REVIVE_INVULN / FEATHER_INVULN 写进 DownedState.invulnSec
+ *   tickInvuln()   递减该字段            —— 生产 0 调用
+ *   isInvulnerable() 读该字段判无敌       —— 生产 0 调用
+ *   ⇒ **这个字段到不了玩家身上**(没有读者)
+ *
+ * 活的那一套(受击判定真正读的):
+ *   vitals.ts:97    Vitals.iframeSec
+ *   vitals.ts:397   applyHit() `if (v.iframeSec > 0)` ⇒ blockedByIframe
+ *   vitals.ts:444   stepTimers() 每帧递减
+ *   world_sim.ts:2718 把它传给伤害结算
+ *   ⇒ 玩家受击无敌 0.35s(PLAYER_IFRAME_SEC)**正常工作**(实测:第 2 拳 applied=0)
+ * ```
+ *
+ * **task-64 的修法**(已实施):复活的无敌**不递减本字段**,而是由
+ * `touchRevive` 的 `result.invulnSec` 经 `world_sim.tickDowned()` 转写进
+ * **`vitals.iframeSec`**(见 `vitals.revive()` 第三参)。
+ * 实测:复活后第 1 拳 `applied` 由 **14 → 0**。
+ *
+ * ⚠️ **所以本组三件是「定义正确但无消费者」**,不是「逻辑错误」。
+ * 处置待裁:删除,或保留供 `featherRevive` / `flagRevive` 接线时复用
+ * (那三条复活动作**整组未接线**,见下方标志)。
+ */
 export function tickInvuln(downed: DownedState, dt: number): DownedState {
   return { ...downed, invulnSec: Math.max(0, Math.round((downed.invulnSec - dt) * 1000) / 1000) };
 }
 
+/**
+ * 改判定「是否处于无敌」。
+ *
+ * ## ⚠️ 死实现警告(CR-19 / task-64)
+ *
+ * **生产调用点 0 ⇒ 它读的 `invulnSec` 到不了玩家身上。**
+ * 真正生效的无敌判定在 `vitals.ts:397`(`applyHit` 读 `v.iframeSec`)。
+ * 完整说明见上方 `tickInvuln` 的注释 —— **不要只看这一个函数**。
+ */
 export function isInvulnerable(downed: DownedState): boolean {
   return downed.invulnSec > 0;
 }

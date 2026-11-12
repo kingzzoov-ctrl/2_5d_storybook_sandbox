@@ -1946,8 +1946,15 @@ export class WorldSim {
         /* 复活落账:把 HP 写回 `vitals`(半血)并清掉倒地标记。
            这是「谁负责把状态机结果写回瞬时判定」的必要一步 ——
            不写回的话 `vitals.downed` 仍是 true,下一帧又会重建泡泡,
-           表现为「复活了但立刻又倒下」。 */
-        this.vitals.revive(id, out.result.hpAfter);
+           表现为「复活了但立刻又倒下」。
+
+           ⚠️ 第三参 `out.result.invulnSec` 是 task-64 补的,**不能省**:
+           `revive.ts` 把 `MANUAL_REVIVE_INVULN` 写进了 `DownedState.invulnSec`,
+           而**读那个字段的 `isInvulnerable()` 生产 0 调用** ⇒ 无敌到不了玩家身上;
+           真正被受击判定读的是 `vitals.iframeSec`(见 vitals.ts:397)。
+           实测(修前):复活后第 1 拳 `applied=14`(期望 0)⇒ **复活后零宽限无敌**。
+           ⇒ 必须把结果里的秒数**转写进活的那一套**。 */
+        this.vitals.revive(id, out.result.hpAfter, out.result.invulnSec);
         this.downedStates.delete(id);
         continue;
       }
