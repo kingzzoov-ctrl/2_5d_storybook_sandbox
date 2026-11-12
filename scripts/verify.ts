@@ -2453,6 +2453,82 @@ function checkJudgementAudit(): void {
   console.log('    └─ ⚠️ C 类命中带 [C?] 标记者**须人工复核** —— 该检测器覆盖判定已知偏窄');
 }
 
+/**
+ * **临时残留清点**(2026-11-13,Lead 加)。
+ *
+ * ## 为什么必须是门禁的一道
+ *
+ * ```
+ * .gitignore 第 37 行是 `_*` ⇒ **临时文件被 git 结构性忽略**
+ * ⇒ `git status --porcelain` **看不见它们**
+ * ⇒ 而全仓的「工作区干净」自证**用的正是那条命令**
+ * ```
+ * 实测(2026-11-13):清点出 **25 个**残留、**111.1 KB**、
+ * 最老的跨了 **1 小时 20 分**(它的作者以为早删了)。
+ *
+ * ## 为什么它只告警、不失败
+ *
+ * 工作**进行中**的临时探针是合法的(本仓铁律要求"用 write 工具写临时 .ts 探针")。
+ * 让门禁为此变红会让正常的并行工作流被打断,反而催生「忽略那条失败」。
+ * ⇒ **只报数量与归属**,不判失败。
+ *
+ * ## 但它仍然有价值 —— 而且已被实测证明
+ *
+ * ```
+ * 2026-11-13:临时脚本 `scripts/_cp_strip.ts` **被 judgement_audit 抓到**
+ *            (§判据形态审计报「新增 1 处」)
+ * ⇒ 那是**门禁替人发现了人没发现的东西** —— 人一直在用 git status 看"干净"
+ * ```
+ * ⇒ 那次的教训:残留落在**审计扫描根之内**(`scripts/` / `tests/` /
+ * `server/src/` / `client/src/` / `shared/`)时,它会**污染别的门禁**,
+ * 那时就不只是"脏",而是**假红**(狼来了 ⇒ 门禁失效)。
+ *
+ * ## 扫描根之外的呢
+ *
+ * 根目录下的 `_x.ts` **不会**被 judgement_audit 扫到(它不扫仓库根),
+ * ⇒ 那些只脏、不破坏判据。**两者要分开报。**
+ */
+function checkTempResidue(): void {
+  console.log('\n[临时残留]');
+  const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
+  const hits: { rel: string; size: number; inAuditRoot: boolean }[] = [];
+  const walk = (dir: string, rel: string): void => {
+    if (!existsSync(dir)) return;
+    for (const n of readdirSync(dir)) {
+      const full = join(dir, n);
+      const r = rel ? `${rel}/${n}` : n;
+      if (/^(node_modules|_design|_shots|_cdp_profile|\.git)$/.test(n)) continue;
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) { walk(full, r); continue; }
+      /* 临时探针:文件名以 `_` 开头 + 常见扩展名 */
+      if (/^_.*\.(ts|js|mjs|txt|md|log|json)$/.test(n)) {
+        hits.push({ rel: r, size: st.size, inAuditRoot: SCAN_ROOTS.some((x) => r.startsWith(`${x}/`)) });
+      }
+    }
+  };
+  walk(ROOT, '');
+  if (hits.length === 0) {
+    console.log('  ✓ 无临时残留(仓库根与扫描根内均清)');
+    return;
+  }
+  const bytes = hits.reduce((a, h) => a + h.size, 0);
+  const inRoot = hits.filter((h) => h.inAuditRoot);
+  console.log(`  ⚠ 发现 ${hits.length} 个临时残留(合计 ${(bytes / 1024).toFixed(1)} KB)`);
+  for (const h of hits.slice(0, 12)) {
+    console.log(`      ${h.inAuditRoot ? '★' : ' '} ${h.rel}  (${h.size}B)`);
+  }
+  if (hits.length > 12) console.log(`      …另有 ${hits.length - 12} 个`);
+  advise(
+    '临时残留',
+    `临时残留 ${hits.length} 个(${(bytes / 1024).toFixed(1)} KB)`
+    + (inRoot.length > 0
+      ? `;★ 其中 **${inRoot.length} 个落在审计扫描根内** ⇒ 会污染「判据形态审计」造成**假红**(狼来了)`
+      : ';它们都在审计扫描根**之外**,只脏不破坏判据')
+    + ' ⇒ 跑 `node scripts/clean-temp.ts` 清理',
+  );
+}
+
 function checkInertHandlers(): void {
   console.log('\n[入口执行层]');
   const found = findVerdictHandlers();
@@ -4230,6 +4306,11 @@ checkInertHandlers();
  *    (build-wiring 三次栽在同一处),命中行带 `[C?]` 标记,须人工复核。
  *    这是「启发式判定标注边界,而不是假装无边界」的实例。 */
 checkJudgementAudit();
+/* ★ 临时残留(只告警)—— 必须在 judgement_audit **之后**:
+   残留落在审计扫描根内会先污染那道,本道负责**解释那道为什么红**。
+   ⚠️ 顺序颠倒的话,读者会先看到"临时残留 3 个"而不知道
+      其中 1 个正是让上一道变红的原因。 */
+checkTempResidue();
 checkTautology();
 checkClientTrust();
 if (!frozenOnly && !only && !contentOnly) checkDocs();
@@ -4243,10 +4324,19 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
    ⇒ 那两句话会把「新增了未登记欠账」误读成「完全干净」。
    修法:不改变默认口径(告警仍不拦截),但汇总行**必须把告警与升级开关报出来**。 */
 const verdict = failures === 0 ? '全部通过' : `${failures} 项失败`;
+/* ⚠️ 有一类告警**故意没有升级开关**(如「临时残留」:工作时的临时探针是合法的,
+   让它变红会打断正常并行工作流,反而催生「忽略那条失败」)。
+   ⇒ 那种情况**不能打印 `加 ?`** —— 看的人会去找一个不存在的开关。
+   ⇒ 实测踩到:加了「临时残留」告警后,汇总行打出
+      「⚠ 1 项告警未拦截(临时残留:加 ? 才算失败)」——`?` 不是开关名。 */
 const adviseSuffix = advises === 0
   ? ''
   : ` · ⚠ ${advises} 项告警**未拦截**(`
-    + [...advisedGates].map((g) => `${g}:加 ${ADVISE_UPGRADE[g] ?? '?'} 才算失败`).join('; ')
+    + [...advisedGates]
+      .map((g) => (ADVISE_UPGRADE[g] === undefined
+        ? `${g}:**按设计只告警,无升级开关**`
+        : `${g}:加 ${ADVISE_UPGRADE[g]} 才算失败`))
+      .join('; ')
     + ')';
 console.log(`\n${verdict}${adviseSuffix} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
