@@ -80,7 +80,6 @@ export const ORPHAN_KNOWN = new Map<string, string>([
   ['server/src/social/afk.ts', 'WS-11 挂机检测;待房间 tick 调用'],
   ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫;待接 applyPrank'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图;待客户端接线'],
-  ['server/src/combat/revive.ts', 'WS-10 救援;待接入玩家倒地流程'],
   ['server/src/mobs/taming.ts', 'WS-04 驯服;待交互系统调用'],
   ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块);等客户端网络层 —— 服务端侧不该接'],
   ['server/src/db/memory_db.ts', 'WS-07 内存库;生产走 sqlite 驱动,仅测试用'],

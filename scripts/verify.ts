@@ -747,8 +747,6 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
    * ⇒ **两套清单都对,但判据不同,不应合并、不应互相「对齐」。**
    *   改这里之前先确认你改的是**传递性判据**还是**直接引用判据**。
    * ══════════════════════════════════════════════════════════════════════ */
-  ['server/src/combat/progression.ts', 'WS-10 击杀结算,待接入'],
-  ['server/src/combat/revive.ts', 'WS-10 复活/无敌,待接入'],
   /* `combat/cooking.ts` 已于 2026-11-12 接线(task-39):
      `WorldSim` 真的调用 `createKitchenState` / `feedStation` / `tryCook` / `potCount`
      (各 2~4 处**真实调用点**,不是只 import)。已从本表摘除。 */

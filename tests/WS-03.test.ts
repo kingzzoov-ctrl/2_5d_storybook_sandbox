@@ -109,6 +109,25 @@ function countObjIn(sim: WorldSim, objId: number): number {
   return n;
 }
 
+/* ══════════ task-48 房间效果消费的夹具 ══════════ */
+
+/** 把玩家送到某格中心并推进到下一个慢帧,返回推进后的 vitals。 */
+function tickInRoom(sim: WorldSim, id: string, x: number, y: number, ticks = 10): void {
+  sim.setPlayerPos(id, x + 0.5, y + 0.5);
+  for (let i = 0; i < ticks; i += 1) sim.tick();
+}
+
+/** 盖一间带指定核心件的房间,并在房间中心放一个玩家。 */
+function makeRoomWith(sim: WorldSim, coreIds: readonly number[], opts: { x0?: number; y0?: number; w?: number } = {}): { cx: number; cy: number } {
+  const x0 = opts.x0 ?? 3;
+  const y0 = opts.y0 ?? 3;
+  const w = opts.w ?? 9;
+  buildClosedRoomSim(sim, x0, y0, w, w);
+  /* 核心件沿房间内部一行排开 */
+  coreIds.forEach((id, i) => sim.setCell(x0 + 2 + i, y0 + 2, { obj: id }));
+  return { cx: x0 + Math.floor(w / 2), cy: y0 + Math.floor(w / 2) };
+}
+
 /* ══════════════════ 公共夹具 ══════════════════ */
 
 const WALL = 352; /* 复古红砖承重墙 */
@@ -1182,6 +1201,132 @@ test('WT-03-62 [接线] 房间识别成本与实际建造规模成正比,与远�
   eq(labs.length, 2, '两间分离的炼金实验室都应识别出来');
   const ids = new Set(labs.map((r) => r.roomId));
   eq(ids.size, 2, '两间房的 roomId 必须不同(跨簇撞号是簇化引入的新风险)');
+});
+
+/* ══════════ task-48:房间效果消费(此前接上了但没人消费)══════════
+
+ * task-36 把 `identifyAllRooms` 接到了 `WorldSim` 慢帧,`rooms()` 能识别出
+ * `ALCHEMY_LAB`(score=108)且有断言守住。**但全仓 `.rooms()` 只出现在本文件**
+ * ⇒ 没有任何游戏逻辑消费识别结果。
+ *
+ * 后果:玩家盖出【森系茶歇卧室】(手册 L:核心件 `517`)站进去,
+ * **血量不回复** —— 而门禁全绿。这是「测试全绿 + 生产零消费」家族的又一例。
+ *
+ * 下面先断言「不生效」(会红),再接上消费点转绿。
+ */
+
+test('WT-03-63 [房间效果] 森系茶歇卧室:站在房里应按手册恢复 HP(接前为零)', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  const { cx, cy } = makeRoomWith(sim, [517]);  /* 517 云端软绵绵单人床 = 卧室核心件 */
+  sim.addPlayer('p1', cx + 0.5, cy + 0.5);
+
+  /* 先把血打掉一截,否则 hp 已是满值,「不回血」与「回血被上限吃掉」分不开。 */
+  sim.vitals.get('p1')!.hp = 50;
+  ok(sim.rooms().some((r) => r.key === 'COZY_BEDROOM'),
+    '前置条件:应识别出 COZY_BEDROOM(实测应为真)');
+
+  tickInRoom(sim, 'p1', cx, cy, 20);
+  const hp = sim.vitals.get('p1')!.hp;
+
+  /* 手册原文:「躺上去每秒快速恢复 15 HP」。
+     跑 20 帧 = 1 秒(快帧 20Hz),即便按慢帧 2Hz 算也过了 2 秒。 */
+  ok(hp > 50, `站在卧室里 HP 应上升(手册:每秒 15 HP);实测 50 → ${hp}`);
+
+  /* 负对照:拆掉核心件后增益必须停止 —— 这是「增益真挂在房间识别上」的判据。
+     不拆核心件的话,「玩家坐标碰巧在某处就回血」也能过这条断言。 */
+  const sim2 = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  const r2 = makeRoomWith(sim2, [517]);
+  sim2.addPlayer('p1', r2.cx + 0.5, r2.cy + 0.5);
+  sim2.vitals.get('p1')!.hp = 50;
+  /* 核心件位置 = makeRoomWith 里放的那格(x0+2, y0+2),不是随手挑一格 ——
+     删错格子(比如删一块空地)会让房间仍成立,负对照就失去区分力。 */
+  eq(sim2.grid.objIdAt(5, 5), 517, '前置条件:517 应在 (5,5)');
+  sim2.setCell(5, 5, { obj: 0 });
+  eq(sim2.rooms().some((r) => r.key === 'COZY_BEDROOM'), false,
+    '拆掉 517 后不应再识别为卧室');
+  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 20);
+  const hp2 = sim2.vitals.get('p1')!.hp;
+  eq(hp2, 50, '拆掉核心件 517 后不得再回血(增益必须挂在房间识别上)');
+});
+
+test('WT-03-64 [房间效果] 露天温泉馆:泡澡获生命上限提升,且随离开失效', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  const { cx, cy } = makeRoomWith(sim, [526]);  /* 526 露天温泉石灯笼 = 温泉馆识别件 */
+  sim.addPlayer('p1', cx + 0.5, cy + 0.5);
+  ok(sim.rooms().some((r) => r.key === 'SAKURA_ONSEN'), '前置条件:应识别出 SAKURA_ONSEN');
+
+  const base = sim.effectiveMaxHp('p1');
+  tickInRoom(sim, 'p1', cx, cy, 20);
+  const boosted = sim.effectiveMaxHp('p1');
+  /* 手册原文:「战前泡澡获 20 分钟生命上限 +30%」 */
+  ok(boosted > base, `泡温泉应提升生命上限(手册:+30%);实测 ${base} → ${boosted}`);
+  /* 数值也要对:100 × 1.3 = 130。只断言「变大」的话,乘 1.01 也能过。 */
+  eq(boosted, Math.round(base * 1.3), '提升幅度应为 +30%(手册原文)');
+
+  /* 手册原文:「战前泡澡获 20 分钟生命上限 +30%」。
+     ⇒ 加成**泡完带走 20 分钟**,所以离开水池后不应立即消失。
+     断言分两段:①离开后仍在(+30% 持续);②计时耗尽后才撤销。 */
+  sim.setPlayerPos('p1', 40.5, 40.5);
+  for (let i = 0; i < 20; i += 1) sim.tick();
+  eq(sim.effectiveMaxHp('p1'), boosted,
+    '手册说「获 20 分钟」⇒ 离开水池后加成应持续,不得立即消失');
+
+  /* ② 把计时推干(1200 秒 ÷ 慢帧 0.5s = 2400 慢帧 = 24000 快帧;
+     直接调 tick 太多,这里用 `roomEffectOf` 把计时清零来模拟「20 分钟到」——
+     测的是「计时到点后撤销」这条逻辑,不是 tick 的次数)。 */
+  const st = sim.roomEffectOf('p1')!;
+  st.onsenSec = 0;
+  sim.setPlayerPos('p1', 40.5, 40.5);
+  for (let i = 0; i < 20; i += 1) sim.tick();
+  eq(sim.effectiveMaxHp('p1'), base, '20 分钟计时耗尽后生命上限应恢复基准值');
+});
+
+test('WT-03-65 [房间效果] 大师锻造房:房内解锁中高级锻造,房外不解锁', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  const { cx, cy } = makeRoomWith(sim, [503, 504]);  /* 高炉 + 铁砧 = 锻造房两个核心件 */
+  sim.addPlayer('p1', cx + 0.5, cy + 0.5);
+  ok(sim.rooms().some((r) => r.key === 'FORGE_MASTER'), '前置条件:应识别出 FORGE_MASTER');
+
+  tickInRoom(sim, 'p1', cx, cy, 10);
+  eq(sim.forgeUnlocked('p1'), true, '站在大师锻造房里应解锁中高级锻造');
+
+  /* 负对照:走到房外 → 必须立刻不解锁(不是永久解锁)。 */
+  sim.setPlayerPos('p1', 40.5, 40.5);
+  for (let i = 0; i < 20; i += 1) sim.tick();
+  eq(sim.forgeUnlocked('p1'), false, '房外不得解锁锻造(不能一次进入就永久解锁)');
+
+  /* 负对照 2:只放一个核心件(缺铁砧)不构成锻造房 ⇒ 不解锁。 */
+  const sim2 = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  const r2 = makeRoomWith(sim2, [503]);
+  sim2.addPlayer('p1', r2.cx + 0.5, r2.cy + 0.5);
+  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 10);
+  eq(sim2.forgeUnlocked('p1'), false, '只有高炉没有铁砧,不构成大师锻造房');
+});
+
+test('WT-03-66 [房间效果] 房间远离原点时增益仍生效(钉住格坐标换算)', () => {
+  /* ⚠️ 上面三间房都盖在 (3,3) —— 那里的扫描窗口原点接近 0,
+     若「局部格坐标 → 世界坐标」的换算漏了 `x0/y0` 偏移,在原点附近
+     **仍会侥幸正确**(局部坐标恰好等于世界坐标)。这条把房间盖到远处,
+     专门钉这个换算:漏加偏移时玩家定位整体错位,增益不生效。 */
+  const far = new WorldSim({ sizeCells: 64, mobs: false, wiring: false });
+  const rf = makeRoomWith(far, [517], { x0: 30, y0: 30 });
+  far.addPlayer('p1', rf.cx + 0.5, rf.cy + 0.5);
+  far.vitals.get('p1')!.hp = 50;
+  ok(far.rooms().some((r) => r.key === 'COZY_BEDROOM'), '远处(30,30)置房的识别(前置)');
+  tickInRoom(far, 'p1', rf.cx, rf.cy, 20);
+  ok(far.vitals.get('p1')!.hp > 50,
+    `远离原点 (30,30) 的卧室同样应回血 —— 钉住「局部格坐标 + 窗口原点」的换算;`
+    + `实测 50 → ${far.vitals.get('p1')!.hp}`);
+
+  /* 反向:站在远处**空地**(房外)不得回血。换算错位会在这里暴露 ——
+     漏加偏移会把「房外」误判成「某房间内」。 */
+  const out = new WorldSim({ sizeCells: 64, mobs: false, wiring: false });
+  makeRoomWith(out, [517], { x0: 30, y0: 30 });
+  out.addPlayer('p1', 40.5, 40.5);
+  out.vitals.get('p1')!.hp = 50;
+  for (let i = 0; i < 20; i += 1) out.tick();
+  eq(out.vitals.get('p1')!.hp, 50,
+    '站在远处空地(房外)不得回血 —— 换算错位会在这里暴露');
 });
 
 report('WS-03');

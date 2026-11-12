@@ -49,6 +49,14 @@ import { SignalGraph } from '../wiring/graph.ts';
    只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
 import { scanRooms, identifyRoom, DEFAULT_SCAN_OPTIONS, type RoomIdentity } from '../build/rooms.ts';
 import { RelayQueue, buildRelayQueue, type Blueprint } from '../build/blueprint.ts';
+/* task-48 房间效果消费点:把识别结果变成玩家身上的可观测增益。 */
+import {
+  createRoomEffectState,
+  stepRoomEffects,
+  roomAtCell,
+  maxHpMulOf,
+  type RoomEffectState,
+} from '../rooms/effects.ts';
 import {
   createKitchenState,
   feedStation,
@@ -110,17 +118,41 @@ import { DamageKind } from '../mobs/behaviors.ts';
 import {
   computeDamage,
   mobCombatProfile,
+  makeDot,
+  tickDot,
   DamageSource,
+  type DotTask,
   type DamageResult as PipelineDamageResult,
 } from '../combat/damage.ts';
 import {
   combatantStats,
   weaponById,
+  ARMOR_BY_ID,
   Element,
   BREACH_PICK,
   type SkillDef,
   type WeaponDef,
 } from '../combat/weapons.ts';
+/* ── task-44:WS-10 三个「实现完整、生产零引用」模块的接线(见各自接线注释)── */
+import {
+  KillLedger,
+  createProgress,
+  settleMobExp,
+  applyShareResult,
+  isTalentUnlocked,
+  SHARE_RADIUS,
+  type PlayerProgress,
+  type ShareResult,
+} from '../combat/progression.ts';
+import {
+  createDowned,
+  tickGhostBubble,
+  touchRevive,
+  TOUCH_RADIUS,
+  type DownedState,
+  type EquipmentSnapshot,
+  type ReviveResult,
+} from '../combat/revive.ts';
 
 /**
  * 读地面掉落物的物品 ID —— **兼容两种字段名**。
@@ -460,6 +492,72 @@ export class WorldSim {
    */
   private readonly logisticsBelts = new Map<string, ConveyorState>();
 
+  /* ═══════════ task-44:击杀结算 / 幽灵泡泡 / 装备词条的生产接线 ═══════════ */
+
+  /**
+   * 击杀去重账本 —— `progression.settleMobExp` 的必需入参。
+   *
+   * ## 为什么它必须由编排层持有(而不是每次结算新建一个)
+   *
+   * `KillLedger` 的职责是「同一怪实例只结算一次」。若在结算处 `new KillLedger()`,
+   * 每次都是空账本 ⇒ `claim()` 恒为 true ⇒ 去重**完全失效**,而来回调用
+   * 10 次就发 10 份经验。这个错误不会让任何纯函数单测变红:纯函数测的是
+   * 「同一账本上重复 claim 返回 false」,而缺陷在于「账本的生命周期错了」。
+   *
+   * ⇒ 生命周期必须与「世界」一致,故由 `WorldSim` 持有。
+   */
+  private readonly killLedger = new KillLedger();
+
+  /**
+   * 玩家成长档案(等级 / 经验 / 天赋钩子)。
+   *
+   * ⚠ **目前是编排层自建的运行时账本**,不是权威存档 —— 与 `playerById` /
+   * `syncPlayers` 硬编码 `wearing: []` 同属「玩家状态权威归属未定」这一族。
+   * 本轮的接线目标是让击杀**真的会结算**,不是定义存档契约(那是 US2/存档线的范围)。
+   */
+  private readonly progresses = new Map<string, PlayerProgress>();
+
+  /** 最近一次击杀结算结果(供断言与 UI;null = 尚未发生击杀)。 */
+  lastKillSettle: ShareResult | null = null;
+
+  /** 本帧新产生的升级事件(玩家 ID → 升级详情),供网络层播动画。 */
+  readonly pendingLevelUps = new Map<string, { from: number; to: number }[]>();
+
+  /**
+   * 倒地玩家的幽灵泡泡状态(玩家 ID → 状态)。
+   *
+   * 与 `vitals.ts` 的 `downed` 布尔是**两层不同的事实**:
+   * `vitals.downed` 是「HP 归零」这个**瞬时判定**(VitalsSystem 的职责),
+   * `DownedState` 是「泡泡位置 / 救援进度 / 无敌计时」这套**持续状态机**。
+   * 两者必须同步,但一个是布尔、一个是状态对象,不能合并。
+   */
+  private readonly downedStates = new Map<string, DownedState>();
+
+  /** 最近一次复活结果(供断言与 UI;null = 尚未发生复活)。 */
+  lastRevive: ReviveResult | null = null;
+
+  /**
+   * 生物身上的持续伤害(灼烧 DoT):生物 ID → 任务。
+   *
+   * ⚠ 这里的类型是 `DotTask & { fromDeg: number }` —— **不是** `damage.ts` 的
+   * `DotTask`。`fromDeg` 是本仓编排层需要的额外信息(见 `tickDots` 的注释:
+   * 发条重骑的正面护板按方向减伤,传死值会让灼烧量取决于站位运气)。
+   *
+   * 为什么不直接给 `damage.ts` 的 `DotTask` 加字段:那会改动它的导出契约,
+   * 而 task-47(US2)正依赖既有契约。用交叉类型在编排层附加信息,
+   * 纯函数 `makeDot`/`tickDot` 保持零改动 —— 它们并不需要知道方向。
+   */
+  private readonly dots = new Map<string, DotTask & { fromDeg: number }>();
+
+  /** DoT 自增序号,保证同一生物被多次点燃时按键覆盖而不是叠加无限任务。 */
+  private dotSeq = 0;
+
+  /** 累计已结算的击杀数(供断言「击杀真的触发了结算」)。 */
+  killSettleCount = 0;
+
+  /** 累计已发放的经验总量(供断言)。 */
+  totalExpGranted = 0;
+
   /* ═══════════ task-36:建造 / 房间识别 / 蓝图接力的生产接线 ═══════════ */
 
   /**
@@ -479,6 +577,22 @@ export class WorldSim {
    * 必须断言「**生产路径**上、由真实地形写入触发」的识别结果。
    */
   lastRoomScan: RoomIdentity[] = [];
+  /**
+   * 与 `lastRoomScan` **一一对应**的房间内部格集合(供「玩家是否在房内」判定)。
+   *
+   * ## 为什么需要并行保留一份
+   *
+   * `RoomInfo` 带 `cells`(房间内部全部格),但 `identifyRoom` 返回的
+   * `RoomIdentity` **只带 key/score/matches,把 cells 丢了**。
+   * 判定「玩家站在房间内」必须按**格集合**而不是外接矩形 ——
+   * 房间形状不必是矩形(BFS 泛洪取内部格),用 `bbox` 会把 L 形房间
+   * 凹进去的房外空间也算作房内:玩家贴着墙站在屋外,却拿到卧室回血。
+   *
+   * ⇒ 在调用 `identifyRoom` 之前把 `info.cells` 抄下来,按同一顺序存放,
+   * 下标与 `lastRoomScan` 对齐。`build/rooms.ts` 本轮不在写域内,
+   * 因此不改它的返回类型(那是冻结层的调用契约),改由编排层并记。
+   */
+  lastRoomCells: { x: number; y: number }[][] = [];
   /**
    * 房间识别的**脏标记**:地形写入后置位,下一次慢帧才重算。
    *
@@ -777,6 +891,8 @@ export class WorldSim {
 
     const pad = this.roomScanPad;
     const out: RoomIdentity[] = [];
+    /* 与 `out` 一一对应的格集合,见 `lastRoomCells` 的注释。 */
+    const cellsOut: { x: number; y: number }[][] = [];
     let id = 0;
     let area = 0;
     for (const cl of clusters) {
@@ -811,9 +927,13 @@ export class WorldSim {
         /* 房间 ID 在全局唯一:簇内 `scanRooms` 从 1 开始编号,会跨簇重复,
            这里统一用全局自增的 `id` 覆盖,否则两簇的第 1 间房会撞号。 */
         out.push(identifyRoom({ ...info, id }));
+        /* 格坐标必须**换回世界坐标**:视图是 `x0/y0` 偏移过的局部坐标,
+           直接存会让「玩家在房内」判定整体偏移 (x0,y0)。 */
+        cellsOut.push(info.cells.map((c) => ({ x: c.x + x0, y: c.y + y0 })));
       }
     }
     this.lastRoomScan = out;
+    this.lastRoomCells = cellsOut;
     this.lastRoomScanArea = area;
     this.roomsDirty = false;
   }
@@ -1328,6 +1448,23 @@ export class WorldSim {
     const ai = this.damageMob(mobId, result.finalDamage, kind, fromDeg);
     const rawLoss = ai?.hpLoss ?? 0;
     const hpLoss = Math.max(0, Math.min(rawLoss, hpBefore));
+
+    /* 6 灼烧 DoT(task-44 接线)—— 命中带 `dot` 的武器则点燃目标。
+     *
+     * ## 判据用「本次真的掉血了」而不是「打中了」
+     *
+     * `hpLoss > 0` 才算命中:被闪避 / 距离不足 / 目标已死时 `hpLoss = 0`,
+     * 此时点燃等于给一个没打到的目标挂灼烧。手册 §18 的「每击 +15 灼烧」
+     * 语义是「命中后附加」,不是「挥空也附加」。
+     *
+     * ## 只在生物还活着时点燃
+     *
+     * 一击打死时挂 DoT 是无意义的(下一帧 `tickDots` 见 `!rt.alive` 立刻清账),
+     * 但更重要的是:那会让「击杀时的 DoT 数」这个可观测值出现一个
+     * **活了 0 帧的幽灵任务**,断言写起来会有虚假的正例。 */
+    if (weapon !== null && weapon.dot !== null && hpLoss > 0 && rt.alive) {
+      this.applyDot(mobId, weapon.dot, fromDeg);
+    }
     return { result, hpLoss, events: ai?.events ?? [] };
   }
 
@@ -1427,13 +1564,281 @@ export class WorldSim {
     kind: DamageKind,
     fromDeg: number,
   ): DamageResult | null {
+    const rt = this.mobHost.runtimeOf(mobId);
+    const wasAlive = rt !== null && rt.alive;
     const r = this.mobHost.damage(mobId, amount, kind, fromDeg);
     if (r === null) return null;
     /* AI 的 `onDamage` 可能已把 hp 扣到 0 或负 —— 同步存活标记,
        否则 `tickMobs` 会继续推进一只已经死掉的生物。 */
-    const rt = this.mobHost.runtimeOf(mobId);
-    if (rt !== null && rt.hp <= 0) rt.alive = false;
+    const after = this.mobHost.runtimeOf(mobId);
+    if (after !== null && after.hp <= 0) after.alive = false;
+
+    /* ── task-44 接线:击杀结算(经验)──
+     *
+     * ## 为什么挂在 `damageMob` 而不是 `attackMob`
+     *
+     * `damageMob` 是**全部**生物伤害的唯一收口:玩家普攻(`attackMob`)、
+     * 技能、环境(熔岩/掉落)、陷阱、脚本全都经由它(`attackMob` 自己也是
+     * 调它)。挂在 `attackMob` 会漏掉「生物被熔岩烧死」「被陷阱打死」
+     * 这类同样该发经验的击杀。
+     *
+     * 手册 §「全队经验共享」判据是**按距离**而不是「谁补的刀」
+     * (`settleMobExp` 的入参是 participants 的 distance),所以这个位置
+     * 天然正确:不需要知道击杀者是谁,只需要知道击杀点在哪。
+     *
+     * ## 判据用 `wasAlive && !after.alive`
+     *
+     * 不能只看 `after.hp <= 0`:一具**尸体**再挨打时 hp 已经是 0,
+     * 那样每打一次都会「击杀」一次 —— 正是 task-33 实测过的
+     * 「为死掉的生物反复记账」。同理不能只看 `wasAlive`:活着但没打死
+     * 不该结算。两者合取才是「本次伤害**造成了**击杀」。
+     * 另外 `KillLedger` 做第二道去重(同一实例只结算一次),两道防线
+     * 各自独立:前者防「尸体反复结算」,后者防「同一怪被多路径结算」。 */
+    if (wasAlive && after !== null && !after.alive) {
+      this.settleKill(mobId, after.x, after.y);
+    }
     return r;
+  }
+
+  /**
+   * 击杀结算 —— 队伍经验共享 + 入账(task-44 接线)。
+   *
+   * 从 `damageMob` 调用(见那里的注释说明为什么是那个位置)。
+   * 返回 `ShareResult`,`null` 表示该怪不在 `MOB_BY_ID` 里(查不到等级/经验)。
+   */
+  private settleKill(mobId: string, x: number, y: number): ShareResult | null {
+    const def = MOB_BY_ID.get(mobId);
+    if (def === undefined) return null;
+
+    /* 参与者 = 所有「有成长档案的玩家」,距离取与击杀点的平面距离。 */
+    const participants = [];
+    let inRange = 0;
+    for (const id of this.playerIds) {
+      const p = this.progressOf(id);
+      const b = this.physics.bodies.get(id);
+      const dist = b === undefined ? Number.POSITIVE_INFINITY : Math.hypot(b.x - x, b.y - y);
+      if (dist <= SHARE_RADIUS) inRange += 1;
+      participants.push({
+        playerId: id,
+        distance: dist,
+        level: p.level,
+        afk: false,
+        hasDreamTalent: isTalentUnlocked(p.level, 'talent_dream_revelation'),
+      });
+    }
+
+    const result = settleMobExp(this.killLedger, {
+      mobInstanceId: mobId,
+      mobLevel: def.level,
+      baseExp: def.exp,
+      participants,
+    });
+
+    /* 入账:把 share 写进各玩家档案(含连续升级)。 */
+    const applied = applyShareResult(this.progresses, result);
+    for (const [id, p] of applied.progresses) this.progresses.set(id, p);
+    for (const [id, ev] of applied.events) {
+      if (ev.levelUps.length > 0) {
+        const list = this.pendingLevelUps.get(id) ?? [];
+        for (const lu of ev.levelUps) list.push({ from: lu.from, to: lu.to });
+        this.pendingLevelUps.set(id, list);
+      }
+    }
+
+    this.lastKillSettle = result;
+    this.killSettleCount += 1;
+    this.totalExpGranted += result.total;
+    void inRange;
+    return result;
+  }
+
+  /** 取(必要时新建)玩家成长档案。 */
+  progressOf(playerId: string): PlayerProgress {
+    let p = this.progresses.get(playerId);
+    if (p === undefined) {
+      p = createProgress(playerId);
+      this.progresses.set(playerId, p);
+    }
+    return p;
+  }
+
+  /** 某玩家当前成长档案的快照(供断言;不存在则返回 null)。 */
+  progressSnapshotOf(playerId: string): PlayerProgress | null {
+    return this.progresses.get(playerId) ?? null;
+  }
+
+  /** 取玩家幽灵泡泡状态(不存在 = 未倒地)。 */
+  downedOf(playerId: string): DownedState | undefined {
+    return this.downedStates.get(playerId);
+  }
+
+  /**
+   * 幽灵泡泡逐帧推进 + 队友触摸救援(task-44 接线)。
+   *
+   * ## 为什么触发条件读 `vitals.downed` 而不是自己判 HP
+   *
+   * 「HP 归零 ⇒ 倒地」的判定属于 `VitalsSystem`(`vitals.ts` 的
+   * `applyHit` 里置 `v.downed = true`)。若在这里再判一次
+   * `hp <= 0` 就出现了**两份实现了同一规则**——本仓明确把它当缺陷形态
+   * (`roomAtCell`/`forgeUnlocked` 的注释都记着这条)。
+   * ⇒ 这里只**消费** `vitals` 的判定结果,负责「判定之后的事」:
+   * 建泡泡、推进计时、处理救援。分工是「vitals 判瞬时、这里管持续」。
+   *
+   * ## 为什么救援判定放在慢帧
+   *
+   * 与房间效果同一理由:救援读条按 `dt` 折算,总量与帧率无关,
+   * 2Hz 足够(`REVIVE_TIME = 1.0s` 只需 2 个慢帧)。挂快帧只会
+   * 让同一份状态被查询 10 倍次数。
+   */
+  private tickDowned(): void {
+    const dt = SIM_SLOW_DT;
+    for (const id of this.playerIds) {
+      const v = this.vitals.get(id);
+      if (v === null) continue;
+      const st = this.downedStates.get(id);
+
+      /* 情况 1:刚倒地(vitals 说 downed,但还没有泡泡状态)⇒ 建泡泡。 */
+      if (v.downed && st === undefined) {
+        const body = this.physics.bodies.get(id);
+        const d = createDowned(
+          this.progressOf(id),
+          this.equipmentSnapshotOf(id),
+          body?.x ?? 0,
+          body?.y ?? 0,
+        );
+        this.downedStates.set(id, d);
+        continue;
+      }
+      /* 情况 2:没倒地但留着状态 ⇒ 清掉(复活后由本路径收尾)。 */
+      if (!v.downed) {
+        if (st !== undefined) this.downedStates.delete(id);
+        continue;
+      }
+      if (st === undefined) continue;
+
+      /* 情况 3:已倒地 —— 推进泡泡计时,并尝试队友触摸救援。 */
+      let d = tickGhostBubble(st, dt).downed;
+
+      /* 找最近的**其他**玩家作为救援者(自己捞不起自己)。 */
+      const body = this.physics.bodies.get(id);
+      let bestId: string | null = null;
+      let bestDist = Number.POSITIVE_INFINITY;
+      if (body !== undefined) {
+        for (const other of this.playerIds) {
+          if (other === id) continue;
+          const ov = this.vitals.get(other);
+          if (ov === null || ov.downed) continue;   /* 倒地的人救不了人 */
+          const ob = this.physics.bodies.get(other);
+          if (ob === undefined) continue;
+          const dist = Math.hypot(ob.x - body.x, ob.y - body.y);
+          if (dist < bestDist) { bestDist = dist; bestId = other; }
+        }
+      }
+
+      if (bestId !== null && bestDist <= TOUCH_RADIUS) {
+        const out = touchRevive({
+          downed: d,
+          rescuerId: bestId,
+          distance: bestDist,
+          dt,
+          progress: this.progressOf(id),
+        });
+        d = out.downed;
+        if (out.revived && out.result !== null) {
+          this.lastRevive = out.result;
+          /* 复活落账:把 HP 写回 `vitals`(半血)并清掉倒地标记。
+             这是「谁负责把状态机结果写回瞬时判定」的必要一步 ——
+             不写回的话 `vitals.downed` 仍是 true,下一帧又会重建泡泡,
+             表现为「复活了但立刻又倒下」。 */
+          this.vitals.revive(id, out.result.hpAfter);
+          this.downedStates.delete(id);
+          continue;
+        }
+      }
+      this.downedStates.set(id, d);
+    }
+  }
+
+  /** 玩家的装备栏快照(供倒地时冻结;零爆装由它保证)。 */
+  private equipmentSnapshotOf(playerId: string): EquipmentSnapshot {
+    const wearing = this.wearingOf(playerId);
+    const snap: EquipmentSnapshot = {
+      weapon: null, armor: null, helm: null, boots: null, relic: null, cape: null,
+    };
+    for (const id of wearing) {
+      const a = ARMOR_BY_ID.get(id);
+      if (a === undefined) {
+        if (snap.weapon === null) snap.weapon = id;
+        continue;
+      }
+      if (snap[a.slot] === null) snap[a.slot] = id;
+    }
+    return snap;
+  }
+
+  /**
+   * 灼烧 DoT 逐帧推进(task-44 接线)。
+   *
+   * 挂在**快帧**:`dps` 的单位是「每秒」,按 `DT` 折算到每帧,
+   * 总量与帧率无关。挂慢帧会让 3 秒的灼烧只结算 6 次(手感差异无必要引入)。
+   *
+   * ## ⚠ 为什么 DoT 要记住**点燃时的方向**(我自己踩的坑)
+   *
+   * 第一版给 `damageMob` 传的是硬编码 `fromDeg: 0`。实测同一玩家、同一武器、
+   * 同一只发条重骑,只因**站位在正面 / 背后**,灼烧总量是 **6.00 / 17.16** ——
+   * 差近 3 倍。
+   *
+   * 原因:`behaviors.ts` 的 `KnightAi.onDamage` 按**方向**判定正面护板减伤
+   * (`KNIGHT_FRONT_DR = 0.90`,正面只吃 10%),而它比对的正是
+   * `fromDeg - rt.facingDeg`。传死值 0 等于宣称「灼烧永远从 0° 方向来」——
+   * 伤害于是取决于**生物恰好朝哪边**,这是运气而不是设计。
+   *
+   * ⇒ 点燃时把那一击的真实方向存进任务,后续每跳沿用之。
+   * 语义是「灼烧源自那一次命中」,可复现、可解释。
+   *
+   * ## 仍然开放的设计问题(不在本轮裁决,如实记录)
+   *
+   * 「持续燃烧**该不该**再受正面护板影响」手册未规定 —— 直觉上
+   * 护板挡的是正面**冲击**,而已经烧在身上的火不该被护板挡第二次。
+   * 但改这个语义要动 `behaviors.ts`(不在本任务写域),且属机制裁决,
+   * 故本轮**只消除不确定性**,不替设计作决定。已报给 Lead。
+   */
+  private tickDots(): void {
+    if (this.dots.size === 0) return;
+    for (const [mobId, task] of [...this.dots]) {
+      const rt = this.mobHost.runtimeOf(mobId);
+      /* 生物已死 / 已移除 ⇒ 烧完的账直接清掉,不留孤儿任务。 */
+      if (rt === null || !rt.alive) { this.dots.delete(mobId); continue; }
+      const step = tickDot(task, DT);
+      if (step.damage > 0) {
+        /* DoT 走 `damageMob`(同一个收口)—— 于是灼烧**也能击杀**,
+           击杀同样触发经验结算,不需要在 DoT 里复制一份击杀判定。 */
+        this.damageMob(mobId, step.damage, DamageKind.FIRE, task.fromDeg);
+      }
+      if (step.expired) this.dots.delete(mobId);
+      else this.dots.set(mobId, step.task);
+    }
+  }
+
+  /**
+   * 点燃生物(由命中带 `dot` 的武器触发)。
+   *
+   * 同一生物重复点燃时**覆盖**而不是叠加:手册写的是「附加 8/s × 3s」,
+   * 没有「可叠层」的记载。用递增 key 保证方向性 —— 若用固定 key,
+   * 覆盖与不覆盖在外部不可区分。
+   */
+  private applyDot(
+    mobId: string,
+    dot: { element: Element; dps: number; sec: number },
+    fromDeg: number,
+  ): void {
+    this.dotSeq += 1;
+    this.dots.set(mobId, { ...makeDot(mobId, dot, `dot_${this.dotSeq}`), fromDeg });
+  }
+
+  /** 某生物当前是否有灼烧(供断言)。 */
+  dotOf(mobId: string): (DotTask & { fromDeg: number }) | undefined {
+    return this.dots.get(mobId);
   }
 
   /* ── Boss 副本的三个生产入口(WS-05)─────────────────────────────
@@ -1498,8 +1903,7 @@ export class WorldSim {
     };
   }
 
-  /** 登记一个「玩家」:物理刚体 + AOI 唤醒源,一次注册两处保持一致。 */  addPlayer(id: string, x: number, y: number): void {
-    this.physics.spawn(id, { x, y, z: 0 });
+  /** 登记一个「玩家」:物理刚体 + AOI 唤醒源,一次注册两处保持一致。 */  addPlayer(id: string, x: number, y: number): void {    this.physics.spawn(id, { x, y, z: 0 });
     this.aoi.registerMob(id, x, y);
     /* 记账 —— 供 syncPlayers 区分玩家与生物(两者都在 physics.bodies 里) */
     this.playerIds.add(id);
@@ -1515,6 +1919,10 @@ export class WorldSim {
     this.vitals.unregister(id);
     this.physics.bodies.delete(id);
     this.aoi.unregisterMob(id);
+    /* 房间效果状态一并清掉:留着会让重新加入的同名玩家**继承上一轮的温泉计时**
+       (表现为「刚上线就带着 20 分钟上限加成」)。 */
+    this.roomEffects.delete(id);
+    this.forgeUnlockedIds.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -1522,6 +1930,140 @@ export class WorldSim {
   /** 治疗玩家(料理 / 药水 / 队友技能)。返回实际回复量。 */
   healPlayer(id: string, amount: number): number {
     return this.vitals.heal(id, amount);
+  }
+
+  /* ═══════════ task-48:房间效果消费点 ═══════════ */
+
+  /**
+   * 每个玩家的房间效果状态(温泉计时 / 本帧在哪个房间)。
+   *
+   * 按玩家持有而不是全局:温泉增益是**个人**的(谁泡谁得),
+   * 而 `vitals` 里的 `hp`/`maxHp` 也是按玩家存的。
+   */
+  private readonly roomEffects = new Map<string, RoomEffectState>();
+  /**
+   * 最近一慢帧房间效果的施加结果(供诊断与断言)。
+   *
+   * 与 `lastMobTicks` / `lastLogisticsTick` 同一模式:把「这一帧给哪些玩家
+   * 施加了什么」暴露成可观测量。没有它,「增益没接」与「接了但这一帧恰好
+   * 没人站在房里」从外面看不出区别。
+   */
+  lastRoomEffects: { playerId: string; roomKey: string | null; healHp: number; maxHpMul: number; forgeUnlocked: boolean }[] = [];
+  /**
+   * 本慢帧**解锁了锻造**的玩家集合。
+   *
+   * ## 为什么单独存一个集合,而不是在 `forgeUnlocked()` 里重判一次
+   *
+   * 第一版 `forgeUnlocked()` 写的是 `playerRoomKey.get(id) === 'FORGE_MASTER'`,
+   * 即**绕过了 `stepRoomEffects` 的返回值自己又判了一遍**。
+   * 后果(由故障注入 J3 抓到):把 `effects.ts` 的 `forgeUnlocked: inForge`
+   * 改成恒 `false`,**没有任何断言变红** —— 那个返回字段根本没人读,
+   * 是个死字段。判定逻辑存在**两份实现**。
+   *
+   * 这正是本仓反复出现的病灶(`world_sim.ts` 里 `fluid.solid` 与
+   * `isSolidAt` 的双份判定、`components.ts` 与 `logistics.ts` 的双份搬运)。
+   * 两份判定**今天结果相同**,但迟早漂移 —— 而漂移时不报错,只是某一边失效。
+   *
+   * ⇒ 单一真相:判定只发生在 `stepRoomEffects` 里,本集合是它的**唯一出口**。
+   */
+  private readonly forgeUnlockedIds = new Set<string>();
+
+  /** 移动玩家到指定坐标(测试与传送用)。 */
+  setPlayerPos(id: string, x: number, y: number): void {
+    const b = this.physics.bodies.get(id);
+    if (b === undefined) return;
+    b.x = x;
+    b.y = y;
+    this.syncPlayers();
+  }
+
+  /**
+   * 该玩家当前是否处于【大师锻造房】内(手册:解锁中高级锻造)。
+   *
+   * 同步查询,读慢帧缓存的**单一真相**(`forgeUnlockedIds`)——
+   * 不在这里重新判一遍房间 key,否则判定会有两份实现,一边失效时不报错。
+   * 详见 `forgeUnlockedIds` 的注释(该字段是被故障注入 J3 逼出来的)。
+   */
+  forgeUnlocked(id: string): boolean {
+    return this.forgeUnlockedIds.has(id);
+  }
+
+  /** 某玩家的房间效果状态(供断言与 UI)。 */
+  roomEffectOf(id: string): RoomEffectState | undefined {
+    return this.roomEffects.get(id);
+  }
+
+  /**
+   * 推进全部玩家的房间效果一慢帧。
+   *
+   * ## 为什么挂在慢帧(2Hz)而不是快帧(20Hz)
+   *
+   * 与流体/电路/物流同一理由:房间识别本身就是慢帧产物
+   * (`refreshRooms`),本函数消费它的输出。挂在快帧只会读到同一份缓存
+   * 十次,徒增开销。代价是增益以 0.5s 为粒度施加 —— 对「每秒 15 HP」
+   * 这类持续性增益完全够用(按 `dt` 折算,总量与帧率无关)。
+   */
+  private tickRoomEffects(): void {
+    const dt = SIM_SLOW_DT;
+    const out: typeof this.lastRoomEffects = [];
+
+    /* 把 `lastRoomScan`(key)与 `lastRoomCells`(格集合)按下标配成一张表。
+       两者由 `refreshRooms` 同一次循环产出,长度必然相等;仍显式取 min,
+       避免将来任一侧单独改动时静默错位成「A 房的 key + B 房的格」。 */
+    const roomsView: { key: string | null; cells: readonly { x: number; y: number }[] }[] = [];
+    const n = Math.min(this.lastRoomScan.length, this.lastRoomCells.length);
+    for (let i = 0; i < n; i += 1) {
+      roomsView.push({ key: this.lastRoomScan[i].key, cells: this.lastRoomCells[i] });
+    }
+
+    for (const id of this.playerIds) {
+      const b = this.physics.bodies.get(id);
+      if (b === undefined) continue;
+
+      /* 玩家坐标定位到格:房间按格集合记录,必须 floor 到格再查。 */
+      const key = roomAtCell(roomsView, b.x, b.y);
+
+      let st = this.roomEffects.get(id);
+      if (st === undefined) {
+        st = createRoomEffectState();
+        this.roomEffects.set(id, st);
+      }
+      const r = stepRoomEffects(st, { roomKey: key, dt });
+      this.roomEffects.set(id, r.state);
+
+      /* 卧室回血:走既有 `vitals.heal` 接口 —— 它已处理「上限截断」
+         与「倒下不回血」两条边界,不在这里重写一遍。 */
+      if (r.healHp > 0) this.vitals.heal(id, r.healHp);
+
+      /* 锻造解锁:记录 `stepRoomEffects` 的**返回判定**,不在此重判。 */
+      if (r.forgeUnlocked) this.forgeUnlockedIds.add(id);
+      else this.forgeUnlockedIds.delete(id);
+
+      out.push({ playerId: id, roomKey: key, healHp: r.healHp, maxHpMul: r.maxHpMul, forgeUnlocked: r.forgeUnlocked });
+    }
+    this.lastRoomEffects = out;
+  }
+
+  /**
+   * 某玩家的**有效生命上限**(含房间增益)。
+   *
+   * ## 为什么不直接改 `PlayerVitals.maxHp`
+   *
+   * `vitals.ts` 明说 `maxHp` 是**构造期常量**,且 `importVitals` 刻意
+   * **不信任存档里的 maxHp**(见那里的注释)。若房间效果直接写 `maxHp`,
+   * 存档往返一次就把增益固化,离开温泉也回不去 —— 与那条不变量冲突。
+   *
+   * ⇒ 基准值留在 `vitals.maxHp`,增益在此**派生**。这样「离开即撤销」
+   * 天然成立,不需要任何反向记账(WT-03-64 的负对照钉住这条)。
+   */
+  effectiveMaxHp(id: string): number {
+    const v = this.vitals.get(id);
+    if (v === null) return 0;
+    const st = this.roomEffects.get(id);
+    /* 倍率走 `effects.ts` 的 `maxHpMulOf` —— 与 `stepRoomEffects` 同一个函数,
+       不在这里重写一遍条件(重写就是第二份实现,漂移时不报错)。 */
+    if (st === undefined) return v.maxHp;
+    return Math.round(v.maxHp * maxHpMulOf(st));
   }
 
   /** 复活玩家(满血)。 */
@@ -2262,6 +2804,18 @@ export class WorldSim {
     physics = this.physics.step(SIM_FAST_DT);
     this.syncPlayers();
 
+    /* ── 快帧 20Hz:灼烧 DoT(task-44)──
+     * ⚠ **必须在快帧、且用 `SIM_FAST_DT`**。
+     *
+     * 我第一版把它放进了下面的 `isSlow` 块(2Hz)却仍按 `DT = 0.05s` 折算,
+     * 于是每帧只扣 1/10 的量、烧 30 秒 —— 总伤害偏小一个数量级,
+     * 而「有没有烧」看不出差别(仍会跳数字)。`dps` 的单位是「每秒」,
+     * 只有「每帧一次 × 每帧实际时长」才让它与帧率无关。
+     *
+     * 位置在物理之后:AoI 的存活判定已由物理步同步,`tickDots` 才能看到
+     * 本帧的准确坐标与存活状态(见那里的 `!rt.alive` 清账分支)。 */
+    this.tickDots();
+
     if (this.mobsOn) {
       /* ── 慢帧 2Hz:AOI 唤醒 / 休眠 ──
          `update()` 才是**决定谁该被推进**的那一步;`stepActive` 只遍历
@@ -2396,6 +2950,18 @@ export class WorldSim {
          `refreshRooms` 自带脏标记,地形没动时是空操作。 */
       this.tickRelay();
       if (this.roomsDirty) this.refreshRooms();
+
+      /* ── 慢帧 2Hz:房间效果消费(task-48)──
+         必须在 `refreshRooms()` **之后**:本函数消费的正是识别结果
+         (`lastRoomScan` / `lastRoomCells`)。放在之前会读到上一帧的房间 ——
+         玩家盖好卧室的当帧拿不到增益,表现为「晚一帧才生效」。 */
+      this.tickRoomEffects();
+
+      /* ── 慢帧 2Hz:幽灵泡泡与救援(task-44)──
+         读 `vitals.downed`(VitalsSystem 的瞬时判定),负责其后的持续状态:
+         建泡泡 / 漂移计时 / 队友触摸救援。放在房间效果之后无依赖,
+         取「与其它玩家状态推进同处一地」便于阅读。 */
+      this.tickDowned();
 
       /* ── 慢帧 2Hz:刷怪决策 ── */
       if (this.mobsOn) {
