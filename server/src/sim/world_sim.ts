@@ -1610,20 +1610,28 @@ export class WorldSim {
     const def = MOB_BY_ID.get(mobId);
     if (def === undefined) return null;
 
-    /* 参与者 = 所有「有成长档案的玩家」,距离取与击杀点的平面距离。 */
+    /* 参与者 = 所有玩家,距离取与击杀点的平面距离。
+     *
+     * ⚠ **只给范围内**的玩家建档。第一版对全部 `playerIds` 都调 `progressOf`,
+     * 于是范围外(实测 40 格)的玩家也凭空多出一个 lv1/exp0 的档案。
+     * `totalExp` 仍是 0(没发经验,行为本身是对的),但「档案存在与否」
+     * 这个可观测值被污染了 —— 它不再等价于「这人参与过击杀」。
+     * 断言 `progressSnapshotOf(far) === null` 正是被这条抓出来的:
+     * 起初我以为是断言写得苛刻,查后确认是接线引入了无谓副作用。 */
     const participants = [];
-    let inRange = 0;
     for (const id of this.playerIds) {
-      const p = this.progressOf(id);
       const b = this.physics.bodies.get(id);
       const dist = b === undefined ? Number.POSITIVE_INFINITY : Math.hypot(b.x - x, b.y - y);
-      if (dist <= SHARE_RADIUS) inRange += 1;
+      if (dist <= SHARE_RADIUS && !this.progresses.has(id)) {
+        this.progresses.set(id, createProgress(id));
+      }
+      const p = this.progresses.get(id);
       participants.push({
         playerId: id,
         distance: dist,
-        level: p.level,
+        level: p?.level ?? 1,
         afk: false,
-        hasDreamTalent: isTalentUnlocked(p.level, 'talent_dream_revelation'),
+        hasDreamTalent: p === undefined ? false : isTalentUnlocked(p.level, 'talent_dream_revelation'),
       });
     }
 
@@ -1648,7 +1656,6 @@ export class WorldSim {
     this.lastKillSettle = result;
     this.killSettleCount += 1;
     this.totalExpGranted += result.total;
-    void inRange;
     return result;
   }
 
@@ -1735,25 +1742,38 @@ export class WorldSim {
         }
       }
 
-      if (bestId !== null && bestDist <= TOUCH_RADIUS) {
-        const out = touchRevive({
-          downed: d,
-          rescuerId: bestId,
-          distance: bestDist,
-          dt,
-          progress: this.progressOf(id),
-        });
-        d = out.downed;
-        if (out.revived && out.result !== null) {
-          this.lastRevive = out.result;
-          /* 复活落账:把 HP 写回 `vitals`(半血)并清掉倒地标记。
-             这是「谁负责把状态机结果写回瞬时判定」的必要一步 ——
-             不写回的话 `vitals.downed` 仍是 true,下一帧又会重建泡泡,
-             表现为「复活了但立刻又倒下」。 */
-          this.vitals.revive(id, out.result.hpAfter);
-          this.downedStates.delete(id);
-          continue;
-        }
+      /* ⚠ **不要在这里加 `bestDist <= TOUCH_RADIUS` 预检查** —— 我加过,是缺陷。
+       *
+       * `revive.ts` 的 `touchRevive` 已经把「距离越界」定义成**松手**:
+       * `if (input.distance > TOUCH_RADIUS) return { ...downed, reviveProgress: 0, rescuerId: null }`。
+       * 我在外面预先判一次并**跳过调用**,等于让那段归零逻辑永不执行:
+       * 实测救援者在半径内累积 0.5 进度、走远、再回来 —— 进度**被继承**,
+       * 下一次贴近直接凑满 1.0 复活。表现是「松手不清进度」,救援变得比设计容易。
+       *
+       * 这是本仓点名的「同一个概念长出第二份实现」缺陷形态
+       * (`effects.ts` 的死字段、`roomAtCell` 的两份判定都属此族):
+       * 两份判据今天同结果 ⇒ 注入只改一份时另一份顶着 ⇒ **断言全绿、缺陷隐身**。
+       * 注入实验 I9(去掉我这里那份)保持全绿,正是这个形态的实证。
+       *
+       * ⇒ 单一真相:距离判定只由 `touchRevive` 拥有,这里无条件委托给它。
+       * 无救援者时传 `+Infinity` —— 语义即「没人来救」,由它归零。 */
+      const out = touchRevive({
+        downed: d,
+        rescuerId: bestId ?? '',
+        distance: bestId === null ? Number.POSITIVE_INFINITY : bestDist,
+        dt,
+        progress: this.progressOf(id),
+      });
+      d = out.downed;
+      if (out.revived && out.result !== null) {
+        this.lastRevive = out.result;
+        /* 复活落账:把 HP 写回 `vitals`(半血)并清掉倒地标记。
+           这是「谁负责把状态机结果写回瞬时判定」的必要一步 ——
+           不写回的话 `vitals.downed` 仍是 true,下一帧又会重建泡泡,
+           表现为「复活了但立刻又倒下」。 */
+        this.vitals.revive(id, out.result.hpAfter);
+        this.downedStates.delete(id);
+        continue;
       }
       this.downedStates.set(id, d);
     }

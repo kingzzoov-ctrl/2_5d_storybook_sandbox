@@ -6,7 +6,6 @@
  */
 
 import { test, ok, eq, near, includes, inRange, mulberry32, report } from '../shared/testing/harness.ts';
-
 import {
   WEAPONS, WEAPON_BY_ID, BREACH_PICK, PRANK_HAMMER_KNOCKBACK, ARMORS, ARMOR_BY_ID,
   COMBAT_CONSUMABLES, COMBAT_ITEM_INDEX, COMBAT_ITEM_RANGE, Element, ELEMENT_COUNTER,
@@ -1998,6 +1997,454 @@ test('createTarget / targetFromStats:受击方档案可直接由战斗面板生�
   eq(shielded.shieldMax, 60, '自动补写 shieldMax');
   eq(shieldPercent(shielded), 1.0, '满护盾比例 1.0');
   eq(shieldPercent({ ...shielded, shield: 30 }), 0.5, '半护盾 0.5');
+});
+
+/* ══════════════ 零之二、生产路径:击杀结算 / 幽灵泡泡 / 装备词条(task-44 接线)══════════════
+ *
+ * 三个模块在接线前**生产零引用**(`verify.ts` 的 `UNREACHABLE_EXEMPT` 挂着
+ * 前两个的理由原文是「WS-10 击杀结算,待接入」「WS-10 复活/无敌,待接入」)。
+ *
+ * 接线前的实测缺口(经生产路径复现):
+ *   · 击杀 `mob_sheep` 后 `WorldSim` 上**没有任何经验账本可观测** —— 24 格共享
+ *     经验 / 连续升级 / 天赋钩子全部不生效;
+ *   · `vitals.downed` 变成 `true` 之后**没有后续** —— 不进幽灵泡泡、队友贴着
+ *     站 300 帧也救不起来;
+ *   · `713` 声明了 `dot: { dps: 8, sec: 3 }`、手册写着「每击附加 8/s × 3s 灼烧」,
+ *     但命中后跑满 60 帧(3s)生物 HP **纹丝不动**;`equipSummary` 还把护甲的
+ *     `keywords` 整个丢掉(729 的「吸血」靠硬编码 `lifestealPerHit` 兜的)。
+ *
+ * 与 task-33 同一纪律:下面每条都**经 `WorldSim` 真实入口**(以及真实生物 AI),
+ * 不复述纯函数行为 —— 纯函数那部分在接线前就已经全绿。
+ */
+
+/** 多玩家世界(经 `setMobPlayers` 灌装备,走装配层入口)。 */
+function partyWorld(
+  players: readonly { id: string; x: number; y: number; wearing?: readonly number[] }[],
+  mobId: string,
+  mobAt: readonly [number, number] = [25, 24],
+): WorldSim {
+  const s = new WorldSim({ sizeCells: 120 });
+  for (const p of players) s.addPlayer(p.id, p.x, p.y);
+  s.setMobPlayers(players.map((p) => ({
+    id: p.id, x: p.x, y: p.y, z: 0, facingDeg: 0, afk: false,
+    heldItem: 0, wearing: [...(p.wearing ?? [711])], playingInstrument: false,
+  })));
+  s.addMob(mobId, 'MEADOW', mobAt[0], mobAt[1]);
+  return s;
+}
+
+test('task44-1:击杀生物 → 队伍经验真的入账(接线前 WorldSim 无任何经验账本)', () => {
+  const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [712] }], 'mob_sheep');
+
+  /* 反例先立:接线前这条是红的 —— 击杀后经验恒为 0。 */
+  eq(s.progressSnapshotOf('p1'), null, '对照:击杀前该玩家还没有成长档案(账本不是构造时就预填的)');
+  eq(s.killSettleCount, 0, '对照:击杀前结算计数为 0');
+  eq(s.totalExpGranted, 0, '对照:击杀前累计发放经验为 0');
+
+  const rt = s.mobHost.runtimeOf('mob_sheep')!;
+  const r = s.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 })!;
+  eq(rt.alive, false, '一击击杀(前置:确实发生了击杀,否则下面测的是别的东西)');
+  eq(r.hpLoss, 60, '前置:本次造成 60 点掉血 = 绵羊满血(伤害足够致死)');
+
+  /* 正例:击杀真的结算了。 */
+  const p = s.progressSnapshotOf('p1')!;
+  ok(p !== null, '击杀后该玩家有了成长档案(账本由击杀这一事件创建)');
+  eq(s.killSettleCount, 1, '击杀结算计数 = 1');
+  eq(p.totalExp, 15, '入账总经验 = 绵羊 exp 15(接线前恒为 0)');
+  eq(p.level, 1, '15 经验不足以升到 2 级,等级仍是 1');
+  eq(s.totalExpGranted, 15, '累计发放经验 = 15');
+  eq(s.lastKillSettle!.deduped, false, '本次不是重复结算(去重账本首次 claim 成功)');
+});
+
+test('task44-2:尸体不能反复结算(击杀判定取「本次伤害造成击杀」而非「hp<=0」)', () => {
+  const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [712] }], 'mob_sheep');
+  s.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 });
+  const n1 = s.killSettleCount;
+  const e1 = s.totalExpGranted;
+  eq(n1, 1, '前置:第一次击杀结算了 1 次');
+
+  /* 反例:连打 10 次尸体 —— 一次都不能再结算。 */
+  for (let i = 0; i < 10; i += 1) s.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 });
+  eq(s.killSettleCount, n1, '连打 10 次尸体,结算计数不变(仍是 1)');
+  eq(s.totalExpGranted, e1, '累计经验不变(没有为死掉的生物反复记账)');
+
+  /* 正例对照:换一只**不同 ID** 的怪,必须能继续结算 —— 归零不能把正常路径吃掉。 */
+  s.addMob('mob_boar', 'MEADOW', 25, 24);
+  const rt2 = s.mobHost.runtimeOf('mob_boar')!;
+  for (let i = 0; i < 20 && rt2.alive; i += 1) s.attackMob('p1', 'mob_boar', { level: 20, weaponId: 712 });
+  eq(rt2.alive, false, '第二只怪被击杀');
+  eq(s.killSettleCount, 2, '第二只怪的击杀**也**结算了(计数 2)');
+  eq(s.totalExpGranted, 15 + 45, '累计经验 = 绵羊 15 + 野猪 45 = 60');
+});
+
+test('task44-3:24 格外不共享经验(负对照:范围外必须为 0)', () => {
+  /* ⚠ 这条断言的存在理由:若把两个玩家都放在**附近**(< 24 格),
+     那么「漏了距离判定」的实现**照样全绿** —— 因为「附近」满足「在范围内」。
+     ⇒ 必须有一个**范围外**的玩家当负对照。
+     这与 task-33 那条(「测钳制不生效,必须先证明输入落在不生效的那一侧」)同族。 */
+  const s = partyWorld([
+    { id: 'near', x: 24, y: 24, wearing: [712] },
+    { id: 'far', x: 24, y: 64, wearing: [712] },   /* 距击杀点 40 格 > SHARE_RADIUS */
+  ], 'mob_sheep');
+
+  /* 前置:先证明这个夹具**真的**把两人放在了范围内外两侧。 */
+  ok(40 > SHARE_RADIUS, `前置:40 格确实超出共享半径 ${SHARE_RADIUS}`);
+
+  s.attackMob('near', 'mob_sheep', { level: 20, weaponId: 712 });
+
+  eq(s.progressSnapshotOf('near')!.totalExp, 15, '范围内的玩家拿到 15 经验');
+  /* ⚠ 判据用 `totalExp`/**经验条目**,不用「档案是否存在」。
+     我第一版断言 `progressSnapshotOf('far') === null`,它**红**了 ——
+     查后确认:范围外的玩家确实拿到了 0 经验(行为正确),但被建了个空档案。
+     那是我接线引入的多余副作用,已修成「只给范围内建档」;
+     即便如此,**断言本身也该测行为(拿到多少经验)而不是副作用(档案在不在)**
+     —— 后者会在任何无关重构下变红,属脆弱断言。 */
+  const far = s.progressSnapshotOf('far');
+  eq(far?.totalExp ?? 0, 0, '范围外的玩家拿到 **0** 经验(负对照的核心)');
+  eq(far, null, '且范围外的玩家**不会**被建档(次生不变量:档案 = 参与过击杀)');
+
+  /* 更强的一条:结算条目里 far 的 share 必须是 0,而不是「压根没进列表」。 */
+  const farEntry = s.lastKillSettle!.entries.find((e) => e.playerId === 'far')!;
+  eq(farEntry.share, 0, '结算条目里 far 的 share = 0(在列表里但份额为 0)');
+  eq(farEntry.inRadius, false, 'far 被标记为不在半径内');
+  eq(s.lastKillSettle!.outOfRangeCount, 1, '结算结果记录「1 人在范围外被削减」');
+  eq(s.totalExpGranted, 15, '本次总发放只有范围内那一份');
+});
+
+test('task44-4:经验结算吃的是 progression 的等级,不是 attackMob 的 opts.level', () => {
+  /* ⚠ 这条钉住一个**已知的双源**,不是宣称它是正确的。
+     `attackMob({ level })` 是调用方自报、参与伤害;`progression` 的等级来自
+     击杀累积、参与经验压制。两者今天**恰好**都从 1 开始,所以看起来一致;
+     一旦 US2 把 opts.level 接上客户端报文,这里就会分叉。
+     ⇒ 断言把现状**写死并可见**,而不是留一个将来会静默分叉的隐形双源。 */
+  const results: number[] = [];
+  for (const lv of [1, 20]) {
+    const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [712] }], 'mob_sheep');
+    s.attackMob('p1', 'mob_sheep', { level: lv, weaponId: 712 });
+    results.push(s.totalExpGranted);
+  }
+  eq(results[0], 15, `opts.level=1 时入账 15(progression 等级 1,无压制)`);
+  eq(results[1], 15, `opts.level=20 时**同样**入账 15 —— 经验压制读的是 progression 的 lv1,不是 opts.level=20`);
+  /* 显式记录两者今天是同一个数,将来分叉时这条会红。 */
+  eq(results[0], results[1], '两者当前一致;若将来 US2 把等级权威统一到进度档案,本断言需同步改为「按 progression 等级压制」');
+});
+
+test('task44-5:HP 归零 → 进幽灵泡泡(vitals.downed 是唯一判据)', () => {
+  const s = partyWorld([
+    { id: 'p1', x: 24, y: 24 },
+    { id: 'p2', x: 40, y: 40 },   /* 队友先在远处,避免把人打死后立刻被救 */
+  ], 'mob_lava_elem', [24, 26]);
+
+  eq(s.downedOf('p1'), undefined, '对照:一开始没有泡泡状态');
+
+  let downedAt = -1;
+  for (let i = 0; i < 600; i += 1) {
+    s.tick();
+    if (s.vitals.get('p1')!.downed) { downedAt = i; break; }
+  }
+  ok(downedAt >= 0, `前置:确实在 600 帧内被打到 HP 归零(第 ${downedAt} 帧)`);
+
+  const d = s.downedOf('p1')!;
+  ok(d !== undefined, '倒地后有了幽灵泡泡状态(接线前 downed=true 但没有任何后续)');
+  eq(d.state, BodyState.GHOST_BUBBLE, '泡泡状态是 GHOST_BUBBLE');
+  eq(d.reviveProgress, 0, '刚倒计时救援进度为 0');
+  eq(d.rescuerId, null, '还没有救援者');
+  /* 零掉级 / 零爆装:倒地瞬间冻结的快照必须来自进度档案。 */
+  eq(d.levelSnapshot, s.progressSnapshotOf('p1')!.level, '倒地快照的等级 = 进度档案的等级(零掉级的前提)');
+});
+
+test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对照', () => {
+  /* ⚠ 反向对照是必须的:若只测「同格能救」,漏了距离判定的实现照样全绿。
+     实测边界:TOUCH_RADIUS=0.9,0.85 格能救、0.95 格不能。 */
+  const attempt = (dist: number): { revived: boolean; hp: number } => {
+    const s = partyWorld([
+      { id: 'p1', x: 24, y: 24 },
+      { id: 'p2', x: 24 + 40, y: 24 },   /* 先放远处 */
+    ], 'mob_lava_elem', [24, 26]);
+    for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+    /* 前置:此时确实倒地了。 */
+    if (!s.vitals.get('p1')!.downed) return { revived: false, hp: -1 };
+    s.setPlayerPos('p2', 24 + dist, 24);   /* 移到指定距离 */
+    for (let i = 0; i < 60; i += 1) {
+      s.tick();
+      if (s.lastRevive !== null) break;
+    }
+    return { revived: s.lastRevive !== null, hp: s.vitals.get('p1')!.hp };
+  };
+
+  /* 正例:0.3 格(明显在半径内)。
+     ⚠ 这个局部变量**不能叫 `near`** —— 会遮蔽导入的 `near()` 断言函数,
+     报错是运行时才出现的 `near is not a function`(TS 类型剥离不做作用域报错)。
+     踩过一次,留此注记。 */
+  const closeBy = attempt(0.3);
+  eq(closeBy.revived, true, '队友站 0.3 格(≤0.9)→ 触摸复活成功');
+  eq(closeBy.hp, 50, '复活血量 = 50% 上限(100 × REVIVE_HP_RATIO 0.5)');
+
+  /* 反向对照 1:0.95 格(刚好超出 0.9)。 */
+  const justOut = attempt(0.95);
+  eq(justOut.revived, false, '队友站 0.95 格(>TOUCH_RADIUS 0.9)→ **不能**复活(反向对照)');
+
+  /* 反向对照 2:3 格(明显在半径外)。 */
+  const far = attempt(3.0);
+  eq(far.revived, false, '队友站 3 格 → 不能复活(反向对照)');
+
+  /* ── 「中途松手,进度归零」—— 单一真相,由 revive.ts 拥有 ──
+   *
+   * ⚠ 这条是我修掉一个**自己引入的缺陷**后补的,值得完整记录。
+   *
+   * 我第一版在编排层写了 `if (bestId !== null && bestDist <= TOUCH_RADIUS)`
+   * 预检查,**跳过**越界时的 `touchRevive` 调用。而 `revive.ts` 正是用
+   * 「距离越界」表达**松手**:越界时它把 `reviveProgress` 归零。
+   * 跳过调用 = 那段归零永不执行 ⇒ 实测「贴身累积 0.5 → 走远 → 回来」
+   * 进度**被继承**,下一次贴近直接凑满 1.0 复活 —— 救援比设计更容易。
+   *
+   * 注入实验 I9(去掉我那份判据)保持**全绿** ⇒ 证明半径是两份实现、
+   * 且断言当时完全测不到这个语义。这正是 Lead 转述的 build-wiring 教训
+   * (「同一个概念的第二份实现」⇒ 死字段/缺陷隐身)在我这里的复现。
+   *
+   * 修法:距离判定只由 `touchRevive` 拥有,编排层无条件委托给它
+   * (无救援者时传 `+Infinity`)。下面这条钉住修复后的语义。 */
+  const release = ((): { carriedOver: boolean; afterReturn: number } => {
+    const s = partyWorld([
+      { id: 'p1', x: 24, y: 24 },
+      { id: 'p2', x: 64, y: 24 },
+    ], 'mob_lava_elem', [24, 26]);
+    for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+    /* 贴身 1 个慢帧(0.5s < REVIVE_TIME 1.0s ⇒ 不会复活)。 */
+    s.setPlayerPos('p2', 24.3, 24);
+    for (let i = 0; i < 10; i += 1) s.tick();
+    const built = s.downedOf('p1')?.reviveProgress ?? -1;
+    /* 走远(> TOUCH_RADIUS)。 */
+    s.setPlayerPos('p2', 30, 24);
+    for (let i = 0; i < 10; i += 1) s.tick();
+    const afterRelease = s.downedOf('p1')?.reviveProgress ?? -1;
+    /* 再回来 1 个慢帧 —— 若进度被继承会直接满,若从零则回到 0.5。 */
+    s.setPlayerPos('p2', 24.3, 24);
+    for (let i = 0; i < 10; i += 1) s.tick();
+    return { carriedOver: built > 0 && afterRelease > 0, afterReturn: s.downedOf('p1')?.reviveProgress ?? -1 };
+  })();
+  eq(release.carriedOver, false, '走远后救援进度归零(「中途松手进度归零」契约生效)');
+  near(release.afterReturn, 0.5, 1e-9, '回来后进度从 0 重新累积到 0.5,而不是继承走远前那 0.5');
+
+  /* ── 倒地者不能当救援者 ──
+   *
+   * ⚠ 这条是注入 I10 逼出来的**测试盲区**:
+   * 注入「去掉 `ov.downed` 过滤」时**全绿**,查后确认原因是
+   * **没有任何夹具含「倒地的救援者」** —— 我的 task44-6 把救援者放在远处,
+   * 而贴身夹具里两人会被熔岩同时打死(范围伤害),于是这条路径从未走到。
+   *
+   * 判据:直接把队友的 `downed` 置真,再看倒地者能否被「救活」。
+   * 若没有这条,「倒地者救倒地者」这个错误行为在测试里完全不可见。 */
+  const ghostRescuer = ((): { revived: boolean } => {
+    const g = partyWorld([
+      { id: 'p1', x: 24, y: 24 },
+      { id: 'p2', x: 64, y: 24 },
+    ], 'mob_lava_elem', [24, 26]);
+    while (!g.vitals.get('p1')!.downed) g.tick();
+    /* 把 p2 也标成倒地(直接置字段 —— 它是可变对象),再把它挪到 p1 身边。 */
+    const gv2 = g.vitals.get('p2')!;
+    gv2.downed = true;
+    gv2.hp = 0;
+    g.setPlayerPos('p2', 24.3, 24);
+    for (let i = 0; i < 40; i += 1) {
+      g.tick();
+      if (g.lastRevive !== null) break;
+      /* 每帧重置:避免被其它路径改动而干扰本断言。 */
+      g.vitals.get('p2')!.downed = true;
+    }
+    return { revived: g.lastRevive !== null };
+  })();
+  eq(ghostRescuer.revived, false, '倒地者(p2)站在 0.3 格也**救不了**人(倒地者不能当救援者)');
+});
+
+test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () => {
+  /* ⚠ 这条防的是一个我预见的失败模式:若复活后没把结果写回 `vitals`,
+     下一帧 `vitals.downed` 仍是 true → 又建一次泡泡 → 表现为
+     「复活了但立刻又倒下」。断言必须查**复活之后**的状态。 */
+  const s = partyWorld([
+    { id: 'p1', x: 24, y: 24 },
+    { id: 'p2', x: 64, y: 24 },
+  ], 'mob_lava_elem', [24, 26]);
+  for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+  eq(s.vitals.get('p1')!.downed, true, '前置:先倒地');
+  s.setPlayerPos('p2', 24.3, 24);
+  for (let i = 0; i < 60 && s.lastRevive === null; i += 1) s.tick();
+
+  ok(s.lastRevive !== null, '复活发生了');
+  eq(s.lastRevive!.method, ReviveMethod.TOUCH, '复活方式是 TOUCH');
+  eq(s.lastRevive!.levelUnchanged, true, '零掉级:复活后等级未变');
+  eq(s.lastRevive!.equipmentUnchanged, true, '零爆装:复活后装备栏未变');
+  eq(s.lastRevive!.invulnSec, 0.5, '复活后有 0.5s 无敌(MANUAL_REVIVE_INVULN)');
+
+  eq(s.vitals.get('p1')!.downed, false, '复活后 vitals.downed 归 false(写回了瞬时判定)');
+  eq(s.vitals.get('p1')!.hp, 50, '复活后 HP 为 50');
+  eq(s.downedOf('p1'), undefined, '复活后泡泡状态被清除');
+
+  /* ⚠ 「再跑一段确认没有立刻又倒下」这条我第一版写错了两次,值得记录。
+     第一次:夹具里熔岩**还在旁边**,p1 复活在 50 血后又被打空 ——
+     那是**预期行为**(世界里有持续伤害源),不是「状态没写回的死死循环」。
+     第二次:我想 `removeMob` 移走熔岩,但**编排层没有这个方法**。
+     ⇒ 最终做法:把 p1/p2 一起传送到远处(实测可行),再验证。
+     判据用 `totalTaken` —— 它只增不减,最能说明「没有再挨打」。 */
+  s.setPlayerPos('p1', 300, 300);
+  s.setPlayerPos('p2', 300, 300);
+  const takenAfterRevive = s.vitals.get('p1')!.totalTaken;
+  for (let i = 0; i < 40; i += 1) s.tick();
+  eq(s.vitals.get('p1')!.downed, false, '移开伤害源后 40 帧内没有再次倒地(排除状态未清的死循环)');
+  eq(s.vitals.get('p1')!.totalTaken, takenAfterRevive, 'totalTaken 未再增长 —— 确实没有再挨打');
+  eq(s.downedOf('p1'), undefined, '没有重新生成泡泡');
+});
+
+test('task44-8:713 命中 → 灼烧 DoT 真的逐帧扣血(原先生产零消费)', () => {
+  const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_tanuki');
+
+  /* 反例先立:接线前命中后 60 帧 HP 纹丝不动。 */
+  const rt = s.mobHost.runtimeOf('mob_tanuki')!;
+  const r = s.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 })!;
+  const afterHit = rt.hp;
+  ok(r.hpLoss > 0, `前置:命中确实造成了直伤 ${r.hpLoss}`);
+
+  const dot = s.dotOf('mob_tanuki');
+  ok(dot !== undefined, '命中带 dot 的武器后生物身上有点燃任务(接线前恒为 undefined)');
+  eq(dot!.dps, 8, '任务 dps 取自武器表 713 的 dot.dps = 8');
+  eq(dot!.remainSec, 3, '任务时长取自武器表 dot.sec = 3');
+
+  for (let i = 0; i < 60; i += 1) s.tick();   /* 3 秒 = 60 快帧 */
+  const burned = afterHit - rt.hp;
+  near(burned, 24, 1e-6, `3 秒灼烧总量 = ${burned}(期望 8/s × 3s = 24,接线前为 0)`);
+  eq(s.dotOf('mob_tanuki'), undefined, '3 秒后灼烧任务被清账(不留孤儿任务)');
+
+  /* ── 时间剖面:证明灼烧是「3 秒内均匀烧完」而不是「瞬间烧完」──
+   *
+   * ⚠ 这条是被注入 I13 逼出来的。把 `tickDot(task, DT)` 误写成
+   * `tickDot(task, SIM_SLOW_DT)`(0.5 而非 0.05)时:
+   *   总量仍是 24(= dps × sec,与 dt 无关)⇒ **上面那条总量断言全绿**;
+   *   但灼烧会在 **6 帧 = 0.3 秒**内烧完,而不是 3 秒。
+   * ⇒ 「总量」抓不到时钟错误,只有**时间剖面**能抓。
+   * 这是我 task-44 第一版的真实错误(在别处踩过同族):断言测了总量,
+   * 却没测「什么时候烧完」。 */
+  const prof = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_tanuki');
+  const prt = prof.mobHost.runtimeOf('mob_tanuki')!;
+  prof.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 });
+  const ph0 = prt.hp;
+  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 1s */
+  near(ph0 - prt.hp, 8, 1e-6, `t=1s 时已烧 8(1/3 总量)—— 若按错时钟此时已烧完 24`);
+  ok(prof.dotOf('mob_tanuki') !== undefined, 't=1s 时灼烧任务**仍在**(没提前结束)');
+  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 2s */
+  near(ph0 - prt.hp, 16, 1e-6, 't=2s 时已烧 16(2/3 总量)');
+  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 3s */
+  near(ph0 - prt.hp, 24, 1e-6, 't=3s 时恰好烧完 24');
+  eq(prof.dotOf('mob_tanuki'), undefined, 't=3s 时任务清除');
+
+  /* 反例:再跑 60 帧不应继续掉血(时长到了就该停)。 */
+  const hpAt3s = rt.hp;
+  for (let i = 0; i < 60; i += 1) s.tick();
+  near(rt.hp, hpAt3s, 1e-9, '再跑 3 秒 HP 不变(灼烧按时长结束,不是永久燃烧)');
+});
+
+test('task44-9:DoT 只在**命中**时点燃(挥空 / 无 dot 武器两个反向对照)', () => {
+  /* 反向对照 1:无 dot 的武器(711)不该点燃。 */
+  const a = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [711] }], 'mob_tanuki');
+  a.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 711 });
+  eq(a.dotOf('mob_tanuki'), undefined, '反向对照:711 没有 dot 字段 → 不点燃');
+
+  /* 反向对照 2:超距挥空(hpLoss=0)不该点燃。 */
+  const b = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_tanuki', [60, 60]);
+  const rb = b.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 })!;
+  eq(rb.hpLoss, 0, '前置:超距攻击 hpLoss = 0(确实挥空了)');
+  eq(b.dotOf('mob_tanuki'), undefined, '反向对照:挥空(hpLoss=0)→ 不点燃');
+
+  /* 反向对照 3:一击致死时不留「活了 0 帧」的幽灵任务。 */
+  const c = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_sheep');
+  const rc = c.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 713 })!;
+  eq(c.mobHost.runtimeOf('mob_sheep')!.alive, false, '前置:一击击杀');
+  eq(c.dotOf('mob_sheep'), undefined, '反向对照:一击致死 → 不挂灼烧(尸体上不留任务)');
+});
+
+test('task44-10:DoT 击杀同样结算经验(灼烧走同一个伤害收口)', () => {
+  /* 这条钉住「DoT 经 damageMob 而不是直接改 rt.hp」——
+     若 DoT 绕过收口,灼烧致死**不会**触发经验结算,而这在
+     「有没有掉血」的断言下完全看不出来。 */
+  const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_tanuki');
+  const rt = s.mobHost.runtimeOf('mob_tanuki')!;
+  /* 把血卡在「直伤打不死、但直伤 + 24 能烧死」的区间。 */
+  const probe = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_tanuki');
+  const direct = probe.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 })!.hpLoss;
+  rt.hp = direct + 12;
+
+  s.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 });
+  eq(rt.alive, true, '前置:直伤之后目标**仍然活着**(本击杀必须由灼烧完成)');
+  eq(s.killSettleCount, 0, '前置:此时还没有结算');
+
+  for (let i = 0; i < 60; i += 1) s.tick();
+  eq(rt.alive, false, '灼烧把目标烧死了');
+  eq(s.killSettleCount, 1, '灼烧致死**同样**触发击杀结算(证明 DoT 走的是同一个伤害收口)');
+  eq(s.totalExpGranted, 85, '入账的正是 mob_tanuki 的 exp 85');
+});
+
+test('task44-11:DoT 携带命中方向(fromDeg),不因站位运气改变总量', () => {
+  /* ⚠ 这条是我自己踩的坑:第一版给 DoT 传硬编码 `fromDeg: 0`,
+     而发条重骑的正面护板按方向减伤(KNIGHT_FRONT_DR=0.90)。
+     实测同一玩家、同一武器、只因站位不同,灼烧 2.40 vs 24.00 —— 差 10 倍。
+     传死值等于宣称「灼烧永远从 0° 来」,伤害取决于生物恰好朝哪边。
+     ⇒ 点燃时必须记住那一击的真实方向。
+
+     ## 为什么必须**冻结朝向**
+     骑士每帧 `facingDeg` 朝向最近玩家 ⇒ 只靠坐标无法区分正面/背后
+     (两侧都会被判成正面)。我第一次对照就是这样失效的:两个数都没变。
+     ⇒ 必须把 `rt.facingDeg` 钉住,变量才被隔离。 */
+  const burnFrom = (fromDeg: number): { burn: number; events: string[] } => {
+    const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [713] }], 'mob_clock_knight');
+    const rt = s.mobHost.runtimeOf('mob_clock_knight')!;
+    const r = s.attackMob('p1', 'mob_clock_knight', { level: 1, weaponId: 713, fromDeg })!;
+    const afterHit = rt.hp;
+    for (let i = 0; i < 60; i += 1) { rt.facingDeg = 0; s.tick(); }
+    return { burn: afterHit - rt.hp, events: r.events as string[] };
+  };
+
+  const front = burnFrom(0);     /* 骑士朝 0°,攻击也来自 0° → 正面 */
+  const back = burnFrom(180);    /* 骑士朝 0°,攻击来自 180° → 背后 */
+
+  includes(front.events, 'knight_front_plate', '正面击中触发护板事件(前置:方向确实被判成正面)');
+  eq(back.events.length, 0, '背后击中不触发护板事件(前置:方向确实被判成背后)');
+
+  near(front.burn, 2.4, 1e-6, `正面灼烧 = ${front.burn}(24 × 10%,护板吃掉了 90%)`);
+  near(back.burn, 24, 1e-6, `背后灼烧 = ${back.burn}(全额,未被护板削减)`);
+  ok(Math.abs(front.burn - back.burn) > 0.5,
+    '两侧灼烧**不同** ⇒ DoT 真的携带了命中方向(硬编码 fromDeg 时两侧会同值)');
+
+  /* 同一方向必须可复现 —— 排除「随机」。 */
+  const frontAgain = burnFrom(0);
+  near(frontAgain.burn, front.burn, 1e-9, '同一方向重复点燃,灼烧量完全一致(方向是唯一变量,结果确定)');
+});
+
+test('task44-12:护甲 keywords 被 equipSummary 丢弃(已知缺口,显式记录而非静默)', () => {
+  /* ⚠ 这条记录一个**我判定为「本轮不修」的缺口**,并说明理由。
+     不修的原因不是「不重要」,而是「改了会造假」:
+     729 的 `keywords: ['吸血','飞行']` 里,「吸血」由硬编码
+     `flags.lifestealPerHit = 3` 兑现,「飞行」**没有任何数值定义** ——
+     手册也没写飞行的高度/速度。若为了让 `keywords` 非空而把它塞进
+     `flags`,等于**凭空发明一套机制数值**,那比缺口更坏。
+     ⇒ 断言把「summary 不含 keywords」写死为**当前事实**,
+       将来真做了词条系统时这条会红,迫使实现者同步更新。 */
+  const sum = equipSummary([711, 729]);
+  eq('keywords' in sum, false, '当前事实:EquipSummary 不含 keywords 字段(护甲的 keywords 被丢弃)');
+  eq(sum.flags.lifestealPerHit, 3, '729 的「吸血」靠硬编码 flags 兑现(不是走 keywords)');
+  eq(ARMOR_BY_ID.get(729)!.keywords.length, 2, '729 表里**确实**声明了 2 条 keywords');
+
+  /* 反向对照:数值字段**没有**被丢弃 —— 证明问题只出在 keywords,不是整个 summary 坏了。 */
+  const sum2 = equipSummary([711, 724]);
+  eq(sum2.dodgeRate, 0.1, '反向对照:724 的 dodgeRate 0.10 正常进入 summary');
+  eq(sum2.hpBonus, 40, '反向对照:724 的 hpBonus 40 正常进入 summary');
+  /* 724 的 keywords 同样是 2 条却不体现在 summary 里 —— 与数值字段形成对照。 */
+  eq(ARMOR_BY_ID.get(724)!.keywords.length, 2, '对照:724 也有 2 条 keywords,但 summary 里同样看不到');
+  /* 两者差异只来自数值字段,不来自 keywords。 */
+  const a = attackWorld('mob_sheep', { wearing: [711, 724] });
+  const b = attackWorld('mob_sheep', { wearing: [711, 730] });
+  const ra = a.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 711 })!;
+  const rb = b.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 711 })!;
+  eq(ra.result.finalDamage, rb.result.finalDamage,
+    '两件 keywords 完全不同的护甲(724 vs 730)对伤害无影响 —— keywords 目前不参与伤害管线');
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */
