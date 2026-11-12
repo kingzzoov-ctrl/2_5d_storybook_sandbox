@@ -4181,8 +4181,28 @@ function runTests(): void {
         sumPassed += c.passed;
         sumTotal += c.total;
         counted += 1;
-        /* `WS-01.test.ts` → `WS-01`;`WS-FND-01.test.ts` → `WS-FND-01` */
-        const g = /(WS-[A-Z0-9-]+?)\.test\.ts$/.exec(rel)?.[1] ?? rel;
+        /* `WS-01.test.ts` → `WS-01`;`WS-FND-01.test.ts` → `WS-FND-01`;
+           `WS-FND-09-wiring.test.ts` → `WS-FND-09-wiring`。
+
+           ⚠️ 2026-11-13 task-69 修:原字符类 `[A-Z0-9-]` **不含小写**,
+           于是 `WS-FND-09-wiring.test.ts` 捕获失败 ⇒ 走 `?? rel` 兜底 ⇒
+           该组的键变成**整条相对路径** ⇒ 它既不匹配 `^WS-\d+$`(main 桶)
+           也不 `startsWith('WS-FND')`(fnd 桶)⇒ **两个分组桶都不进**,
+           但它的 14 条**已经**计进 `sumPassed`/`sumTotal`/`counted`(上面三行,在分组之前)。
+
+           后果(实测):汇总行打印
+             `用例汇总:1382 条通过(21 个套件;WS-01..11 共 922 条 / 12 套件;基座 446 条 / 8 套件)`
+           而 922 + 446 = **1368 ≠ 1382**,12 + 8 = **20 ≠ 21**。
+           **汇总行自己不自洽,而门禁全绿** —— 因为没人校验「小计和 == 总数」。
+
+           这正是本仓反复出现的形态(陷阱 67):**总量对不能推出分部正确**;
+           它这次出现在门禁**自己的打印行**上。读数的人会默认
+           「21 = 12 + 8」并据此判断"都对"。
+
+           修法两层:① 字符类放宽到 `[A-Za-z0-9-]`(认小写);
+           ② 加一条**自洽断言**(见下方 `sumOf(main) + sumOf(fnd) !== sumTotal`),
+           这样将来任何套件名再落在两个桶之外,门禁自己就红,而不是打印一行矛盾的字。 */
+        const g = /(WS-[A-Za-z0-9-]+?)\.test\.ts$/.exec(rel)?.[1] ?? rel;
         const prev = byGroup.get(g) ?? { passed: 0, total: 0 };
         byGroup.set(g, { passed: prev.passed + c.passed, total: prev.total + c.total });
       }
@@ -4202,6 +4222,24 @@ function runTests(): void {
     const parts: string[] = [];
     if (main.length > 0) parts.push(`WS-01..11 共 ${sumOf(main)} 条 / ${main.length} 套件`);
     if (fnd.length > 0) parts.push(`基座 ${sumOf(fnd)} 条 / ${fnd.length} 套件`);
+    /* ⚠️ 2026-11-13 task-69 加:汇总行必须**自洽**。
+       `main` + `fnd` 是"认得出名字"的分组;若某个套件的键落在这两桶之外
+       (例如文件名形态超出 `WS-NN` / `WS-FND-NN`,由分组正则兜底成整条路径),
+       它的断言数**仍计进 sumTotal**,却不进任何小计 ⇒ 打印出一行
+       「1382 条通过(21 个套件;… 922 条 / 12 套件;基座 446 条 / 8 套件)」
+       而 922+446≠1382、12+8≠21 —— **门禁全绿却自相矛盾**。
+       这里把它变成一条断言,而不是靠人读出来。 */
+    const groupedTotal = sumOf(main) + sumOf(fnd);
+    const groupedCount = main.length + fnd.length;
+    if (groupedTotal !== sumTotal || groupedCount !== counted) {
+      const unrouted = counted - groupedCount;
+      fail(
+        `用例汇总行不自洽:总数 ${sumTotal} 条 / ${counted} 套件,`
+        + `但分组小计只有 ${groupedTotal} 条 / ${groupedCount} 套件`
+        + `(差 ${sumTotal - groupedTotal} 条 / ${unrouted} 套件 ⇒ 有套件名未落进任何分组桶)。`
+        + '请检查 L4185 的分组正则是否认不出该套件文件名形态',
+      );
+    }
     pass(`用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`);
   }
 

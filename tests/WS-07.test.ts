@@ -13,6 +13,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_BYTES, CHUNK_CELLS, packTile, unpackTile } from '../shared/types/tile.ts';
 import { BASE_MOVE_SPEED, DT, TICK_HZ, BodyState } from '../shared/types/physics.ts';
+/* CR-24:`SC` 走 schema.ts(重导出面),`SH` 走 shared 本体。
+   引用相等断言在文件末尾 —— 它是「只有一份实现」的机器判据。 */
+import * as SC from '../server/src/net/schema.ts';
+import * as SH from '../shared/types/wire.ts';
 /* task-59:帧数算术的**外部标尺**(独立于接线路径)与双频常量。 */
 import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT } from '../server/src/sim/world_sim.ts';
 
@@ -4814,6 +4818,60 @@ test('N6 帧数只由**一处**驱动:不在 step() 之外重复推进', () => {
   const roomCode = room.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   const hits = roomCode.match(/host\.advance\(/g) ?? [];
   eq(hits.length, 1, `★ room.ts 里 host.advance 恰好 1 处(实测 ${hits.length})`);
+});
+
+/* ═══════════════ CR-24:上移后的「同一份实现」断言 ═══════════════ */
+
+/* 判据:**引用相等**(`Object.is`),不是「值相等」。
+ *
+ * 为什么必须是引用相等:
+ *   · `export * from '../../../shared/types/wire.ts'` = **编译期转发**
+ *     ⇒ `schema.FIELD_TABLE` 与 `wire.FIELD_TABLE` 是**同一个对象**
+ *     ⇒ 内容永远同步,**结构上不可能漂移**
+ *   · 若有人改成「在 schema.ts 里再写一遍」(两份实现)⇒ 引用相等**必然失败**
+ *   · 若有人写成「两份同步的拷贝」⇒ 值相等但引用不等 ⇒ **也失败** ✓
+ * ⇒ ★ 这把「同物两名(安全)」与「两份实现(CR-20,危险)」**用机器分开了**。
+ *   只写注释守不住这条 —— 注释不会在重定义时变红。 */
+test('CR-24:上移的 27 个符号在 schema.ts 与 wire.ts 是同一引用(只有一份实现)', () => {
+  const SHARED_27 = [
+    'FieldType', 'FIELD_TYPE_BYTES', 'POS_SCALE', 'quantizePos', 'dequantizePos', 'FieldSpec',
+    'EntityKind', 'ENTITY_KIND_LABEL', 'chunkKey', 'serializeChunkVersions', 'parseChunkVersions',
+    'tableFor', 'BossState', 'WildlifeState', 'ROOM_FIELD_TABLE',
+    'PlayerState', 'RoomState', 'cloneRoomState',
+    'StateFlagIndex', 'STATE_FLAG_NAMES', 'FsmIndex', 'FSM_NAMES', 'TelegraphShape', 'RoomMetaState',
+    'FIELD_TABLE', 'WILDLIFE_FIELD_TABLE', 'BOSS_FIELD_TABLE',
+  ];
+  /* 6 个是**纯类型**(interface),不产生运行时绑定 ⇒ 比不了引用,由 tsc 保证同一性 */
+  const TYPE_ONLY = new Set(['FieldSpec', 'BossState', 'WildlifeState', 'PlayerState',
+    'RoomState', 'RoomMetaState']);
+
+  let compared = 0;
+  for (const k of SHARED_27) {
+    if (TYPE_ONLY.has(k)) continue;
+    const a = (SC as unknown as Record<string, unknown>)[k];
+    const b = (SH as unknown as Record<string, unknown>)[k];
+    ok(a !== undefined, `${k} 在 schema.ts 上可见(重导出生效)`);
+    ok(b !== undefined, `${k} 在 wire.ts 上可见`);
+    ok(Object.is(a, b), `${k} 在 schema 与 shared 是**同一引用** ⇒ 只有一份实现`);
+    compared += 1;
+  }
+  eq(compared, 21, `运行时可比 21 个(27 − 6 纯类型),实测 ${compared}`);
+
+  /* 反向:那 16 个「留 server」的符号**不得**出现在 wire.ts —— 否则切分线被破坏 */
+  const SERVER_16 = ['createPlayerState', 'createRoomState', 'removePlayer', 'createWildlifeState',
+    'createBossState', 'upsertPlayer', 'upsertWildlife', 'upsertBoss', 'removeWildlife', 'removeBoss',
+    'bumpChunkVersion', 'fullMask', 'validateFieldTable', 'fieldBytes', 'entityPayloadBytes',
+    'MAX_FIELDS_PER_TABLE'];
+  for (const k of SERVER_16) {
+    ok((SH as unknown as Record<string, unknown>)[k] === undefined,
+      `${k} 是服务端状态管理,不得出现在 wire.ts`);
+    ok((SC as unknown as Record<string, unknown>)[k] !== undefined,
+      `${k} 仍在 schema.ts 上可见(对外面不变)`);
+  }
+
+  /* 总数:21 转发 + 16 自有 = 37(与上移前的运行时导出数一致 ⇒ 对外面零变化) */
+  eq(Object.keys(SC).length, 37, 'schema.ts 运行时导出仍为 37(对外面零变化)');
+  eq(Object.keys(SH).length, 21, 'wire.ts 运行时导出 21(= 27 − 6 纯类型)');
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

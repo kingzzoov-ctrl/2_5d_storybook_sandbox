@@ -9,6 +9,11 @@ import {
   test, ok, eq, near, includes, inRange, mulberry32, report,
 } from '../shared/testing/harness.ts';
 
+/* CR-24 上移后,「协议房间字段表」的行为判据从这里取。
+   ⚠️ 走 `schema.ts` 的对外面(它对 shared 是 `export * from` 编译期转发,
+      引用相等由 WS-07 的断言钉住)⇒ 本文件不需要直接认识 wire.ts。 */
+import { tableFor, EntityKind } from '../server/src/net/schema.ts';
+
 import {
   createManualClock,
   createRushOrderSession,
@@ -1603,9 +1608,20 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
     ok(!room.includes(absent),
       `room.ts 不含 ${absent} ⇒ 有枚举、无对局运行时`);
   }
-  /* 计分字段存在却无人驱动 —— 「有字段」不等于「有机制」。 */
-  const schema = readFileSync(join(ROOT, 'server', 'src', 'net', 'schema.ts'), 'utf8');
-  ok(/key: 'scoreA'/.test(schema), 'schema 有 scoreA 字段');
+  /* 计分字段存在却无人驱动 —— 「有字段」不等于「有机制」。
+   *
+   * ⚠️ 2026-11-13 改判据(CR-24 上移后**假红**,由 client-stage 修正):
+   *   原判据 `readFileSync('schema.ts')` + `/key: 'scoreA'/` ——
+   *   它声称的本体是「**协议**有 scoreA 字段」,而判据是「**schema.ts 这个文件**的文本有这一行」。
+   *   两者在重命名/上移时**必然分叉**:字段表移到 `shared/types/wire.ts` 后,
+   *   **事实仍成立**(协议确实声明了 scoreA),但文件文本里没有了 ⇒ 断言变红。
+   *   ⇒ 这是「判据的视野」≠「它声称的本体」,与陷阱 27/66 同族。
+   *
+   * ★ 改成**行为判据**:直接问协议的字段表里有没有这个字段 ——
+   *   它不依赖声明位置,而且**比文本匹配更强**(文本有这一行不代表表里真装了它)。
+   *   `tableFor` 从 `schema.ts` 取(重导出),所以这条仍走 schema.ts 的对外面。 */
+  const roomFields = tableFor(EntityKind.ROOM).map((f) => f.key);
+  ok(roomFields.includes('scoreA'), '协议的房间字段表含 scoreA(行为判据,不依赖声明位置)');
   const wildSim = readFileSync(join(ROOT, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
   ok(!wildSim.includes('partyMode'), 'world_sim 不含 partyMode ⇒ 计分字段无人驱动');
 

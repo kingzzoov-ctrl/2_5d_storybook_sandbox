@@ -135,7 +135,7 @@ upsertCount  u16
 
 **图例**:`✓对齐` = 两侧都能表达且语义一致;`缺失` = 客户端无对应表达;`★错配` = 两侧都有但语义/单位/下标不同。
 
-### 3.1 玩家 `FIELD_TABLE`(14 字段 · `server/src/net/schema.ts:85`)
+### 3.1 玩家 `FIELD_TABLE`(14 字段 · `shared/types/wire.ts:106`;切分前在 `schema.ts:85`)
 
 | bit | 字段 | 服务端类型/单位 | 客户端 | 判定 |
 | --: | :--- | :--- | :--- | :--- |
@@ -160,7 +160,7 @@ upsertCount  u16
 > 不是 11。错因:我把「14 − 3 − 1 = 10」算成了 14 − 3 − 0 = 11(漏了那 1 个错配)。
 > 这个错被 §8 的校验器复算抓出(它从表格逐行判定,不读我手写的小计)。
 
-### 3.2 野生动物 `WILDLIFE_FIELD_TABLE`(9 字段 · `:103`)
+### 3.2 野生动物 `WILDLIFE_FIELD_TABLE`(9 字段 · `shared/types/wire.ts:124`,切分前 `:103`)
 
 | bit | 字段 | 类型 | 客户端 | 判定 |
 | --: | :--- | :--- | :--- | :--- |
@@ -183,7 +183,7 @@ upsertCount  u16
 > `WILDLIFE.x` 也解到同一个 `Snapshot` 上,就会复现阶段 1 的 S1(两个语义共用一个变量)。
 > **⇒ 契约必须区分「本地玩家位置」与「远程实体位置」两个容器。**
 
-### 3.3 Boss `BOSS_FIELD_TABLE`(10 字段 · `:116`)—— ★ 阶段 3 画预警圈要用
+### 3.3 Boss `BOSS_FIELD_TABLE`(10 字段 · `shared/types/wire.ts:137`,切分前 `:116`)—— ★ 阶段 3 画预警圈要用
 
 | bit | 字段 | 类型/单位 | 客户端可表达? | 判定 |
 | --: | :--- | :--- | :--- | :--- |
@@ -220,7 +220,7 @@ upsertCount  u16
 `telegraphShape` 的 5 个取值里有 3 个(`SECTOR`/`RECT`/`RING`)**服务端发得出、客户端画不出**。
 **这是协议层的缺口,不是客户端缺口** —— 修它要动 `server/**`(或 `shared/**`),**请你裁决。**
 
-### 3.4 房间 `ROOM_FIELD_TABLE`(5 字段 · `:136`)
+### 3.4 房间 `ROOM_FIELD_TABLE`(5 字段 · `shared/types/wire.ts:157`,切分前 `:136`)
 
 | bit | 字段 | 类型 | 客户端 | 判定 |
 | --: | :--- | :--- | :--- | :--- |
@@ -589,3 +589,115 @@ Lead 扫的是 `tests/` + `scripts/` 里 `shared` 与 `readdirSync`/`.length ===
 - **未修改 `shared/**`、`server/**`、`client/**` 任何一行**(本轮纯只读复核)。
 - **未改 CR-24**、未动 `docs/CHANGE_REQUESTS.md`(Lead 写域)。
 - 临时探针 `_sp_*.ts` 全在仓库根,**已删除**;未写入 `scripts/`。
+
+---
+
+## 11. ✅ 切分已落地(CR-24 授权后执行)—— 含实测复核
+
+> §10 是**只读复核**;本节是**执行后的实测结果**。CR-24 裁决:(b) 按实测消费者切分 +
+> `export * from` 单向转发。**Lead 追加的机器判据「引用相等」已写成断言。**
+
+### 11.1 落点
+
+```
+新建 `shared/types/wire.ts`             341 行 / 14,317 B  ⇒ 21 运行时导出 + 6 纯类型
+  SHA-256 45C8B550449013124D005B1282FE32A31FB41F75DBE2343C6B9632DBCEBAC73E
+改写 `server/src/net/schema.ts`         201 行 /  7,387 B(原 442 行 / 16,448 B)
+  SHA-256 F9819CE5A537A2F660ABB99BDCCE1455FA6350B8496D95E5C717A8B55A8E8BE7
+  · 唯一转发 `export * from '../../../shared/types/wire.ts'`
+  · **不重新定义任何符号**(这条由断言守住,不靠注释)
+```
+**⇒ 21 + 16 = 37 = 上移前的运行时导出数 ⇒ 对外面零变化,没有任何 import 点需要改。**
+
+### 11.2 ★★ 关键判据:引用相等(把「同物两名」与「两份实现」用机器分开)
+
+**位置:`tests/WS-07.test.ts` 末尾,新增 1 条 `test(...)`(58 行)。**
+
+```
+运行时可比 **21 / 21 Object.is 相等** ✓ ⇒ **只有一份实现**
+纯类型 6 个比不了引用(无运行时绑定)⇒ 由 tsc 保证同一性
+反向:16 个 server 符号**零泄漏**进 wire.ts ✓
+```
+**为什么必须是引用相等而不是值相等**:
+```
+· `export * from` = **编译期转发** ⇒ 同一个对象 ⇒ 结构上不可能漂移
+· 「两份同步的拷贝」⇒ **值相等但引用不等 ⇒ 也失败** ✓
+⇒ ★ 只靠注释守不住:有人补一个 `export const X = ...` 覆盖同名,注释不会变红。
+```
+**故障注入(带生效自检)**:在 `schema.ts` 里重新定义一份 `FIELD_TABLE`
+```
+SHA  前 F9819CE5…  →  后 C654AA8C…   ⇒ **生效自检:内容确实变了** ✓
+断言**精确变红**:「FIELD_TABLE 在 schema 与 shared 是同一引用」
+连带 5 条既有断言也红(B01/B06/H03/H13/H17,字段数 14→1)⇒ 注入确实刺穿真实现
+还原 ⇒ SHA **逐字节**回到 F9819CE5… ✓
+```
+
+### 11.3 孤儿审计对比(锚)
+
+| | 基线 | 切分后 |
+| :--- | --: | --: |
+| 可达 | 70 | **70** ✓ |
+| 不可达 | 14 | **14** ✓(新增 **0**) |
+| 生产文件 | 84 | 84 |
+
+**⇒ `wire.ts` 在 `PROD_ENTRIES` 闭包内,未变成「未登记不可达」。§10.6 那条预告已实测确认。**
+
+### 11.4 ★ 切分暴露的一个真缺陷(已修)
+
+```
+tests/WS-11.test.ts 原判据:readFileSync('schema.ts') + /key: 'scoreA'/
+⇒ 它**声称**的本体是「**协议**有 scoreA 字段」,
+   判据却是「**schema.ts 这个文件**的文本有这一行」
+⇒ 上移后事实**仍成立**(tableFor(ROOM) 实测 = chunkVersions, partyMode, partyTimer,
+   **scoreA**, scoreB),但文件文本里没有了 ⇒ **假红**
+⇒ ★ 与陷阱 27/66 同族:**判据的视野 ≠ 它声称的本体**
+```
+**修法:换成行为判据** `tableFor(EntityKind.ROOM).some(f => f.key === 'scoreA')` ——
+不依赖声明位置,而且**比文本匹配更强**。WS-11 回到 85/85。
+
+### 11.5 勘误:「谁 import `schema.ts`」的精确名单(按 `path.resolve` 判,不按字符串)
+
+> ⚠️ 我此前两次口述这个名单,一次说 5 个、一次说 `room.colyseus.ts` 不 import ——
+> **两个名字相近的文件必须分开说**:`schema.ts`(线上格式,现 201 行)与
+> `schema.colyseus.ts`(44 个装饰器,Colyseus 版)。**用「schema」简称必然混淆。**
+
+**按 `path.resolve` 解析绝对路径统计**(不理字符写法 ⇒ 同目录 `./schema.ts` 也能命中):
+
+| 谁 | import 的是 | 说明 |
+| :--- | :--- | :--- |
+| `server/src/net/delta.ts` | **`schema.ts`** | 编码器 |
+| `server/src/net/room.ts` | **`schema.ts`** | 房间 |
+| `server/src/net/schema.colyseus.ts` | **`schema.ts`** | Colyseus 装配层(用字段表生成 `@type`) |
+| `tests/WS-07.test.ts` | **`schema.ts`** | 两处(原 import + CR-24 引用相等断言) |
+| `tests/WS-FND-04.test.ts` | **`schema.ts`** | — |
+| `tests/WS-FND-05.test.ts` | **`schema.ts`** | — |
+| `tests/WS-11.test.ts` | **`schema.ts`** | ★ CR-24 后我新增(行为判据要用 `tableFor`) |
+| `scripts/extension-drill.ts` | **`schema.ts`** | — |
+| `scripts/perf-bounds.ts` | **`schema.ts`** | — |
+| `server/src/net/room.colyseus.ts` | **`schema.colyseus.ts`** | ★ **不是** `schema.ts` |
+| `server/src/index.ts` | — | **两者都不 import** |
+
+**⇒ 切分前 8 个、切分后 9 个(我加了 WS-11)。**
+**⇒ 复核方法**:`for each import 声明 → path.resolve(dirname(file), spec) → 与目标的绝对路径比对`。
+**不能字符串比对** —— 同目录写法是 `./schema.ts`(不含 `net/`),
+而跨目录写法含 `net/`;只认一种就会漏掉同目录那一半。
+
+### 11.6 ⚠️ 仍未解决的一处:客户端 `TelegraphShape` 与 wire.ts 冲突
+
+```
+client/src/ui/boss_hud.ts:26  {CIRCLE:0, ANNULUS:1, CONE:2, LINE:3, CROSS:4}
+shared/types/wire.ts          {NONE:0, CIRCLE:1, SECTOR:2, RECT:3, RING:4}
+⇒ **5 个下标全部冲突** —— 切分**不解决**它,要等阶段 3 让 boss_hud 改从 shared 取
+```
+（`client/src/net/prediction.ts:13` 提到 `POS_SCALE` 但**只是注释**,不是第二份定义。）
+
+**另**:`client/src/ui/boss_hud.ts` 的 `TelegraphSpec`(12 字段)比协议能给的几何**更宽** ——
+`facing`/`spreadRad`/`innerRadius`/`length`/`width` 都不在 `BOSS_FIELD_TABLE` 里(§3.3)。
+⇒ 接线时 ANNULUS 的 `innerRadius` 只能由客户端自定,**这是玩法参数,不是同步字段**。
+
+```
+client/src/ui/boss_hud.ts:26  {CIRCLE:0, ANNULUS:1, CONE:2, LINE:3, CROSS:4}
+shared/types/wire.ts          {NONE:0, CIRCLE:1, SECTOR:2, RECT:3, RING:4}
+⇒ **5 个下标全部冲突** —— 切分**不解决**它,要等阶段 3 让 boss_hud 改从 shared 取
+```
+（`client/src/net/prediction.ts:13` 提到 `POS_SCALE` 但**只是注释**,不是第二份定义。）
