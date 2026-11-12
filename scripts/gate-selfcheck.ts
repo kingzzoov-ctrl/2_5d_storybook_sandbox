@@ -464,6 +464,8 @@ const CASES: Case[] = [
        而白名单会随接线单调收缩(43→35→27…)。写死会让本用例在每次接线后
        变成假失败,而不是真失败:它测的是「有没有写死」,
        写死一个随时会变的数字恰恰是它要防的病。
+     ⚠️ 2026-11-12 加严:「全部待接」这个前提已被 task-43 实测**证伪**,
+     口径改为「N 条中 M 条非欠账」⇒ **M 也必须取实测**。
        故改为「必须打印**当前实际条数**」—— 从 verify.ts 读同源常量。 */
     wantMsg: (() => {
       const src = readFileSync(join(ROOT, 'scripts', 'verify.ts'), 'utf8');
@@ -473,9 +475,25 @@ const CASES: Case[] = [
          白名单条目可以写成**多行**(理由用 `+` 拼接),而原先的正则
          无论是「同行闭合」还是「同行不闭合」都会漏计多行条目。
          实测:漏计 3 条 ⇒ 自检报假失败(26/27)。**这是 Lead 引入的 bug。** */
-      const n = [...src.slice(a, b).matchAll(/^\s*\['[^']+',/gm)].length;
-      /* 既断言「用了实测值」,也断言「没写死上一个值」 */
-      return new RegExp(`欠账构成\\(${n} 条全部待接`);
+      const body = src.slice(a, b);
+      const n = [...body.matchAll(/^\s*\['[^']+',/gm)].length;
+      /* ⚠️ 2026-11-12 加严(Lead):打印口径从「N 条**全部待接**」改成
+         「N 条中 M 条非欠账,余 N−M 条按卡点分类」—— 因为 task-43 实测证明
+         「全部待接」这个**假设是假的**(有 2 条非欠账:gate-only 与差集)。
+         ⇒ M 也**必须从源算**,不许写死。否则同一个病换个字段藏:
+           只断言 N,N 对了门禁就放行,而 M 可以随便写。
+         窄词在此**重复一份而非 import** —— 本文件的职责是**独立复算**;
+         若 import verify.ts 的正则,正则写错时两边一起错,自检就失去意义。 */
+      const reasons = [...body.matchAll(/^\s*\['[^']+',\s*'([^']+)'/gm)].map((m) => m[1]!);
+      const nonDebt = reasons.filter((r) => /gate-only/.test(r) || /差集/.test(r)).length;
+      const rules = src.slice(
+        src.indexOf('const WL_NON_DEBT_GATE'),
+        src.indexOf('const WL_BLOCK_MECHANISM'),
+      );
+      if (!/gate-only/.test(rules) || !/差集/.test(rules)) {
+        throw new Error('gate-selfcheck: WL_NON_DEBT_* 判据不见了');
+      }
+      return new RegExp(`欠账构成\\(${n} 条中 ${nonDebt} 条`);
     })(),
     args: ['--frozen'],
   },
