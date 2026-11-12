@@ -722,7 +722,9 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/build/autotile.ts', 'WS-03 自动贴图,待客户端接线'],
   ['server/src/build/blueprint.ts', 'WS-03 蓝图接力队列,待接入'],
   ['server/src/build/grid.ts', 'WS-03 建造网格,待接入'],
-  ['server/src/build/rooms.ts', 'WS-03 BFS 房间检测,待接入'],
+  ['server/src/build/rooms.ts',
+    'WS-03 BFS 房间检测,待接入;perf-bounds.ts 只 import 常量 DEFAULT_MAX_AREA 做内存估算,'
+    + 'BFS 本身生产零执行'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图,待客户端接线'],
   /* ══════════════════════════════════════════════════════════════════════
    * ⚠️ 为什么本表 22 条,而 `orphan-audit.ts` 只有 13 条?(差 9 条)
@@ -777,9 +779,14 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      服务端自己是权威,接进去等于「预测自己已经权威的东西」)。
      卡点是**客户端还没有网络层**(24 个文件里 0 个有 WebSocket/colyseus/fetch)。 */
   ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块)—— 等客户端网络层消费快照'],
-  ['server/src/party/modes.ts', 'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时)'],
+  ['server/src/party/modes.ts',
+    'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时);'
+    + '注意 data-conformance.ts 只 import 它的**常量**(CROWN_WIN_SEC 等)与手册比对,'
+    + '不代表 738 行**逻辑**被接线 —— 引用 ≠ 执行'],
   ['server/src/party/scoring.ts', 'WS-11 计分,待接入'],
-  ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个)'],
+  ['server/src/prank/immunity.ts',
+    'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个);'
+    + 'data-conformance.ts 只读它的常量,逻辑未接'],
   ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个)'],
   ['server/src/social/afk.ts', 'WS-11 挂机攒露水,等房间每帧驱动(与 room 的 AFK 同名异义)'],
   /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
@@ -1198,9 +1205,18 @@ function relOfPath(p: string): string {
   return relative(ROOT, p).split(sep).join('/');
 }
 
-/** 在 `server/src` / `client/src` / `shared` 下按文件名找(用于裸文件名引用)。 */
+/** 在 `server/src` / `client/src` / `shared` / `client` / **`scripts`** 下按文件名找
+ *  (用于裸文件名引用)。
+ *
+ *  ⚠️ `scripts` 是**必须**的:白名单理由会引用门禁脚本(如
+ *  「data-conformance.ts 只读它的常量」),而本函数原先漏了它 ⇒
+ *  把**真实存在**的脚本报成「引用的文件不存在」—— 一个**假失败**。
+ *
+ *  ⇒ 这与 `docs/ARCH-GAPS.md` 记的那条盲区**是同源的**:
+ *    「`scripts/**` 算不算生产侧」在这道门禁里表现为「算不算可被引用的文件」。
+ *    **同一个概念上的疏漏,在两个地方独立地长了出来。** */
 function findFileByName(name: string): string | null {
-  for (const d of ['server/src', 'client/src', 'shared', 'client']) {
+  for (const d of ['server/src', 'client/src', 'shared', 'client', 'scripts']) {
     const base = join(ROOT, d);
     if (!existsSync(base)) continue;
     const hit = walk(base, [name.slice(name.lastIndexOf('.'))]).find((f) => f.endsWith(sep + name));
