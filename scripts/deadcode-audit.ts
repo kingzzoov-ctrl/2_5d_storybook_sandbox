@@ -45,6 +45,7 @@
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve, dirname } from 'node:path';
+import { extractRelativeImports } from './imports.ts';
 
 const ROOT = process.cwd();
 const PROD_ROOTS = ['server/src', 'client/src'];
@@ -169,8 +170,26 @@ for (const entry of PROD_ENTRIES) {
     const s = byAbs.get(P(p));
     if (!s || reachable.has(s.path)) return;
     reachable.add(s.path);
-    for (const m of s.linker.matchAll(/from\s*['"](\.[^'"]+)['"]/g)) {
-      const hit = byAbs.get(resolve(dirname(s.abs), m[1]).replace(/\\/g, '/'));
+    /* ⚠️ **不要在这里写 `matchAll(/from\s*['"]…/)`** —— 那正是本处的原缺陷。
+     *
+     * 旧实现只认 `from`,漏掉**裸副作用导入**与**动态导入**:
+     * ```
+     * server/src/sim/world_sim.ts:108   import '../wiring/components.ts';   ← 裸副作用
+     * ⇒ wiring/components.ts **不在可达闭包内**
+     * ⇒ 本脚本把它报为「[真缺陷] 注册了行为但没有任何生产文件 import 它」
+     * ⇒ **而那句结论是假的** —— :108 就 import 了它
+     * ```
+     * 实测(2026-11-12,build-wiring 只读审计发现 + Lead 复核):
+     * ```
+     * 只认 from:  46 个文件,wiring/** 2 个
+     * 全形态  :  47 个文件,wiring/** 3 个
+     * 差异    :  server/src/wiring/components.ts   ⇒ 现行真实缺陷,不是潜伏
+     * ```
+     * 根因是**两份实现**(`verify.ts` 那份已认全形态,本文件这份没有)—— 陷阱 31/41。
+     * ⇒ 已抽到 `scripts/imports.ts` 作为**单一事实来源**,两边都用它。
+     *   **不要在本地再维护一份 import 正则。** */
+    for (const spec of extractRelativeImports(s.linker)) {
+      const hit = byAbs.get(resolve(dirname(s.abs), spec).replace(/\\/g, '/'));
       if (hit) dfs(hit.path);
     }
   })(entry);

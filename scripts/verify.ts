@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { FluidField } from '../server/src/world/fluid.ts';
 import { collectOpenItems, detectStale } from './backlog.ts';
 import { ENTRY_LOAD_EXEMPT } from './entry_load_exempt.ts';
+import { extractRelativeImports } from './imports.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 
@@ -1122,108 +1123,11 @@ function resolveImport(fromAbs: string, spec: string): string | null {
   return null;
 }
 
-/**
- * 提取**代码态**下的相对导入路径。
- *
- * **为什么不用正则 + `stripCommentsOnly`**(那是 S26 之前的写法,已被实测证伪):
- * `stripCommentsOnly` 保留字符串内容,于是下面这些**字符串字面量**里的
- * `from './x.ts'` 会被误当成依赖(四种形态实测**全部误抓**):
- *
- * ```ts
- * export const msg = "failed from './combat/damage.ts'";
- * export const q   = "src from '../a/b.ts' here";
- * export const t   = `load from './c.ts'`;
- * ```
- *
- * 后果:**幽灵依赖** ⇒ 该模块被误判为可达 ⇒ 不可达数偏小。
- * 若幽灵指向白名单模块,会因「已可达」自检而暴露;若指向未登记模块,
- * **告警会静默消失** —— 那是掩盖方向,必须消除。
- *
- * 本函数逐字符扫描:跳过注释与字符串的**内容**,只在代码态识别
- * `import` / `from` 关键字,再读紧随其后的字符串字面量作为路径。
- */
-function extractRelativeImports(text: string): string[] {
-  const out: string[] = [];
-  const n = text.length;
-  const isId = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9_$]/.test(c);
-  let i = 0;
-  while (i < n) {
-    const c = text[i] as string;
-    /* 注释:整段跳过 */
-    if (c === '/' && text[i + 1] === '*') { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
-    if (c === '/' && text[i + 1] === '/') { const e = text.indexOf('\n', i); i = e < 0 ? n : e; continue; }
-    /* 字符串:整段跳过(**这里正是旧实现漏掉的**) */
-    if (c === "'" || c === '"' || c === '`') {
-      const q = c;
-      i += 1;
-      while (i < n) { if (text[i] === '\\') { i += 2; continue; } if (text[i] === q) { i += 1; break; } i += 1; }
-      continue;
-    }
-    /* 代码态标识符 */
-    if (isId(c) && !isId(text[i - 1])) {
-      let j = i;
-      while (j < n && isId(text[j])) j += 1;
-      const word = text.slice(i, j);
-      if (word === 'import' || word === 'from') {
-        let k = j;
-        while (k < n && /\s/.test(text[k] as string)) k += 1;
-        /* ★ 动态 `import(...)`(2026-11-12 补,原为已登记盲点 (g))
-         *
-         * 旧实现只认 `import`/`from` 后**紧跟**的字符串 ⇒ **动态导入全部漏掉**:
-         * ```
-         * await import('./x.ts')        ⇒ 漏
-         * import('./y.ts').then(...)    ⇒ 漏
-         * await import(`./z.ts`)        ⇒ 漏(模板串)
-         * ```
-         * ⇒ 后果是**幽灵依赖的反方向**:真实的依赖边**缺失** ⇒ 该模块被报「不可达」
-         *   ⇒ 不可达数偏大 ⇒ 白名单被迫覆盖本该可达的模块(与 task-32 那个
-         *     「客户端入口漏登记」的方向**同族**,那次是 16 条 `client/**` 带着假理由长期挂白名单)。
-         *
-         * ⇒ 实测当前生产侧动态相对导入 **0 处**(`server/src` + `client/src` + `shared`),
-         *   所以这是**潜伏**缺口而非现行失败 —— 但本仓已因这类「口径比事实窄」栽过多次
-         *   (见 `docs/PROGRESS.md` 陷阱 44/46:门禁看不见执行、提取口径与事实不符)。
-         *
-         * ⚠️ 不要误抓 `import.meta`(`.` 不是 `(` 也不是引号,天然不匹配)——
-         *   本仓 `verify.ts` 自己就用了 `import.meta.url` / `import.meta.main`。
-         *   我的 T33 自检会跑 `import('./scripts/verify.ts')`,也是靠这条判据解析的。 */
-        if (text[k] === '(') {
-          let m = k + 1;
-          while (m < n && /\s/.test(text[m] as string)) m += 1;
-          const dq = text[m];
-          if (dq === "'" || dq === '"' || dq === '`') {
-            let e = m + 1;
-            let spec = '';
-            while (e < n) {
-              if (text[e] === '\\') { spec += text[e + 1]; e += 2; continue; }
-              if (text[e] === dq) break;
-              spec += text[e]; e += 1;
-            }
-            if (spec.startsWith('.')) out.push(spec);
-            i = e + 1;
-            continue;
-          }
-        }
-        const q = text[k];
-        if (q === "'" || q === '"') {
-          let e = k + 1;
-          let spec = '';
-          while (e < n) {
-            if (text[e] === '\\') { spec += text[e + 1]; e += 2; continue; }
-            if (text[e] === q) break;
-            spec += text[e]; e += 1;
-          }
-          if (spec.startsWith('.')) out.push(spec);
-          i = e + 1;
-          continue;
-        }
-      }
-      i = j;
-      continue;
-    }
-    i += 1;
-  }
-  return out;
-}
+/* ⚠️ `extractRelativeImports` 已抽到 `scripts/imports.ts`(**单一事实来源**)。
+   理由:`deadcode-audit.ts` 里那份只认 `from`,漏裸副作用导入 ⇒
+   实测把 `wiring/components.ts` 误报成「真缺陷」(而 `world_sim.ts:108` 就 import 了它)。
+   两份口径必然漂移 —— 本仓陷阱 31/41 的形态。已改为两边 import 同一份。
+   ⚠️ 不要在这里再写一份。 */
 
 /**
  * 在**代码态**下依次产出源码里的标识符、字符串字面量、以及分界符。
