@@ -684,10 +684,14 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/content/baseline.ts', 'WS-03 内容基线登记,待接入'],
   ['server/src/content/handshake.ts', '内容握手协议,待接入'],
   ['server/src/content/registry.ts', '内容注册表,待接入'],
-  ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,待接入'],
+  /* 以下六条由 task-38 / task-41 **实测**判定:不是缺接线动作,是**等的宿主不存在**。
+     理由从笼统的「待接入」改成「等什么」——
+     笼统说法会让人以为「有人动手就能接」,那正是**误报掩盖**:
+     它掩盖「上游结构不存在」,让后来的执行者白费一轮。 */
+  ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2)'],
   ['server/src/db/driver.sqlite.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
   ['server/src/db/memory_db.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
-  ['server/src/mobs/taming.ts', 'WS-04 牧场驯服,待接入'],
+  ['server/src/mobs/taming.ts', 'WS-04 牧场驯服,等宠物容器 + 驯服交互(tameItem 无人消费)'],
   /* `net/prediction.ts` 已于 2026-11-12 **搬迁**到 `client/src/net/`,
      不是接线 —— 它本就是客户端模块,放在 `server/src/` 下是放错位置。
      理由改写成「等客户端网络层」而非「待接线」:
@@ -695,11 +699,11 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      服务端自己是权威,接进去等于「预测自己已经权威的东西」)。
      卡点是**客户端还没有网络层**(24 个文件里 0 个有 WebSocket/colyseus/fetch)。 */
   ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块)—— 等客户端网络层消费快照'],
-  ['server/src/party/modes.ts', 'WS-11 竞技模式状态机,待接入'],
+  ['server/src/party/modes.ts', 'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时)'],
   ['server/src/party/scoring.ts', 'WS-11 计分,待接入'],
-  ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫,待接入'],
-  ['server/src/prank/toys.ts', 'WS-11 玩具,待接入'],
-  ['server/src/social/afk.ts', 'WS-11 挂机/生态箱,待接入'],
+  ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个)'],
+  ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个)'],
+  ['server/src/social/afk.ts', 'WS-11 挂机攒露水,等房间每帧驱动(与 room 的 AFK 同名异义)'],
   /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
      经 `WorldSim` 的慢帧 `tickLogisticsStep` 驱动。已从本表摘除。 */
 ]);
@@ -758,7 +762,18 @@ const WL_BLOCK_CLIENT_SHELL = /本仓无装配入口|客户端子系统/;
    否则又会把服务端那批「待客户端接线」先抓走(见上方实测 19/22/9/0 vs 16/25/9/0)。 */
 const WL_BLOCK_CLIENT_MECH = /客户端网络层|客户端运行时|客户端装配层/;
 const WL_BLOCK_DEPENDENCY = /three|依赖未安装|相容层/;
-const WL_BLOCK_MECHANISM = /随.*一起接|尚未注入|被.*聚合/;
+/* 「等对局层 / 等上游结构」= 上游结构不存在,不是缺接线动作。
+   依据:task-38 与 task-41 两个独立任务都用**实测**证明这些模块等的是不存在的宿主。
+
+   ⚠️ 关键设计:**用句式而不是枚举名词**。
+   我第一版写的是枚举(`等对局层|等上游结构`),加完理由就漏了 5 条
+   (taming 等「宠物容器」/ modes 等「对局运行时」/ immunity+toys 等「宿主」/
+   afk 等「每帧驱动」)—— 因为它们的**名词各不相同**。
+   枚举式规则有个致命性质:**它随条目腐坏** —— 新写一条理由就多一个静默口袋,
+   而口袋本身不会报错(未归类若不检查就只是数字变一下)。
+   改成句式:「等」之后 14 字内出现**结构性名词后缀**(层/容器/线/运行时/宿主/驱动/管线)。
+   实测:22 条全部分类,**且 12 条「待接」式一条都没被误吞**(见下方顺序注释)。 */
+const WL_BLOCK_MECHANISM = /随.*一起接|尚未注入|被.*聚合|等.{0,14}(?:层|容器|线|运行时|宿主|驱动|管线)/;
 /* 「缺接线动作」与「等人拍板」是两件事,不可混。当前 43 条全是前者:
    没有一条是「本可做、但等产品决定」的 —— 所以 decision 预期恒 0。 */
 const WL_BLOCK_WIRING = /待接|等编排层接线|待客户端接线/;
@@ -3086,13 +3101,22 @@ async function checkIntegration(): Promise<void> {
      所以有信息量的是构成,不是总数。这里把构成与 README 对齐。 */
   {
     const wlNow = whitelistBreakdown();
-    const re = /欠账构成:[^\n]*?等客户端入口\s*(\d+)[^\n]*?等编排层接线\s*(\d+)[^\n]*?等服务端机制\s*(\d+)[^\n]*?等裁决\s*(\d+)/g;
+    /* ⚠️ 每个桶都必须被捕获 —— 否则该桶成为**静默口袋**:
+       README 可以随便写,而门禁读不到它,于是恒绿。
+       本轮实测过这个缺陷:我新增「等客户端机制」桶时正则没跟着改,
+       注入「等客户端机制 999」门禁**仍然全绿**。
+       两个可选桶(客户端机制 / 外部依赖)是「仅在非 0 时出现」的设计,
+       所以写成可选组、读到缺省即 0 —— 而不是把它们排除在校验外。 */
+    const re = /欠账构成:[^\n]*?等客户端入口\s*(\d+)[^\n]*?等编排层接线\s*(\d+)[^\n]*?等服务端机制\s*(\d+)(?:[^\n]*?等客户端机制\s*(\d+))?(?:[^\n]*?等外部依赖\s*(\d+))?[^\n]*?等裁决\s*(\d+)/g;
     /* 用 matchAll 而非 match:**首匹配会被"影子行"绕过** ——
        任意位置先放一行正确数字,后面改错的行就永远读不到(复核者实测三种藏法全部退出 0)。
        要求恰好 1 处,多一处也报错。 */
     const ms = [...readmeText.matchAll(re)];
     if (ms.length === 0) {
-      fail('README.md 里找不到「欠账构成:等客户端入口 N / 等编排层接线 N / 等服务端机制 N / 等裁决 N」—— 无法校验欠账口径');
+      fail(
+        'README.md 里找不到「欠账构成:等客户端入口 N / 等编排层接线 N / 等服务端机制 N'
+          + ' [/ 等客户端机制 N] [/ 等外部依赖 N] / 等裁决 N」—— 无法校验欠账口径',
+      );
     } else if (ms.length > 1) {
       fail(
         `README.md 里出现 ${ms.length} 处「欠账构成」行 —— 只校验首处会让其余成为影子行,` +
@@ -3100,8 +3124,17 @@ async function checkIntegration(): Promise<void> {
       );
     } else {
       const g = ms[0]!;
-      const got = [Number(g[1]), Number(g[2]), Number(g[3]), Number(g[4])];
-      const want = [wlNow.clientShell, wlNow.wiring, wlNow.mechanism, wlNow.decision];
+      /* 可选桶捕获不到时是 undefined ⇒ 必须按 0 读。
+         **不能 `Number(undefined)`** —— 那是 NaN,而 NaN 与任何值都不相等,
+         会让校验**永远失败**,即从一个静默口袋换成一道永远红的门。 */
+      const num = (v: string | undefined): number => (v === undefined ? 0 : Number(v));
+      const got = [
+        num(g[1]), num(g[2]), num(g[3]), num(g[4]), num(g[5]), num(g[6]),
+      ];
+      const want = [
+        wlNow.clientShell, wlNow.wiring, wlNow.mechanism,
+        wlNow.clientMech, wlNow.dependency, wlNow.decision,
+      ];
       /* `other` 必须一并断言:否则将来一条「等 Lead 定 API 形态」(含「等」但不含「接|注入」)
          会落入 other 而**不参与校验** ⇒ 门禁静默。这是复核者指出的缺口。 */
       if (wlNow.other > 0) {

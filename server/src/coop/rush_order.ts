@@ -223,9 +223,45 @@ export function deliverItem(board: RushOrderBoard, itemId: number, qty: number):
   }
   const remaining = slot.need - slot.delivered;
   const consumed = Math.min(qty, remaining);
-  slot.delivered += consumed;
-  const perUnit = slot.points / slot.need;
-  const points = Math.round(perUnit * consumed);
+  const deliveredBefore = slot.delivered;
+  slot.delivered = deliveredBefore + consumed;
+
+  /*
+   * 按**累计进度**结算,再减去「上一次已发出的部分」——
+   * 而不是「每件单价 × 本次件数」逐次取整。
+   *
+   * 为什么必须这样:手册 §6.1 的核心卖点是**多人分件流水线**
+   * (A 砍 → 隔河扔给 B → B 接住送切木机 → C 接住拍在地基上),
+   * 也就是「同一批货由几个人分几次交」是**玩法本身的自由度**。
+   * 原实现 `Math.round(slot.points / slot.need * consumed)` 每交一次取整一次,
+   * 误差按件数累加 ⇒ **交法会改变得分**。实测 1600 块真实订单板,769 块
+   * (48.1%)一次性交满与逐件交满得分不同,且**两个方向都有**(既多 1 分也少 1 分)
+   * —— 没有哪一侧是「保守正确」,纯粹是取整残差。
+   *
+   * 差值式 `round(P·dₙ/N) − round(P·dₙ₋₁/N)` 是**望远镜求和**:
+   * 任意切分都收敛到 `round(P) − round(0) = P`,与切分方式无关。
+   * 于是「怎么分件」只影响体验,不影响分数。
+   *
+   * 边界:`slot.need` 由 generateOrderBoard 保证 ≥ ORDER_NEED_MIN = 1,
+   * 不会除零;`consumed` 已被 remaining 夹住,故 `slot.delivered ≤ slot.need`。
+   *
+   * ⚠️ **本改动与 `docs/WS-11-coop-prank-party.md` §10.2 的 U2 决策相抵触**,
+   * 属 task-41 的有意变更,需 Lead 裁决。U2 原文记「保持现实现的『先乘后除再
+   * 取整』,**不做末位补差**」,理由两条:(a) 误差 ≤ 2 分「可忽略」;
+   * (b)「末位补差需额外维护余数状态,复杂度不值得」。两条都不成立:
+   *
+   *   (a) 量级确实小,但**符号取决于交付批次**,且两个方向都有
+   *       ⇒ 不是精度问题而是**规则不确定**:同样的货、不同的分件方式,分数不同,
+   *       且无规则说明哪种才对。手册 §6.1 恰以「多人分件流水线」为卖点。
+   *   (b) 本做法**无需任何额外状态** —— 复用既有的 `slot.delivered`
+   *       做望远镜差值即可。U2 估算的复杂度成本不适用于该做法。
+   *
+   * ⇒ 若 Lead 裁决按 U2 保留原行为,请连同 `tests/WS-11.test.ts` 的
+   *   **K2** 一起回退(只回退代码会让 K2 变红)。
+   */
+  const awardedBefore = Math.round((slot.points * deliveredBefore) / slot.need);
+  const awardedAfter = Math.round((slot.points * slot.delivered) / slot.need);
+  const points = awardedAfter - awardedBefore;
   return {
     accepted: true,
     itemId,

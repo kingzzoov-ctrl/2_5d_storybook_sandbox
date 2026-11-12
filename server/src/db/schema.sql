@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   status         TEXT    NOT NULL DEFAULT 'OPEN'
                  CHECK (status IN ('OPEN', 'SLEEPING', 'CLOSED')),
   party_mode     TEXT    NOT NULL DEFAULT 'NONE'
-                 CHECK (party_mode IN ('NONE', 'BRIDGE_FLAG', 'JELLY_BALL', 'CROWN_RUN', 'PAINT_WAR')),
+                 CHECK (party_mode IN ('NONE', 'BRIDGE_CTF', 'JELLY_BALL', 'CROWN_BR', 'PAINT_WAR')),
   world_seed     INTEGER NOT NULL DEFAULT 0,
   world_tick     INTEGER NOT NULL DEFAULT 0  CHECK (world_tick >= 0),
   chunk_radius   INTEGER NOT NULL DEFAULT 4  CHECK (chunk_radius BETWEEN 1 AND 16),

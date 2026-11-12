@@ -276,11 +276,20 @@ export const RoomStatus = {
 } as const;
 export type RoomStatus = (typeof RoomStatus)[keyof typeof RoomStatus];
 
+/* ⚠️ 词表以**冻结层** `shared/constants/bosses.ts` 的 `PARTY_MODES` 为准。
+   本枚举此前写的是 `BRIDGE_FLAG` / `CROWN_RUN`,与冻结层的 `BRIDGE_CTF` / `CROWN_BR`
+   不一致 —— 而 `schema.sql` 的 CHECK 也跟着写了错的那套,于是:
+   **设成冻结层的值会被 DDL 拒绝**(真实 SQLite 实测:`BRIDGE_CTF` →
+   `CHECK constraint failed`),而设成 DDL 的值则与冻结层/WS-11 H0 断言不符。
+   两套清单(可达性 / 生产零引用)都**查不出**这类缺陷:它们只看可达性。
+
+   冻结层是权威(WS-11 `H0 冻结层 PARTY_MODES 四模式与节拍一致` 直接断言它),
+   持久层不该为它让步。已同步修 `schema.sql:82` 的 CHECK。 */
 export const PartyMode = {
   NONE: 'NONE',
-  BRIDGE_FLAG: 'BRIDGE_FLAG',
+  BRIDGE_CTF: 'BRIDGE_CTF',
   JELLY_BALL: 'JELLY_BALL',
-  CROWN_RUN: 'CROWN_RUN',
+  CROWN_BR: 'CROWN_BR',
   PAINT_WAR: 'PAINT_WAR',
 } as const;
 export type PartyMode = (typeof PartyMode)[keyof typeof PartyMode];

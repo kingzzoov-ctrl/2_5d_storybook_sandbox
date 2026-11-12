@@ -135,7 +135,7 @@ export const BOSS_FIELD_TABLE: readonly FieldSpec[] = [
  */
 export const ROOM_FIELD_TABLE: readonly FieldSpec[] = [
   { key: 'chunkVersions', bit: 0, type: FieldType.STR, bytes: 24, note: '排序后的 "cx,cy:v" 串,变长' },
-  { key: 'partyMode', bit: 1, type: FieldType.U8, bytes: 1, note: '0=NONE 1=BRIDGE_FLAG 2=JELLY_BALL 3=CROWN_RUN 4=PAINT_WAR' },
+  { key: 'partyMode', bit: 1, type: FieldType.U8, bytes: 1, note: '0=NONE 1=BRIDGE_CTF 2=JELLY_BALL 3=CROWN_BR 4=PAINT_WAR(词表以冻结层 PARTY_MODES 为准)' },
   { key: 'partyTimer', bit: 2, type: FieldType.POS, bytes: 4, note: '派对剩余秒数' },
   { key: 'scoreA', bit: 3, type: FieldType.U16, bytes: 2, note: '红队比分 / 持冠秒数' },
   { key: 'scoreB', bit: 4, type: FieldType.U16, bytes: 2, note: '蓝队比分' },

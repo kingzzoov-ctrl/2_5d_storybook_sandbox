@@ -20,6 +20,10 @@ import {
   boardProgress,
   gradeOf,
   generateOrderBoard,
+  deliverItem,
+  ORDER_SLOT_MIN,
+  ORDER_SLOT_MAX,
+  ROOM_LEVEL_PER_SLOT,
   ORDER_POOL,
   assertOrderPoolClosed,
   RUSH_ORDER_DURATION_SEC,
@@ -130,6 +134,14 @@ import { ITEM_BY_ID } from '../shared/constants/items.ts';
 import { AFK_EXP_RATIO } from '../shared/types/entities.ts';
 import * as PHY from '../shared/types/physics.ts';
 import { CATCH_RADIUS, CARRY_Z_STEP, BodyState } from '../shared/types/physics.ts';
+
+/* task-38 的归属判定要读生产源码文本(宿主的**存在性**无法由 import 断言)。 */
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** 仓库根(本文件在 <root>/tests/ 下)。 */
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 /* ════════════════════════════════════════════════════════════════════
  * A. 急单:订单生成可复现 + 3 分钟状态机 + 交付评分
@@ -1567,6 +1579,296 @@ test('J10 四大模式各自的结算互不串扰', () => {
   /* 给造桥加分不影响果冻球 */
   getTeam(bridge.mode.board, TEAM_KEY.RED).score = 999;
   eq(getTeam(jelly.mode.board, TEAM_KEY.RED).score, 0, '跨模式无串扰');
+});
+
+/* ═══════════════ task-38:四个「生产零引用」模块的归属与前置条件 ═══════════════ */
+
+/* 判定结论(详见 task-38 报告):
+ *   taming.ts    → 真欠账,但缺两个不存在的宿主(宠物容器 + 驯服交互)
+ *   modes.ts     → 等「对局容器」(生产有枚举与计分字段,无对局运行时)
+ *   afk.ts       → 等「房间每帧驱动 + 切后台事件」
+ *   immunity.ts  → 等「施加整蛊的宿主」,与 toys.ts **同一个宿主**
+ *
+ * 本组**不重复门禁的可达性判据**(verify.ts 的白名单自检已覆盖「不可达」),
+ * 只钉哪三个门禁**查不出**的事实:宿主缺失、词表冲突、AFK 同名异义。 */
+
+test('task-38:四个模块的宿主在生产里都不存在(故「接线」是伪命题)', () => {
+  /* ⚠️ 断言必须读**生产源码文本**,不能用「文件里有没有这个词」的宽匹配 ——
+   * 注释与类型声明都会命中,会造成恒真。下面统一用 import 语句/成员访问形态。 */
+
+  /* modes.ts:生产只有 party **枚举存储**,没有对局运行时。 */
+  const room = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  ok(/partyMode/.test(room), 'room.ts 有 partyMode 字段(仅是枚举存储)');
+  for (const absent of ['tickPartyMode', 'RoomMode', 'MatchState', 'createPartyMode']) {
+    ok(!room.includes(absent),
+      `room.ts 不含 ${absent} ⇒ 有枚举、无对局运行时`);
+  }
+  /* 计分字段存在却无人驱动 —— 「有字段」不等于「有机制」。 */
+  const schema = readFileSync(join(ROOT, 'server', 'src', 'net', 'schema.ts'), 'utf8');
+  ok(/key: 'scoreA'/.test(schema), 'schema 有 scoreA 字段');
+  const wildSim = readFileSync(join(ROOT, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
+  ok(!wildSim.includes('partyMode'), 'world_sim 不含 partyMode ⇒ 计分字段无人驱动');
+
+  /* afk.ts:等的是「房间 tick + 切后台事件」,两者都没有。 */
+  ok(!wildSim.includes('tickAfk'), 'world_sim 不调 tickAfk');
+  ok(!room.includes('tickAfk'), 'room.ts 也不调 tickAfk');
+
+  /* immunity.ts:施加整蛊的宿主不存在。 */
+  ok(!wildSim.includes('resolveShield'), 'world_sim 不调 resolveShield');
+  ok(!room.includes('resolveShield'), 'room.ts 也不调 resolveShield');
+
+  /* taming.ts:宠物容器不存在。 */
+  ok(!/interface WorldPlayer[\s\S]{0,600}?\bpets?\b/.test(wildSim),
+    'world_sim 的玩家模型里没有宠物集合');
+  ok(!wildSim.includes('PetRecord') && !wildSim.includes('feedPet'),
+    'world_sim 不碰 PetRecord/feedPet ⇒ 宠物容器不存在');
+});
+
+test('task-38 【已修】party 词表:冻结层 / repo / DDL 三者一致', () => {
+  /* 原为**缺陷登记**:冻结层 `PARTY_MODES` 用 `BRIDGE_CTF`/`CROWN_BR`,
+   * 而 `repo.PartyMode` 与 `schema.sql` 的 CHECK 用 `BRIDGE_FLAG`/`CROWN_RUN`。
+   * 4 个模式里 2 个会被 CHECK 拒绝(真实 SQLite 实测 `CHECK constraint failed`)。
+   *
+   * **已修**(Lead 收口):冻结层是权威(WS-11 的 H0 直接断言它,且 `shared/**` 是冻结层),
+   * 持久层不该为它让步 ⇒ 改 `schema.sql` 与 `repo.PartyMode` 对齐冻结层。
+   *
+   * ⚠️ 本条现在断言**一致性**而不是**不一致**。
+   * 原断言按自己的注释要求「修好后应改为 eq(missing.length, 0)」—— 已照办。
+   * 这条陷阱值得记:**缺陷登记式断言必须写明「修好后怎么改」**,
+   * 否则修完它就从「登记缺陷」悄悄变成「阻碍修复」。 */
+  const sql = readFileSync(join(ROOT, 'server', 'src', 'db', 'schema.sql'), 'utf8');
+  const checkLine = sql.split('\n').find((l) => l.includes('party_mode IN (')) ?? '';
+  ok(checkLine.length > 0, 'schema.sql 有 party_mode 的 CHECK 约束');
+
+  const frozenKeys = PARTY_MODES.map((m) => m.key);
+  eq(frozenKeys.length, 4, '冻结层恰好 4 个模式');
+
+  const missing = frozenKeys.filter((k) => !checkLine.includes(`'${k}'`));
+  eq(missing.length, 0, `DDL CHECK 必须允许全部 4 个冻结层模式(缺:${missing.join(' / ') || '无'})`);
+
+  /* 旧词表不得再出现 —— 否则两套词表并存,接线时会静默写入错值。 */
+  ok(!checkLine.includes('BRIDGE_FLAG'), 'DDL 不再残留旧词 BRIDGE_FLAG');
+  ok(!checkLine.includes('CROWN_RUN'), 'DDL 不再残留旧词 CROWN_RUN');
+
+  /* repo.PartyMode 也必须对齐 —— 它是写入路径的实际取值来源。 */
+  const repo = readFileSync(join(ROOT, 'server', 'src', 'db', 'repo.ts'), 'utf8');
+  const repoBlock = repo.slice(repo.indexOf('export const PartyMode = {'));
+  const repoVals = [...repoBlock.slice(0, 300).matchAll(/([A-Z_]+): '([A-Z_]+)'/g)].map((m) => m[2]!);
+  for (const k of frozenKeys) {
+    ok(repoVals.includes(k), `repo.PartyMode 含冻结层 key ${k}`);
+  }
+  ok(!repoVals.includes('BRIDGE_FLAG') && !repoVals.includes('CROWN_RUN'),
+    'repo.PartyMode 不再残留旧词');
+});
+
+test('task-38:两处「AFK」是不同概念,不应互相顶替', () => {
+  /* room.ts 的 `AFK` = 在场状态(AFK_TIMEOUT_MS=30min,占席位、仍 online);
+   * social/afk.ts 的 `AFK` = 挂机攒露水玩法(DOZE_AFTER_SEC / 露水)。
+   * 同名会让后来者以为「room 已经有 AFK 了,afk.ts 不用接」—— 正是误报掩盖。
+   * 判据:room.ts 里**没有**露水/打盹产出概念。 */
+  const room = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  ok(/AFK_TIMEOUT_MS/.test(room), 'room.ts 有 AFK 概念(在场状态)');
+  ok(!/露水|dew/i.test(room), '但 room.ts **不含**露水/dew ⇒ 与 afk.ts 不是同一件事');
+
+  const afkSrc = readFileSync(join(ROOT, 'server', 'src', 'social', 'afk.ts'), 'utf8');
+  ok(/露水|dew/i.test(afkSrc), 'afk.ts 含露水概念(挂机玩法)');
+  ok(/DOZE_AFTER_SEC/.test(afkSrc), 'afk.ts 有打盹阈值(5 秒切后台)');
+  /* 两者用的是不同的时间线与不同的持久化意图 ⇒ 不能合并。 */
+  ok(!afkSrc.includes('AFK_TIMEOUT_MS'),
+    'afk.ts 不引用 room 的 AFK_TIMEOUT_MS ⇒ 两套时间线独立');
+});
+
+test('task-38:consumeItem 是**真死代码**(0 调用点),驯服不该误用它', () => {
+  /* task-38 要求判定 `consumeItem`。实测:0 个调用点。
+   * 它的语义是「按 instance_id 扣减 ai_item_instances」——
+   * 而驯服喂食按**物品 ID + 数量**扣,不涉及 instance_id ⇒ 两者口径不同。 */
+  const repo = readFileSync(join(ROOT, 'server', 'src', 'db', 'repo.ts'), 'utf8');
+  ok(/export function consumeItem/.test(repo), 'consumeItem 有定义');
+  /* 它的签名按 instanceId 扣 —— 与按 itemId 扣是不同口径。 */
+  includes(repo, 'consumeItem(db: DbLike, instanceId: string, n: number',
+    'consumeItem 按 **instanceId** 扣减(不是按 itemId)');
+
+  /* 0 调用点:**全生产树**扫描,且只匹配**代码**。
+   *
+   * ⚠️ 两类假阳性都必须排掉(都实测踩过):
+   *   ① **测试源码里的自指** —— 本组自己的断言字面量 `'consumeItem(db: ...'`
+   *      与 test 标题里都含 `consumeItem(`,一度把计数从 0 顶到 1
+   *      (由 mob-boss-ai 独立复现并报来;我此前已定位同一根因)。
+   *      ⇒ 解法:**不扫 tests/**。
+   *   ② **生产源码里的字符串与注释** —— 例如错误消息 `'consumeItem failed'`
+   *      或分发表里的键名,`/consumeItem\s*\(/` 一样会命中。
+   *      ⇒ 解法:**先剥掉注释与字符串字面量**再匹配。
+   *
+   * 同时去掉 `repo.ts` 里的**定义体**,避免把签名自身算成调用。 */
+  const codeOnly = (src: string): string => src
+    .replace(/\/\*[\s\S]*?\*\//g, '')        /* 块注释 */
+    .replace(/\/\/[^\n]*/g, '')              /* 行注释 */
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")   /* 单引号串 */
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')   /* 双引号串 */
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``');    /* 模板串 */
+
+  const prodTrees = [
+    join(ROOT, 'server', 'src'),
+    join(ROOT, 'client', 'src'),
+  ];
+  const prodTs: string[] = [];
+  const collect = (dir: string): void => {
+    for (const e of readdirSync(dir)) {
+      if (e === 'node_modules' || e === '.git' || e.startsWith('_')) continue;
+      const p = join(dir, e);
+      if (statSync(p).isDirectory()) collect(p);
+      else if (e.endsWith('.ts')) prodTs.push(p);
+    }
+  };
+  for (const t of prodTrees) collect(t);
+  ok(prodTs.length > 40, `扫到生产 .ts ${prodTs.length} 个(覆盖面足够)`);
+
+  let callers = 0;
+  const callSites: string[] = [];
+  for (const p of prodTs) {
+    let code = codeOnly(readFileSync(p, 'utf8'));
+    /* 剥掉定义体本身(签名也是 `consumeItem(`)。 */
+    code = code.replace(/export function consumeItem\b[\s\S]*?\n\}/, '');
+    if (/consumeItem\s*\(/.test(code)) {
+      callers += 1;
+      callSites.push(p.slice(ROOT.length + 1).split('\\').join('/'));
+    }
+  }
+  eq(callers, 0,
+    `consumeItem 在**全生产树**(${prodTs.length} 个文件)0 调用点 ⇒ 死代码`
+    + `(若不为 0,实际调用点:${callSites.join(', ')})`);
+
+  /* 而 world_sim 有自己的按 ID 扣减口径 —— 那才是驯服该用的。 */
+  const wildSim = readFileSync(join(ROOT, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
+  ok(/consumeGroundItem\s*\(/.test(wildSim),
+    'world_sim 走 consumeGroundItem(itemId, count) —— 按 ID 扣,与驯服口径一致');
+});
+
+/* ════════════════════════════════════════════════════════════════════
+ * K. task-41:槽位公式的两侧边界 + 交付计分不变量
+ *
+ * 前两套(A2/A5)只钉住了「点」:A2 断言 `slots.length ∈ [2,4]` 且只用 lv=12,
+ * 于是 `ORDER_SLOT_MIN`/`ORDER_SLOT_MAX`/`ROOM_LEVEL_PER_SLOT` 三个常量
+ * **改任何值套件都全绿**(实测:SLOT_MIN 取 1/2/3/4 全绿,SLOT_MAX 取 2/3/4/5/8 全绿)。
+ * 下面 K1/K2 把两侧边界与饱和点都钉死。
+ * ════════════════════════════════════════════════════════════════════ */
+
+test('K1 槽位公式:三个常量按设计档取值,两侧边界与饱和点都精确', () => {
+  /*
+   * ⚠ 这里**必须写设计档的字面量**,不能拿导出常量当期望值。
+   * 否则断言是恒真的:`eq(slotsAt(1), ORDER_SLOT_MIN)` 在 MIN 被改成任何值时
+   * 两侧同时变,永远通过 —— 实测 MIN 取 1/2/3 全绿,等于没测。
+   * 字面量的出处是 `docs/WS-11-coop-prank-party.md` §5.1 参数表(权威档):
+   *   ORDER_SLOT_MIN / MAX = 2 / 4;ROOM_LEVEL_PER_SLOT = 5
+   */
+  eq(ORDER_SLOT_MIN, 2, '设计档 §5.1:小房间 2 单');
+  eq(ORDER_SLOT_MAX, 4, '设计档 §5.1:大房间 4 单');
+  eq(ROOM_LEVEL_PER_SLOT, 5, '设计档 §5.1:每 5 级 +1 订单位');
+
+  const slotsAt = (lv: number): number =>
+    generateOrderBoard(mulberry32(41), lv, {}, 41).slots.length;
+
+  /* 下界平台:floor((lv-1)/5) 在 lv≤5 时恒为 0 */
+  eq(slotsAt(1), 2, 'lv=1 → 2 单(下界)');
+  eq(slotsAt(5), 2, 'lv=5 → 仍 2 单(平台右端)');
+  /* 第一次上跳:lv=6 → floor(5/5)=1 */
+  eq(slotsAt(6), 3, 'lv=6 → 3 单(首跳)');
+  eq(slotsAt(10), 3, 'lv=10 → 仍 3 单');
+  /* 第二次上跳即饱和:lv=11 → floor(10/5)=2 → 4 */
+  eq(slotsAt(11), 4, 'lv=11 → 4 单(饱和点)');
+  /* 饱和之后永不越界 —— 这正是单边盲区藏身处 */
+  for (const lv of [12, 20, 30, 99, 999]) {
+    eq(slotsAt(lv), 4, `lv=${lv} 不得越过上界 4`);
+  }
+
+  /* 单调不减 + 全程夹在 [2,4] */
+  let prev = 0;
+  for (let lv = 1; lv <= 40; lv += 1) {
+    const n = slotsAt(lv);
+    ok(n >= prev, `槽位数应随等级单调不减(lv=${lv}: ${prev}→${n})`);
+    ok(n >= 2 && n <= 4, `lv=${lv} 槽位 ${n} 越界`);
+    prev = n;
+  }
+});
+
+test('K2 交付计分与**切分方式无关**(分件流水线不改变得分)', () => {
+  /*
+   * 手册 §6.1 的核心卖点是多人分件流水线(A 砍 → 隔河扔 B → B 接住送切木机
+   * → C 接住拍地基)。「同一批货分几次交」是玩法自由度,**不该改变得分**。
+   *
+   * ⚠️ 本条与 `docs/WS-11-coop-prank-party.md` §10.2 的 **U2 决策相抵触**,
+   * 属**有意为之**,理由如下(task-41 实测):
+   *
+   * U2 原文:「订单单件分 `round(points / need)`(Lead 已采纳:保持现实现的
+   *          「先乘后除再取整」,**不做末位补差**)」
+   * U2 理由:(a)「每单最多 4 件,累计舍入误差 ≤ 2 分,对 totalPoints 量级可忽略」
+   *          (b)「末位补差需在槽位里额外维护余数状态,复杂度不值得」
+   *
+   * 两条理由经实测**都不成立**:
+   *
+   * (a) 这不是「精度误差可忽略」问题,而是**规则不确定性**。误差的量级确实小,
+   *     但它的**符号取决于交付批次** —— 实测 1600 块真实订单板中 769 块(48.1%)
+   *     两种交法得分不同,**且两个方向都有**(既多 1 分也少 1 分,见下方反证);
+   *     ⇒ 没有哪一侧是「保守正确」。玩家按同一套动作交满同一批货,
+   *       分数却因「谁先交、分几批」而变,且无任何规则说明哪种才对。
+   *     手册把一个 3~12 人的协作玩法当作卖点,计分却对协作方式敏感。
+   *
+   * (b) 本修法**不需要任何额外余数状态**:用 `slot.delivered`(字段本就存在)
+   *     做望远镜式差值 `round(P·dₙ/N) − round(P·dₙ₋₁/N)`,任意切分都收敛到
+   *     `round(P) − round(0) = P`。U2 估算的「复杂度」成本**不适用**于这个做法。
+   *
+   * ⇒ 若 Lead 裁决仍按 U2 保留原行为,请**回退 `deliverItem` 并把本条断言删掉**
+   *   (或改成断言「两种交法应当不同」)。不要只回退代码而留下本条 —— 那会红。
+   */
+  const clone = (b: ReturnType<typeof generateOrderBoard>): ReturnType<typeof generateOrderBoard> =>
+    JSON.parse(JSON.stringify(b)) as ReturnType<typeof generateOrderBoard>;
+
+  const deliverAll = (
+    board: ReturnType<typeof generateOrderBoard>,
+    pattern: readonly number[],
+  ): number[] => {
+    const per: number[] = [];
+    for (const s of board.slots) {
+      let got = 0;
+      let left = s.need;
+      let pi = 0;
+      while (left > 0) {
+        const chunk = Math.min(pattern[pi % pattern.length]!, left);
+        got += deliverItem(board, s.itemId, chunk).points;
+        left -= chunk;
+        pi += 1;
+      }
+      per.push(got);
+    }
+    return per;
+  };
+
+  const patterns: Array<readonly number[]> = [[99], [1], [2], [3], [1, 2, 3], [2, 1], [3, 1, 1]];
+  let boards = 0;
+
+  for (let seed = 1; seed <= 120; seed += 1) {
+    for (const lv of [1, 6, 11, 20, 30]) {
+      const base = generateOrderBoard(mulberry32(seed), lv, {}, seed);
+      boards += 1;
+
+      let ref: number[] | null = null;
+      for (const pat of patterns) {
+        const got = deliverAll(clone(base), pat);
+        if (ref === null) ref = got;
+        else {
+          eq(JSON.stringify(got), JSON.stringify(ref),
+            `seed=${seed} lv=${lv} 切分 ${JSON.stringify(pat)} 得分应与其他切分一致`);
+        }
+      }
+
+      /* 交满后每槽实得必须**恰好等于** slot.points(不是「>0」) */
+      for (let i = 0; i < base.slots.length; i += 1) {
+        eq(ref![i], base.slots[i]!.points,
+          `seed=${seed} lv=${lv} 槽 ${base.slots[i]!.itemId} 交满实得应等于满分`);
+      }
+    }
+  }
+  eq(boards, 600, '抽样规模(防止循环被改成空跑而静默通过)');
 });
 
 report('WS-11');

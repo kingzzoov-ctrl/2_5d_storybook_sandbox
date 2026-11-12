@@ -2016,9 +2016,9 @@ test('F17 派对模式:仅 OWNER/ADMIN 可切,GUEST 被拒且模式不变', () =
   rt.join({ userId: 'g', asGuest: true });
   eq(rt.setPartyModeBy('g', PartyMode.JELLY_BALL).ok, false, 'GUEST 应被拒');
   eq(rt.partyMode, PartyMode.NONE, '模式不变');
-  eq(rt.setPartyModeBy('owner', PartyMode.CROWN_RUN).ok, true);
-  eq(rt.partyMode, PartyMode.CROWN_RUN);
-  eq(rt.state.meta.partyMode, Object.values(PartyMode).indexOf('CROWN_RUN'));
+  eq(rt.setPartyModeBy('owner', PartyMode.CROWN_BR).ok, true);
+  eq(rt.partyMode, PartyMode.CROWN_BR);
+  eq(rt.state.meta.partyMode, Object.values(PartyMode).indexOf('CROWN_BR'));
 });
 
 test('F18 step() 推进 tick 并产出差量包;20 帧后 tick%20==0 落盘', () => {

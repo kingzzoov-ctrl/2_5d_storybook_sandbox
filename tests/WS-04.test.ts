@@ -4,7 +4,7 @@
  * 运行:`node tests/WS-04.test.ts`(Node 24 原生类型擦除)
  */
 
-import { test, ok, eq, near, inRange, report } from '../shared/testing/harness.ts';
+import { test, ok, eq, near, includes, inRange, report } from '../shared/testing/harness.ts';
 import { mulberry32 } from '../shared/testing/harness.ts';
 import { MOB_LIST, MOB_BY_ID, hostileMobs, tameableMobs } from '../shared/constants/mobs.ts';
 import { Biome, MobBehavior } from '../shared/types/entities.ts';
@@ -34,7 +34,7 @@ import {
 import {
   createPetRecord, feedPet, commandPet, deployLimit, deployPet, sendToRanch,
   tickRanch, carrySlots, TameStage, TameCommand, canTame, tamingCoverage,
-  RANCH_PRODUCE_SEC, DEPLOY_BADGE_ID,
+  tameableDefs, RANCH_PRODUCE_SEC, DEPLOY_BADGE_ID,
 } from '../server/src/mobs/taming.ts';
 import {
   BIOME_SPAWN, decideSpawn, lightSuppressed, inSafeZone, safeZoneShield,
@@ -1220,6 +1220,73 @@ test('W4-52 性能:200 只怪 30 只唤醒时每 20Hz 帧 CPU 估算(休眠 170 
   const before = aoi.totalActiveTicks;
   for (let f = 0; f < 100; f += 1) aoi.stepActive(() => {});
   eq(aoi.totalActiveTicks - before, 200, '100 帧 × 2 只 = 200 次;其余 198 只零开销');
+});
+
+/* ═══════════ task-38:taming.ts 的归属判定与前置条件 ═══════════ */
+
+/* 读生产源码文本 —— 宿主的**存在性**无法用 import 断言。 */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
+const wildSimSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
+const behavSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'mobs', 'behaviors.ts'), 'utf8');
+
+test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不是缺接线动作)', () => {
+  /* 判定:它不是「有人该 import 它却忘了」,而是**两个宿主都不存在**:
+   *   ① 宠物容器 —— 生产没有任何「每玩家宠物集合」
+   *   ② 驯服交互 —— 没有任何 AI 消费 `mobs.ts` 的 `tameItem`
+   *
+   * ⚠️ 断言必须读**生产源码文本**(宿主的**存在性**无法用 import 表达)。
+   * 且不能用宽词 —— 「有 `pet` 这个子串」会被注释/变量名命中而恒真。 */
+
+  /* ① 宠物容器不存在:world_sim 完全不碰 taming 的任何核心类型。 */
+  ok(!/PetRecord|TameStage|feedPet|deployPet|sendToRanch/.test(wildSimSrc),
+    'world_sim 不碰 PetRecord/TameStage/feedPet ⇒ 宠物容器不存在');
+
+  /* ② 驯服交互不存在:behaviors.ts 里没有 TameableAi,也没有 tameItem 分支。 */
+  ok(!/class TameableAi|TameableAi extends/.test(behavSrc),
+    'behaviors.ts 没有 TameableAi ⇒ 没有生物实现驯服交互');
+  ok(!/tameItem/.test(behavSrc),
+    'behaviors.ts 不读 tameItem ⇒ 7 种可驯服生物的 tameItem 字段无人消费');
+
+  /* ③ 反向证据:注册表登记了可驯服名单,却**零引用** ——
+   *    这是「登记了但从未被用」的典型信号(比「没登记」更可疑)。 */
+  includes(behavSrc, 'TAMEABLE_AI_IDS', 'behaviors.ts 登记了可驯服 AI 名单');
+  const tameRefs = [
+    readFileSync(join(ROOT_DIR, 'server', 'src', 'mobs', 'behaviors.ts'), 'utf8'),
+    readFileSync(join(ROOT_DIR, 'server', 'src', 'mobs', 'host.ts'), 'utf8'),
+    readFileSync(join(ROOT_DIR, 'server', 'src', 'mobs', 'spawner.ts'), 'utf8'),
+    wildSimSrc,
+  ].reduce((n, s) => n + (s.match(/TAMEABLE_AI_IDS/g) ?? []).length, 0);
+  eq(tameRefs, 1,
+    'TAMEABLE_AI_IDS 全仓只出现 1 次(它自己的定义处)⇒ 名单登记了但从未被消费');
+
+  /* ④ 而 taming.ts 自身是**完整**的(27 个导出、测试全绿)——
+   *    所以它是「实现存在 + 宿主缺失」,不是「实现有坑」。 */
+  eq(tamingCoverage().tameable, tameableDefs().length,
+    'taming.ts 的可驯服覆盖数是自洽的(实现完整)');
+  ok(wildSimSrc.indexOf('interactMob') > 0,
+    'world_sim 有 interactMob 挂在 MobHost.interact ⇒ 缺的是「tameItem 分支」而非「交互入口」');
+});
+
+test('task-38 驯服该按 **itemId** 扣物品,不该照搬 consumeItem(instanceId 口径)', () => {
+  /* task-38 要求判定 `consumeItem`。结论:它是**死代码**(0 调用点),
+   * 且口径与驯服需求**不同** —— 它按 `instance_id` 扣 `ai_item_instances`,
+   * 而驯服喂食是「用掉一个物品 ID」,走的是 `world_sim.consumeGroundItem(itemId, count)`。 */
+  const repo = readFileSync(join(ROOT_DIR, 'server', 'src', 'db', 'repo.ts'), 'utf8');
+  includes(repo, 'consumeItem(db: DbLike, instanceId: string, n: number',
+    'consumeItem 按 **instanceId** 扣减(不是 itemId)');
+  ok(/consumeGroundItem\s*\(/.test(wildSimSrc),
+    'world_sim 有 consumeGroundItem(itemId, count) —— 这才是驯服该用的口径');
+
+  /* 0 调用点:排除定义体后,生产侧无人调它。 */
+  const stripped = wildSimSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  ok(!/consumeItem\s*\(/.test(stripped),
+    'world_sim 不调 consumeItem ⇒ 它仍是死代码');
 });
 
 /* ═════════════════════ 汇总 ═════════════════════ */
