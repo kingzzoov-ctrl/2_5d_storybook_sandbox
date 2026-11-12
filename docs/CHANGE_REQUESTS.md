@@ -2559,3 +2559,135 @@ task-64 B 的判据实验:把活的 revive 改回坏的 ⇒ **WS-10 94/94 仍全
 - **Lead 裁决**:待裁(建议选项 1+2+3 一起做,先定 `outcome` 语义)
 - **关联**:CR-21(料理 buff 无消费点)· task-64 B(活路径优先/欠账判据)
   · `docs/WS10-INVULN-VERDICT.md` §6.1 · 陷阱 62
+
+---
+
+## [CR-24] 2026-11-13 Lead — 客户端解码器的**契约来源**无处可放:`shared/` 冻结,"跨层 import" 未被任何门禁拦住
+
+- **发现者**:`client-stage`(task-67 阶段 2 `docs/CLIENT-NET-CONTRACT.md` §1)
+- **性质**:**计划层的洞 + 门禁的洞**,两件叠在一起
+- **裁决**:见 §5(Lead 已裁决,选项 **(b) 拆分上移** + 一条**新门禁**)
+
+### 1. 事实(Lead 独立复核,全部实测)
+
+```
+server/src/net/schema.ts          442 行 / 46 个导出
+  自身依赖:shared/types/physics.ts, shared/types/entities.ts
+  三方依赖:0        node:* 依赖:0        ⇒ **浏览器安全**(vite 可直接打包)
+  import 者仅 5 个:scripts/extension-drill.ts · scripts/perf-bounds.ts
+                  tests/WS-07.test.ts · tests/WS-FND-04.test.ts · tests/WS-FND-05.test.ts
+
+client/src/net/prediction.ts      457 行,Snapshot 只有 4 个字段(tick,x,y,z)
+  client/src 里的 FIELD_TABLE / POS_SCALE / DataView / getInt32 / dequantize /
+  decodePacket —— **各 0 次** ⇒ 客户端**没有解码能力,也没有第二份字段表**
+```
+
+**⇒ 所以这不是 CR-20「同一判据多份实现」**(那至少有两份可比对),
+**而是「一份完整协议 vs 一个 4 字段锚点」**。CR-20 的解法(抽出可复用模块)在这里**不适用** ——
+因为客户端**一份都没有**,不存在"多份"要合并。
+
+### 2. 两侧字段对照(client-stage 逐字段比过 38 个,Lead 采信)
+
+```
+服务端 4 张表 = 38 个字段(玩家 14 + 野生动物 9 + Boss 10 + 房间 5)
+客户端 Snapshot =  4 个字段
+
+  6 处对齐    玩家 x/y/z + Boss telegraphX/Y/R
+  6 处同名不同物  ★ 真正的危险
+  26 个字段客户端无对应表达
+  ⇒ 6 + 26 + 6 = 38,与字段总数闭合
+```
+
+**★ 6 处「同名不同物」(CR-20 形态,全部会"编译通过、类型正确、静默出错"):**
+```
+1 telegraphShape : 服务端 0 = NONE,客户端同下标解成 CIRCLE —— **5 个下标全部不同**
+2 stateFlag      : 服务端 7 态 ↔ 客户端只有 1 个布尔 `frozen`
+3 move 通道      : InputCmd{seq,moveX,moveY,jump} ↔ MoveIntent{tick,x,y,z,speedMul} —— **零同名**
+```
+
+### 3. ★★ 门禁的洞(比 §1 更严重)
+
+**WS-09 的「分层不变量」门禁真实判据(`tests/WS-09.test.ts:3429-3437`):**
+```ts
+const re = /from\s*['"]([^'"]+)['"]/g;
+while ((m = re.exec(src)) !== null) {
+  const s = m[1];
+  if (s.startsWith('.') || s.startsWith('node:')) continue;   // ★ 以 `.` 开头 ⇒ 放行
+  thirdParty.push(`${rel} → ${s}`);
+}
+eq(thirdParty, [], '纯逻辑层只依赖 node:* 与仓库内相对路径');
+```
+**⇒ `import ... from '../../server/src/net/schema.ts'` 以 `.` 开头 ⇒ 判为「仓库内相对路径」⇒ 通过。**
+
+**⇒ 这道门禁的**名字**说它是"分层不变量",而它的**判据**只排除非相对说明符** ——
+   它拦的是「三方包」,不是「越层」。`client → server` 无人拦。**
+**⇒ 实测:`client/src` 里指 `server/` 的 import = 0 处 ⇒ 这条路**无人走过**,
+   既没有先例也没有禁令 —— 正是**职责边界表里有一个洞**的又一处。**
+
+### 4. 三个选项与 Lead 的裁决
+
+| 选项 | 内容 | 问题 |
+| :--- | :--- | :--- |
+| (a) | 客户端 import `server/src/net/schema.ts` | 浏览器安全(实测 0 三方/0 node:*),但**制造 `client → server` 反向依赖**;且 `schema.ts` 里混了 `upsertPlayer`/`removeBoss` 等**纯服务端状态管理** ⇒ 会把房间逻辑拖进 vite 包 |
+| (b) | 契约上移 `shared/` | **contracts/FREEZE.md L5 明文:冻结层只读,需要改签名先写 CR,由 Lead 裁决** ⇒ 需走正式流程(本 CR 就是该流程) |
+| (c) | 客户端手写解码器 | ⇒ **制造真正的 CR-20**:同一判据两份实现,再也无法证明对齐 |
+
+**★ Lead 裁决:取 (b),但不用"整文件搬",用实测数据定切分线。**
+
+**切分线来自实测(`delta.ts` vs `room.ts` 各用到哪些符号):**
+```
+schema.ts 46 个导出
+  ① 只被编码器用 18 个  → **线上格式** ⇒ 上移 shared/
+     FieldType · FIELD_TYPE_BYTES · POS_SCALE · quantizePos · dequantizePos
+     FieldSpec · FIELD_TABLE · WILDLIFE_FIELD_TABLE · BOSS_FIELD_TABLE · ROOM_FIELD_TABLE
+     EntityKind · ENTITY_KIND_LABEL · chunkKey · serializeChunkVersions · parseChunkVersions
+     tableFor · BossState · WildlifeState
+  ② 只被房间用   3 个  → **留在 server/**(纯状态管理)
+     createPlayerState · createRoomState · removePlayer
+  ③ 两边都用     3 个  → **上移 shared/**(线上格式的基底)
+     PlayerState · RoomState · cloneRoomState
+  ④ 两边都不用  22 个  → 需单独判(见下)
+```
+
+**⇒ 上移集合 = ① ∪ ③ = 21 个符号;客户端解码必需集(`decodePacket` 体内实际用到的)
+   = ROOM_FIELD_TABLE · PlayerState · WildlifeState · RoomState · EntityKind · cloneRoomState · tableFor
+   ⇒ **全部落在 ① ∪ ③ 内** ⇒ 切分线**自洽**(不需要把任何服务端状态管理拖过去)。**
+
+**★ 为什么这个切分是对的(而不是审美):**
+```
+它不按「文件」分,按**消费者**分:
+  · 编码器要的 = 线上格式 ⇒ 两侧都需要 ⇒ shared/
+  · 房间要的   = 状态管理 ⇒ 只有服务端要 ⇒ server/
+⇒ 而判据可**机器验证**:(b) 做完后跑一遍 ② 那 3 个符号,
+   若 client 侧出现对它们的引用 ⇒ 切错了
+```
+
+### 5. 附带的**新门禁**(这是本 CR 的另一半,不可省)
+
+```
+★ 现状:「分层不变量」门禁拦三方包,不拦越层 client→server。
+⇒ 新增判据:**client/src/** 的 import 不得解析到 server/** 之外的相对路径**
+   —— 即允许 `@shared/` 与 `client/**` 内相对路径,禁止 `../../server/`
+⚠️ 但**不能只为跑通而加** —— 必须先钉住 (b) 的切分线,否则新门禁加完就红。
+```
+
+### 6. 未实测(如实列出)
+
+```
+[ ] (b) 的切分线**未执行验证** —— 上面是静态分析(谁 import 谁),
+    未实际拆文件后搭起来跑一遍 ⇒ 拆完必须跑全量四旗
+[ ] client 侧解码器**尚不存在** ⇒ 阶段 3 才能验证「客户端能解服务端的包」
+     (client-stage 的 `_nc_chan.ts` 已实测通道 C:encodeFull → 66 字节 → decodePacket → 2 upsert,
+      **但那是用服务端代码解的,不是客户端代码**)
+[ ] 线上格式上移后,`shared/` 的 8 个文件 → 9 个,是否触发任何「shared 文件数」类断言
+     ⇒ Lead 已扫过 tests/ 与 scripts/ 的 `shared` + `readdirSync`/`.length ===` 组合,
+       **未发现该类硬断言** ✓(故预期不触发;但仍以实跑为准)
+```
+
+### 7. 关联
+
+- `docs/CLIENT-NET-CONTRACT.md`(client-stage,阶段 2 交付,459 行)
+- `docs/CLIENT-AUTHORITY-AUDIT.md`(阶段 1,14 类本地权威点)
+- CR-20(同一判据多份实现 —— 本 CR 说明它**不适用**于此,并给出适用版本)
+- CR-22(`.gitignore` 的 `_*` 让自证失效 —— 同族:门禁的**名字**与它**实际拦的东西**不一致)
+- 陷阱 60(守错对象)· `shared/contracts/FREEZE.md:5`(冻结层的正式扩展流程)
