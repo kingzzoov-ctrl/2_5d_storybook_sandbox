@@ -751,9 +751,33 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      `WorldSim` 真的调用 `createKitchenState` / `feedStation` / `tryCook` / `potCount`
      (各 2~4 处**真实调用点**,不是只 import)。已从本表摘除。 */
 
-  ['server/src/content/baseline.ts', 'WS-03 内容基线登记,待接入'],
-  ['server/src/content/handshake.ts', '内容握手协议,待接入'],
-  ['server/src/content/registry.ts', '内容注册表,待接入'],
+  /* ── content/** 三条(task-43 逐条实测判定,2026-11-12)──────────────────
+   * 原来的理由一律写「待接入」,**三条全部不成立** —— 我按 build-wiring 的实测改写了。
+   *
+   * 「待接入」这个措辞本身有害:它暗示「有接线点、只差一行」。
+   * 实测三条各是不同情形,成本差一个数量级:                        */
+  /* ① 门禁真消费它(静态 `from` + 动态 `await import` 两种形态都有),
+     生产侧真 importer = **0** ⇒ 属 `GATE_ONLY`,**不是欠账**。
+     判据:content-lock.ts:9(静态)/ verify.ts:3647(动态)。
+     ⚠️ 白名单**登记条目**(字符串)不算「消费」—— 登记是**证据**,import 是**消费**,
+        两者性质相反。混算会把真欠账洗成 gate-only。 */
+  ['server/src/content/baseline.ts',
+    '内容基线锁;gate-only(被 content-lock / extension-drill / verify 真消费),非欠账'],
+  /* ② 比 baseline 更孤立:**连 gate-only 都不是** ——
+     门禁侧真 import = 0,`scripts/**` 里的每次出现都只是**登记**。
+     实测三条阻塞全成立 ⇒ 改写成「等什么」:
+       · room.ts 的 join() 无 contentClaim 参数(0 次命中)
+       · DEFAULT_CONTENT_POLICY = STRICT ⇒ 拒所有无指纹客户端
+       · 客户端 24 个 .ts 里含网络能力的是 0 个
+     ⇒ 它等的是**不存在的客户端网络层**。 */
+  ['server/src/content/handshake.ts',
+    '内容握手;等客户端网络层 + join 签名扩展(三条阻塞已实测成立),非「待接入」'],
+  /* ③ 有生产引用(2 处),**但两个引用者都不可达** ⇒ 属差集 `DIFF_REF`。
+     它是「对不可达模块的引用」,不是「已接」。
+     ⚠️ 「有生产引用」与「生产可达」是**两个判据**;本条目满足前者、不满足后者。
+        「已接」这个词若只按前者定义,就会把本条误记成「已完成」。 */
+  ['server/src/content/registry.ts',
+    '内容注册表;被 baseline/handshake 引用但两者均不可达 ⇒ 差集条目,无生产路径'],
   /* 以下六条由 task-38 / task-41 **实测**判定:不是缺接线动作,是**等的宿主不存在**。
      理由从笼统的「待接入」改成「等什么」——
      笼统说法会让人以为「有人动手就能接」,那正是**误报掩盖**:
@@ -837,6 +861,36 @@ const WL_BLOCK_CLIENT_SHELL = /本仓无装配入口|客户端子系统/;
    否则又会把服务端那批「待客户端接线」先抓走(见上方实测 19/22/9/0 vs 16/25/9/0)。 */
 const WL_BLOCK_CLIENT_MECH = /客户端网络层|客户端运行时|客户端装配层/;
 const WL_BLOCK_DEPENDENCY = /three|依赖未安装|相容层/;
+/* ══════════════════════════════════════════════════════════════════════════
+   **非欠账**两桶(task-43 实测新增,2026-11-12)
+
+   为什么必须有这两桶:本表此前的**隐含假设**是「14 条全部是欠账,只是卡点不同」。
+   task-43 用 `verify.ts` 自己的 `reachableClosure` 实测,**这个假设是假的**:
+   有 2 条**根本不是欠账**,把它们混进「欠账」是**误报掩盖** ——
+   读者会以为「有人动手就能接」,而实际上:
+     · `baseline.ts`:门禁**真消费**它 ⇒ 它**已经在岗**,只是岗位不在生产侧
+     · `registry.ts`:引用者**全部不可达** ⇒ 它是「对不可达模块的引用」,
+       **不是「已接」也不是「待接」**
+   两者的正确处置都是**「从欠账口径里移出」**,而不是「排进欠账队列等接线」。
+
+   ⚠️ 这两桶与另外六桶**性质相反**:
+   六桶说「是欠账,卡在 X」;这两桶说「**不是欠账**」。所以
+   · 它们**不进**「全部待接」的分母;
+   · 它们**不参与**「等裁决影子数」的统计。
+   混算会把真欠账洗成非欠账(或反向),两种方向都是口径污染。 */
+/* `gate-only` = 生产侧 0 消费,但 `scripts/**` **真消费**它。
+   ⚠️ 「真消费」= 静态 `from` ∨ 动态 `await import(` ∧ **排除 `typeof import(`**
+      (类型查询不产生运行时边)。
+   ⚠️⚠️ 白名单**登记条目**(本表自身)是**字符串**,不是消费 ——
+      登记是**证据**,import 是**消费**,两者性质相反。
+      把登记算成消费会得出「10/14 都是 gate-only」的**虚高**结论
+      (task-43 第一版就犯了这个错,已修正)。 */
+const WL_NON_DEBT_GATE = /gate-only/;
+/* 差集 = 有生产引用,**但引用者全部不可达**。
+   它是「对不可达模块的引用」,不是「已接」。
+   ⚠️ 「有生产引用」与「生产可达」是**两个判据**;只按前者定义「已接」,
+      就会把本条误记成「已完成」—— Lead 的手写探针就报过「registry.ts 已接」。 */
+const WL_NON_DEBT_DIFF = /差集/;
 /* 「等对局层 / 等上游结构」= 上游结构不存在,不是缺接线动作。
    依据:task-38 与 task-41 两个独立任务都用**实测**证明这些模块等的是不存在的宿主。
 
@@ -859,6 +913,7 @@ const WL_DECISION_B = /(?:接|注入)/;
 function whitelistBreakdown(): {
   clientShell: number; clientMech: number; wiring: number; mechanism: number;
   dependency: number; decision: number; other: number; decisionShadowed: number;
+  nonDebt: number;
 } {
   let clientShell = 0;
   let clientMech = 0;
@@ -867,6 +922,10 @@ function whitelistBreakdown(): {
   let dependency = 0;
   let decision = 0;
   let other = 0;
+  /* **非欠账**条目数(task-43 新增)。它与其余七桶**性质相反** ——
+     其余七桶都答「是欠账,卡在哪」,这个答「**不是欠账**」。
+     ⇒ 不参与「全部待接」的分母,也不参与「等裁决影子数」。 */
+  let nonDebt = 0;
   /* **被前面的桶抢走的 decision 候选数**。
      ⚠️ 这个计数器是本轮(task-32)加的,原因的实证如下:
      43 条里**有 27 条**同时满足 decision 的两个正则,而**没有一条**能落进
@@ -880,6 +939,10 @@ function whitelistBreakdown(): {
 
   for (const [, reason] of UNREACHABLE_EXEMPT) {
     /* 顺序有讲究 —— **具体优先于笼统**:
+       0 `nonDebt`:**最先判** —— 它答的不是「卡在哪」而是「**是不是欠账**」,
+         性质不同,必须先分流;否则会被下面的窄桶按名字抓走
+         (实测:`baseline.ts` 的理由含「gate-only」也含「非欠账」,
+          若不先判,它会被 `wiring` 的宽词结构吞掉);
        1 `wiring`:最具体(明确说「待接/接线」= 缺接线动作);
        2 `clientShell`:缺入口文件;
        3 `mechanism`:随别的模块一起接;
@@ -888,6 +951,12 @@ function whitelistBreakdown(): {
        6 其余归 `other`。
        早期把 clientShell 排在 wiring 前面,导致「待客户端接线」被宽词抓走。 */
     const isDecisionCandidate = WL_DECISION_A.test(reason) && WL_DECISION_B.test(reason);
+    /* ⚠️ 非欠账两条**不参与 isDecisionCandidate 统计** ——
+       它们不是「等人拍板」,把它们算进影子数会虚报。 */
+    if (WL_NON_DEBT_GATE.test(reason) || WL_NON_DEBT_DIFF.test(reason)) {
+      nonDebt += 1;
+      continue;
+    }
     if (WL_BLOCK_WIRING.test(reason)) {
       wiring += 1;
       if (isDecisionCandidate) decisionShadowed += 1;
@@ -916,7 +985,7 @@ function whitelistBreakdown(): {
     if (isDecisionCandidate) { decision += 1; continue; }
     other += 1;
   }
-  return { clientShell, clientMech, wiring, mechanism, dependency, decision, other, decisionShadowed };
+  return { clientShell, clientMech, wiring, mechanism, dependency, decision, other, decisionShadowed, nonDebt };
 }
 
 
@@ -1392,7 +1461,13 @@ function checkReachability(): void {
         + `;「生产可达」是**三入口并集**,不等于「服务端/客户端运行时可达」`
       : '');
   const breakdown =
-    `        └─ 欠账构成(${UNREACHABLE_EXEMPT.size} 条全部待接,按卡点分类):等客户端入口 ${wl.clientShell}`
+    /* ⚠️ 分母只说「欠账构成(N 条)」是**错的** —— 表里有非欠账条目。
+       原来写「14 条全部待接」,而 task-43 实测有 2 条不是欠账。
+       ⇒ 现在把「欠账」与「非欠账」分开陈述,并明说非欠账**不进分母**:
+         否则读者会把 gate-only 条目读成「排在最长的欠账队列里」,
+         而它其实**已经在岗**(只是岗位在门禁侧)。 */
+    `        └─ 欠账构成(${UNREACHABLE_EXEMPT.size} 条中 ${wl.nonDebt} 条**非欠账**,`
+    + `余 ${UNREACHABLE_EXEMPT.size - wl.nonDebt} 条按卡点分类):等客户端入口 ${wl.clientShell}`
     + ` / 等编排层接线 ${wl.wiring} / 等服务端机制 ${wl.mechanism}`
     /* 「等外部依赖」「等客户端机制」「未归类」**仅在非 0 时出现**:
        README 的固定四桶句式因此保持有效(不因 0 值桶而格式抖动),
@@ -1401,6 +1476,11 @@ function checkReachability(): void {
     + (wl.dependency > 0 ? ` / 等外部依赖 ${wl.dependency}` : '')
     + ` / 等裁决 ${wl.decision}`
     + (wl.other > 0 ? ` / 未归类 ${wl.other}` : '')
+    + (wl.nonDebt > 0
+      ? `\n  i         └─ 上列 ${wl.nonDebt} 条**非欠账**(gate-only / 差集)`
+        + ` —— 它们**不进欠账分母**,理由是「已经在岗」或「引用者全不可达」,`
+        + `不是「等着接线」;详见 verify.ts 里 \`WL_NON_DEBT_*\` 的说明`
+      : '')
     /* 「等裁决 0」是分类顺序的产物而非测量结果 —— 必须显式说出来,
        否则读者会把它读成「没有等人拍板的事」。实测 43 条里 27 条
        (分类收窄后 35 条里 35 条)都满足「等裁决」的两个正则,却没有一条
