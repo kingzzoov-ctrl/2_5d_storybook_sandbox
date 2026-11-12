@@ -498,6 +498,103 @@ reflectFrom / planSkillHits / healTarget / shieldPercent   全部 0 处
 
 ---
 
+## 第五层空缺:US2 不是「接线」,是「**先裁决唯一所有者**」
+
+**来源**:`task-49`(`net-persist`)的 `docs/AUTHORITY-MAP.md`,Lead 逐条复核。
+**这一层是第四层的前提** —— 第四层说「参数从哪来」,这一层回答「**权威是谁**」。
+
+### 现象:同一份玩家状态在服务端有**两套互不相识的实例**
+
+```
+room.ts 侧   : state.players[]            ← 网络投影给客户端的
+WorldSim 侧  : 5 个 Map(vitals/progresses/…/downedStates)  ← 战斗实际用的
+```
+
+**三条硬判据**(Lead 已复核):
+```
+room.ts 含 WorldSim / world_sim : **false / false**   ← 完全不认识模拟层
+room.ts 内 `.level =` 命中      : **0 处**;join() 只传 name/x/y/z
+wearing 唯一入口 setMobPlayers  : 生产调用 **0 处**(测试 5 处)
+```
+⇒ **交集字段(`level` / `hp` / `maxHp` / `x,y,z` / 武器)没有任何同步通道**,
+而 `room.ts` 那一套**一半字段没有写者、另一半是硬编码常量**。
+
+**⇒ 这不是「接一条线」能解决的**:必须先裁决谁是唯一所有者,
+否则接线只会把两份并成三份。
+
+### 实测:7 处「≥2 个写者」
+
+| # | 状态 | 写者 A | 写者 B | 危害 |
+| :-- | :--- | :--- | :--- | :--- |
+| W1 | `maxHp` | `VitalsSystem` 构造常量 **100** | `progression.recompute`(L30=**535**) | **可造出 `hp > maxHp`** |
+| W2 | `level` | `PlayerProgress.level` | `room.PlayerState.level`(**无写者**) | 网络层等级**永久为 1** |
+| W3 | `downed` | `PlayerVitals.downed`(布尔) | `DownedState`(结构体 Map) | 同名不同义 |
+| W4 | `carrySlots` | 冻结层 `statsAtLevel` | `room.ts` 内联 `8+(lv-1)` | L>30 分歧 |
+| W5 | 背包 | `users.inventory_json`(明细) | `room.inventoryTotals`(仅总量) | 两份各自漂 |
+| W6 | `hp`/`x,y,z`/`weaponId` | 模拟层各权威 | `room.PlayerState` 同名字段 | 8 个字段零同步 |
+| W7 | `Clock` 接口 | `coop/rush_order.ts` | `net/anticheat.ts` | 两个同名接口 |
+
+**其中 W1 有 Lead 独立复现的实测**:`vitals.revive('p1', 535)` → `hp=535 maxHp=100`。
+链条:`revive.ts` 取 `progress.maxHp` → `vitals.ts` 的 `v.hp = hp ?? v.maxHp` **无钳制**。
+⚠️ **而同一个入口的读档路径是有钳的**(`importVitals` 里 `Math.min(v.maxHp, row.hp)`)
+⇒ **同一入口两条路径行为不一致** —— 这才是缺陷的准确形态。
+
+### ⚠️ 一条**升级后又降级**的发现(`mobHitDamage`)—— 记录方法教训
+
+`net-persist` 报告「**怪物打人无钳!** `level 1e9 → 2000000004`」。
+Lead 复核:**函数层成立**(完全复现),但**危害半径要收窄**:
+
+```
+vitals.ts:403   v.hp = Math.max(0, v.hp - raw);   ⇒ **HP 侧有钳(钳在 0)**
+vitals.ts:406   v.totalTaken += raw;              ⇒ 无钳
+vitals.ts:416   this.totals.damage += raw;        ⇒ 无钳
+```
+⇒ 真实危害是「**统计字段吸收荒谬值**」,不是「玩家掉荒谬的血」。
+
+**可达性**(决定性,Lead 实测):
+```
+冻结层 mobs.ts  :24 个 level,1..25
+冻结层 bosses.ts: 8 个 level,5..30
+⇒ 生物最大等级 = 30 ⇒ mobHitDamage(30) = 64  ⇒ **当前内容不可达**
+```
+⇒ **正确定性:缺少守卫的契约缺陷,不是当前可利用缺陷。**
+两者都该记,但**优先级与修法不同**。
+
+⚠️ **更具体的隐患**(Lead 算):`2000000004` 距 `INT32_MAX = 2147483647` 只差 `1.4e8`
+⇒ **若该值经任何 int32 序列化(网络差量/存档 blob),会溢出为负。**
+而 US2 正要把它搬进网络层 ⇒ **这是「它现在不该上线」的直接论据。**
+
+**⇒ 方法教训(与第四层同族,但方向相反)**:
+第四层是我**高估**(把封顶误读为无上限);这里是**形容词越界** ——
+「无钳」在函数层为真,但读者会理解成「玩家会掉荒谬的血」,而**那是假的**。
+**⇒ 报告里的每个形容词也在断言事实。** 与「门禁印的每个数字都在断言事实」同理。
+
+### 与第四层的关系(为什么两层都要写)
+
+| 层 | 回答的问题 | 若只做这一层 |
+| :--- | :--- | :--- |
+| 第四层 | 参数**从哪来**(调用方自报 vs 服务端派生) | 把「自报」改成「派生」,但**不知道从哪派生** |
+| 第五层 | 谁是**权威所有者** | 知道该派生,但**没有可派生的唯一真相源** |
+
+⇒ **两层合起来才是 US2 的完整前置。** 顺序:先第五层(定所有者)→ 再第四层(定来源)。
+
+### 影响面
+
+US2(`task-47`)已据此把依赖改为 `blocked_by [task-36, task-44, task-49, task-51]`。
+**`task-49` 的产出(`docs/AUTHORITY-MAP.md`)是本层的权威依据。**
+
+### 未决(需 Lead 裁决)
+
+- **`maxHp` 以谁为准?** `vitals` 的常量 100 还是 `progression` 的等级派生?
+  ⇒ 这决定「温泉 +30% 生命上限」(task-48 已接)该乘在哪个基上。
+- **`room.PlayerState.level` 无写者** —— 是**删掉该字段**还是**补写者**?
+- **8 个交集字段的同步方向**:服务端权威单向投影,还是双向?
+- W1 的修法:在 `revive` 侧钳,还是在 `vitals` 侧钳?
+  ⚠️ 两侧都钳会重演「两份实现」—— **必须选一处**。
+- `mobHitDamage` 加钳的阈值取什么?(生物最大 30 ⇒ 但不该硬编码 30)
+
+---
+
 ## 未决问题
 
 1. **`party_mode` 词表冲突**(实测,`net-persist` 用**真实 SQLite**验证):
