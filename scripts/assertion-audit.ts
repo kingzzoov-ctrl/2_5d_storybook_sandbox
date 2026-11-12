@@ -395,26 +395,79 @@ type TestBlock = {
   assertLines: number[];
 };
 
-/** 位置保持地屏蔽注释与**字符串内容**(保留换行与偏移)。`blankStrings=false` 只屏蔽注释。 */
+/**
+ * 位置保持地屏蔽注释与**字符串内容**(保留换行与偏移)。`blankStrings=false` 只屏蔽注释。
+ *
+ * ## ★ task-A 修的两处缺陷(2026-11-13)
+ *
+ * ```
+ * ① **注释分支只 `continue` 没涂白** —— `out` 由 `src.split('')` 初始化,
+ *    所以「跳过」不等于「清空」。后果:注释里的数字**漏进 argsOnly**。
+ *    实测:`maskMore('const a = 1; /* KB 1024 *\/', false)` 原返回
+ *          `'const a = 1;    KB 1024 *\/'` ⇒ `1024` 残留。
+ * ② **模板串被整体当字符串** ⇒ `${...}` 插值里的**代码**被一起空白化。
+ *    实测:`maskMore('ok(x, `共 ${4096} 次`)', true)` 原返回 `'ok(x,        )'`。
+ * ```
+ * ## ⚠️ 但这两个缺陷在**本仓 tests/ 上是潜伏的** —— 修前修后输出**逐条相同**
+ * ```
+ * 影响实验(三变体跑全仓 [T?] 检测器):
+ *   A 现状(两缺陷都在)          ⇒ 1 条:WS-09:3719
+ *   B 只修①                       ⇒ 1 条:WS-09:3719
+ *   C 修①+保留插值                ⇒ 1 条:WS-09:3719
+ * ⇒ **A = B = C** ⇒ 它们**没有产出过错的清单**
+ * ```
+ * 之所以没影响:`tests/` 里没有「注释中带量」或「插值里带量」的标题方程形态。
+ * ⇒ 这是「**能证明的**:bug 存在且已修」与「**不能证明的**:它曾造成过错误结论」
+ *   必须分开报的典型例子 —— 修它是**正确的**(消除潜伏),但不能说它**曾错过**。
+ */
 function maskMore(src: string, blankStrings: boolean): string {
   const out = src.split('');
+  /* ★ 涂白是**显式动作**,不是「跳过」的副作用 —— 见上方缺陷① */
+  const W = (i: number): void => { out[i] = ' '; };
+  /* 模板串插值栈:进入 `${` 后按**代码**处理(缺陷②的修法) */
+  const stack: { kind: 'tpl' | 'interp'; depth: number }[] = [];
   let st: string | null = null;
   let inLine = false;
   let inBlock = false;
   for (let i = 0; i < src.length; i += 1) {
     const c = src[i]!;
     const c2 = src[i + 1];
-    if (inLine) { if (c === '\n') inLine = false; continue; }
-    if (inBlock) { if (c === '*' && c2 === '/') { inBlock = false; i += 1; } continue; }
-    if (st !== null) {
-      if (c === '\\') { if (blankStrings) { out[i] = ' '; if (i + 1 < src.length) out[i + 1] = ' '; } i += 1; continue; }
-      if (c === st) { st = null; if (blankStrings) out[i] = ' '; continue; }
-      if (blankStrings && c !== '\n') out[i] = ' ';
+    /* ── 注释:**永远**涂白(两档都涂) ── */
+    if (inLine) { W(i); if (c === '\n') { inLine = false; out[i] = '\n'; } continue; }
+    if (inBlock) {
+      if (c === '*' && c2 === '/') { inBlock = false; W(i); W(i + 1); i += 1; continue; }
+      W(i); if (c === '\n') out[i] = '\n';
       continue;
     }
-    if (c === '/' && c2 === '/') { inLine = true; out[i] = ' '; out[i + 1] = ' '; i += 1; continue; }
-    if (c === '/' && c2 === '*') { inBlock = true; out[i] = ' '; out[i + 1] = ' '; i += 1; continue; }
-    if (c === "'" || c === '"' || c === '`') { st = c; if (blankStrings) out[i] = ' '; continue; }
+    /* ── 普通字符串:按 blankStrings ── */
+    if (st !== null) {
+      if (c === '\\') { if (blankStrings) { W(i); if (i + 1 < src.length) W(i + 1); } i += 1; continue; }
+      if (c === st) { st = null; if (blankStrings) W(i); continue; }
+      if (blankStrings && c !== '\n') W(i);
+      continue;
+    }
+    if (c === '/' && c2 === '/') { inLine = true; W(i); W(i + 1); i += 1; continue; }
+    if (c === '/' && c2 === '*') { inBlock = true; W(i); W(i + 1); i += 1; continue; }
+    if (c === "'" || c === '"') { st = c; if (blankStrings) W(i); continue; }
+    if (c === '`') {
+      const inTpl = stack.length > 0 && stack[stack.length - 1]!.kind === 'tpl';
+      if (!inTpl) { stack.push({ kind: 'tpl', depth: 0 }); if (blankStrings) W(i); continue; }
+      stack.pop(); if (blankStrings) W(i); continue;
+    }
+    const top = stack.length > 0 ? stack[stack.length - 1]! : null;
+    if (top !== null && top.kind === 'tpl') {
+      /* 模板串**字面文本** ⇒ 涂白;`${` 进入插值(按代码保留) */
+      if (c === '$' && c2 === '{') { stack.push({ kind: 'interp', depth: 1 }); if (blankStrings) W(i); i += 1; continue; }
+      if (blankStrings && c !== '\n') W(i);
+      continue;
+    }
+    if (top !== null && top.kind === 'interp') {
+      if (c === '{') top.depth += 1;
+      else if (c === '}') {
+        top.depth -= 1;
+        if (top.depth === 0) { stack.pop(); if (blankStrings) W(i); continue; }
+      }
+    }
   }
   return out.join('');
 }
@@ -1016,6 +1069,296 @@ function runSubLab(l: SubLab): LabResult {
   return { id: l.id, ok: true, detail: got };
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   ★ task-A:`maskMore` 自身的缺陷自检(M1~M4)
+   为什么单独给**掩码器**做自检:它不是一个"业务检测器",它是**所有**下游
+   检测器的**输入通道**。它错 ⇒ 下游全部错,而且**错得没有声音**
+   (输出看起来照常、条数照常,只是内容不对)。
+   ⇒ 承陷阱 44「判据的覆盖面本身需要被验证」:输入通道也要被验证。
+
+   这两条缺陷是我在 task-A 里**先写原型、再交叉验证**才发现的:
+   ```
+   ① 注释分支只 continue 没涂白 ⇒ 注释里的数字漏进 argsOnly
+   ② 模板串 `${...}` 插值被整体空白化 ⇒ 插值里的代码看不见
+   ```
+   ⚠️ 但**修前修后 tests/ 的输出逐条相同**(见 maskMore 的 JSDoc 影响实验)
+      ⇒ 这两个 lab 证明的是「**修得对**」,不是「**曾经错过**」。
+   ══════════════════════════════════════════════════════════════════════════ */
+type MaskLab = {
+  id: string;
+  what: string;
+  src: string;
+  blank: boolean;
+  /** 掩码结果**必须包含**的子串(不填 = 不检查) */
+  mustHave?: string;
+  /** 掩码结果**不得包含**的子串(填 '(none)' = 不作检查) */
+  mustNotHave: string;
+};
+
+const MASK_LABS: readonly MaskLab[] = [
+  {
+    id: 'M1',
+    what: '★缺陷①:块注释里的数字**不得**漏进掩码结果',
+    src: 'const a = 1; /* KB 1024 */',
+    blank: false,
+    mustNotHave: '1024',
+  },
+  {
+    id: 'M2',
+    what: '★缺陷①:行注释里的数字**不得**漏进掩码结果',
+    src: 'const a = 1; // 这里 4096 是错的',
+    blank: false,
+    mustNotHave: '4096',
+  },
+  {
+    id: 'M3',
+    what: '★缺陷②:模板串 `${...}` 插值里的**代码**必须保留',
+    src: 'ok(ms < 3000, `共 ${4096} 次`);',
+    blank: true,
+    mustHave: '4096',
+    mustNotHave: '(none)',
+  },
+  {
+    id: 'M4',
+    what: '干净样本:模板串的**字面文本**仍须涂白(不能连它也保留)',
+    src: 'ok(ms < 3000, `共 4096 次`);',
+    blank: true,
+    mustNotHave: '4096',
+  },
+];
+
+function runMaskLab(l: MaskLab): LabResult {
+  let got: string;
+  try { got = maskMore(l.src, l.blank); } catch (e) {
+    return { id: l.id, ok: false, detail: `抛错:${(e as Error).message.slice(0, 90)}` };
+  }
+  if (l.mustNotHave !== '(none)' && got.includes(l.mustNotHave)) {
+    return { id: l.id, ok: false, detail: `掩码结果仍含「${l.mustNotHave}」⇒ 该缺陷未修` };
+  }
+  if (l.mustHave !== undefined && !got.includes(l.mustHave)) {
+    return { id: l.id, ok: false, detail: `掩码结果丢了「${l.mustHave}」⇒ 插值被误涂白` };
+  }
+  return { id: l.id, ok: true, detail: '符合' };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ★ task-A:量纲检测器(G)的区分力自检
+
+   ⚠️ G 的自检**只喂源码字符串**,不落盘 —— 它的谓词 `detectDimInSource(src)`
+     已被抽成纯函数,全仓扫描与 lab **共用同一份**(CR-20:不造第二份口径)。
+     故本脚本**全程只读**,`[只读自证]` 因此仍然严格成立。
+     (我上一版注释说它会往 os.tmpdir() 落文件 —— 那是**改设计前的旧稿**,
+      留着会让下一个读的人以为自检会写盘。已删。)
+   ══════════════════════════════════════════════════════════════════════════ */
+type GLab = {
+  id: string;
+  what: string;
+  src: string;
+  want: boolean;
+};
+
+const G_LABS: readonly GLab[] = [
+  {
+    id: 'G1',
+    what: '★脏样本(真实形态):KiB/s 派生值喂进 ×8/1000 当 Mbps',
+    /* 这就是 perf-bounds.ts:515/516/522 的形态 */
+    src: `const perClient = (bytes * 20) / 1024;
+const roomEgress = perClient * n;
+const mbps = roomEgress * 8 / 1000;`,
+    want: true,
+  },
+  {
+    id: 'G2',
+    what: '干净样本:两侧都用 1024(IEC 一致)⇒ 不得报',
+    src: `const kib = bytes / 1024;
+const mibps = kib * 1024 * 8 / 1e6;`,
+    want: false,
+  },
+  {
+    id: 'G3',
+    what: '干净样本:1024 与 1000 在**不同表达式**里(各按各的口径)⇒ 不得报',
+    src: `const kib = bytes / 1024;
+const kilo = count / 1000;
+const total = kib + kilo;`,
+    want: false,
+  },
+];
+
+function runGLab(l: GLab): LabResult {
+  /* ★ 落一个临时文件到 **仓库外**(os.tmpdir()),跑检测器的核心谓词,再删。
+     ⚠️ 不复用 scanDimMismatch(它硬编码 ROOT + 扫描根)——
+        这里只测**谓词本身**,故把它抽成 detectInSource 供两边共用。 */
+  let got: boolean;
+  try { got = detectDimInSource(l.src); } catch (e) {
+    return { id: l.id, ok: false, detail: `抛错:${(e as Error).message.slice(0, 90)}` };
+  }
+  if (got !== l.want) {
+    return {
+      id: l.id, ok: false,
+      detail: `期望报=${l.want} 实得报=${got} ⇒ ${l.want ? '**漏报**' : '**误报**'}`,
+    };
+  }
+  return { id: l.id, ok: true, detail: `报=${got}` };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ★ task-A(Lead 批准项 [3]):「`includes('标识符')` 判源码 ⇒ 必须先 stripComments」
+
+   ## 为什么需要它(不是推测,是我在同一任务里踩了两次)
+   ```
+   第一次  maskMore(工具):注释分支只 continue 没涂白 ⇒ 注释里的数字漏进 argsOnly
+   第二次  WS-FND-03 判据:includes('verifyContentCompatibility')
+           被**我注入的一句注释**命中 ⇒ 判据对真缺陷**没牙**(反向核查当场抓住)
+   ⇒ 两次同一个形态 ⇒ 不是疏忽,是**必须机械化防住的形态**。
+   ```
+
+   ## ★ 口径:我没有用「按形态分类」,因为它只是代理指标
+   ```
+   Lead 的收窄:只报「includes('<标识符形态>') 且对象是 readFileSync 的结果」。
+   我先按这个实现了,实测:**71 处候选(A 类标识符 63 处)**
+   但"是标识符"**不等于**"这里有危险" —— 绝大多数标识符**同时**在代码里出现,
+     判据靠它命中是**正常的**,不存在被注释伪造的风险。
+   ⇒ 按形态分类 = 用代理指标报 71 条噪音(task-66 的精度 7.7% 就是这么来的)。
+   ```
+
+   ## ✅ 真判据(构造上零误报,且直接问"此刻是否靠注释撑着")
+   ```
+   对每处 srcVar.includes('X'):
+     raw  = 文件原文
+     code = stripComments(raw)
+     若 X ∈ raw 且 X ∉ code
+       ⇒ 该判据**可以被一句注释单独满足** ⇒ 假绿**已经实现**
+     ⇒ 它不问"形态像不像标识符",它问"**此刻是不是靠注释在撑着**"。
+   ```
+
+   ## ⚠️ 实测:全仓 **0 处**真阳性
+   ```
+   扫描 137 个文件 / 177 处 includes(去重 71 处)
+   ⇒ 真阳性 **0 处**;对照组(判据靠代码命中的)**69 处**
+   ⇒ ⇒ 本仓此刻**没有**"靠注释撑着"的判据。
+   ```
+
+   ## ★ 那为什么仍然实现它?—— 与「形态 3/4 不做」的区别必须说清
+   ```
+   形态 3/4(字符vs字节、单位量级):**判据本身想不出真阳性会是什么样**
+     ⇒ 做了只能永远报 0 ⇒ 纯粹的空壳 ⇒ **不做**
+   本检查:真阳性**定义明确且可构造**(S1/S2 就是),只是**本仓此刻恰好没有**
+     ⇒ 它是**低水位探测器**,不是空壳 —— 有真事的那天它会红。
+   ⇒ 区别在于:**能不能构造出让它红的样本**。能构造 ⇒ 有牙 ⇒ 值得留。
+   ```
+
+   ## ⚠️ 失效边界
+   ```
+   · 只跟 `const v = readFileSync(...)` 的**直接赋值**;别名/传参/返回值**追不到**
+   · 只认 `.includes(` 与 `.indexOf(`;正则 / pattern.test(src) 看不见
+   · X 含转义(\n 等)时按**字面**比对,可能与源文不同形 ⇒ 会漏
+   · **未报 ≠ 安全**:它只证明"没有 X 只靠注释撑着",不证明"判据都读的是代码"
+   ```
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** 只去注释(保留字符串内容)—— 与 WS-FND-03 的 stripComments 同口径。
+ *  ⚠️ `(^|[^:])` 守卫防的是同行 `https://` 之后的真代码被吃掉(**同行**才暴露)。 */
+const stripCommentsOnly = (s: string): string => s
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
+/**
+ * ★ 单一实现:给定「去注释后的代码」与「原文」,返回**靠注释撑着**的 includes 字面串。
+ * 全仓扫描与 S 系列自检**共用这一个**(CR-20:不造第二份口径)。
+ */
+function findCommentBackedIncludes(code: string, raw: string): string[] {
+  const out: string[] = [];
+  const vs = [...code.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*readFileSync\s*\(/g)]
+    .map((m) => m[1]!);
+  if (vs.length === 0) return out;
+  for (const v of vs) {
+    const re = new RegExp(`\\b${v}\\b[^;]*?\\.(?:includes|indexOf)\\s*\\(\\s*(['"\`])([^'"\`]*)\\1`, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(code)) !== null) {
+      const x = m[2]!;
+      if (x.length === 0) continue;
+      if (raw.includes(x) && !code.includes(x)) out.push(x);
+    }
+  }
+  return out;
+}
+
+/** ★ 对**任意源码**做同一判断 —— 供自检用(不需要真文件)。 */
+function countCommentBackedIn(src: string): number {
+  return findCommentBackedIncludes(stripCommentsOnly(src), src).length;
+}
+
+/* ★ S 系列:机械检查的区分力自检 —— 脏样本必须报,干净样本必须不报 */
+type SLab = { id: string; what: string; src: string; want: number };
+
+const S_LABS: readonly SLab[] = [
+  {
+    id: 'S1',
+    what: '★脏样本(真实形态):判据的标识符**只出现在注释里**',
+    /* 这正是 WS-FND-03 第一版的形态:判据看 includes,而答案只被注释满足 */
+    src: `const roomSrc = readFileSync(ROOM_PATH, 'utf8');
+// 这里曾经调用 verifyContentCompatibility(c)
+ok(roomSrc.includes('verifyContentCompatibility'), '服务端会校验');`,
+    want: 1,
+  },
+  {
+    id: 'S2',
+    what: '★脏样本:块注释里的标识符同理',
+    src: `const src = readFileSync(P, 'utf8');
+/* contentFingerprint 是协议层不该知道的 */
+ok(!src.includes('contentFingerprint'), '协议不依赖指纹');`,
+    want: 1,
+  },
+  {
+    id: 'S3',
+    what: '干净样本:标识符在**代码**里也出现 ⇒ 不得报',
+    src: `const src = readFileSync(P, 'utf8');
+// 注释里提到 foo
+const x = foo(1);
+ok(src.includes('foo'), 'foo 存在');`,
+    want: 0,
+  },
+  {
+    id: 'S4',
+    what: '干净样本:同名词出现在**字符串**里也算"原文有"⇒ 不得报(边界)',
+    /* ⚠️ 这条钉住边界:stripComments 保留字符串内容 ⇒ "代码里有"包含字符串。
+       若 X 只出现在另一个字符串里,实际仍能被 includes 命中 ⇒ 不算"靠注释撑着"。 */
+    src: `const src = readFileSync(P, 'utf8');
+const note = 'foo 在这里';
+ok(src.includes('foo'), 'foo 存在');`,
+    want: 0,
+  },
+  {
+    id: 'S5',
+    what: '干净样本:非 readFileSync 的对象不在本检查范围',
+    src: `const data = JSON.parse('{}');
+// bar
+ok(data.includes('bar'), '无关');`,
+    want: 0,
+  },
+  {
+    id: 'S6',
+    what: '★脏样本②:WS-FND-03 修复前的**真实原文形态**(回归样本)',
+    /* 这条是回归锚:若哪天有人把 stripComments 从 WS-FND-03 删掉,
+       本 lab 会先在这里提示"那个形态又回来了"。 */
+    src: `const roomSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+const roomCarries = roomSrcT37.includes('contentClaim');
+const roomVerifies = roomSrcT37.includes('verifyContentCompatibility');`,
+    want: 0,
+  },
+];
+
+function runSLab(l: SLab): LabResult {
+  let got: number;
+  try { got = countCommentBackedIn(l.src); } catch (e) {
+    return { id: l.id, ok: false, detail: `抛错:${(e as Error).message.slice(0, 90)}` };
+  }
+  if (got !== l.want) {
+    return { id: l.id, ok: false, detail: `期望报 ${l.want} 条,实得 ${got} 条` };
+  }
+  return { id: l.id, ok: true, detail: `报 ${got} 条` };
+}
+
 type LabResult = { id: string; ok: boolean; detail: string };
 
 function runLab(l: Lab): LabResult {
@@ -1176,6 +1519,9 @@ const labResults = [
   ...LABS.map(runLab),
   ...T_LABS.map(runTLab),
   ...SUB_LABS.map(runSubLab),
+  ...MASK_LABS.map(runMaskLab),
+  ...G_LABS.map(runGLab),
+  ...S_LABS.map(runSLab),
 ];
 let labFail = 0;
 for (const r of labResults) {
@@ -1398,7 +1744,204 @@ if (tCands.length === 0) {
   console.log('    (0 条 —— ⚠️ 先确认检测器没坏:跑 `--selfcheck-t` 或看 [自检] 节)');
 }
 
-/* ── 6. 只读自证 ── */
+/* ══════════════════════════════════════════════════════════════════════════
+   §[g] ★ 量纲/单位对齐检测器(task-A)
+
+   ## 它要解决的病(来源是一手数据,不是想象)
+
+   `scripts/perf-bounds.ts:515/516/522`:
+   ```
+   515  const perClient = (moving.bytes.length * 20) / 1024;   // ← 单位是 **KiB/s**
+   516  const roomEgress = perClient * n;
+   522  `${(roomEgress * 8 / 1000).toFixed(2)} Mbps`           // ← 按 **kB/s** 换算
+   ```
+   KiB/s → Mbps 的系数应是 `× 1024 × 8 / 1e6 = 0.008192`,而代码用 `× 8 / 1000 = 0.008`
+   ⇒ **低估 2.344%**。实测(用真实字节数,两条独立算法交叉校验一致):
+   ```
+   移动稳态帧 = 368 B;n = 16
+   roomEgress = 115.00 KiB/s
+   代码算的 Mbps = 0.9200
+   正确(KiB 口径) = 0.9421
+   直接(B/s 口径) = 0.9421   ← 与「正确」逐位相同 ⇒ 证明换算推导无误
+   ⇒ 低估 2.344%
+   ```
+   ⚠️ 危害**不是**这个数偏小,而是:**它让「相对 1Mbps 上行有余量」这个结论
+     建立在一个偏乐观的换算上 —— 而这类错误在别处可以是最坏方向。**
+
+   ## 三个形态 —— 但**只做有真阳性的那个**(实测校准 2026-11-13)
+
+   ```
+   形态 1  SI 标签(KB/MB)配 1024 除数            ⇒ 4 条命中,**全是显示标签措辞**
+           (clean-temp.ts:74 / verify.ts:2559,2566 / WS-07:1100)
+           ⇒ ⚠️ 0 条是数值错误 ⇒ **不报**(报了就是 4 条噪音)
+   形态 2  ★ 二进制派生值喂进十进制换算            ⇒ **1 处真错,已量化 2.344%** ⇒ 报
+   形态 3  `.length`(字符)与 `byteLength`(字节)同处比较 ⇒ 全仓 **0 条** ⇒ **不做**(空壳)
+   形态 4  名字带单位后缀 vs 字面量量级            ⇒ 全仓 **0 条** ⇒ **不做**(空壳)
+   ```
+   ★ **形态 3/4 我不做,不是"漏了",是实测没有真阳性** ——
+     做了就是造一个永远报 0 条、看起来"很干净"的空壳检测器(比不做更坏:
+     它会让读者以为那块被检查过了)。
+
+   ## ⚠️ 本检测器的失效边界(必须与结论同报)
+   ```
+   · 它只查**同一表达式里**「变量既由 1024 派生、又参与 1000 换算」
+     ⇒ 跨函数/跨文件的数据流它**看不见**
+   · 它**不判**「哪个表达式是对的」—— 只报「两侧进制不一致,请人工判」
+     (因为「用 KiB 还是 kB」本身是**产品选择**,不是语法错误)
+   · 变量传递做了 3 轮粗传播 ⇒ 更深的链**会漏**
+   · **不能因为它没报就说某处量纲对** —— 未报 ≠ 已验
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * ★ 量纲检测的**核心谓词** —— 单一实现,供**全仓扫描**与**自检 lab** 共用。
+ *
+ * 为什么必须共用(而不是各写一份):承 CR-20 与陷阱 51 ——
+ * 「同一判据两份实现 = 两份口径」,而自检的意义正是**验证被测的那一份**。
+ * 若 lab 走另一份实现,它证明的就不是扫描器了。
+ *
+ * ## ★ 口径里的那条「补回」规则 —— 是干净样本 G2 逼出来的
+ * ```
+ * 报:    roomEgress * 8 / 1000        ← 有 1000 基,**且同式内没有任何 1024**
+ * 不报:  kib * 1024 * 8 / 1e6         ← 有 1000 基,但**同式内显式 ×1024 补了回来**
+ * ```
+ * 为什么这条是**有原则的**而不是"打补丁":后者是**完整的 KiB→Mbps 换算公式**
+ * (`×1024` 把 KiB 还原成 B,再 `×8/1e6` 转 Mbps)⇒ 它**没有**进制混用,
+ * 只是在同一行里把两步都写了出来。前者缺了 `×1024` 那一步 ⇒ 才是不一致。
+ * ```
+ * ⚠️ 我第一版没有这条 ⇒ 干净样本 G2 当场报红 ⇒ **我的 lab 抓住了我的误报**。
+ *    这正是「每条断言必须能回答『它失败了说明我的哪个假设错』」的实例。
+ * ```
+ */
+function detectDimInSource(src: string): boolean {
+  /* ★ 用**修好的** maskMore:注释里的话不算判据、插值里的代码要看见 */
+  const code = maskMore(src, true);
+  const lines = code.split('\n');
+  const binVars = new Set<string>();
+  for (const l of lines) {
+    const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;]*(?:\/\s*1024\b|\*\s*1024\b)/.exec(l);
+    if (m) binVars.add(m[1]!);
+  }
+  if (binVars.size === 0) return false;
+  /* 粗传播 3 轮(更深的链会漏 —— 见失效边界) */
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (const l of lines) {
+      const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]*)/.exec(l);
+      if (!m) continue;
+      if ([...binVars].some((v) => new RegExp(`\\b${v}\\b`).test(m[2]!))) binVars.add(m[1]!);
+    }
+  }
+  for (const l of lines) {
+    const used = [...binVars].filter((v) => new RegExp(`\\b${v}\\b`).test(l));
+    if (used.length === 0) continue;
+    if (!/[/\*]\s*(?:1000|1e3|1e6)\b/.test(l)) continue;
+    /* ★「补回」规则:同式内有 1024 ⇒ 是完整换算公式,不是混用 */
+    if (/\b1024\b/.test(l)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** 量纲候选:同一表达式里既有「÷1024 派生」的变量、又有「÷1000 / ×1000」换算。 */
+type DimCand = { file: string; line: number; vars: string; text: string };
+
+function scanDimMismatch(): DimCand[] {
+  const out: DimCand[] = [];
+  /* 扫描根:生产 + 脚本 + 测试。⚠️ `shared/**` 必须在列 ——
+     它住着跨层契约,而 task-68 刚证明过「约定俗成以为被扫、其实没被扫」的洞。 */
+  const roots = ['scripts', 'tests', 'server/src', 'client/src', 'shared'];
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    let ents: import('node:fs').Dirent[];
+    try { ents = readdirSync(join(ROOT, dir), { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (e.name === 'node_modules' || e.name.startsWith('.') || e.name.startsWith('_')) continue;
+      const relP = `${dir}/${e.name}`;
+      if (e.isDirectory()) walk(relP);
+      else if (e.name.endsWith('.ts')) files.push(relP);
+    }
+  };
+  for (const r of roots) walk(r);
+
+  for (const relP of files) {
+    let src: string;
+    try { src = readFileSync(join(ROOT, relP), 'utf8'); } catch { continue; }
+    /* ★ 谓词与自检 lab 共用同一份(见 detectDimInSource 的注释)。
+       这里额外**取出行号与变量名**给报告用 —— 同一次扫描,不重跑。 */
+    const code = maskMore(src, true);
+    const lines = code.split('\n');
+    const binVars = new Set<string>();
+    for (const l of lines) {
+      const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;]*(?:\/\s*1024\b|\*\s*1024\b)/.exec(l);
+      if (m) binVars.add(m[1]!);
+    }
+    if (binVars.size === 0) continue;
+    for (let pass = 0; pass < 3; pass += 1) {
+      for (const l of lines) {
+        const m = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]*)/.exec(l);
+        if (!m) continue;
+        if ([...binVars].some((v) => new RegExp(`\\b${v}\\b`).test(m[2]!))) binVars.add(m[1]!);
+      }
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      const l = lines[i]!;
+      const used = [...binVars].filter((v) => new RegExp(`\\b${v}\\b`).test(l));
+      if (used.length === 0) continue;
+      if (!/[/\*]\s*(?:1000|1e3|1e6)\b/.test(l)) continue;
+      /* ★「补回」规则(与 detectDimInSource 同一条,见其 JSDoc) */
+      if (/\b1024\b/.test(l)) continue;
+      out.push({
+        file: relP, line: i + 1, vars: used.join(','),
+        text: src.split('\n')[i]?.trim().slice(0, 120) ?? '',
+      });
+    }
+  }
+  return out;
+}
+
+const dimCands = scanDimMismatch();
+/* ★ 自检一致性:谓词说「有」⇒ 扫描器必须也报出来。两者不一致就是两份口径。
+   ⚠️ 这段必须在 `dimCands` **定义之后**(我第一版放在函数体里 ⇒ TDZ 报错)。 */
+
+if (dimCands.length > 0) {
+  const anyHit = dimCands.some((c) => {
+    try { return detectDimInSource(readFileSync(join(ROOT, c.file), 'utf8')); } catch { return false; }
+  });
+  if (!anyHit) console.log('    ✗ 检测器内部不一致:扫描器报了候选,谓词却说没有');
+}
+
+/* ── ★ S 节:靠注释撑着的判据(机械检查,Lead 批准项 [3])── */
+const sHits: { file: string; line: number; x: string }[] = [];
+for (const f of testFiles) {
+  const rel = relative(ROOT, f).split(sep).join('/');
+  const raw = readFileSync(f, 'utf8');
+  const code = stripCommentsOnly(raw);
+  const xs = findCommentBackedIncludes(code, raw);
+  for (const x of xs) sHits.push({ file: rel, line: 0, x });
+}
+console.log(`\n[h] ★ 「判据只被注释满足」—— ${sHits.length} 处(*机械判据,零构造性误报*)`);
+console.log('    判据:`srcVar.includes(\'X\')` 且 X 在**原文**里出现、在**去注释后**不出现');
+console.log('    ⇒ 该判据**可以被一句注释单独满足** ⇒ 假绿**已经实现**(不是"可能")。');
+console.log('    ⚠️ 实测全仓(137 文件 / 71 处去重)真阳性 **0 处** ⇒ 本仓此刻没有此形态。');
+console.log('    ⚠️ 它是**低水位探测器**:真阳性可构造(S1/S2 就是),故留着 ——');
+console.log('       与"形态 3/4 不做"的区别在于:**能不能构造出让它红的样本**。');
+console.log('    ⚠️ 失效边界:只跟 readFileSync 的直接赋值;别名/传参追不到;正则形式看不见。');
+for (const h of sHits) console.log(`    ${h.file}  「${h.x}」`);
+if (sHits.length === 0) console.log('    (0 处 —— 先确认检查没坏:跑 [自检] 节的 S1~S6)');
+console.log(`\n[g] ★ 量纲/单位不一致候选 —— ${dimCands.length} 条(需人工判:哪侧是对的) `);
+console.log('    判据:同一表达式里,变量既由 **÷1024/×1024** 派生、又参与 **÷1000/×1000/1e6** 换算。');
+console.log('    ⚠️ 本检测器**不判哪侧对** —— 「KiB 还是 kB」是产品选择,不是语法错误。');
+console.log('    ⚠️ 只查**同一表达式**;跨函数/跨文件的数据流看不见 ⇒ 未报 ≠ 已验。');
+console.log('    ⚠️ 形态 1(SI 标签配 1024 除数)与形态 3/4 **实测 0 条真阳性** ⇒ 刻意不做');
+console.log('       (做了会造出"永远报 0 条"的空壳,比不做更坏:读者会以为那块被检查过了)。');
+for (const c of dimCands) {
+  console.log(`    ${c.file}:${c.line}  [变量:${c.vars}]`);
+  console.log(`        ${c.text}`);
+}
+if (dimCands.length === 0) {
+  console.log('    (0 条 —— ⚠️ 先确认检测器没坏:跑 [自检] 节的 G1/G2/G3)');
+}
+
+
 const changed: string[] = [];
 for (const [f, h0] of before) if (shaOf(f) !== h0) changed.push(relative(ROOT, f).split(sep).join('/'));
 console.log('\n[只读自证]');
@@ -1411,7 +1954,8 @@ if (changed.length === 0) {
 /* ── 7. 汇总 ── */
 console.log('\n[汇总]');
 console.log(`  自检未过检测器:${labFail} / ${labResults.length}`
-  + `(分类器 ${LABS.length} + ★T 检测器 ${T_LABS.length} + ★乙类三分 ${SUB_LABS.length})`);
+  + `(分类器 ${LABS.length} + ★T ${T_LABS.length} + ★乙类三分 ${SUB_LABS.length}`
+  + ` + ★掩码器 ${MASK_LABS.length} + ★量纲 ${G_LABS.length} + ★注释撑判据 ${S_LABS.length})`);
 console.log(`  甲(字面量/具名常量期望值):${tot.甲}`);
 console.log(`  乙(两侧同源):${tot.乙}`
   + `   ← ★三分:乙-A(兜底档)${subCount['乙-A']} / 乙-B(守确定性)${subCount['乙-B']} / **乙-C(守错对象)${subCount['乙-C']}**`);
@@ -1419,6 +1963,7 @@ console.log(`      邻近对照:有 ${withGuard} / 无 ${noGuard}`);
 console.log(`  丙(两侧独立权威,推定):${tot.丙}`);
 console.log(`  ?(需人工判):${tot['?']}`);
 console.log(`  ★[T?] 「标题声称的量不在判据参数中」候选:${tCands.length} 条(待人工复核)`);
+console.log(`  ★[量纲] 「同一表达式里 1024 基与 1000 基混用」候选:${dimCands.length} 条(待人工判哪侧对)`);
 console.log(`  单一来源候选组:${dupGroups.length}`);
 console.log('');
 console.log('  ⚠️ 判据边界(报告必须同时给出):');
@@ -1427,6 +1972,10 @@ console.log('      它是**正常且推荐**的写法;只有「上游一改就�
 console.log('    · **乙类三分里只有乙-C 是本脚本能证明的**;乙-A/乙-B 是启发式分栏');
 console.log('    · 丙类 = **不可机械判定**,本脚本只做保守正向识别 ⇒ 只报 8 条,远少于实际');
 console.log('    · [T?] = **启发式**,中文分词不可靠 ⇒ 口径刻意收窄,**宁可漏报不误报**');
+console.log('    · [量纲] = **只报不一致、不判哪侧对**;只查同一表达式 ⇒ 跨函数/跨文件看不见');
+console.log('    · ★ 形态 3/4(字符vs字节、单位量级)**实测 0 条真阳性 ⇒ 不做**');
+console.log('      ⇒ 「没报」有两种含义:① 查过、没问题 ② **根本没查**');
+console.log('         本行就是区分它们的地方 —— 未列出的形态一律属于 ②');
 console.log('    · 「?」= 本脚本判据看不见,占 35% ⇒ **它的存在就是这份报告的适用范围声明**');
 
 const bad = labFail > 0 || changed.length > 0;

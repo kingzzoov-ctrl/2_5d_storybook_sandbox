@@ -1862,7 +1862,30 @@ function checkReachability(): void {
   } else if (unlisted.length > 0) {
     /* 未登记的不可达模块 —— 本门禁的核心产出。
        默认只告警(见函数头注释),但 `--strict-reach` 会把告警升级为失败,
-       否则「永远是警告」本身又会退化成一条不起作用的装饰。 */
+       否则「永远是警告」本身又会退化成一条不起作用的装饰。
+
+       ★★★ 2026-11-13 加:`reachHint` —— 把「同一根因的两个投影」连起来报。
+
+       ## 为什么要多打一句「README 也要一起改」
+
+       实测(三次连红 78/93 → 78/95 → 78/96):
+         新文件进可达集 ⇒ 本门禁报「新增未登记的不可达模块 N 个」;
+         **同一次**运行里 `README 生产可达性` 也会红(那个数也变了)。
+         ⇒ 两条红**是同一件事的两个投影**,但在输出里**相隔很远**。
+         ⇒ 后果实测:改的人补完白名单、以为做完了,下一轮才发现第二条
+           ⇒ **同一次改动被分成两次往返**。
+
+       ⚠️ 解法**不是**让 README 自动生成数字 —— 理由是结构性的:
+         手写数 + 门禁比对 ⇒ 漂了就红 ⇒ **红的时候告诉我该填什么**(有信息);
+         自动生成        ⇒ 永远一致 ⇒ **永远不会红** ⇒ 那个数再也不能告诉你任何事。
+         ⇒ 那是**自我复述,不是校验**,与陷阱 69「算了但不比」互为镜像:
+           一个是不比,一个是**两边同一个源**。
+         ⇒ 要的是**两个独立记录**:README 是人写的意图,门禁是实测的事实,
+           **不一致时才有信息**。
+       ⇒ 所以修的是**引导**,不是"少报一条":把两次往返压成一次。 */
+    const reachHint = '★ 同时注意:README「生产可达性」那个数**也会一起变** —— '
+      + '补完这里的白名单/接线后请同步改 README,否则下一次运行还会再红一次'
+      + '(两条红是**同一根因的两个投影**)。';
     if (strictReach) {
       fail(
         `新增未登记的不可达模块 ${unlisted.length} 个(--strict-reach):`
@@ -2707,7 +2730,8 @@ function checkTautology(): void {
     if (strictTaut) {
       fail(
         `新增未登记的同义反复候选 ${unlisted.length} 个(--strict-taut):`
-        + `${unlisted.slice(0, 4).join(', ')}${unlisted.length > 4 ? ' ...' : ''}`,
+        + `${unlisted.slice(0, 4).join(', ')}${unlisted.length > 4 ? ' ...' : ''}`
+        + `\n      ${reachHint}`,
       );
     } else {
       advise(
@@ -2719,6 +2743,7 @@ function checkTautology(): void {
         console.warn(`      · ${s}  ${n}`);
       }
       if (unlisted.length > 12) console.warn(`      ... 另有 ${unlisted.length - 12} 个`);
+      console.warn(`      ${reachHint}`);
     }
   }
 

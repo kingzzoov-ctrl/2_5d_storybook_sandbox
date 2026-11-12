@@ -511,17 +511,68 @@ function checkBandwidth(): void {
     note: '判据是「差量 < 全量一半」这一结构性质,不含任何绝对字节数',
   });
 
-  /* 手册 L747 的 12 房间并发 + 出口带宽上界 */
-  const perClient = (moving.bytes.length * 20) / 1024;
-  const roomEgress = perClient * n;
+  /* 手册 L747 的 12 房间并发 + 出口带宽上界。
+   *
+   * ═══ ★ 量纲修正(task-A,2026-11-13)═══
+   *
+   * **原错**:`perClient` 除的是 `/1024`(⇒ 单位是 **KiB/s**),
+   *   而 Mbps 换算写成 `× 8 / 1000`(⇒ 假设输入是 **kB/s**)。
+   *   实测(移动稳态帧 368 B / n = 16):代码算 0.9200 Mbps,正确 **0.9421 Mbps**
+   *   ⇒ **低估 2.344%**。
+   *
+   * **为什么改换算而不改除数**(选「乙」):
+   * ```
+   * `1024` 在这里是对的 —— 网络字节量按 2 的幂分组是既定惯例,
+   *   且 `bytes / 1024` 求的就是 KiB,这个量本身没错。
+   * 错的是换算:它假设输入是 kB,而输入不是。
+   * ⇒ 错的在**换算**,不在**除数**。
+   * ```
+   *
+   * **为什么把单位写成显式的两步**(而不是只把 1000 换成 1024):
+   * ```
+   * 只换数字 ⇒ 读者仍要自己推导「KiB × 1024 × 8 / 1e6 为什么对」;
+   * 写成两步 ⇒ **量纲在代码里可见**:KiB → B(×1024)→ bit(×8)→ Mb(÷1e6)。
+   * ⇒ 与 C4a/C4b 的写法一致(那里也用显式 `× 1024 × 1024`)。
+   * ```
+   * ⚠️ **同时把单位名改准**:`kB/s` → **`KiB/s`**(打印文本 + 上方注释)。
+   *   否则「修了值、留着错标签」⇒ 下一个人按标签读,又会得到错结论,
+   *   而那个坑**比原来的更难发现**(原来的错有内部矛盾,修完剩的错**看起来是对的**)。
+   */
+  const bytesPerFrame = moving.bytes.length;
+  const perClient = (bytesPerFrame * 20) / 1024;      /* KiB/s */
+  const roomEgress = perClient * n;                    /* KiB/s */
+  /* KiB → Mbps 的**显式两步**:×1024(KiB→B)× 8(B→bit)÷ 1e6(→Mb) */
+  const kibsToMbps = (kibs: number): number => (kibs * 1024 * 8) / 1e6;
+  const egressMbps = kibsToMbps(roomEgress);
+  /* ★ 独立的第二条算法:**绕过 KiB**,直接从 B/s 算 Mbps —— 用于交叉校验 */
+  const egressMbpsDirect = (bytesPerFrame * 20 * n * 8) / 1e6;
+
   add({
     id: 'C8d',
     claim: '12 房间并发时单房广播出口可接受(手册 L747 的 1GB 服务器)',
     source: '手册 L747',
     expected: '相对常见 1Mbps 上行有余量',
-    actual: `单客户端 ${perClient.toFixed(2)} kB/s;全房广播 ${roomEgress.toFixed(1)} kB/s ≈ ${(roomEgress * 8 / 1000).toFixed(2)} Mbps`,
+    actual: `单客户端 ${perClient.toFixed(2)} KiB/s;全房广播 ${roomEgress.toFixed(1)} KiB/s ≈ ${egressMbps.toFixed(2)} Mbps`,
     verdict: 'holds',
-    note: '按实编移动稳态 ${moving.bytes.length}B × 20Hz 计;手册 L747 给出 12 房间并发目标',
+    /* ⚠️ 原为**单引号**字符串 ⇒ `${...}` 不会被插值,会字面打印出去。
+       这是与量纲错**无关的第二个缺陷**,顺手修掉(改成模板串)。 */
+    note: `按实编移动稳态 ${bytesPerFrame}B × 20Hz 计;手册 L747 给出 12 房间并发目标`,
+  });
+
+  /* ★ **把量纲钉成常驻判据**(task-A):
+   * 这条把「两条独立算法一致」从**一次人工复核**变成**每次运行都校验**。
+   * 若哪天有人把换算改回 `×8/1000`,这里立刻变红 —— 而 C8d 的 verdict
+   * 只判"relative 有余量",**察觉不到 2.34% 的偏差**。
+   * 判据用 1e-12:两式是同一量的两种算法,应当**逐位相同**(浮点下允许最后几位)。 */
+  add({
+    id: 'C8e',
+    claim: '出口带宽换算的量纲自洽:KiB 口径与 B/s 口径必须一致',
+    source: 'task-A 量纲修正(自检,非手册断言)',
+    expected: '两式逐位一致(1e-12)',
+    actual: `KiB 口径 ${egressMbps.toFixed(6)} Mbps vs 直接 B/s 口径 ${egressMbpsDirect.toFixed(6)} Mbps`,
+    verdict: Math.abs(egressMbps - egressMbpsDirect) < 1e-12 ? 'holds' : 'fails',
+    note: '若换算写成 ×8/1000(把 KiB 当 kB)⇒ 此处偏差 2.344% ⇒ 变红。'
+      + '这是「量纲正确性」的唯一常驻守卫',
   });
 }
 

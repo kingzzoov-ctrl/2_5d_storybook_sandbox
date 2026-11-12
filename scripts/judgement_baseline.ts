@@ -381,6 +381,27 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
  *                   ⇒ 只能本地复制一份结构来接 JSON ⇒ 这是**进程边界导致的必然重复**。
  *                   早已注意:它连 ROOT 都刻意不复制(见本仓"两份实现"教训)。
  *                   ⇒ 按规则**上调水位并把理由写清**(这正是水位守卫的用途)。
+ * 2026-11-13  44 对  ★ 水位守卫抓到的**第二次增长** ——
+ *                   `client/src/net/session.ts:39 HelloFrame` ↔
+ *                   `client/src/net/session.ts:50 WelcomeFrame`
+ *                   共享 `[t, protocolVersion, contentClaim]`
+ *                   独有A `[passwordHash, asGuest]` / 独有B `[playerId, roomId]`
+ *                   定性:**请求/响应对的协议对称,非重复实现**。逐条理由:
+ *                   · `t` —— 帧类型判别式,**每一帧都有** ⇒ 共享是定义使然;
+ *                   · `protocolVersion` —— 握手**两端都必须声明版本**,否则
+ *                     "版本不符 ⇒ 明确失败"无从判定(WS-12 有行为判据守这条);
+ *                   · `contentClaim` —— 两端都携带内容指纹,但**角色不同**:
+ *                     客户端侧恒为 `null`(阶段 3 拿不到 registry,见 CR-26),
+ *                     服务端侧是 `string`(encodeContentClaim 的输出)。
+ *                     ⇒ **同一字段名的两种角色**,不是一个概念的两份实现。
+ *                   · 独有字段**正交**:上行带凭据,下行带身份 ⇒ 零重叠。
+ *                   ⇒ 若合并成一个类型,会造出「playerId 可有可无的帧」——
+ *                     类型不再表达方向,是**更差**的设计。
+ *                   ⇒ 按规则**上调水位并把理由写清**。
+ * ______________________________________________________________________
+ * ⚠️ 两次增长由**同一条守卫**抓到,且**都发生在同一天** ——
+ *    说明它的灵敏度是对的:它**不**假装能区分"有意传递"与"重复实现",
+ *    而是把**每一次增长都当信号**,逼一个人来定性。这正是设计意图。
  * ```
  */
-export const G_CANDIDATE_WATERMARK = 43;
+export const G_CANDIDATE_WATERMARK = 44;

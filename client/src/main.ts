@@ -19,12 +19,37 @@
  */
 
 import { boot, type BootHandle } from './three/boot.ts';
+import { createSession, type SessionHandle } from './net/session.ts';
 
 declare global {
   interface Window {
     /** 供自检/截图脚本读取运行状态 */
     __stageReady?: () => Record<string, unknown>;
   }
+}
+
+/**
+ * 联机地址 —— 由页面通过 `?server=ws://host:port` 指定。
+ *
+ * ## 为什么**默认不连**
+ *
+ * 阶段 3 只做「**最小可行接线**」:让字节流通、让权威位置画对。
+ * 而 `boot()` 在**没有**服务端时必须照常跑(截图自检、离线开发都依赖它)——
+ * 若默认去连一个不存在的地址,错误路径会淹没真正的失败。
+ * ⇒ ∴ 不传 `?server=` 就是**单机模式**:`session` 为 `null`,一切照旧。
+ *
+ * ## 为什么把 `handle.store` **传进** `createSession`
+ *
+ * `boot()` 内部已经建了一个 `ClientStateStore`(渲染循环每帧读它)。
+ * ⇒ `createSession({ store: handle.store })` 让会话写进**同一个**对象。
+ * 若让会话自己再建一个,就会出现「字节收到了、画面不动」——
+ * 而**没有任何东西会报错**(两个 store 各自都"正常工作")。
+ * ⇒ 这是本仓反复出现的形态:两处都对,合起来不对。
+ *   ∴ 把「谁持有 store」变成**参数**,而不是运行期约定。
+ */
+function serverUrlFromLocation(): string | null {
+  const q = new URLSearchParams(window.location.search).get('server');
+  return q !== null && q !== '' ? q : null;
 }
 
 function main(): void {
@@ -45,8 +70,39 @@ function main(): void {
     throw e;
   }
 
-  window.__stageReady = () => handle.summary();
-  window.addEventListener('beforeunload', () => handle.dispose());
+  /* ── 联机:只在给了 `?server=` 时才连 ──
+     不给就完全是单机模式,与接线前行为一致(截图自检依赖这一点)。 */
+  let session: SessionHandle | null = null;
+  const url = serverUrlFromLocation();
+  if (url !== null) {
+    session = createSession({
+      url,
+      /* ★ 复用 boot 的 store —— 别让两个 store 各写各的(见上) */
+      store: handle.store,
+      events: {
+        /* 帧到达:渲染循环自己在读 `handle.store`,这里**不需要**触发重画。
+           只把"坏包/空帧"留痕,便于自检脚本读。 */
+        onFrame: () => { /* 渲染循环每帧自读 store */ },
+        onState: (s, detail) => {
+          if (s === 'failed') console.warn('[session] 失败:', detail);
+        },
+        onWelcome: (w) => {
+          console.info(`[session] 已加入房间 ${w.roomId}(玩家 ${w.playerId})`);
+        },
+      },
+    });
+  }
+
+  window.__stageReady = () => ({
+    ...handle.summary(),
+    /* 联机状态也进自检口径 —— 否则「连没连上」只能靠看控制台 */
+    sessionState: session?.state ?? 'offline',
+    serverContentClaim: session?.serverContentClaim ?? null,
+  });
+  window.addEventListener('beforeunload', () => {
+    session?.close();
+    handle.dispose();
+  });
 }
 
 if (document.readyState === 'loading') {

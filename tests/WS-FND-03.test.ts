@@ -288,27 +288,216 @@ okHas(hsSrc, 'ContentPolicy', '导出策略常量');
 
 /* ═══════════ task-37:handshake 的主人归属判定 ═══════════ */
 
-/* 这三条把「handshake 为何是真欠账、但为何**不能现在接线**」钉住。
- * 它们是**接线的前置条件清单** —— 条件变了就该来改这里,并据此接线。 */
+/*
+ * ★★ task-A 结构性改写(2026-11-13):从「**钉住缺陷**」改成「**钉住能力**」
+ *
+ * ## 原形态的病
+ * ```
+ * 原文四条都是**否定式**,记录的是「内容协商在生产上完全没接线」:
+ *   L298 ok(!roomSrc.includes('contentClaim'))         ← room 还不承载
+ *   L300 ok(!roomSrc.includes('verifyContentCompatibility')) ← room 还不校验
+ *   L323 eq(clientNet.length, 0)                        ← 客户端还没有网络层
+ *   L327 ok(!deltaSrc.includes('contentFingerprint'))   ← 协议层不管内容
+ * ⇒ 前三条把**一个缺陷状态**写成了**期望值**
+ *   ⇒ 缺陷一被修,它们就变红 ⇒ **这不是意外,是它们的设计注定的**
+ *   ⇒ 后果:接线的人必须"先改测试",于是测试从**门禁**退化成**路障**
+ * ```
+ * ## 改法:三种断言分开,各自钉它真正该钉的东西
+ * ```
+ * 甲 **能力断言**(永远为真,接线前后都绿)—— 判据是「这个机制能不能工作」
+ * 乙 **架构不变量**(永远为真)—— 判据是「两层的职责边界」
+ * 丙 ★ **不许出现的中间态**(接线前后都绿,**只在半接线时红**)
+ *     这是关键:把「两个独立的缺失」升级成「一个不许出现的组合」
+ *     ⇒ 它不奖励"没做",也不惩罚"做了",只抓"做了一半"
+ * 丁 **接线状态报告**(非断言)—— 让下一个人看到进展,但**不会因进展变红**
+ * ```
+ * ⚠️ 为什么丙比"接上了就绿"更强:接线有**两个独立动作**(服务端承载 + 客户端发送)。
+ *    「接上了就绿」只覆盖两个都完成的终态;而真正的危险区恰恰是**中间态**
+ *    (服务端开始校验、客户端还没发指纹 ⇒ **所有客户端被挡在门外**)。
+ *    ⇒ 丙把这个中间态抓成红的 —— 那是**真缺陷**,不是进度差异。
+ */
 
-console.log('\n— task-37 归属判定:handshake 是真欠账但被三前提阻塞 —');
+console.log('\n— task-37 归属判定:内容协商的能力与接线状态 —');
 
-/* 前提1:生产 join 路径没有承载 contentClaim 的位置。 */
-const roomSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
-ok(!roomSrcT37.includes('contentClaim'),
-  'room.ts 完全不提 contentClaim(join 无该入参位)⇒ 接线要先改 join 签名');
-ok(!roomSrcT37.includes('verifyContentCompatibility'),
-  'room.ts 不调用内容校验 ⇒ 现状是「完全不校验」而非「另有机制替代」');
-
-/* 前提2:默认策略 STRICT,而它拒绝「未提供指纹」的客户端。 */
+/* ── 甲 能力断言:机制本身能不能工作(接线前后都必须成立)── */
+console.log('\n  · 能力:校验机制覆盖三态');
 eq(h.DEFAULT_CONTENT_POLICY, h.ContentPolicy.STRICT, '默认策略为 STRICT');
 const strictNull = h.verifyContentCompatibility(null, h.ContentPolicy.STRICT);
 ok(strictNull.ok === false,
-  'STRICT + 无指纹 ⇒ 拒绝(故「无条件接线」会把所有现有客户端挡在门外)');
+  '能力①:STRICT + 无指纹 ⇒ 拒绝(故「无条件接线」会把所有现有客户端挡在门外)');
 ok(strictNull.reason?.includes('未提供内容指纹') === true,
-  `拒因指明是「未提供指纹」(实测:${strictNull.reason?.slice(0, 40)}...)`);
+  `能力①拒因指明是「未提供指纹」(实测:${strictNull.reason?.slice(0, 40)}...)`);
 
-/* 前提3:客户端没有网络层 ⇒ 发不出声明。 */
+/* ★ task-A 补的两条:原判据只测了「null + STRICT ⇒ 拒」,
+   而**能力齐全**还要求「匹配 ⇒ 通」「不匹配 ⇒ 拒」。
+   缺后两条的话,一个「永远返回 false」的实现也能让上面那条绿。
+   ⚠️ `verifyContentCompatibility` 收的是 **ClientContentClaim 对象**,不是字符串
+      (我第一版传了字符串 ⇒ 实测 ok=false ⇒ 被自己的断言抓住)。 */
+const claimLocal = h.localContentClaim();
+const matchRes = h.verifyContentCompatibility(claimLocal, h.ContentPolicy.STRICT);
+ok(matchRes.ok === true,
+  `能力②:提供的指纹与本地一致 ⇒ 放行(实测 ok=${matchRes.ok})`);
+const mismatchRes = h.verifyContentCompatibility(
+  { ...claimLocal, overall: 'ffffffffffffffff' }, h.ContentPolicy.STRICT);
+ok(mismatchRes.ok === false,
+  '能力③:指纹不一致 ⇒ 拒绝(否则校验形同虚设)');
+
+/* ── 丙 ★ 不许出现的中间态:服务端承载就必须校验,不承载就两边都不carry ──
+ *
+ * ⚠️⚠️ **这一族判据必须读「代码」,不能读「原文」** —— 我第一版用
+ *      `roomSrc.includes('verifyContentCompatibility')` 措词,**反向核查当场抓住它没牙**:
+ * ```
+ * 注入:room.ts 加一行 `const contentClaim = null;` +
+ *       一句**注释**里提到 verifyContentCompatibility
+ * ⇒ roomCarries=true,roomVerifies=true(命中注释!)⇒ 两边相等 ⇒ **绿**
+ * ⇒ 但那正是「承载了却不校验」= 真缺陷 ⇒ 判据对真缺陷**没有牙**
+ * ```
+ * ⇒ 与 `maskMore` 那条 bug **完全同族**:「注释里的字不是判据」。
+ *   修法同 task-63:去注释,**并且**判**调用形态**而不是判"出现过":
+ * ```
+ * `/verifyContentCompatibility\s*\(/`  ← 带左括号
+ *   ⇒ 排除 `import { verifyContentCompatibility } from ...`(那是"引入",不是"调用")
+ *   ⇒ 排除类型注解 `: typeof verifyContentCompatibility`
+ * ```
+ */
+/* ══════════════════════════════════════════════════════════════════════════
+   ★ stripComments —— 把「注释里的字」从判据里剔掉
+
+   ⚠️⚠️ **这个函数的必要性是被反向核查证明的**(见上方日志):不去注释的话,
+      一句提到 `verifyContentCompatibility` 的**注释**就会让判据误判为"已校验"。
+
+   ## 那条 `(^|[^:])` 守卫:方向对,但**理由必须写准**
+   ```
+   我原来的注释写:「否则 https:// 里的 // 会被当注释截断」
+   ⇒ ★ 这句**不准** —— 实测(8 个用例,仅 1 例有差别):
+        A 同行:`const u='https://x/y'; const r = verifyContentCompatibility(c);`
+          有守卫=true  无守卫=**false**   ★★ 有差别
+        B 跨行:`https://` 与真调用**不同行**
+          有守卫=true  无守卫=true        无差别
+   ⇒ 被吃掉的**不是 URL**(URL 本身是对的),而是**同一行里、URL 之后紧跟的真代码**。
+     跨行形态下无差别,因为那一行的真代码本来就不在同一行。
+   ⇒ ⇒ 所以守卫防的是**假阴性**(把真调用弄丢),而假阴性**看不见** ——
+       这正是本仓反复出问题的那一类。**测例必须用同行形态**,否则证明不了这一点。
+   ```
+   ## ★ 已知理论边界:模板串里的 `//`
+   ```
+   实测:`const s = \`// x\`; const r = verifyContentCompatibility(c);`
+     ⇒ stripComments 之后 = **false**(期望 true)⇒ **假阴性**
+   原因:本函数**先剥注释、不认模板串**,所以 `` `// x` `` 里的 `//` 被当行注释,
+        连带吃掉同行的真代码。
+   实测本仓**当前无此形态**(room.ts / delta.ts 里没有把 `//` 写进模板串的)
+     ⇒ 不修,但**写在这里**:它某天出现时会以"判据莫名其妙变绿"的形式咬人。
+   ⚠️ 为什么不现在改成完整的词法扫描:那是**第三份** masker 实现,
+      而本仓已有一份(`assertion-audit.ts` 的 maskMore,带 tpl/interp 栈)。
+      ⇒ 造第三份 = 三份口径 ⇒ 违背 CR-20。正确做法是**共用**,
+        但那要动 assertion-audit 的导出面,属另一个任务。
+   ══════════════════════════════════════════════════════════════════════════ */
+const stripComments = (s: string): string => s
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
+const roomSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+const roomCode = stripComments(roomSrcT37);
+const roomCarries = /\bcontentClaim\b/.test(roomCode);
+const roomVerifies = /verifyContentCompatibility\s*\(/.test(roomCode);
+
+/* ── 丙-方向1 服务端**半接线**:承载了却不校验 ──
+   ⇒ 危害形态:**挡在门外** —— 一旦开始校验而客户端没发指纹,
+     STRICT 策略会把**所有**现有客户端拒掉 ⇒ 故障**可见**(没人能进来)。 */
+ok(
+  roomCarries === roomVerifies,
+  roomCarries
+    ? '★ 丙①:服务端已承载 contentClaim ⇒ 必须同时校验(否则「半接线」把所有客户端挡在门外)'
+    : '★ 丙①:服务端未承载 contentClaim ⇒ 与「不校验」一致(两态自洽,不是缺陷)',
+);
+
+/* ── 丙-方向2 ★ 客户端**已发真指纹**但服务端**不读** ──
+ *
+ * 这是 Lead 指出的另一个方向的中间态。**实测它是真实存在的**(不是假想):
+ * ```
+ * client/src/net/session.ts:166-170  open 事件里发 hello:
+ *     const hello: HelloFrame = { t:'hello', protocolVersion, contentClaim: null };
+ *     socket.send(encodeClientFrame(JSON.stringify(hello), true));
+ * ⇒ **客户端确实在线上发 contentClaim 字段** ✓
+ *
+ * server/src/net/room.colyseus.ts:134
+ *     override onJoin(client, options: { passwordHash?: string; asGuest?: boolean })
+ * ⇒ ★ options 的类型里**没有 contentClaim** ⇒ 服务端**根本没读它**
+ * ```
+ * ⇒ **方向2 成立**,且危害形态与方向1**根本不同**:
+ * ```
+ * 方向1 挡在门外   ⇒ 故障**可见**(没人能进来)⇒ 会有人来报
+ * 方向2 静默丢弃   ⇒ 外部表现**一切正常**,而指纹**从来没被比对过**
+ *                    ⇒ ★ **没有人会来报** —— 所以它比方向1更危险
+ * ```
+ * ⚠️ 为什么现在**是绿的**(而不是"我放过了它"):
+ * ```
+ * 客户端当前发的是**字面 `null`** —— 一个不带信息的占位符。
+ * 丢掉一个 `null` 不损失任何信息 ⇒ **此刻无危害**。
+ * ⇒ 判据因此钉的不是"发没发",而是「**发的是不是真指纹**」:
+ *     发真指纹 + 服务端不读 ⇒ **立刻变红**
+ *   ⇒ 这样它在"危险的那一刻"红,而不是在"接线中途"红。
+ * ```
+ */
+const colyseusSrc = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
+const clientSrc = readFileSync(join(ROOT, 'client', 'src', 'net', 'session.ts'), 'utf8');
+const clientCode2 = stripComments(clientSrc);
+/* ⚠️⚠️ **必须区分上行/下行** —— 我第一版的正则
+ *    `/contentClaim\s*:\s*(?!null\b)\S/` 命中的是 **`WelcomeFrame.contentClaim: string`**
+ *    (那是**服务端→客户端**的下行字段,不是客户端发的)**⇒ 判据当场误红 114/115**。
+ * ```
+ * ⇒ ★ 「同名标识符在不同方向上含义相反」—— 这是本任务里我第三次踩
+ *   「同一个名字、不同含义」类的坑(前两次:量纲 1024/1000、注释 vs 代码)。
+ * ⇒ 修法:**只在 `HelloFrame`(上行)的声明块内**判定。
+ * ⚠️⚠️ 但**危险只看「线上发的是什么」= 运行时构造值**。我上一版要求
+ *    「声明 **且** 运行时都非 null」才算危险,**反向核查当场抓住它漏报**:
+ * ```
+ * 注入:只把运行时构造改成 'v1-abc123'(声明接口仍留 null)
+ *   旧条件 clientSendsRealClaim && sendsRealAtRuntime && !serverReadsClaim
+ *     = false && true && true = **false** ⇒ 仍绿 ⇒ **漏报**
+ * ⇒ 但那一刻线上**确实**在发真指纹、服务端确实不读 ⇒ 就是「静默丢弃」
+ * ⇒ ⇒ 「声明」是**类型契约**,「构造值」是**线上事实**;危险由**事实**决定。
+ *   我把「光看声明不够」错推成了「两者都要」——**"不足"不等于"必需"**。
+ * ```
+ * ⚠️ 而两者**不一致**本身值得单独报(契约与实际不符),故另起一条。
+ * ```
+ */
+const helloBlock = /export interface HelloFrame\s*\{([\s\S]*?)\n\}/.exec(clientCode2);
+const helloDecl = helloBlock === null ? '' : helloBlock[1]!;
+const clientSendsField = /\bcontentClaim\b/.test(helloDecl);
+const clientSendsRealClaim = /contentClaim\s*:\s*(?!null\b)\S/.test(helloDecl);
+const helloLiteral = /const hello\s*:\s*HelloFrame\s*=\s*\{([\s\S]*?)\n\s*\};/.exec(clientCode2);
+const helloLiteralBody = helloLiteral === null ? '' : helloLiteral[1]!;
+const sendsRealAtRuntime = /contentClaim\s*:\s*(?!null\b)\S/.test(helloLiteralBody);
+/* 服务端是否读它:onJoin 的 options 类型或 room 侧引用 */
+const serverReadsClaim = /\bcontentClaim\b/.test(stripComments(colyseusSrc)) || roomCarries;
+
+ok(
+  !(sendsRealAtRuntime && !serverReadsClaim),
+  sendsRealAtRuntime && !serverReadsClaim
+    ? '★ 丙②:客户端**线上发真指纹**而服务端不读 ⇒ **静默丢弃**(外部一切正常,而指纹从未被比对)'
+    : `★ 丙②:线上发的 contentClaim ${sendsRealAtRuntime ? '是**真指纹**' : '是字面 null(占位,丢弃无损失)'}`
+      + `;服务端${serverReadsClaim ? '读它' : '不读它'} ⇒ 无「静默丢弃」`,
+);
+/* ★ 契约 vs 事实不一致 —— 危害与上条不同(上条是"丢数据",这条是"契约撒谎") */
+ok(
+  clientSendsRealClaim === sendsRealAtRuntime,
+  clientSendsRealClaim === sendsRealAtRuntime
+    ? `★ 丙②契约自洽:声明(${clientSendsRealClaim ? '真指纹' : 'null'})`
+      + ` = 运行时(${sendsRealAtRuntime ? '真指纹' : 'null'})`
+    : `★ 丙②:类型声明与运行时构造**不一致**(声明${clientSendsRealClaim ? '真指纹' : 'null'}`
+      + ` vs 运行时${sendsRealAtRuntime ? '真指纹' : 'null'})⇒ 契约与实际不符`,
+);
+
+/* ── 乙 架构不变量:线格式层与内容协商解耦 ──
+   ⚠️ 这条**保持否定式是对的** —— 它守的不是"还没做",是**职责边界**:
+      协议层永远不该知道内容指纹。它与进度无关。
+   ⚠️ 同样要**去注释**再判,否则注释里提一句就假红。 */
+const deltaSrcT37 = readFileSync(DELTA_SRC_PATH, 'utf8');
+ok(!stripComments(deltaSrcT37).includes('contentFingerprint'),
+  '架构不变量:线格式层不依赖内容指纹(协议与内容协商解耦)');
+
+/* ── 丁 接线状态报告(★ 不是断言,不会因进展变红)── */
 import { readdirSync, statSync } from 'node:fs';
 function walkClient(d: string, a: string[] = []): string[] {
   for (const e of readdirSync(d)) {
@@ -320,12 +509,16 @@ function walkClient(d: string, a: string[] = []): string[] {
 }
 const clientNet = walkClient(join(ROOT, 'client')).filter((f) =>
   /WebSocket|colyseus|fetch\(/.test(readFileSync(f, 'utf8')));
-eq(clientNet.length, 0, '客户端零网络能力 ⇒ 无通道发送 contentClaim(接线需先补网络层)');
+/* ★ 这里**不再断言** `clientNet.length === 0`。
+   原因:它钉的是「客户端还没有网络层」= 一个**必然被修掉的状态**。
+   改成报告:把事实说出来,让读者判断进度,**但不把进度差异判成失败**。
+   (原判据在 client-stage 建 `client/src/net/session.ts` 时按设计变红 ——
+    那是它的结构注定的,不是"有人弄坏了什么"。) */
+console.log(`  · 接线状态(非断言):客户端有网络能力的文件 = ${clientNet.length} 个`
+  + (clientNet.length > 0 ? ` → ${clientNet.map((f) => f.replace(/\\/g, '/').replace(/.*\/client\//, 'client/')).join(', ')}` : ''));
+console.log(`  · 接线状态(非断言):服务端承载=${roomCarries} 校验=${roomVerifies}`
+  + ` ⇒ ${roomCarries && roomVerifies ? '**已接线**' : '**未接线**(缺口真实存在:两端内容错配在生产上无人拦截)'}`);
 
-/* 三项合起来:现状**没有**替代机制在做内容一致性校验 —— 缺口是真实的。 */
-const deltaSrcT37 = readFileSync(DELTA_SRC_PATH, 'utf8');
-ok(!deltaSrcT37.includes('contentFingerprint'),
-  'delta.ts 也不做内容校验 ⇒ 两端内容错配在生产上确实无人拦截');
 
 /* 顺带钉住「不该顺手修正」的历史指纹:handshake 里的旧指纹是故意保留的记录。 */
 okHas(hsSrc, 'fa111d71', 'handshake.ts 保留旧指纹 fa111d71(历史记录,刻意不改)');

@@ -91,6 +91,10 @@ import {
 import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
 import { UiOverlay, type UiDrawState, type UiHit } from './ui_binding.ts';
 import { createAudio, type AudioHandle } from './audio_out.ts';
+/* task-67 阶段 3:玩家位置改由**权威状态**提供(不再从 `pan` 抄,见 S1 注释)。
+   这两个模块都**纯**(零三方、零 DOM)⇒ 可被 WS-12 直接 import 断言。 */
+import { ClientStateStore } from '../net/state_store.ts';
+import { telegraphCenterOf } from '../net/telegraph_center.ts';
 
 /** 帧率统计窗口(毫秒) */
 const FPS_WINDOW_MS = 500;
@@ -125,6 +129,13 @@ export interface BootHandle {
   /** 已渲染的世界摘要,供自检/截图脚本读取 */
   summary: () => Record<string, unknown>;
   dispose: () => void;
+  /**
+   * 权威状态存储(task-67 阶段 3)。
+   *
+   * 暴露它有两个原因:① 网络层(`session.ts`)拿到字节后要写进**同一个** store;
+   * ② 自检脚本能读到「权威位置是否真的到了」,而不只是"画面看起来对"。
+   */
+  store: ClientStateStore;
 }
 
 /**
@@ -542,15 +553,33 @@ export function boot(container: HTMLElement): BootHandle {
     entering: false,
   }));
   /**
-   * 玩家所在格(相机焦点即「玩家镜头位置」)
+   * 玩家所在格 —— ★ task-67 阶段 3:来源已改为**权威状态**(不再是 `pan`)。
    *
-   * ⚠ 屋顶分片**故意放在玩家出生点之外**(见下方 `ROOF_ORIGIN`),
-   * 这样「走进屋顶 → 淡出」这条路径在 demo 里是**真的能观察到**的:
-   * 出生时 alpha = 1,走进那 5×5 格后才降到 0.15。
-   * 若把屋顶盖在出生点正上方,则开局即淡出,反而看不出「进入」这个动作。
+   * ## 为什么不能再用 `pan`(S1 删掉的那两行)
+   *
+   * `pan` 是**相机平移**:WASD 拖拽与 `teleport` 都会改它,它可以**离开玩家**。
+   * 把它当玩家位置是「把相机当玩家」—— 而玩家位置由**服务端裁决**。
+   * 接线前这里写的是:
+   * ```
+   * playerGx = pan.x;   // ← 每帧无条件执行(唯一写点)
+   * playerGy = pan.y;
+   * ```
+   * 只要它在,**任何权威值都会在同一帧被覆盖** ⇒ 表现为「接线了但没效果」,
+   * 不抛错、不报红。∴ S1 先删掉它,此处才改成从 `authority` 取。
+   *
+   * ## 语义:权威 → 就地使用;权威**未知** → 保持上一帧(不清零)
+   *
+   * `telegraphCenterOf` 在「本地玩家还没到 / 没有自己」时返回 `null`
+   * (不是 `{0,0}` —— 那会把预警圈画到世界原点上一帧,且无人报错)。
+   * ⇒ 本层遇到 `null` 时**保持上一帧的值**:第一帧还没到时用出生点,
+   *   之后一直用权威值。这样「未知」不会被误当成「位置是 0,0」。
    */
+  const authority = new ClientStateStore();
+  /* 出生点:第一帧权威值到达前的占位(与 `pan` 初值一致,视觉上不跳) */
   let playerGx = WORLD_CELLS / 2;
   let playerGy = WORLD_CELLS / 2;
+  /** 权威位置是否已到达过一次 —— 供 `summary()` 自检与 WS-12 观测。 */
+  let authoritySeen = false;
   /**
    * 当前激活的屋顶分片。
    *
@@ -1029,9 +1058,20 @@ export function boot(container: HTMLElement): BootHandle {
     /* ── 每帧子系统推进(这些调用就是「模块真的在跑」的证据)── */
     /* 1. state_machine:推进打开动画(OPENING → OPEN) */
     uiFsm.tick(dt / 1000);
-    /* 2. roof_transparency:玩家所在格 → 屋顶连通域 → 淡入淡出 */
-    playerGx = pan.x;
-    playerGy = pan.y;
+    /* 2. roof_transparency:玩家所在格 → 屋顶连通域 → 淡入淡出
+     *
+     * ★ task-67 阶段 3(S2)在此**从权威状态取玩家位置**。
+     *   (S1 删掉了原来的 `playerGx = pan.x; playerGy = pan.y;` —— 见文件内注释)
+     *
+     * `telegraphCenterOf` 的 `null` 语义:权威未知(第一帧未到 / 还没有自己的 id)
+     * ⇒ **保持上一帧**,不清零、不画到世界原点。
+     */
+    const center = telegraphCenterOf(authority.state, authority.localPlayerId);
+    if (center !== null) {
+      playerGx = center.cx;
+      playerGy = center.cy;
+      authoritySeen = true;
+    }
     updateRoof(dt / 1000);
     /* 把算出来的 alpha 真的喂给材质 —— 否则「淡出」只是内存里的一个数 */
     (roofMesh.material as THREE.MeshLambertMaterial).opacity = roofOpacity();
@@ -1071,6 +1111,7 @@ export function boot(container: HTMLElement): BootHandle {
   window.addEventListener('resize', onResize);
 
   return {
+    store: authority,
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.length,
@@ -1081,6 +1122,16 @@ export function boot(container: HTMLElement): BootHandle {
       triangles: renderer.info.render.triangles,
       fps: Math.round(fps),
       running: raf !== 0,
+      /* ── task-67 阶段 3:权威位置自检口径 ──
+         截图/自检脚本靠这三个字段判断「玩家位置是不是真的来自服务端」,
+         而不是只看"画面看起来在动"(那是本地推测,不是权威)。 */
+      authoritySeen,
+      authorityTick: authority.state.meta.tick,
+      playerGx,
+      playerGy,
+      authoritativeCenter: telegraphCenterOf(authority.state, authority.localPlayerId),
+      authorityDecodeErrors: authority.decodeErrors,
+      authorityEmptyFrames: authority.emptyFrames,
       /* ── 图集自检口径:截图脚本靠这几个字段判断「真图 vs 占位」── */
       atlasOk,
       atlasErr,
