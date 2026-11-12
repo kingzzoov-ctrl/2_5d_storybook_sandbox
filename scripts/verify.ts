@@ -1167,6 +1167,42 @@ function extractRelativeImports(text: string): string[] {
       if (word === 'import' || word === 'from') {
         let k = j;
         while (k < n && /\s/.test(text[k] as string)) k += 1;
+        /* ★ 动态 `import(...)`(2026-11-12 补,原为已登记盲点 (g))
+         *
+         * 旧实现只认 `import`/`from` 后**紧跟**的字符串 ⇒ **动态导入全部漏掉**:
+         * ```
+         * await import('./x.ts')        ⇒ 漏
+         * import('./y.ts').then(...)    ⇒ 漏
+         * await import(`./z.ts`)        ⇒ 漏(模板串)
+         * ```
+         * ⇒ 后果是**幽灵依赖的反方向**:真实的依赖边**缺失** ⇒ 该模块被报「不可达」
+         *   ⇒ 不可达数偏大 ⇒ 白名单被迫覆盖本该可达的模块(与 task-32 那个
+         *     「客户端入口漏登记」的方向**同族**,那次是 16 条 `client/**` 带着假理由长期挂白名单)。
+         *
+         * ⇒ 实测当前生产侧动态相对导入 **0 处**(`server/src` + `client/src` + `shared`),
+         *   所以这是**潜伏**缺口而非现行失败 —— 但本仓已因这类「口径比事实窄」栽过多次
+         *   (见 `docs/PROGRESS.md` 陷阱 44/46:门禁看不见执行、提取口径与事实不符)。
+         *
+         * ⚠️ 不要误抓 `import.meta`(`.` 不是 `(` 也不是引号,天然不匹配)——
+         *   本仓 `verify.ts` 自己就用了 `import.meta.url` / `import.meta.main`。
+         *   我的 T33 自检会跑 `import('./scripts/verify.ts')`,也是靠这条判据解析的。 */
+        if (text[k] === '(') {
+          let m = k + 1;
+          while (m < n && /\s/.test(text[m] as string)) m += 1;
+          const dq = text[m];
+          if (dq === "'" || dq === '"' || dq === '`') {
+            let e = m + 1;
+            let spec = '';
+            while (e < n) {
+              if (text[e] === '\\') { spec += text[e + 1]; e += 2; continue; }
+              if (text[e] === dq) break;
+              spec += text[e]; e += 1;
+            }
+            if (spec.startsWith('.')) out.push(spec);
+            i = e + 1;
+            continue;
+          }
+        }
         const q = text[k];
         if (q === "'" || q === '"') {
           let e = k + 1;
