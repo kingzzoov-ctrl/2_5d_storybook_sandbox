@@ -814,7 +814,13 @@ export class WorldSim {
     const want = left;
     for (let i = this.mobGround.length - 1; i >= 0 && left > 0; i -= 1) {
       const g = this.mobGround[i];
-      if (g.itemId !== itemId) continue;
+      /* 必须走 `groundItemId`,不能直读 `g.itemId` —— 这一处曾漏改:
+         `GroundItem` 声明的是 `id`,只有生产写入侧才同时写 `itemId`。
+         于是 `setGroundItems([{id:151,...}])` 之后本方法对**确实存在**的
+         151 返回 0(实测),而同类入口已修好,只有这个公开入口还在按
+         `itemId` 读 —— 同一个类里两种读法,正是这个缺陷最坏的地方:
+         调用方看到时灵时不灵。 */
+      if (groundItemId(g) !== itemId) continue;
       const take = Math.min(left, g.count);
       g.count -= take;
       left -= take;
