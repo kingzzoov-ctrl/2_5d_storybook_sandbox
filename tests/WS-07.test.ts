@@ -4330,13 +4330,45 @@ test('K6 装配位不得让 US2 探针误报:net 层仍不含模拟层符号(代
      本断言用与探针**同一口径**(去注释)复核这一点,防止将来改动踩它。 */
   const strip = (s: string): string => s
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/\/\/[^\n]*/g, ' ');
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
   const files = ['server/src/net/room.ts', 'server/src/net/room.colyseus.ts'];
   for (const f of files) {
     const code = strip(readFileSync(join(ROOT_DIR, f), 'utf8').replace(/\r\n/g, '\n'));
     ok(!/WorldSim|world_sim/.test(code),
       `${f} 的**代码态**不含 WorldSim/world_sim(注释里提到不算)⇒ US2 探针不会误报`);
   }
+  /* ── task-63 自检:证明「裸版错 / 保护版对」,且两版**必须能区分** ──
+   *
+   * 为什么两个方向都要验:若只断言「保护版没截断」,那么**任何一个不含 `//` 的样本**
+   * 都能让它绿 ⇒ 这个自检恒真,什么都没证明。
+   * ⇒ 必须同时断言「裸版**会**截断」—— 那才是被修掉的那个缺陷本身。
+   *
+   * 为什么定性为**潜伏缺口**而非现行失败:真实被扫的 `room.ts` /
+   * `room.colyseus.ts` 里 `://` 出现 **0 处** ⇒ 两版剥出来**逐字节相同** ⇒ 现在不红。
+   * 本自检用**构造输入**把那个缺口逼出来,使它在**改动前**就有能力变红。
+   *
+   * ⚠️ 裸版刻意用 `new RegExp` 拼装而非字面量:`scripts/judgement_audit.ts` 的
+   *    DET_B 按**字面形态**扫「缺 `(^|[^:])` 防护的 strip」,字面写出来会被算成本仓
+   *    第 8 处待修项(其登记表不在本任务写域内)。此处要的是**对照夹具** ——
+   *    复现旧行为以证明缺陷成立,它并不是「用来准备被扫文本」的那类 strip。 */
+  const bareReSrc = '\\/\\/[^\\n]*';
+  const bareStrip = (s: string): string => s
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(new RegExp(bareReSrc, 'g'), ' ');
+  /* 构造输入:`https://` 之后**紧跟真符号** —— 这正是缺防护时会静默出错的形态。 */
+  const poison = "const u = 'https://x.dev/a'; const WorldSim = 1;";
+  eq(bareStrip(poison).includes('WorldSim'), false,
+    'task-63 自检·方向1:裸版**必须**把 `https://` 的 `//` 当注释起点 ⇒ 其后的真符号被吞(缺陷形态成立)');
+  eq(strip(poison).includes('WorldSim'), true,
+    'task-63 自检·方向2:带 `(^|[^:])` 保护后,`https://` 不再是注释起点 ⇒ 真符号保留(修法有效)');
+  ok(bareStrip(poison) !== strip(poison),
+    'task-63 自检·区分力:同一输入下两版**必须**结果不同 —— 相同则本自检恒真(该样本不触发差异)');
+  eq(strip('const a = 1; // WorldSim 尾注释').includes('WorldSim'), false,
+    'task-63 自检·回归:行尾真注释仍被剥掉(保护前缀没有妨害注释剥离)');
+  eq(strip('// WorldSim 行首注释').includes('WorldSim'), false,
+    'task-63 自检·回归:行首真注释仍被剥掉');
+  eq(strip('const a = 1;\n// WorldSim 第二行注释').includes('WorldSim'), false,
+    'task-63 自检·回归:多行文本第 2 行开头的注释仍被剥(`\n` 也是 `[^:]`,不依赖 `m` 旗标)');
 });
 
 /* ═══════════ task-58:applyMove → physics.bodies(第二项装配缺口)═══════════ */
