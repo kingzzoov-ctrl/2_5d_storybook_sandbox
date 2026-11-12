@@ -10,6 +10,7 @@
  *   node scripts/verify.ts --content       # 只做内容基线一致性检查
  *   node scripts/verify.ts --integration   # 只做跨 WS 集成检查
  *   node scripts/verify.ts --strict-taut   # 把「未登记的同义反复候选」升级为失败
+ *   node scripts/verify.ts --strict-inert # 入口执行层:未登记项报错
  *   node scripts/verify.ts --strict-reach  # 把「未登记的不可达模块」升级为失败
  */
 
@@ -40,6 +41,9 @@ const contentOnly = argv.includes('--content');
 const strictReach = argv.includes('--strict-reach');
 /** `--strict-taut`:把「未登记的同义反复候选」从告警升级为失败。见 `checkTautology`。 */
 const strictTaut = argv.includes('--strict-taut');
+/* 入口执行层:与 --strict-reach / --strict-taut 同构 ——
+   新增未登记项默认只告警,本开关升级为失败。 */
+const strictInert = argv.includes('--strict-inert');
 
 /**
  * `--all`:跑**全部**门禁(等价于不传任何选择性 flag)。
@@ -191,6 +195,7 @@ const advise = (gate: string, msg: string): void => {
 const ADVISE_UPGRADE: Record<string, string> = {
   可达性: '--strict-reach',
   同义反复: '--strict-taut',
+  入口执行层: '--strict-inert',
 };
 
 
@@ -1982,6 +1987,141 @@ function checkTautology(): void {
 }
 
 
+/* --------- 2.7 入口执行层:verdict 守卫 handler 的**登记与漂移** ---------
+ *
+ * ## 为什么单独立一道
+ *
+ * | 门禁 | 查什么 | 本类缺陷为什么躲得过 |
+ * | :--- | :--- | :--- |
+ * | 可达性 / 生产零引用 | 模块在不在 import 闭包 / 有无生产引用 | handler 与它调的函数**都在闭包里** |
+ * | 同义反复 | 断言右侧是否取自被测模块 | 与断言无关 |
+ *
+ * 本类缺陷是:**消息收得到、权限查得到、执行不存在**。
+ * 实测两例:`attack` → `applyAttack()`、`action` → `authorize()`。
+ *
+ * ## ⚠️ 判据只做「登记 + 漂移」,不宣称「自动发现」
+ *
+ * 三个 handler 的句法形态**逐字相同**:
+ * ```ts
+ * const v = this.runtime.<FN>(...);
+ * if (!v.allowed) client.send(...);
+ * ```
+ * 但 `move` 的 `applyMove` 含真状态赋值(`p.x = intent.x` 等,实测)
+ * ⇒ 执行完成于调用内,不是缺口;
+ * 而 `applyAttack` / `authorize` **无**状态赋值 ⇒ 真缺口。
+ *
+ * ⇒ **差别在「被调函数是否改状态」,那是语义而非句法。**
+ * 句法扫描器无法区分,硬报就产生误报 —— 而本仓记着
+ * 「**一条会误报的门禁等于没有门禁**」。
+ *
+ * ⇒ 本门禁职责:**强制登记 + 检测漂移**。句法扫描找形态(可靠),
+ *   人的判定写进 `VERDICT_HANDLER_KNOWN` 并**附可复核证据**;
+ *   漏登记 ⇒ 告警;登记为无执行但后来被修好 ⇒ **报错**。
+ */
+interface VerdictHandlerFacts {
+  /** 成功路径做了什么。**无** 表示真缺口 */
+  successPath: string;
+  /** 判定依据,必须可复核(附出处) */
+  evidence: string;
+}
+const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([
+  ['server/src/net/room.colyseus.ts::move', {
+    successPath: '位置已由 applyMove 写入权威状态(p.x/p.y/p.z),执行完成于调用内',
+    evidence: '实测 room.ts applyMove 含 p.x = intent.x / p.y / p.z 真状态赋值',
+  }],
+  ['server/src/net/room.colyseus.ts::attack', {
+    successPath: '**无** —— applyAttack 只做反作弊校验,不算伤害、不改血量',
+    evidence: '实测 applyAttack 体无真状态赋值(仅 ac.attack + pendingViolations.push);'
+      + '且玩家→怪伤害方向生产零调用,见 docs/ARCH-GAPS.md 第四类空缺',
+  }],
+  ['server/src/net/room.colyseus.ts::action', {
+    successPath: '**无** —— authorize 是纯查表函数,授权通过后无执行、无回执',
+    evidence: '实测 authorize 体零状态赋值;且 22 个 RoomAction 无分发器,'
+      + '见 docs/ARCH-GAPS.md 第二层',
+  }],
+]);
+
+/** 句法扫描:找「`const v = ...;` 后跟 `if (!v.allowed) ...`」形态的 onMessage handler。
+ *  只**发现形态**,不判定缺口 —— 判定在 VERDICT_HANDLER_KNOWN 里。 */
+function findVerdictHandlers(): Map<string, number> {
+  const found = new Map<string, number>();
+  const files: string[] = [];
+  const walk = (d: string): void => {
+    let ents: string[] = [];
+    try { ents = readdirSync(d); } catch { return; }
+    for (const name of ents) {
+      const p = join(d, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (name.endsWith('.ts')) files.push(p);
+    }
+  };
+  walk(join(ROOT, 'server/src'));
+  walk(join(ROOT, 'client/src'));
+
+  for (const f of files) {
+    const rel = relative(ROOT, f).replace(/\\/g, '/');
+    const L = readFileSync(f, 'utf8').replace(/\r\n/g, '\n').split('\n');
+    for (let i = 0; i < L.length; i += 1) {
+      const m = /onMessage\(\s*['"]([^'"]+)['"]/.exec(L[i] ?? '');
+      if (!m) continue;
+      let depth = 0;
+      let started = false;
+      const body: string[] = [];
+      for (let k = i; k < L.length && k < i + 40; k += 1) {
+        const line = L[k]!;
+        const opens = (line.match(/\{/g) ?? []).length;
+        const closes = (line.match(/\}/g) ?? []).length;
+        if (k > i) {
+          const t = line.trim();
+          if (t !== '' && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*')) body.push(t);
+        }
+        if (opens > 0) started = true;
+        depth += opens - closes;
+        if (started && depth <= 0) break;
+      }
+      /* 闭合行不算语句:`});` / `}` / `})` */
+      const stmts = body.filter((x) => !/^\}[)\];.,]*$/.test(x));
+      if (stmts.length < 2) continue;
+      const last = stmts[stmts.length - 1]!;
+      if (!/^if\s*\(\s*!/.test(last)) continue;
+      if (!/allowed|verdict|gate/.test(last)) continue;
+      if (!stmts.slice(0, -1).every((x) => /^(const|let)\s+\w+\s*=/.test(x))) continue;
+      found.set(`${rel}::${m[1]}`, i + 1);
+    }
+  }
+  return found;
+}
+
+function checkInertHandlers(): void {
+  console.log('\n[入口执行层]');
+  const found = findVerdictHandlers();
+  const bad: string[] = [];
+  for (const [key, facts] of VERDICT_HANDLER_KNOWN) {
+    if (!found.has(key)) {
+      bad.push(`${key}(不再是该形态 —— 若已加成功执行,应移出登记并记为已修)`);
+      continue;
+    }
+    if (!facts.successPath || facts.successPath.trim().length < 10) bad.push(`${key}(未写明成功路径)`);
+    if (!facts.evidence || facts.evidence.trim().length < 20) bad.push(`${key}(证据不足)`);
+  }
+  if (bad.length > 0) {
+    fail(`入口执行层登记失真(${bad.length} 处):${bad.join('; ')}`);
+    return;
+  }
+  const unlisted = [...found.keys()].filter((k) => !VERDICT_HANDLER_KNOWN.has(k));
+  if (unlisted.length > 0) {
+    const msg = `新增未登记的 verdict 守卫 handler ${unlisted.length} 个(必须写明成功路径做了什么 —— 其中可能有「校验通过但无执行」):` + unlisted.slice(0, 6).join(', ');
+    if (strictInert) fail(msg);
+    else advise('入口执行层', msg);
+  }
+  const gaps = [...VERDICT_HANDLER_KNOWN.values()].filter((v) => v.successPath.includes("**无**")).length;
+  pass(
+    `入口执行层登记自洽(${VERDICT_HANDLER_KNOWN.size} 个 verdict 守卫 handler 已登记;`
+    + `其中 ${gaps} 个成功路径为空(真缺口,见 docs/ARCH-GAPS.md);`
+    + `句法命中 ${found.size} 个,未登记 ${unlisted.length} 个)`,
+  );
+}
+
 /* --------- 2.6 生产零引用(L2 测试专用)门禁 ---------
  *
  * 与 `checkReachability()` **判据不同,故两套清单不该互相「对齐」**:
@@ -3656,6 +3796,8 @@ checkReachability();
 /* 生产零引用(第二套判据)—— 必须紧跟在可达性之后:
    它的核心不变量是「orphan ⊆ 可达性白名单」,依赖上面那一步算出的 UNREACHABLE_EXEMPT。 */
 checkOrphanList();
+/* 入口执行层 —— 查「handler 被调用了但成功路径为空」,与上面两道查"谁引用谁"的门禁互补。 */
+checkInertHandlers();
 checkTautology();
 checkClientTrust();
 if (!frozenOnly && !only && !contentOnly) checkDocs();
