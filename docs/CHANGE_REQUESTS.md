@@ -2301,3 +2301,83 @@ stripCommentsAndStrings 销毁字符串内容  ⇒ 某些计数场景需要
   步 2 要动 7 处调用者,每一处都要重新验,不适合与当前并行任务混做)
 - **关联**:`docs/PROGRESS.md` 陷阱 51(同一判据两份实现)· 陷阱 58(测量粒度)
   · task-63(WS-07:4331 一行修复)· `scripts/imports.ts`(成功先例)
+
+## [CR-21] 2026-11-13 Lead — 料理 buff 的 7 个数值字段**没有消费点**:属「功能未做」,需玩法裁决
+
+- **提出人**:build-wiring(task-64 B 项,只读调查)+ Lead(提为玩法裁决)
+- **文件**:`server/src/combat/cooking.ts`(生产端);消费端**不存在**
+- **实测事实(build-wiring 逐个字段查生产消费者)**:
+
+```
+★ 先看"看起来有消费者"的三个 —— 实际全是**同名不同物**:
+  atkMul    ✓9 外部   BUT 是 weapons.ts 的**套装配置字段**
+  critRate  ✓12 外部  BUT 是 damage.ts 的 **DamageResult 输出字段**
+  moveMul   ✓13 外部  BUT 是 revive.ts **ghostControl() 的返回值**
+  ⇒ 三次都骗过了计数 ⇒ **若采信计数,B 项的答案会反**
+
+★ 真正零外部消费者的 7 个字段:
+  hpFlat / defFlat / gravityMul / muOverride / jumpMul / gatherMul / expMul
+
+★ 函数层:
+  tickFoodBuff       生产 1 处(= 自身定义)⇒ 外部 0
+  mergeFoodBuffs     生产 1 处(= 自身定义)⇒ 外部 0
+  cleansePrankBuffs  生产 1 处(= 自身定义)⇒ 外部 0
+  CookResult.buff    生产读取点 **0**(只在 cooking.ts 内部出现)
+  FoodBuff 类型      生产 8 处、**测试 0 处**
+
+★ 对照「已接线该长的样子」—— `roomEffects`:
+  maxHpMul 4 处 / healHp 11 处 / forgeUnlocked 6 处
+  ⇒ 都真落在 `rooms/effects.ts` + `world_sim` 的消费点
+  ⇒ 即:**仓库有成熟范式**,food buff **没走它**
+```
+
+- **裁定**:**「功能未做」,不是「缺一段接线」**
+```
+若只是"少一行调用",那补一行即可。
+但 7 个字段**根本没有消费点** ⇒ 补调用也没用 ——
+那是先要回答「这 7 个字段**分别该被谁读**」,再谈实现。
+⇒ 这是**玩法设计问题**,不是接线问题。
+```
+
+- **需要 owner 裁决的玩法问题(逐个)**:
+
+| 字段 | 语义(推测) | 该被谁读 | 裁决 |
+|---|---|---|---|
+| `hpFlat` | 生命上限加值 | ? | 待裁 |
+| `defFlat` | 防御加值 | ? | 待裁 |
+| `gravityMul` | 重力倍率 | ? | 待裁 |
+| `muOverride` | 摩擦系数覆盖 | ? | 待裁 |
+| `jumpMul` | 跳跃力倍率 | ? | 待裁 |
+| `gatherMul` | 采集倍率 | ? | 待裁 |
+| `expMul` | 经验倍率 | ? | 待裁 |
+
+  ⇒ **关键问题:这 7 个字段是本版要做的,还是数据结构先铺好、实现留待后续?**
+  ⇒ 若"留待后续" ⇒ 按 CR-19 模式**显式标注为未接线**,别让后人以为接错了。
+  ⇒ 若"本版要做" ⇒ 需要一个**接入设计**(见下)。
+
+- **接入设计参考(若裁决"要做")**:
+```
+仿 roomEffects 的形状:
+  1 新建 foodBuffs: Map<playerId, FoodBuff[]>(world_sim 持有)
+  2 tick() 慢帧里逐条 tickFoodBuff,expired 的移除
+  3 把 mergeFoodBuffs(...) 的结果接进**各字段的语义归属处**:
+     · hpFlat     → VitalsSystem.maxHp 的派生(注意:现 maxHp 是构造期常量)
+     · defFlat    → damage.ts 的 takenMul / dmgReduce 通道
+     · gravityMul / muOverride / jumpMul → physics 的对应参数
+     · gatherMul / expMul → 采集与升级结算处
+  ⚠️ 逐字段都要**先定语义归属**,不能一个总开关全接上
+```
+  ⚠️ **不建议**把 7 个字段一股脑塞进某个 `statMods` 总表 ——
+  本仓已有多例「同名容器混装不同语义」导致误判(见陷阱 58 与检测器 G)。
+
+- **不做会怎样**:
+```
+做菜**有产出、有 buff 对象、没人装上、没人倒计时** ⇒
+玩家看不到任何效果,而**门禁全绿、测试全过**(FoodBuff 测试 0 处)。
+⇒ 与陷阱 54(第二份死实现)同族:不是"功能坏了",是"**功能从未接上**"。
+```
+
+- **Lead 裁决**:待裁(**需 owner 决定 7 个字段各自该被谁读**)
+  ⇒ 在这之前,**不动 cooking.ts**
+- **关联**:`docs/PROGRESS.md` 陷阱 54 · 58(有牙断言给没牙的当掩护)
+  · CR-19(同族:死实现标注)· CR-20(多份实现的结构根因)
