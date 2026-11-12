@@ -2842,3 +2842,116 @@ delta.ts 体内**真用**  18 个;  import 了但体内 0 次 = **3 个**:
 - **陷阱 63**(工具的红绿都是关于工具的说法)· **陷阱 65**(假阳性压掉的办法是让判据恒真)
 - **陷阱 66**(新:The 判据的**视野**决定它看得见什么;「0 次」与「死代码」不可区分)
 - `docs/CLIENT-NET-CONTRACT.md` §10(client-stage 的复核)
+---
+
+## [CR-26] 2026-11-13 Lead — 阶段 3 选型的**真门槛不是 ws vs colyseus**,而是「零依赖约束下能不能连上」
+
+- **发现者**:`client-stage`(task-67 阶段 3 预备,发现 `ws` 未声明)
+- **Lead 实测补完**:它只看出「需声明」,往下追一步才是真门槛
+- **裁决**:见 §4(选 **内置 WebSocket 客户端 + colyseus ws-transport 服务端**,**零新增依赖**)
+
+### 1. client-stage 的发现(成立,我复核)
+
+```
+package.json
+  dependencies:         **undefined**(整个键不存在)
+  devDependencies:      { typescript ^5.6.3, vite ^8.3.8 }
+  optionalDependencies: { @colyseus/schema, better-sqlite3, colyseus, three }
+
+而 `import 'ws'` 能解析 ⇒ node_modules/ws 存在(版本 **7.5.13**)
+⇒ 它是从别人的传递依赖 hoist 上来的
+```
+
+### ★★ 2. 但真门槛是 FREEZE.md 的零依赖硬约束
+
+```
+FREEZE.md:「**零运行时依赖**。测试与实现不得 import 除 `node:*` 之外的任何模块」
+⇒ `dependencies` **整个键是 undefined** 不是偶然 —— 它是**约束的表达**
+⇒ colyseus / three / better-sqlite3 全在 **optionalDependencies** = 「默认不装,装了才用」
+⇒ ★ 所以「把 ws 加进 dependencies」**本身就违反冻结契约**;
+   加进 optionalDependencies 则只是把问题挪到"装不上就不可用"
+```
+
+### ★★★ 3. Lead 实测两个门槛(结论:**客户端零依赖可行**)
+
+**① Node 24 有内置 WebSocket 客户端:**
+```
+typeof WebSocket = **function**
+Node 版本 = v24.13.0
+实证:对一个普通 HTTP server 发连接 ⇒ 得到 error(升级被拒)
+⇒ **它真的在发升级请求,不是空壳** ✓
+⇒ 客户端侧**不需要新增任何依赖** ✓
+```
+
+**② 服务端的 `ws` 从哪来:**
+```
+colyseus 0.15.57 的依赖 5 个,其中
+  **@colyseus/ws-transport 0.15.3**
+   它的 dependencies = { @types/ws, **ws** }
+⇒ ★ `ws` 是 **@colyseus/ws-transport 的依赖**,不是 colyseus 的直接依赖
+⇒ 也就是说:**服务端只要用 colyseus,ws 就必然在**(经由 ws-transport)
+⇒ 服务端也**不需要新增依赖** ✓
+```
+
+### 4. 裁决
+
+```
+阶段 3 的传输层:
+  客户端  Node 内置 WebSocket(零依赖)✓
+  服务端  colyseus + @colyseus/ws-transport(已是 optionalDependency)✓
+⇒ **不新增任何 dependency** ⇒ 守住 FREEZE.md 的零依赖约束 ✓
+
+⚠️ 但有一条未验证的硬问题(见 §5),它决定这条路线是否真能走通。
+```
+
+### ★★ 5. 未验证的硬问题(这才是真正的风险)
+
+```
+★ colyseus 的 **协议** 不是裸 WebSocket:
+  它有自己的握手(room join、seat reservation、patch 帧封装)
+⇒ 客户端若用**裸 WebSocket** 连 colyseus server,**未必能说上话**
+⇒ 两个分支:
+   分支甲 客户端也用 colyseus 协议 ⇒ 需 colyseus.js ⇒ **新增前端依赖**
+   分支乙 服务端**不用 colyseus 的 transport**,自己用 ws 起裸 WebSocket
+          + 直接用本仓已有的 `encodeFull` / `decodePacket` / `applyPacket`
+          ⇒ 客户端内置 WebSocket ✓ 服务端…需要 ws(经 ws-transport 可得,但**是间接的**)
+
+⇒ ★ 分支乙在**架构上更合本仓**:本仓的协议是**自己手写的**(`delta.ts` 零依赖,
+   `encodeFull`/`decodePacket` 都是本仓实现),**并不需要 colyseus 的 patch 通道**
+   —— 而 `room.colyseus.ts:41` 自己就写着 `export const USE_COLYSEUS_PATCH = false;`
+⇒ 也就是说:**本仓已经把 colyseus 的 patch 关掉了** ⇒ 用一个重型框架只为了它的 socket,
+   在结构上是不经济的
+```
+
+### 6. 因此阶段 3 的正确形状(供裁决参考,**未实测**)
+
+```
+最小可行接线 =
+  服务端:一个 **薄 ws 服务端**(裸 WebSocket,端口 A)
+          · 收到的帧 → `decodePacket` → `RoomRuntime.applyMove`
+          · 每 tick → `encodeFull`/`encodeDelta` → 广播
+          · **不经过 colyseus**(因为它的价值被 USE_COLYSEUS_PATCH=false 关掉了)
+          ⚠️ 但它就需要 `ws` —— 而 ws 现在是**间接可得**,不是声明依赖
+          ⇒ 若要走这条路,必须**显式声明** ws 到 optionalDependencies
+            (与 colyseus/three 同档:「默认不装,装了才用」)⇒ **不违反**零依赖
+  客户端:内置 WebSocket + `decodePacket`/`applyPacket`(切分后从 shared 取)
+          ⇒ **零新增依赖** ✓
+```
+
+### 7. 未实测(如实列出)
+
+```
+[ ] colyseus 的 ws-transport 能否挂**裸** ws 连接(未实测 —— 需起服务端试)
+    ⇒ 若不能 ⇒ 上表"薄 ws 服务端"是唯一解
+[ ] 内置 WebSocket 的**二进制**帧收发(我只验了它发升级请求,未验 ArrayBuffer 往返)
+[ ] vite 能否把 `shared/**` 的纯类型模块与内置 WebSocket 一起打包(未测)
+[ ] 真机延迟/丢包(从未测)
+```
+
+### 8. 关联
+
+- **CR-24 / CR-25**(delta.ts 切分后客户端可直接用 ⇒ 是本 CR §6 的前提)
+- `server/src/net/room.colyseus.ts:41` `export const USE_COLYSEUS_PATCH = false;`
+  ⇒ **本 CR 最关键的一条现成证据**
+- `package.json`(零依赖的表达)· `shared/contracts/FREEZE.md`(零依赖的约束)
+- `docs/CLIENT-NET-CONTRACT.md` §2.4(client-stage 的选型分析)
