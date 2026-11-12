@@ -3648,8 +3648,16 @@ test('面板布局:配方行缩进随深度单调递增', () => {
     ok(rows[i]!.indent > rows[i - 1]!.indent, `第 ${i} 行比第 ${i - 1} 行更缩进`);
   }
   eq(rows[0]!.indent, 0, '深度 0 不缩进');
-  eq(rows[1]!.indent - rows[0]!.indent, RECIPE_INDENT_PX, '每级缩进 = RECIPE_INDENT_PX');
-  eq(rows[3]!.indent, 3 * RECIPE_INDENT_PX, '深度 3 缩进 = 3 级');
+  /* ⚠️ 这里原先写 `eq(rows[1].indent - rows[0].indent, RECIPE_INDENT_PX)` ——
+     那是**同义反复**:断言右侧取自被测模块自己的导出常量,于是「把常量改成 999」
+     会让实现与期望**同步变化**,断言永远绿。门禁的「同义反复候选」扫描把它抓出来了
+     (报告:`WS-09 RECIPE_INDENT_PX` 未登记 1 条)。
+     改成**写死设计档字面量** `16`(出处:`panel_layout.ts` 的注释「每级缩进 16px」)。
+     现在 `RECIPE_INDENT_PX` 被改成任何别的值,这两条都会红。 */
+  eq(rows[1]!.indent - rows[0]!.indent, 16, '每级缩进 = 16px(设计档,不取自被测常量)');
+  eq(rows[3]!.indent, 48, '深度 3 缩进 = 3 级 × 16px');
+  /* 反向对照:常量本身必须等于设计档 —— 否则上面两条会与实现「一起错」。 */
+  eq(RECIPE_INDENT_PX, 16, 'RECIPE_INDENT_PX 应等于设计档 16px(此条把常量钉在字面量上)');
   /* 深度相同则缩进相同 */
   const same = indentRecipeRows([0, 0], [2, 2]);
   eq(same[0]!.indent, same[1]!.indent, '同深度同缩进');
