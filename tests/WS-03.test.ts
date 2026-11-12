@@ -1042,7 +1042,20 @@ test('WT-03-59 [接线] 房间识别必须在 tick 的慢帧里自动刷新(不�
     '墙有缺口时不得识别(负对照)');
 
   /* 第二步:补齐缺口 —— **只调用地形写入**,不手工调 build/ 的任何函数。
-     注意:这里刻意**先不读** `rooms()`,以免它的惰性补偿掩盖「tick 自己有没有算」。 */
+     注意:这里刻意**先不读** `rooms()`,以免它的惰性补偿掩盖「tick 自己有没有算」。
+
+     ⚠️ 「不碰 rooms()」是**必需的纪律**,不是洁癖。`rooms()` 带惰性补偿:
+     ```
+     rooms(): RoomIdentity[] {
+       if (this.roomsDirty) this.refreshRooms();   // ← 调用方也会触发扫描
+       return this.lastRoomScan;
+     }
+     ```
+     ⇒ **「我调它」与「tick 调它」返回值完全相同**,`roomScanCount` 也都会 +1。
+     实测 D 组:构造后未 tick、直接调一次 `rooms()` → 计数 `0 → 1`。
+     所以若在本行之前顺手读一下 `rooms()`,下面那条计数断言会被惰性补偿**蹭绿**,
+     从而**测不出接线是否真的挂在慢帧上**。这条纪律的存在理由就是这个。
+     (此陷阱由 `combat-progress` 用 `roomScanCount` 直接数发现,Lead 复现并补了 D 组。) */
   const before = sim.roomScanCount;
   sim.setCell(6, 3, { obj: 351 });
   for (let i = 0; i < 10; i += 1) sim.tick();
@@ -1138,6 +1151,22 @@ test('WT-03-62 [接线] 房间识别成本与实际建造规模成正比,与远�
     near.rooms().filter((r) => r.key === 'ALCHEMY_LAB').length,
     '远处孤立格不得改变房间识别结果',
   );
+
+  /* ── 复杂度断言(本测试真正的牙)──
+     钉的是「扫了多少格」这个**确定量**,不是墙钟时间(时间在 CI 上必然抖)。
+     修复前是「全球一个外接矩形」:只要世界里有 (10,10) 和 (240,240) 两个点,
+     窗口就是 256×256 = 65536 格 —— 与那格多孤远无关地把整张图扫一遍。
+     修复后按簇扫:近处一格 → 两个小窗口;远那格 → 独立 16×16 簇。
+     阈值取 20000:远大于「两个小簇 + 一个孤砖簇」(~2000),
+     又远小于「整图」(65536),留足余量且不依赖具体实现细节。 */
+  ok(near.lastRoomScanArea < 20000,
+    `近处孤立格:扫描面积应很小,实测 ${near.lastRoomScanArea}`);
+  ok(far.lastRoomScanArea < 20000,
+    `远处(240,240)的孤立格不得把扫描窗口撑成整张地图:`
+    + `实测扫了 ${far.lastRoomScanArea} 格(修复前为 65536)`);
+  /* 反向对照:两种情况的扫描量必须在同一量级,而不是差两个数量级。 */
+  ok(far.lastRoomScanArea <= near.lastRoomScanArea * 4,
+    `远处那格不应显著放大扫描量:近处 ${near.lastRoomScanArea} vs 远处 ${far.lastRoomScanArea}`);
 
   /* 房间 ID 必须全局唯一:簇内 scanRooms 从 1 重新编号,跨簇会撞号。
      造两间分离的房,各放一套炼金件 ⇒ 两间都应识别出来且 id 不重复。 */

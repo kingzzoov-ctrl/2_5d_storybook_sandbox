@@ -726,6 +726,16 @@ export class WorldSim {
    * 在外部完全无法区分 —— 测试也就验证不了接线是否真的挂在慢帧上。
    */
   roomScanCount = 0;
+  /**
+   * 最近一次房间识别**实际扫过的格数**(所有簇的窗口面积之和)。
+   *
+   * 为什么需要把它暴露出来:簇化修复(见 `refreshRooms`)的收益是**算法复杂度**,
+   * 而复杂度不能用墙钟时间断言 —— 时间随机器负载抖,在 CI 上会变成随机红。
+   * 用「扫了多少格」这个**确定性**的量,才能把「成本与远处置砖无关」钉成断言:
+   * 修复前(全球一个外接矩形)远处放一格 → 扫 256×256 = 65536 格;
+   * 修复后 → 两个簇各扫自己那点,量级差两个数量级。
+   */
+  lastRoomScanArea = 0;
 
   /**
    * 重算房间识别(慢帧调用,或由脏标记触发)。
@@ -768,6 +778,7 @@ export class WorldSim {
     const pad = this.roomScanPad;
     const out: RoomIdentity[] = [];
     let id = 0;
+    let area = 0;
     for (const cl of clusters) {
       const x0 = Math.max(0, cl.x0 - pad);
       const y0 = Math.max(0, cl.y0 - pad);
@@ -776,6 +787,7 @@ export class WorldSim {
       const w = x1 - x0 + 1;
       const h = y1 - y0 + 1;
       if (w <= 0 || h <= 0) continue;
+      area += w * h;
 
       /* 只读视图:直接转发到 `WorldGrid`,不复制数据 ⇒ 读到的永远是当前地形。
          这正是 `grid.ts` 的 `TileGridLike` 存在的理由(详见那里的注释)。 */
@@ -802,6 +814,7 @@ export class WorldSim {
       }
     }
     this.lastRoomScan = out;
+    this.lastRoomScanArea = area;
     this.roomsDirty = false;
   }
 
