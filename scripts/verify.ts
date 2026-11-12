@@ -4573,6 +4573,38 @@ async function checkIntegration(): Promise<void> {
     pass(`README demo 独有数与实测一致(${reachDemoOnly} 个)`);
   }
 
+  /* ── ★★ 2026-11-13 加:「demo 独有」**紧邻的百分比**也曾无人校验 ──
+   *
+   * 实测:`README.md` 写「demo 独有 1 个(**占可达数 1.3%**)」,
+   * 而门禁自己的表达式算的是 `1 / 81 = 1.2%` —— **两个数不一样**。
+   * ⇒ 上面那条只钉住了**计数**,没钉住**它旁边那个百分比**。
+   * ⇒ ★ 这正是本文件上方那条注释自述的形态:「**它不是一个被断言的数字**,
+   *   只是正文里的一句话」—— 而且它就写在那句教训的**同一行**上。
+   *   (上一轮我修「demo 独有 N 个」时,只把**计数**纳入了校验,
+   *    把同一句里那个百分比漏在了外面 —— 视野只放到"我刚想到的那个词"。)
+   * ⇒ 门禁口径与打印口径必须**同源**:都用 `reachDemoOnly / reachProdReachable`。 */
+  const pctAll = [...readmeText.matchAll(/demo 独有\s+\d+\s*个\s*[(（]\s*占可达数\s*([\d.]+)\s*%\s*[)）]/g)];
+  if (reachDemoOnly < 0 || reachProdReachable <= 0) {
+    console.log('      · 本模式未算出可达数,demo 独有百分比未校验');
+  } else if (pctAll.length !== 1) {
+    fail(
+      `README.md 里出现 ${pctAll.length} 处「demo 独有 N 个(占可达数 X%)」—— 应恰好 1 处。`
+        + `若正文要引述历史值,请避开此字形`,
+    );
+  } else {
+    /* 与 verify.ts 打印时**同一个算式**(不要各写一份,否则又是"两边同源"的反面) */
+    const wantPct = Number(((reachDemoOnly / reachProdReachable) * 100).toFixed(1));
+    const gotPct = Number(pctAll[0]![1]);
+    if (gotPct !== wantPct) {
+      fail(
+        `README 声称 demo 独有「占可达数 ${pctAll[0]![1]}%」,`
+          + `实测 ${wantPct}%(${reachDemoOnly}/${reachProdReachable})—— 应更新 README`,
+      );
+    } else {
+      pass(`README demo 独有百分比与实测一致(${wantPct}%)`);
+    }
+  }
+
   const backlogCounts = await countBacklog();
   /* matchAll + 唯一性:防「影子行」 */
   const bmAll = [...readmeText.matchAll(
