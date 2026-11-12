@@ -149,7 +149,34 @@ function snapshot(files: readonly string[]): Map<string, string> {
  * `strings: 'blank'` 一并屏蔽字符串(找纯代码构造用)。
  * 正则字面量**两种模式都保留**(它是代码,且检测器的目标就在其中)。
  */
-function maskComments(src: string, strings: 'keep' | 'blank'): string {
+/**
+ * ★★ task A:**行尾归一化 —— 唯一实现**(LEAD 2026-11-13 要求定性 D 的 `#5`)。
+ *
+ * ```
+ * 为什么需要它:检测器普遍按 `text.split('\n')` 逐行判定。
+ * 若源码是 **CR-only**(老 Mac),`\n` 不是分隔符 ⇒ **整份源码成一"行"**
+ * ⇒ 逐行判定退化成"只判第一处"。实测两个受害者:
+ *   · G 的 collectContainers ⇒ 只收到 1 个容器 ⇒ 命中数**塌成 0**
+ *   · D 的计数             ⇒ 同一行里 exec 只取**首匹配** ⇒ 报 1 而非 2
+ *
+ * ⇒ 判据**从没打算问**「这份源码含不含 \n」,却把行尾当成了普遍前提。
+ *   这是陷阱 70 方向 5:**把输入的偶然性质当成普遍前提**。
+ *
+ * ⚠️ 位置保持:`\r\n`→`\n` 与 `\r`→`\n` 都**不改变行数**
+ *   ⇒ `maskComments` 的「位置保持 / 行号可靠」承诺仍然成立
+ *   (CR 与 LF 都是"换一行",只是字节不同)。
+ *
+ * ★ 本函数是**唯一实现**,两个调用点共用(不是两份实现):
+ *   1 `maskComments` 入口 —— 覆盖 A/B/C/D/F 五个走掩码的检测器
+ *   2 `collectContainers` 入口 —— 覆盖 G(它不走掩码,直接解析源码)
+ * ```
+ */
+function normalizeEol(s: string): string {
+  return s.split('\r\n').join('\n').split('\r').join('\n');
+}
+
+function maskComments(srcRaw: string, strings: 'keep' | 'blank'): string {
+  const src = normalizeEol(srcRaw);
   const out = src.split('');
   const blank = (i: number): void => { if (i < src.length && src[i] !== '\n') out[i] = ' '; };
   /** 上一个有意义的代码字符 —— 用于判断 `/` 是除法还是正则起点。 */
@@ -364,8 +391,7 @@ function asSamples(s: string | readonly string[]): readonly string[] {
  */
 
 /** 把源码转成指定行尾形态。 */
-function withEol(src: string, kind: 'lf' | 'crlf' | 'cr' | 'mixed'): string {
-  const lf = src.split('\r\n').join('\n').split('\r').join('\n');
+function withEol(src: string, kind: 'lf' | 'crlf' | 'cr' | 'mixed'): string {  const lf = src.split('\r\n').join('\n').split('\r').join('\n');
   if (kind === 'lf') return lf;
   if (kind === 'crlf') return lf.split('\n').join('\r\n');
   if (kind === 'cr') return lf.split('\n').join('\r');
@@ -438,6 +464,37 @@ function eolCheckHasTeeth(): boolean {
   return eolConsistency(deliberatelySensitive, ['name:\n']).bad.length > 0;
 }
 
+/**
+ * ★★ `mixed` 这一维**必须真的产生混合**才算测到了。
+ *
+ * ```
+ * Lead 2026-11-13 建议(我采纳):「在 --selftest 里断言每个检测器的多行样本数 ≥ 3
+ *   —— 否则 mixed 这一维**名义上在测、实际没测**。」
+ *
+ * 为什么是 ≥3 而不是 ≥1:
+ *   · 1 行样本 ⇒ 无第二行可混 ⇒ `mixed` **等于** `lf`
+ *   · 2 行样本 ⇒ half=1 ⇒ 全 CRLF ⇒ `mixed` **等于** `crlf`
+ *   · ≥3 行   ⇒ 才真的出现「前半 CRLF + 后半 LF」
+ * ⇒ 唯一**保证非退化**的阈值是 3。
+ * ```
+ *
+ * ⚠️ 这条断言自身也要防「两边都没跑」:它只数行数,不依赖任何检测器跑通
+ *    ⇒ 它是**输入性质**的断言,与 detect 的正确性正交。故它能在
+ *      "检测器全炸"的情况下依然给出有意义的结论(这正是它该有的性质)。
+ */
+const EOL_MIXED_MIN_LINES = 3;
+
+/** 该检测器的样本里,多少条有 ≥`EOL_MIXED_MIN_LINES` 行(即 `mixed` 非退化)。 */
+function mixedCapableSamples(d: Detector): number {
+  const all = [
+    ...asSamples(d.dirty),
+    ...asSamples(d.clean),
+    ...(d.pairs ?? []).flatMap((p) => [p.safe, p.defect]),
+  ];
+  return all.filter((s) => s.split('\n').length >= EOL_MIXED_MIN_LINES).length;
+}
+
+
 
 type SelfTestResult = { id: string; ok: boolean; detail: string };
 
@@ -507,14 +564,31 @@ function selfTest(d: Detector): SelfTestResult {
   );
   const eolBad = eol.bad;
 
-  const ok = dirtyBad.length === 0 && cleanBad.length === 0 && pairBad.length === 0 && eolBad.length === 0;
-  /* ★ 明细**总是**报通过数 —— 即使全过也要看到 4/4,否则看不出覆盖了几类 */
+  /* ── 5 `mixed` 这一维是否**非退化**(task A 补:Lead 建议的断言) ──
+     ```
+     若多行样本 < 3 条,`mixed` 会退化成 lf / crlf ⇒ 那一维**名义在测、实际没测**。
+     这是本检查的**结构性边界**,故让检查显式断言这个前提,而不是写在注释里。 */
+  const mixedN = mixedCapableSamples(d);
+  const degraded: string[] = [];
+  if (mixedN < 3) {
+    degraded.push(`混合行尾这一维**退化**:≥3 行样本只有 ${mixedN} 条(应 ≥3)`);
+  }
+
+  const ok = dirtyBad.length === 0 && cleanBad.length === 0
+    && pairBad.length === 0 && eolBad.length === 0 && degraded.length === 0;
+  /* ★ 明细**总是**报通过数 —— 即使全过也要看到 4/4,否则看不出覆盖了几类
+     ⚠️ `行尾 N/M` 只统计**行尾敏感**的失败,**不含**"这一维退化" ——
+        两者性质不同(前者是判据错,后者是**样本组没测到**)。
+        我第一版把退化消息也 push 进 `eolBad` ⇒ 打印出 `行尾 4/5`,
+        看起来像"有一条行尾敏感",而实际**四条都一致、只是没测到**。
+        ⇒ 这是本仓反复的「两个概念混进一个变量」,当场修掉。 */
   const detail = `脏 ${dirtySamples.length - dirtyBad.length}/${dirtySamples.length}`
     + ` / 干净 ${cleanSamples.length - cleanBad.length}/${cleanSamples.length}`
     + (pairs.length > 0 ? ` / 成对 ${pairs.length - new Set(pairBad.map((s) => s.split(' ')[0]!)).size}/${pairs.length}` : '')
     + ` / 行尾 ${eol.checked - eolBad.length}/${eol.checked}`
+    + ` / 多行 ${mixedN}`
     + ` (命中 ${dirtyHitTotal} 条)`
-    + (ok ? '' : ` ⇒ ${[...dirtyBad, ...cleanBad, ...pairBad, ...eolBad].join(' ; ')}`);
+    + (ok ? '' : ` ⇒ ${[...dirtyBad, ...cleanBad, ...pairBad, ...eolBad, ...degraded].join(' ; ')}`);
   return { id: d.id, ok, detail };
 }
 
@@ -571,6 +645,25 @@ const DET_A: Detector = {
     'const ks = [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1]);',
     'const ks = [...body.matchAll(/^\\s*(\\w+):\\s*/gm)].map((m) => m[1]);',
     'const ks = [...body.matchAll(/(\\w+)\\s*:/g)].map((m) => m[1]);',
+    /* ★ task A:`mixed` 行尾这一维只有在 **≥3 行**样本上才真的产生混合。
+       下面三条是多行形态(真实代码本来也是多行的),让 mixed 非退化。 */
+    [
+      'function keys(body: string): string[] {',
+      '  const ks = [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1]);',
+      '  return ks;',
+      '}',
+    ].join('\n'),
+    [
+      'const ks = Object.fromEntries(',
+      '  [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => [m[1], true]),',
+      ');',
+    ].join('\n'),
+    [
+      'for (const part of body) {',
+      '  const hit = /(\\w+)\\s*:/.exec(part);',
+      '  if (hit !== null) out.push(hit[1]);',
+      '}',
+    ].join('\n'),
   ],
   clean: [
     [
@@ -647,6 +740,24 @@ const DET_B: Detector = {
     `const a = src.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ')${NEEDLE_LINE_COMMENT}, '');`,
     `let out = src${NEEDLE_LINE_COMMENT}, '');`,
     `function strip(s) { return s${NEEDLE_LINE_COMMENT}, ''); }`,
+    /* ★ task A:多行样本,让 `mixed` 行尾非退化(真实代码是多行的) */
+    [
+      'export function stripLineComments(src: string): string {',
+      `  return src${NEEDLE_LINE_COMMENT}, '');`,
+      '}',
+    ].join('\n'),
+    [
+      'const stripped = src',
+      `  .replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ')`,
+      `${NEEDLE_LINE_COMMENT}, '');`,
+    ].join('\n'),
+    [
+      'function normalize(text: string): string {',
+      `  const a = text${NEEDLE_LINE_COMMENT}, '');`,
+      `  const b = a.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ');`,
+      '  return b;',
+      '}',
+    ].join('\n'),
   ],
   clean: [
     `const a = src.replace(/(^|[^:])${NEEDLE_LINE_COMMENT}, '$1');`,
@@ -753,6 +864,33 @@ const DET_C: Detector = {
       `const RE = /from\\s*['"]|import\\s*['"]/;`,
       `if (RE.test(line)) inImport = false;`,
     ].join('\n'),
+    /* ★ task A:多行样本,让 `mixed` 行尾非退化(真实实现是多行的) */
+    [
+      'export function importsOf(src: string): string[] {',
+      '  const out: string[] = [];',
+      `  for (const line of src.split('\\\\n')) {`,
+      `    if (/from\\s*['"]/.test(line)) out.push(line);`,
+      '  }',
+      '  return out;',
+      '}',
+    ].join('\n'),
+    [
+      'function scan(text: string): boolean {',
+      `  const m = /from\\s*['"]([^'"]+)/.exec(text);`,
+      '  return m !== null;',
+      '}',
+    ].join('\n'),
+    /* ★ task A:第 3 条多行样本 —— 断言阈值是 3,C/D 之前只有 2 条 ⇒ 被自检抓到 */
+    [
+      'export function edgesOf(file: string): string[] {',
+      '  const edges: string[] = [];',
+      `  for (const l of readFileSync(file, 'utf8').split('\\\\n')) {`,
+      `    const m = /from\\s*['"]([^'"]+)/.exec(l);`,
+      '    if (m !== null) edges.push(m[1]);',
+      '  }',
+      '  return edges;',
+      '}',
+    ].join('\n'),
   ],
   clean: [
     [
@@ -832,6 +970,27 @@ const DET_D: Detector = {
     [
       'let n = 0;',
       'for (const _ of src.matchAll(/@type/g)) n += 1;',
+    ].join('\n'),
+    /* ★ task A:多行样本,让 `mixed` 行尾非退化(真实实现是多行的) */
+    [
+      'export function countTypes(src: string): number {',
+      '  const n = (src.match(/@type/g) ?? []).length;',
+      '  return n;',
+      '}',
+    ].join('\n'),
+    [
+      'const counts = {',
+      '  types: [...src.matchAll(/@type/g)].length,',
+      '  exports: [...src.matchAll(/@export/g)].length,',
+      '};',
+    ].join('\n'),
+    /* ★ task A:第 3 条 ≥3 行样本 —— 断言阈值是 3,之前只有 2 条 ⇒ 被自检抓到 */
+    [
+      'export function audit(src: string): void {',
+      '  const n = (src.match(/@type/g) ?? []).length;',
+      '  const d = [...src.matchAll(/@decorator/g)].length;',
+      '  report(n, d);',
+      '}',
     ].join('\n'),
   ],
   clean: [
@@ -948,7 +1107,10 @@ function collectContainers(source: string, path: string): GContainer[] {
    *   `lineOf` 依赖 `\n` 计行,归一化后行号仍然正确(CR 与 LF 都是"换一行")。
    * ```
    */
-  const text = codeOnlyMask(source).split('\r\n').join('\n').split('\r').join('\n');
+  /* ⚠️ 行尾已由 `codeOnlyMask` → `maskComments` → `normalizeEol` 归一化
+     ⇒ **这里不再做第二次**(做了就是第二份实现,而第二份实现会各自漂)。
+     G 的 CR-only 塌陷(`cr=0`)正是靠那**一处**归一化修掉的。 */
+  const text = codeOnlyMask(source);
   const out: GContainer[] = [];
   const RE_DECL = /(?:^|\n)\s*(?:export\s+)?(?:declare\s+)?(interface|type)\s+([A-Za-z_$][\w$]*)[^\n{]*\{/g;
 
