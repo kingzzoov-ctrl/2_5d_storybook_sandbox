@@ -268,7 +268,7 @@ import {
   worstPitchDeviation,
 } from '../client/src/audio.ts';
 
-import { ITEM_LIST, TOTAL_ITEM_COUNT, itemName } from '../shared/constants/items.ts';
+import { ITEM_LIST, TOTAL_ITEM_COUNT, itemName, matchRecipeByTags } from '../shared/constants/items.ts';
 import { ItemCategory } from '../shared/types/entities.ts';
 import { BOSS_LIST, TOTAL_BOSS_COUNT } from '../shared/constants/bosses.ts';
 import { CHUNK_BYTES, Elevation, packTile } from '../shared/types/tile.ts';
@@ -1926,6 +1926,162 @@ test('配方树:库存检查与缺料报告', () => {
   ok(usedBy(130).length > 0, '130 梦境露水有下游');
   eq(usedBy(999999).length, 0, '未知材料无下游');
   eq(USAGE_INDEX.size > 50, true, '反向索引有规模');
+});
+
+/* ══════════════════ 17b. 留白槽(recipeAnyTag / CR-17)══════════════════
+ *
+ * ## 修的缺陷(task-54)
+ *
+ * 冻结层 `ItemDef.recipeAnyTag` 表达「留白槽」:某槽位接受**任意**一个带该 tag
+ * 的材料。旧实现只读 `recipe`,把留白槽的**登记代表**(如 `#237` 的 `166`)
+ * 当成硬性要求显示 ⇒ 拿着 `167` 的玩家看到「需要绯红植物染料」,
+ * **以为自己缺料,而服务端 `matchRecipeByTags` 实测 `ok=true`**。
+ * **这是「UI 说错了」(误导),不是「UI 少显示了」(残缺)。**
+ *
+ * ## 断言口径说明(实测得出,不猜)
+ *
+ * `tree.leaves` 是**基础叶子**(`165` 展开成 `108`;`166` 展开成 `121×2`),
+ * 所以 `checkCraft` 的库存也要用**基础材料**表达 —— 与既有 `351` 用例同口径。
+ * 顺带覆盖「玩家没有现成染料,但有合成染料的基础材料」这条路径
+ * (登记代表被槽接管后,它的基础叶子不再进 `tree.leaves`,故单独记在
+ * `RecipeSlot.candidateLeaves` 里;少了这层就会**回归**成「拿基础料反而做不出」)。
+ */
+
+/** 全部含留白槽的物品(实测 3 件)。断言不写死数量,以免配表扩充即断。 */
+const SLOT_ITEMS = ITEM_LIST.filter((i) => (i.recipeAnyTag ?? []).length > 0);
+
+test('配方树留白槽:不把登记代表当硬性要求(#237 单槽)', () => {
+  const t = buildRecipeTree(237);
+  /* 实测:#237 recipe={165:1,166:1} recipeAnyTag=[['染料']]
+   * 166 是留白槽的登记代表 ⇒ 由槽接管,不是额外确定件 */
+  eq(t.slots.length, 1, '#237 识别出 1 个留白槽');
+  const slotNodes = t.root.children.filter((c) => c.slotTags !== undefined);
+  eq(slotNodes.length, 1, '#237 有 1 个槽节点');
+
+  /* ★ 核心:槽节点必须**列出全部候选**,而不是只报 166 */
+  const sc = slotNodes[0].slotCandidates ?? [];
+  ok(sc.includes(166), '候选含 166(登记代表)');
+  ok(sc.includes(167), '★ 候选含 167(修的就是这条:167 同样合格)');
+  ok(sc.length > 1, `候选数为 ${sc.length} —— 不是单一硬性要求`);
+
+  /* ★ 玩家可见的标注:名字里必须出现「任意」与其它候选,不能只写 166 的名字 */
+  const nm = slotNodes[0].name;
+  ok(nm.includes('任意'), `槽节点名体现「任意」:${nm}`);
+  ok(nm.includes('167'), `槽节点名列出 167:${nm}`);
+  ok(nm !== itemName(166), '★ 槽节点名不等于「绯红植物染料」(旧实现正是如此,构成误导)');
+});
+
+test('配方树留白槽:玩家拿 167 也能合成(#237 判定)', () => {
+  const t = buildRecipeTree(237);
+  /* tree.leaves 实测 = [[108,1]](165 展开成 108) */
+
+  /* 直接持有成品 167 */
+  ok(checkCraft(t, { 108: 1, 167: 1 }).craftable, '★ 直接持有 167 可合成');
+
+  /* 用基础材料自己合成 167(167 = 122×1 + 123×1) */
+  ok(checkCraft(t, { 108: 1, 122: 1, 123: 1 }).craftable, '★ 拿 167 的基础料可合成');
+
+  /* 用基础材料自己合成 166(166 = 121×2)—— 登记代表路径不得回归 */
+  ok(checkCraft(t, { 108: 1, 121: 2 }).craftable, '拿 166 的基础料可合成');
+
+  /* 用 168 / 169 也应合格(候选全集) */
+  ok(checkCraft(t, { 108: 1, 103: 1, 118: 2 }).craftable, '拿 168 的基础料可合成');
+  ok(checkCraft(t, { 108: 1, 116: 1, 129: 1 }).craftable, '拿 169 的基础料可合成');
+
+  /* 负侧:完全没有染料 ⇒ 不可合成 */
+  ok(!checkCraft(t, { 108: 1 }).craftable, '无染料不可合成');
+
+  /* 缺料报告要说「任意染料」而不是只报 166 —— 否则仍是误导 */
+  const rep = missingReport(checkCraft(t, { 108: 1 }));
+  ok(rep.includes('任意'), `缺料报告指明留白槽:${rep}`);
+});
+
+test('配方树留白槽:双槽必须两个都填(#356,最易修漏)', () => {
+  const t = buildRecipeTree(356);
+  /* 实测 recipeAnyTag=[['染料'],['染料']] ⇒ **两个**槽,不是合并成一个 */
+  eq(t.slots.length, 2, '★ #356 识别出 2 个留白槽(漏成 1 个即本断言失败)');
+  eq(t.root.children.filter((c) => c.slotTags !== undefined).length, 2, '#356 有 2 个槽节点');
+
+  /* tree.leaves 实测 = [[108,2]](154 展开成 108×2) */
+
+  /* 两个槽都填(都用 166:121×4) */
+  ok(checkCraft(t, { 108: 2, 121: 4 }).craftable, '两个 166 可合成');
+  /* 两个槽都填(都用 167:122×2 + 123×2) */
+  ok(checkCraft(t, { 108: 2, 122: 2, 123: 2 }).craftable, '★ 两个 167 可合成');
+  /* ★ 只够一件 ⇒ 必须 false。若实现只处理第一个槽,这条会(错误地)判 true */
+  ok(!checkCraft(t, { 108: 2, 122: 1, 123: 1 }).craftable, '★ 只够一件染料不可合成(不许 1 件冒充 2 件)');
+  ok(!checkCraft(t, { 108: 2, 167: 1 }).craftable, '★ 直接持有 167×1 不可合成');
+  ok(checkCraft(t, { 108: 2, 167: 2 }).craftable, '直接持有 167×2 可合成');
+
+  /* 混用两种不同染料各一 */
+  ok(checkCraft(t, { 108: 2, 121: 2, 122: 1, 123: 1 }).craftable, '两种不同染料各一可合成');
+  ok(checkCraft(t, { 108: 2, 166: 1, 167: 1 }).craftable, '直接持有 166+167 各一可合成');
+
+  /* slotNeeds 逐槽报告,UI 可据此显示「2 个槽都满足」 */
+  const chk = checkCraft(t, { 108: 2, 167: 2 });
+  eq(chk.slotNeeds.length, 2, 'slotNeeds 逐槽报告 2 条');
+  ok(chk.slotNeeds.every((s) => s.satisfied), '两槽均标为已满足');
+});
+
+test('配方树留白槽:与服务端 matchRecipeByTags 判定一致(同构,不另立标准)', () => {
+  /* 客户端树与服务端匹配器必须对同一份配表给出同一答案 ——
+   * 否则 UI 与权威判定会各说各话,重新制造本次这类误导。 */
+  const CASES: [number, Record<number, number>, Record<number, number>][] = [
+    /* [craftId, 服务端口径的 have(成品), 客户端口径的 stock(基础叶子)] */
+    [237, { 165: 1, 166: 1 }, { 108: 1, 121: 2 }],
+    [237, { 165: 1, 167: 1 }, { 108: 1, 122: 1, 123: 1 }],
+    [237, { 165: 1, 168: 1 }, { 108: 1, 103: 1, 118: 2 }],
+    [237, { 165: 1 }, { 108: 1 }],
+    /* ⚠ #245 的基础叶子是 **103 翠玉青竹 + 126 爆裂火椒**(不是 108 —— 那是 #237 的)。
+     * 我先前照抄上一行写 108,断言立刻变红;实测后才改对。 */
+    [245, { 103: 1, 126: 1, 167: 1 }, { 103: 1, 126: 1, 122: 1, 123: 1 }],
+    [245, { 103: 1, 126: 1 }, { 103: 1, 126: 1 }],
+    [356, { 154: 1, 167: 2 }, { 108: 2, 122: 2, 123: 2 }],
+    [356, { 154: 1, 167: 1 }, { 108: 2, 122: 1, 123: 1 }],
+  ];
+  for (const [id, have, stock] of CASES) {
+    const srv = matchRecipeByTags(id, have).ok;
+    const cli = checkCraft(buildRecipeTree(id), stock).craftable;
+    eq(cli, srv, `#${id} 客户端(${cli}) 与服务端(${srv}) 判定一致`);
+  }
+});
+
+test('配方树留白槽:全部槽物品都识别(覆盖扩展,不只样本)', () => {
+  /* 邻近点扫描:不只看 #237/#356,而是**遍历配表里全部**含 recipeAnyTag 的物品 */
+  ok(SLOT_ITEMS.length > 0, `配表含留白槽物品 ${SLOT_ITEMS.length} 件`);
+  for (const it of SLOT_ITEMS) {
+    const t = buildRecipeTree(it.id);
+    const want = (it.recipeAnyTag ?? []).length;
+    eq(t.slots.length, want, `★ #${it.id} 槽数 = recipeAnyTag 长度(${want})`);
+    eq(
+      t.root.children.filter((c) => c.slotTags !== undefined).length,
+      want,
+      `★ #${it.id} 槽节点数 = ${want}`,
+    );
+    /* 每个槽节点必须带候选集,且非空(候选为空说明判据与冻结层脱节) */
+    for (const c of t.root.children.filter((x) => x.slotTags !== undefined)) {
+      ok((c.slotCandidates ?? []).length > 0, `#${it.id} 槽 ${JSON.stringify(c.slotTags)} 候选非空`);
+    }
+  }
+});
+
+test('配方树负对照:无留白槽物品的节点数不受修法影响', () => {
+  /* ★ 只测正例不够 —— 修法若让**所有**物品多出节点,正例也会「通过」。
+   * 这里遍历全部**不含** recipeAnyTag 的有配方物品,逐一对照。 */
+  let checked = 0;
+  for (const it of ITEM_LIST) {
+    if ((it.recipeAnyTag ?? []).length > 0) continue;
+    if (!it.recipe) continue;
+    const t = buildRecipeTree(it.id);
+    checked += 1;
+    eq(t.slots.length, 0, `#${it.id} 无 recipeAnyTag ⇒ tree.slots 为空`);
+    eq(
+      t.root.children.length,
+      Object.keys(it.recipe).length,
+      `★ #${it.id} children 数 = recipe 键数(不许因修法多出节点)`,
+    );
+  }
+  ok(checked > 200, `负对照覆盖 ${checked} 件有配方且无留白槽的物品`);
 });
 
 /* ══════════════════ 18. 像素画架 ══════════════════ */
