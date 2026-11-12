@@ -2154,3 +2154,72 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert
   下一个同类缺陷(新入口加载不了、契约字段没被生产赋值)**依旧不会被任何断言捕获**。
   ```
 - **Lead 裁决**:待裁(本 CR 由 Lead 并入;`build-wiring` 起草)
+
+## [CR-19] 2026-11-13 Lead — `damage.ts` 的 `crystalArmor` / `shield` 是**第二份死实现**:改它不影响生产,而活实现在别处
+
+- **文件与符号**:`server/src/combat/damage.ts`
+  `TargetProfile.crystalArmor`(L131)、`TargetProfile.shield` / `shieldMax`(L125/127)、
+  `computeDamage` 的 `crystalMul`(L388)、`shieldDamage` / `shieldBroken`(L390-397)、
+  `applyDamage`(L530)、`shieldPercent`(L621)
+- **实测事实(Lead 逐条跑过,含正面/背面对照)**:
+
+```
+① 冻结层 24 只生物,**crystalArmor=true 的 0 只,shield>0 的 0 只**
+   (mobCombatProfile 从 MobDef 派生;而 MobDef(shared/types/entities.ts:101)
+    **根本没有 crystalArmor 与 shield 字段** ⇒ 这两个值只可能是 createTarget 的默认 false/0)
+
+② crystalArmor / shield 的**全部生产读取点都在 damage.ts 自己内部**:
+   crystalArmor  3 处(131 定义、147 默认、388 使用)
+   .shield      17 处(全在 damage.ts)
+   shieldMax     5 处(全在 damage.ts)
+   shieldPercent 1 处(自身定义)
+   ⇒ **零外部消费者** ⇒ 整条链自洽但永不执行
+
+③ applyDamage 生产调用者 **0**(测试 6 处)
+
+④ **而功能是好的** —— 活实现在 AI 层(正面 vs 背面实测):
+   怪朝向   0°(玩家正面)  ⇒ hpLoss = 1.6      events=["beetle_front_armor"]
+   怪朝向 180°(玩家背面)  ⇒ hpLoss = 8.0
+   ⇒ 比值 **0.200**,与 BEETLE_FRONT_DR = 0.80 精确一致
+   ⇒ 且 `weaponId=204`(黑金爆破冲击镐)实测 events=["beetle_shell_broken"]
+     ⇒ damageKindOf(L1681)把 204 映射成 EXPLOSION ⇒ note 的设计**已实现且可达**
+```
+
+- **原因(即本 CR 的要点)**:这是**两份实现**——`damage.ts` 一份(死),
+  `mobs/behaviors.ts` 的 `BeetleAi.onDamage`(L716-744)一份(活)。
+  两者**数值恰好相同**(都 ×0.20),所以从行为上看不出哪份在起作用。
+
+- **影响面(需同步改动的 WS)**:
+  - **不阻塞任何验收**:晶甲、破壳、碎壳**均已生效**(§④ 实测)
+  - **但如果有人想调「晶甲强度」而改 `crystalArmor` / `CRYSTAL_ARMOR_MUL`,
+    生产行为不会变** —— 这是本 CR 真正要防的事故
+  - Boss 侧的护盾走的是**另一套**(`bosses/phases.ts:398 damageBoss` →
+    `toShield`/`toHp`,操作 `BossState.shieldHp`),与 `TargetProfile.shield` 无关
+  - `TargetProfile` 还被 `allyPrankHit` / `reflectFrom` / `healTarget` / `tickDot` /
+    `planSkillHits` 共用 —— 改它要连带核对,不能只删两个字段
+- **建议改法(三选一)**:
+
+| # | 选项 | 代价 |
+|---|---|---|
+| **1** | 给 `MobDef` 加 `crystalArmor?` / `shield?`,让 `mobCombatProfile` 读它,并把 `BeetleAi` 的正面判定**改为消费 `crystalMul`**(合并成一份) | 改动最大;且 `crystalMul` **不含朝向**(`AttackInput` 无 `fromDeg` 字段),而设计要的是「**正面**免疫」⇒ 合并会把「正面」退化成「全向」,**改变玩法** |
+| **2** | 保留双份,但在 `damage.ts` 的这两个字段处写**显式警告注释**:「本字段当前恒为默认值,生产消费者 = 0;改它不影响行为,活实现在 `BeetleAi.onDamage`」 | 最小;但靠注释约束 |
+| **3** | 删除死分支(`crystalMul` / `shieldDamage` / `shieldBroken` / `applyDamage` / `shieldPercent`) | 与 `tests/WS-10.test.ts` 的 6 处断言冲突;**且 note 里"破盾"武器语义会失去公式侧承载** |
+
+- **建议**:**选项 2**(标注),并把「朝向」这条**写成 CR 的未决项**。
+  理由链:
+```
+1 玩家可见行为**已经正确**(§④ 实测 ×0.200),所以这不是缺陷,是**归属未声明**
+2 选项 1 会**改变玩法**(全向免疫 ≠ 正面免疫)⇒ 不是纯重构,应单独裁决
+3 选项 3 会删掉 note 里"破盾"的公式侧承载,且要动 6 条断言 ⇒ 动静与收益不成比例
+4 「(正面)」这一条**两份实现都装不下**:crystalMul 无朝向,BeetleAi 有朝向
+   ⇒ 若将来要统一,先要裁决的是「晶甲该不该全向」—— 这是**玩法问题**,不是代码问题
+```
+- **不做会怎样**:
+```
+读代码的人会以为「护盾/晶甲系统在 damage.ts」—— 因为那里实现最完整、
+有 shieldDamage/shieldBroken/shieldPercent,还有 6 条测试。
+⇒ 而改那里**生产行为零变化**,且**门禁全绿**(没有任何断言会发现这件事)。
+⇒ 与陷阱 51(deadcode-audit 只认 from)同族:**两份都在用、有一份对、门禁全绿**。
+```
+- **Lead 裁决**:待裁(本条由 Lead 提出并附实测)
+- **关联**:`docs/PROGRESS.md` 陷阱 51(两份实现)· CR-18(装饰器/零依赖矛盾)
