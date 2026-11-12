@@ -122,7 +122,7 @@ import {
   resimulate,
   simulateInterpolation,
   type InputCmd,
-} from '../server/src/net/prediction.ts';
+} from '../client/src/net/prediction.ts';
 
 import {
   ACTION_PERMISSION,
@@ -3047,18 +3047,53 @@ test('task-37 判定2:`baseline.ts` 的主人是**门禁**,Lead 的口径确实�
 test('task-37 判定3:把 `scripts/**` 并入「生产侧」会**掩盖**真实欠账', () => {
   /* Lead 提的修法(把 scripts/** 算生产侧)会带来方向性危险:
    * 模块只要「被某个门禁读了一下」就从缺账里消失,而它**运行时仍不执行**。
-   * 以 `cooking.ts` 为例:门禁 `data-conformance.ts:674` 拿它的 FOODS 比对手册,
-   * 但生产交互系统从不调用它 —— 这是**两种不同的缺陷**,不能混为一谈。 */
-  ok(importsTarget('scripts/data-conformance.ts', 'combat/cooking.ts'),
-    '门禁确实 import 了 cooking.ts(:674)');
+   * 门禁覆盖缺失 与 运行时功能缺失 是**两种不同的缺陷**,不能合并成一条判据。
+   *
+   * ⚠️ **本组曾以 `cooking.ts` 作为例子并硬编码「生产侧零引用」——
+   * 那是个会过期的断言。2026-11-12 `task-39` 把 cooking.ts 接进生产后它变红。
+   * 断言必须钉**原理**(存在这样的模块),而不是钉**某个具体模块的当前状态**。 */
+  /* ⚠️ **本组不得点名任何具体模块**。它曾以 `cooking.ts` 举例并硬编码
+   * 「生产侧零引用」—— 2026-11-12 `task-39` 把它接进生产后断言变红。
+   * 点名 = 把断言绑在某个模块的**当前状态**上,那个状态本来就会变。
+   * 正确做法:断言 **「这类模块的集合非空」** 这个纯原理。 */
 
-  /* 而生产侧确实没接 —— 所以它「被门禁引用」不等于「已接线」。 */
-  let prodRefs = 0;
-  for (const f of ['server/src/net/room.ts', 'server/src/sim/world_sim.ts']) {
-    if (importsTarget(f, 'combat/cooking.ts')) prodRefs += 1;
+  /* 原理:「被门禁引用但生产零引用」的模块**集合非空**。
+   * 只要该集合非空,「把 scripts/** 并入生产侧」就一定会掩盖掉欠账 ——
+   * 这是集合层面的性质,与集合里有谁无关。 */
+  const vSrc37 = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8');
+  const wlKeys = [...vSrc37.matchAll(/\['((?:server|client)\/src\/[^']+)',\s*'/g)].map((m) => m[1]!);
+  ok(wlKeys.length > 0, `从白名单取到待判定模块(${wlKeys.length} 条)`);
+
+  const scriptFiles = listTs(join(ROOT_DIR, 'scripts'));
+  const prodFiles = [
+    ...listTs(join(ROOT_DIR, 'server', 'src')),
+    ...listTs(join(ROOT_DIR, 'client', 'src')),
+  ];
+
+  const gateOnly: string[] = [];
+  for (const mod of wlKeys) {
+    /* 用路径尾部(去掉 <side>/src/ 前缀)匹配 import 语句。 */
+    const tail = mod.replace(/^(?:server|client)\/src\//, '');
+    const gateRef = scriptFiles.some((f) => importsTarget(f, tail));
+    const prodRef = prodFiles.some((f) => importsTarget(f, tail));
+    if (gateRef && !prodRef) gateOnly.push(mod);
   }
-  eq(prodRefs, 0, '但生产侧零引用 —— 门禁引用不能当作已接线的证据');
+
+  ok(gateOnly.length > 0,
+    `“仅被门禁引用、生产零引用”的模块必须非空(否则掩盖风险不存在)。`
+    + `实测 ${gateOnly.length} 个:${gateOnly.slice(0, 4).join(', ')}`);
 });
+
+/** 列出目录下所有 .ts 文件(相对 ROOT_DIR 的路径),跳过 node_modules 与临时脚本。 */
+function listTs(dir: string, acc: string[] = []): string[] {
+  for (const e of readdirSync(dir)) {
+    if (e === 'node_modules' || e === '.git' || e === 'dist' || e.startsWith('_')) continue;
+    const p = join(dir, e);
+    if (statSync(p).isDirectory()) listTs(p, acc);
+    else if (e.endsWith('.ts')) acc.push(p.slice(ROOT_DIR.length + 1).split('\\').join('/'));
+  }
+  return acc;
+}
 
 test('task-37 判定4:`logistics.ts` 已被生产引用,应从清单移出', () => {
   /* `orphan-audit.ts` 自己的自检已报「已可达,应移出」。
@@ -3163,6 +3198,59 @@ test('task-37 判定6:两个目标模块在**两套清单**里的口径必须一
   ok(vSrc.includes("'server/src/db/driver.sqlite.ts'"), 'driver.sqlite 在 verify 白名单');
   ok(!aSrc.includes("['server/src/db/driver.sqlite.ts'"), '但**不在** orphan 清单');
 });
+
+/* ═══════════ task-40:prediction.ts 的归属判定与搬迁 ═══════════ */
+
+test('task-40 判定:prediction 是**客户端**模块,已搬到 client/src/net/', () => {
+  /* 判定依据(四条,task-40 任务书列的三条 + 我补的依赖判据):
+   *   1. 文件自述「客户端预测…立即出画面」(读源码断言,防有人写回服务端)
+   *   2. 它要的是**服务端权威快照** ⇒ 服务端自己是权威,不需要 reconcile 自己
+   *   3. 服务端入口 `room.ts` 只**产出**快照,不含 predictStep/reconcile/Interpolator
+   *   4. 它只依赖 `shared/`(唯一 import),不依赖 server/src ⇒ 可自由搬迁
+   * 结论:放 `server/src/net/` 是**放错位置**,不是「漏接线」。 */
+
+  /* 1. 搬迁结果:文件在客户端侧,且服务端侧已无此文件。 */
+  ok(existsSync(join(ROOT_DIR, 'client', 'src', 'net', 'prediction.ts')),
+    'prediction.ts 位于 client/src/net/(搬迁已完成)');
+  ok(!existsSync(join(ROOT_DIR, 'server', 'src', 'net', 'prediction.ts')),
+    'server/src/net/prediction.ts 已不存在(没有留下副本)');
+
+  /* 2. 依赖判据:唯一 import 是 shared/,故搬迁不牵出依赖链。
+   *    ⚠ 断言要解析 **import 语句本身**,不能用 /shared/ 之类宽词 ——
+   *    注释里出现「shared」会让断言恒真(同义反复,task-25 的教训)。 */
+  const predSrc = readFileSync(join(ROOT_DIR, 'client', 'src', 'net', 'prediction.ts'), 'utf8');
+  const predImports = predSrc.split('\n').filter((l) => /^\s*import\s/.test(l));
+  eq(predImports.length, 1, '它只有 1 条 import(依赖面极窄)');
+  ok(/from\s+'\.\.\/\.\.\/\.\.\/shared\//.test(predImports[0]!),
+    `唯一依赖是 shared/(实际:${predImports[0]!.trim().slice(0, 70)})`);
+  ok(!predImports.some((l) => /server\//.test(l)),
+    '不依赖 server/src ⇒ 搬迁未带出依赖链');
+
+  /* 3. 服务端侧确实不用它 —— 这是「放错位置」的正面证据。 */
+  const roomSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  ok(/snapshotFor/.test(roomSrc), 'room.ts **产出**快照(snapshotFor)');
+  for (const fn of ['predictStep', 'reconcile', 'Interpolator']) {
+    ok(!roomSrc.includes(fn),
+      `room.ts 不含 ${fn} ⇒ 服务端不该预测自己已是权威的东西`);
+  }
+
+  /* 4. 搬迁后**仍不可达**:客户端尚无网络层,没人调用它。
+   *    所以白名单条目**保留**,只改理由(不是摘除)。 */
+  const mainSrc = readFileSync(join(ROOT_DIR, 'client', 'src', 'main.ts'), 'utf8');
+  ok(!mainSrc.includes('prediction'),
+    'client/src/main.ts 未 import prediction ⇒ 搬迁后**仍不可达**');
+  ok(!/WebSocket|colyseus|fetch\(/.test(mainSrc),
+    '客户端仍无网络层 ⇒ 它等的是「客户端网络层」,不是「服务端接线」');
+});
+
+/* 注:「旧路径必须从两套清单消失」**不在本套件断言** —— 理由有二:
+ *   1. 那两处清单归 Lead / coop-party 改(不在 task-40 写域);
+ *      在此断言会让共享门禁在他人收口前**持续变红**,挡住所有队友。
+ *   2. **不必重复**:`verify.ts` 的白名单自检已经查「文件不存在」
+ *      (`checkReachability` 的 `stale.push(rel + '(文件不存在)')`),
+ *      搬迁后它会自己报出 `server/src/net/prediction.ts(文件不存在)`。
+ *      在此再断言一遍属于同一判据的第二套词法 —— 正是本仓已发生过
+ *      「两套词法互相矛盾」的教训。 */
 
 /* ═══════════════ 收尾 ═══════════════ */
 

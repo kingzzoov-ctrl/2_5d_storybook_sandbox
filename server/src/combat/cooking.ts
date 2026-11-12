@@ -94,6 +94,19 @@ function mods(p: Partial<FoodBuff['statMods']> = {}): FoodBuff['statMods'] {
 /** 恶作剧判定优先级:列表靠前者优先命中。 */
 export const PRANK_PRIORITY: readonly number[] = [607, 608, 609, 610, 611];
 
+/**
+ * 汤锅正常投料配方 —— **唯一事实来源**。
+ *
+ * 为什么单独导出而不是留在 `cookSoup` 里当局部量:出锅时要按「到底用了哪份配方」
+ * 从锅里**扣掉**对应材料(总量守恒),而扣料方在编排层。若编排层自己再抄一份,
+ * 两处会漂移 —— 改了一处、另一处就静默算错账,且不抛错。
+ *
+ * `Object.freeze` 是刻意的:它是账目基准,运行时被改写会让守恒核对失去意义。
+ */
+export const SOUP_NORMAL_RECIPE: Readonly<Record<number, number>> = Object.freeze({
+  104: 1, 124: 2, 121: 2,
+});
+
 /* ───────────────────────────── 601~615 料理表 ───────────────────────────── */
 
 export const FOODS: readonly FoodDef[] = [
@@ -268,7 +281,11 @@ export function cookSoup(input: CookInput): CookResult {
   const positive = Object.entries(input.inputs).filter(([, v]) => v > 0);
   if (positive.length === 0) return empty('投料为空');
 
-  let branch = CookBranch.NORMAL;
+  /* 显式标注为 `CookBranch`(而不是让 TS 收窄成字面量 "NORMAL"):
+     `CookBranch` 是 `as const` 对象的值联合,不收窄的话下面 `branch = PRANK`
+     与 `branch === PRANK` 两处都会被判为「不可能发生」。运行时行为不变,
+     但少了标注后这两处判断在类型层面等于**不存在**。 */
+  let branch: CookBranch = CookBranch.NORMAL;
   let food = FOOD_BY_ID.get(604)!;
   let prankTriggeredBy: Record<number, number> | null = null;
   let prankFlags: Record<string, number | string | boolean> = {};
@@ -286,7 +303,7 @@ export function cookSoup(input: CookInput): CookResult {
   }
 
   if (branch === CookBranch.NORMAL) {
-    const normalRecipe: Record<number, number> = { 104: 1, 124: 2, 121: 2 };
+    const normalRecipe = SOUP_NORMAL_RECIPE;
     if (!matches(input.inputs, normalRecipe)) {
       return empty(`正常投料不足:需要 ${JSON.stringify(normalRecipe)}`);
     }
@@ -294,8 +311,11 @@ export function cookSoup(input: CookInput): CookResult {
 
   const bonusKeywords: string[] = [];
   if (input.shovelUsed === true) {
+    /* 用显式三元而不是 `input.shovelUsed * 1`:后者的类型是 `boolean | undefined`,
+       参与算术会被 TS 判为可疑表达式。此处已由 `=== true` 收窄,行为等价。 */
+    const shovelBonus = SHOVEL_BONUS_KEYWORDS;
     const pick = COMBAT_KEYWORD_POOL[
-      (food.id + input.shovelUsed * SHOVEL_BONUS_KEYWORDS) % COMBAT_KEYWORD_POOL.length
+      (food.id + shovelBonus) % COMBAT_KEYWORD_POOL.length
     ];
     bonusKeywords.push(pick);
   }
@@ -338,6 +358,109 @@ export function cookSoup(input: CookInput): CookResult {
       ? `整蛊投料命中,改判为 ${food.name}`
       : '正常投料,出锅成功',
   };
+}
+
+/* ───────────────────── 料理站容器(编排层接线用)───────────────────── */
+
+/**
+ * 一个料理站的**锅内状态**。
+ *
+ * ## 为什么这个容器是必需的
+ *
+ * `cookSoup` 是纯函数:它只看 `input.inputs`,不持有任何状态。而「做菜」在玩法上
+ * 是**累积过程** —— 玩家/机械臂一件件把料丢进锅,够了才出锅。缺一个累积容器,
+ * 投进来的料就**无处可去**:这正是本仓此前的实际情形(见下)。
+ *
+ * ## 它修掉的真实缺陷
+ *
+ * `wiring/logistics.ts` 的 `ARM_TARGETS` **含 506 大汤锅**(设计上机械臂就该投料进锅),
+ * 而编排层接线后机械臂真的会投喂 —— 但投喂只把货**丢掉**(地面 N 件 → 0 件,
+ * 什么也不产出)。所以这里不只是「让料理能跑」,还**恢复了物品守恒**:
+ * 投进锅的货记在 `inputs` 里,出锅时按配方扣掉,不凭空消失。
+ */
+export interface KitchenState {
+  /** 锅内投料:物品 ID -> 件数。**这是货的暂存处,不是丢弃处**。 */
+  inputs: Record<number, number>;
+  /** 累计投喂件数(守恒对账用:进锅总量) */
+  fedTotal: number;
+  /** 累计出锅次数 */
+  cooked: number;
+  /** 最近一次出锅的料理 ID(0 = 尚未出锅) */
+  lastItemId: number;
+  /** 最近一次出锅的完整结果(供诊断与断言) */
+  lastResult: CookResult | null;
+  /** 炉火是否被浇灭(227 水枪 / 212 铲);`true` 时下一次投料作废 */
+  fireOut: boolean;
+}
+
+export function createKitchenState(): KitchenState {
+  return { inputs: {}, fedTotal: 0, cooked: 0, lastItemId: 0, lastResult: null, fireOut: false };
+}
+
+/**
+ * 往锅里投料。**总是接收**(不丢货),除非锅已灭火 —— 灭火时本次投料作废,
+ * 与 `cookSoup` 的 `fireOut` 语义一致:丢进去就烧糊了,不能算料。
+ *
+ * @returns 实际接收件数(灭火时为 0)
+ */
+export function feedStation(state: KitchenState, itemId: number, count: number): number {
+  const n = Math.max(0, Math.trunc(count));
+  if (n === 0) return 0;
+  if (state.fireOut) return 0;
+  const id = Math.trunc(itemId);
+  state.inputs[id] = (state.inputs[id] ?? 0) + n;
+  state.fedTotal += n;
+  return n;
+}
+
+/**
+ * 试出锅:锅内料够了就出一份料理。
+ *
+ * ## 判定顺序与「谁被扣掉」
+ *
+ * `cookSoup` 内部先扫整蛊投料(`PRANK_PRIORITY`)、再退到正常配方。所以扣料必须
+ * **按它实际用了哪份配方**来扣,而不是一律扣正常配方 —— 否则做出一道整蛊料理
+ * 却把正常配方的料扣了,锅里会留下错料,下一锅跟着错。
+ * `prankTriggeredBy` 就是「实际用了哪份」的权威答案。
+ *
+ * @returns 出锅结果;未出锅返回 `null`(料不够 / 非汤锅 / 已灭火)
+ */
+export function tryCook(state: KitchenState, stationId: number): CookResult | null {
+  /* 只有 506 汤锅有 `cookSoup` 实现。507 切菜台 / 508 披萨炉 / 505 的菜虽有
+     数据(`FoodDef.station`),但**没有 cook 入口** —— 这里如实返回 null 并
+     把货留在锅内,而不是假装出锅或把货丢掉。缺口已在报告里列出。 */
+  if (stationId !== SOUP_POT_ID) return null;
+  if (state.fireOut) return null;
+
+  const res = cookSoup({ inputs: state.inputs });
+  if (!res.ok) return null;
+
+  /* 扣掉实际用掉的配方料 —— 配方基准取自 `SOUP_NORMAL_RECIPE` / `prankTriggeredBy`,
+     不在这里重抄数字 */
+  const used: Record<number, number> = res.prankTriggeredBy ?? { ...SOUP_NORMAL_RECIPE };
+  for (const [k, v] of Object.entries(used)) {
+    const id = Number(k);
+    const left = (state.inputs[id] ?? 0) - v;
+    if (left > 0) state.inputs[id] = left;
+    else delete state.inputs[id];
+  }
+
+  state.cooked += 1;
+  state.lastItemId = res.itemId;
+  state.lastResult = res;
+  return res;
+}
+
+/** 浇灭炉火(227 泡泡水枪 / 212 大铁铲)。浇灭后锅内的料**保留**,只是不再出锅。 */
+export function extinguishStation(state: KitchenState): void {
+  state.fireOut = true;
+}
+
+/** 锅内当前件数合计(守恒核对用)。 */
+export function potCount(state: KitchenState): number {
+  let n = 0;
+  for (const v of Object.values(state.inputs)) n += v;
+  return n;
 }
 
 /* ───────────────────────────── buff 计时与清洗 ───────────────────────────── */

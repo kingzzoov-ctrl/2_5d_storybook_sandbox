@@ -673,11 +673,14 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/build/grid.ts', 'WS-03 建造网格,待接入'],
   ['server/src/build/rooms.ts', 'WS-03 BFS 房间检测,待接入'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图,待客户端接线'],
-  ['server/src/combat/cooking.ts', 'WS-06 料理,待接入'],
   ['server/src/combat/damage.ts', 'WS-10 八步伤害公式 —— 生产走 vitals.ts 简化路径,待接线'],
   ['server/src/combat/progression.ts', 'WS-10 击杀结算,待接入'],
   ['server/src/combat/revive.ts', 'WS-10 复活/无敌,待接入'],
   ['server/src/combat/weapons.ts', 'WS-10 武器表,随 damage.ts 一起接'],
+  /* `combat/cooking.ts` 已于 2026-11-12 接线(task-39):
+     `WorldSim` 真的调用 `createKitchenState` / `feedStation` / `tryCook` / `potCount`
+     (各 2~4 处**真实调用点**,不是只 import)。已从本表摘除。 */
+
   ['server/src/content/baseline.ts', 'WS-03 内容基线登记,待接入'],
   ['server/src/content/handshake.ts', '内容握手协议,待接入'],
   ['server/src/content/registry.ts', '内容注册表,待接入'],
@@ -685,7 +688,13 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/db/driver.sqlite.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
   ['server/src/db/memory_db.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
   ['server/src/mobs/taming.ts', 'WS-04 牧场驯服,待接入'],
-  ['server/src/net/prediction.ts', 'WS-07 客户端预测,待客户端接线'],
+  /* `net/prediction.ts` 已于 2026-11-12 **搬迁**到 `client/src/net/`,
+     不是接线 —— 它本就是客户端模块,放在 `server/src/` 下是放错位置。
+     理由改写成「等客户端网络层」而非「待接线」:
+     服务端侧**根本不该接**它(`reconcile` 要的是服务端权威快照,
+     服务端自己是权威,接进去等于「预测自己已经权威的东西」)。
+     卡点是**客户端还没有网络层**(24 个文件里 0 个有 WebSocket/colyseus/fetch)。 */
+  ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块)—— 等客户端网络层消费快照'],
   ['server/src/party/modes.ts', 'WS-11 竞技模式状态机,待接入'],
   ['server/src/party/scoring.ts', 'WS-11 计分,待接入'],
   ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫,待接入'],
@@ -723,17 +732,31 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
    有信息量的是**欠账卡在哪**,因此按阻塞原因分类:
 
    - `blockedOnClientShell`:等客户端入口壳(client/src 无入口文件)
+   - `blockedOnClientMechanism`:等**客户端侧机制** —— 入口已有,但缺该模块要消费的东西
+     (如网络层:客户端目前 0 个文件有 `WebSocket`/`colyseus`/`fetch`)
    - `blockedOnDependency`:等外部依赖(如 `three` 未安装 —— 台账已有 open item)
-   - `blockedOnMechanism`:等服务端机制(如产出凭证记账、权威物品总量)
+   - `blockedOnMechanism`:等**服务端**机制(如产出凭证记账、权威物品总量)
    - `blockedOnDecision`:等产品/设计裁决(如回放系统 US7)
 
    每类都**是欠账**,区别只在「谁能解」。这样报出来不会让读者误以为有「不必修的」。
+
+   ⚠ `clientShell` 与 `clientMechanism` **必须分开**:前者是「入口文件不存在」,
+   后者是「入口在、但上游能力不在」。合并会让「等网络层」看起来像「缺入口文件」,
+   而解法、责任人、时间尺度都不同。
+   本轮新增后者的实证:客户端入口补齐后,`prediction.ts` 搬迁过去仍是「等网络层」——
+   它**既不是缺入口,也不是缺服务端接线**(服务端侧根本不该接它:
+   `reconcile` 要的是服务端权威快照,服务端自己是权威)。
  */
 /* ⚠️ 必须用**窄词**:早期版本写 /客户端|本仓无装配入口/,
    宽词「客户端」会把 3 条 server/src/** 的**接线活**先抓走 ——
    它们的理由是「待客户端接线」(缺接线动作),不是「等入口文件」。
    实测:宽词 19/22/9/0 → 窄词 16/25/9/0。 */
 const WL_BLOCK_CLIENT_SHELL = /本仓无装配入口|客户端子系统/;
+/* 「等客户端**机制**」与「等客户端**入口**」不是一回事:
+   入口 = 文件不在;机制 = 文件在、上游能力不在。
+   窄词是「客户端」+「机制类名词」(网络层/运行时/装配层)—— 不写宽词「客户端」,
+   否则又会把服务端那批「待客户端接线」先抓走(见上方实测 19/22/9/0 vs 16/25/9/0)。 */
+const WL_BLOCK_CLIENT_MECH = /客户端网络层|客户端运行时|客户端装配层/;
 const WL_BLOCK_DEPENDENCY = /three|依赖未安装|相容层/;
 const WL_BLOCK_MECHANISM = /随.*一起接|尚未注入|被.*聚合/;
 /* 「缺接线动作」与「等人拍板」是两件事,不可混。当前 43 条全是前者:
@@ -744,10 +767,11 @@ const WL_DECISION_A = /(?:待|等|尚未|随)/;
 const WL_DECISION_B = /(?:接|注入)/;
 
 function whitelistBreakdown(): {
-  clientShell: number; wiring: number; mechanism: number; dependency: number;
-  decision: number; other: number; decisionShadowed: number;
+  clientShell: number; clientMech: number; wiring: number; mechanism: number;
+  dependency: number; decision: number; other: number; decisionShadowed: number;
 } {
   let clientShell = 0;
+  let clientMech = 0;
   let wiring = 0;
   let mechanism = 0;
   let dependency = 0;
@@ -784,6 +808,11 @@ function whitelistBreakdown(): {
       if (isDecisionCandidate) decisionShadowed += 1;
       continue;
     }
+    if (WL_BLOCK_CLIENT_MECH.test(reason)) {
+      clientMech += 1;
+      if (isDecisionCandidate) decisionShadowed += 1;
+      continue;
+    }
     if (WL_BLOCK_MECHANISM.test(reason)) {
       mechanism += 1;
       if (isDecisionCandidate) decisionShadowed += 1;
@@ -797,7 +826,7 @@ function whitelistBreakdown(): {
     if (isDecisionCandidate) { decision += 1; continue; }
     other += 1;
   }
-  return { clientShell, wiring, mechanism, dependency, decision, other, decisionShadowed };
+  return { clientShell, clientMech, wiring, mechanism, dependency, decision, other, decisionShadowed };
 }
 
 
@@ -1209,9 +1238,10 @@ function checkReachability(): void {
   const breakdown =
     `        └─ 欠账构成(${UNREACHABLE_EXEMPT.size} 条全部待接,按卡点分类):等客户端入口 ${wl.clientShell}`
     + ` / 等编排层接线 ${wl.wiring} / 等服务端机制 ${wl.mechanism}`
-    /* 「等外部依赖」与「未归类」**仅在非 0 时出现**:
+    /* 「等外部依赖」「等客户端机制」「未归类」**仅在非 0 时出现**:
        README 的固定四桶句式因此保持有效(不因 0 值桶而格式抖动),
        而一旦真有该类别欠账,它会立刻出现在输出里。 */
+    + (wl.clientMech > 0 ? ` / 等客户端机制 ${wl.clientMech}` : '')
     + (wl.dependency > 0 ? ` / 等外部依赖 ${wl.dependency}` : '')
     + ` / 等裁决 ${wl.decision}`
     + (wl.other > 0 ? ` / 未归类 ${wl.other}` : '')

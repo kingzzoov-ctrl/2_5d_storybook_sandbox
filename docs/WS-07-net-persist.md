@@ -52,12 +52,31 @@
 | `server/src/net/schema.ts` | `FIELD_TABLE` 等四张表、`RoomState` | 零依赖状态核心 |
 | `server/src/net/schema.colyseus.ts` | `PlayerSchema` 等 `Schema` 子类 | 装饰器装配(不被测试 import;由 H 组按**源码文本**校验) |
 | `server/src/net/delta.ts` | `encodeDelta` `decodePacket` `applyPacket` `estimateBandwidth` | 手写差量编码 |
-| `server/src/net/prediction.ts` | `predictStep` `reconcile` `Interpolator` `LossyChannel` | 预测/校正/插值 |
+| `client/src/net/prediction.ts` | `predictStep` `reconcile` `Interpolator` `LossyChannel` | 预测/校正/插值 —— **客户端模块**(见下方归属说明) |
 | `server/src/net/anticheat.ts` | `AntiCheatRoom` `checkMove` `checkAttack` `checkInventory` | 四类校验 |
 | `server/src/net/room.ts` | `RoomRuntime` `RoomRegistry` `PERMISSION_MATRIX` `AFK_TIMEOUT_MS` `MemberPresence` | 生命周期、权限、在场四态 |
 | `server/src/net/room.colyseus.ts` | `NetPersistRoom` `USE_COLYSEUS_PATCH` | Colyseus 薄装配 + 单通道开关 |
 
 **零依赖分层的关键**:`tests/WS-07.test.ts` 只 import `node:*` 与 `shared/**` 与本 WS 的零依赖实现。`schema.colyseus.ts` / `room.colyseus.ts` 承担 Colyseus 依赖,不被测试导入。
+
+#### 归属说明:`prediction.ts` 为何在 `client/` 而非 `server/`
+
+它原先放在 `server/src/net/` 下,长期不可达,白名单理由是「待 rollback 路径接入」。
+**task-40 判定这是「放错位置」,不是「漏接线」**,2026-11-12 已 `git mv` 到 `client/src/net/`:
+
+| 判据 | 证据 |
+| :--- | :--- |
+| 文件自述 | 头部「**客户端**预测…本地先跑一遍积分,**立即出画面**」;「客户端」出现 11 次 |
+| 输入来源 | `reconcile(predicted, authoritative)` 需要**服务端权威快照**;服务端自己就是权威 |
+| 服务端入口 | `room.ts` 只**产出**快照(`snapshotFor`),**不含** `predictStep`/`reconcile`/`Interpolator` |
+| 依赖面 | 唯一 import 是 `shared/types/physics.ts`,**不依赖 `server/src`** ⇒ 可自由搬迁 |
+
+**关键推论:把它硬接进服务端 tick 是引入缺陷,不是修缺陷** —— 会造出「服务端预测自己已经是权威的东西」。
+搬迁后它**仍不可达**(客户端尚无网络层:`client/src/main.ts` 不 import 它,且全文无 `WebSocket`/`colyseus`/`fetch`),
+故白名单条目**保留但改理由**:从「待 rollback 路径接入」→「**客户端模块,待客户端网络层**」。
+
+搬迁后唯一失效的相对 import 已同步:`tests/WS-07.test.ts` 改为 `../client/src/net/prediction.ts`;
+`git mv` 记录为 **0 insertions / 0 deletions**(内容逐字节保留)。
 
 `driver.sqlite.ts` 原本也在此列(依赖 `better-sqlite3`),**现已改造成零依赖可测**(CR-12):
 

@@ -46,8 +46,20 @@ import { AoiManager, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { SignalGraph } from '../wiring/graph.ts';
 import {
+  createKitchenState,
+  feedStation,
+  tryCook,
+  potCount,
+  FOOD_BY_ID,
+  SOUP_POT_ID,
+  KITCHEN_TABLE_ID,
+  PIZZA_OVEN_ID,
+  type KitchenState,
+} from '../combat/cooking.ts';
+import {
   tickLogistics,
   loadConveyor,
+  ARM_BATCH,
   type ArmWorld,
   type ArmState,
   type ConveyorState,
@@ -87,6 +99,30 @@ import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts'
 import { MOB_BY_ID } from '../../../shared/constants/mobs.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
 import type { GroundItem, WorldPlayer, DamageKind, DamageResult } from '../mobs/behaviors.ts';
+
+/**
+ * 读地面掉落物的物品 ID —— **兼容两种字段名**。
+ *
+ * ## 为什么需要这个函数(真缺陷,不是洁癖)
+ *
+ * 本仓对「地面掉落物」的 ID 字段存在**两种不一致的命名**:
+ *  - 接口 `GroundItem`(mobs/behaviors.ts)声明的是 `{ id, x, y, count }`,
+ *    且 `behaviors.ts:242/410/1124` 确实按 `g.id` 读;
+ *  - 但生产写入侧(`spawnItem`、`forgeAlchemy` 产物)**写的是 `itemId`**,
+ *    而 `world_sim.ts` 有 6 处按 `g.itemId` 读。
+ *
+ * 后果是**静默的数据不可见**,不是报错:
+ *  - 生物 `spawnItem` 落地的货(如 `behaviors.ts:478` 的 611),
+ *    被同文件 `:242` 的 `groundItems().filter(g => g.id === ...)` 永远看不到;
+ *  - 实测 `consumeGroundItem(151, 3)` 对**确实存在**的 151 返回 **0**。
+ *
+ * 这类「同一数组两种字段名、读写各看一半」的缺陷不会抛错,只会让功能看起来
+ * 时灵时不灵,所以这里统一走一个读法,兼容两侧;写入侧另行补齐两个字段
+ * (见 `spawnItem` / `forgeAlchemy` 的注释),使双方都能看见。
+ */
+function groundItemId(g: GroundItem): number {
+  return (g as { itemId?: number }).itemId ?? g.id;
+}
 /* 存档闭环:`db` 只作为**参数**出现在 `saveToDb` / `loadFromDb` 里,
    不进构造器 —— 保住 `new WorldSim({sizeCells})` 的纯度(见该方法注释)。 */
 import {
@@ -370,6 +406,20 @@ export class WorldSim {
   private readonly logisticsSorters = new Map<string, SorterState>();
   private readonly logisticsArms = new Map<string, ArmState>();
   private readonly logisticsDrills = new Map<string, DrillState>();
+  /**
+   * 各料理站的锅内状态(506 汤锅 / 507 切菜台 / 508 披萨炉)。
+   *
+   * 按**设备 ID**而不是坐标索引:坐标会随玩家拆建而变,而「这口锅里的料」
+   * 是跟着设备走的。本仓目前一台设备只有一份状态(同一世界不多开同型灶),
+   * 与 `ARM_TARGETS` 的粒度一致。
+   *
+   * 惰性创建:`kitchenOf()` 首次访问时建。开局不该为用不到的灶分配状态。
+   */
+  private readonly kitchens = new Map<number, KitchenState>();
+  /** 料理系统的累计账目(供诊断与断言)。 */
+  lastCookReport: { cooked: number; lastItemId: number; fedTotal: number; potCount: number } = {
+    cooked: 0, lastItemId: 0, fedTotal: 0, potCount: 0,
+  };
 
   constructor(opts: WorldSimOptions = {}) {
     this.sizeCells = Math.max(16, Math.trunc(opts.sizeCells ?? 64));
@@ -469,7 +519,7 @@ export class WorldSim {
         let left = count;
         for (let i = this.mobGround.length - 1; i >= 0 && left > 0; i -= 1) {
           const g = this.mobGround[i];
-          if (g.itemId !== itemId) continue;
+          if (groundItemId(g) !== itemId) continue;
           const take = Math.min(left, g.count);
           g.count -= take;
           left -= take;
@@ -485,7 +535,10 @@ export class WorldSim {
         this.setCell(Math.floor(x), Math.floor(y), { obj });
       },
       spawnItem: (x, y, itemId, count) => {
-        this.mobGround.push({ itemId, x, y, count });
+        /* 两个字段都写:接口 `GroundItem` 声明 `id`,而本文件其余读点与
+           既有生产写入用 `itemId`。只写一个就会让另一侧读不到(实测
+           `consumeGroundItem` 对存在的货返回 0)。修法见 `groundItemId` 的注释。 */
+        this.mobGround.push({ id: itemId, itemId, x, y, count } as GroundItem);
       },
       frame: () => this.frameCount,
     };
@@ -687,7 +740,7 @@ export class WorldSim {
     for (const id of gate.materialIds) need.set(id, (need.get(id) ?? 0) + 1);
     for (const [id, want] of need) {
       let have = 0;
-      for (const g of this.mobGround) if (g.itemId === id) have += g.count;
+      for (const g of this.mobGround) if (groundItemId(g) === id) have += g.count;
       if (have < want) {
         return {
           ok: false,
@@ -739,11 +792,12 @@ export class WorldSim {
     const x = Math.trunc(opts.x ?? 0);
     const y = Math.trunc(opts.y ?? 0);
     this.mobGround.push({
+      id: -1,
       itemId: -1,
       x,
       y,
       count: 1,
-    });
+    } as GroundItem);
     return { ok: true, result, consumed, spawned: { x, y } };
   }
 
@@ -1211,24 +1265,70 @@ export class WorldSim {
         for (let i = this.mobGround.length - 1; i >= 0; i -= 1) {
           const g = this.mobGround[i]!;
           if (g.x !== x || g.y !== y || g.count <= 0) continue;
-          const out: Stack = { id: g.itemId, count: g.count };
-          if (g.count <= 1) this.mobGround.splice(i, 1);
-          else g.count -= 1;
+          /*
+           * 不搬**成品料理** —— 只搬原料。
+           *
+           * `ARM_TARGETS` 全是加工设备(高炉/汤锅/披萨炉/炼金炉/炮台/分拣/火车头),
+           * 把一道做好的菜再喂进加工设备是**无意义自环**:它既不是任何配方
+           * 的原料,也不会被加工出别的东西。
+           *
+           * 实测缺陷(不修就成死循环):出锅的成品落在汤锅相邻格,而该格仍在
+           * 机械臂的抓取半径内 ⇒ 刚出锅就被抓回锅里 —— 锅里的 604 **永远
+           * 到不了玩家手里**(逐帧追踪:`cooked=1` 但地面为空、锅内卡着 604)。
+           *
+           * 判定用 `FOOD_BY_ID`(料理表)而不是硬编码 ID 段:表本身是
+           * 权威来源,以后加菜不必改这里。
+           */
+          if (FOOD_BY_ID.has(groundItemId(g))) continue;
+          /*
+           * 只取 **1 件**,不是整叠 —— `ARM_BATCH = 1` 就是「每次搬运件数」。
+           *
+           * 这里原先是 `count: g.count`(返回整叠数量)却只从地上减 1:
+           * 结果是「地上少 1 件、手里报 2 件」,投喂时按 2 记账。
+           * 实测后果:5 件材料被投出 8 件的账,凭空多出 3 件 ——
+           * 物品守恒被破坏,而**不抛任何错**。
+           */
+          const take = Math.min(g.count, ARM_BATCH);
+          const out: Stack = { id: groundItemId(g), count: take };
+          if (g.count <= take) this.mobGround.splice(i, 1);
+          else g.count -= take;
           return out;
         }
         return null;
       },
-      feed: (deviceId: number, x: number, y: number, _item: Stack): boolean => {
+      feed: (deviceId: number, x: number, y: number, item: Stack): boolean => {
         /* 目标设备必须在 OBJ 层真实存在;不存在就不算投喂成功。
            返回 false 会让机械臂保持持有,下一循环继续找目标 ——
            这比「假装成功」更能暴露配置错误。 */
         const r = Math.max(1, 3);
+        let foundDevice = false;
         for (let dy = -r; dy <= r; dy += 1) {
           for (let dx = -r; dx <= r; dx += 1) {
-            if (this.grid.objIdAt(x + dx, y + dy) === deviceId) return true;
+            if (this.grid.objIdAt(x + dx, y + dy) === deviceId) { foundDevice = true; break; }
           }
+          if (foundDevice) break;
         }
-        return false;
+        if (!foundDevice) return false;
+
+        /*
+         * 投喂进料理站:货**入锅记账**,而不是被丢弃。
+         *
+         * 这里修的是一个真实缺陷:`ARM_TARGETS` 含 506 汤锅 / 508 披萨炉,
+         * 机械臂接线后真的会往它们投喂,但原实现只 `return true` ——
+         * 货凭空消失(实测 5 件 → 0 件,无任何产出)。
+         * 「投喂成功」必须是「有容器收下了」,否则走到设备前等于倒进黑洞。
+         */
+        if (deviceId === SOUP_POT_ID || deviceId === PIZZA_OVEN_ID || deviceId === KITCHEN_TABLE_ID) {
+          const k = this.stationState(deviceId);
+          const accepted = feedStation(k, item.id, item.count);
+          if (accepted > 0) {
+            this.tryCookAt(deviceId);
+            return true;
+          }
+          /* 炉火被浇灭:料不能进,返回 false 让机械臂留着手里的货 */
+          return false;
+        }
+        return true;
       },
       deviceAt: (x: number, y: number): number => this.grid.objIdAt(x, y),
     };
@@ -1371,6 +1471,121 @@ export class WorldSim {
     return '';
   }
 
+  /* ══════════════════ 料理系统接线(WS-10)══════════════════ */
+
+  /**
+   * 取某个料理站的锅内状态(惰性创建)。
+   *
+   * 为什么按设备 ID 索引而不是坐标:坐标随拆建而变,而「这口锅里的料」
+   * 跟着设备走。与 `ARM_TARGETS` 的粒度一致(一台设备一份状态)。
+   */
+  stationState(deviceId: number): KitchenState {
+    let k = this.kitchens.get(deviceId);
+    if (!k) {
+      k = createKitchenState();
+      this.kitchens.set(deviceId, k);
+    }
+    return k;
+  }
+
+  /**
+   * 把**地面掉落物**投进指定料理站(玩家手动投料的公开入口)。
+   *
+   * 与机械臂的 `feed()` 走同一条记账路径 —— 两条路都必须把货记进锅里,
+   * 否则又会造出「一边投一边丢」的分叉实现。
+   *
+   * @returns 实际投入的件数(该格无货 / 火已灭 时为 0)
+   */
+  feedStationAt(deviceId: number, x: number, y: number, maxCount = 1): number {
+    const k = this.stationState(deviceId);
+    let moved = 0;
+    const want = Math.max(0, Math.trunc(maxCount));
+    for (let i = this.mobGround.length - 1; i >= 0 && moved < want; i -= 1) {
+      const g = this.mobGround[i]!;
+      if (g.x !== x || g.y !== y || g.count <= 0) continue;
+      const take = Math.min(g.count, want - moved);
+      const accepted = feedStation(k, groundItemId(g), take);
+      if (accepted === 0) break;
+      g.count -= accepted;
+      moved += accepted;
+      if (g.count <= 0) this.mobGround.splice(i, 1);
+    }
+    if (moved > 0) this.tryCookAt(deviceId);
+    return moved;
+  }
+
+  /**
+   * 试出锅并把成品落地。
+   *
+   * 产物**作为掉落物落在地面上**,而不是只留在返回值里 —— 这是本仓
+   * 那条被反复验证的判据:`材料件数 → 成品件数` 必须可对账,
+   * 只返回一个对象等于把「函数被调过」当成「生效了」。
+   */
+  private tryCookAt(deviceId: number): void {
+    const k = this.kitchens.get(deviceId);
+    if (!k) return;
+    const res = tryCook(k, deviceId);
+    if (res === null) {
+      this.syncCookReport(deviceId);
+      return;
+    }
+    /* 出锅:成品落地。
+       落在**站点相邻格**而不是站点自己那一格 —— 后者会被机械臂的抓取半径
+       覆盖,于是「刚出锅 → 立刻被抓回锅里」,成品永远到不了玩家手里
+       (实测:落点选站格时锅内残留 1 件、地面为空)。
+       相邻格才是「从锅里拿出来」的语义。 */
+    const spot = this.freeTileNear(deviceId);
+    this.mobGround.push({ id: res.itemId, itemId: res.itemId, x: spot.x, y: spot.y, count: 1 } as GroundItem);
+    this.bus.emit('cook_done', { itemId: res.itemId, station: deviceId });
+    this.syncCookReport(deviceId);
+  }
+
+  /**
+   * 找站点旁一个空格放成品。找不到理想位就退回站点自身坐标
+   * (宁可落在站上,也不让产物凭空消失)。
+   */
+  private freeTileNear(deviceId: number): { x: number; y: number } {
+    let sx = 0;
+    let sy = 0;
+    let found = false;
+    for (let y = 0; y < this.sizeCells && !found; y += 1) {
+      for (let x = 0; x < this.sizeCells && !found; x += 1) {
+        if (this.grid.objIdAt(x, y) === deviceId) { sx = x; sy = y; found = true; }
+      }
+    }
+    if (!found) return { x: 0, y: 0 };
+    for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]] as const) {
+      const nx = sx + dx;
+      const ny = sy + dy;
+      if (nx < 0 || ny < 0 || nx >= this.sizeCells || ny >= this.sizeCells) continue;
+      if (this.grid.objIdAt(nx, ny) === 0) return { x: nx, y: ny };
+    }
+    return { x: sx, y: sy };
+  }
+
+  /** 把锅内账目刷新到 `lastCookReport`(供断言,避免逐字段翻 Map)。 */
+  private syncCookReport(deviceId: number): void {
+    const k = this.kitchens.get(deviceId);
+    this.lastCookReport = {
+      cooked: this.totalCooked(),
+      lastItemId: k ? k.lastItemId : 0,
+      fedTotal: k ? k.fedTotal : 0,
+      potCount: k ? potCount(k) : 0,
+    };
+  }
+
+  /** 全部料理站的出锅次数合计。 */
+  private totalCooked(): number {
+    let n = 0;
+    for (const k of this.kitchens.values()) n += k.cooked;
+    return n;
+  }
+
+  /** 浇灭某料理站的炉火(227 水枪 / 212 大铁铲)。锅内料保留,只是不再出锅。 */
+  extinguishStationAt(deviceId: number): void {
+    this.stationState(deviceId).fireOut = true;
+  }
+
   /**
    * 把该格的**地面掉落物**装上传送带(公开入口,供生产与测试调用)。
    *
@@ -1398,7 +1613,7 @@ export class WorldSim {
     for (let i = this.mobGround.length - 1; i >= 0; i -= 1) {
       const g = this.mobGround[i]!;
       if (g.x !== x || g.y !== y || g.count <= 0) continue;
-      const okLoad = loadConveyor(st, { id: g.itemId, count: g.count });
+      const okLoad = loadConveyor(st, { id: groundItemId(g), count: g.count });
       if (okLoad) {
         this.mobGround.splice(i, 1);
         return true;
