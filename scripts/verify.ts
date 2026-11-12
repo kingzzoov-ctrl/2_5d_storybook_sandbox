@@ -2376,6 +2376,83 @@ function findVerdictHandlers(): Map<string, number> {
   return found;
 }
 
+/**
+ * **判据形态审计**(build-wiring task-60,Lead 接线)。
+ *
+ * 扫「**查产物的判据本身**」的缺陷 —— 与前面各道门禁的分工:
+ * ```
+ * 可达性 / 零引用 / 入口可加载 / 入口执行层   ⇒ 查**产物**对不对
+ * 本道(judgement_audit)                    ⇒ 查**判据**对不对(元判据)
+ * ```
+ * 五类形态(`scripts/judgement_audit.ts` 的 A/B/C/D/F):
+ * ```
+ * A  对象字面量键提取只认 `k:` 不认简写 `k,`
+ * B  剥注释的贴身 `//` 无 `[^:]` 前缀 ⇒ 把 `https://` 当注释起点
+ * C  import 探测只认 `from`,漏裸副作用 / 动态 import  ← **命中须人工复核**
+ * D  对**原文**(未剥注释)跑 match(/x/g) 计数
+ * F  spawnSync 之后不读 status/error ⇒ 子进程崩溃被当成"没问题"
+ * ```
+ *
+ * ## 为什么用 `--baseline` 而非 `--strict`(实测过的取舍)
+ *
+ * ```
+ * --strict    任何命中都红 ⇒ 接进门禁**立刻全红**(18 处多数是已定性/挂账项)
+ * --baseline  只对**超出登记表的新增**报红 ⇒ 门禁该用的语义
+ * ```
+ * ⇒ 登记表 `scripts/judgement_baseline.ts`,**每条必填 reason**。
+ *
+ * ## ⚠️ 为什么必须紧跟一道「区分力自检」
+ *
+ * **一个永远 `exit 0` 的脚本也是绿的。** 所以本道接线的有效性**不靠"它跑了"**,
+ * 而靠 `gate-selfcheck` 的 **T35**:往登记表外注入 1 处新命中 ⇒ 本道必须红。
+ * ```
+ * ⇒ 否则这条接线就是本仓反复点名的「恒真门禁」:
+ *   跑了、绿了、什么都没查。
+ * ```
+ *
+ * ## ⚠️ C 类命中**不可当确证缺陷读**
+ *
+ * 该检测器的**覆盖判定已知偏窄**(build-wiring 三次栽在同一处:漏判
+ * `^\s*import\b` 与 `import(` 的组合写法)。命中行带 `[C?]` 标记,
+ * **必须人工复核**。这是「启发式判定标注边界,而不是假装无边界」的实例 ——
+ * 输出上标注,不能只标在 JSDoc 里(没人读 JSDoc)。
+ */
+function checkJudgementAudit(): void {
+  console.log('\n[判据形态审计]');
+  const script = join(ROOT, 'scripts/judgement_audit.ts');
+  if (!existsSync(script)) {
+    advise('判据形态审计', 'judgement_audit.ts 不存在 ⇒ 判据形态审计未运行(它扫的是判据自身)');
+    return;
+  }
+  const r = spawnSync(process.execPath, ['scripts/judgement_audit.ts', '--baseline'], {
+    cwd: ROOT, encoding: 'utf8', timeout: 180_000,
+  });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  /* ★ 先判「跑了没有」—— 否则崩溃/超时会被读成"没问题"(形态 F 的教训) */
+  const m = out.match(/合计命中:(\d+)\s*处;其中\s*\*{0,2}新增\s*(\d+)\s*\*{0,2}\s*处/);
+  if (m === null) {
+    /* 没有可解析的汇总行 ⇒ **不能当成绿**。它可能是:崩溃、超时、输出格式变了。 */
+    const head = out.split('\n').slice(0, 3).join(' / ').trim();
+    fail(`判据形态审计未产出可解析汇总(可能崩溃/超时/格式变了)::${head.slice(0, 160)}`);
+    return;
+  }
+  const total = Number(m[1]);
+  const added = Number(m[2]);
+  if (r.status !== 0 && added === 0) {
+    /* 非零退出但没有新增 ⇒ 与"判据无效"同类,如实报而不是当成红 */
+    fail(`判据形态审计 exit=${String(r.status)} 但新增 0 处 ⇒ 退回码与判据不一致`);
+    return;
+  }
+  if (added > 0) {
+    const lines = out.split('\n').filter((l) => /^\s*\[新增\]/.test(l)).slice(0, 8);
+    for (const l of lines) fail(`判据形态审计发现**未登记**的命中${l.slice(0, 150)}`);
+    if (lines.length === 0) fail(`判据形态审计报新增 ${added} 处,但未列出位置`);
+    return;
+  }
+  console.log(`  ✓ 判据形态审计:登记 ${total} 处已定性,本期**新增 0 处**`);
+  console.log('    └─ ⚠️ C 类命中带 [C?] 标记者**须人工复核** —— 该检测器覆盖判定已知偏窄');
+}
+
 function checkInertHandlers(): void {
   console.log('\n[入口执行层]');
   const found = findVerdictHandlers();
@@ -4125,6 +4202,34 @@ checkOrphanList();
 checkEntryLoadable();
 /* 入口执行层 —— 查「handler 被调用了但成功路径为空」,与上面两道查"谁引用谁"的门禁互补。 */
 checkInertHandlers();
+/* ★ 判据形态审计(build-wiring task-60,Lead 接线)—— 2026-11-13
+ *
+ * 它扫**门禁与测试自身**的「提取口径比事实窄」形态(A 键提取漏简写 /
+ * B 剥注释缺 `[^:]` 前缀 / C import 探测只认 from / D 对原文 match 计数 /
+ * F spawnSync 不读 status),这是**元判据**:前面几道都在查"产物对不对",
+ * 这道查"**查产物的判据本身对不对**"。
+ *
+ * ## 为什么用 `--baseline` 而不是 `--strict`
+ *
+ * ```
+ * --strict    任何命中都红 ⇒ 接进门禁会**立刻全红**
+ *             (18 处命中里多数是已定性的已知项/挂账项,不是现行缺陷)
+ * --baseline  只对**超出登记表的新增**报红 ⇒ 这才是门禁该用的语义
+ * ```
+ * ⇒ 登记表在 `scripts/judgement_baseline.ts`,**每条必填 reason**;
+ *   维护规则写在它文件头(新增先定性 / reason 必填 / 修掉要从表里删 /
+ *   用关键片段不用行号)。
+ *
+ * ## ⚠️ 接线时必须自带区分力自检
+ *
+ * 一个「永远 exit 0」的脚本也是绿的 —— 所以本轮接线**必须证明它抓得住新增**。
+ * 见 `gate-selfcheck` 的 **T35**:往登记表外注入 1 处新命中 ⇒ 门禁必须红。
+ * ⇒ 否则这条接线就是本仓反复点名的「恒真门禁」。
+ *
+ * ⚠️ **C 类的命中不可当确证缺陷读** —— 该检测器的覆盖判定已知偏窄
+ *    (build-wiring 三次栽在同一处),命中行带 `[C?]` 标记,须人工复核。
+ *    这是「启发式判定标注边界,而不是假装无边界」的实例。 */
+checkJudgementAudit();
 checkTautology();
 checkClientTrust();
 if (!frozenOnly && !only && !contentOnly) checkDocs();

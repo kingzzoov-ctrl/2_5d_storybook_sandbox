@@ -727,6 +727,95 @@ let passed = 0;
    ⇒ 两个都读作「全部通过」时不会有人发现,但**一个绿一个红时必被误读**。
    ⇒ 汇总只在**文件末尾**打印一次。 */
 
+/* ── T35:「判据形态审计」的接线是否有牙(防恒真门禁)──
+ *
+ * ## 为什么必须单独守它
+ *
+ * `verify.ts` 新接了一道 `checkJudgementAudit()`(跑 `judgement_audit.ts --baseline`)。
+ * **一个永远 exit 0 的脚本也是绿的** —— 所以「它跑了、汇总绿了」**不构成任何证据**。
+ * ⇒ 唯一有效的证明是:**往登记表之外注入 1 处新命中,门禁必须红**。
+ * ⇒ 这正是我对 build-wiring 的要求,也是我在 `verify.ts` 那段注释里写下的承诺。
+ *
+ * ## 动作序列
+ * ```
+ * 1 在 tests/ 下**新建**一个临时文件,内含一处 D 形态(对原文跑 match 计数)
+ *    ⚠️ 必须**新建**,不能改既有文件 —— 改既有文件会与别的用例互相干扰,
+ *      且万一没还原干净就是给别人留坑
+ * 2 跑 `node scripts/judgement_audit.ts --baseline` ⇒ 期望 exit 1 且输出「新增」
+ * 3 删临时文件 ⇒ 再跑一次 ⇒ 期望 exit 0 且「新增 0 处」
+ * ⇒ **两端都要验**:只验第 2 步证明不了它在干净时不会误报;
+ *   只验第 3 步证明不了它有牙。**两个方向都绿才是真结论。**
+ *
+ * ## ⚠️ 不用 inject.ts 的原因
+ *
+ * `scripts/inject.ts` 是 build-wiring 的注入器,它**改既有文件**。
+ * 本条只需要「加一处新命中」,**新建文件**是更小、更安全、无还原风险的做法。
+ * ⇒ 用最轻的手段达成就行,不必为了复用工具而引入改文件的还原风险。
+ */
+{
+  console.log('\n[T35] 「判据形态审计」接线是否有牙(注入 1 处新命中必须红)');
+  /* ⚠️ **必须在 lab 里造**,不能写进真仓库 —— 本脚本全套设计的前提是
+     「绝不碰真仓库:把整棵树复制到 %TEMP%」。
+     我第一版写的是 `join(ROOT, 'tests', ...)` ⇒ 那会在**真仓库**里创建文件。
+     即使 finally 会删,「在真仓库里创建文件」本身就违反本脚本自己的第 1 条铁律。
+     ⇒ 用 `makeLab()`(它已复制整棵树)⇒ 一切都发生在临时副本里。 */
+  const labRoot = makeLab();
+  const labFile = join(labRoot, 'tests', '__T35_PROBE.test.ts');
+  const runAudit = (): { exit: number; added: number; listed: boolean; out: string } => {
+    const r = spawnSync(process.execPath, ['scripts/judgement_audit.ts', '--baseline'], {
+      cwd: labRoot, encoding: 'utf8', timeout: 180_000,
+    });
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+    const m = out.match(/其中\s*\*{0,2}新增\s*(\d+)\s*\*{0,2}\s*处/);
+    return { exit: r.status ?? -1, added: m === null ? -1 : Number(m[1]), listed: /\[新增\]/.test(out), out };
+  };
+  try {
+    const before = runAudit();
+    const baseClean = before.added === 0;
+    console.log(`  注入前:exit=${before.exit} 新增=${before.added < 0 ? '**解析不到**' : String(before.added)}`);
+
+    /* 造一处 **A 形态**:键提取正则只认 `(\w+):`,没有配套的「简写属性」分支。
+       ⚠️ 我第一版造的是「对原文跑 match 计数」(以为那是 D 形态)⇒ **D 检测器报 0**。
+       实测校准:改用 A 形态 —— 它就是 DET_A 的 `dirty` 样本本身。
+       ⇒ 「注入不生效」与「判据没牙」必须区分开(陷阱 31),这里是我自己先撞上的。 */
+    writeFileSync(
+      labFile,
+      [
+        '/* T35 探针 —— gate-selfcheck 在临时副本里创建,跑完即删。 */',
+        'export function keysOf(body: string): string[] {',
+        '  return [...body.matchAll(/^\\s*(\\w+):/gm)].map((m) => m[1]!);',
+        '}',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const after = runAudit();
+    console.log(`  注入后:exit=${after.exit} 新增=${after.added < 0 ? '**解析不到**' : String(after.added)} 列出位置=${after.listed ? '✓' : '✗'}`);
+
+    const teeth = baseClean && after.exit !== 0 && after.added > 0 && after.listed;
+    if (teeth) {
+      console.log('  ⇒ ✓ 有牙:注入前 0 新增/exit 0;注入后 >0 新增/exit 非 0 **并指出位置**');
+      passed += 1;
+    } else if (!baseClean) {
+      console.log('  ⇒ ✗✗ 注入前就有新增 ⇒ 登记表已不全,本条的对照不成立');
+      console.log('     (这不是「接线没牙」,而是「基线不干净」—— 两者要分开报)');
+      failures += 1;
+    } else {
+      console.log('  ⇒ ✗✗ **接线没牙** —— 注入了新命中却没红');
+      console.log('     这正是「恒真门禁」:跑了、绿了、什么都没查。');
+      failures += 1;
+    }
+  } finally {
+    try { if (existsSync(labFile)) rmSync(labFile, { force: true }); } catch { /* 忽略 */ }
+    const restored = !existsSync(labFile);
+    /* ⚠️ 真仓库里**本来就不该有**这个文件 —— 一并自证没污染真仓库 */
+    const realClean = !existsSync(join(ROOT, 'tests', '__T35_PROBE.test.ts'));
+    console.log(`  还原:临时副本已清=${restored ? '✓' : '✗✗'}  真仓库未被污染=${realClean ? '✓' : '✗✗ **污染了真仓库!**'}`);
+    if (!restored || !realClean) failures += 1;
+  }
+  dropLab();
+}
+
 /* ── 基线:干净副本 ──
    若基线有红(通常是队友在飞的改动),**不中止**,而是把它当作差值基准 ——
    见 `deltaFails` 的说明。这样本脚本在多人并行时依然能给出有效结论。 */
