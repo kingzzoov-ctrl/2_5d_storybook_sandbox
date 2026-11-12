@@ -2090,3 +2090,67 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert
 - 未改 `docs/PROGRESS.md`(归 Lead)。
 
 ---
+
+## [CR-18] 2026-11-12 build-wiring(Lead 并入)— Colyseus 房间无法在 Node 下加载:装饰器与「零依赖直接跑 .ts」不可兼得
+
+- **文件与符号**:`server/src/net/room.colyseus.ts`、`server/src/net/schema.colyseus.ts`
+- **原因**(Lead 已独立复核):该文件被 `PROD_ENTRIES` 当作**生产入口**,
+  但它**在 Node 下根本无法加载**。实测:
+  ```
+  ✗ server/src/net/room.colyseus.ts   SyntaxError: Invalid or unexpected token
+  稳定复现,两条独立原因:
+    B1 命名导入自 CommonJS:`import { Room, Client } from 'colyseus'`
+       ⇒ `SyntaxError: Named export 'Client' not found.`
+       ⇒ **可解**(改 `import * as colyseus`,实测 `c.default.Server` 是 function)
+    B2 传递依赖 `./net/schema.colyseus.ts` 含 **44 处 `@type` 装饰器**
+       (行首口径;含注释残留为 45 —— 口径见 `docs/ARCH-GAPS.md:212`)
+       ⇒ Node 24 strip-only **不支持装饰器**
+       ⇒ 且 `--experimental-transform-types` **同样失败**(均已实测)
+  ⇒ 两个原因叠加 ⇒ **该文件当前一行都跑不起来**,而门禁**从未察觉**。
+  ```
+  ⚠️ **为什么门禁察觉不到**(这是本 CR 的根因,比 B1/B2 更重要):
+  ```
+  reachableClosure() **只做词法分析** —— 读 import 语句、拼相对路径、算闭包,
+  **从不执行一行代码** ⇒ 「这个入口能不能被 import 成功」**结构上不可见**。
+  ⇒ 已修:新增 checkEntryLoadable 门禁(见下「已处置」)。
+  ```
+- **影响面**(需同步改动的 WS):
+  - **不阻塞任何验收**:`WorldSaveHost` 契约的生产装配路径**不经过**该文件 ——
+    装配入口是 `server/src/index.ts`(零 colyseus 依赖,已交付,
+    验收见 `tests/WS-FND-09-wiring.test.ts`,14 条)
+  - **但「接上 colyseus 真服务」这条路是断的**
+  - 受影响的门禁:`PROD_ENTRIES` / 可达性口径 / README(若采纳选项 3)
+- **建议改法(三个选项与各自代价)**:
+
+| # | 选项 | 代价 | 影响面 |
+|---|---|---|---|
+| **1** | 移除 colyseus 依赖(schema 仅作元数据容器) | 需摘掉 **3 处真用到值**的调用:`Room<RoomSchema>` 类型参、`setState(new RoomSchema())`、两处 `this.schema().syncFrom(...)`。⚠️ **`USE_COLYSEUS_PATCH = false` 只让 patch 不发,`syncFrom` 仍在写值** ⇒ 摘除**改变语义**,不是「反正没在用」 | `room.colyseus.ts` + `schema.ts`;生产改为自建房间容器 |
+| **2** | 为该文件引入构建步骤(tsc/esbuild) | **直接违反本仓铁律「零依赖 + 直接跑 .ts」**;`dependencies` 现已为空,加构建即引入工具链与产物目录 | 全仓构建 / CI / 部署口径 |
+| **3** | 该房间降级为设计文档,从 `PROD_ENTRIES` 移出 | 保留 44 处装饰器作为**文档**,不再声称它是可运行入口;代价 = 放弃 colyseus 实装路线 | `PROD_ENTRIES` / README / 门禁口径 |
+
+- **建议**:**选项 3,但用「登记豁免」而非物理删除**。理由链:
+  ```
+  1 本仓铁律(零依赖、直接跑 .ts)与 Colyseus 的装饰器要求**结构上不可兼得**
+  2 选项 2 破坏铁律;选项 1 破坏语义;**而现状已经是「不能跑」**
+  3 ⇒ 选项 3 只是把这件事**如实写下来**:不改变任何运行时行为,
+    也**不放弃将来接**(豁免条目里写明了「待裁决」与三条出路)
+  4 且豁免**已生效**:verify.ts 会在**新增**入口加载不了时报红,不再静默
+  ```
+- **已处置**(CR 提出时的既成事实,供裁决参考):
+  ```
+  ① `scripts/entry_load_exempt.ts` 登记该豁免(单一事实来源,须写「原因 + 出路」)
+     —— 另有 `client/src/main.ts`(浏览器入口,设计如此)
+  ② `verify.ts` 新增 `checkEntryLoadable()`:PROD_ENTRIES 里**不在豁免表**的
+     入口必须能被 Node 加载。判据用**错误类型**不用消息字符串
+     (消息白名单必然漏 —— 实测漏过 `@@@` 的 `Expected indent`)
+     ⚠️ 用**子进程**加载,不用 `await import()` —— `demo.ts` 加载即执行且**跑完不抛错**
+  ③ `gate-selfcheck` 新增 **T33**:子进程 import `verify.ts`,断言 stdout 无门禁输出
+     ⇒ 防「import 守卫被删」(守卫根除的是**无限递归**,不是一条可读的失败)
+  ```
+- **不做会怎样**:
+  ```
+  门禁会**继续把一个加载不了的文件算作「生产入口」且全绿** ——
+  这正是「词法可达性看不见执行」那一层的直接后果;
+  下一个同类缺陷(新入口加载不了、契约字段没被生产赋值)**依旧不会被任何断言捕获**。
+  ```
+- **Lead 裁决**:待裁(本 CR 由 Lead 并入;`build-wiring` 起草)
