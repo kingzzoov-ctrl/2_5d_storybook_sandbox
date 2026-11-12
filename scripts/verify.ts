@@ -148,6 +148,52 @@ const pass = (msg: string): void => {
   console.log(`  ✓ ${msg}`);
 };
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * `advise` —— 只能告警、不能拦截的发现。
+ *
+ * ## 为什么需要单独一类
+ *
+ * 本文件有两道门禁的核心产出是**「新增未登记项」**(可达性 / 同义反复),
+ * 它们在默认口径下只告警,由 `--strict-reach` / `--strict-taut` 升级为失败。
+ * 这个设计本身是对的(新增欠账不该让所有人的构建立刻红)。
+ *
+ * **但它造成了汇总行说谎。** 实测(2026-11-12):
+ * ```
+ * 造一个「新增未登记的不可达模块」后 ——
+ *   默认口径          : stdout 印「全部通过 · 6363ms」,退出码 0
+ *                       (告警只在 stderr,且**不进入汇总行**)
+ *   --strict-reach    : stdout 印「1 项失败 · 6309ms」,退出码 1
+ * ```
+ * ⇒ **只 grep stdout 的读者、或只看「全部通过」这四个字的读者,
+ *   会把一个「新增了未登记欠账」的状态读成完全干净。**
+ *
+ * 而本仓 `docs/PROGRESS.md` 的工具陷阱第 2 条**恰恰教人这么做**:
+ *   > PowerShell 里 `node scripts/verify.ts` 成功也显示 `[exit code: 1]`
+ *   > —— 看「全部通过」这行
+ * 更有 README 开头写着「**唯一的完成定义**:`node scripts/verify.ts` 全绿」。
+ * 于是「全绿」这句话**并不覆盖**可达性与同义反复这两道门禁 ——
+ * **完成定义本身是不完整的**,而它以最权威的口吻说了出来。
+ *
+ * ## 修法:让汇总行**自己报出**它不覆盖什么
+ *
+ * 不改变默认口径(告警仍不拦截),但汇总行必须加上一句
+ * `N 项告警(未拦截)`,并指名哪道门禁有哪个开关能把它升级为失败。
+ * ⇒ 「全部通过」从此**不再是一个可以误读的绝对断言**。
+ * ══════════════════════════════════════════════════════════════════════════ */
+let advises = 0;
+const advisedGates = new Set<string>();
+const advise = (gate: string, msg: string): void => {
+  advises += 1;
+  advisedGates.add(gate);
+  console.warn(`  ⚠ ${msg}`);
+};
+/** 升级开关清单:汇总行据此告诉读者「怎么让它变红」。 */
+const ADVISE_UPGRADE: Record<string, string> = {
+  可达性: '--strict-reach',
+  同义反复: '--strict-taut',
+};
+
+
 /* ───────────────────── 1. 冻结层不变量 ───────────────────── */
 
 async function checkFrozen(): Promise<void> {
@@ -1256,8 +1302,9 @@ function checkReachability(): void {
         + `${unlisted.slice(0, 4).join(', ')}${unlisted.length > 4 ? ' …' : ''}`,
       );
     } else {
-      console.warn(
-        `  ⚠ 新增未登记的不可达模块 ${unlisted.length} 个(不在生产闭包内,需补白名单理由或接线):`,
+      advise(
+        '可达性',
+        `新增未登记的不可达模块 ${unlisted.length} 个(不在生产闭包内,需补白名单理由或接线):`,
       );
       for (const u of unlisted.slice(0, 12)) console.warn(`      · ${u}`);
       if (unlisted.length > 12) console.warn(`      … 另有 ${unlisted.length - 12} 个`);
@@ -1907,7 +1954,10 @@ function checkTautology(): void {
         + `${unlisted.slice(0, 4).join(', ')}${unlisted.length > 4 ? ' ...' : ''}`,
       );
     } else {
-      console.warn(`  ⚠ 新增未登记的同义反复候选 ${unlisted.length} 个(断言右侧取自被测模块导出常量):`);
+      advise(
+        '同义反复',
+        `新增未登记的同义反复候选 ${unlisted.length} 个(断言右侧取自被测模块导出常量):`,
+      );
       for (const u of unlisted.slice(0, 12)) {
         const [s, n] = u.split('::');
         console.warn(`      · ${s}  ${n}`);
@@ -3536,6 +3586,18 @@ if (!frozenOnly && !only && !contentOnly) checkDocs();
 if (!frozenOnly && !docsOnly && !integrationOnly) await checkContent();
 if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
 
-console.log(`\n${failures === 0 ? '全部通过' : `${failures} 项失败`} · ${Date.now() - t0}ms`);
+/* ⚠️ 汇总行必须**自报它不覆盖什么**。见 `advise()` 的定义处长注释 ——
+   实测过:造一个「新增未登记的不可达模块」后,默认口径仍打「全部通过」退出码 0,
+   告警只在 stderr 且不进汇总行;而 README 写着「唯一的完成定义:verify.ts 全绿」、
+   `PROGRESS.md` 又教人「看『全部通过』这行」。
+   ⇒ 那两句话会把「新增了未登记欠账」误读成「完全干净」。
+   修法:不改变默认口径(告警仍不拦截),但汇总行**必须把告警与升级开关报出来**。 */
+const verdict = failures === 0 ? '全部通过' : `${failures} 项失败`;
+const adviseSuffix = advises === 0
+  ? ''
+  : ` · ⚠ ${advises} 项告警**未拦截**(`
+    + [...advisedGates].map((g) => `${g}:加 ${ADVISE_UPGRADE[g] ?? '?'} 才算失败`).join('; ')
+    + ')';
+console.log(`\n${verdict}${adviseSuffix} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
 }
