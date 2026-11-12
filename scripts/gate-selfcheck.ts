@@ -116,6 +116,39 @@ function pickServerReason(src: string): string {
 }
 
 const CASES: Case[] = [
+  /* ═══ T37:新增的「入口执行层」门禁必须能检测漂移 ═══
+   *
+   * 该门禁查的是「handler 有 verdict 守卫但**成功路径为空**」。
+   * 一旦有人给成功侧加上真执行,登记里的「成功路径为空」就变成假事实 ——
+   * 门禁必须报「应移出登记」,否则这份登记会慢慢腐烂成一份假的清单。
+   *
+   * ⚠️ 锚点由 pickVerdictGuard() **运行时自取**(同 T32/T34 的理由):
+   * 这两条 handler 一旦被修好,写死的锚点就会过期,而过期的表现是
+   * 「锚点命中 0 次」—— 看起来像「门禁没问题」,实际是**用例没测到**。
+   */
+  {
+    group: 'T37',
+    name: 'action handler 加上成功执行 ⇒ 登记应报「不再是该形态」',
+    file: 'server/src/net/room.colyseus.ts',
+    from: '',
+    to: '',
+    expect: 'red',
+    wantMsg: /不再是该形态/,
+    args: ['--frozen'],
+    mark: 'inert-action',
+  } as Case,
+  {
+    group: 'T37',
+    name: 'attack handler 加上成功执行 ⇒ 登记应报「不再是该形态」',
+    file: 'server/src/net/room.colyseus.ts',
+    from: '',
+    to: '',
+    expect: 'red',
+    wantMsg: /不再是该形态/,
+    args: ['--frozen'],
+    mark: 'inert-attack',
+  } as Case,
+
   /* ═══ T34:新增的「生产零引用」门禁必须能失败 ═══
    *
    * 这道门禁的核心不变量是 `orphan ⊆ 可达性白名单`。
@@ -483,6 +516,29 @@ function resolveAnchors(): void {
   const injectRow = `${ind}${ind}['server/src/sim/world_sim.ts', 'probe:可达模块'],\n`;
 
   for (const c of CASES) {
+    if (c.mark === 'inert-action' || c.mark === 'inert-attack') {
+      const ev = c.mark === 'inert-action' ? 'action' : 'attack';
+      const rl = 'server/src/net/room.colyseus.ts';
+      const src2 = readFileSync(join(ROOT, rl), 'utf8').replace(/\r\n/g, '\n');
+      const re = new RegExp(`onMessage\\(\\s*'${ev}'`);
+      const m = re.exec(src2);
+      if (!m) {
+        throw new Error(`gate-selfcheck: 找不到 onMessage('${ev}') —— 锚点自取失败,用例等于不存在`);
+      }
+      /* 取该 handler 的最后一条语句(拒绝守卫)整行,在它后面插一行成功执行 */
+      const lines2 = src2.split('\n');
+      const li = src2.slice(0, m.index).split('\n').length - 1;
+      let guardLine = '';
+      for (let k = li; k < li + 12; k += 1) {
+        if (/!\w+\.allowed/.test(lines2[k] ?? '')) { guardLine = lines2[k]!; break; }
+      }
+      if (guardLine === '') {
+        throw new Error(`gate-selfcheck: ${ev} 的拒绝守卫行未找到`);
+      }
+      const indent = guardLine.match(/^\s*/)![0];
+      c.from = guardLine + '\n';
+      c.to = guardLine + '\n' + indent + 'this.runtime.__probeExecute__();' + '\n';
+    }
     if (c.mark === 'orphan-subset') {
       /* 插入一个必然可达的模块 —— 它不在 UNREACHABLE_EXEMPT 里,
          于是触发「是 orphan 却不在可达性白名单 —— 两套判据矛盾」 */
