@@ -14,7 +14,7 @@
 
 import { ITEM_BY_ID, itemName, itemValue } from '../../../shared/constants/items.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
-import { TileGrid } from './grid.ts';
+import { TileGrid, type TileGridLike } from './grid.ts';
 /* 地板槽位 → ID 的唯一事实源(WS-01),不得在本地重写偏移 */
 import { floorIdOfSlot } from '../world/chunk.ts';
 
@@ -567,7 +567,7 @@ export class RelayQueue {
   }
 
   /** 把已放置的任务写回世界网格(蓝图坐标系 + 偏移)。 */
-  applyTo(grid: TileGrid, ox: number, oy: number): number {
+  applyTo(grid: TileGridLike, ox: number, oy: number): number {
     let n = 0;
     for (const t of this.tasks) {
       if (t.state !== RelayTaskState.PLACED) continue;

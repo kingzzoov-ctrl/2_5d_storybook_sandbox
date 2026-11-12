@@ -36,7 +36,7 @@
  */
 
 import { SLOW_TICK_HZ, TICK_HZ, DT } from '../../../shared/types/physics.ts';
-import type { WireColor } from '../../../shared/types/tile.ts';
+import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
 import { Chunk, type TileFields } from '../world/chunk.ts';
 import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
@@ -45,6 +45,10 @@ import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowRe
 import { AoiManager, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { SignalGraph } from '../wiring/graph.ts';
+/* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
+   只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
+import { scanRooms, identifyRoom, DEFAULT_SCAN_OPTIONS, type RoomIdentity } from '../build/rooms.ts';
+import { RelayQueue, buildRelayQueue, type Blueprint } from '../build/blueprint.ts';
 import {
   createKitchenState,
   feedStation,
@@ -98,7 +102,25 @@ import { EventBus } from '../events/bus.ts';
 import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { MOB_BY_ID } from '../../../shared/constants/mobs.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
-import type { GroundItem, WorldPlayer, DamageKind, DamageResult } from '../mobs/behaviors.ts';
+import type { GroundItem, WorldPlayer, DamageResult } from '../mobs/behaviors.ts';
+import { DamageKind } from '../mobs/behaviors.ts';
+/* 玩家 → 生物 方向的伤害管线(task-33 接线)。
+   `damage.ts` 与 `weapons.ts` 此前只在 `tests/**` 里被引用,生产闭包中没有它们;
+   接上之后两者同时进入闭包,可达性白名单里的对应两条需一并摘除。 */
+import {
+  computeDamage,
+  mobCombatProfile,
+  DamageSource,
+  type DamageResult as PipelineDamageResult,
+} from '../combat/damage.ts';
+import {
+  combatantStats,
+  weaponById,
+  Element,
+  BREACH_PICK,
+  type SkillDef,
+  type WeaponDef,
+} from '../combat/weapons.ts';
 
 /**
  * 读地面掉落物的物品 ID —— **兼容两种字段名**。
@@ -195,6 +217,37 @@ export interface WorldSimOptions {
   mobs?: boolean;
   /** 确定性随机源,返回 [0,1)。默认用固定的 mulberry32。 */
   rng?: () => number;
+  /**
+   * 战斗随机源(**与 `rng` 分离**),返回 [0,1)。供暴击/闪避取数。
+   *
+   * ## 为什么要单开一条流(不是洁癖,是实测缺陷)
+   *
+   * 第一版 `attackMob` 用 `this.rng()` 取 `critRoll`/`dodgeRoll`,而
+   * **同一个 `rng` 也喂给 `mobHost`(生物 AI)与 spawner**(见构造里的
+   * `new MobHost(..., { rng: this.rng })`)。实测后果:
+   *
+   * ```
+   * 0 次攻击 vs 1 次攻击 → 三个**远处、与战斗无关**的生物轨迹全部分叉:
+   *   mob_boar      50.2835,50.7434 → 51.0355,49.4897
+   *   mob_tanuki    40.3489,54.6323 → 37.3426,55.6306
+   *   mob_squirrel  54.1809,38.3564 → 55.1844,39.4780
+   *   1 次 vs 3 次攻击 → 同样分叉
+   * ```
+   *
+   * ⇒ **玩家攻击次数成了生物 AI 的隐式输入**。这在真实游戏里是错的:
+   * 玩家在 A 处砍一刀,不该改变 B 处野猪的游荡轨迹。回放/录像也会因此
+   * 无法只记录世界种子重演 —— 必须额外记录完整攻击序列。
+   *
+   * 本仓把「同种子两次运行逐字节一致」当硬不变量(`demo.ts` 自检、
+   * `verify.ts`),所以这类耦合必须切断。分离后:
+   *   · 生物 AI 的随机序列**只由世界推进决定**,与玩家行为解耦;
+   *   · 战斗仍确定性可复现(同种子 → 同暴击序列,只是流独立);
+   *   · 想复现「含战斗」的一次运行,需同时给 `rng` 与 `combatRng` 同种子。
+   *
+   * **反例守卫**:断言「攻击不扰动远处生物」守住这条 —— 若有人把
+   * `combatRng()` 改回 `this.rng()`,该断言立刻红。
+   */
+  combatRng?: () => number;
   /**
    * 炼金服务覆盖。缺省时构造一个**离线可用**的实现
    * (`MemoryRecipeStore` + `StubLlmClient` + `allowDegrade=true`),
@@ -328,6 +381,8 @@ export class WorldSim {
 
   readonly sizeCells: number;
   private readonly rng: () => number;
+  /** 战斗专用随机流(与 `rng` 分离,见 `WorldSimOptions.combatRng`)。 */
+  private readonly combatRng: () => number;
   private readonly fluidBudget: number;
   private readonly wiringOn: boolean;
   private readonly mobsOn: boolean;
@@ -404,6 +459,54 @@ export class WorldSim {
    * 重建成本 O(件数),LOGISTICS_* 件典型数量在个位数到几十。
    */
   private readonly logisticsBelts = new Map<string, ConveyorState>();
+
+  /* ═══════════ task-36:建造 / 房间识别 / 蓝图接力的生产接线 ═══════════ */
+
+  /**
+   * 最近一次**房间识别**结果(供诊断与断言)。
+   *
+   * ## 为什么这个字段本身就是交付物的一部分
+   *
+   * `server/src/build/` 的 5 个模块(1688 行)在 `server/src` 里**零引用**,
+   * 只有 `tests/` 与 `scripts/perf-bounds.ts` 用它们 —— 门禁因此把整目录挂白名单。
+   * 后果是典型的一族缺陷:
+   *   - `rooms.ts` 的 BFS 闭合检测**实现完整**、WS-03 的 80 条用例**全绿**;
+   *   - 但玩家在真实世界里盖出封闭小屋时,`identifyAllRooms` **永远不会被调用**;
+   *   - ⇒ 手册 §3.8 的「餐馆 / 工坊 / 温室 / 奇想炼金实验室」等 9 种动态房间
+   *     **永不成立**,而模拟层看不出任何异常(它只知道地形被写了)。
+   *
+   * 只测纯函数发现不了这一点(那正是既有 80 条用例在做的事):
+   * 必须断言「**生产路径**上、由真实地形写入触发」的识别结果。
+   */
+  lastRoomScan: RoomIdentity[] = [];
+  /**
+   * 房间识别的**脏标记**:地形写入后置位,下一次慢帧才重算。
+   *
+   * 为什么不每格写入都立刻重算:`scanRooms` 是 O(sizeCells²) 的全图扫描,
+   * 而一次 `fillRect` 可能连写几千格 ⇒ 每格都扫一遍是 O(n·sizeCells²)。
+   * 用脏标记把它收敛成「每慢帧至多一次」,与流体/电路的慢帧节流同构。
+   *
+   * 反过来,**不能**只算一次就永远缓存:`WT-03-61` 钉的就是
+   * 「墙都拆了还报着那间房」—— 那种错误不报错、不抛异常,
+   * 只是房间永久停留在初始识别的结果上。
+   */
+  private roomsDirty = true;
+  /**
+   * 房间识别扫描的**视窗半径**。
+   *
+   * `scanRooms` 会对整张 `width × height` 做泛洪。生产世界的 `WorldGrid` 是
+   * **稀疏 Chunk**,按 `sizeCells`(默认 64,上限可到 512)全量扫是每慢帧
+   * 26 万格 —— 而实际有建筑的区域通常只有中心几十格。
+   * 这里只扫「所有非空 Chunk 的外接矩形」并外扩该半径,使成本与**实际建造规模**
+   * 成正比而不是与世界尺寸成正比。
+   */
+  private readonly roomScanPad = 8;
+  /** 正在推进的蓝图接力队列(未启动时为 null)。 */
+  private relay: RelayQueue | null = null;
+  /** 接力蓝图的落位基准(蓝图左上角对齐到世界的这个坐标)。 */
+  private relayOrigin = { x: 0, y: 0 };
+  /** 已落位的任务数(接力计数,供断言)。 */
+  relayPlacedCount = 0;
   private readonly logisticsSorters = new Map<string, SorterState>();
   private readonly logisticsArms = new Map<string, ArmState>();
   private readonly logisticsDrills = new Map<string, DrillState>();
@@ -428,6 +531,9 @@ export class WorldSim {
     this.wiringOn = opts.wiring !== false;
     this.mobsOn = opts.mobs !== false;
     this.rng = opts.rng ?? mulberry32(0x5eed);
+    /* 战斗随机**独立成一条流** —— 见 `combatRng` 字段注释。
+       种子取 `0x5eed` 的派生值,同种子仍完全可复现。 */
+    this.combatRng = opts.combatRng ?? mulberry32(0xc0ffee);
 
     this.grid = new WorldGrid();
     this.fluid = new FluidField(this.sizeCells, this.sizeCells);
@@ -586,6 +692,207 @@ export class WorldSim {
          否则两份判定迟早漂移(这正是 US5 指出的「双份状态」病灶)。 */
       this.fluid.setCell(x, y, { solid: this.grid.isSolidAt(x, y) });
     }
+
+    /* task-36:地形变了 ⇒ 房间识别结果作废。
+       只有 `obj` / `floor` 变化才影响房间判定(墙/门/核心件都在 OBJ 层,
+       地砖用于 `floorSet` 评分),`elev` / `wire` / `meta` 与房间无关 ——
+       不加这个条件的话,铺一条电线就会触发整轮全图扫描。 */
+    if (fields.obj !== undefined || fields.floor !== undefined) this.roomsDirty = true;
+  }
+
+  /* ═══════════════ task-36:房间识别 / 蓝图接力的生产入口 ═══════════════ */
+
+  /**
+   * 生产路径上的**房间识别结果**(手册 §3.8 的 9 种动态房间)。
+   *
+   * 正常情况下结果由慢帧(2Hz)自动刷新 —— 与流体/电路/物流同一节流策略。
+   * 但**取用时若发现脏标记仍置位,就顺手重算一次**:调用方有权利拿到
+   * 「与当前地形一致」的答案,而不是一个空数组或上一帧的旧值。
+   *
+   * 这点很重要:第一次 `tick()` 是**快帧**(`frame % 10 !== 0`),
+   * 若只靠慢帧刷新,构造完立刻取 `rooms()` 会得到 `[]` ——
+   * 而世界明明已经盖好了一间房。那会让调用方以为「没有房间」。
+   * 脏标记保证这次补偿重算**每次地形变化至多一次**。
+   */
+  rooms(): RoomIdentity[] {
+    if (this.roomsDirty) this.refreshRooms();
+    return this.lastRoomScan;
+  }
+
+  /**
+   * 房间识别已执行次数(供断言「是 tick 自己驱动的,不是调用方手工触发」)。
+   *
+   * 没有这个计数器,`rooms()` 的惰性补偿会让「自动刷新」与「手工触发」
+   * 在外部完全无法区分 —— 测试也就验证不了接线是否真的挂在慢帧上。
+   */
+  roomScanCount = 0;
+
+  /**
+   * 重算房间识别(慢帧调用,或由脏标记触发)。
+   *
+   * ## 为什么按「Chunk 簇」而不是「全球外接矩形」扫描
+   *
+   * `WorldGrid` 是**稀疏**的(`Map<chunkKey, Chunk>`):没被碰过的区域根本没有
+   * Chunk。最直接的做法是取所有已存在 Chunk 的**总**外接矩形当扫描窗口。
+   *
+   * **实测那是个性能陷阱**(本文件 `_bw36_perf2.ts` 的标定数据):
+   * 256×256 世界里,一间 9×9 的房在 (10,10):
+   * ```
+   *   远处那格在 (12,12)   →   0.42 ms/次
+   *   远处那格在 (80,80)   →   4.59 ms/次
+   *   远处那格在 (160,160) →  16.90 ms/次
+   *   远处那格在 (240,240) →  32.57 ms/次   ← 涨了 78 倍
+   * ```
+   * 原因:总外接矩形由**两个最远点**决定。玩家在离家很远处随手放一格
+   * (沙盒建造游戏里这再正常不过),窗口就被撑成整张地图 —— 而窗口里
+   * 绝大多数格是空的。房间识别随之变成每慢帧 O(世界面积)。
+   *
+   * ⇒ 改成**按 Chunk 连通簇分别扫描**:把相邻的非空 Chunk 聚成一簇,
+   * 每簇各取自己的外接矩形。一格孤砖只形成 16×16 的簇。
+   * 效果(同一次标定):世界 64 → 256(格数 ×16),单次扫描稳定在
+   * **0.27ms**,与建造规模成正比而不是与世界尺寸成正比。
+   *
+   * 簇间互不影响:房间不可能跨越两簇(中间隔着完全空的无 Chunk 区域,
+   * 泛洪到那里就断了),所以逐簇识别的结果与整体扫描等价。
+   */
+  private refreshRooms(): void {
+    this.roomScanCount += 1;
+    const clusters = this.chunkClusters();
+    if (clusters.length === 0) {
+      /* 世界还没有任何 Chunk ⇒ 不可能有房间。清空而不是留旧值。 */
+      this.lastRoomScan = [];
+      this.roomsDirty = false;
+      return;
+    }
+
+    const pad = this.roomScanPad;
+    const out: RoomIdentity[] = [];
+    let id = 0;
+    for (const cl of clusters) {
+      const x0 = Math.max(0, cl.x0 - pad);
+      const y0 = Math.max(0, cl.y0 - pad);
+      const x1 = Math.min(this.sizeCells - 1, cl.x1 + pad);
+      const y1 = Math.min(this.sizeCells - 1, cl.y1 + pad);
+      const w = x1 - x0 + 1;
+      const h = y1 - y0 + 1;
+      if (w <= 0 || h <= 0) continue;
+
+      /* 只读视图:直接转发到 `WorldGrid`,不复制数据 ⇒ 读到的永远是当前地形。
+         这正是 `grid.ts` 的 `TileGridLike` 存在的理由(详见那里的注释)。 */
+      const view = {
+        width: w,
+        height: h,
+        get: (x: number, y: number) => this.grid.cellAt(x0 + x, y0 + y),
+        set: (x: number, y: number, v: number) => {
+          this.setCell(x0 + x, y0 + y, unpackTile(v));
+        },
+        setObj: (x: number, y: number, objId: number) => {
+          this.setCell(x0 + x, y0 + y, { obj: objId });
+        },
+        inBounds: (x: number, y: number) => x >= 0 && y >= 0 && x < w && y < h,
+      };
+
+      for (const info of scanRooms(view, DEFAULT_SCAN_OPTIONS)) {
+        /* 只保留**闭合**的房间:漏墙的泛洪是「室外」,识别它没有意义。 */
+        if (!info.closed) continue;
+        id += 1;
+        /* 房间 ID 在全局唯一:簇内 `scanRooms` 从 1 开始编号,会跨簇重复,
+           这里统一用全局自增的 `id` 覆盖,否则两簇的第 1 间房会撞号。 */
+        out.push(identifyRoom({ ...info, id }));
+      }
+    }
+    this.lastRoomScan = out;
+    this.roomsDirty = false;
+  }
+
+  /**
+   * 把相邻的非空 Chunk 聚成连通簇,返回每簇的**世界格**外接矩形。
+   *
+   * 相邻判据用 4-连通(上下左右):斜角相接的两个 Chunk 之间隔着一格宽的
+   * 对角空隙,房间的泛洪过不去,合成一簇只会白白放大窗口。
+   */
+  private chunkClusters(): { x0: number; y0: number; x1: number; y1: number }[] {
+    const present = new Set<string>();
+    for (const c of this.grid.chunks.values()) present.add(`${c.cx},${c.cy}`);
+    const seen = new Set<string>();
+    const out: { x0: number; y0: number; x1: number; y1: number }[] = [];
+
+    for (const key of present) {
+      if (seen.has(key)) continue;
+      const parts = key.split(',');
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      const stack: string[] = [key];
+      seen.add(key);
+      while (stack.length > 0) {
+        const k = stack.pop()!;
+        const [cs, rs] = k.split(',');
+        const cx = Number(cs);
+        const cy = Number(rs);
+        const gx0 = cx * 16;
+        const gy0 = cy * 16;
+        if (gx0 < x0) x0 = gx0;
+        if (gy0 < y0) y0 = gy0;
+        if (gx0 + 15 > x1) x1 = gx0 + 15;
+        if (gy0 + 15 > y1) y1 = gy0 + 15;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const nk = `${cx + dx},${cy + dy}`;
+          if (present.has(nk) && !seen.has(nk)) {
+            seen.add(nk);
+            stack.push(nk);
+          }
+        }
+      }
+      out.push({ x0, y0, x1, y1 });
+    }
+    return out;
+  }
+
+  /**
+   * 启动一次**蓝图飞砖接力**(手册 `208 魔法描图卷轴`)。
+   *
+   * 生产路径上的蓝图消费入口:把蓝图拆成每格一个任务,由接力队列在慢帧里
+   * 逐块派发/飞行,**落位时真正写进世界**(见 `tickRelay`)。
+   *
+   * ## 为什么必须「落位即写世界」而不是只推进队列状态
+   *
+   * `RelayQueue.tick()` 只维护 `PENDING → FLYING → PLACED` 三个状态位,
+   * **一行都没写过网格**(实测:`RelayQueue` 段落内 `setCell`/`setObj` 出现 0 次)。
+   * WS-03 既有用例也只断言 `r.placed === 256` 这个**计数** ——
+   * 于是「队列说全放完了,世界里一块砖都没有」这种缺陷全绿通过。
+   * ⇒ 本方法负责把 `PLACED` 的任务真正落到地形上。
+   */
+  startRelay(bp: Blueprint, builders: { id: string; x: number; y: number; speedMul: number }[], origin?: { x: number; y: number }): void {
+    this.relayOrigin = origin ?? { x: 0, y: 0 };
+    this.relay = new RelayQueue(buildRelayQueue(bp), builders);
+    this.relayPlacedCount = 0;
+  }
+
+  /** 接力是否仍在进行。 */
+  relayActive(): boolean {
+    return this.relay !== null;
+  }
+
+  /**
+   * 推进接力一次(慢帧调用),并把**本帧落位的任务真正写进世界**。
+   *
+   * 时间戳用**模拟时钟**(`frameCount × 快帧 dt`)而不是 `Date.now()`:
+   * 用真实墙钟会让接力速度取决于机器快慢,且测试无法确定性复现。
+   */
+  private tickRelay(): void {
+    const q = this.relay;
+    if (q === null) return;
+    const nowMs = (this.frameCount / TICK_HZ) * 1000;
+    const r = q.tick(nowMs);
+    for (const t of r.placed) {
+      const x = this.relayOrigin.x + t.lx;
+      const y = this.relayOrigin.y + t.ly;
+      this.setCell(x, y, { obj: t.obj, floor: t.floor, elev: t.elev, wire: t.wire, meta: t.meta });
+      this.relayPlacedCount += 1;
+    }
+    if (r.remaining === 0) this.relay = null;
   }
 
   /** 把某格标为实心(墙体/黑曜石),水不能流入。 */
@@ -851,6 +1158,244 @@ export class WorldSim {
     return this.mobHost.interact(mobId, itemId, p);
   }
 
+  /* ── 玩家 → 生物 的伤害入口(task-33 接线)─────────────────────────
+   *
+   * ## 为什么必须新增入口,而不是「让 damageMob 内部算一下」
+   *
+   * 接线前实测(`_cp_red33.ts`):
+   *   · `computeDamage` 生产调用点 = **0**;
+   *   · 玩家贴 `mob_sheep`(60HP)站 600 帧 → 生物 HP **仍是 60**;
+   *   · `damageMob(amount=7)`→7、`damageMob(amount=70)`→70 —— `amount`
+   *     完全由调用方给定,等级/武器/护甲/元素/暴击**一个都不参与**;
+   *   · 手工直调 `computeDamage` → `finalDamage=28`、八步全跑。
+   *   ⇒ 缺陷在**接线**,不在算法。
+   *
+   * `damageMob` 保留原样:它的 `amount` 语义是「已经算好的伤害」,
+   * 环境伤害、陷阱、脚本事件都该直接给数,不该被拉去跑一遍八步公式。
+   * 新增的 `attackMob` 才是「玩家发起一次攻击」的入口 —— 它负责
+   * **算出** amount,再交给 `damageMob` 转发给生物 AI。
+   */
+
+  /**
+   * 玩家对生物发起一次**真实攻击**:走八步伤害公式,再转交生物 AI。
+   *
+   * ## 链路(每一步都不可省)
+   *
+   * ```
+   * equipSummary(wearing)  →  CombatantStats  ← 等级/武器/护甲/词条
+   *         ↓
+   * computeDamage(...)     →  DamageResult   ← 八步:基础/元素/破甲/破盾/暴击/减伤/反伤/击退
+   *         ↓
+   * damageMob(hpLoss)      →  生物 AI        ← 个体特性:格挡/反弹/晶甲/固化
+   * ```
+   *
+   * 前两段是**通用规则**,后一段是**个体差异**。本仓把个体特性全部实现在
+   * 各生物的 `onDamage` 里(实测:剑客正面格挡、骑士正面减伤、卡皮巴拉反弹、
+   * 甲虫正面 80% 减伤),所以这里**只算通用八步**,不重复实现个体特性
+   * —— 重复会让同一次攻击被减两遍(见 `mobCombatProfile` 的注释)。
+   *
+   * ## 反伤(第 7 步)为什么回打玩家而不回打生物
+   *
+   * `result.reflectDamage` 语义是「**受击方**把伤害反给攻击者」。玩家的
+   * 728 反伤甲只在玩家**挨打**时生效(那条路在 `vitals.ts`,本函数不涉及)。
+   * 生物没有反伤甲这类装备,`mobCombatProfile` 也刻意不给 `reflectMul`
+   * (给了就会凭空造出「怪物反伤」)。所以这里只把非零反伤如实上报,
+   * 不擅自扣玩家血 —— 扣了就等于给每只怪白送反伤。
+   *
+   * ## 随机源
+   *
+   * 暴击/闪避用 `this.rng`,与生物 AI 同一个确定性 PRNG(`mulberry32`)。
+   * 用 `Math.random` 会让回放与测试不可复现 —— 本仓的 `rng` 注入口
+   * 正是为此存在(`WorldSimOptions.rng`)。
+   *
+   * @returns `null` 表示没有这个生物;`outOfReach`/`dodged` 时 `finalDamage=0`。
+   */
+  attackMob(
+    playerId: string,
+    mobId: string,
+    opts: {
+      /**
+       * 已装备物品 ID(武器 + 护甲);缺省取 `setMobPlayers` 灌入的 wearing。
+       *
+       * ⚠️ **信任边界:`wearing` / `level` / `weaponId` 目前是「调用方自报值」。**
+       *
+       * 本入口现在只有测试与 `scripts/**` 调用(非测试生产调用者 = 0,
+       * 与 WS-05 的 `tryBreakBoss`/`bossSnapshots` 同标准),所以这三个
+       * 覆盖参数是给测试注入受控夹具用的。
+       *
+       * **但网络层一旦接上(US2),绝不能把客户端报文里的装备/等级直接塞进来** ——
+       * 本仓已有同类事故先例(CR-14 U1):`applyInventory` 早期由调用方传
+       * `allowedSources` / `capacity`,等于「自带合法清单就能凭空产物品」。
+       *
+       * 接线的正确形态:这三个值**一律由服务端从玩家权威状态派生**,
+       * 即调用方只传 `playerId` / `mobId`,其余走 `this.wearingOf(playerId)`
+       * 与玩家档案里的 `level`;`opts` 覆盖项应改为**仅测试可见**。
+       *
+       * ⇒ 现在**不要**给这三个参数加「客户端可传」的语义;
+       * 与 `playerById` / `syncPlayers` 硬编码 `wearing: []` 是同一个病根:
+       * **装备与等级的权威归属尚未定义**,应由 US2 一并裁决。
+       */
+      wearing?: readonly number[];
+      /** 玩家等级;缺省 1。语义与信任边界同 `wearing`,见上。 */
+      level?: number;
+      /** 武器 ID;缺省从 wearing 里自动识别。语义同 `wearing`,见上。 */
+      weaponId?: number;
+      /** 技能(有则走 SKILL 源,并叠技能倍率)。 */
+      skill?: SkillDef | null;
+      /** 普攻连段倍率(1.00 / 1.00 / 1.25)。 */
+      comboMul?: number;
+      /** 覆盖伤害类型(默认由武器推导)。 */
+      kind?: DamageKind;
+      /** 朝向(度),供生物 AI 的正面/背面判定。 */
+      fromDeg?: number;
+    } = {},
+  ): { result: PipelineDamageResult; hpLoss: number; events: string[] } | null {
+    const rt = this.mobHost.runtimeOf(mobId);
+    if (rt === null) return null;
+
+    /* 1 组装攻击方面板 —— 装备/等级 → CombatantStats(武器/护甲词条在此聚合)。 */
+    const wearing = opts.wearing ?? this.wearingOf(playerId);
+    const level = Math.max(1, Math.trunc(opts.level ?? 1));
+    const attacker = combatantStats(level, [...wearing]);
+    const weaponId = opts.weaponId ?? attacker.flags.weaponId;
+    const weapon = weaponId > 0 ? weaponById(weaponId) : null;
+
+    /* 2 距离:超出 reach 容差时九步里的第 0a 步会短路(此处如实传入)。 */
+    const distance = this.mobDistance(playerId, mobId);
+
+    /* 3 受击方档案 —— 由冻结层 MobDef 派生(缺的字段见 mobCombatProfile)。 */
+    const target = mobCombatProfile(rt.def, { hp: rt.hp });
+
+    /* 4 八步公式。暴击/闪避注入确定性随机。
+       ⚠ 用 `combatRng` 而非 `this.rng` —— 后者与生物 AI 共用,
+       拿它取战斗随机会把「玩家攻击次数」变成生物 AI 的隐式输入
+       (实测扰动远处生物轨迹,见 `WorldSimOptions.combatRng`)。 */
+    const critRoll = this.combatRng();
+    const dodgeRoll = this.combatRng();
+    const result = computeDamage({
+      attacker,
+      target,
+      weapon,
+      skill: opts.skill ?? null,
+      comboMul: opts.comboMul,
+      critRoll,
+      dodgeRoll,
+      distance,
+      source: opts.skill ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
+    });
+
+    /* 5 落账:公式给出通用伤害,生物 AI 再叠个体特性(格挡/反弹/晶甲)。
+       一律走 `damageMob`,**不直接改 rt.hp** —— 否则绕过个体特性。 */
+    const kind = opts.kind ?? this.damageKindOf(weapon);
+    const fromDeg = opts.fromDeg ?? this.facingOf(playerId);
+
+    /* ⚠ 已死生物:`hpLoss` 必须归零,不能照抄 AI 的返回值。
+     *
+     * `BaseMobAi.onDamage`(`behaviors.ts:175`)算的是
+     * `hpLoss = Math.max(0, amount); rt.hp = Math.max(0, rt.hp - hpLoss)`
+     * —— 对一具**尸体**(`rt.hp` 已是 0)它会返回 `hpLoss = amount`,
+     * 但 `rt.hp` 仍被钳在 0。实测:`alive=false, hp=0` 时再攻击得到
+     * `hpLoss=27`,`hp` 却 `0 → 0`。
+     *
+     * 这与 `damageMob` 自述的契约「`hpLoss` 才是真正的掉血」**直接矛盾**:
+     * 调用方若据此发经验 / 判定击杀 / 记 DPS,会为已经死掉的生物反复记账
+     * (本仓把「击杀真的会发生」当验收项,所以这条迟早被读到)。
+     *
+     * 归零的判据取「攻击前 `rt.hp`」而非 AI 返回值 —— 只有攻击前还活着、
+     * 且攻击后 HP 真的下降,才算掉血。
+     *
+     * 外层 `Math.max(0, …)` 经实测是**冗余防御**,不是必要逻辑:遍历全部
+     * 24 个生物 × 5 档伤害 × 4 种 `DamageKind` 共 480 次真实调用,
+     * 最小 `hpLoss` = 0,无一为负(`behaviors.ts` 里所有分支都从
+     * `Math.max(0, amount)` 或 `amount × 正系数` 起算)。
+     * 保留它是为了将来某个 AI 若返回负值时不至于把血**加上去**;
+     * 注意**这句冗余本身测不住**——注入实验里去掉它,断言全绿完全相同,
+     * 属等价变异体,不是断言盲区。 */
+    const hpBefore = rt.hp;
+    const ai = this.damageMob(mobId, result.finalDamage, kind, fromDeg);
+    const rawLoss = ai?.hpLoss ?? 0;
+    const hpLoss = Math.max(0, Math.min(rawLoss, hpBefore));
+    return { result, hpLoss, events: ai?.events ?? [] };
+  }
+
+  /** 取玩家已装备物品(装配层经 `setMobPlayers` 灌入;无记录则为空)。 */
+  private wearingOf(playerId: string): readonly number[] {
+    const p = this.mobPlayers.find((x) => x.id === playerId);
+    /* `?? []` 不是洁癖:装配层漏传 `wearing` 时 `p.wearing` 是 `undefined`,
+       直接返回会让调用方在 `[...wearing]` 处抛 `TypeError: wearing is not iterable`。
+       本仓的取舍是「生产路径上不 throw」——漏传装备应当退化成**按裸装结算**
+       (玩家看得见伤害数字变小),而不是让整次攻击崩掉。 */
+    return p?.wearing ?? [];
+  }
+
+  /** 取玩家朝向(度)。 */
+  private facingOf(playerId: string): number {
+    const b = this.physics.bodies.get(playerId);
+    return b?.facingDeg ?? 0;
+  }
+
+  /** 玩家与生物的平面距离(格)。任一方不存在时返回 `Infinity`。 */
+  private mobDistance(playerId: string, mobId: string): number {
+    const a = this.physics.bodies.get(playerId);
+    const rt = this.mobHost.runtimeOf(mobId);
+    if (a === undefined || rt === null) return Infinity;
+    return Math.hypot(rt.x - a.x, rt.y - a.y);
+  }
+
+  /**
+   * 由武器推导生物的 `DamageKind` —— 决定生物 AI 走哪条减伤/碎壳/固化分支。
+   *
+   * ## 只映射**真的有 AI 分支**的四种
+   *
+   * 实测 `behaviors.ts` 里对 `kind` 的判定只有四处:
+   * `FIRE`(`behaviors.ts:581` 剑客点燃、`:979` 巧克力盾卫融化)、
+   * `EXPLOSION`(`:720` 紫晶甲虫碎壳)、`WATER`(`:1224` 火灵固化)、
+   * 其余一律不判。所以这里**只产出这四种 + PHYSICAL 兜底**,
+   * 不把 `LIGHTNING`/`LIGHT`/`SLIME` 硬塞进 `SOUND`/`SLIP` 之类
+   * —— 那些 kind 没有任何 AI 消费,映射过去只会让日志里出现
+   * 「明明该碎壳却走了 SOUND」的假信号。
+   *
+   * ## 为什么 204 必须映射成 `EXPLOSION`(真缺陷,不是可选)
+   *
+   * 手册与 `WeaponDef` 都写着 204 黑金爆破冲击镐「对晶甲类护盾拥有 4.0
+   * 破盾倍率」「一击敲碎晶甲类怪物的护盾」,而 `BeetleAi.onDamage` 的碎壳
+   * 分支判据正是 `kind === DamageKind.EXPLOSION`。
+   *
+   * `BREACH_PICK.element` 是 `NONE`(它靠爆破而非元素),若按元素映射就会
+   * 落到 `PHYSICAL` ⇒ **碎壳分支永远不可达** —— 手册记载的机制在
+   * `attackMob` 这条新入口上形同不存在。这是「实现存在但生产跑不到」的
+   * 又一例,只是这次出现在我刚接的线上。故按**武器 ID** 单独钉死。
+   */
+  private damageKindOf(weapon: WeaponDef | null): DamageKind {
+    if (weapon === null) return DamageKind.PHYSICAL;
+    /* 204 爆破镐:靠爆破碎晶甲壳,必须走 EXPLOSION(见上)。 */
+    if (weapon.id === BREACH_PICK.id) return DamageKind.EXPLOSION;
+    switch (weapon.element) {
+      case Element.FIRE: return DamageKind.FIRE;
+      /* ⚠ **刻意没有 `case Element.ICE`。**
+       *
+       * 直觉上该有:火灵的固化分支判 `kind === DamageKind.WATER`,而
+       * `Element.ICE` 是唯一语义上对应水的武器元素。但**实测武器表里
+       * 没有任何 ICE 武器**(13 把武器的元素只有 NONE/FIRE/LIGHT/SLIME/
+       * LIGHTNING —— 见下方断言「武器表无 ICE 武器」)。
+       * ⇒ 写 `case Element.ICE` 就是一段**永不执行的代码**,正是本仓
+       * 反复出现的「实现存在但生产跑不到」那一类,只不过这次会是我自己
+       * 刚引进来的。故不写。
+       *
+       * 那 WATER 通道怎么走?两条**真实可达**的路径:
+       *   1. 调用方显式给 `kind: DamageKind.WATER`(本方法只负责推导,
+       *      显式覆盖优先于推导);
+       *   2. 227 泡泡连发水枪经 `interactMob`(工具通道,不经本方法)。
+       * 两条都由断言覆盖。
+       *
+       * 若将来新增 ICE 武器,必须同时恢复 `case Element.ICE:
+       * return DamageKind.WATER;`,否则火灵固化会**静默失效**
+       * —— 这个陷阱由断言「武器表无 ICE 武器」守着:一旦有人加了 ICE
+       * 武器,该断言立刻变红并把这句话顶到脸上。 */
+      default: return DamageKind.PHYSICAL;
+    }
+  }
+
   /**
    * 玩家对生物造成伤害(武器 / 环境 / 元素)。
    *
@@ -859,6 +1404,9 @@ export class WorldSim {
    *
    * 返回 `null` 表示没有这个生物;否则返回 AI 的结算结果
    * (`hpLoss` 才是真正的掉血,因为可能被格挡)。
+   *
+   * **`amount` 的语义是「已经算好的伤害」**:环境/陷阱/脚本事件直接给数;
+   * 玩家发起的攻击请用 `attackMob`,由它跑八步公式算出 amount。
    */
   damageMob(
     mobId: string,
@@ -1827,6 +2375,14 @@ export class WorldSim {
            `componentsEvaluated` 与 `running` 都正常 —— 单看这些指标看不出问题。 */
         this.tickLogisticsStep();
       }
+
+      /* ── 慢帧 2Hz:建造 / 房间识别 / 蓝图接力(task-36)──
+         放在地形与物流之后:本帧的地形写入(含接力落位)应在本帧就被看见,
+         否则「墙立起来了但房间要等下一帧才认」——一帧的延迟在这里无害,
+         但「先识别再落位」会让本帧识别的是**落位前**的地形,顺序反了。
+         `refreshRooms` 自带脏标记,地形没动时是空操作。 */
+      this.tickRelay();
+      if (this.roomsDirty) this.refreshRooms();
 
       /* ── 慢帧 2Hz:刷怪决策 ── */
       if (this.mobsOn) {

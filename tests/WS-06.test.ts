@@ -23,6 +23,14 @@ import {
   type LLMAlchemyOutputSchema,
 } from '../shared/types/alchemy.ts';
 import { ITEM_LIST } from '../shared/constants/items.ts';
+/* CR-17 用命名空间导入:`matchRecipeByTags` 尚不存在时,静态 import 会让整个文件
+   加载失败(那不是「断言红」,是「语法错」,证据力弱)。走命名空间后缺失会落在
+   断言里,报出我自己写的中文消息 —— 这才是「先红后绿」要的红。 */
+import * as itemsMod from '../shared/constants/items.ts';
+const ITEM_BY_ID = itemsMod.ITEM_BY_ID;
+const satisfiesAnyTagSlot = (id: number, slot: string[]): boolean =>
+  itemsMod.satisfiesAnyTagSlot(id, slot);
+const matchRecipeByTags = (id, have) => itemsMod.matchRecipeByTags(id, have);
 import {
   THROW_SPEED_XY, THROW_SPEED_Z, throwVelocity, resolveCircleBounce,
 } from '../shared/types/physics.ts';
@@ -1345,5 +1353,113 @@ test('L6【U4】降级与 few-shot 也必须满足交叉矩阵(离线路径不�
 });
 
 /* ───────────────────────── 汇总 ───────────────────────── */
+
+/* ══════════ CR-17:「任意染料」配方留白(附加式,冻结字段不改)══════════
+
+ * 手册有 **3 条**配方写「任意染料」,代码把留白**硬编成了 166**:
+ *   L178 `237 七彩颜料水球`   = `陶瓷空药水瓶×1 + 任意染料×1`
+ *   L186 `245 手持庆典烟花筒` = `翠玉青竹×1 + 爆裂火椒×1 + 染料×1`
+ *   L242 `356 哥特彩绘花窗墙` = `全透琉璃板×1 + 任意染料×2`   ← 任务书未列,本次新增发现
+ * ⚠️ 第三条不是我顺手加的:它是同一条手册规则的**同一实例**,漏了它就等于
+ *    只修一半 —— 玩家拿 167 仍做不出 356。
+ *
+ * ⚠️ `recipe` **未被** `contentFingerprints()` 哈希(items 分区只哈希
+ *    `{id,name,category,tags,value}`)⇒ 改 recipe 不动指纹。
+ *    但仍**不删**既有 `recipe` 键(那会让 WS-FND-06 的 237/245 用例与
+ *    verify.ts 的引用闭合红)—— 留白以**新增可选字段**并存。
+ */
+
+test('G-DYE-1 CR-17 三条「任意染料」配方必须声明留白槽,且不删既有具体键', () => {
+  const CASES: [number, string, number, number][] = [
+    [237, '七彩颜料水球', 166, 178],
+    [245, '手持庆典烟花筒', 166, 186],
+    [356, '哥特彩绘花窗墙', 166, 242],
+  ];
+  for (const [id, name, concrete, line] of CASES) {
+    const def = ITEM_BY_ID.get(id);
+    ok(def !== undefined, `#${id} ${name} 应存在`);
+    /* 负半:既有具体键必须还在(否则 WS-FND-06 的对照会红) */
+    ok(def!.recipe !== undefined, `#${id} 既有 recipe 不得被删`);
+    ok((def!.recipe ?? {})[concrete] !== undefined,
+      `#${id} 既有 recipe 仍须含具体染料 #${concrete}(手册 L${line} 是「任意」,但删键会撞红写域外用例)`);
+    /* 正半:留白槽必须被声明 */
+    const anyTag = def!.recipeAnyTag ?? [];
+    ok(anyTag.length > 0, `#${id} 应声明 recipeAnyTag(手册 L${line}「任意染料」),实际 ${JSON.stringify(anyTag)}`);
+    ok(anyTag.some((g) => g.includes('染料')),
+      `#${id} 的留白槽应包含「染料」tag,实际 ${JSON.stringify(anyTag)}`);
+
+    /* ⚠️ 关键不变量(易漏):**槽数必须等于「登记代表」在 recipe 里的数量**。
+       匹配时代表键被跳过、由槽接管 ⇒ 若代表写着 ×2 而只放 1 个槽,
+       整条配方就会少要 1 个染料(356 会退化成「任意染料×1」),而 G-DYE-2 的
+       「只给 1 个应拒绝」恰好能抓住这一点 —— 但那是间接的,这里直接钉住数量关系。 */
+    const repQty = Object.entries(def!.recipe ?? {})
+      .filter(([k]) => anyTag.some((slot) => satisfiesAnyTagSlot(Number(k), slot)))
+      .reduce((s, [, v]) => s + v, 0);
+    ok(repQty > 0, `#${id} 应有一个「登记代表」写在 recipe 里(实际 ${repQty})`);
+    eq(anyTag.length, repQty,
+      `#${id} 槽数(${anyTag.length})必须等于登记代表的 recipe 数量(${repQty})`);
+  }
+});
+
+test('G-DYE-2 CR-17 四色染料必须全部可满足留白槽(166/167/168/169)', () => {
+  /* 这是本 CR 的**目的**:167/168/169 此前完全无法用于这三条配方。
+     每条配方的「固有材料」也要给全 —— 只给染料是不够的(否则测的是半条配方)。 */
+  const dyes = itemsMod.ITEM_LIST.filter((i) => i.tags.includes('染料'));
+  eq(dyes.map((i) => i.id).sort((a, b) => a - b), [166, 167, 168, 169],
+    '带「染料」tag 的必须是且仅是 166/167/168/169');
+
+  /* 产物 → (固有材料, 每个槽需要的染料数) */
+  const RECIPES: [number, Record<number, number>, number][] = [
+    [237, { 165: 1 }, 1],              /* 陶瓷空药水瓶×1 + 任意染料×1 */
+    [245, { 103: 1, 126: 1 }, 1],      /* 翠玉青竹×1 + 爆裂火椒×1 + 染料×1 */
+    [356, { 154: 1 }, 2],              /* 全透琉璃板×1 + 任意染料×2 */
+  ];
+
+  let checked = 0;
+  for (const dyeId of [166, 167, 168, 169]) {
+    for (const [craftId, fixed, needQty] of RECIPES) {
+      const r = itemsMod.matchRecipeByTags(craftId, { ...fixed, [dyeId]: needQty });
+      eq(r.ok, true, `#${craftId} 应可用染料 #${dyeId}×${needQty} 合成(实际 ${r.reason ?? ''})`);
+      checked += 1;
+    }
+  }
+  eq(checked, 12, '4 色 × 3 配方 = 12 组组合全部检查过(防止循环写空)');
+
+  /* 负对照 1:数量不足必须拒绝 —— 证明不是「只要有这个 ID 就算过」。
+     356 要 2 个染料;只给 1 个时,**固有件给全**也必须拒绝。 */
+  const short = itemsMod.matchRecipeByTags(356, { 154: 1, 167: 1 });
+  eq(short.ok, false, '356 需要染料×2,只给 1 个应拒绝');
+  eq(itemsMod.matchRecipeByTags(356, { 154: 1, 167: 2 }).ok, true, '给足 2 个应通过');
+  eq(itemsMod.matchRecipeByTags(237, { 165: 1, 167: 2 }).ok, true, '给多于所需数量应仍可合成(多余不拦)');
+
+  /* 负对照 2:固有材料不得被留白放宽 —— 只给染料、不给药水瓶必须拒绝 */
+  eq(itemsMod.matchRecipeByTags(237, { 167: 1 }).ok, false,
+    '237 还缺 165 陶瓷空药水瓶,只给染料应拒绝');
+
+  /* 负对照 3:非染料物不得冒充 —— 209 带「颜料」tag 但不是「染料」 */
+  ok(ITEM_BY_ID.get(209)!.tags.includes('颜料'), '前置条件:209 带「颜料」tag');
+  eq(ITEM_BY_ID.get(209)!.tags.includes('染料'), false, '前置条件:209 **不带**「染料」tag');
+  const fake = itemsMod.matchRecipeByTags(237, { 165: 1, 209: 1 });
+  eq(fake.ok, false, '209 是染色枪,不能当「任意染料」用');
+  ok((fake.reason ?? '').includes('染料'), `拒绝理由应指向染料槽,实际:${fake.reason ?? ''}`);
+});
+
+test('G-DYE-3 CR-17 留白槽不得放宽固有材料:翡翠森林染料仍是 244 的专指件', () => {
+  /* 244 手册 L185 写的是 `高弹果冻胶×3 + 翡翠森林染料×1` —— 指名道姓,不是「任意」。
+     这一条防的是「把 recipeAnyTag 当成万能后门,顺手给所有配方都开留白」。 */
+  const d244 = ITEM_BY_ID.get(244)!;
+  eq(d244.recipe, { 162: 3, 168: 1 }, '244 配方必须逐位不变(手册指明 168)');
+  eq(d244.recipeAnyTag ?? [], [], '244 不得声明留白槽(手册未写「任意」)');
+
+  /* 负对照:换成另一种染料应当不被接受 */
+  eq(itemsMod.matchRecipeByTags(244, { 162: 3, 167: 1 }).ok, false,
+    '244 指名 168,换成 167 应拒绝');
+  eq(itemsMod.matchRecipeByTags(244, { 162: 3, 168: 1 }).ok, true, '244 用 168 应通过');
+
+  /* 负对照的负对照:只有 3 条配方有留白槽 —— 若谁批量开洞,这条会红 */
+  const withSlots = itemsMod.ITEM_LIST.filter((i) => (i.recipeAnyTag ?? []).length > 0);
+  eq(withSlots.map((i) => i.id).sort((a, b) => a - b), [237, 245, 356],
+    '声明留白槽的必须**恰好**是手册写「任意染料」的那 3 条');
+});
 
 report('WS-06');

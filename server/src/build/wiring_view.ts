@@ -9,7 +9,7 @@
  */
 
 import { WIRE_BIT, WireColor, unpackTile } from '../../../shared/types/tile.ts';
-import { TileGrid, DIR_DX, DIR_DY } from './grid.ts';
+import { type TileGridLike, DIR_DX, DIR_DY } from './grid.ts';
 import { isBarrier } from './autotile.ts';
 
 /** 颜色短名(与冻结层 `WireColor` 值一一对应)。 */
@@ -93,7 +93,7 @@ export interface WireView {
  *  - `perColorWiredCells` 是逐色计数之和,重叠格在每色各计 1 次;
  *  - `perColorWiredCells − wiredCells === overlapCells` 是必须成立的不变量。
  */
-export function buildWireView(grid: TileGrid): WireView {
+export function buildWireView(grid: TileGridLike): WireView {
   const width = grid.width;
   const height = grid.height;
   const overlay = new Uint8Array(width * height);
@@ -193,7 +193,7 @@ function connectedComponentSizes(
 }
 
 /** 取某格的布线信息。 */
-export function wireCellAt(grid: TileGrid, x: number, y: number): WireCellInfo {
+export function wireCellAt(grid: TileGridLike, x: number, y: number): WireCellInfo {
   const v = grid.get(x, y);
   const f = unpackTile(v);
   const wireMask = f.wire & 0xf;
@@ -218,7 +218,7 @@ export const LayWireResult = {
 export type LayWireResult = (typeof LayWireResult)[keyof typeof LayWireResult];
 
 /** 铺线合法性:实心墙体/门/窗内不能埋线(除了「窗帘墙 + 暗线」的例外由 UI 侧裁决)。 */
-export function canLayWire(grid: TileGrid, x: number, y: number, color: WireColor): LayWireResult {
+export function canLayWire(grid: TileGridLike, x: number, y: number, color: WireColor): LayWireResult {
   if (!grid.inBounds(x, y)) return LayWireResult.OUT_OF_BOUNDS;
   const f = unpackTile(grid.get(x, y));
   if (isBarrier(f.obj)) return LayWireResult.BLOCKED_BY_SOLID;

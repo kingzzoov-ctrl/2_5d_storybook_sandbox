@@ -1170,4 +1170,155 @@ test('W5-50 生产入口真的存在:WorldSim 暴露 summon/damage/break/snapsho
   eq(sim.tryBreakBoss('boss_not_exist', {}).ok, false, '未知 Boss 破防 → false');
 });
 
+/* ══════════ CR-16:手册 L495~L502 的战利品表达力(附加式,冻结字段不改)══════════
+
+ * 背景:手册每行「必掉史诗战利品与经验」列里有三类信息,`loot: number[]` 只能表达第一类:
+ *   1. 带 ID 的必掉件          → 已有
+ *   2. 带数量的必掉件(`×N`)    → **丢失**
+ *   3. 无对应 ID 的抽象奖励     → **丢失**
+ * 另有两行把「可造载具」写进了 loot(437 / 440),而手册里它们是造物/手段,不是战利品。
+ *
+ * ⚠️ `loot` 被 `contentFingerprints()` 哈希(bosses 分区),改它会让指纹漂移并撞红
+ *    WS-FND-01/06、data-conformance、README 四处**写域外**锚点。
+ * ⇒ 修正一律走**新增可选字段**,`loot` 一个字节不动。下面每条都先断言「冻结字段没被改」,
+ *    再断言「新字段把手册表达出来了」—— 前后两半互为约束。
+ */
+
+test('W5-51 CR-16 冻结字段 loot 必须逐字保持原样(修正不得走改 loot 的路)', () => {
+  /* 正负对照的「负」这一半:如果谁图省事直接改 loot,这条立刻红。
+     期望值抄自 CR-15 之后的实测快照,与 content.baseline.json 的 bosses 分区同源。 */
+  const EXPECT: Record<string, number[]> = {
+    boss_jelly_king: [704, 719, 727],
+    boss_beaver_mecha: [703, 437],
+    boss_fox_kitsune: [705, 720],
+    boss_crab_kraken: [706, 721, 728],
+    boss_scorpion_pharaoh: [707, 722],
+    boss_ginger_troll: [609, 613],
+    boss_sky_whale: [117, 718, 440],
+    boss_chronos_colossus: [708, 723],
+  };
+  eq(Object.keys(EXPECT).length, TOTAL_BOSS_COUNT, '8 个 Boss 全部登记,防止漏测');
+  for (const [id, loot] of Object.entries(EXPECT)) {
+    eq(BOSS_BY_ID.get(id)!.loot, loot, `${id}.loot 必须与冻结快照一致`);
+  }
+});
+
+test('W5-52 CR-16 手册逐件数量(×N)必须被表达:703×10 / 117×15', () => {
+  /* 手册唯一两处带数量:
+   *   L496 `703 河狸钢牙×10`
+   *   L501 `117 极光星辰碎片×15`
+   * 其余件手册未写数量 ⇒ 缺省 1(不是「随便填」,是手册没写)。 */
+  const MANUAL_QTY: [string, number, number, number][] = [
+    ['boss_beaver_mecha', 703, 10, 496],
+    ['boss_sky_whale', 117, 15, 501],
+  ];
+  for (const [bossId, itemId, qty, line] of MANUAL_QTY) {
+    const def = BOSS_BY_ID.get(bossId)!;
+    const idx = def.loot.indexOf(itemId);
+    ok(idx >= 0, `${bossId}.loot 应含 #${itemId}(前置条件)`);
+    const list = def.lootQty ?? [];
+    eq(list.length, def.loot.length, `${bossId}.lootQty 必须与 loot 等长(逐位对应,不靠猜)`);
+    eq(list[idx], qty, `${bossId} #${itemId} 数量(手册 L${line})`);
+  }
+
+  /* 负对照:没写数量的件必须留 1 —— 证明我们不是把整张表乘了某个数。
+     若谁把 lootQty 全填成 10,下面这条会红。 */
+  const jelly = BOSS_BY_ID.get('boss_jelly_king')!;
+  eq((jelly.lootQty ?? []).every((n) => n === 1), true,
+    '果冻王手册(L495)未写任何数量 ⇒ 全部为 1');
+
+  /* 更严的负对照(故障注入 I8 逼出来的):
+     只查「果冻王」不够 —— 给**别的** Boss 乱加数量照样能溜过去。
+     手册里带 `×N` 的只有 L496 的 703 与 L501 的 117,其余 14 件一律 1。
+     ⇒ 断言改成全表枚举:凡不在白名单里的 (Boss,item) 数量必须是 1。 */
+  const MANUAL_QTY_ALLOW: Record<string, number> = { 'boss_beaver_mecha:703': 10, 'boss_sky_whale:117': 15 };
+  let seenQty = 0;
+  for (const b of BOSS_LIST) {
+    const q = b.lootQty;
+    if (q === undefined) continue; /* 缺省即全 1,与下面冲突时由白名单兜住 */
+    eq(q.length, b.loot.length, `${b.id}.lootQty 长度须等于 loot 长度`);
+    for (let i = 0; i < q.length; i += 1) {
+      const key = `${b.id}:${b.loot[i]}`;
+      const want = MANUAL_QTY_ALLOW[key] ?? 1;
+      eq(q[i], want, `${key} 数量应为 ${want}(手册 L495~L502 只对 703/117 写了 ×N)`);
+      seenQty += 1;
+    }
+  }
+  ok(seenQty >= 4, `至少核对 4 件(实际 ${seenQty})`);
+  eq(Object.keys(MANUAL_QTY_ALLOW).length, 2, '手册只有 2 处写 ×N —— 白名单也是 2 条');
+});
+
+test('W5-53 CR-16 手册的抽象奖励(320 表内 0 命中)必须被记录,不得静默丢弃', () => {
+  /* 这 7 条在 `ITEM_LIST` 里 **0 命中**(CR-16 报告里有逐条实测),
+     所以不能塞进物品表(会破坏 320 件内容锁),只能作为**文字奖励**登记。 */
+  const MANUAL_ABSTRACT: [string, string, number][] = [
+    ['boss_beaver_mecha', '自动伐木机甲宠物图纸', 496],
+    ['boss_ginger_troll', '皇家甜点', 500],
+    ['boss_ginger_troll', '姜饼人随从', 500],
+    ['boss_chronos_colossus', '纯金通关纪念碑', 502],
+  ];
+  for (const [bossId, kw, line] of MANUAL_ABSTRACT) {
+    const list = BOSS_BY_ID.get(bossId)!.lootAbstract ?? [];
+    ok(list.some((s) => s.includes(kw)),
+      `${bossId} 应登记抽象奖励「${kw}」(手册 L${line});实际 ${JSON.stringify(list)}`);
+  }
+
+  /* 负对照:这四条必须有**独立**字符串,不能靠一条糊住全部 —— 
+     若谁把 lootAbstract 填成 ['自动伐木机甲宠物图纸'] 挂到所有 Boss 上,下面会红。 */
+  const beaver = BOSS_BY_ID.get('boss_beaver_mecha')!.lootAbstract ?? [];
+  const chronos = BOSS_BY_ID.get('boss_chronos_colossus')!.lootAbstract ?? [];
+  eq(beaver.includes('纯金通关纪念碑'), false, '伐木机甲图纸不得挂到克洛诺斯上');
+  eq(chronos.includes('自动伐木机甲宠物图纸'), false, '纯金纪念碑不得挂到河狸上');
+});
+
+test('W5-54 CR-16 手册未列为战利品的可造载具必须被标注,且生产掉落里确实不含', () => {
+  /* 两条实测(手册原文):
+   *   - `437 叮当蒸汽小火车头` —— 手册 L313 是**可造载具**(`寒铁金属锭×6 + 黄铜金属锭×4`),
+   *     L603 也只是玩家把它当载具玩。L496 的战利品列写的是「703×10 + 自动伐木机甲宠物图纸」。
+   *   - `440 八人云海探险飞艇` —— 手册 L316 是**可造载具**(`秘银魔导锭×6 + 蓬松云朵布×10`),
+   *     L501 的破防手段写「全队**驾驶** 440 飞艇贴近云鲸」;L501 的战利品列是「117×15 + 718」。
+   * ⇒ 它们是「手段」,不是「掉落」。 */
+  const NOT_LOOT: [string, number, number, string][] = [
+    ['boss_beaver_mecha', 437, 496, 'L313 可造载具'],
+    ['boss_sky_whale', 440, 501, 'L316 可造载具 / L501 驾驶手段'],
+  ];
+  for (const [bossId, itemId, line, why] of NOT_LOOT) {
+    const def = BOSS_BY_ID.get(bossId)!;
+    ok(def.loot.includes(itemId), `前置条件:${bossId}.loot 仍含 #${itemId}(冻结字段不动)`);
+    const dev = def.lootDeviations ?? [];
+    ok(dev.some((d) => d.itemId === itemId),
+      `${bossId} 应标注 #${itemId} 非手册战利品(手册 L${line} 实为${why})`);
+  }
+
+  /* 生产路径断言:标注要真的生效,光球里不许出现。 */
+  for (const [bossId, itemId, line, why] of NOT_LOOT) {
+    const orbs = rollPersonalLoot(bossId, makeParticipants(2));
+    ok(orbs.length > 0, `${bossId} 应产出光球(前置条件)`);
+    for (const o of orbs) {
+      ok(!o.entries.some((e) => e.itemId === itemId),
+        `${bossId} 光球不得含 #${itemId}(手册 L${line} 是${why},不是掉落)`);
+    }
+  }
+
+  /* 负对照:被标注的件必须仍留在 loot 里 —— 我们是「标注 + 生产过滤」,
+     不是「从冻结表里删掉」。若谁改成删 loot,上面 W5-51 与这里的前置条件都会红。 */
+  eq(BOSS_BY_ID.get('boss_sky_whale')!.loot.includes(440), true,
+    '440 必须仍在 loot(冻结字段不动),只由 lootDeviations 标注');
+});
+
+test('W5-55 CR-16 生产掉落数量必须真的用手册数量(不是只登记不用)', () => {
+  /* 这条防的是本仓反复出现的「登记了但没人消费」。
+     光球条目必须按 lootQty 结算:703 那一项 ≥10。 */
+  const orbs = rollPersonalLoot('boss_beaver_mecha', makeParticipants(2));
+  ok(orbs.length > 0, '前置条件:应产出光球');
+  for (const o of orbs) {
+    const e = o.entries.find((x) => x.itemId === 703);
+    ok(e !== undefined, '光球应含 #703');
+    ok(e!.count >= 10, `#703 掉落数应 ≥ 手册的 10(实际 ${e!.count})`);
+    /* 负对照:非手册数量的件不得被一起抬到 10 */
+    const other = o.entries.find((x) => x.itemId !== 703 && x.itemId !== 437);
+    if (other !== undefined) ok(other.count < 10, `其余件不应被抬到 10(实际 #${other.itemId}=${other.count})`);
+  }
+});
+
 report('WS-05');

@@ -719,12 +719,6 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
    * 不抛异常、只是时间凭空快 10 倍。这类量纲错配不会自我暴露。
    *
    * 且 Boss 不是生物:8 个 Boss 全不在 `MOB_BY_ID`,挂 `tickMobs` 等于挂在空集合上。 */
-  ['server/src/build/autotile.ts', 'WS-03 自动贴图,待客户端接线'],
-  ['server/src/build/blueprint.ts', 'WS-03 蓝图接力队列,待接入'],
-  ['server/src/build/grid.ts', 'WS-03 建造网格,待接入'],
-  ['server/src/build/rooms.ts',
-    'WS-03 BFS 房间检测,待接入;perf-bounds.ts 只 import 常量 DEFAULT_MAX_AREA 做内存估算,'
-    + 'BFS 本身生产零执行'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图,待客户端接线'],
   /* ══════════════════════════════════════════════════════════════════════
    * ⚠️ 为什么本表 22 条,而 `orphan-audit.ts` 只有 13 条?(差 9 条)

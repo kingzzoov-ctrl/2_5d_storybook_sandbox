@@ -127,7 +127,11 @@ const PRANKS: ItemDef[] = [
   { id: 234, name: '便携弹簧跳板', category: P, tags: ['机关', '高弹', '地形', '垫脚'], value: 90, recipe: { 151: 2, 124: 2 }, station: 504, note: '随时丢在脚下跳上高台躲避全屏震地波;或丢在奔跑的队友面前把他弹进水沟。' },
   { id: 235, name: '伪装恶作剧宝箱', category: P, tags: ['木材', '陷阱', '伪装', '击退'], value: 150, recipe: { 151: 4, 223: 1 }, station: 504, note: '外观与金箱子一致,贪心的朋友或偷东西的哥布林打开时直接被弹簧拳套揍飞 3 格。' },
   { id: 236, name: '臭鼬彩虹屁坐垫', category: P, tags: ['家具', '胶体', '陷阱', '爆炸'], value: 100, recipe: { 162: 2, 126: 1 }, station: 505, note: '放在椅子上,朋友一坐上去就会发出响亮“噗——”声并被彩虹烟雾弹射到半空。' },
-  { id: 237, name: '七彩颜料水球', category: P, tags: ['颜料', '投掷', '致盲'], value: 70, recipe: { 165: 1, 166: 1 }, station: 505, note: '涂色对战道具;砸中 Boss 眼睛可糊住其视线使其攻击偏离方向。' },
+  { id: 237, name: '七彩颜料水球', category: P, tags: ['颜料', '投掷', '致盲'], value: 70, recipe: { 165: 1, 166: 1 },
+   /* CR-17:手册 L178 写「任意染料×1」。166 保留为**登记代表**
+      (删键会撞红写域外的 WS-FND-06 对照表),实际判定由 recipeAnyTag
+      接管 ⇒ 167/168/169 均可满足。 */
+   recipeAnyTag: [['染料']], station: 505, note: '涂色对战道具;砸中 Boss 眼睛可糊住其视线使其攻击偏离方向。' },
   { id: 238, name: '撑杆跳高青竹竿', category: P, tags: ['管状', '弹性', '地形', '跨越'], value: 85, recipe: { 103: 3, 160: 1 }, station: 502, note: '助跑撑杆越过 4 格宽的河流或 Boss 激光网。' },
   { id: 239, name: '竹蜻蜓飞行草帽', category: P, tags: ['头饰', '纤维', '浮空', '滞空'], value: 80, recipe: { 103: 2, 118: 3 }, station: 502, note: '连按跳跃键慢速飞越深渊或躲避地面岩浆喷发。' },
   { id: 240, name: '回旋木飞镖', category: P, tags: ['手持', '木材', '投掷', '拉怪'], value: 75, recipe: { 152: 2 }, station: 502, note: '扔出去可同时刮中直线上多只怪物吸引仇恨并飞回手中。' },
@@ -135,7 +139,9 @@ const PRANKS: ItemDef[] = [
   { id: 242, name: '大声公扩音喇叭', category: P, tags: ['乐器', '金属', '声波', '嘲讽'], value: 155, recipe: { 155: 2, 116: 1 }, station: 504, note: '发出环形声波,既震醒打瞌睡的队友,也强制吸引周围 8 格内怪物仇恨保护脆皮队友。' },
   { id: 243, name: '引雷铁锅头盔', category: P, tags: ['头饰', '金属', '导电', '雷电'], value: 175, recipe: { 156: 3 }, station: 504, note: '雷雨天吸引闪电劈下,对周围 3 格内怪物造成感电麻痹(也会把自己电成爆炸头)。' },
   { id: 244, name: '果冻怪伪装壳', category: P, tags: ['胶体', '伪装', '潜行', '颜料'], value: 140, recipe: { 162: 3, 168: 1 }, station: 505, note: '套在身上变成绿色果冻怪,野生怪物不会主动攻击你,可悄悄摸到 Boss 身后放炸弹。' },
-  { id: 245, name: '手持庆典烟花筒', category: P, tags: ['管状', '爆炸', '火焰', '惊吓'], value: 95, recipe: { 103: 1, 126: 1, 166: 1 }, station: 505, note: '发射绚丽烟花,同时能吓退夜晚怕光的暗影小怪。' },
+  { id: 245, name: '手持庆典烟花筒', category: P, tags: ['管状', '爆炸', '火焰', '惊吓'], value: 95, recipe: { 103: 1, 126: 1, 166: 1 },
+   /* CR-17:手册 L186 写「染料×1」。同 237,166 为登记代表。 */
+   recipeAnyTag: [['染料']], station: 505, note: '发射绚丽烟花,同时能吓退夜晚怕光的暗影小怪。' },
   { id: 246, name: '阳光尤克里里', category: P, tags: ['乐器', '战歌', '治疗', '木材'], value: 160, recipe: { 152: 2, 120: 2 }, station: 502, note: '演奏时为周围 6 格内队友提供每秒 +5 HP 的持续生命恢复光环。' },
   { id: 247, name: '微风手风琴', category: P, tags: ['乐器', '战歌', '布', '效率'], value: 165, recipe: { 151: 2, 161: 2 }, station: 502, note: '演奏时让周围队友采集效率与技能冷却缩减 +20%。' },
   { id: 248, name: '星光卡林巴琴', category: P, tags: ['乐器', '战歌', '发光', '护盾'], value: 175, recipe: { 104: 2, 156: 1 }, station: 504, note: '演奏时为周围队友附加夜间照明与魔法抗性护盾。' },
@@ -191,7 +197,10 @@ const BUILDINGS: ItemDef[] = [
   { id: 353, name: '奶油白灰泥墙', category: B, tags: ['墙体', '石材', '可染色'], value: 18, recipe: { 106: 1, 107: 1 }, station: 502, note: '地中海绘本小镇风,最适合用染色喷枪涂刷成马卡龙色。' },
   { id: 354, name: '日式障子纸格墙', category: B, tags: ['墙体', '木材', '透光'], value: 34, recipe: { 152: 1, 118: 1 }, station: 502, note: '透出屋内温暖橘光,搭配温泉旅馆绝佳。' },
   { id: 355, name: '全透明落地玻璃墙', category: B, tags: ['墙体', '透明', '玻璃'], value: 58, recipe: { 154: 1 }, station: 503, note: '建造阳光花房、怪物生态观察室与百货橱窗必备。' },
-  { id: 356, name: '哥特彩绘花窗墙', category: B, tags: ['墙体', '玻璃', '颜料'], value: 80, recipe: { 154: 1, 166: 2 }, station: 503, note: '阳光照射下会在室内地面投射出绚丽的彩色光斑。' },
+  { id: 356, name: '哥特彩绘花窗墙', category: B, tags: ['墙体', '玻璃', '颜料'], value: 80, recipe: { 154: 1, 166: 2 },
+   /* CR-17:手册 L242 写「任意染料×2」—— 是**两个独立留白槽**,
+      不是一个槽放大倍数。这样「只带 1 个染料」会被正确判为不足。 */
+   recipeAnyTag: [['染料'], ['染料']], station: 503, note: '阳光照射下会在室内地面投射出绚丽的彩色光斑。' },
   { id: 357, name: '翠竹编织篱笆墙', category: B, tags: ['墙体', '管状', '半高', '围栏'], value: 26, recipe: { 103: 2 }, station: 502, note: '半高透气围栏,可圈养驯服的云朵绵羊与陆行鸟(弓箭与水枪可隔着篱笆射击)。' },
   { id: 358, name: '盛开花藤绿植墙', category: B, tags: ['墙体', '纤维', '花卉', '邀宠'], value: 30, recipe: { 118: 2, 121: 1 }, station: 502, note: '随微风摇摆的鲜花拱墙,自然吸引蝴蝶与蜜蜂生成。' },
   { id: 359, name: '黑曜石防爆城墙', category: B, tags: ['墙体', '抗爆', '反震'], value: 62, recipe: { 110: 1 }, station: 503, note: '免疫一切 Boss 冲撞破坏,且能将撞上来的【深渊晶甲巨蟹】反震眩晕。' },
@@ -436,4 +445,121 @@ export function expandRecipe(recipe: Record<number, number>, batches = 1): Recor
   const out: Record<number, number> = {};
   for (const [k, v] of Object.entries(recipe)) out[Number(k)] = v * batches;
   return out;
+}
+
+/* ═══════════════ 「任意 X」留白槽的配方匹配(CR-17)═══════════════ */
+
+/**
+ * 单件材料能否顶替某个留白槽。
+ *
+ * 判据是**物品 tag** 而非 ID —— 这正是「任意染料」的语义:
+ * 手册写的是类别,不是具体某一件。
+ */
+export function satisfiesAnyTagSlot(itemId: number, slot: readonly string[]): boolean {
+  const tags = ITEM_BY_ID.get(itemId)?.tags;
+  if (tags === undefined) return false;
+  /* 槽内 tag 之间取「或」:写 ['染料'] 即任一带该 tag 的都行;
+     写成多个 tag 时同理,它们互为备选,不是全要。 */
+  return slot.some((t) => tags.includes(t));
+}
+
+/** 找出全部能满足某留白槽的物品 ID(升序)。 */
+export function itemsMatchingAnyTagSlot(slot: readonly string[]): number[] {
+  return ITEM_LIST.filter((i) => satisfiesAnyTagSlot(i.id, slot)).map((i) => i.id).sort((a, b) => a - b);
+}
+
+export interface RecipeMatchResult {
+  ok: boolean;
+  /** 未满足的原因(ok=true 时为空) */
+  reason?: string;
+  /** 实际被消耗的 ID -> 数量(含留白槽选中的那件) */
+  consumed: Record<number, number>;
+}
+
+/**
+ * 按 tag 留白匹配配方。
+ *
+ * `have` 是「背包里有什么」的 `ID -> 数量`。判定分两步,顺序不能颠倒:
+ *   1. **先扣确定件**(`recipe`):这些是手册指名道姓的固有材料,缺一不可;
+ *   2. **再逐个填留白槽**(`recipeAnyTag`):每个槽挑一件**仍有余量**的合格材料消耗 1 个。
+ *
+ * ⚠️ 为什么必须走 `consumed` 记账而不是简单查集合:
+ *   `356` 需要「任意染料 ×2」,若只判「背包里有染料」就会**用 1 个染料冒充 2 个**。
+ *   本实现按槽逐个扣减,数量不足时返回 `ok=false`。
+ *
+ * 注意:`recipeAnyTag` 只是**放宽**留白处,**不会**放宽固有材料 ——
+ * `244 果冻怪伪装壳` 手册指名 `168 翡翠森林染料`,它没有留白槽,
+ * 换成 167 依然做不出来。
+ */
+export function matchRecipeByTags(
+  craftId: number,
+  have: Record<number, number>,
+): RecipeMatchResult {
+  const def = ITEM_BY_ID.get(craftId);
+  if (def === undefined) return { ok: false, reason: `未知产物 #${craftId}`, consumed: {} };
+  if (def.recipe === undefined && def.recipeAnyTag === undefined) {
+    return { ok: false, reason: `#${craftId} 没有配方`, consumed: {} };
+  }
+
+  const pool: Record<number, number> = {};
+  for (const [k, v] of Object.entries(have)) {
+    const n = Math.max(0, Math.trunc(v));
+    if (n > 0) pool[Number(k)] = n;
+  }
+  const consumed: Record<number, number> = {};
+  const take = (id: number, n: number): void => {
+    pool[id] -= n;
+    consumed[id] = (consumed[id] ?? 0) + n;
+  };
+
+  const slots = def.recipeAnyTag ?? [];
+  /*
+   * 确定件里那些「本身就是某个留白槽的合格件」的键,是**该槽的登记代表**,
+   * 不是额外的硬性要求 —— 否则 `237` 会变成「既要有 166 又要任一带染料」,
+   * 玩家拿 167 仍然做不出来,CR-17 等于没修。
+   *
+   * 保留这些键在 `recipe` 里的理由:WS-FND-06 的对照表与 verify.ts 的引用闭合
+   * 都按 `recipe` 的现有键断言,删键会撞红**写域外**用例。
+   * ⇒ 键保留(数据不变),判定时由所在槽接管(语义变对)。
+   */
+  const repIds = new Set<number>();
+  for (const [k] of Object.entries(def.recipe ?? {})) {
+    const id = Number(k);
+    if (slots.some((slot) => satisfiesAnyTagSlot(id, slot))) repIds.add(id);
+  }
+
+  /* 第 1 步:确定件 —— 固有材料不因留白而放宽 */
+  for (const [k, need] of Object.entries(def.recipe ?? {})) {
+    const id = Number(k);
+    if (repIds.has(id)) continue; /* 由留白槽接管 */
+    const got = pool[id] ?? 0;
+    if (got < need) {
+      return {
+        ok: false,
+        reason: `缺 #${id}×${need - got}(需 ${need},有 ${got})`,
+        consumed,
+      };
+    }
+    take(id, need);
+  }
+
+  /* 第 2 步:逐个填留白槽,每个槽消耗 1 件合格材料 */
+  for (const slot of slots) {
+    const pick = itemsMatchingAnyTagSlot(slot).find((id) => (pool[id] ?? 0) > 0);
+    if (pick === undefined) {
+      return {
+        ok: false,
+        reason: `留白槽 [${slot.join('|')}] 无可用材料(背包余量不足)`,
+        consumed,
+      };
+    }
+    take(pick, 1);
+  }
+
+  return { ok: true, consumed };
+}
+
+/** 该产物的完整配方是否含因 tag 而放开的留白槽。 */
+export function hasAnyTagSlot(itemId: number): boolean {
+  return (ITEM_BY_ID.get(itemId)?.recipeAnyTag ?? []).length > 0;
 }

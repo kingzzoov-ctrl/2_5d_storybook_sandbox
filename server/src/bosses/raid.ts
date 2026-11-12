@@ -338,12 +338,49 @@ export function seededRoll(seed: number): () => number {
 }
 
 /**
+ * 手册口径的「实际必掉清单」。
+ *
+ * ## 为什么需要这一层(CR-16)
+ *
+ * `BossDef.loot` 同时被 `contentFingerprints()` 的 bosses 分区哈希,
+ * 所以**不能**直接改它来对齐手册。但手册与代码确实有三处偏离:
+ *
+ * | Boss | 偏离 |
+ * | :--- | :--- |
+ * | `boss_beaver_mecha` | 手册 L496 要 `703×10`;且 `437` 是 L313 的**可造载具**,不是战利品 |
+ * | `boss_sky_whale` | 手册 L501 要 `117×15`;且 `440` 是 L316 的**可造载具**,只被当驾驶手段 |
+ * | `boss_chronos_colossus` | 手册 L502 的「纯金通关纪念碑」在 320 表内不存在 |
+ *
+ * ⇒ 修法:偏离记在 `lootQty` / `lootAbstract` / `lootDeviations` 三个**附加字段**上,
+ * 由本函数在**生产掉落路径**上落实。`loot` 一个字节不动、指纹不漂移,
+ * 而「打河狸拿到 1 个钢牙」「打完云鲸白得一艘飞艇」这两个实际错误被真正修掉。
+ *
+ * 返回的 `qty` 与 `out` 逐位对应;`abstract` 是手册写了但没有 ID 的奖励原文。
+ */
+export function effectiveLoot(def: BossDef): { out: number[]; qty: number[]; abstract: string[] } {
+  const deviations = new Set((def.lootDeviations ?? []).map((d) => d.itemId));
+  const out: number[] = [];
+  const qty: number[] = [];
+  for (let i = 0; i < def.loot.length; i += 1) {
+    const itemId = def.loot[i];
+    /* 被标注为「手册里不是战利品」的件不参与掉落 —— 不删 loot,只在生产侧过滤。 */
+    if (deviations.has(itemId)) continue;
+    out.push(itemId);
+    /* `lootQty` 与 `loot` 逐位对应;缺省 1(手册未注数量即 1 件)。 */
+    qty.push(def.lootQty?.[i] ?? 1);
+  }
+  return { out, qty, abstract: [...(def.lootAbstract ?? [])] };
+}
+
+/**
  * 结算个人独立掉落。
  *
  * 规则:
  *  - **每位参与战斗的玩家各自获得一个独立光球**(8 人 → 8 球),
  *    光球 `personal: true` 且 `ownerId` 唯一,互不可见;
- *  - 战利品取自 `def.loot`(必掉清单),数量 = 1 + floor(damageShare × 2);
+ *  - 战利品取自 `effectiveLoot(def)` —— 即 `def.loot` 剔除 `lootDeviations`
+ *    标注的「手册里不是战利品」条目(见 CR-16);
+ *  - 数量 = **手册数量**(`lootQty`,缺省 1)× `(1 + floor(damageShare × 2))` × `dropMul`;
  *  - 经验按 `def.exp` 全额 × 伤害份额,3 人以上套用冻结层 `PARTY_BONUS`;
  *  - 未参与者(挂机/提前离场)不产出光球。
  */
@@ -363,13 +400,14 @@ export function rollPersonalLoot(
   const evenShare = 1 / contributors.length;
 
   const orbs: LootOrb[] = [];
+  const eff = effectiveLoot(def);
   for (const p of contributors) {
     const share = totalDamage > 0 ? Math.max(0, p.damageDealt) / totalDamage : evenShare;
     const rng = seededRoll(fnv1a(`${bossId}|${p.id}`));
-    const entries: LootEntry[] = def.loot.map((itemId) => {
-      const base = 1 + Math.floor(share * 2);
-      const jitter = rng() < 0.35 ? 1 : 0; /* 35% 几率数量翻倍(烘焙派词条同源概率) */
-      return { itemId, count: Math.max(1, Math.round((base + jitter) * dropMul)) };
+    const entries: LootEntry[] = eff.out.map((itemId, i) => {
+      const base = (1 + Math.floor(share * 2)) * eff.qty[i];
+      const jitter = rng() < 0.35 ? eff.qty[i] : 0; /* 35% 几率数量翻倍(烘焙派词条同源概率) */
+      return { itemId, count: Math.max(eff.qty[i], Math.round((base + jitter) * dropMul)) };
     });
     const angle = rng() * Math.PI * 2;
     const radius = rng() * LOOT_SCATTER_RADIUS;

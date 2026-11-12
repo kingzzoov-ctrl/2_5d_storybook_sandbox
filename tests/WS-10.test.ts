@@ -10,8 +10,8 @@ import { test, ok, eq, near, includes, inRange, mulberry32, report } from '../sh
 import {
   WEAPONS, WEAPON_BY_ID, BREACH_PICK, PRANK_HAMMER_KNOCKBACK, ARMORS, ARMOR_BY_ID,
   COMBAT_CONSUMABLES, COMBAT_ITEM_INDEX, COMBAT_ITEM_RANGE, Element, ELEMENT_COUNTER,
-  elementMul, equipSummary, combatantStats, levelDamageMul, skillOf,
-  MAX_DODGE_RATE, BASE_CRIT_DMG, SET_BONUSES, activeSets, SkillShape,
+  elementMul, equipSummary, combatantStats, levelDamageMul, skillOf, weaponById,
+  MAX_DODGE_RATE, BASE_CRIT_DMG, MAX_CRIT_DMG, SET_BONUSES, activeSets, SkillShape,
 } from '../server/src/combat/weapons.ts';
 
 import {
@@ -40,6 +40,7 @@ import {
 } from '../server/src/combat/cooking.ts';
 
 import { BodyState } from '../shared/types/physics.ts';
+import { DamageKind } from '../server/src/mobs/behaviors.ts';
 import {
   MAX_LEVEL, TALENT_LEVELS, SHARE_EXP_RADIUS, PARTY_BONUS_THRESHOLD, PARTY_BONUS,
   AFK_EXP_RATIO, REVIVE_TIME, REVIVE_HP_RATIO, FEATHER_RANGE, FEATHER_INVULN,
@@ -47,8 +48,792 @@ import {
 } from '../shared/types/entities.ts';
 import { ITEM_BY_ID } from '../shared/constants/items.ts';
 import { BOSS_LIST } from '../shared/constants/bosses.ts';
+import { MOB_BY_ID } from '../shared/constants/mobs.ts';
+import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { mobCombatProfile, MOB_DEF_BASE, MOB_DEF_PER_LEVEL, MOB_ELEMENT_BY_ID } from '../server/src/combat/damage.ts';
 
 const rng = mulberry32(0x5eed10);
+
+/* ══════════════ 零、生产路径:玩家 → 生物(task-33 接线)══════════════
+ *
+ * ## 为什么这组断言必须走 `WorldSim`,不能直调 `computeDamage`
+ *
+ * 接线前的实测缺陷(`_cp_red33.ts`,全部经生产路径):
+ *   · `computeDamage` 生产调用点 = **0**,`damage.ts` 整文件不在生产闭包里;
+ *   · 玩家贴 `mob_sheep`(60HP)站 600 帧 → 生物 HP **仍是 60**;
+ *   · `damageMob(amount=7)`→7、`damageMob(amount=70)`→70,`amount` 完全由
+ *     调用方给定 ⇒ 等级/武器/护甲/元素/暴击**一个都不参与**;
+ *   · 但手工直调 `computeDamage` → `finalDamage=28`、八步全跑。
+ *   ⇒ **公式是好的,只是没人调。缺陷在接线,不在算法。**
+ *
+ * 所以下面每一条都**经 `WorldSim`**(真实编排层入口 + 真实生物 AI),
+ * 而不是复述 `computeDamage` 的纯函数行为 —— 后者在接线前就已经全绿,
+ * 正是本仓反复出现的「测试全绿 + 生产零消费」。
+ */
+
+/** 建一个「玩家挨着生物」的世界,装备经 `setMobPlayers` 灌入(走装配层入口)。 */
+function attackWorld(
+  mobId: string,
+  opts: { wearing?: readonly number[]; at?: [number, number]; mobAt?: [number, number] } = {},
+): WorldSim {
+  const s = new WorldSim({ sizeCells: 48 });
+  const [px, py] = opts.at ?? [24, 24];
+  const [mx, my] = opts.mobAt ?? [25, 24];
+  s.addPlayer('p1', px, py);
+  s.setMobPlayers([{
+    id: 'p1', x: px, y: py, z: 0, facingDeg: 0, afk: false,
+    heldItem: 0, wearing: [...(opts.wearing ?? [711])], playingInstrument: false,
+  }]);
+  s.addMob(mobId, 'MEADOW', mx, my);
+  return s;
+}
+
+test('生产接线1:玩家经 WorldSim 攻击生物 → 生物真的掉血(八步在生产路径上跑通)', () => {
+  const s = attackWorld('mob_sheep');
+  const rt = s.mobHost.runtimeOf('mob_sheep')!;
+  const hp0 = rt.hp;
+
+  /* 反例先立:接线前这条是红的 —— 玩家在场 600 帧,生物血量纹丝不动。 */
+  const idle = attackWorld('mob_sheep');
+  const idleRt = idle.mobHost.runtimeOf('mob_sheep')!;
+  for (let i = 0; i < 600; i += 1) idle.tick();
+  eq(idleRt.hp, 60, '对照:玩家只站着不走攻击入口时,生物 600 帧不掉血(攻击不会自己发生)');
+
+  /* 正例:经编排层入口发起攻击。 */
+  const r = s.attackMob('p1', 'mob_sheep', { level: 10 });
+  ok(r !== null, '经 WorldSim.attackMob 能结算(入口存在且返回结果)');
+  eq(rt.hp, hp0 - r!.hpLoss, '生物 HP 实际减少了 hpLoss(不是只返回一个对象)');
+  ok(r!.hpLoss > 0, `生物真的掉血 ${r!.hpLoss}(接线前恒为 0)`);
+  eq(r!.result.steps.length, 8, '八步全部落在 steps 链上(生产路径走的是完整公式)');
+
+  /* 入口的第三个反例:不存在的生物必须返回 null,而不是静默算出一个伤害。 */
+  eq(s.attackMob('p1', 'mob_not_exist'), null, '不存在的生物 → null(不静默造伤害)');
+});
+
+test('生产接线2(第1步 基础伤害):等级与武器倍率在生产路径上真的参与', () => {
+  /* 正例:等级越高,等级倍率越大 ⇒ 同一只怪的承伤越多。
+     注意玩家 totalAtk 在本仓是**常数 22**(不随等级涨,那是 progression 的账),
+     所以这里只能断言「等级倍率这一项」的方向,不能断言 ATK 变化。 */
+  const lo = attackWorld('mob_sheep');
+  const rLo = lo.attackMob('p1', 'mob_sheep', { level: 1 })!;
+  const hi = attackWorld('mob_sheep');
+  const rHi = hi.attackMob('p1', 'mob_sheep', { level: 25 })!;
+
+  eq(rLo.result.levelMul, 1, 'Lv1 等级倍率 = 1(基线)');
+  near(rHi.result.levelMul, 1 + 0.03 * 24, 1e-9, 'Lv25 等级倍率 = 1 + 0.03×24(生产路径读到的是同一公式)');
+  ok(rHi.result.finalDamage > rLo.result.finalDamage,
+    `等级从 1 到 25:承伤 ${rLo.result.finalDamage} → ${rHi.result.finalDamage}(等级倍率真的进了最终伤害)`);
+
+  /* 反例1:换更强武器(723 磁暴齿轮炮 atk 更高)应打出更多伤害。 */
+  const weak = attackWorld('mob_sheep', { wearing: [711] });
+  const rWeak = weak.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 711 })!;
+  const strong = attackWorld('mob_sheep', { wearing: [723] });
+  const rStrong = strong.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 723 })!;
+  ok(rStrong.result.base > rWeak.result.base,
+    `换武器:base ${rWeak.result.base} → ${rStrong.result.base}(weaponMul 进了第 1 步)`);
+
+  /* 反例2:`levelMul` 的注入验证锚点 —— 公式若退化(去掉等级项),上面 near() 立刻红。 */
+  eq(lo.attackMob('p1', 'mob_sheep', { level: 1 })!.result.levelMul, 1,
+    '等级倍率在 Lv1 恒为 1(注入「删掉等级项」后此项仍成立,但 Lv25 那条会红)');
+});
+
+test('生产接线3(第2步 元素克制):元素矩阵在生产路径上真的参与', () => {
+  /* 火系生物 mob_lava_elem 对 FIRE 攻击 ×0.5(被克制)。
+     用同一把武器打「同等级的火灵」与「同等级的中性怪」,对比第 2 步后的值。 */
+  const fire = attackWorld('mob_lava_elem');
+  const rFire = fire.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 713 })!; /* 713 = 黑曜石烈焰巨剑, FIRE */
+  const neutral = attackWorld('mob_sheep');
+  const rNeutral = neutral.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 713 })!;
+
+  eq(rFire.result.elementMulValue, elementMul(Element.FIRE, Element.FIRE),
+    '火打火 = ×0.5(元素表在生产路径上被读到)');
+  eq(rNeutral.result.elementMulValue, 1, '火打中性(NONE)= ×1');
+  ok(rFire.result.afterElement < rNeutral.result.afterElement,
+    `元素克制真的影响第 2 步:火灵 ${rFire.result.afterElement} < 绵羊 ${rNeutral.result.afterElement}`);
+
+  /* 反例:同一把武器打雷系生物应 ×1.5(火→雷在矩阵里是 1)。
+     用 ice 打 fire 验证反向增益,确保不是「一律相乘为常数」。 */
+  const iceOnFire = attackWorld('mob_lava_elem');
+  const rIce = iceOnFire.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 712 })!; /* 712 无元素 */
+  eq(rIce.result.elementMulValue, 1, '无元素武器(element NONE)打任何目标恒 ×1');
+
+  /* 派生表的两个反例:未登记元素的怪必须是 NONE,且表本身可断言。 */
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_sheep')!).element, Element.NONE,
+    '未登记元素的生物派生为 NONE(不凭空发明元素)');
+  eq(MOB_ELEMENT_BY_ID.get('mob_lava_elem'), Element.FIRE, '火灵在元素表里登记为 FIRE');
+  eq(MOB_ELEMENT_BY_ID.size, 3, '元素表恰好 3 条(只收名称/行为明确带元素语义的)');
+});
+
+test('生产接线4(第3步 破甲):固定穿透与百分比穿透在生产路径上真的参与', () => {
+  /* 破甲的关键外部表现:`effectiveDef` 随穿透下降,且**不为负**。 */
+  const noPen = attackWorld('mob_lava_elem');
+  const rNoPen = noPen.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 711 })!; /* 711 pen=0 */
+  const pen = attackWorld('mob_lava_elem');
+  const rPen = pen.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 722 })!; /* 722 pen=15 penPct=0.15 */
+
+  eq(rNoPen.result.flatPen, 0, '711 木剑固定穿透 = 0');
+  eq(rPen.result.flatPen, 15, '722 流沙毒刺枪固定穿透 = 15');
+  ok(rPen.result.effectiveDef < rNoPen.result.effectiveDef,
+    `破甲真的降低有效防御:${rNoPen.result.effectiveDef} → ${rPen.result.effectiveDef}`);
+  ok(rPen.result.effectiveDef >= 0, '有效防御不为负(不允许穿透溢出反向放大伤害)');
+
+  /* 反例:穿透超过目标防御时钳制在 0,不是负数。
+     火灵 lv23 的派生 def = 6 + 2×22 = 50;用 pen=15+pct 的组合仍 > 0,
+     所以换一只低级怪(lv1, def=6)打 pen=15 验证钳制。 */
+  const clamp = attackWorld('mob_sheep');
+  const rClamp = clamp.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 722 })!;
+  eq(rClamp.result.effectiveDef, 0, '穿透(15)超过派生 def(6)时有效防御钳到 0,不为负');
+
+  /* 派生曲线本身:与 vitals.ts 同构的等级线性。 */
+  eq(MOB_DEF_BASE, 6, 'MOB_DEF_BASE = 6(与 vitals.MOB_HIT_BASE 同值)');
+  eq(MOB_DEF_PER_LEVEL, 2.0, 'MOB_DEF_PER_LEVEL = 2.0(与 vitals.MOB_HIT_PER_LEVEL 同值)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_sheep')!).def, 6, 'lv1 绵羊 def = 6');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_clock_knight')!).def, 6 + 2 * 24, 'lv25 发条重骑 def = 54');
+});
+
+test('生产接线5(第4步 破盾):护盾与晶甲系数在生产路径上真的参与', () => {
+  /* 晶甲类:`crystalArmor` 时普通武器只打 20%。
+     用 createTarget 注入受控夹具(生物派生刻意不设晶甲 —— 见 mobCombatProfile 注释)。 */
+  const armored = createTarget({
+    id: 'mob_beetle_crystal', name: '紫晶重甲虫', hp: 750, maxHp: 750,
+    def: 32, crystalArmor: true,
+  });
+  const s = new WorldSim({ sizeCells: 48 });
+  const st = combatantStats(10, [711]);
+  const plain = computeDamage({ attacker: st, target: armored, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  const breaker = computeDamage({ attacker: st, target: armored, weapon: weaponById(204), critRoll: 1, dodgeRoll: 1 });
+  eq(plain.crystalMul, 0.20, '晶甲未破:系数 ×0.20');
+  eq(breaker.crystalMul, 1.0, '204 爆破镐 shieldBreakMul=4.0 ≥ 3.0 ⇒ 无视晶甲 ×1.0(反例)');
+
+  /* 护盾未破时 HP 完全免伤;击破后溢出按破盾倍率折算转入 HP。 */
+  const shielded = createTarget({
+    id: 'mob_x', name: '带盾夹具', hp: 500, maxHp: 500, shield: 10, shieldMax: 10,
+  });
+  const rShield = computeDamage({ attacker: st, target: shielded, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  eq(rShield.shieldBroken, true, '护盾 10 被一击击破');
+  ok(rShield.shieldDamage > 0, `护盾伤害 ${rShield.shieldDamage} > 0`);
+  const applied = applyDamage(shielded, rShield);
+  eq(applied.shieldLeft, 0, '击破后护盾余量归零');
+  ok(applied.target.hp < 500, `击破后溢出转入 HP:500 → ${applied.target.hp}`);
+
+  /* 反例:护盾未破时 HP 完全不动(与「护盾只是数字装饰」区分开)。 */
+  const thick = createTarget({ id: 'mob_y', name: '厚盾夹具', hp: 500, maxHp: 500, shield: 9999, shieldMax: 9999 });
+  const rThick = computeDamage({ attacker: st, target: thick, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  eq(rThick.finalDamage, 0, '护盾未破 ⇒ HP 免伤,最终伤害为 0');
+  eq(applyDamage(thick, rThick).target.hp, 500, '护盾未破时 HP 一点没掉');
+  void s;
+});
+
+test('生产接线6(第5步 暴击):暴击率封顶与爆伤上限在生产路径上真的参与', () => {
+  const st = combatantStats(10, [711]);
+  const t = createTarget({ id: 'mob_sheep', name: '云朵绵羊', hp: 60, maxHp: 60, def: 6 });
+
+  /* 正例:critRoll = 0 必暴(0 < critRate)。 */
+  const crit = computeDamage({ attacker: st, target: t, weapon: weaponById(711), critRoll: 0, dodgeRoll: 1 });
+  const noCrit = computeDamage({ attacker: st, target: t, weapon: weaponById(711), critRoll: 0.999, dodgeRoll: 1 });
+  eq(crit.critRolled, true, 'critRoll=0 ⇒ 必暴');
+  eq(noCrit.critRolled, false, 'critRoll=0.999 ⇒ 不暴(反例)');
+  eq(noCrit.critMul, 1.0, '未暴击时倍率 = 1(不影响伤害)');
+  ok(crit.critMul > 1, `暴击倍率 ${crit.critMul} > 1`);
+  ok(crit.finalDamage > noCrit.finalDamage, `暴击真的提高最终伤害:${noCrit.finalDamage} → ${crit.finalDamage}`);
+
+  /* 边界:爆伤上限 3.0(MANU 手册规定),超过则钳制。 */
+  const overloaded = { ...st, critDmg: 99 };
+  const capped = computeDamage({ attacker: overloaded, target: t, weapon: weaponById(711), critRoll: 0, dodgeRoll: 1 });
+  eq(capped.critMul, 3.0, '爆伤钳到上限 3.0(不是取输入值 99)');
+  ok(capped.critMul < 99, '反例锚点:钳制确实发生');
+});
+
+test('生产接线7(第6步 减伤):护甲递减曲线与词条减伤在生产路径上真的参与', () => {
+  const st = combatantStats(10, [711]);
+
+  /* 递减曲线:ARMOR_K/(ARMOR_K+def),def 越高系数越小但恒 > 0。 */
+  const soft = createTarget({ id: 'a', name: '软皮', hp: 9999, maxHp: 9999, def: 0 });
+  const hard = createTarget({ id: 'b', name: '重甲', hp: 9999, maxHp: 9999, def: 5000 });
+  const rSoft = computeDamage({ attacker: st, target: soft, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  const rHard = computeDamage({ attacker: st, target: hard, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+
+  eq(rSoft.mitigationMul, 1, 'def=0 ⇒ 护甲系数 = 1(不减伤)');
+  ok(rHard.mitigationMul > 0, `def=5000 时系数 ${rHard.mitigationMul} 恒 > 0(递减永不归零)`);
+  ok(rHard.mitigationMul < rSoft.mitigationMul, '护甲系数真的随 def 递减');
+  eq(rHard.finalDamage, 1, 'DEF=5000 ⇒ 原始伤害被最低保底抬到 1(保底分支可达)');
+  eq(MIN_DAMAGE, 1, 'MIN_DAMAGE = 1');
+
+  /* 词条减伤(728 = 0.30)是第 6 步的独立乘区。 */
+  const reduced = createTarget({ id: 'c', name: '带减伤', hp: 9999, maxHp: 9999, def: 6, dmgReduce: 0.30 });
+  const plain = createTarget({ id: 'd', name: '无减伤', hp: 9999, maxHp: 9999, def: 6 });
+  const rRed = computeDamage({ attacker: st, target: reduced, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  const rPlain = computeDamage({ attacker: st, target: plain, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  ok(rRed.finalDamage < rPlain.finalDamage,
+    `词条减伤 30% 真的生效:${rPlain.finalDamage} → ${rRed.finalDamage}`);
+
+  /* 反例:takenMul = 0 完全免疫(幽灵泡泡/无敌墙)。 */
+  const immune = createTarget({ id: 'e', name: '无敌墙', hp: 9999, maxHp: 9999, def: 0, takenMul: 0 });
+  const rImmune = computeDamage({ attacker: st, target: immune, weapon: weaponById(711), critRoll: 0, dodgeRoll: 1 });
+  eq(rImmune.finalDamage, 0, 'takenMul=0 ⇒ 即使暴击也完全免伤,最终伤害归零');
+});
+
+test('生产接线8(第7步 反伤):反伤数值与作用半径在生产路径上真的参与', () => {
+  const st = combatantStats(10, [711]);
+  /* 反伤是「受击方把承伤折算回攻击者」。728 反伤甲的 reflectMul = 1.50。 */
+  const reflector = createTarget({
+    id: 'p_reflect', name: '728 反伤甲玩家', hp: 9999, maxHp: 9999, def: 32, reflectMul: 1.5,
+  });
+  const r = computeDamage({ attacker: st, target: reflector, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  near(r.reflectDamage, r.finalDamage * 1.5, 1e-6, '反伤 = 实际承伤 × 1.5(第 7 步)');
+
+  /* 与独立入口 reflectFrom 双向一致(两处口径必须同源)。 */
+  const indep = reflectFrom(1.5, r.finalDamage);
+  near(indep.reflectDamage, r.reflectDamage, 1e-6, 'reflectFrom 与 computeDamage 第 7 步同值');
+  eq(indep.radius, REFLECT_RADIUS, '反伤半径取自实现');
+  eq(REFLECT_RADIUS, 3, 'REFLECT_RADIUS = 3 格(设计基线,非取自实现)');
+  eq(r.steps[6]!.step, '7 反伤', '第 7 步在 steps 链的第 7 位(顺序固定)');
+
+  /* 反例1:无反射倍率 ⇒ 反伤为 0(不是「一律有反伤」)。 */
+  const plain = createTarget({ id: 'mob_plain', name: '普通怪', hp: 9999, maxHp: 9999, def: 6 });
+  const rPlain = computeDamage({ attacker: st, target: plain, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  eq(rPlain.reflectDamage, 0, 'reflectMul=0 ⇒ 反伤 0(反例)');
+
+  /* 反例2:生物派生**刻意不设** reflectMul —— 否则等于给每只怪白送反伤。
+     这条守住 mobCombatProfile 的职责边界(个体特性交给 AI)。 */
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).reflectMul, 0,
+    '派生档案不设反伤(生物反伤不做 —— 否则凭空造出「怪物反伤」)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).crystalArmor, false,
+    '派生档案不设晶甲(个体特性由生物 AI 的 onDamage 负责,避免双重结算)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).dmgReduce, 0,
+    '派生档案不设词条减伤(同上,否则「减 80%」会变成减 96%)');
+});
+
+test('生产接线9(第8步 击退):击退冲量在生产路径上真的参与', () => {
+  const st = combatantStats(10, [711]);
+  /* 击退 = 武器基础击退 × 倍率 × 技能倍率 ÷ 质量。 */
+  const light = createTarget({ id: 'a', name: '轻', hp: 9999, maxHp: 9999, def: 6, mass: 1.0 });
+  const heavy = createTarget({ id: 'b', name: '重', hp: 9999, maxHp: 9999, def: 6, mass: 4.0 });
+  const rLight = computeDamage({ attacker: st, target: light, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  const rHeavy = computeDamage({ attacker: st, target: heavy, weapon: weaponById(711), critRoll: 1, dodgeRoll: 1 });
+  ok(rLight.knockbackImpulse > 0, `击退冲量 ${rLight.knockbackImpulse} > 0`);
+  near(rHeavy.knockbackImpulse, rLight.knockbackImpulse / 4, 1e-6, '质量 ×4 ⇒ 击退 ÷4(质量真的参与)');
+  eq(rLight.steps[7]!.step, '8 击退', '第 8 步在 steps 链的第 8 位(八步顺序固定)');
+
+  /* 反例:222 充气大锤除击退外,对队友是 0 伤害 + 固定冲量。 */
+  const prank = allyPrankHit(light);
+  eq(prank.finalDamage, 0, '整蛊命中对队友 0 伤害');
+  eq(prank.knockbackImpulse, PRANK_HAMMER_KNOCKBACK, `整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK} 格/秒(与武器无关)`);
+  ok(prank.knockbackImpulse !== rLight.knockbackImpulse, '整蛊冲量与普通攻击不同(反例锚点)');
+
+  /* 派生质量:生物质量默认 1(与 physics.spawn 默认一致)。 */
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_clock_knight')!).mass, 1, '生物派生质量默认 1');
+});
+
+test('生产接线10:八步之外的短路分支在生产路径上真的参与(超距 / 闪避)', () => {
+  /* 0a 超距:距离超过 reach + 容差 ⇒ 落空,不产生任何伤害。 */
+  const far = attackWorld('mob_sheep', { at: [10, 10], mobAt: [40, 40] });
+  const rFar = far.attackMob('p1', 'mob_sheep', { level: 10 })!;
+  eq(rFar.result.outOfReach, true, '距离 42 格 ⇒ outOfReach(生产路径真的传了 distance)');
+  eq(rFar.result.finalDamage, 0, '超距 ⇒ 最终伤害 0');
+  eq(rFar.hpLoss, 0, '超距 ⇒ 生物一点血没掉');
+  eq(far.mobHost.runtimeOf('mob_sheep')!.hp, 60, '超距后生物仍是满血');
+
+  /* 0b 闪避:目标闪避率封顶 0.75,roll 落在其下则完全免伤。 */
+  const slippery = createTarget({ id: 'x', name: '滑', hp: 9999, maxHp: 9999, def: 0, dodgeRate: 5.0 });
+  const st = combatantStats(10, [711]);
+  const dodged = computeDamage({ attacker: st, target: slippery, weapon: weaponById(711), critRoll: 0, dodgeRoll: 0.74 });
+  const hit = computeDamage({ attacker: st, target: slippery, weapon: weaponById(711), critRoll: 0, dodgeRoll: 0.76 });
+  eq(dodged.dodged, true, 'dodgeRoll 0.74 < 封顶 0.75 ⇒ 闪避');
+  eq(dodged.finalDamage, 0, '闪避 ⇒ 最终伤害 0');
+  eq(hit.dodged, false, 'dodgeRoll 0.76 > 0.75 ⇒ 未闪避(反例:封顶真的在起作用)');
+  ok(hit.finalDamage > 0, `未闪避 ⇒ 正常结算 ${hit.finalDamage}`);
+  eq(MAX_DODGE_RATE, 0.75, 'MAX_DODGE_RATE = 0.75(闪避硬封顶)');
+
+  /* 反例:生物派生不设闪避率(怪物不闪避 —— 那会让玩家的每次攻击都可能空)。 */
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_tanuki')!).dodgeRate, 0, '派生档案不设闪避(怪物不闪避)');
+});
+
+test('生产接线11:装配层真的能把玩家装备喂进伤害管线', () => {
+  /* 这条守的是「护甲算得出但喂不进去」—— 若 setMobPlayers 的 wearing 没被
+     attackMob 读到,玩家穿什么都是裸装,护甲形同虚设。 */
+  const bare = attackWorld('mob_sheep', { wearing: [] });
+  const rBare = bare.attackMob('p1', 'mob_sheep', { level: 10, wearing: [] })!;
+  const armored = attackWorld('mob_sheep', { wearing: [711, 728] });
+  const rArmored = armored.attackMob('p1', 'mob_sheep', { level: 10, wearing: [711, 728] })!;
+
+  eq(equipSummary([711, 728]).def, 32, '728 提供 def +32(装配层聚合)');
+  ok(rArmored.result.base > rBare.result.base,
+    `穿 728 后第 1 步更高:${rBare.result.base} → ${rArmored.result.base}(wearing 真的被读到)`);
+  eq(equipSummary([711, 728]).reflectMul, 1.5, '728 反伤倍率 1.5 被聚合(供第 7 步)');
+  eq(equipSummary([711, 728]).dmgReduce, 0.30, '728 词条减伤 0.30 被聚合(供第 6 步)');
+
+  /* 反例:`setMobPlayers` 灌入的 wearing 必须被 attackMob 作为缺省读到。 */
+  const auto = attackWorld('mob_sheep', { wearing: [711, 728] });
+  const rAuto = auto.attackMob('p1', 'mob_sheep', { level: 10 })!; /* 不显式传 wearing */
+  eq(rAuto.result.base, rArmored.result.base,
+    '不显式传 wearing 时,attackMob 从 setMobPlayers 的记录里读到同一套装备');
+});
+
+test('生产接线12:204 爆破镐经 attackMob 真的能一击敲碎晶甲(EXPLOSION 可达)', () => {
+  /* ## 这条守的是一个我自己在接线时引入的缺陷
+   *
+   * 手册与 `WeaponDef` 都写着 204「对晶甲类护盾拥有 4.0 破盾倍率」,
+   * 而 `BeetleAi.onDamage`(`behaviors.ts:720`)的碎壳分支判据是
+   * `kind === DamageKind.EXPLOSION`。
+   *
+   * 我第一版 `damageKindOf` **按元素映射**,而 `BREACH_PICK.element` 是 `NONE`
+   * (它靠爆破而非元素)⇒ 落到 `PHYSICAL` ⇒ **碎壳分支永远不可达**。
+   * 症状与 task-33 本身同型:手册记载的机制,在生产入口上形同不存在。
+   *
+   * 修法:按**武器 ID** 把 204 钉死为 `EXPLOSION`。 */
+  const beetle = attackWorld('mob_beetle_crystal');
+  const rt = beetle.mobHost.runtimeOf('mob_beetle_crystal')!;
+
+  /* 正例:先确认未碎壳(flag 初始为 0)。 */
+  eq(rt.mem.shellBroken ?? 0, 0, '前置:甲虫壳完好');
+
+  /* 用 204 攻击 —— 必须触发碎壳事件,而不是只掉一点血。 */
+  const r = beetle.attackMob('p1', 'mob_beetle_crystal', { level: 10, weaponId: 204 })!;
+  eq(rt.mem.shellBroken, 1, '204 经 attackMob 真的敲碎了晶甲壳(shellBroken=1)');
+  includes(r.events, 'beetle_shell_broken', '碎壳事件被上报(不是静默改血量)');
+  ok(r.hpLoss > 0, `碎壳同时造成伤害 ${r.hpLoss}`);
+
+  /* 反例:同一只甲虫,用普通武器(711, element NONE)不触发碎壳。
+     这一条守住「碎壳不是无条件发生的」—— 若 204 的映射失效退回 PHYSICAL,
+     上面的正例会红;若有人把碎壳改成无条件,下面的反例会红。 */
+  const plain = attackWorld('mob_beetle_crystal');
+  const plainRt = plain.mobHost.runtimeOf('mob_beetle_crystal')!;
+  plain.attackMob('p1', 'mob_beetle_crystal', { level: 10, weaponId: 711 });
+  eq(plainRt.mem.shellBroken ?? 0, 0, '反例:711 木剑不碎壳(碎壳是 204/爆破专属)');
+
+  /* 第二条反例:正例不能靠「伤害高」蒙混 —— 713 火巨剑 atk 更高,仍不碎壳。 */
+  const fire = attackWorld('mob_beetle_crystal');
+  const fireRt = fire.mobHost.runtimeOf('mob_beetle_crystal')!;
+  fire.attackMob('p1', 'mob_beetle_crystal', { level: 10, weaponId: 713 });
+  eq(fireRt.mem.shellBroken ?? 0, 0, '反例:713 火巨剑也不碎壳(看的是 kind,不是伤害量)');
+});
+
+test('生产接线13:火灵遇水经 attackMob 真的固化为黑曜石(WATER 可达)', () => {
+  /* ## 这条守的通道,以及一个「差点写出来的死代码」
+   *
+   * 火灵的固化分支判 `kind === DamageKind.WATER`(`behaviors.ts:1224`)。
+   * 我第一版 `damageKindOf` 里写了 `case Element.ICE: return WATER` ——
+   * 语义上合理,但**实测武器表里没有任何 ICE 武器**(13 把武器的元素只有
+   * NONE/FIRE/LIGHT/SLIME/LIGHTNING),那段就是**永不执行的代码**。
+   *
+   * 故现在 `damageKindOf` 刻意不写 ICE 分支,并在此**设一道陷阱断言**:
+   * 一旦有人新增 ICE 武器,该断言变红,提醒必须同时恢复映射 ——
+   * 否则火灵固化会静默失效。
+   *
+   * WATER 的两条**真实可达**路径在这里都被覆盖:
+   *   路径 A:`opts.kind` 显式覆盖(推导只做缺省);
+   *   路径 B:227 泡泡水枪经 `interactMob`(工具通道)。 */
+  const lava = attackWorld('mob_lava_elem');
+  const rt = lava.mobHost.runtimeOf('mob_lava_elem')!;
+  eq(rt.mem.solidified ?? 0, 0, '前置:火灵未固化');
+
+  /* 反例先立:普通物理攻击不固化(固化不是无条件发生的)。 */
+  const plain = attackWorld('mob_lava_elem');
+  const plainRt = plain.mobHost.runtimeOf('mob_lava_elem')!;
+  const rPlain = plain.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 711 })!;
+  eq(plainRt.mem.solidified ?? 0, 0, '反例:711 木剑(PHYSICAL)不固化火灵');
+  ok(rPlain.hpLoss > 0, '普通攻击正常造成伤害(不固化 ≠ 不受伤)');
+
+  /* 路径 A:显式给 kind=WATER,固化必须发生。 */
+  const water = attackWorld('mob_lava_elem');
+  const waterRt = water.mobHost.runtimeOf('mob_lava_elem')!;
+  water.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 711, kind: DamageKind.WATER });
+  eq(waterRt.mem.solidified, 1, '路径A:显式 kind=WATER 经 attackMob 真的固化火灵');
+
+  /* 路径 B:227 泡泡连发水枪走工具通道。 */
+  const gun = attackWorld('mob_lava_elem');
+  const gunRt = gun.mobHost.runtimeOf('mob_lava_elem')!;
+  const interacted = gun.interactMob('mob_lava_elem', 227, 'p1');
+  eq(interacted, true, '路径B:227 泡泡水枪经 interactMob 命中火灵');
+  eq(gunRt.mem.solidified, 1, '路径B:水枪使火灵固化(与 attackMob 的 kind 通道互补,两条都在)');
+
+  /* ⚠ 陷阱断言:武器表里不能有 ICE 武器,否则上面的推导必须补回 ICE 分支。 */
+  ok(!WEAPONS.some((w) => w.element === Element.ICE),
+    '武器表无 ICE 武器 —— 若有新增,必须恢复 damageKindOf 里的 ICE→WATER 映射,'
+    + '否则火灵固化静默失效(本条即为该提醒)');
+  eq(WEAPONS.filter((w) => w.element !== Element.NONE).map((w) => w.element).sort().join(','),
+    ['FIRE', 'LIGHT', 'LIGHT', 'LIGHT', 'LIGHT', 'LIGHTNING', 'SLIME'].sort().join(','),
+    '非 NONE 元素武器恰好 7 把(FIRE×1 / LIGHT×4 / LIGHTNING×1 / SLIME×1)');
+
+  /* 派生档案:火灵是 FIRE 元素(元素表登记),供第 2 步克制计算。 */
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).element, Element.FIRE,
+    '火灵派生元素 = FIRE(第 2 步火打火 ×0.5)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).def, 6 + 2 * 22,
+    '火灵 lv23 派生 def = 50(与 vitals 同构的等级线性)');
+});
+
+test('生产接线14:八步逐步在生产路径上被驱动(并标明哪几步无生产触发器)', () => {
+  /* ## 这条把「八步都在生产路径上跑」拆到**逐步**可判定
+   *
+   * task-33 的验收口语是「八步每步各一条断言 + 反例」。但有一个必须
+   * **如实说明**的事实:八步里有几步在「玩家打怪」方向上**没有生产触发器**
+   * —— 不是接线没做完,而是本仓的生物数据里根本不存在能触发它的输入。
+   * 硬凑一条断言只会造出「测住了但生产跑不到」的假绿。
+   *
+   * | 步 | 生产触发器 | 能否经 attackMob 驱动 |
+   * | :--- | :--- | :--- |
+   * | 1 基础伤害 | 等级 / 武器倍率 / 连段 | ✓ 可(下面第 1 组) |
+   * | 2 元素克制 | 元素武器 × 生物元素 | ✓ 可(713 打火灵) |
+   * | 3 破甲 | 武器 armorPen / armorPenPct | ✓ 可(711 vs 722) |
+   * | 4 破盾 | 生物 `shield` / 晶甲系数 | **✗ 部分**:生物派生不给 `shield`
+   *   (冻结层无该字段),晶甲已由生物 AI 的 `onDamage` 承担 ⇒ 见下方说明 |
+   * | 5 暴击 | `critRate` + `critRoll` | ✓ 可但**不可控**(roll 由 rng 出;
+   *   生产上只能靠概率,断言只能查「暴击时倍率正确」) |
+   * | 6 减伤 | 生物 `def` + 词条减伤 | ✓ 可(不同生物 def 不同) |
+   * | 7 反伤 | 受击方 `reflectMul` | **✗ 不可**:生物派生刻意不设 `reflectMul`
+   *   (设了就是凭空造「怪物反伤」)⇒ 该步在玩家→怪方向**恒为 0** |
+   * | 8 击退 | 武器击退 ÷ 质量 | ✓ 可(质量恒 1,故 = 武器基础击退) |
+   *
+   * ⇒ 下面分三组:能驱动的逐步断言、不能驱动的**如实断言其恒为 0**、
+   *   以及短路分支。**没有把不可驱动的步伪装成已覆盖。** */
+  const s = attackWorld('mob_lava_elem');
+  const r = s.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 713 })!;
+
+  /* ── 八步全部出现在 steps 链上(顺序与条数固定)── */
+  eq(r.result.steps.length, 8, 'steps 链恰好 8 步');
+  eq(r.result.steps.map((x) => x.step).join(' | '),
+    '1 基础伤害 | 2 元素克制 | 3 破甲 | 4 破盾 | 5 暴击 | 6 减伤 | 7 反伤 | 8 击退',
+    '八步名称与顺序固定(生产路径产出,不是测试里手写的)');
+
+  /* ── 第 1 步:随等级/武器倍率变 ── */
+  const s1a = attackWorld('mob_lava_elem');
+  const r1a = s1a.attackMob('p1', 'mob_lava_elem', { level: 1, weaponId: 711 })!;
+  ok(r.result.steps[0]!.value > r1a.result.steps[0]!.value,
+    `第1步随输入变:lv1/711=${r1a.result.steps[0]!.value} → lv10/713=${r.result.steps[0]!.value}`);
+  /* 反例:把武器换成更弱的,第 1 步必须下降。 */
+  const s1b = attackWorld('mob_lava_elem');
+  const r1b = s1b.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 711 })!;
+  ok(r1b.result.steps[0]!.value < r.result.steps[0]!.value, '反例:换弱武器第 1 步下降');
+
+  /* ── 第 2 步:火焰武器打火灵(×0.5)── */
+  ok(r.result.steps[1]!.value < r.result.steps[0]!.value,
+    `第2步元素克制真的削减:${r.result.steps[0]!.value} → ${r.result.steps[1]!.value}(火打火 ×0.5)`);
+  /* 反例:同一把武器打中性生物,第 2 步不变。 */
+  const s2 = attackWorld('mob_sheep');
+  const r2 = s2.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 713 })!;
+  eq(r2.result.steps[1]!.value, r2.result.steps[0]!.value,
+    '反例:火焰武器打中性(NONE)生物,第 2 步等于第 1 步(×1,不削减)');
+
+  /* ── 第 3 步:破甲把有效防御打下来 ── */
+  const s3 = attackWorld('mob_lava_elem');
+  const r3 = s3.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 722 })!;
+  ok(r3.result.steps[2]!.value < r.result.steps[2]!.value,
+    `第3步破甲生效:711(pen0) effDef=${r.result.steps[2]!.value} → 722(pen15) effDef=${r3.result.steps[2]!.value}`);
+  /* 反例:穿透超过防御时钳到 0,不为负。 */
+  const s3b = attackWorld('mob_sheep');
+  const r3b = s3b.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 722 })!;
+  eq(r3b.result.steps[2]!.value, 0, '反例:pen 15 > 绵羊 def 6 ⇒ effDef 钳到 0(不为负)');
+
+  /* ── 第 4 步:**如实断言**——生物派生不给 shield,故生产上第 4 步不削血。
+     ⚠️ 量纲提醒:第 3 步 value 是 **`effectiveDef`(防御值)**,
+     第 4 步才是**伤害**。拿它们直接比大小是量纲错误(实测第3步=38、
+     第4步=18.86,前者大只因它是防御点而不是伤害)。故第 4 步与第 2 步比。
+     晶甲/格挡等个体特性已由生物 AI 的 `onDamage` 承担(见 生产接线12 甲虫碎壳)。── */
+  eq(r.result.steps[3]!.value, r.result.steps[1]!.value,
+    '第4步(破盾)对派生生物不削减:生物无 shield 字段 ⇒ 该步等于第2步(如实断言,非「已覆盖」)');
+  eq(r.result.steps[2]!.value, r.result.effectiveDef,
+    '第3步 value 是 effectiveDef(防御量纲),不是伤害 —— 与结果字段同源');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).shield, 0, '派生档案 shield = 0(冻结层无该字段)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).crystalArmor, false,
+    '派生档案 crystalArmor = false —— 晶甲交给生物 AI,避免双重结算');
+
+  /* ── 第 5 步:暴击。生产上 roll 由 combatRng 决定,故断言「暴击语义正确」
+     而非「必然/必然不暴击」。第 5 步的值 = 第 4 步 × critMul,故两种情况都合法。── */
+  ok(r.result.critMul >= 1 && r.result.critMul <= MAX_CRIT_DMG,
+    `第5步暴击倍率在 [1, ${MAX_CRIT_DMG}] 内(生产路径钳制生效)`);
+  eq(r.result.steps[4]!.value,
+    r.result.steps[3]!.value * r.result.critMul,
+    `第5步 = 第4步 × 暴击倍率(实测 ${r.result.steps[3]!.value} × ${r.result.critMul} = ${r.result.steps[4]!.value};`
+    + `本次 critRolled=${r.result.critRolled})`);
+  /* 反例:用夹具强制不暴 → 倍率为 1、第 5 步等于第 4 步。 */
+  const noCritFix = computeDamage({
+    attacker: combatantStats(10, [711]),
+    target: createTarget({ id: 'x', name: '夹具', hp: 999, maxHp: 999, def: 6 }),
+    weapon: weaponById(711), critRoll: 0.999, dodgeRoll: 1,
+  });
+  eq(noCritFix.critMul, 1, '反例(夹具强制不暴):critMul = 1');
+  eq(noCritFix.steps[4]!.value, noCritFix.steps[3]!.value, '反例:不暴时第 5 步等于第 4 步');
+  /* 反例:用夹具强制暴击,倍率必须 > 1 且真的抬高伤害。 */
+  const forced = computeDamage({
+    attacker: combatantStats(10, [711]), target: createTarget({ id: 'x', name: '夹具', hp: 999, maxHp: 999, def: 6 }),
+    weapon: weaponById(711), critRoll: 0, dodgeRoll: 1,
+  });
+  ok(forced.critMul > 1, `反例(夹具强制暴击):critMul=${forced.critMul} > 1`);
+  ok(forced.finalDamage > noCritFix.finalDamage,
+    `暴击真的抬高最终伤害:${noCritFix.finalDamage} → ${forced.finalDamage}`);
+
+  /* ── 第 6 步:减伤。不同生物 def 不同 ⇒ 减伤系数不同。── */
+  eq(r.result.steps[5]!.step, '6 减伤', '第6步在链上');
+  const s6a = attackWorld('mob_sheep');
+  const r6a = s6a.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 711 })!;
+  const s6b = attackWorld('mob_clock_knight');
+  const r6b = s6b.attackMob('p1', 'mob_clock_knight', { level: 10, weaponId: 711 })!;
+  ok(r6b.result.mitigationMul < r6a.result.mitigationMul,
+    `第6步随 def 递减:绵羊(def6)=${r6a.result.mitigationMul} > 重骑(def54)=${r6b.result.mitigationMul}`);
+  /* 反例:def=0 时减伤系数为 1(不减伤)。 */
+  eq(computeDamage({
+    attacker: combatantStats(10, [711]), target: createTarget({ id: 'z', name: '无甲', hp: 999, maxHp: 999, def: 0 }),
+    weapon: weaponById(711), critRoll: 1, dodgeRoll: 1,
+  }).mitigationMul, 1, '反例:def=0 ⇒ 减伤系数 1(不减伤)');
+
+  /* ── 第 7 步:**如实断言**——生物派生不给 reflectMul ⇒ 玩家→怪方向反伤恒为 0。── */
+  eq(r.result.steps[6]!.value, 0,
+    '第7步反伤对派生生物恒为 0(生物无 reflectMul ⇒ 该步在玩家→怪方向不可驱动,如实断言)');
+  eq(mobCombatProfile(MOB_BY_ID.get('mob_lava_elem')!).reflectMul, 0,
+    '派生档案 reflectMul = 0 —— 不凭空造「怪物反伤」');
+  /* 反例:反伤机制本身活着 —— 728 反伤甲作为受击方时第 7 步非零。 */
+  const refl = computeDamage({
+    attacker: combatantStats(10, [711]),
+    target: createTarget({ id: 'p', name: '728 玩家', hp: 999, maxHp: 999, def: 32, reflectMul: 1.5 }),
+    weapon: weaponById(711), critRoll: 1, dodgeRoll: 1,
+  });
+  ok(refl.reflectDamage > 0, `反例:受击方带 reflectMul 时第 7 步非零(${refl.reflectDamage})`);
+
+  /* ── 第 8 步:击退。质量为 1 ⇒ 击退 = 武器基础击退 × 倍率。── */
+  ok(r.result.steps[7]!.value > 0, `第8步击退 = ${r.result.steps[7]!.value} > 0`);
+  const s8 = attackWorld('mob_lava_elem');
+  const r8 = s8.attackMob('p1', 'mob_lava_elem', { level: 10, weaponId: 711 })!;
+  ok(r.result.steps[7]!.value !== r8.result.steps[7]!.value,
+    `第8步随武器变:711=${r8.result.steps[7]!.value} vs 713=${r.result.steps[7]!.value}`);
+  /* 反例:222 充气大锤打队友 = 0 伤害 + 固定冲量(击退与伤害解耦)。 */
+  const prank = allyPrankHit(createTarget({ id: 'ally', name: '队友', hp: 999, maxHp: 999 }));
+  eq(prank.finalDamage, 0, '反例:整蛊对队友 0 伤害');
+  eq(prank.knockbackImpulse, PRANK_HAMMER_KNOCKBACK, `反例:整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK}(与武器无关)`);
+
+  /* ── 短路分支同样在生产路径上 ── */
+  const sFar = attackWorld('mob_sheep', { at: [4, 4], mobAt: [40, 40] });
+  const rFar = sFar.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 715 })!; /* 715 弓 reach 12 */
+  eq(rFar.result.outOfReach, true, `短路:超距(outOfReach)在生产路径上生效(弓 reach 12,距离 ${Math.hypot(36, 36).toFixed(1)})`);
+  eq(rFar.hpLoss, 0, '短路:超距时生物一点血没掉');
+
+  /* ── 逐步汇总(供报告引用)── */
+  console.log('    [八步生产路径实测值]');
+  r.result.steps.forEach((x, i) => console.log(`      ${i + 1}. ${x.step} = ${x.value}`));
+});
+
+test('生产接线15:玩家攻击不消耗生物 AI 的随机流(战斗随机流已分离)', () => {
+  /* ## 这条守的是我在接线时引入的一个**静默耦合**
+   *
+   * 第一版 `attackMob` 用 `this.rng()` 取 critRoll/dodgeRoll,而同一个
+   * `rng` 也喂给 `mobHost`(生物 AI)与 spawner。实测:0 次 vs 1 次攻击
+   * 时,**三个远处、与战斗无关**的生物轨迹全部分叉 ——
+   * ⇒ 玩家攻击次数成了生物 AI 的隐式输入,回放无法只靠世界种子重演。
+   *
+   * 修法:`WorldSimOptions.combatRng` 独立成流。
+   *
+   * ## 判据为什么用**计数包装器**,而不是「远处生物轨迹是否一致」
+   *
+   * 我第一版用的是轨迹比较,结果**过于严格而不成立**,原因是本仓一个
+   * **既有架构属性**:`MobHost` 内部所有生物共用**一条** rng 流。
+   * 攻击目标怪会合理改变它自己的行为(scared/flee),该行为消耗的随机数
+   * 个数随之变化,于是**同一条流上后面的其他生物也被顺移** ——
+   * 这与我的战斗取数无关,是设计使然。
+   *
+   * 所以正确的判据是直测「谁消耗了哪条流」:给 `rng` 与 `combatRng`
+   * 各包一层计数器,断言 `attackMob` **从共享流取 0 次**、从战斗流取 >0 次。
+   * 这比轨迹比较更精确,也不会把既有架构属性误判成缺陷。 */
+  const counting = (base: () => number): { fn: () => number; n: () => number } => {
+    let c = 0;
+    return { fn: () => { c += 1; return base(); }, n: () => c };
+  };
+  const build = (rng: () => number, combatRng: () => number): WorldSim => {
+    const s = new WorldSim({ sizeCells: 64, rng, combatRng });
+    s.addPlayer('p1', 8, 8);
+    s.setMobPlayers([{
+      id: 'p1', x: 8, y: 8, z: 0, facingDeg: 0, afk: false,
+      heldItem: 0, wearing: [711], playingInstrument: false,
+    }]);
+    s.addMob('mob_sheep', 'MEADOW', 9, 8);
+    s.addMob('mob_boar', 'MEADOW', 50, 50);
+    return s;
+  };
+
+  /* 正例:attackMob 完全不碰共享流。 */
+  const shared1 = counting(mulberry32(1));
+  const combat1 = counting(mulberry32(2));
+  const s1 = build(shared1.fn, combat1.fn);
+  const sh0 = shared1.n();
+  const cb0 = combat1.n();
+  const r1 = s1.attackMob('p1', 'mob_sheep', { level: 10 });
+  eq(shared1.n() - sh0, 0,
+    'attackMob 从**共享** rng 取 0 次(生物 AI 的流不被玩家攻击推进)');
+  ok(combat1.n() - cb0 > 0,
+    `attackMob 从**战斗流**取数 ${combat1.n() - cb0} 次(暴击+闪避各一次,证明它真的在用 combatRng)`);
+  eq(combat1.n() - cb0, 2, '恰好 2 次:critRoll 与 dodgeRoll 各一');
+  ok(r1 !== null, '攻击照常结算(分离不等于没跑)');
+
+  /* 反例:只 tick 不攻击 ⇒ 战斗流必须为 0,共享流必须 > 0。 */
+  const shared2 = counting(mulberry32(1));
+  const combat2 = counting(mulberry32(2));
+  const s2 = build(shared2.fn, combat2.fn);
+  const sh2 = shared2.n();
+  const cb2 = combat2.n();
+  for (let i = 0; i < 20; i += 1) s2.tick();
+  ok(shared2.n() - sh2 > 0, `反例:20 帧 AI 推进消耗共享流 ${shared2.n() - sh2} 次`);
+  eq(combat2.n() - cb2, 0, '反例:不攻击时战斗流取 0 次(战斗流不归 AI 用)');
+
+  /* 同时:战斗本身仍确定性可复现(分离不能把可复现性搞丢)。 */
+  const mkAtk = (): number => {
+    const s = build(mulberry32(1), mulberry32(2));
+    return s.attackMob('p1', 'mob_sheep', { level: 10 })!.result.finalDamage;
+  };
+  eq(mkAtk(), mkAtk(), '同种子两次攻击结果完全一致(分离后仍可复现)');
+
+  /* combatRng 可注入且真的决定暴击序列。 */
+  const mk = (combatRng: () => number): WorldSim => {
+    const s = new WorldSim({ sizeCells: 48, combatRng });
+    s.addPlayer('p1', 24, 24);
+    s.setMobPlayers([{
+      id: 'p1', x: 24, y: 24, z: 0, facingDeg: 0, afk: false,
+      heldItem: 0, wearing: [711], playingInstrument: false,
+    }]);
+    s.addMob('mob_sheep', 'MEADOW', 25, 24);
+    return s;
+  };
+  const rc = mk(() => 0).attackMob('p1', 'mob_sheep', { level: 10 })!;
+  const rn = mk(() => 0.999).attackMob('p1', 'mob_sheep', { level: 10 })!;
+  eq(rc.result.critRolled, true, '注入 combatRng=()=>0 ⇒ 必暴(证明 combatRng 真的被读)');
+  eq(rn.result.critRolled, false, '注入 combatRng=()=>0.999 ⇒ 不暴(反例)');
+  ok(rc.result.finalDamage > rn.result.finalDamage,
+    `暴击序列可注入且真的影响伤害:${rn.result.finalDamage} → ${rc.result.finalDamage}`);
+});
+
+test('生产接线16:攻击已死生物时 hpLoss 归零(不虚报掉血)', () => {
+  /* ## 这条守的是 `hpLoss` 的真实语义
+   *
+   * `damageMob` 自述契约是「**`hpLoss` 才是真正的掉血**,因为可能被格挡」。
+   * 但 `BaseMobAi.onDamage`(`behaviors.ts:175`)算的是:
+   * ```ts
+   * const hpLoss = Math.max(0, amount);
+   * rt.hp = Math.max(0, rt.hp - hpLoss);   // 尸体上 rt.hp 恒被钳在 0
+   * ```
+   * ⇒ 对一具**尸体**它照样返回 `hpLoss = amount`。实测修前:
+   * ```
+   * rt.alive=false, rt.hp=0 → 再攻击 → hpLoss=27,hp 0 → 0
+   * ```
+   * 调用方若据此发经验 / 判定击杀 / 统计 DPS,会为死掉的生物反复记账。
+   *
+   * 修法:`attackMob` 用「攻击前 `rt.hp`」钳制 `hpLoss` —— 只有攻击前还活着、
+   * 且 HP 真的下降才算掉血。本断言守住它。 */
+  const s = attackWorld('mob_sheep');
+  const rt = s.mobHost.runtimeOf('mob_sheep')!;
+
+  /* 先正常打到死。 */
+  let killed = 0;
+  for (let i = 0; i < 20 && rt.alive; i += 1) {
+    const r = s.attackMob('p1', 'mob_sheep', { level: 10 });
+    killed += r!.hpLoss;
+  }
+  eq(rt.alive, false, '20 次内击杀成功(活着的目标会掉血)');
+  eq(rt.hp, 0, '死亡时 HP 为 0');
+  ok(killed > 0, `击杀过程确实累计掉血 ${killed}(不是从未受伤就死了)`);
+
+  /* 正例:攻击尸体 hpLoss 必须为 0(修前是 27)。 */
+  const r1 = s.attackMob('p1', 'mob_sheep', { level: 10 })!;
+  eq(r1.hpLoss, 0, '攻击已死生物 ⇒ hpLoss = 0(修前虚报 27)');
+  eq(rt.hp, 0, '尸体 HP 仍是 0(没被扣成负数)');
+  eq(rt.alive, false, '尸体不会因再挨打而「复活」');
+
+  /* 反例:活着的生物 hpLoss 必须 > 0 —— 归零不能把正常路径也吃掉。 */
+  const alive = attackWorld('mob_sheep');
+  const aliveRt = alive.mobHost.runtimeOf('mob_sheep')!;
+  const ra = alive.attackMob('p1', 'mob_sheep', { level: 10 })!;
+  ok(ra.hpLoss > 0, `反例:活着的生物 hpLoss = ${ra.hpLoss} > 0`);
+  eq(aliveRt.hp, 60 - ra.hpLoss, '反例:HP 实际减少了 hpLoss(正常路径未被影响)');
+
+  /* ── 钳制的**另一半**语义:溢出侧(Lead 提出,我原先写出了弱断言)──
+   *
+   * `Math.min(rawLoss, hpBefore)` 有两侧:
+   *   · 下侧 = 尸体不虚报(上面已断言 `hpLoss = 0`);
+   *   · 上侧 = **剩余血量 < 伤害时,`hpLoss` 应等于剩余血量,而不是伤害值**。
+   *
+   * 我原先写的是 `ok(rl.hpLoss <= 3)` —— 那是**弱断言,等于没测**:
+   * `hpLoss = 0` 也能通过 `<= 3`,而 0 恰恰是「伤害完全没记上」的错误行为。
+   * ⇒ 改成**精确相等 + 伤害确实超过残血**的前置条件,两侧夹住。 */
+  const low = attackWorld('mob_sheep');
+  const lowRt = low.mobHost.runtimeOf('mob_sheep')!;
+  lowRt.hp = 6; /* 只剩 6 血 */
+  /* 用 Lv20 + 712 重剑,保证 finalDamage 明显大于 6 —— 否则「溢出被钳」
+     与「伤害本来就小」无法区分,断言又会变成形状化。 */
+  const rl = low.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 })!;
+  ok(rl.result.finalDamage > 6,
+    `前置:本次 finalDamage=${rl.result.finalDamage} 确实超过残血 6(否则测不到溢出钳制)`);
+  eq(rl.hpLoss, 6, `残血 6 被 ${rl.result.finalDamage} 伤害打死 ⇒ hpLoss 恰为 6(不是伤害值,也不是 0)`);
+  eq(lowRt.hp, 0, '残血目标被击杀,HP 归 0');
+
+  /* 再补一条**更严格**的:残血 1 时 hpLoss 必须 = 1(最难区分 0 与 1)。 */
+  const one = attackWorld('mob_sheep');
+  const oneRt = one.mobHost.runtimeOf('mob_sheep')!;
+  oneRt.hp = 1;
+  const rOne = one.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 })!;
+  eq(rOne.hpLoss, 1, '残血 1 ⇒ hpLoss 恰为 1(同时排除「虚报大数」与「记成 0」两种错法)');
+
+  /* 反例(未溢出侧):伤害**小于**满血时,hpLoss 必须等于伤害本身。
+     ⚠ 这里我自己先写错过一次:Lv20 + 712 打出 65,而绵羊满血只有 60
+     ⇒ 那**本身就是溢出情形**,钳制理应生效(hpLoss=60),不是反例。
+     要测「未溢出时钳制不生效」,必须让 finalDamage 严格小于满血。 */
+  const full = attackWorld('mob_sheep');
+  const fullRt = full.mobHost.runtimeOf('mob_sheep')!;
+  const rFull = full.attackMob('p1', 'mob_sheep', { level: 1, weaponId: 711 })!;
+  ok(rFull.result.finalDamage < 60,
+    `前置:本次 finalDamage=${rFull.result.finalDamage} < 满血 60(这才是真正的未溢出情形)`);
+  eq(rFull.hpLoss, rFull.result.finalDamage,
+    `反例:未溢出时 hpLoss(${rFull.hpLoss}) = finalDamage(${rFull.result.finalDamage}) —— 钳制不生效`);
+  eq(fullRt.hp, 60 - rFull.result.finalDamage, '反例:HP 按 finalDamage 全额扣除');
+
+  /* 再补一条:伤害**恰好等于**满血时的边界(既不算溢出、也不该被削)。 */
+  const exact = attackWorld('mob_sheep');
+  const exactRt = exact.mobHost.runtimeOf('mob_sheep')!;
+  const rExact = exact.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 })!;
+  eq(rExact.result.finalDamage, 65, '边界:该组合恰好打出 65 > 60,故属溢出侧');
+  eq(rExact.hpLoss, 60, '边界:溢出侧 hpLoss = 满血 60(与 finalDamage 65 不等,钳制生效)');
+  eq(exactRt.hp, 0, '边界:一次打死,HP 归 0');
+});
+
+test('生产接线17:装配层漏传 wearing 时退化为裸装,不抛异常', () => {
+  /* ## 守什么
+   *
+   * `attackMob` 由网络层调用(不在 tick 路径上),但**装配层漏传 `wearing`**
+   * 会走到 `wearingOf()`。第一版写的是 `p ? p.wearing : []` ——
+   * 只覆盖「找不到玩家」,**不覆盖「玩家存在但 `wearing` 是 `undefined`」**,
+   * 于是 `[...wearing]` 抛 `TypeError: wearing is not iterable`。
+   *
+   * 实测该反例:显式传 `wearing: undefined` 即触发。
+   * 本仓的取舍是「生产路径上不 throw」⇒ 应**退化为按裸装结算**
+   * (玩家看得见伤害数字变化),而不是让整次攻击崩掉。 */
+  const s = new WorldSim({ sizeCells: 48 });
+  s.addPlayer('p1', 24, 24);
+  /* 刻意构造「玩家已登记、但 wearing 字段缺失」的畸形输入。 */
+  s.setMobPlayers([{
+    id: 'p1', x: 24, y: 24, z: 0, facingDeg: 0, afk: false,
+    heldItem: 0, wearing: undefined as unknown as number[], playingInstrument: false,
+  }]);
+  s.addMob('mob_sheep', 'MEADOW', 25, 24);
+
+  /* 正例:不抛异常,且按裸装算出伤害。 */
+  let threw: string | null = null;
+  let r: ReturnType<typeof s.attackMob> = null;
+  try {
+    r = s.attackMob('p1', 'mob_sheep', { level: 10 });
+  } catch (err) {
+    threw = (err as Error).message;
+  }
+  eq(threw, null, `wearing 缺失时不抛异常(实际:${threw ?? '无异常'})`);
+  ok(r !== null, 'wearing 缺失时仍返回结算结果(退化为裸装,不是中断)');
+  ok(r!.result.base > 0, `裸装仍算出第 1 步伤害 ${r!.result.base}`);
+
+  /* 反例:显式传空数组与缺字段应得到**同一个**结果(两条退化路径一致)。 */
+  const bare = attackWorld('mob_sheep', { wearing: [] });
+  const rBare = bare.attackMob('p1', 'mob_sheep', { level: 10, wearing: [] })!;
+  eq(r!.result.base, rBare.result.base, '缺 wearing 与传空数组等价(都按裸装)');
+
+  /* 对照:正常装配仍能拿到装备(退化不能把正常路径也吃掉)。 */
+  const okWorld = attackWorld('mob_sheep', { wearing: [711, 728] });
+  const rOk = okWorld.attackMob('p1', 'mob_sheep', { level: 10 })!;
+  ok(rOk.result.base > rBare.result.base,
+    `对照:正常 wearing 下第 1 步更高(${rBare.result.base} → ${rOk.result.base}),退化不影响正常路径`);
+});
 
 /* ═══════════════════════ 一、装备配表完整性 ═══════════════════════ */
 

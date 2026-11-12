@@ -17,7 +17,7 @@
  */
 
 import { OBJ_MASK } from '../../../shared/types/tile.ts';
-import { TileGrid } from './grid.ts';
+import { type TileGridLike } from './grid.ts';
 
 /** 四向掩码单 bit 常量。 */
 export const MASK_N = 0b0001;
@@ -167,7 +167,7 @@ export function maskOf(n: boolean, e: boolean, s: boolean, w: boolean): number {
  * 越界邻居一律视为「不连接」,保证边界墙不会错误连到世界外。
  */
 export function sampleMask(
-  grid: TileGrid,
+  grid: TileGridLike,
   x: number,
   y: number,
   isSame: (objId: number, x: number, y: number) => boolean,
@@ -185,7 +185,7 @@ export function sampleMask(
 
 /** 单体 Auto-Tile:直接在网格上取 (x,y) 的结果。 */
 export function autoTileAt(
-  grid: TileGrid,
+  grid: TileGridLike,
   x: number,
   y: number,
   isSame: (objId: number, x: number, y: number) => boolean,
@@ -204,7 +204,7 @@ export interface AutoTileCell extends AutoTileResult {
  * 复杂度 O(W·H),单格常数 5 次位与 + 2 次表查,512×512 约 26 万格。
  */
 export function autoTileAll(
-  grid: TileGrid,
+  grid: TileGridLike,
   isSelf: (objId: number, x: number, y: number) => boolean,
   cfg: AutoTileConfig = DEFAULT_AUTOTILE_CONFIG,
 ): AutoTileCell[] {

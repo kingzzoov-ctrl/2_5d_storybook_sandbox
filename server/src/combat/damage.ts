@@ -41,6 +41,57 @@ export const TELEGRAPH_MIN_SEC = 0.6;
 /** 命中最长距离容差,超过则本次攻击不结算 */
 export const MAX_REACH_TOLERANCE = 1.5;
 
+/* ───────────────── 生物战斗面板的派生系数(冻结层缺这几项)───────────────── */
+
+/**
+ * 生物护甲的等级线性派生系数。
+ *
+ * ## 为什么是「派生」而不是「查表」
+ *
+ * 冻结层 `MobDef` 只有 `{id,name,biome,behavior,level,hp,exp,drops,note}` ——
+ * **没有 `def`、没有 `element`、没有 `crystalArmor`**;手册里也没有怪物的防御表
+ * (grep `防御|护甲|晶甲` 命中的全是**物品**数值,如「616 草帽 防御+2」,
+ * 没有一条是生物的)。而 `TargetProfile` 这四项都是必需输入。
+ * ⇒ 「怪物的防御从哪来」只能由服务端派生,**不能**去改冻结层补字段。
+ *
+ * ## 为什么刻意与 `vitals.ts` 取同一组系数
+ *
+ * 本仓「怪打玩家」方向已经是纯等级线性(`vitals.ts`):
+ *   `MOB_HIT_BASE + MOB_HIT_PER_LEVEL × (lv − 1)` = `6 + 2/lv`
+ * 这里让「玩家打怪」的护甲走**同一形式、同一组数值**,两条伤害方向在
+ * **口径上可互相换算**。两个方向**不共用代码**(输入类型无交集:见
+ * `docs/DAMAGE-LOOP.md`),能共享的本来就只有口径 —— 另造一套会让同一个
+ * 平衡问题在两条路上各说各话。
+ *
+ * ⚠ **这是派生规则,不是手册硬数值。属平衡决策,待 owner 批准。**
+ */
+export const MOB_DEF_BASE = 6;
+/** 每级增量。与 `vitals.MOB_HIT_PER_LEVEL` 同值同量纲(整数点)。 */
+export const MOB_DEF_PER_LEVEL = 2.0;
+/** 生物质量默认 1(物理刚体 `physics.spawn` 默认即 1,击退换算按此)。 */
+export const MOB_MASS_DEFAULT = 1.0;
+
+/**
+ * 生物自身的元素属性表 —— **只收名称/行为里明确带元素语义的生物**。
+ *
+ * 未列出的生物一律 `Element.NONE`(元素矩阵对 NONE 恒 ×1,即无克制)。
+ * 刻意**不**「顺手给每只怪分配一个元素」:元素矩阵是 6×6 的克制关系,
+ * 凭空赋值等于凭空发明平衡。
+ *
+ * 收录依据(逐条可查证):
+ * - `mob_lava_elem` 熔炉赤焰火灵 —— 名称含「赤焰火灵」,且 `BeetleAi` 同级
+ *   的 `LavaElemAi` 自身每 0.5s 把脚下 3×3 改写为火炭砖、吐 2.6 格火环;
+ * - `mob_thunder_sprite` 雷云闪电球 —— 名称含「雷云」;
+ * - `mob_slime_green` 甜莓果冻怪 —— 名称含「果冻怪」,`Element.SLIME` 即为其设。
+ *
+ * ⚠ **待 owner 批准**(平衡决策)。
+ */
+export const MOB_ELEMENT_BY_ID: ReadonlyMap<string, Element> = new Map<string, Element>([
+  ['mob_lava_elem', Element.FIRE],
+  ['mob_thunder_sprite', Element.LIGHTNING],
+  ['mob_slime_green', Element.SLIME],
+]);
+
 export const DamageSource = {
   NORMAL_ATTACK: 'NORMAL_ATTACK',
   SKILL: 'SKILL',
@@ -113,6 +164,58 @@ export function targetFromStats(
     reflectMul: stats.reflectMul,
     dodgeRate: stats.dodgeRate,
     mass: 1.0,
+    ...patch,
+  });
+}
+
+/**
+ * 由冻结层 `MobDef` 派生「受击方档案」—— 「玩家 → 生物」方向的唯一入口。
+ *
+ * ## 为什么要这个函数(它是 task-33 接线缺的那一环)
+ *
+ * `computeDamage` 第二参数要 `TargetProfile`(13 个字段),而 `MobDef` 只有
+ * `{id,name,biome,behavior,level,hp,exp,drops,note}` —— **只有 4 个能用**
+ * (`id`/`name`/`hp`)。冻结层不能改,所以缺的 9 项必须在这里补。
+ *
+ * ## 职责边界:`computeDamage` 管通用八步,生物 AI 管个体特性
+ *
+ * 这是本函数**刻意留空**很多字段的理由 —— 不是没做,是**避免双重结算**:
+ *
+ * | 字段 | 谁负责 | 为什么 |
+ * | :--- | :--- | :--- |
+ * | `def` / `element` | **本函数**(派生) | 冻结层完全没有这两项 |
+ * | `dmgReduce` / `reflectMul` / `dodgeRate` | **留 0,交给 AI** | 见下 |
+ * | `shield` / `crystalArmor` | **留空,交给 AI** | 见下 |
+ *
+ * 实测:**手册/行为里记载的个体特性,全部已经在各生物的 `onDamage` 里实现了** ——
+ * 竹林剑客傀儡的正面 100% 格挡(`samurai_block`)、远古发条重骑的正面减伤
+ * (`knight_front_plate`)、温泉卡皮巴拉的反弹爱心(`capybara_heart_reflect`)、
+ * 紫晶重甲虫的正面 ±75° 减伤 80%(`beetle_front_armor`)都是。
+ *
+ * 若这里**再**把 `crystalArmor` 或 `dmgReduce` 也设上,同一次攻击会被减两遍
+ * (公式减一次、AI 的 `onDamage` 再减一次)—— 那是**静默的数值错误**:
+ * 不抛异常、只是伤害莫名其妙偏低,而且「减伤 80%」会变成 96%。
+ *
+ * 所以本函数只补**通用、无个体差异**的两项(`def`/`element`),
+ * 个体特性一律留给生物自己的 AI。调用链:
+ * `computeDamage`(通用八步)→ `mobHost.damage`(个体 `onDamage`)。
+ *
+ * @param def   冻结层的生物定义
+ * @param patch 覆盖(供特例与测试注入受控夹具;缺省则全部走派生)
+ */
+export function mobCombatProfile(
+  def: { id: string; name: string; level: number; hp: number },
+  patch: Partial<TargetProfile> = {},
+): TargetProfile {
+  const level = Math.max(1, Math.trunc(def.level));
+  return createTarget({
+    id: def.id,
+    name: def.name,
+    hp: def.hp,
+    maxHp: def.hp,
+    def: MOB_DEF_BASE + MOB_DEF_PER_LEVEL * (level - 1),
+    element: MOB_ELEMENT_BY_ID.get(def.id) ?? Element.NONE,
+    mass: MOB_MASS_DEFAULT,
     ...patch,
   });
 }

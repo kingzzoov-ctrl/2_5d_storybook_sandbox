@@ -33,7 +33,18 @@ export const BOSS_LIST: readonly BossDef[] = [
     baseHp: 4800,
     summonItem: 735,
     exp: 1600,
+    /* ⚠️ CR-16:`loot` 保持字节级不变(它被 contentFingerprints 的 bosses 分区哈希)。
+       手册 L496 的战利品列是「703 河狸钢牙×10 + 自动伐木机甲宠物图纸」:
+        · 数量 10 → `lootQty`(缺省 1,故必须显式给,且与 loot 等长);
+        · 「自动伐木机甲宠物图纸」→ 320 表内 0 命中,登记为 `lootAbstract`;
+        · `437 叮当蒸汽小火车头` → 手册 L313 是**可造载具**,不是战利品 ⇒ 记 `lootDeviations`,
+          由 rollPersonalLoot 在生产掉落里过滤掉(不删 loot,删了会动指纹)。 */
     loot: [703, 437],
+    lootQty: [10, 1],
+    lootAbstract: ['自动伐木机甲宠物图纸'],
+    lootDeviations: [
+      { itemId: 437, reason: '手册 L496 战利品列为「703×10 + 自动伐木机甲宠物图纸」;437 在 L313 是可造载具(寒铁金属锭×6+黄铜金属锭×4),非战利品' },
+    ],
     phases: [
       { hpThreshold: 1.0, name: 'P1 锯木机甲冲撞', telegraph: '横贯战场的窄长红色矩形(宽 2 格,长度 12 格)', skill: '驾驶木质锯木机甲横冲直撞,沿途发射旋转圆木滚筒。' },
       { hpThreshold: 0.5, name: 'P2 筑坝龟缩', telegraph: '战场中央 5×3 的灰色木坝掩体区', skill: '在战场中央快速搭建坚固木坝,自己躲在坝后发射松果迫击炮。' },
@@ -104,6 +115,11 @@ export const BOSS_LIST: readonly BossDef[] = [
      * 按「抽象奖励」处理、不塞进物品表(否则破坏 320 件的内容锁)。
      */
     loot: [609, 613],
+    /* CR-16:手册 L500 的战利品列是「皇家甜点主题全套城堡图纸与姜饼人随从」——
+       两件在 320 表内均 0 命中 ⇒ 登记为 `lootAbstract`(CR-15 已判明它们不属物品表)。
+       `609 庆典三层奶油蛋糕` 是 CR-15 给 739 自反馈换上的替代件,手册没写数量 ⇒ 1。 */
+    lootQty: [1, 1],
+    lootAbstract: ['皇家甜点主题全套城堡图纸', '姜饼人随从'],
     phases: [
       { hpThreshold: 1.0, name: 'P1 巧克力浆泼洒', telegraph: '大面积紫色减速沼泽预警区(半径 4 格)', skill: '泼洒大面积减速巧克力浆,投掷会滚动的巨型焦糖球。' },
       { hpThreshold: 0.5, name: 'P2 饥饿狂暴', telegraph: '指向手持食物玩家的橙色锁定圈(半径 1.5 格)', skill: '肚子饿了开始狂暴追咬手持食物的玩家。' },
@@ -118,7 +134,15 @@ export const BOSS_LIST: readonly BossDef[] = [
     baseHp: 26000,
     summonItem: 740,
     exp: 12000,
+    /* ⚠️ CR-16:手册 L501 战利品列是「117 极光星辰碎片×15 + 718 极光星辰魔导师杖」。
+       · 117 的数量 15 → `lootQty`;
+       · `440 八人云海探险飞艇` → L316 是**可造载具**,L501 的破防手段写「全队**驾驶** 440
+         飞艇贴近云鲸」—— 它是手段不是掉落 ⇒ 记 `lootDeviations` 并在生产掉落里过滤。 */
     loot: [117, 718, 440],
+    lootQty: [15, 1, 1],
+    lootDeviations: [
+      { itemId: 440, reason: '手册 L501 战利品列为「117×15 + 718」;440 在 L316 是可造载具(秘银魔导锭×6+蓬松云朵布×10),L501 只把它当驾驶手段,非战利品' },
+    ],
     phases: [
       { hpThreshold: 1.0, name: 'P1 云浪巡游', telegraph: '环绕浮空岛外围的宽环状云浪预警(环宽 3 格)', skill: '环绕浮空岛外围云海巡游,掀起云浪并降下追踪落雷。' },
       { hpThreshold: 0.55, name: 'P2 高空星河吐息', telegraph: '从 Z=2 高空指向地面的一条巨大红色扇形(60°,长 14 格)', skill: '飞升至高空 Z=2 蓄力星河吐息。' },
@@ -133,7 +157,12 @@ export const BOSS_LIST: readonly BossDef[] = [
     baseHp: 38000,
     summonItem: 741,
     exp: 25000,
+    /* ⚠️ CR-16:手册 L502 战利品列是「708 永动发条太阳核 + 723 克洛诺斯磁暴齿轮炮
+       + 纯金通关纪念碑」。前两件 loot 已有;「纯金通关纪念碑」在 320 表内 0 命中
+       ⇒ 登记为 `lootAbstract`(不塞物品表,否则破坏 320 件内容锁)。 */
     loot: [708, 723],
+    lootQty: [1, 1],
+    lootAbstract: ['纯金通关纪念碑'],
     phases: [
       { hpThreshold: 1.0, name: 'P1 时间激光指针', telegraph: '从中心顺时针旋转的细长红色指针(宽 1 格,长 12 格,角速度恒定)', skill: '发射 360° 顺时针旋转的时间激光指针。' },
       { hpThreshold: 0.65, name: 'P2 时间回溯护盾', telegraph: '四角红/蓝/黄/绿导电座的独立指示环 + 中央电磁脉冲塔', skill: '开启时间回溯护盾,8 秒内未切断供能则回血。' },

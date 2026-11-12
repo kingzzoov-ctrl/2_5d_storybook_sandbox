@@ -12,7 +12,7 @@
 
 import { OBJ_MASK, packTile, unpackTile } from '../../../shared/types/tile.ts';
 import { ROOM_RECIPES } from '../../../shared/constants/bosses.ts';
-import { TileGrid, DIR_DX, DIR_DY } from './grid.ts';
+import { TileGrid, DIR_DX, DIR_DY, type TileGridLike } from './grid.ts';
 import { isBarrier, isDoor, isWindow, isWall, isRoof } from './autotile.ts';
 
 /** 单房间默认上限:100 格(手册 §3.8 动态房间面积约束)。 */
@@ -169,7 +169,7 @@ export const ALL_REQUIRED_IDS: readonly number[] = Object.freeze(
 
 /* ─────────────────── 数据抽取 ─────────────────── */
 
-function extractObjects(grid: TileGrid, cells: readonly RoomCell[]): Map<number, number> {
+function extractObjects(grid: TileGridLike, cells: readonly RoomCell[]): Map<number, number> {
   const m = new Map<number, number>();
   for (const c of cells) {
     const obj = (grid.get(c.x, c.y) & OBJ_MASK) >>> 16;
@@ -178,7 +178,7 @@ function extractObjects(grid: TileGrid, cells: readonly RoomCell[]): Map<number,
   return m;
 }
 
-function extractFloors(grid: TileGrid, cells: readonly RoomCell[]): Set<number> {
+function extractFloors(grid: TileGridLike, cells: readonly RoomCell[]): Set<number> {
   const s = new Set<number>();
   for (const c of cells) {
     const f = unpackTile(grid.get(c.x, c.y)).floor;
@@ -194,7 +194,7 @@ function extractFloors(grid: TileGrid, cells: readonly RoomCell[]): Set<number> 
  * 复杂度 O(A),A 为泛洪面积(≤ maxArea + 1),每格检查 4 个邻居 → 常数 4。
  */
 export function floodRoom(
-  grid: TileGrid,
+  grid: TileGridLike,
   ax: number,
   ay: number,
   options: ScanOptions = DEFAULT_SCAN_OPTIONS,
@@ -392,7 +392,7 @@ export function floodRoom(
 
 /** 已访问位图:全场扫描时避免重复处理同一区域。 */
 export function scanRooms(
-  grid: TileGrid,
+  grid: TileGridLike,
   options: ScanOptions = DEFAULT_SCAN_OPTIONS,
 ): RoomInfo[] {
   const width = grid.width;
@@ -505,7 +505,7 @@ export function identifyRoom(
  * 过滤条件集中在 `isRecognizable`,不在调用点重复书写。
  */
 export function identifyAllRooms(
-  grid: TileGrid,
+  grid: TileGridLike,
   options: ScanOptions = DEFAULT_SCAN_OPTIONS,
   recipes: readonly RoomRecipeDef[] = NORMALIZED_RECIPES,
 ): RoomIdentity[] {
@@ -533,7 +533,7 @@ export interface BoxRoomSpec {
  * 在网格上盖一间矩形小屋:四壁 `wallId`、内部铺 `floorId`、南墙开门。
  * 内部尺寸 = (w−2) × (h−2),默认 w=h=7 → 25 格内部,落在 100 格上限内。
  */
-export function stampBoxRoom(grid: TileGrid, spec: BoxRoomSpec): void {
+export function stampBoxRoom(grid: TileGridLike, spec: BoxRoomSpec): void {
   const { x, y, w, h, wallId, floorId } = spec;
   for (let dy = 0; dy < h; dy += 1) {
     for (let dx = 0; dx < w; dx += 1) {
@@ -554,14 +554,14 @@ export function stampBoxRoom(grid: TileGrid, spec: BoxRoomSpec): void {
 }
 
 /** 挖掉一个围合格,制造「缺一个角」的漏墙世界。 */
-export function punchHole(grid: TileGrid, x: number, y: number): void {
+export function punchHole(grid: TileGridLike, x: number, y: number): void {
   const f = unpackTile(grid.get(x, y));
   f.obj = 0;
   grid.set(x, y, packTile(f));
 }
 
 /** 在房间内部放一件物体(保持地砖不变)。 */
-export function placeInRoom(grid: TileGrid, x: number, y: number, objId: number): void {
+export function placeInRoom(grid: TileGridLike, x: number, y: number, objId: number): void {
   grid.setObj(x, y, objId);
 }
 

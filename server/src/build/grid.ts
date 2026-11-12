@@ -111,3 +111,71 @@ export class TileGrid {
     return this.data.slice();
   }
 }
+
+/**
+ * `TileGrid` 的**结构子集** —— `rooms.ts` / `autotile.ts` / `wiring_view.ts`
+ * 实际只用到这 6 个成员(实测,见下方注),因此生产侧的 `WorldGrid`
+ * 可以**不复制任何数据**地直接满足它。
+ *
+ * ## 为什么必须是「视图」而不是「把 WorldGrid 拷进 TileGrid」
+ *
+ * `TileGrid` 的 `data` 是 **private** ⇒ TS 结构化类型不成立(名义类型),
+ * 生产 `WorldGrid` 无法直接当 `TileGrid` 用。看似最省事的做法是:
+ * 每次调用 `scanRooms` 前把 `WorldGrid` 拷进一个 `TileGrid`。
+ *
+ * **那是错的**,而且是本仓反复出现过的那一类错误:
+ *   - 拷贝一次 = 造出**第二份真相**;地形随后每帧都在变,
+ *     而 `rooms()` 会读到过期快照 ⇒ 表现成「墙都拆了还报着那间房」
+ *     (WT-03-61 正是钉这个);
+ *   - `WorldSim` 的世界是**稀疏 Chunk**(`Map`),没有固定 `width × height`,
+ *     按 `sizeCells` 全量拷贝是每帧 O(sizeCells²),512×512 就是 26 万格/帧 ——
+ *     只为了一次房间识别而把整张地图复制一遍。
+ *
+ * ⇒ 改用**结构化的只读视图**:`grid` 参数放宽到下面这个接口,
+ *   由 `WorldSim` 传一个只转发到 `WorldGrid` 的对象(与
+ *   `world_sim.ts` 里 `physics.terrain` / `mobWorldAdapter` 的既有做法同构)。
+ *   零拷贝、零第二份真相,越界语义与 `TileGrid` 对齐(读越界得 `EMPTY_TILE`)。
+ *
+ * ⚠️ 实测依据(`server/src/build/**` 内 `grid.<member>` 的全部用法):
+ *   `rooms.ts` → get / set / setObj / inBounds / width / height
+ *   `autotile.ts` → get / inBounds / width / height
+ *   `wiring_view.ts` → get / inBounds / width / height
+ *   `blueprint.ts` → get / set
+ *   即 `objAt` / `index` / `fillRect` / `blit` / `forEach` / `countWhere` / `toArray`
+ *   **一次都没用到** ⇒ 接口只收窄到这 6 个,收得太宽反而会逼出无意义的实现。
+ */
+export interface TileGridLike {
+  readonly width: number;
+  readonly height: number;
+  /** 读整格(32 位打包);越界返回 `EMPTY_TILE` */
+  get(x: number, y: number): number;
+  /** 写整格;越界静默丢弃 */
+  set(x: number, y: number, v: number): void;
+  /** 写 OBJ 层,其余位保留 */
+  setObj(x: number, y: number, objId: number): void;
+  inBounds(x: number, y: number): boolean;
+}
+
+/**
+ * 把可写的 `TileGridLike` 适配成 `TileGrid` 的**只读**代理。
+ *
+ * 用途:纯读的消费点(房间识别 / Auto-Tile / 布线视图)接受 `TileGrid`,
+ * 而生产侧只有 `WorldGrid`。本函数**不复制数据** —— 所有读写都转发到 `src`,
+ * 因此读到的永远是当前帧的真实地形。
+ *
+ * 注意:返回的对象**不是** `TileGrid` 实例(类型上是,运行期不是),
+ * 只应传给把它当结构用的纯读函数。任何 `instanceof TileGrid` 的判断都会失败,
+ * 因此刻意不导出 `data` / `blit` / `toArray` 这些依赖内部数组的成员 —— 
+ * 调用它们会抛错而不是静默给出空数据。
+ */
+export function asTileGrid(src: TileGridLike): TileGrid {
+  const shim = {
+    width: src.width,
+    height: src.height,
+    get: (x: number, y: number) => src.get(x, y),
+    set: (x: number, y: number, v: number) => src.set(x, y, v),
+    setObj: (x: number, y: number, id: number) => src.setObj(x, y, id),
+    inBounds: (x: number, y: number) => src.inBounds(x, y),
+  };
+  return shim as unknown as TileGrid;
+}

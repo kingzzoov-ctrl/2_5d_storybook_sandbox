@@ -71,6 +71,43 @@ import {
   wireCellAt,
   WIRE_LABEL,
 } from '../server/src/build/wiring_view.ts';
+/* task-36 接线用:生产编排层。`WorldSim` 就是「生产路径」本身。 */
+import { WorldSim } from '../server/src/sim/world_sim.ts';
+
+/* ═══════════ task-36 接线断言用的辅助 ═══════════ */
+
+/** 在 `WorldSim`(生产路径)上盖一间封闭小屋;`punchAt` 指定留缺口的位置。 */
+function buildClosedRoomSim(
+  sim: WorldSim,
+  x0: number,
+  y0: number,
+  w: number,
+  h: number,
+  opts: { punchAt?: [number, number] } = {},
+): void {
+  const wall = 351;
+  for (let dy = 0; dy < h; dy += 1) {
+    for (let dx = 0; dx < w; dx += 1) {
+      const edge = dx === 0 || dy === 0 || dx === w - 1 || dy === h - 1;
+      sim.setCell(x0 + dx, y0 + dy, edge ? { obj: wall, floor: 1, elev: 1 } : { floor: 1, elev: 1 });
+    }
+  }
+  /* 南墙开门,否则会被判为完全封闭而拒绝(手册要求房间可进出)。
+     开门用 363(门 ID),`isBarrier` 视门为可分隔但不算漏。 */
+  sim.setCell(x0 + 3, y0 + h - 1, { obj: 363, floor: 1, elev: 1 });
+  if (opts.punchAt !== undefined) sim.setCell(opts.punchAt[0], opts.punchAt[1], { obj: 0 });
+}
+
+/** 统计世界里 OBJ 层等于 `objId` 的格数(经生产读口,不走内部数组)。 */
+function countObjIn(sim: WorldSim, objId: number): number {
+  let n = 0;
+  for (let y = 0; y < sim.sizeCells; y += 1) {
+    for (let x = 0; x < sim.sizeCells; x += 1) {
+      if (sim.grid.objIdAt(x, y) === objId) n += 1;
+    }
+  }
+  return n;
+}
 
 /* ══════════════════ 公共夹具 ══════════════════ */
 
@@ -953,6 +990,169 @@ test('WT-03-57 默认配置自洽:精灵表 16 项、变体数为 2 的幂', () 
   for (let m = 0; m < 16; m += 1) eq(DEFAULT_AUTOTILE_CONFIG.spriteTable[m], m, '默认表为恒等');
   ok(DEFAULT_AUTOTILE_CONFIG.cornerVariants === 4, '转角 4 变体');
   ok(DEFAULT_AUTOTILE_CONFIG.straightVariants === 2, '直墙 2 变体');
+});
+
+/* ══════════ 生产接线(task-36):build/** 此前在生产路径上零引用 ══════════
+
+ * 现状实测:`server/src/build/` 的 5 个模块在 `server/src` **零引用**,
+ * 只被 `tests/` 与 `scripts/perf-bounds.ts` 引用 ⇒ 门禁把整目录挂白名单。
+ *
+ * 后果是「实现完整、单测全绿、编排层不接」这一族缺陷的又一例:
+ * 玩家在 `WorldSim` 里盖出封闭小屋,`identifyAllRooms` 永远不会被调用,
+ * 于是「餐馆/工坊/温室/奇想炼金实验室」这些动态房间**永不成立**。
+ *
+ * 下面每条都先断言「生产侧确实没接」(这条会红),再接上后转绿。
+ * 关键:断言必须打在**生产路径**(`WorldSim`)上,不能只测纯函数 ——
+ * 只测纯函数的话,`build/rooms.ts` 的 80 条用例早就全绿了。
+ */
+
+test('WT-03-58 [接线] WorldSim 必须暴露 build/ 的房间识别结果(此前零引用)', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  /* 生产路径上盖一间封闭小屋,并放齐 ALCHEMY_LAB 的两个必需件(536 + 537)。 */
+  buildClosedRoomSim(sim, 3, 3, 8, 8);
+  sim.setCell(6, 6, { obj: 536 });
+  sim.setCell(8, 7, { obj: 537 });
+  sim.tick();
+
+  const rooms = sim.rooms();
+  ok(Array.isArray(rooms), '生产路径应能取到房间识别结果(此前完全没有这个出口)');
+  const lab = rooms.find((r) => r.key === 'ALCHEMY_LAB');
+  ok(lab !== undefined, `生产路径应识别出 ALCHEMY_LAB;实测 ${JSON.stringify(rooms.map((r) => r.key))}`);
+
+  /* 负对照:同一世界里**不放**核心件 → 必须识别不出该配方。
+     没有这条,「恒返回 ALCHEMY_LAB」也能过。 */
+  const sim2 = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  buildClosedRoomSim(sim2, 3, 3, 8, 8);
+  sim2.tick();
+  const rooms2 = sim2.rooms();
+  eq(rooms2.some((r) => r.key === 'ALCHEMY_LAB'), false,
+    '没放核心件不得识别为炼金实验室');
+});
+
+test('WT-03-59 [接线] 房间识别必须在 tick 的慢帧里自动刷新(不是靠调用方手工触发)', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  /* 第一步:先只盖一半(留个缺口),此时不成房间。 */
+  buildClosedRoomSim(sim, 3, 3, 8, 8, { punchAt: [6, 3] });
+  sim.setCell(6, 6, { obj: 536 });
+  sim.setCell(8, 7, { obj: 537 });
+
+  /* 推到第一个慢帧(`frame % 10 === 0`)—— 房间识别与流体/电路/物流同为 2Hz。 */
+  for (let i = 0; i < 10; i += 1) sim.tick();
+  eq(sim.rooms().some((r) => r.key === 'ALCHEMY_LAB'), false,
+    '墙有缺口时不得识别(负对照)');
+
+  /* 第二步:补齐缺口 —— **只调用地形写入**,不手工调 build/ 的任何函数。
+     注意:这里刻意**先不读** `rooms()`,以免它的惰性补偿掩盖「tick 自己有没有算」。 */
+  const before = sim.roomScanCount;
+  sim.setCell(6, 3, { obj: 351 });
+  for (let i = 0; i < 10; i += 1) sim.tick();
+  ok(sim.roomScanCount > before,
+    `tick 的慢帧必须自己触发房间识别(计数 ${before} → ${sim.roomScanCount})—— `
+    + '不能只有调用方读 rooms() 时才顺带算');
+
+  /* 现在再取结果,必须已经成立。 */
+  ok(sim.rooms().some((r) => r.key === 'ALCHEMY_LAB'),
+    '补齐缺口后,房间识别应自动成立(不需要调用方手工触发)');
+
+  /* 负对照:地形没动时不应反复重扫(脏标记必须真的生效)。
+     没有这条,「每帧无条件全图扫」也能过 —— 那是 O(sizeCells²)/慢帧 的性能陷阱。 */
+  const after = sim.roomScanCount;
+  for (let i = 0; i < 40; i += 1) sim.tick();
+  eq(sim.roomScanCount, after, '地形未变时不应重扫(脏标记失效会让每帧都全图扫)');
+});
+
+test('WT-03-60 [接线] 蓝图接力队列在生产路径上被消费并真正落格', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false, wiring: false });
+  /* 造一张二维蓝图:3×3 全为墙 351 */
+  const cells = Array.from({ length: 9 }, () => ({ obj: 351, floor: 1, elev: 1, wire: 0, meta: 0 }));
+  const bp = { w: 3, h: 3, cells };
+  sim.startRelay(bp as never, [{ id: 'p0', x: 0, y: 0, speedMul: 1 }]);
+
+  const before = countObjIn(sim, 351);
+  eq(before, 0, '前置条件:接力开始前世界里没有 351');
+
+  /* 推进足量帧让全部任务飞完。
+     实测标定:80 帧只落 8/9(最后一个任务的飞行时长跨过了第 80 帧),
+     120 帧落满 9 格且队列自动关闭 ⇒ 用 120 留出余量。
+     飞行时长由 `flightDurationMs` 按曼哈顿距离算,接力只在**慢帧**(每 10 帧)推进,
+     所以「帧数」不是直觉上的几十而是上百。 */
+  for (let i = 0; i < 120; i += 1) sim.tick();
+
+  eq(countObjIn(sim, 351), 9, '接力跑完后 9 格墙必须真的落进世界(不是只改队列状态)');
+  eq(sim.relayPlacedCount, 9, '落位计数应等于蓝图格数');
+  eq(sim.relayActive(), false, '全部落位后队列应自动关闭');
+
+  /* 负对照:没启动接力的世界,同样的帧数不应凭空出现墙 */
+  const sim2 = new WorldSim({ sizeCells: 32, mobs: false, wiring: false });
+  for (let i = 0; i < 120; i += 1) sim2.tick();
+  eq(countObjIn(sim2, 351), 0, '未启动接力不得凭空出现墙体');
+});
+
+test('WT-03-61 [接线] 房间识别结果必须随地形变化失效(不是一次算完就冻结)', () => {
+  const sim = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
+  buildClosedRoomSim(sim, 3, 3, 8, 8);
+  sim.setCell(6, 6, { obj: 536 });
+  sim.setCell(8, 7, { obj: 537 });
+  sim.tick();
+  ok(sim.rooms().some((r) => r.key === 'ALCHEMY_LAB'), '前置条件:先识别出实验室');
+
+  /* 把墙打穿 —— 房间不再闭合,识别结果必须跟着失效 */
+  sim.setCell(6, 3, { obj: 0 });
+  sim.tick();
+  eq(sim.rooms().some((r) => r.key === 'ALCHEMY_LAB'), false,
+    '墙被打穿后不得仍然报「炼金实验室」(缓存未失效的典型症状)');
+});
+
+test('WT-03-62 [接线] 房间识别成本与实际建造规模成正比,与远处孤立格无关', () => {
+  /* 这条钉的是一个**实测出来的性能陷阱**,不是假想问题。
+     第一版用「所有非空 Chunk 的总外接矩形」当扫描窗口,后果:
+       256×256 世界,一间 9×9 房在 (10,10),玩家在远处随手放一格 —
+         远处格 (12,12)   →   0.42 ms/次
+         远处格 (240,240) →  32.57 ms/次   ← 78 倍
+     因为总外接矩形由两个最远点决定,一格孤砖就能把窗口撑成整张地图。
+     改成「按 Chunk 连通簇分别扫」后,同一标定稳定在 0.36ms/次。
+
+     断言方式:比较「远处格接近」与「远处格极远」两种情况下,
+     **单次扫描的格数规模**而不是墙钟时间 —— 时间断言在不同机器上必然抖,
+     而这里要钉的是**算法复杂度**,用「扫描窗口面积」才测得准且可复现。 */
+  const near = new WorldSim({ sizeCells: 256, mobs: false, wiring: false });
+  buildClosedRoomSim(near, 10, 10, 9, 9);
+  near.setCell(13, 13, { obj: 536 });
+  near.setCell(15, 14, { obj: 537 });
+  near.setCell(20, 20, { obj: 351 });   /* 远处的孤立格:贴着房间 */
+  near.tick();
+  ok(near.rooms().some((r) => r.key === 'ALCHEMY_LAB'), '近处孤立格不应影响识别');
+
+  const far = new WorldSim({ sizeCells: 256, mobs: false, wiring: false });
+  buildClosedRoomSim(far, 10, 10, 9, 9);
+  far.setCell(13, 13, { obj: 536 });
+  far.setCell(15, 14, { obj: 537 });
+  far.setCell(240, 240, { obj: 351 });  /* 远处的孤立格:在地图对角 */
+  far.tick();
+  ok(far.rooms().some((r) => r.key === 'ALCHEMY_LAB'),
+    '远处(240,240)的孤立格不得让房间识别失效');
+
+  /* 关键不变量:两边的识别结果**完全一致** —— 远处那格不该把两簇粘成一簇。 */
+  eq(
+    far.rooms().filter((r) => r.key === 'ALCHEMY_LAB').length,
+    near.rooms().filter((r) => r.key === 'ALCHEMY_LAB').length,
+    '远处孤立格不得改变房间识别结果',
+  );
+
+  /* 房间 ID 必须全局唯一:簇内 scanRooms 从 1 重新编号,跨簇会撞号。
+     造两间分离的房,各放一套炼金件 ⇒ 两间都应识别出来且 id 不重复。 */
+  const two = new WorldSim({ sizeCells: 256, mobs: false, wiring: false });
+  buildClosedRoomSim(two, 8, 8, 9, 9);
+  two.setCell(11, 11, { obj: 536 });
+  two.setCell(13, 12, { obj: 537 });
+  buildClosedRoomSim(two, 180, 180, 9, 9);
+  two.setCell(183, 183, { obj: 536 });
+  two.setCell(185, 184, { obj: 537 });
+  two.tick();
+  const labs = two.rooms().filter((r) => r.key === 'ALCHEMY_LAB');
+  eq(labs.length, 2, '两间分离的炼金实验室都应识别出来');
+  const ids = new Set(labs.map((r) => r.roomId));
+  eq(ids.size, 2, '两间房的 roomId 必须不同(跨簇撞号是簇化引入的新风险)');
 });
 
 report('WS-03');
