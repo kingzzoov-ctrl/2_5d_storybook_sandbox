@@ -18,6 +18,8 @@ import {
   scalingCurve, allScalingCurves, rollPersonalLoot, canLoot, orbCountFor,
   fnv1a, seededRoll, RAID_MAX_PLAYERS, SUMMON_ITEM_MIN, SUMMON_ITEM_MAX,
   type RaidParticipant,
+  summonBossWithOffering, makeOfferingPort, selfRecyclingBosses, summonItemsInLoot,
+  SummonReject,
 } from '../server/src/bosses/raid.ts';
 import {
   createBossState, phaseIndexFor, skillWarnGeoms, tickBoss, applyBreak, damageBoss,
@@ -810,6 +812,160 @@ test('W5-38 与群系耦合:8 个 Boss 各归一个群系,祭品表覆盖 8 群�
     }
     eq(b.phases[0].hpThreshold, 1.0, `${b.id} P1 阈值 = 1.0`);
   }
+});
+
+/* ═════════════════════ 9. 祭品消耗(owner 裁决 D-03)═════════════════════ */
+
+/* 基准请求:野外祭坛、正确祭品、2 人。 */
+const OFFER_BASE = {
+  bossId: 'boss_jelly_king', itemId: 734, hasAltar: true,
+  altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+  playerCount: 2, alreadyAlive: false, ownerId: 'u1',
+};
+
+/** 内存库存:单实例,便于精确观察「扣了几个」。 */
+function memPort(initial: number): {
+  port: ReturnType<typeof makeOfferingPort>;
+  held: () => number;
+  restoreCalls: () => number;
+} {
+  let qty = initial;
+  let restores = 0;
+  const port = makeOfferingPort({
+    listOwned: () => (qty > 0 ? [{ instanceId: 'i1', itemId: 734, quantity: qty }] : []),
+    consumeInstance: (_id, n) => {
+      if (qty < n) return false;
+      qty -= n;
+      return true;
+    },
+    restoreInstance: (_id, n) => { restores += 1; qty += n; },
+  });
+  return { port, held: () => qty, restoreCalls: () => restores };
+}
+
+test('W5-39 祭品消耗:召唤成功后持有数 -1', () => {
+  const m = memPort(3);
+  eq(m.held(), 3, '起始 3 个');
+  const r = summonBossWithOffering(OFFER_BASE, m.port);
+  eq(r.ok, true, '召唤成功');
+  eq(r.offeringConsumed, true, '标记为已消耗');
+  eq(m.held(), 2, '**持有数必须降 1** —— 这是本裁决的核心断言');
+  eq(r.reason, SummonReject.OK, '原因 = OK');
+});
+
+test('W5-40 祭品不足:召唤失败且**一个都不扣**', () => {
+  const m = memPort(0);
+  const r = summonBossWithOffering(OFFER_BASE, m.port);
+  eq(r.ok, false, '没祭品不能召唤');
+  eq(r.reason, SummonReject.NO_OFFERING, '原因 = NO_OFFERING');
+  eq(r.offeringConsumed, false, '失败时不得标记已消耗');
+  eq(m.held(), 0, '失败时持有数不变');
+});
+
+test('W5-41 顺序铁律:其它校验失败时**绝不碰库存**', () => {
+  /* 每一种失败原因都必须发生在扣祭品**之前**。
+     这里用「初始有 1 个」——若实现写成先扣后校验,这些用例会看到 held 变 0。 */
+  const cases: { name: string; over: Partial<typeof OFFER_BASE>; reason: string }[] = [
+    { name: '错误祭品', over: { itemId: 735 }, reason: 'WRONG_ITEM' },
+    { name: '无祭坛', over: { hasAltar: false }, reason: 'NO_ALTAR' },
+    { name: '安全区内', over: { altarX: 0, altarY: 0 }, reason: 'SAFE_ZONE' },
+    { name: '人数越界', over: { playerCount: RAID_MAX_PLAYERS + 1 }, reason: 'TOO_MANY_PLAYERS' },
+    { name: '同 Boss 存活', over: { alreadyAlive: true }, reason: 'BOSS_ALIVE' },
+    { name: '未知 Boss', over: { bossId: 'boss_nope' }, reason: 'UNKNOWN_BOSS' },
+  ];
+  for (const c of cases) {
+    const m = memPort(1);
+    const r = summonBossWithOffering({ ...OFFER_BASE, ...c.over }, m.port);
+    eq(r.ok, false, `${c.name}:召唤失败`);
+    eq(r.reason, c.reason, `${c.name}:原因正确`);
+    eq(r.offeringConsumed, false, `${c.name}:不得标记已消耗`);
+    eq(m.held(), 1, `${c.name}:**祭品必须原封不动**(扣了就是先扣后校验)`);
+  }
+});
+
+test('W5-42 并发兜底:countOf 说有、consume 说没有 ⇒ 按 NO_OFFERING 失败', () => {
+  /* 模拟「预检之后、真扣之前被别人抢走」:countOf 恒返回 1,consume 恒失败。
+     若实现只信 countOf,这里会返回 ok=true —— 那正是并发下的重复召唤漏洞。 */
+  const port = {
+    countOf: () => 1,
+    consume: () => false,
+  };
+  const r = summonBossWithOffering(OFFER_BASE, port);
+  eq(r.ok, false, 'consume 失败 ⇒ 召唤不成立(判据只能取 consume 返回值)');
+  eq(r.reason, SummonReject.NO_OFFERING, '原因 = NO_OFFERING');
+  eq(r.offeringConsumed, false, '未消耗');
+  eq(r.scaledHp, 0, '失败不产生血量');
+});
+
+test('W5-43 多实例跨扣失败时真回滚(不留半扣状态)', () => {
+  /* 两个实例各 1 个。要求扣 2 个:第 1 个成功、第 2 个失败 ⇒ 必须把第 1 个补回。
+     这是 makeOfferingPort 里 `applied` + `restoreInstance` 那条路径。 */
+  const inst = [
+    { instanceId: 'a', itemId: 734, quantity: 1 },
+    { instanceId: 'b', itemId: 734, quantity: 1 },
+  ];
+  let restores = 0;
+  let failSecond = true;
+  const port = makeOfferingPort({
+    listOwned: () => inst,
+    consumeInstance: (id, n) => {
+      const row = inst.find((r) => r.instanceId === id)!;
+      if (id === 'b' && failSecond) return false;
+      if (row.quantity < n) return false;
+      row.quantity -= n;
+      return true;
+    },
+    restoreInstance: (id, n) => { restores += 1; inst.find((r) => r.instanceId === id)!.quantity += n; },
+  });
+  eq(port.consume('u1', 734, 2), false, '跨扣失败返回 false');
+  eq(restores, 1, '**必须回滚已扣的 1 个**');
+  eq(inst[0]!.quantity, 1, '实例 a 恢复原状');
+  eq(inst[1]!.quantity, 1, '实例 b 未被改动');
+
+  /* 正对照:让它成功,证明上面不是「恒失败」的假红 */
+  failSecond = false;
+  eq(port.consume('u1', 734, 2), true, '同样代码路径在允许时应成功');
+  eq(inst[0]!.quantity, 0, '实例 a 已扣');
+  eq(inst[1]!.quantity, 0, '实例 b 已扣');
+});
+
+test('W5-44 自反馈漏洞:战利品不得含自身祭品(CR-15 已修复,含正负对照)', () => {
+  /*
+   * ## 这条用例的两种形态
+   *
+   * 修复前(2026-11-11 ~ 2026-11-12):它**故意断言不期望的现状** ——
+   * 「恰好 1 个 Boss 掉自己的祭品(boss_ginger_troll:739)」,
+   * 目的是在 Lead 改冻结层 loot 时立刻变红提醒同步。
+   *
+   * 修复后(CR-15,2026-11-12):改成断言**期望状态 = 0**。
+   * 它的红灯曾精确亮过一次 —— 那正是修复生效的证据:
+   *   `实测恰好 1 个 Boss 掉自己的祭品 期望 1 / 实际 0`
+   *
+   * 这条的**核心价值不在数字**,而在下面的正负对照:它证明检测器
+   * 真能区分「掉」与「不掉」,而不是恒返回空或恒返回全部。
+   */
+  const bad = selfRecyclingBosses();
+  eq(bad.length, 0, '没有任何 Boss 掉自己的祭品(CR-15 已修)');
+
+  /* 负对照:不掉自身祭品的合成 Boss,检测器必须不命中 */
+  const clean = selfRecyclingBosses([
+    { id: 'x', name: 'x', biome: 'DESSERT', level: 1, baseHp: 1, summonItem: 734, exp: 1, loot: [609], phases: [], breakMechanic: '' },
+  ] as never);
+  eq(clean.length, 0, '不掉自身祭品的 Boss 不得被误报');
+
+  /* 正对照:真的掉了,检测器必须报出来 —— 没有这条,
+     上面的 `0` 可能只是因为检测器恒返回空。 */
+  const bad2 = selfRecyclingBosses([
+    { id: 'y', name: 'y', biome: 'DESSERT', level: 1, baseHp: 1, summonItem: 735, exp: 1, loot: [735, 609], phases: [], breakMechanic: '' },
+  ] as never);
+  eq(bad2.length, 1, '掉自身祭品的 Boss 必须被报出(正对照)');
+  eq(bad2[0]!.bossId, 'y', '报的是那个 Boss');
+  eq(bad2[0]!.itemId, 735, '报的是那个祭品 ID');
+
+  /* 祭品区段扫描:与 selfRecycling 的口径互证 */
+  const inLoot = summonItemsInLoot();
+  eq(inLoot.length, 0, '战利品里不得出现任何祭品(734..741)');
+  eq(SUMMON_ITEM_MIN <= 739 && 739 <= SUMMON_ITEM_MAX, true, '739 确实在祭品区段内(区段判据本身有效)');
 });
 
 report('WS-05');

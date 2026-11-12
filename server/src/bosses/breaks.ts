@@ -179,8 +179,14 @@ export interface CrabSlideInput {
   slidDistance: number;
   /** 前进方向上撞到的方块 ID(0 表示无阻挡)。 */
   obstacleAhead: number;
-  /** 上一次结算时的壳减伤(0.90 为完好)。 */
-  shellDr: number;
+  /**
+   * 上一次结算时的壳减伤。
+   *
+   * **可省略**:省略时按 `CRAB_SHELL_DR`(完好的 90% 减伤)处理 ——
+   * 那是巨蟹的**初始态**,绝大多数调用方要的就是它。
+   * 只有「跨帧续算、壳已残」的场景才需要显式传入。
+   */
+  shellDr?: number;
 }
 
 export interface CrabSlideResult {
@@ -200,7 +206,7 @@ export interface CrabSlideResult {
  * 判定链:
  *  ① 失控 = 地砖是 315 冰砖 **且** μ=0.98(冻结常量)**且** 已滑行 ≥ 4 格;
  *  ② 碎壳 = 失控 **且** 前方是 359 黑曜石防爆城墙 **且** 速度 ≥ 8.0 格/秒;
- *  ③ 碎壳后 `shellDr` 从 0.90 → 0(防御从 90% 减伤降到 0);
+ *  ③ 碎壳后 `shellDr` 从 0.90(`CRAB_SHELL_DR`)→ 0(防御从 90% 减伤降到 0);
  *  ④ 眩晕窗口恒为 6 秒(与 `BREAK_STUN_SEC` 一致)。
  */
 export function crabSlideBreak(i: CrabSlideInput): CrabSlideResult {
@@ -210,10 +216,15 @@ export function crabSlideBreak(i: CrabSlideInput): CrabSlideResult {
   const shattered = uncontrolled
     && i.obstacleAhead === BREAK_ITEM.OBSIDIAN_WALL
     && i.speed >= CRAB_SHATTER_SPEED;
+  /* `CRAB_SHELL_DR` 的**唯一消费点**。此前这里写的是 `i.shellDr`,
+     而该常量在本文件内零读取 —— 「手册原文 90%」于是只活在一个测试
+     字面量里,实现侧随时可以漂移而无人发现。
+     现在把「未指定 ⇒ 壳完好」的默认值落在常量上,常量回到判定链中。 */
+  const shellDrBefore = i.shellDr ?? CRAB_SHELL_DR;
   return {
     uncontrolled,
     shattered,
-    shellDrAfter: shattered ? 0 : i.shellDr,
+    shellDrAfter: shattered ? 0 : shellDrBefore,
     stunSec: shattered ? OBSIDIAN_WALL_STUN_SEC : 0,
   };
 }

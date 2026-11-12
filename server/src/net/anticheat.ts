@@ -7,6 +7,11 @@
  *   3. 攻速上限 —— 攻击间隔不得小于武器基线间隔 × (1 - 攻速加成上限)。
  *   4. 物品栏一致性 —— 物品总量守恒(消耗必须有来源,产出必须落账)。
  *
+ * ⚠️ 第 1~3 类的「加成」**取自客户端声明**(装备/料理/冰面),服务端只把它**钳到上限**,
+ * 不自行核算该玩家应有多少加成 —— 因为服务端目前没有装备数据(见 `MoveIntent.speedMul`
+ * 与 `docs/WS-07-net-persist.md` §7)。故上限会随声明抬高;收敛它需先让服务端知道装备
+ * (`CR-14 U2`)。服务端强制的是**声明的合法性**(非法值不得让检查失效),不是声明的大小。
+ *
  * 处置:轻则**静默拒绝**(把请求回退到权威值,不打断同伴游戏),
  * 重则**累计违规分**触发 kick。所有裁决写 `room_events`。
  */
@@ -17,10 +22,13 @@ import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../../../shared/types/physics.ts';
 
 /**
  * 移速加成上限。来源:手册 §3.9/§3.10 的可叠加加速项取上界并留余量 ——
- *   249 行进小军鼓 +25% · 601 甜莓果茶 +15% · 719/731 移速 +10% ·
+ *   249 行进小军鼓 +25% · 601 甜莓果茶 +15% · 729 夜影吸血蝙蝠斗篷 移速 +10% ·
  *   619 冰面 +40% · 622 水中 +30% · 724 滚翻冷却(不改速度) ·
  *   叠罗汉 `carrierSpeedMul` 只减不增 · 230 缩小药水 0.3 倍(减速)。
  * 最坏正向叠加 1.25 × 1.15 × 1.10 × 1.40 = 2.21;再给 1.15 的余量 → 2.55。
+ *
+ * 注:手册 `719` 无移速、`731` 是攻防,两者均与本值无关 —— 早期把它们并写作移速出处
+ * 是**引用标错**(数值 1.10 一直是对的),已修正为手册 `729`。
  */
 export const MAX_SPEED_BONUS_MUL = 2.55;
 
@@ -143,7 +151,22 @@ export interface MoveIntent {
   x: number;
   y: number;
   z: number;
-  /** 客户端声明的移速倍率(装备/料理),服务端会与服务端自己的账比对。 */
+  /**
+   * 客户端声明的移速倍率(装备/料理)。
+   *
+   * ⚠️ **服务端不自行核算这个值 —— 只把它钳到上限**(见 §7「一律钳到上限,不自证」)。
+   * 服务端目前**没有**装备数据可据以独立算出「该玩家应该多快」:`PlayerState` 只有
+   * `weaponId`、无装备槽,`room.ts` 也不保存穿戴状态,`statsAtLevel` 不含任何速度字段。
+   *
+   * 因此这是**已声明的设计取舍,不是「服务端已核对过」**:上限会随声明抬高
+   * (声明 `2.55` 时约基线的 3.19 倍),且绕过装备前置。
+   *
+   * 要收敛这里就得让服务端真正知道装备(CR-14 U2 的另一条路:加装备槽 + 服务端速度模型),
+   * 在那之前**不要**把本注释写成「已比对」—— 那与 §7 口径矛盾,会误导后来者以为这里安全。
+   *
+   * 唯一被服务端强制的是**值的合法性**:非数字/`NaN` 声明不会让检查失效
+   * (见 `sanitizeMul`),而不是「声明的大小」。
+   */
   speedMul?: number;
 }
 
@@ -188,11 +211,49 @@ export function decayScore(s: PlayerAntiCheatState): number {
 }
 
 /**
+ * 把客户端声明的加成**一律化为有界的有限数**。
+ *
+ * ## 为什么必须有这一步(WR-14 U2-b,真缺陷)
+ *
+ * 声明值会被喂进 `Math.min/Math.max` 算阈值,而 `Math.max(0, {})` = **`NaN`** ——
+ * 之后 `dist > NaN`、`since < NaN` **恒为 `false`**,于是
+ * **瞬移 / 窗口均速 / 攻速三道检查同时静默失效**:
+ * 单帧跳 200 格会被**直接放行**。
+ *
+ * 这条路经**真实可达**:`{"speedMul":{}}` / `{"speedMul":"abc"}` 经 JSON 反序列化
+ * 即进入 `room.colyseus.ts` 的 `onMessage`;TS 的 `speedMul?: number`
+ * **只是编译期标注,不产生运行时校验**,拦不住。
+ *
+ * ## 兜底为什么取 `fallback`(「未声明」默认值)而不是 0
+ *
+ * 取 `0` 会让 `allowed = 0`,把该玩家的**每一次**移动都判成瞬移 ——
+ * 等于用一个坏输入把自己锁死(自我拒绝服务)。取 `fallback` 则退化为
+ * 「没有声明加成」,该玩家仍按基线正常移动。
+ *
+ * 兜底**不构成放水面**:声明一个合法的上限值(如 `2.55`)得到的结果与兜底完全相同,
+ * 作弊者没有动机发非法值;而非法值不再让任何检查失效。
+ *
+ * ## 为什么只对 `NaN` / `-Infinity` 兜底,而 `+Infinity` 仍旧钳到 `max`
+ *
+ * `+Infinity` 经 `Math.min` 本来就被钳到 `max` —— 这是**安全**的(等于「申请最大加成」),
+ * 属于既有正确行为,不该改;改了反而是无谓回归。
+ * 真正有害的只有两个:`NaN` 让比较恒 false(绕过),`-Infinity` 钳成 `0` 会锁死自己。
+ */
+function sanitizeMul(declared: unknown, fallback: number, max: number): number {
+  if (typeof declared !== 'number') return fallback;
+  if (Number.isNaN(declared) || declared === Number.NEGATIVE_INFINITY) return fallback;
+  return Math.min(Math.max(0, declared), max);
+}
+
+/**
  * 单帧允许的最大位移。
  * 位移上界 = maxSpeed(声明倍率) × DT,再乘 `teleportSlack` 补偿时钟抖动。
+ *
+ * 声明倍率先经 `sanitizeMul` 兜底 —— 否则非法声明会让本函数返回 `NaN`,
+ * 使调用方的 `dist > allowed` 恒为 false(见 `sanitizeMul` 说明)。
  */
 export function maxDisplacementPerTick(speedMul = 1, limits: AntiCheatLimits = DEFAULT_LIMITS): number {
-  const mul = Math.min(Math.max(0, speedMul), limits.maxSpeedBonusMul);
+  const mul = sanitizeMul(speedMul, 1, limits.maxSpeedBonusMul);
   return BASE_MOVE_SPEED * mul * DT * limits.teleportSlack;
 }
 
@@ -248,7 +309,7 @@ export function checkMove(
     const path = pathLength(s.window);
     const spanS = spanTicks * DT;
     const observed = path / spanS;
-    const cap = BASE_MOVE_SPEED * Math.min(intent.speedMul ?? 1, limits.maxSpeedBonusMul)
+    const cap = BASE_MOVE_SPEED * sanitizeMul(intent.speedMul ?? 1, 1, limits.maxSpeedBonusMul)
       * limits.speedWindowTolerance;
     if (observed > cap + 1e-9) {
       const v: Violation = {
@@ -280,8 +341,11 @@ function pathLength(win: readonly { x: number; y: number }[]): number {
 
 /**
  * 校验一次攻击。
- * 最小间隔 = `baseAttackIntervalS / (1 + 攻速加成)`;加成被服务端上限钳制,
- * 所以客户端自称 +500% 攻速也无效。
+ * 最小间隔 = `baseAttackIntervalS / (1 + 攻速加成)`;加成被服务端上限钳制。
+ *
+ * ⚠️ 「钳制」≠「核算」:声明 `1.0` 即拿满 2× 攻速且**不需要任何装备前置**
+ * (CR-14 U2 的已知取舍)。服务端**不**核对声明是否与持有物相符 ——
+ * 它没有装备数据可核。见 `MoveIntent.speedMul` 注释与 §7。
  */
 export function checkAttack(
   s: PlayerAntiCheatState,
@@ -289,7 +353,7 @@ export function checkAttack(
   claimedAttackSpeedBonus = 0,
   limits: AntiCheatLimits = DEFAULT_LIMITS,
 ): Verdict {
-  const bonus = Math.min(Math.max(0, claimedAttackSpeedBonus), limits.maxAttackSpeedBonus);
+  const bonus = sanitizeMul(claimedAttackSpeedBonus, 0, limits.maxAttackSpeedBonus);
   const minIntervalTicks = (limits.baseAttackIntervalS / (1 + bonus)) * TICK_HZ;
   const since = tick - s.lastAttackTick;
   if (since < minIntervalTicks - 1e-9) {

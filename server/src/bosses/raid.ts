@@ -45,6 +45,13 @@ export const SummonReject = {
   SAFE_ZONE: 'SAFE_ZONE',
   TOO_MANY_PLAYERS: 'TOO_MANY_PLAYERS',
   BOSS_ALIVE: 'BOSS_ALIVE',
+  /**
+   * 祭品库存不足 —— **只在所有其它校验都通过之后**才可能返回。
+   *
+   * 见 `summonBossWithOffering`:顺序是「先全量校验,再扣除」,
+   * 绝不「先扣再发现不够」。
+   */
+  NO_OFFERING: 'NO_OFFERING',
 } as const;
 export type SummonReject = (typeof SummonReject)[keyof typeof SummonReject];
 
@@ -100,6 +107,150 @@ export function summonBoss(req: SummonRequest): SummonResult {
   if (req.alreadyAlive) return { ok: false, reason: SummonReject.BOSS_ALIVE, scaledHp: 0 };
   const state = createBossState(req.bossId, req.playerCount);
   return { ok: true, reason: SummonReject.OK, state, scaledHp: state.maxHp };
+}
+
+/* ─────────────── 祭品消耗(owner 裁决 D-03)─────────────── */
+
+/**
+ * 祭品库存端口 —— 把「有多少 / 扣一个」这两件事注入进来,
+ * 让 `summonBoss` 系列保持**纯函数**、可被 node 零依赖测试。
+ *
+ * ## 为什么用端口而不是直接 import `db/repo.ts`
+ *
+ * `server/src/bosses/` 现有三个文件(`raid`/`phases`/`breaks`)**全部只依赖冻结层**,
+ * 不碰数据库。改成直接 import repo 会把 Boss 战逻辑与存储层焊死:
+ * 测试要建 db、迁移、造用户才能测一次召唤,而且 `bosses/` 会多出一条
+ * 「业务 → 存储」的硬依赖。端口注入让两侧各自可测。
+ *
+ * 生产装配时传 `consumeItem` 的适配器;测试里传一个内存计数闭包即可。
+ */
+export interface OfferingPort {
+  /** 玩家当前持有多少个该祭品 */
+  countOf: (ownerId: string, itemId: number) => number;
+  /**
+   * 扣除 `n` 个。**必须原子且全成功或全不动**:
+   * 返回 `false` 表示库存不足且**未扣除任何东西**。
+   * (`db/repo.ts#consumeItem` 正是这个语义:数量不足返回 false 且不写库。)
+   */
+  consume: (ownerId: string, itemId: number, n: number) => boolean;
+}
+
+/** 召唤请求 + 祭品归属。 */
+export interface SummonWithOfferingRequest extends SummonRequest {
+  /** 谁在献祭 —— 祭品从这个玩家的库存里扣 */
+  ownerId: string;
+}
+
+/** 召唤结果 + 是否真的扣了祭品。 */
+export interface SummonWithOfferingResult extends SummonResult {
+  /** 本次是否扣除了祭品。失败路径**恒为 false** */
+  offeringConsumed: boolean;
+}
+
+/**
+ * 祭坛召唤(**含祭品消耗**)。
+ *
+ * ## 顺序是这条链路的全部要点
+ *
+ * ```
+ * 1. summonBoss() 全量校验(未知 Boss / 无祭坛 / 安全区 / 祭品不匹配 /
+ *    人数越界 / 同 Boss 存活)
+ * 2. 校验全过 → 再查库存 countOf
+ * 3. 库存够 → consume 扣 1
+ * 4. consume 返回 false(并发下被别人先扣走)→ 按 NO_OFFERING 失败,**召唤不成立**
+ * ```
+ *
+ * **绝不能反过来「先扣再发现不够」**:那会在失败时留下已经扣掉的祭品,
+ * 玩家丢东西而 Boss 没出来,而且这种状态一旦持久化就无法自动区分
+ * 「玩家本来就没有祭品」和「服务端扣错了」。
+ *
+ * ## `consume` 返回 false 时为什么还要单独判一次
+ *
+ * 第 2 步的 `countOf` 与第 3 步的 `consume` 之间不是原子的(两玩家同时献祭)。
+ * `countOf` 只是**廉价预检**,真正的判据是 `consume` 的返回值 ——
+ * 所以第 4 步必须存在,否则并发下会出现「校验说有、扣的时候没了、却仍然召唤成功」。
+ */
+export function summonBossWithOffering(
+  req: SummonWithOfferingRequest,
+  port: OfferingPort,
+): SummonWithOfferingResult {
+  /* ① 全量校验先行 —— 任何失败都在**扣东西之前**返回 */
+  const base = summonBoss(req);
+  if (!base.ok) return { ...base, offeringConsumed: false };
+
+  /* ② 预检:没有祭品就不必再动库存 */
+  if (port.countOf(req.ownerId, req.itemId) < 1) {
+    return { ok: false, reason: SummonReject.NO_OFFERING, scaledHp: 0, offeringConsumed: false };
+  }
+
+  /* ③ 真扣 —— 返回值是**唯一**判据 */
+  if (!port.consume(req.ownerId, req.itemId, 1)) {
+    return { ok: false, reason: SummonReject.NO_OFFERING, scaledHp: 0, offeringConsumed: false };
+  }
+
+  /* ④ 扣成功 ⇒ 召唤成立 */
+  return { ...base, offeringConsumed: true };
+}
+
+/**
+ * 用 `db/repo.ts` 风格的回调搭一个 `OfferingPort`。
+ *
+ * 参数是**函数**而不是 `DbLike`:本模块不 import 存储层,保持 `bosses/**`
+ * 对 `node:*` 之外零依赖(`raid`/`phases`/`breaks` 三个文件此前都只依赖冻结层)。
+ * 装配层把 `listItems`/`consumeItem` 包进来即可。
+ *
+ * ## 多实例时为什么要真的回滚
+ *
+ * 同一个祭品 ID 可能散在多个实例上(合成分批入库)。扣 `n` 个要跨实例,
+ * 而每次 `consumeInstance` 只保证「自己这一次全成或全不动」——
+ * 若第二个实例失败,第一个实例**已经被扣掉了**。
+ *
+ * 只写一句「失败即放弃」的注释不算数:那会留下**半扣状态**,而半扣状态
+ * 又恰好是「玩家丢东西、Boss 没出来」的形态,正是本函数要防的。
+ * 所以这里记下已扣明细,失败时逐条 `restoreInstance` 补回去。
+ */
+export function makeOfferingPort(hooks: {
+  /** 列出某玩家全部实例(含 `quantity`),用于按物品 ID 汇总 */
+  listOwned: (ownerId: string) => readonly { instanceId: string; itemId: number; quantity: number }[];
+  /** 扣某个实例的 n 个;不足返回 false 且不改库 */
+  consumeInstance: (instanceId: string, n: number) => boolean;
+  /** 把已扣的 n 个补回该实例(回滚用) */
+  restoreInstance: (instanceId: string, n: number) => void;
+}): OfferingPort {
+  return {
+    countOf: (ownerId, itemId) => hooks
+      .listOwned(ownerId)
+      .filter((r) => r.itemId === itemId)
+      .reduce((s, r) => s + r.quantity, 0),
+
+    consume: (ownerId, itemId, n) => {
+      if (n <= 0) return true;
+      const rows = hooks.listOwned(ownerId).filter((r) => r.itemId === itemId && r.quantity > 0);
+      const total = rows.reduce((s, r) => s + r.quantity, 0);
+      if (total < n) return false;
+
+      const applied: { instanceId: string; n: number }[] = [];
+      let left = n;
+      for (const r of rows) {
+        if (left <= 0) break;
+        const take = Math.min(left, r.quantity);
+        if (!hooks.consumeInstance(r.instanceId, take)) {
+          /* 半扣回滚:把此前已扣的逐条补回,再报失败 */
+          for (const a of applied) hooks.restoreInstance(a.instanceId, a.n);
+          return false;
+        }
+        applied.push({ instanceId: r.instanceId, n: take });
+        left -= take;
+      }
+      /* 理论上到不了这里(total ≥ n 已保证);到了说明 listOwned 期间被并发改动,
+         同样必须回滚,不能「扣了一部分还返回成功」。 */
+      if (left > 0) {
+        for (const a of applied) hooks.restoreInstance(a.instanceId, a.n);
+        return false;
+      }
+      return true;
+    },
+  };
 }
 
 /* ─────────────── 人数血量缩放 ─────────────── */
@@ -254,6 +405,49 @@ export function summonItemCoverage(): { ids: number[]; complete: boolean } {
   for (let i = SUMMON_ITEM_MIN; i <= SUMMON_ITEM_MAX; i += 1) expected.push(i);
   const complete = ids.length === expected.length && ids.every((v, i) => v === expected[i]);
   return { ids, complete };
+}
+
+/**
+ * 自反馈扫描:**战利品里含自己的召唤祭品**的 Boss。
+ *
+ * ## 为什么这条必须单独成函数并让测试钉住
+ *
+ * owner 裁决 D-03 定「祭品在召唤时消耗」。这条裁决把「掉自己的祭品」
+ * 从一个无害的数据巧合变成了**经济漏洞**:
+ *
+ * ```
+ * 打死一次 → 必掉 ≥1 个 739(rollPersonalLoot 每项数最少 1)
+ *         → 用 739 再造祭品
+ *         → 再召唤 → 成本归零,每次还白送 609
+ * ```
+ *
+ * 实测 8 个 Boss 里**只有** `boss_ginger_troll` 命中(`loot = [739, 609]`,
+ * `summonItem = 739`)。
+ *
+ * ## 为什么返回数组而不是布尔
+ *
+ * 布尔只能表达「有/没有」。将来若有第二个 Boss 也自反馈,布尔型断言
+ * 依旧只是 `false → false` 不变,看不出**多了哪一个**。
+ * 返回名单后测试可以断言「恰好 1 个,且是 ginger_troll」——
+ * 既锁住现状,又能在变化时报出具体名字。
+ */
+export function selfRecyclingBosses(list: readonly BossDef[] = BOSS_LIST): { bossId: string; itemId: number }[] {
+  const out: { bossId: string; itemId: number }[] = [];
+  for (const b of list) {
+    if (b.loot.includes(b.summonItem)) out.push({ bossId: b.id, itemId: b.summonItem });
+  }
+  return out;
+}
+
+/** 全部 Boss 的战利品里,落在祭品区段 `734..741` 的项(自反馈的必要条件)。 */
+export function summonItemsInLoot(list: readonly BossDef[] = BOSS_LIST): { bossId: string; itemId: number }[] {
+  const out: { bossId: string; itemId: number }[] = [];
+  for (const b of list) {
+    for (const l of b.loot) {
+      if (l >= SUMMON_ITEM_MIN && l <= SUMMON_ITEM_MAX) out.push({ bossId: b.id, itemId: l });
+    }
+  }
+  return out;
 }
 
 /** Boss 定义查询(含阶段与破防原文,供 UI 图鉴)。 */

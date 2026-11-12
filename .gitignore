@@ -3,6 +3,17 @@ package-lock.json
 pnpm-lock.yaml
 yarn.lock
 
+# 客户端构建产物(Vite)。服务端保持零构建,没有产物。
+dist/
+.vite/
+# headless Chrome 的调试 profile(CDP 驱动截图时产生,每次 20MB)
+_cdp_profile/
+
+# 用户提供的设计稿原包(只作参考,不随仓库分发;分歧一律以手册为准)
+_design/
+# 验收截图(headless Chrome 产出;需要时可重跑生成,不入库)
+_shots/
+
 # 运行时产物
 *.log
 *.txt

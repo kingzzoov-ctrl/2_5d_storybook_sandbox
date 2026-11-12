@@ -162,11 +162,47 @@ function edgeZ(
   return best;
 }
 
+/** 一个合并块的四邻海拔(北 = y−1,南 = y+1,西 = x−1,东 = x+1) */
+export interface NeighborZs {
+  north: number;
+  south: number;
+  west: number;
+  east: number;
+}
+
+/**
+ * 取某个合并块四邻的最高海拔。
+ *
+ * **单一真相源**:建面计数(`buildChunkQuads`)与顶点写出(`chunk_geometry.emitChunkGeometry`)
+ * 都必须走这个函数。早先两处各写一遍同样的取邻逻辑,一旦有人只改一处,
+ * 计数就会与真实顶点数脱节 —— 而测试只断言计数,于是漂移永远不可见。
+ *
+ * 区块边缘无邻接数据时由 `edgeZ` 返回 NaN,`NaN < z` 恒为 false ⇒ 不生成侧面。
+ */
+export function neighborZs(
+  grid: Float64Array,
+  size: number,
+  merge: number,
+  bx: number,
+  by: number,
+  ctx?: EdgeContext,
+): NeighborZs {
+  return {
+    north: by > 0 ? grid[(by - 1) * size + bx] : edgeZ(ctx, 'north', bx, merge),
+    south: by < size - 1 ? grid[(by + 1) * size + bx] : edgeZ(ctx, 'south', bx, merge),
+    west: bx > 0 ? grid[by * size + (bx - 1)] : edgeZ(ctx, 'west', by, merge),
+    east: bx < size - 1 ? grid[by * size + (bx + 1)] : edgeZ(ctx, 'east', by, merge),
+  };
+}
+
 /**
  * 分块建面:greedy meshing。
  *  - 顶面:每个非空合并块 1 个 quad;
  *  - 侧面:块的四邻若海拔不等(或邻块为空)则 1 个 quad,四邻最多 4 个。
  * 复杂度 O(cells)(阶数不随 LOD 变化,只是 size 变小)。
+ *
+ * ⚠️ 本函数**只计数,不产出顶点**。真实顶点/UV/索引由 `chunk_geometry.emitChunkGeometry` 生成,
+ * 两者共享 `dominantZGrid` 与 `neighborZs`,因此计数与几何必然一致。
  */
 export function buildChunkQuads(chunk: ChunkInput, lod: number, ctx?: EdgeContext): QuadBatch {
   const { grid, size, merge } = dominantZGrid(chunk, lod);
@@ -182,16 +218,11 @@ export function buildChunkQuads(chunk: ChunkInput, lod: number, ctx?: EdgeContex
       const layer = Math.max(0, Math.min(3, ELEV_TO_Z.indexOf(z)));
       cellsPerLayer[layer] += 1;
 
-      /* 北 = y−1,南 = y+1,西 = x−1,东 = x+1 */
-      const north = by > 0 ? grid[(by - 1) * size + bx] : edgeZ(ctx, 'north', bx, merge);
-      const south = by < size - 1 ? grid[(by + 1) * size + bx] : edgeZ(ctx, 'south', bx, merge);
-      const west = bx > 0 ? grid[by * size + (bx - 1)] : edgeZ(ctx, 'west', by, merge);
-      const east = bx < size - 1 ? grid[by * size + (bx + 1)] : edgeZ(ctx, 'east', by, merge);
-
-      if (north < z) sideQuads += 1;
-      if (east < z) sideQuads += 1;
-      if (south < z) sideQuads += 1;
-      if (west < z) sideQuads += 1;
+      const nb = neighborZs(grid, size, merge, bx, by, ctx);
+      if (nb.north < z) sideQuads += 1;
+      if (nb.east < z) sideQuads += 1;
+      if (nb.south < z) sideQuads += 1;
+      if (nb.west < z) sideQuads += 1;
     }
   }
 

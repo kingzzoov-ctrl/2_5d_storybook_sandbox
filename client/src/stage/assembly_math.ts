@@ -18,7 +18,7 @@
  * 层间不变量:`stage/**` 与 `ui/**` 永不 import `three`;只有 `three/**` 可以。
  */
 
-import { pixelScale, type IsoCamera } from './iso_camera.ts';
+import { pixelScale, TILE_PX, type IsoCamera } from './iso_camera.ts';
 import { LOD_MERGE_SIZE } from './tile_mesh.ts';
 
 /* ───────────────────── 相机朝向常量 ───────────────────── */
@@ -255,4 +255,323 @@ export function dyeUniformPayload(
  */
 export function dyeUploadCount(entries: readonly unknown[]): number {
   return entries.length > 0 ? 1 : 0;
+}
+
+/* ═════════════════════ 图集几何与缩放(决策 A)═════════════════════
+ *
+ * ## 为什么这些常数要活在本文件里
+ *
+ * `docs/THREE-RESEARCH.md` 实测出图集里每个地形块最宽 **58px**,反推 **≈41 px/格**;
+ * 而 `iso_camera.ts` 锁的是 **`TILE_PX = 16`**。
+ *
+ * owner 裁决(决策 A):**保持 `TILE_PX = 16`,在装配层把 64px 图集缩放后使用。**
+ * 理由:改动最小 —— `zoomLevels` 六档、LOD 四档屏幕阈值、视口包围盒、
+ * 以及**钉住这些值的测试**全部不用动。
+ *
+ * 放在 `assembly_math.ts` 而不是新开一个文件,是为了**不制造新的欠账**:
+ * 本文件已在 `verify.ts` 的 `UNREACHABLE_EXEMPT` 白名单内(理由「本仓无装配入口」),
+ * 新开文件会让门禁的「未登记不可达模块」数字 +1,把一次纯实现变更
+ * 伪装成结构性欠账。纯数学与这里的其它纯数学同类,合并是正确归属。
+ *
+ * ## `ATLAS_PX_PER_CELL = 41` 的推导(测出来的,不是猜的)
+ *
+ * 对 §3.5 地砖的 4 个样本(`id_303`/`id_326`/`id_327`/`id_323`)逐行扫描
+ * 不透明像素的 x 跨度,最宽处**都是 58px** —— 同一设计网格。
+ * 地砖画的是「菱形顶面 + 一定厚度侧面」,最宽处即菱形水平对角线。
+ * 等轴测下 1 格地面的水平对角线 = `2 · cos45° · T`,故:
+ *
+ * ```
+ * T = 58 / (2 · cos45°) = 58 / 1.41421356 = 41.0122 ≈ 41 px/格
+ * ```
+ *
+ * 自证:若 T=41,水平对角线 = `2 · 0.7071068 · 41 = 57.98 ≈ 58` ✓ 与实测吻合;
+ * 顶面高 = `58 · sin35° = 33.27px`,实测总高 48~51px,差 15~18px 即侧面厚度。
+ *
+ * ## 锚点方向(踩过的坑)
+ *
+ * 图集 JSON 的 `anchor = (0.5, 0.85)` **从顶部**度量(TexturePacker 习惯);
+ * three 的 `Sprite.center` **从底部**度量(官方文档:`(0,0)` = lower left)。
+ * ⇒ 必须 `center.y = 1 − 0.85 = 0.15`。
+ * 照抄 `0.85` 会让立牌**静默下沉 `0.70 × 精灵高`**(64px 精灵上即 44.8px):
+ * 不抛异常、不报门禁,只能靠眼睛发现。
+ *
+ * ## 实体 id ≠ 数组下标(最容易写错的一处)
+ *
+ * 358 帧的键名是 `id_101` … `id_858`,**跨度 758**,实测**缺 400 个 id**,
+ * 压缩成 **13 个连续段**;这 13 段与 `shared/contracts/FREEZE.md:106` 的
+ * 物品号段**逐段吻合**(图集是照物品号段出的图)。
+ *
+ * ⇒ **绝不能写 `id - 101`**:`id_303` 的真实下标是 **105**,而 `303 − 101 = 202`,
+ * 直接错位 97 格。必须过 `cellIndexFromId()` 查号段表。
+ */
+
+/** 图集图像宽度(像素),实测自 `meta.size.w` */
+export const ATLAS_IMAGE_W = 1280;
+/** 图集图像高度(像素),实测自 `meta.size.h` */
+export const ATLAS_IMAGE_H = 1152;
+/** 单格边长(像素)—— 358 帧全部 64×64,实测无一例外 */
+export const ATLAS_CELL = 64;
+/** 列数 */
+export const ATLAS_COLS = 20;
+/** 行数 */
+export const ATLAS_ROWS = 18;
+/** 网格容量 = 20×18 = 360 */
+export const ATLAS_CAPACITY = ATLAS_COLS * ATLAS_ROWS;
+/** 实际精灵数 358;容量 360 − 358 = **2 个空槽**(row-major 下标 358 与 359) */
+export const ATLAS_SPRITE_COUNT = 358;
+
+/** 空槽的 row-major 下标(17×20+18=358,17×20+19=359) */
+export const ATLAS_EMPTY_CELLS: readonly number[] = [358, 359];
+
+/** 图集里一格地面的基准像素:`58 / (2·cos45°) = 41.0122 ≈ 41` */
+export const ATLAS_PX_PER_CELL = 41;
+
+/** 地砖样本最宽像素(4/4 实测一致) */
+export const ATLAS_TILE_WIDTH_PX = 58;
+
+/**
+ * 图集像素 → **屏幕像素**的比值:`TILE_PX / ATLAS_PX_PER_CELL = 16 / 41 ≈ 0.3902439`。
+ *
+ * ⚠️ **这是屏幕像素比,不是世界单位比**。three 的 `Sprite.scale` /
+ * `Mesh.scale` 吃的是**世界单位**,所以**不能**拿它去乘 `ATLAS_CELL`
+ * 当作精灵尺寸 —— 那会放大 `TILE_PX = 16` 倍。
+ *
+ * 这个坑是实测踩到的:第一版写 `SPRITE_CELL_WORLD = ATLAS_CELL * SPRITE_SCALE`
+ * (≈ 24.98),截图里精灵占了约 400 屏幕像素、盖住半张地图。
+ * 24.98 恰好 = 64/41 × 16,多的那个 16 就是被当成世界单位的 TILE_PX。
+ *
+ * 本常量的正当用途:估算「某图素在屏幕上有多少像素」,例如判断细节是否被缩掉。
+ */
+export const SPRITE_SCALE = TILE_PX / ATLAS_PX_PER_CELL;
+
+/**
+ * 图集像素 → **世界单位**的比值:`1 / ATLAS_PX_PER_CELL ≈ 0.02439`。
+ *
+ * 因为 1 世界单位 = 1 格(见 `chunk_geometry.ts` 的恒等映射),
+ * 而设计上 41 图素 = 1 格,故 1 图素 = 1/41 世界单位。
+ */
+export const WORLD_PER_ATLAS_PX = 1 / ATLAS_PX_PER_CELL;
+
+/** 图集锚点(JSON 原值,**从顶部**度量) */
+export const ATLAS_ANCHOR_X = 0.5;
+export const ATLAS_ANCHOR_Y = 0.85;
+
+/** three `Sprite.center` 应取的值(**从底部**度量)⇒ `(0.5, 0.15)` */
+export const SPRITE_CENTER_X = ATLAS_ANCHOR_X;
+export const SPRITE_CENTER_Y = 1 - ATLAS_ANCHOR_Y;
+
+/**
+ * 号段表:`[起始 id, 段长]`,共 13 段、合计 358。
+ *
+ * 用「段」而不是「358 个 id 的数组」:13 条数据、可人读、
+ * 改动时能一眼看出是哪一段错位了。实测自 `atlas_sprites.json` 的键集。
+ */
+export const ATLAS_ID_SEGMENTS: readonly (readonly [number, number])[] = [
+  [101, 30], [151, 20], [201, 18], [221, 35], [301, 30], [351, 35], [401, 40],
+  [501, 37], [601, 30], [701, 45], [801, 6], [811, 24], [851, 8],
+];
+
+/** 号段长度合计 —— 必须等于 `ATLAS_SPRITE_COUNT` */
+export const ATLAS_ID_SEGMENT_TOTAL = ATLAS_ID_SEGMENTS.reduce((s, [, n]) => s + n, 0);
+
+/** id 最小值 */
+export const ATLAS_ID_MIN = 101;
+/** id 最大值 */
+export const ATLAS_ID_MAX = 858;
+/** id 跨度:`858 − 101 + 1 = 758`,而帧只有 358 ⇒ 缺 400 */
+export const ATLAS_ID_SPAN = ATLAS_ID_MAX - ATLAS_ID_MIN + 1;
+
+/**
+ * 实体 id → row-major 下标。**不在图集内时返回 `-1`**。
+ *
+ * 复杂度 O(段数) = O(13),常数级。
+ */
+export function cellIndexFromId(id: number): number {
+  let base = 0;
+  for (const seg of ATLAS_ID_SEGMENTS) {
+    const [from, len] = seg;
+    if (id >= from && id < from + len) return base + (id - from);
+    base += len;
+  }
+  return -1;
+}
+
+/** row-major 下标 → 实体 id。越界返回 `-1`。 */
+export function idFromCellIndex(index: number): number {
+  if (!Number.isInteger(index) || index < 0 || index >= ATLAS_SPRITE_COUNT) return -1;
+  let base = 0;
+  for (const seg of ATLAS_ID_SEGMENTS) {
+    const [from, len] = seg;
+    if (index < base + len) return from + (index - base);
+    base += len;
+  }
+  return -1;
+}
+
+/** 该 id 是否有图 */
+export function hasSpriteId(id: number): boolean {
+  return cellIndexFromId(id) >= 0;
+}
+
+/**
+ * 用 `id − 101` 当下标**是否安全**?
+ *
+ * 恒为 `false`:跨度 758 ≠ 帧数 358,缺 400 个 id。
+ * 本函数存在的意义就是让读者看见这个结论 —— 不要删。
+ */
+export function idOffsetIsSafe(): boolean {
+  return ATLAS_ID_SPAN === ATLAS_SPRITE_COUNT;
+}
+
+/** 若强行用 `id − 101` 当下标会落到哪一格(仅供诊断,不要用于生产) */
+export function unsafeCellFromId(id: number): number {
+  return id - ATLAS_ID_MIN;
+}
+
+/** `id − 101` 比真值多算了多少格;id 不存在时返回 NaN */
+export function idOffsetDrift(id: number): number {
+  const truth = cellIndexFromId(id);
+  return truth < 0 ? Number.NaN : unsafeCellFromId(id) - truth;
+}
+
+/** (列,行) → row-major 下标 */
+export function cellIndexOf(col: number, row: number): number {
+  return row * ATLAS_COLS + col;
+}
+
+/** row-major 下标 → (列,行) */
+export function cellCoordsOf(index: number): { col: number; row: number } {
+  return { col: index % ATLAS_COLS, row: Math.floor(index / ATLAS_COLS) };
+}
+
+/** row-major 下标是否落在有效格内(排除 2 个空槽) */
+export function isValidCell(index: number): boolean {
+  return Number.isInteger(index) && index >= 0 && index < ATLAS_CAPACITY && !ATLAS_EMPTY_CELLS.includes(index);
+}
+
+/**
+ * row-major 下标 → 帧矩形(像素)。
+ *
+ * 键序实测 **358/358 严格等于 row-major**,所以「第 i 格」可 O(1) 算出;
+ * **但实体 id 不是下标**,必须先过 `cellIndexFromId()`。
+ */
+export function frameRectOfCell(index: number): { x: number; y: number; w: number; h: number } {
+  const { col, row } = cellCoordsOf(index);
+  return { x: col * ATLAS_CELL, y: row * ATLAS_CELL, w: ATLAS_CELL, h: ATLAS_CELL };
+}
+
+/** 实体 id → 帧矩形。id 不存在时返回 `null`。 */
+export function frameRectOfId(id: number): { x: number; y: number; w: number; h: number } | null {
+  const i = cellIndexFromId(id);
+  return i < 0 ? null : frameRectOfCell(i);
+}
+
+export interface FrameUv {
+  u0: number;
+  v0: number;
+  u1: number;
+  v1: number;
+}
+
+/**
+ * 帧矩形(图像左上角原点)→ three UV(左下角原点)。
+ *
+ * `Texture.flipY` 默认 `true`,故 v 按 `1 − y/H` 翻转:
+ * `v1` 对应帧的**上**边,`v0` 对应帧的**下**边。
+ */
+export function frameToUv(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  imageW = ATLAS_IMAGE_W,
+  imageH = ATLAS_IMAGE_H,
+): FrameUv {
+  return {
+    u0: x / imageW,
+    u1: (x + w) / imageW,
+    v0: 1 - (y + h) / imageH,
+    v1: 1 - y / imageH,
+  };
+}
+
+/** 帧矩形 → `Texture.offset` / `Texture.repeat` */
+export function frameToOffsetRepeat(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  imageW = ATLAS_IMAGE_W,
+  imageH = ATLAS_IMAGE_H,
+): { offsetU: number; offsetV: number; repeatU: number; repeatV: number } {
+  const uv = frameToUv(x, y, w, h, imageW, imageH);
+  return {
+    offsetU: uv.u0,
+    offsetV: uv.v0,
+    repeatU: uv.u1 - uv.u0,
+    repeatV: uv.v1 - uv.v0,
+  };
+}
+
+/** row-major 下标 → offset/repeat(O(1)) */
+export function offsetRepeatOfCell(
+  index: number,
+): { offsetU: number; offsetV: number; repeatU: number; repeatV: number } {
+  const r = frameRectOfCell(index);
+  return frameToOffsetRepeat(r.x, r.y, r.w, r.h);
+}
+
+/** 实体 id → offset/repeat。id 不存在时返回 `null`。 */
+export function offsetRepeatOfId(
+  id: number,
+): { offsetU: number; offsetV: number; repeatU: number; repeatV: number } | null {
+  const r = frameRectOfId(id);
+  return r === null ? null : frameToOffsetRepeat(r.x, r.y, r.w, r.h);
+}
+
+/**
+ * 一格精灵在**世界单位**中的边长 = `ATLAS_CELL / ATLAS_PX_PER_CELL = 64/41 ≈ 1.561`。
+ *
+ * 因为 1 世界单位 = 1 格,而 41 图素 = 1 格,所以 64 图素 = 64/41 格。
+ * 这个值略大于 1,是因为地砖图里那一格画的是 64px 的方形画布,
+ * 而其中**实际占地的菱形对角线是 58px**(见 `ATLAS_TILE_WIDTH_PX`)——
+ * 画布留了 3px 边距,故 64/41 略大于 1 是正常的。
+ */
+export const SPRITE_CELL_WORLD = ATLAS_CELL * WORLD_PER_ATLAS_PX;
+
+/**
+ * 精灵在世界单位中的高度。
+ *
+ * `heightCells` = 设计上想让该精灵占几格高(树/角色/建筑不同)。
+ */
+export function spriteWorldHeight(heightCells: number): number {
+  return SPRITE_CELL_WORLD * heightCells;
+}
+
+/**
+ * 图集锚点(**从顶部**)→ three `Sprite.center`(**从底部**)。
+ *
+ * 本块最重要的一个函数:方向搞反会让立牌静默下沉 `0.70 × 高度`。
+ */
+export function anchorToSpriteCenter(anchorY: number): number {
+  return 1 - anchorY;
+}
+
+/**
+ * 精灵 `position` 应放哪。
+ *
+ * three 的 sprite 顶点计算会把 `center` 那个点对齐到 `position`,
+ * 所以**把 `position` 直接放在格点上,锚点就必然落在格点** —— 不需按高度补偿。
+ * `heightWorld`/`centerY` 参数保留给调用方算包围盒用,本函数不使用。
+ */
+export function spritePositionForAnchor(
+  gx: number,
+  gy: number,
+  gz: number,
+  heightWorld: number,
+  centerY = SPRITE_CENTER_Y,
+): Vec3 {
+  void heightWorld;
+  void centerY;
+  return { x: gx, y: gy, z: gz };
 }

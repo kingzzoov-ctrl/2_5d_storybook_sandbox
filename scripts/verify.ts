@@ -3,11 +3,14 @@
  *
  * 用法:
  *   node scripts/verify.ts                 # 冻结层 + 文档 + 内容锁 + 集成 + 全部测试
+ *   node scripts/verify.ts --all           # 同上(显式写法;`npm test` 用它)
  *   node scripts/verify.ts --only WS-01    # 只跑某个工作流的测试
  *   node scripts/verify.ts --frozen        # 只跑冻结层不变量
  *   node scripts/verify.ts --docs          # 只检查文档结构完整性
  *   node scripts/verify.ts --content       # 只做内容基线一致性检查
  *   node scripts/verify.ts --integration   # 只做跨 WS 集成检查
+ *   node scripts/verify.ts --strict-taut   # 把「未登记的同义反复候选」升级为失败
+ *   node scripts/verify.ts --strict-reach  # 把「未登记的不可达模块」升级为失败
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
@@ -38,6 +41,22 @@ const strictReach = argv.includes('--strict-reach');
 /** `--strict-taut`:把「未登记的同义反复候选」从告警升级为失败。见 `checkTautology`。 */
 const strictTaut = argv.includes('--strict-taut');
 
+/**
+ * `--all`:跑**全部**门禁(等价于不传任何选择性 flag)。
+ *
+ * ⚠️ 第 13 批门禁审计(GATE-AUDIT-13 §N2)实测:这个 flag **此前根本不存在** ——
+ * `verify.ts` 全文不含 `--all`。它"能用"只是因为不传 flag 恰好等于全跑,
+ * 于是 `--all` 被静默忽略。而 `README L117` 与 `package.json` 的
+ * `verify:all` / `test` 都把它当作"全部"来用。
+ *
+ * 危险点:若哪天有人加了 `--strict-*` 之类的**默认关闭**项,`--all`
+ * 不会被算作"全跑",却又不会报错 —— 用 `npm test` 的人会以为跑全了。
+ *
+ * 现在显式解析它,并且在**同时出现选择性 flag**时直接报错(见 main),
+ * 避免"`--all --frozen` 到底跑什么"这种口径歧义。
+ */
+const allFlag = argv.includes('--all');
+
 let failures = 0;
 /* 通过数也计数 —— 这样「跨 WS 集成 N/N」这个数字由工具报出,
    而不是靠人手数输出行数。手工数的坏处不是麻烦,是**口径会飘**:
@@ -51,6 +70,23 @@ const suiteCounts = new Map<string, number>();
 
 /** `checkFrozen` 实际通过的不变量条数(README 的 `冻结层不变量 N/N` 用它校验)。 */
 let frozenInvariantCount = 0;
+
+/**
+ * `checkFrozen` 是否**真的跑过**。
+ *
+ * ⚠️ 为什么需要这个布尔(GATE-AUDIT-13 §N1):`frozenInvariantCount` 初值是 0,
+ * 而 `--integration` 会跳过 `checkFrozen`。于是拿 0 去和 README 的 `17/17` 比,
+ * 在**干净树**上报出:
+ *   `✗ README 声称「冻结层不变量 17/17」,实测 0 —— 应更新为 0/0`
+ * 这条红是**假红** —— 而 `--integration` 正是 README L114 与
+ * `package.json` 的 `verify:integration` 明文提供的入口。
+ * 修复者会照着提示去把 README 改成 `0/0`,方向完全错。
+ *
+ * 修法:**没跑过就跳过校验**,而不是拿"0"冒充"实测值"。
+ * 这与 `checkDocs` 里 `suiteCounts` 为空时静默跳过是同一类坑 ——
+ * 所以这里反过来:显式区分「跑了且为 0」与「没跑」。
+ */
+let frozenRan = false;
 
 /**
  * 统计未决台账(README 的台账数字用它校验)。
@@ -261,6 +297,7 @@ async function checkFrozen(): Promise<void> {
   /* 记录本节的**实际**通过条数,供 README 的「冻结层不变量 N/N」校验。
      不手数 —— 手数的口径会飘(这与集成计数是同一类缺陷)。 */
   frozenInvariantCount = passes - frozenAtStart;
+  frozenRan = true;
 }
 
 /* ───────────────────── 2. 语法扫描 ───────────────────── */
@@ -540,7 +577,35 @@ function checkStrippable(): void {
 const PROD_ENTRIES = [
   'server/src/sim/demo.ts', // npm run sim
   'server/src/net/room.colyseus.ts', // Colyseus 房间被 server 装配层实例化
+
+  /* ── 客户端入口(2026-11-12 补,task-32)──
+   *
+   * ⚠️ 这里曾漏掉整个客户端,后果是本门禁**把正在被浏览器加载的模块
+   * 报成「未登记的不可达模块」**:
+   *   · client/src/main.ts / stage/chunk_geometry.ts /
+   *     stage/demo_world.ts / three/boot.ts
+   * 它们当时确实可达(`client/index.html` 里 `<script src="./src/main.ts">`,
+   * 页面实测 60 FPS 能跑),门禁却不知道 —— 因为 `PROD_ENTRIES` 只有服务端两项。
+   *
+   * 这个漏项的方向是**最坏的一种**:不可达数偏大 ⇒ 白名单被要求覆盖
+   * 本来可达的模块 ⇒ 16 条 `client/**` 带着「本仓无装配入口」这条**假理由**
+   * 长期挂在白名单里,而自检只查「文件存在」「已可达」,查不出「理由已过时」。
+   *
+   * 入口取 `client/src/main.ts` 而非 `client/index.html`:
+   * 闭包只解析 `.ts` 的相对 import,HTML 不是 TS 图的一部分。
+   * 两者的对应关系由 `checkReachability` 里的断言守住(见 `CLIENT_HTML`)。 */
+  'client/src/main.ts', // client/index.html → <script src="./src/main.ts">
 ];
+
+/**
+ * 客户端 HTML 入口 → 它加载的 TS 模块。
+ *
+ * 断言 `client/index.html` 里**确实**引用了 `client/src/main.ts`。
+ * 否则两者会各走各的:HTML 改了 script 路径而 `PROD_ENTRIES` 没跟,
+ * 客户端又会从闭包里掉出去 —— 即上面那段事故的复发路径。
+ */
+const CLIENT_HTML = 'client/index.html';
+const CLIENT_HTML_ENTRY = './src/main.ts';
 
 /**
  * 不可达模块白名单:文件 → 为什么可以不接入生产。
@@ -552,34 +617,43 @@ const PROD_ENTRIES = [
  * 若某天它变成可达,也要移出。否则白名单会因改名/删除而静默放宽。
  */
 const UNREACHABLE_EXEMPT = new Map<string, string>([
-  /* ── 客户端:本仓无客户端装配入口(无 index.html / main.ts) ──
-     这是**仓库结构事实**,不是设计选择:client/src 只有子系统,
-     装配层在别处。故整目录登记,接入条件 = 补上客户端入口。 */
-  ['client/src/audio.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/assembly_math.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/dye_overlay.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/entity_sprites.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/iso_camera.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/particles.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/roof_transparency.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/shaders.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/stage/tile_mesh.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/three/stage_assembly.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/blueprint.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/boss_hud.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/inventory.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/pixel_easel.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/recipe_tree.ts', '客户端子系统,本仓无装配入口'],
-  ['client/src/ui/state_machine.ts', '客户端子系统,本仓无装配入口'],
+  /* ── 客户端:已接线部分**已移出**(2026-11-12,task-32)──
+   *
+   * 下面 8 条曾以「客户端子系统,本仓无装配入口」为理由整目录挂在表里。
+   * 该理由**当时是事实**(client/ 无 index.html / main.ts),
+   * 但本会话补上 `client/index.html` + `client/src/main.ts` 之后它**变成假的**,
+   * 而门禁没察觉:自检只查「文件不存在」「已可达」,不查「理由本身过时」。
+   *
+   * 已移出(现由 `client/src/main.ts` 闭包覆盖,共 15 个文件中的 8 个):
+   *   stage/assembly_math.ts · stage/dye_overlay.ts · stage/entity_sprites.ts ·
+   *   stage/iso_camera.ts · stage/particles.ts · stage/shaders.ts ·
+   *   stage/tile_mesh.ts · three/stage_assembly.ts
+   * 移出后若它们**再次**不可达,门禁会以「未登记」报出来 —— 这正是本表的作用。
+   */
+
+  /* ── 客户端:8 条已于 2026-11-12 全部接线,整块摘除 ──
+   *
+   * 摘除的 8 条:`audio.ts` · `stage/roof_transparency.ts` ·
+   * `ui/{blueprint,boss_hud,inventory,pixel_easel,recipe_tree,state_machine}.ts`
+   *
+   * 接线方式(不是「import 一下」):
+   *   · `client/src/three/ui_binding.ts` —— Canvas2D 覆盖层(刻意不 import three)
+   *   · `client/src/three/audio_out.ts` —— WebAudio 输出,音高/ADSR 全部取自 audio.ts
+   *   · `client/src/ui/panel_layout.ts` —— 面板布局纯逻辑,故可在 node 断言
+   *   · `boot.ts` 里由 `UiStateMachine` 驱动开关(I/R/E/P/Esc),各面板有交互
+   *
+   * 它们原来能进本表,是因为表里的理由是「**本仓无装配入口**」——
+   * 而那是**假的**(`client/index.html` 与 `client/src/main.ts` 当时都已存在)。
+   * 这个假理由被 `detectStaleReason` 抓出来,现已整块删除。
+   *
+   * **留作教训**:目录级、笼统的理由会让白名单在事实变化后继续豁免。
+   * 理由必须写到「**谁接、接法是什么、接在哪一行**」,才可判定是否过时。
+   */
 
   /* ── 服务端:尚未接入编排(构成本门禁要暴露的主类) ── */
-  ['server/src/alchemy/index.ts', 'WS-06 炼金入口,等编排层接线'],
-  ['server/src/alchemy/attributes.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
-  ['server/src/alchemy/cache.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
-  ['server/src/alchemy/degrade.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
-  ['server/src/alchemy/gate.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
-  ['server/src/alchemy/pixel_icon.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
-  ['server/src/alchemy/prompt.ts', 'WS-06 被 index.ts 聚合,随 index 一起接'],
+  /* WS-06 炼金 7 条(index + 6 内部模块)已于 2026-11-12 接线,
+     入口 `WorldSim.forgeAlchemy()`。已从白名单摘除 —— 不在表里
+     却仍不可达会让门禁报「未登记」,这正是本表存在的意义。 */
   ['server/src/bosses/breaks.ts', 'WS-05 Boss 破防,待接入 tickMobs'],
   ['server/src/bosses/phases.ts', 'WS-05 Boss 阶段,待接入 tickMobs'],
   ['server/src/bosses/raid.ts', 'WS-05 副本编排,待接入'],
@@ -650,34 +724,68 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
 const WL_BLOCK_CLIENT_SHELL = /本仓无装配入口|客户端子系统/;
 const WL_BLOCK_DEPENDENCY = /three|依赖未安装|相容层/;
 const WL_BLOCK_MECHANISM = /随.*一起接|尚未注入|被.*聚合/;
-/* 「缺接线动作」与「等人拍板」是两件事,不可混。当前 50 条全是前者:
+/* 「缺接线动作」与「等人拍板」是两件事,不可混。当前 43 条全是前者:
    没有一条是「本可做、但等产品决定」的 —— 所以 decision 预期恒 0。 */
 const WL_BLOCK_WIRING = /待接|等编排层接线|待客户端接线/;
+/** decision 的模式(两个条件都满足才算「等人拍板」)。 */
+const WL_DECISION_A = /(?:待|等|尚未|随)/;
+const WL_DECISION_B = /(?:接|注入)/;
 
 function whitelistBreakdown(): {
-  clientShell: number; wiring: number; mechanism: number; decision: number; other: number;
+  clientShell: number; wiring: number; mechanism: number; dependency: number;
+  decision: number; other: number; decisionShadowed: number;
 } {
   let clientShell = 0;
   let wiring = 0;
   let mechanism = 0;
+  let dependency = 0;
   let decision = 0;
   let other = 0;
+  /* **被前面的桶抢走的 decision 候选数**。
+     ⚠️ 这个计数器是本轮(task-32)加的,原因的实证如下:
+     43 条里**有 27 条**同时满足 decision 的两个正则,而**没有一条**能落进
+     `decision` 桶 —— 它们全部先被 `wiring`(24)或 `mechanism`(3)抓走。
+     于是打印出来的「等裁决 0」**不是「没有等人拍板的事」这个测量结果**,
+     而是分类顺序的结构性产物。实测:把 `WL_BLOCK_MECHANISM` 里的
+     「尚未注入」去掉,同样的表就会算出 `mechanism 1 / decision 2` ——
+     说明这个 0 极度依赖正则的写法,不能当作事实读。
+     所以现在把「影子数」一并算出来并打印,让读者知道 0 是怎么来的。 */
+  let decisionShadowed = 0;
+
   for (const [, reason] of UNREACHABLE_EXEMPT) {
     /* 顺序有讲究 —— **具体优先于笼统**:
        1 `wiring`:最具体(明确说「待接/接线」= 缺接线动作);
        2 `clientShell`:缺入口文件;
        3 `mechanism`:随别的模块一起接;
-       4 `decision`:等人拍板(预期恒 0,非 0 即值得注意);
-       5 其余归 `other`。
+       4 `dependency`:等外部依赖安装(独立计数,不再并进 other);
+       5 `decision`:等人拍板;
+       6 其余归 `other`。
        早期把 clientShell 排在 wiring 前面,导致「待客户端接线」被宽词抓走。 */
-    if (WL_BLOCK_WIRING.test(reason)) { wiring += 1; continue; }
-    if (WL_BLOCK_CLIENT_SHELL.test(reason)) { clientShell += 1; continue; }
-    if (WL_BLOCK_MECHANISM.test(reason)) { mechanism += 1; continue; }
-    if (WL_BLOCK_DEPENDENCY.test(reason)) { other += 1; continue; }
-    if (/(?:待|等|尚未|随)/.test(reason) && /(?:接|注入)/.test(reason)) { decision += 1; continue; }
+    const isDecisionCandidate = WL_DECISION_A.test(reason) && WL_DECISION_B.test(reason);
+    if (WL_BLOCK_WIRING.test(reason)) {
+      wiring += 1;
+      if (isDecisionCandidate) decisionShadowed += 1;
+      continue;
+    }
+    if (WL_BLOCK_CLIENT_SHELL.test(reason)) {
+      clientShell += 1;
+      if (isDecisionCandidate) decisionShadowed += 1;
+      continue;
+    }
+    if (WL_BLOCK_MECHANISM.test(reason)) {
+      mechanism += 1;
+      if (isDecisionCandidate) decisionShadowed += 1;
+      continue;
+    }
+    if (WL_BLOCK_DEPENDENCY.test(reason)) {
+      dependency += 1;
+      if (isDecisionCandidate) decisionShadowed += 1;
+      continue;
+    }
+    if (isDecisionCandidate) { decision += 1; continue; }
     other += 1;
   }
-  return { clientShell, wiring, mechanism, decision, other };
+  return { clientShell, wiring, mechanism, dependency, decision, other, decisionShadowed };
 }
 
 
@@ -859,6 +967,115 @@ function reachableClosure(entries: string[]): Set<string> {
 }
 
 /**
+ * 判断一条白名单**理由**是否已经过时 —— 返回过时原因的说明(空数组 = 仍然成立)。
+ *
+ * ## 为什么需要它(task-32 的核心交付)
+ *
+ * 白名单原有的两处自检是「文件不存在」「已可达,应移出」。两者都只看
+ * **条目与文件系统的关系**,不看**理由说了什么**。于是有这样一类静默放宽:
+ *
+ *   `client/**` 16 条的理由是「客户端子系统,**本仓无装配入口**」。
+ *   这句话在写下时是**事实**(client/ 无 index.html / main.ts)。
+ *   后来补上了 `client/index.html` + `client/src/main.ts`,这句话**变成假的**。
+ *   条目仍「文件存在」、在门禁眼里仍「不可达」(因为 `PROD_ENTRIES` 漏了客户端),
+ *   于是两处自检**全绿**,而这 16 条的理由已经不能解释任何事了。
+ *
+ * 这是最难发现的一类:**不是条目错了,是理由和事实错位了**。
+ * 它让「已全部登记理由」这句话变得没有信息量。
+ *
+ * ## 判据(两条,都只看理由文本与文件系统,不做语义推理)
+ *
+ * 1. **否定的存在性断言** —— 理由里出现 `无 X` / `没有 X` / `尚无 X` 这类
+ *    否定式,而 X 指向的路径**现在存在** ⇒ 过时。
+ *    例:「本仓无装配入口(无 index.html / main.ts)」而两者都在 ⇒ 报。
+ * 2. **肯定的路径引用** —— 理由里提到的调用点/文件(`xxx.ts`、`main.ts`、
+ *    `index.html`)必须**存在**;若指向的道路不存在,理由已与代码脱节。
+ *
+ * ## 局限(刻意承认,不是遗漏)
+ *
+ * 这**不是**自然语言理解。它抓不到「理由在语法上仍成立、但语义已变」的情形,
+ * 例如「随 damage.ts 一起接」在 damage.ts **真被接线之后**依然字面成立。
+ * 所以它是一道**窄网**:能抓住 task-32 这一类的措辞,抓不住所有过时。
+ * 补网的办法是**把理由写成可判定的形式**(写明文件路径与否定断言),
+ * 而不是把正则写得更宽 —— 宽正则会把本来正确的理由误判成过时,
+ * 那会让人开始无视这条告警,比没有更糟。
+ */
+function detectStaleReason(reason: string): string[] {
+  const out: string[] = [];
+
+  /* 理由里提到的路径候选:`xxx.ts` / `xxx.html` / `client/src/...`。
+     只认带扩展名的形态 —— 裸词(如「装配层」)无法判定存在性。 */
+  const pathLike = reason.match(/[\w./-]*[\w-]+\.(?:ts|html|json)/g) ?? [];
+
+  /* ── 判据 1:否定式存在断言 ──
+     匹配 `无 X` / `没有 X` / `尚无 X` / `不存在 X`,X 为路径样式。
+     注意用的是「无」而非「不含」等词,并把「无入口」这种**不带路径**的
+     笼统说法排除在外 —— 那种无法自动判定,留给评审。 */
+  const negRe = /(?:无|没有|尚无|不存在)\s*([\w./-]*[\w-]+\.(?:ts|html|json))/g;
+  for (const m of reason.matchAll(negRe)) {
+    const p = m[1]!;
+    /* 相对于 ROOT 找:理由里可能写 `index.html`(= client/index.html)、
+       `main.ts`、或完整相对路径。任一命中即视为「它已存在」。 */
+    const candidates = [
+      join(ROOT, p),
+      join(ROOT, 'client', p),
+      join(ROOT, 'client/src', p),
+      join(ROOT, 'server/src', p),
+    ];
+    const hit = candidates.find((c) => existsSync(c));
+    if (hit !== undefined) {
+      out.push(`写了「${m[0]}」但它已存在(${relOfPath(hit)})`);
+    }
+  }
+
+  /* ── 判据 1b:「本仓无装配入口」这一具体措辞 ──
+     它是 task-32 的实际肇事句子,且无法用上面的通用式抓住
+     (因为它没直接跟路径)。单独判定:客户端入口一旦存在,该说法即失效。 */
+  if (/本仓无装配入口/.test(reason)) {
+    const clientEntry = join(ROOT, 'client/src/main.ts');
+    const clientHtml = join(ROOT, 'client/index.html');
+    if (existsSync(clientEntry) || existsSync(clientHtml)) {
+      const which = [existsSync(clientEntry) ? 'client/src/main.ts' : '', existsSync(clientHtml) ? 'client/index.html' : '']
+        .filter(Boolean).join('、');
+      out.push(`声称「本仓无装配入口」但装配入口已存在(${which})`);
+    }
+  }
+
+  /* ── 判据 2:肯定的路径引用必须存在 ──
+     排除已被判据 1 处理过的否定式引用(否则同一处会报两遍)。 */
+  const negMatches = new Set([...reason.matchAll(negRe)].map((m) => m[0]));
+  for (const p of pathLike) {
+    if ([...negMatches].some((n) => n.includes(p))) continue;
+    /* `damage.ts`、`main.ts` 这类**不带目录**的引用:全仓找一个同名文件。
+       找不到 ⇒ 理由引用的文件已不存在(改名/删除/从未存在)。 */
+    if (p.includes('/')) {
+      if (!existsSync(join(ROOT, p))) out.push(`引用的路径不存在:${p}`);
+      continue;
+    }
+    const found = findFileByName(p);
+    if (!found) out.push(`引用的文件不存在:${p}`);
+  }
+
+  return out;
+}
+
+/** `path` 相对 ROOT 的 POSIX 形态(reason 检测的报错用)。 */
+function relOfPath(p: string): string {
+  return relative(ROOT, p).split(sep).join('/');
+}
+
+/** 在 `server/src` / `client/src` / `shared` 下按文件名找(用于裸文件名引用)。 */
+function findFileByName(name: string): string | null {
+  for (const d of ['server/src', 'client/src', 'shared', 'client']) {
+    const base = join(ROOT, d);
+    if (!existsSync(base)) continue;
+    const hit = walk(base, [name.slice(name.lastIndexOf('.'))]).find((f) => f.endsWith(sep + name));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
  * 生产可达性门禁。
  *
  * **为什么需要它**:本仓反复出现「完整实现、单测全绿、编排层不接」的缺陷
@@ -892,8 +1109,30 @@ function checkReachability(): void {
   const entries = PROD_ENTRIES.filter((e) => existsSync(join(ROOT, e)));
   const missingEntries = PROD_ENTRIES.filter((e) => !existsSync(join(ROOT, e)));
 
+  /* ── 客户端 HTML 入口与 PROD_ENTRIES 必须对得上 ──
+     否则 HTML 改了 script 路径而入口没跟,整个客户端又会从闭包里掉出去
+     —— 即 task-32 那次事故的复发路径。 */
+  const htmlAbs = join(ROOT, CLIENT_HTML);
+  if (!existsSync(htmlAbs)) {
+    fail(`客户端 HTML 入口不存在:${CLIENT_HTML} —— 客户端可达性口径失效`);
+  } else {
+    const html = readFileSync(htmlAbs, 'utf8');
+    if (!html.includes(CLIENT_HTML_ENTRY)) {
+      fail(
+        `${CLIENT_HTML} 里找不到 \`${CLIENT_HTML_ENTRY}\` —— HTML 入口与 `
+        + `PROD_ENTRIES 的客户端入口已脱节(客户端会再次从可达闭包里消失)`,
+      );
+    }
+  }
+
   /* ── 白名单自检(与 DECORATOR_EXEMPT 同一思路)── */
   const stale: string[] = [];
+  /* 「理由过时」是**独立的一类**,与「条目失真」分开收集:
+     条目可能完好(文件在、当前确实不可达),而理由描述的事实已经变了。
+     旧自检只查前两类,因此抓不到它 —— 那正是 16 条 client/** 带着
+     「本仓无装配入口」长期挂在表里的原因(task-32)。 */
+  const staleReason: string[] = [];
+
   for (const [rel, reason] of UNREACHABLE_EXEMPT) {
     if (!existsSync(join(ROOT, rel))) {
       stale.push(`${rel}(文件不存在)`);
@@ -905,6 +1144,11 @@ function checkReachability(): void {
     }
     if (reach.has(resolve(ROOT, rel))) {
       stale.push(`${rel}(已可达,应移出白名单)`);
+      continue;
+    }
+    /* ── 理由过时检测(新)── */
+    for (const found of detectStaleReason(reason)) {
+      staleReason.push(`${rel}(理由过时:${found})`);
     }
   }
 
@@ -913,7 +1157,12 @@ function checkReachability(): void {
   if (missingEntries.length > 0) {
     fail(`生产入口不存在(门禁口径失效):${missingEntries.join(', ')}`);
   } else if (stale.length > 0) {
-    fail(`不可达白名单失真(${stale.length} 处,应修正):${stale.slice(0, 4).join('; ')}`);
+    fail(`不可达白名单失真(${stale.length} 处,应修正):${stale.join('; ')}`);
+  } else if (staleReason.length > 0) {
+    fail(
+      `不可达白名单**理由过时**(${staleReason.length} 处)—— 条目本身没失真,`
+      + `但它写的事实已经变了,读者会据此低估欠账:${staleReason.slice(0, 4).join('; ')}`,
+    );
   } else if (unlisted.length > 0) {
     /* 未登记的不可达模块 —— 本门禁的核心产出。
        默认只告警(见函数头注释),但 `--strict-reach` 会把告警升级为失败,
@@ -941,11 +1190,28 @@ function checkReachability(): void {
     `生产可达性:可达 ${prodAll.length - unreachableCount} / 不可达 ${unreachableCount} `
     + `(共 ${prodAll.length},入口 ${entries.length} 个,白名单 ${UNREACHABLE_EXEMPT.size} 条)`
     + (unlisted.length > 0 ? ` —— 其中未登记 ${unlisted.length} 个` : '');
-  /* 全部 50 条都是欠账;分类是为了说清**卡在哪**,不是区分「要不要修」。 */
+  /* 条数**取实测**,不写死 —— 旧版这里硬编码「50 条」,而白名单早已降到 43
+     (WS-06 炼金 7 条接线后摘除),于是门禁自己印着一个过时数字。
+     这与 README 的过时数字是同一类缺陷,只不过发生在**门禁的输出**里,
+     更难被发现:读者倾向于相信门禁自己说的话。 */
   const breakdown =
-    `        └─ 欠账构成(50 条全部待接,按卡点分类):等客户端入口 ${wl.clientShell}`
-    + ` / 等编排层接线 ${wl.wiring} / 等服务端机制 ${wl.mechanism} / 等裁决 ${wl.decision}`
-    + (wl.other > 0 ? ` / 未归类 ${wl.other}` : '');
+    `        └─ 欠账构成(${UNREACHABLE_EXEMPT.size} 条全部待接,按卡点分类):等客户端入口 ${wl.clientShell}`
+    + ` / 等编排层接线 ${wl.wiring} / 等服务端机制 ${wl.mechanism}`
+    /* 「等外部依赖」与「未归类」**仅在非 0 时出现**:
+       README 的固定四桶句式因此保持有效(不因 0 值桶而格式抖动),
+       而一旦真有该类别欠账,它会立刻出现在输出里。 */
+    + (wl.dependency > 0 ? ` / 等外部依赖 ${wl.dependency}` : '')
+    + ` / 等裁决 ${wl.decision}`
+    + (wl.other > 0 ? ` / 未归类 ${wl.other}` : '')
+    /* 「等裁决 0」是分类顺序的产物而非测量结果 —— 必须显式说出来,
+       否则读者会把它读成「没有等人拍板的事」。实测 43 条里 27 条
+       (分类收窄后 35 条里 35 条)都满足「等裁决」的两个正则,却没有一条
+       能落进该桶:它们全部被更具体的桶先抓走。 */
+    + (wl.decisionShadowed > 0
+      ? `\n  i         └─ 注:等裁决 ${wl.decision} 是**分类顺序**的结果 —— 另有 `
+        + `${wl.decisionShadowed} 条也符合「等裁决」句式,但归入了上方更具体的桶;`
+        + '故这个 0 不代表没有待裁决事项'
+      : '');
   if (missingEntries.length === 0 && stale.length === 0) {
     pass(summary);
   } else {
@@ -1173,16 +1439,28 @@ function buildReexportMap(): Map<string, string> {
  * 2. 修一条就移一条:门禁做**字段级**比对,某字段改成服务端取值后
  *    该条即变为「已登记但不再命中」⇒ 报「白名单失真,应移出」。
  *    (早期版本是接口级,导致「修好也看不出」的恒绿 —— 见下第 4 点。)
- * 3. 实参**整体透传**(如 `applyMove(id, pkt)`,字段名不出现)时字段级无法定位,
- *    此时回退接口级 ⇒ 只要实参引用客户端就算全部命中。保守多报,不漏。
+ * 3. 实参**整体透传**(如 `applyInventory(userId, input)`,字段名不出现)时
+ *    字段级无法定位,此时**回退接口级** ⇒ 该汇点的全部受管字段一律计入命中,
+ *    并在输出里单独打印「回退接口级 N 个汇点」。
+ *
+ *    ⚠️ 这条**曾经是空头承诺**:注释从第 12 批起就写着「回退接口级…保守多报,不漏」,
+ *    而代码里只有 `if (!fm) continue;`,根本没有回退分支。第 13 批门禁审计
+ *    (GATE-AUDIT-13 §D1)用 `inventory(userId, input as never)` 实测:
+ *    退出码 0、打印「实测取自客户端 0 处」—— **把漏报显示成了好消息**。
+ *    现在真的实现了回退(见 `checkClientTrust` 里的 `matched === 0` 分支)。
  * 4. **接口级恒绿的教训**(实测已确认):`ops: msg.ops` 是**合法且必须**的
  *    客户端输入(客户端提交要买/卖什么),所以「该接口引用客户端」答案**恒为是**。
- *    接口级判定因此测不出任何东西 —— 判据的分辨率低于被测量。
+ *    接口级判定**单独使用**时测不出任何东西 —— 判据的分辨率低于被测量。
  *    它比不装更危险:**让「已检查」看起来成立**。
+ *    故接口级只作为**字段级的兜底**(仅在字段级完全无法定位时启用),
+ *    不单独作为主判据。
  * 5. 受管字段表是**人工维护**的。新写一个 `onMessage` 处理函数时,
  *    如果它引入的服务端自有字段没进表,门禁看不到 —— 这是残余风险。
  *    缓解:`SERVER_OWNED_INPUTS` 与 `TRUST_EXEMPT` 就在本文件可读处,
  *    评审新 handler 时应一并检查。
+ * 6. **契约表自身有双向自检**(第 13 批审计 D2 后补):表被清空、方法名拼错、
+ *    条目被删、字段名在实参里找不到 —— 一律 fail。
+ *    在此之前这些状态全部静默通过,于是「检查范围归零」也会显示绿色。
  */
 const SERVER_OWNED_INPUTS: Readonly<Record<string, readonly string[]>> = {
   /* 入参字段 → 为什么必须由服务端提供 */
@@ -1190,21 +1468,59 @@ const SERVER_OWNED_INPUTS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * **必须受管**的汇点方法 —— `SERVER_OWNED_INPUTS` 的「应有键」参照。
+ *
+ * ## 为什么需要一份独立的名单(D2)
+ *
+ * 只用 `SERVER_OWNED_INPUTS` 自检有个盲点:若某条目被**整条删掉**,
+ * 遍历「表里有什么」的检查全部跳过 —— 表没了,检查也没了,而门禁仍然绿。
+ * 这和第 13 批审计里「白名单因改名而静默放宽」是同一形态。
+ *
+ * 所以「应有哪些键」必须来自**表之外**。这里的名单是刻意的短清单:
+ * 只有那些**确认必须受管**的方法才登记;`applyMove` / `applyAttack`
+ * **不在**此列 —— 因为它们的问题不是「取自客户端」(它们本就该接客户端输入),
+ * 而是上游钳制口径,详见下方「本门禁的盲区登记」。
+ *
+ * 增加新 handler 时:若它引入服务端自有字段,同时加进本名单与
+ * `SERVER_OWNED_INPUTS`;只加后者会被「多余键」检查放过,但**不加后者**
+ * 会被「缺失键」检查抓住。
+ */
+const TRUST_MUST_MANAGE: readonly string[] = ['applyInventory'];
+
+/**
  * ⚠️ **本门禁的盲区登记**(不是遗漏,是刻意划界)。
  *
  * `applyMove` / `applyAttack` **也**被上面的扫描正则覆盖,但它们**不在**
- * `SERVER_OWNED_INPUTS` 里 —— 因为它们已经**确认为真缺陷**(CR-14 U2):
+ * `SERVER_OWNED_INPUTS` 里 —— 因为它们的输入**本就该取自客户端**,
+ * 问题不在「取自客户端」,而在别处。它俩分属两件不同性质的事(CR-14 U2):
+ *
+ * **U2-a —— 已裁决为「可接受的设计取舍」,不是缺陷。**
  * ```
- *   applyMove(client.sessionId, msg)          → speedMul 声明 2.55 ⇒ 维持 ×3.188
+ *   applyMove(client.sessionId, msg)          → 声明 2.55 ⇒ 上限抬到约 ×3.19 基线
  *   applyAttack(id, msg?.claimedBonus ?? 0)   → 声明 1.0 ⇒ 拿满 2× 攻速
  * ```
- * 本门禁查的是「**登记的**字段有没有取自客户端」;这两处的问题**不在**
- * 「取自客户端」(它们就该取自客户端),而在**上游的钳制口径** ——
- * `anticheat.ts:146` 的注释写「服务端会与服务端自己的账比对」,
- * 而 `WS-07-net-persist.md` §7 写「一律钳到上限,**不自证**」,**两者自相矛盾**。
+ * 上游只做**钳位**、不做自证:`WS-07-net-persist.md` §7 明确写「一律钳到上限,
+ * **不自证**」。原因不是懒 —— 是服务端**物理上没有**可自证的数据:
+ * `PlayerState` 只有 `weaponId`、无装备槽,`room.ts` 零穿戴状态,
+ * `statsAtLevel` 不含任何速度字段。真做服务端核算需要「新增装备槽 +
+ * 从零建服务端速度模型 + 穿戴追踪」,属跨 WS 结构性改动。
  *
- * 把它们放进受管表会**误报**(它们的输入本就合法)。所以显式记在这里,
- * 免得读者把「已登记 3 处」当成全部欠账。修法见 `CHANGE_REQUESTS.md` CR-14。
+ * 早先 `anticheat.ts:146` 的注释写「服务端会与服务端自己的账比对」,
+ * 与 §7 矛盾 —— 那句注释**是错的**(已改写)。本注释早先也把它整体写成
+ * 「确认为真缺陷」,同样过时,现已按裁决更正。
+ * 该取舍由 `tests/WS-07.test.ts` 的 `WR-14 U2-a` 用例**钉住**:
+ * 将来若真做服务端核算,该用例会变红提醒改口径。
+ *
+ * **U2-b —— 真缺陷,已修。**
+ * `Math.max(0, {})` 得 `NaN` ⇒ `dist > NaN` 恒 false ⇒ 瞬移 / 窗口均速 /
+ * 攻速**三道检查同时静默失效**,单帧跳 200 格直接放行。这与「上限多大」
+ * 无关(即便上限设 1.0 也照样失守),属**判据本身被污染**,与 U1 同类。
+ * 路径真实可达:`{"speedMul":{}}` 经 JSON 到 `onMessage`,TS 的类型标注
+ * **不产生运行时校验**。已修(`sanitizeMul` 兜底 NaN 与 `-Infinity`;
+ * `+Infinity` 故意不动 —— 它本来就被 `Math.min` 正确钳到上限)。
+ *
+ * 放这两个方法进受管表会**误报**(它们的输入本就合法)。所以显式记在这里,
+ * 免得读者把「已登记 0 处」当成「这段没有欠账」。修法见 `CHANGE_REQUESTS.md` CR-14。
  */
 
 /**
@@ -1271,15 +1587,53 @@ function checkClientTrust(): void {
   const clientParam = /\b(?:input|msg|pkt|payload|req)\b/;
   const found: { method: string; field: string; expr: string }[] = [];
 
+  /* ── 契约表自检的收集桶(D2)──
+     这张表是本门禁**唯一的判据来源**。它若被清空 / 拼错 / 删条,
+     检查范围就静默归零,而门禁自己的自我描述仍然成立。
+     另外三张白名单(DECORATOR_EXEMPT / UNREACHABLE_EXEMPT /
+     TAUT_SUSPECT_EXEMPT)都有「失真即报错」的双向自检,唯独这张没有。
+     这里补齐,并要求「登记了但没覆盖」也必须报错 —— 那是最隐蔽的一种。 */
+  const methodUnknown: string[] = [];
+  const sinkMissing: string[] = [];
+  const fieldMissing: string[] = [];
+  /** 整体透传(回退接口级)的方法名。 */
+  const passthrough: string[] = [];
+
+  const knownMethods = new Set<string>(SINK_CALLS.map((c) => c.method));
+  for (const m of Object.keys(SERVER_OWNED_INPUTS)) {
+    if (!knownMethods.has(m)) methodUnknown.push(m);
+  }
+  /* 应有键的**反向**检查:整条被删时上一条会静默通过(表都没了)。
+     参照 `TRUST_MUST_MANAGE`,它独立于本表存在。 */
+  for (const m of TRUST_MUST_MANAGE) {
+    if (!(m in SERVER_OWNED_INPUTS)) fieldMissing.push(`${m} <契约条目被整条删除>`);
+  }
+
   for (const { call, method } of SINK_CALLS) {
     const want = SERVER_OWNED_INPUTS[method];
     if (!want) continue;
+    /* 空字段表 = 该汇点实际不受管,但读者会以为它在受管。 */
+    if (want.length === 0) {
+      fieldMissing.push(`${method} <字段表为空>`);
+      continue;
+    }
     const at = src.indexOf(call);
-    if (at < 0) continue;
+    if (at < 0) {
+      sinkMissing.push(`${method}(${call.trim()})`);
+      continue;
+    }
     const args = extractCallArgs(src, at + call.length - 1);
+    let matched = 0;
+    const missed: string[] = [];
     for (const field of want) {
       const fm = new RegExp(`\\b${field}\\s*:\\s*`).exec(args);
-      if (!fm) continue;
+      if (!fm) {
+        /* 字段名在实参里找不到 ⇒ 这条契约是**死的**:
+           读者以为该字段受管,门禁其实从没查过它。 */
+        missed.push(field);
+        continue;
+      }
+      matched += 1;
       /* 取该字段的取值表达式(括号配平,止于顶层逗号) */
       const from = fm.index + fm[0].length;
       let depth = 0;
@@ -1298,7 +1652,30 @@ function checkClientTrust(): void {
          `msg.ops.reduce(...)` ⇒ 命中(根是 msg)。 */
       if (clientParam.test(expr)) found.push({ method, field, expr });
     }
+    /* ── D2:登记了但没覆盖 ⇒ 必须报错,不能 continue 静默跳过 ── */
+    for (const f of missed) fieldMissing.push(`${method}.${f}`);
+
+    /* ── D1:实参**整体透传**(对象整体递下去,字段名不出现)──
+       此时字段级判定无从下手。旧版在这里静默 `continue`,
+       于是 `inventory(userId, input)` 会报「实测 0 处」——
+       **把漏报显示成好消息**。而这正是最需要报出来的形态:
+       3 个受管字段全部失控。
+
+       判据:一个字面字段都没匹配到,且实参里出现了客户端标识符
+       (或实参根本不是对象字面量)。此时按**接口级**回退:
+       把所有受管字段标记为「取自客户端」并置对应豁免状态。
+       —— 这就是函数头 `:1176-1177` 一直承诺、但代码里从未实现的回退。 */
+    if (matched === 0) {
+      const looksLikeLiteral = /\{\s*$/.test(args.slice(0, 60));
+      if (clientParam.test(args) || !looksLikeLiteral) {
+        for (const field of want) {
+          found.push({ method, field, expr: '<实参整体透传,回退接口级>' });
+        }
+        passthrough.push(`${method}(整体透传)`);
+      }
+    }
   }
+  void passthrough;
 
   const key = (a: string, b: string) => `${a}::${b}`;
   const exemptSet = new Set(TRUST_EXEMPT.map(([f, mth, fld]) => key(f, mth, fld)));
@@ -1317,6 +1694,29 @@ function checkClientTrust(): void {
     + `受管字段 ${Object.values(SERVER_OWNED_INPUTS).flat().length} 个 / `
     + `实测取自客户端 ${found.length} 处(已登记 ${TRUST_EXEMPT.length} 处)`;
 
+  /* ── D2:契约表自检 —— 与另外三张白名单同款「失真即报错」──
+     本表被清空 / 拼错 / 删条 / 字段名写错,判据来源就静默失效,
+     而门禁仍会打印「已检查」。这些都必须 fail,不允许「数字变了但不红」。 */
+  if (methodUnknown.length > 0) {
+    fail(
+      `信任边界契约表失真:登记了不存在的汇点方法 ${methodUnknown.join(', ')}`
+      + ' —— 该条目永远不会被检查,属死的契约',
+    );
+  }
+  if (sinkMissing.length > 0) {
+    fail(
+      `信任边界契约表失真:${sinkMissing.join(', ')}`
+      + ' 在汇点文件里找不到 —— 汇点被改名/删除,而契约表还在,检查范围静默归零',
+    );
+  }
+  if (fieldMissing.length > 0) {
+    fail(
+      `信任边界契约表失真:${fieldMissing.length} 个受管字段在汇点实参里找不到:`
+      + fieldMissing.join(', ')
+      + ' —— 读者以为它们受管,门禁其实从未查过(「定义了但没覆盖」)',
+    );
+  }
+
   if (unlisted.length > 0) {
     fail(
       `汇点里新增「安全判据取自客户端输入」${unlisted.length} 处(未登记):`
@@ -1328,8 +1728,16 @@ function checkClientTrust(): void {
       `信任边界登记失真(${stale.length} 处汇点已不取自客户端,应移出 TRUST_EXEMPT):`
       + stale.join('; '),
     );
-  } else {
+  } else if (methodUnknown.length === 0 && sinkMissing.length === 0 && fieldMissing.length === 0) {
     pass(summary);
+  }
+  /* 整体透传必须可解释:它命中 ≥3 处,是**真报出来**的,不是静默跳过。
+     这条无条件打印,免得读者以为「0 处」等于「没这回事」。 */
+  if (passthrough.length > 0) {
+    console.log(
+      `  i         └─ 回退接口级 ${passthrough.length} 个汇点(实参整体透传,字段名不可见):${
+        passthrough.join(', ')} —— 已按受管字段全量计入`,
+    );
   }
   console.log(`  i         └─ 已登记欠账:${TRUST_EXEMPT.length} 处`);
 }
@@ -1407,7 +1815,7 @@ function checkTautology(): void {
   const unlisted = [...found.keys()].filter((k) => !TAUT_SUSPECT_EXEMPT.has(k)).sort();
 
   if (stale.length > 0) {
-    fail(`同义反复白名单失真(${stale.length} 处,应修正):${stale.slice(0, 4).join('; ')}`);
+    fail(`同义反复白名单失真(${stale.length} 处,应修正):${stale.join('; ')}`);
   } else if (unlisted.length > 0) {
     if (strictTaut) {
       fail(
@@ -2684,10 +3092,20 @@ async function checkIntegration(): Promise<void> {
     /* README 的表格只列 WS-01..11(基座 FND 在状态块里单独汇总,
        不在这张表内),所以只校验 `WS-NN` 形态的键。 */
     if (!/^WS-\d+$/.test(id)) continue;
-    /* 匹配表格行:`| WS-07 | 存档与 20Hz 网络协议 | 115 |` */
-    const rowRe = new RegExp(`\\|\\s*${id.replace(/[-]/g, '\\-')}\\s*\\|[^|]*\\|\\s*(\\d+)\\s*\\|`);
-    const row = rowRe.exec(readmeForSuites);
-    if (row === null) {
+    /* 匹配表格行:`| WS-07 | 存档与 20Hz 网络协议 | 115 |`
+       ⚠️ 必须 `matchAll` + 唯一性 —— 第 13 批审计(GATE-AUDIT-13 §D3)实测:
+       写成 `rowRe.exec()`(首匹配)时,在真行**之前**插一行同 WS 的假行
+       (数字写对)、再把真行改错,该 WS 就**从报错里彻底消失** ——
+       门禁仍然红(因为别的 WS 错了),但被掩盖的那个看起来没事。
+       这是同文件第 5 处同形态缺陷(前 4 处见 `:2658` / `:2684` / `:2766` / `:2783`)。 */
+    const rowReSrc = `\\|\\s*${id.replace(/[-]/g, '\\-')}\\s*\\|[^|]*\\|\\s*(\\d+)\\s*\\|`;
+    const rowAll = [...readmeForSuites.matchAll(new RegExp(rowReSrc, 'g'))];
+    if (rowAll.length > 1) {
+      staleSuites.push(`${id} 在 README 表格里出现 ${rowAll.length} 次(影子行)`);
+      continue;
+    }
+    const row = rowAll[0];
+    if (row === undefined) {
       staleSuites.push(`${id} 在 README 表格里找不到`);
       continue;
     }
@@ -2714,7 +3132,12 @@ async function checkIntegration(): Promise<void> {
   /* matchAll + 唯一性:防「影子行」(首匹配会让后置的错误行永远读不到) */
   const fmAll = [...readmeText.matchAll(/冻结层不变量\s+(\d+)\/(\d+)/g)];
   const fm = fmAll.length === 1 ? fmAll[0]! : null;
-  if (fmAll.length > 1) {
+  if (!frozenRan) {
+    /* N1:`checkFrozen` 没跑过(--integration / --content / --only 都会跳过它)。
+       此时 `frozenInvariantCount` 是**初值 0**,拿它去比会报假红
+       「README 声称 17/17,实测 0」。跳过而不是当 0。 */
+    console.log('      · 本模式未运行 checkFrozen,README 冻结层计数未校验');
+  } else if (fmAll.length > 1) {
     fail(`README.md 里出现 ${fmAll.length} 处「冻结层不变量 N/N」—— 只校验首处会让其余成为影子行`);
   } else if (fm === null) {
     fail('README.md 里找不到「冻结层不变量 N/N」这一行');
@@ -2811,11 +3234,18 @@ async function checkContent(): Promise<void> {
     console.error('      若属有意扩展:node scripts/content-lock.ts --update,并在 docs/CHANGE_REQUESTS.md 登记');
   }
 
-  /* — 容量账本:位域余量告警 — */
+  /* — 容量账本:位域余量告警 —
+     ⚠️ 旧版走 `console.error(' ⚠ ...') + failures += 1`,**不打印 `✗`**。
+     于是它是全仓唯一一条"失败但不带 ✗ 标记"的路径(GATE-AUDIT-13 §D5 实测:
+     退出码 1,但 ✗ 行数 = 0)。而 `runTests` 的失败摘录、以及人/工具的
+     「grep ✗」习惯都以 ✗ 为准 ⇒ 这条失败极易被当成"告警,非阻塞"略过,
+     且与末尾「N 项失败」的计数对不上账。改为统一的 `fail()`。 */
   for (const c of reg.contentCapacity()) {
     if (c.ratio !== null && c.ratio > 0.9) {
-      console.error(`      ⚠ ${c.space} 已用 ${(c.ratio * 100).toFixed(1)}%,余量紧张:${c.note}`);
-      failures += 1;
+      fail(
+        `容量账本余量紧张:${c.space} 已用 ${(c.ratio * 100).toFixed(1)}%`
+        + `(阈值 90%)—— ${c.note}`,
+      );
     }
   }
 
@@ -2865,12 +3295,39 @@ async function checkContent(): Promise<void> {
  * 因为没人会去复查一个看起来合理的数字)。让验证器自己汇总,
  * 数字就只有一处来源。
  */
+/**
+ * 从套件 stdout 里抽 `N/M 通过`。
+ *
+ * ## 为什么改成「首匹配 + 恰好 1 处」(GATE-AUDIT-13 §D4)
+ *
+ * 旧实现取**末匹配** (`all[all.length - 1]`),理由是「失败时前面可能还有
+ * 其它含分数形式的输出」。但那个理由站不住,而且引入了一个更糟的后果:
+ *
+ *   在 `tests/WS-01.test.ts` 末尾追加一行 `console.log('[WS-01] 999/999 通过')`,
+ *   门禁就把 **999** 当成该套件的「实测」断言数,并报 `✓ 用例汇总:1964 条通过`
+ *   (真值 1015)。**门禁的"实测"变成了骗它的人说什么就是什么。**
+ *
+ * 而且 `runTests` 里的 `sumPassed !== sumTotal` 自洽检查**抓不住**它 ——
+ * 伪造行 `999/999` 自身自洽,两侧一起假,总账依然"通过"。
+ *
+ * ## 现在的判据
+ *
+ * 1. **恰好 1 处** 才算数。>1 处 = 输出被污染(套件多打印了计数行,或被注入),
+ *    直接判失败而不是"挑一个信"。
+ * 2. 取**首次**出现 —— 与 `report()` 的位置无关,但至少不再偏爱末行。
+ * 3. 出现 0 处 ⇒ null(由调用方决定怎么处理)。
+ *
+ * 各套件的 `report()` 只打印一行 `[NAME] N/M 通过`,故「1 处」是正常态的精确刻画。
+ */
 function parseAssertionCounts(out: string): { passed: number; total: number } | null {
-  /* 匹配末行的 `N/N 通过`(各套件统一格式)。取**最后一个**匹配,
-     因为失败时前面可能还有其它含分数形式的输出。 */
   const all = [...out.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)];
   if (all.length === 0) return null;
-  const m = all[all.length - 1];
+  if (all.length > 1) {
+    /* 用 NaN 作为「污染」信号,由 runTests 转成 fail。
+       不在这里直接 fail():本函数是纯函数,便于单测。 */
+    return { passed: NaN, total: NaN };
+  }
+  const m = all[0]!;
   return { passed: Number(m[1]), total: Number(m[2]) };
 }
 
@@ -2909,6 +3366,16 @@ function runTests(): void {
       pass(`${rel} — ${out.split('\n').pop() ?? ''}`);
       const c = parseAssertionCounts(out);
       if (c) {
+        /* D4:NaN = 计数行出现 >1 次 ⇒ 输出被污染。
+           不能"挑一个信" —— 那正是旧版取末匹配被骗走的路。 */
+        if (Number.isNaN(c.passed) || Number.isNaN(c.total)) {
+          const n = [...out.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)].length;
+          fail(
+            `${rel} 输出含 ${n} 处「N/N 通过」—— 每套件应恰好 1 处。`
+            + '多处会让门禁的「实测数字」可被伪造(在套件末尾多打一行即可)',
+          );
+          continue;
+        }
         sumPassed += c.passed;
         sumTotal += c.total;
         counted += 1;
@@ -2945,6 +3412,13 @@ function runTests(): void {
 /* ───────────────────── main ───────────────────── */
 
 const t0 = Date.now();
+
+/* `--all` 的口径歧义必须当场报错,不能靠"恰好等于不传 flag"糊过去。
+   见 `allFlag` 的说明(GATE-AUDIT-13 §N2)。 */
+if (allFlag && (only || frozenOnly || docsOnly || integrationOnly || contentOnly)) {
+  console.error('  ✗ --all 不能与 --only/--frozen/--docs/--content/--integration 同时使用(口径歧义)');
+  process.exitCode = 1;
+} else {
 if (!docsOnly && !only && !integrationOnly && !contentOnly) await checkFrozen();
 /* ⚠️ `runTests()` 必须排在 `checkDocs()` **之前**:
    `checkDocs()` 要用各套件的实测断言数校验 README 表格,
@@ -2962,3 +3436,4 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
 
 console.log(`\n${failures === 0 ? '全部通过' : `${failures} 项失败`} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
+}

@@ -41,8 +41,9 @@ import {
   TELEGRAPH_SEC_MIN,
   type FsmConfig,
 } from './fsm.ts';
-import { circleWarn, type WarnGeom } from './geometry.ts';
-import { angleToDeg } from './geometry.ts';
+/* 两行并一行:`circleWarn` / `WarnGeom` 与 `angleToDeg` 同属 `geometry.ts`,
+   原先写成两条 `from './geometry.ts'`,后半条是被后人追加符号时复制出来的。 */
+import { angleToDeg, circleWarn, type WarnGeom } from './geometry.ts';
 import {
   createMobAi,
   isHostile,

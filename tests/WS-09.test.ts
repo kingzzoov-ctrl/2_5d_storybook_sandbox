@@ -58,6 +58,10 @@ import {
   withinBudget,
   zToElev,
 } from '../client/src/stage/tile_mesh.ts';
+import {
+  emitChunkGeometry,
+  validateChunkGeometry,
+} from '../client/src/stage/chunk_geometry.ts';
 
 import {
   NEIGHBOR4_DX,
@@ -3089,12 +3093,74 @@ function walkTs(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** 抓 `from '...'` 与 `import('...')` 两种形态的相对说明符 */
+/**
+ * 剥离注释,**保留字符串字面量**。
+ *
+ * ## 为什么需要它
+ *
+ * 判据是「相对 import 能解析到真实文件」。但直接扫源码会把**注释里
+ * 举例说明的 import** 也算成真实 import —— 实测踩到过:`boot.ts` 的注释写
+ * 「为什么不用 `import atlas from './atlas_sprites.png'`」,
+ * 那句话本身是文档,却让门禁报「有 import 解析不到」。
+ *
+ * 这会逼着人**为了迎合门禁而把注释写含糊**,是本末倒置。正确做法是把扫描
+ * 做得更精确:**注释里的东西不是代码**。
+ *
+ * 注意**不能连字符串一起剥离** —— import 的说明符本身就是字符串。
+ * 所以这里只去注释,保留引号内内容(含转义)。
+ *
+ * 逐字符状态机,不依赖正则,避免模板字符串/URL 里的 `//` 被误当注释。
+ */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  let quote: string | null = null;
+  while (i < n) {
+    const c = src[i] as string;
+    const c2 = src[i + 1];
+    if (quote !== null) {
+      out += c;
+      if (c === '\\') {
+        out += c2 ?? '';
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      quote = c;
+      out += c;
+      i += 1;
+      continue;
+    }
+    /* 行注释:吃到行尾(保留换行,便于后续按行定位) */
+    if (c === '/' && c2 === '/') {
+      while (i < n && src[i] !== '\n') i += 1;
+      continue;
+    }
+    /* 块注释:吃到闭合;未闭合则吃到末尾 */
+    if (c === '/' && c2 === '*') {
+      i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** 抓 `from '...'` 与 `import('...')` 两种形态的相对说明符(**已剥离注释**) */
 function relativeSpecifiers(src: string): string[] {
   const found: string[] = [];
+  const code = stripComments(src);
   const re = /(?:from\s*|import\s*\(\s*)['"](\.[^'"]*)['"]/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(src)) !== null) found.push(m[1]);
+  while ((m = re.exec(code)) !== null) found.push(m[1]);
   return found;
 }
 
@@ -3116,6 +3182,63 @@ test('分层不变量:client/src 的每条相对 import 都能解析到真实文
   }
   eq(broken, [], `全部 ${total} 条相对 import 必须可解析`);
   ok(total >= 20, `相对 import 数量合理(实测 ${total})`);
+});
+
+/*
+ * 上面那条门禁靠 `stripComments` 排除注释干扰。**剥离器本身必须被验证** ——
+ * 否则它可能把真 import 也剥掉,让门禁「因为看不见问题而变绿」,
+ * 那比原来的误报更糟(误报至少是可见的)。
+ *
+ * 下面这组用例从两个方向钉住它。
+ */
+test('注释剥离器:注释里的 import 不算数,真 import 一条都不能少', () => {
+  /* 方向一:注释里的 import 必须被忽略 */
+  const cases: string[] = [
+    `// import a from './nope.ts';`,
+    `/* import a from './nope.ts'; */`,
+    `const s = "// not a comment"; // import a from './nope.ts';`,
+    `/**\n * 用 fetch 而不是 \`import x from './nope.png'\`\n */`,
+  ];
+  for (const src of cases) {
+    eq(relativeSpecifiers(src), [], `注释里的 import 应被忽略:${src.slice(0, 46).replace(/\n/g, ' ')}`);
+  }
+
+  /* 方向二:真 import 一条都不能漏(含动态 import、双引号、转义) */
+  eq(relativeSpecifiers(`import a from './keep.ts';`), ['./keep.ts'], '单引号 from');
+  eq(relativeSpecifiers(`import a from "./keep.ts";`), ['./keep.ts'], '双引号 from');
+  eq(relativeSpecifiers(`const m = await import('./keep.ts');`), ['./keep.ts'], '动态 import');
+  eq(
+    relativeSpecifiers(`import a from './a.ts';\nimport b from './b.ts';`),
+    ['./a.ts', './b.ts'],
+    '多条全部保留(不是只看第一条)',
+  );
+  /* 关键组合:注释 + 真 import 混在一起,只剩真的那条 */
+  eq(
+    relativeSpecifiers(`// import x from './fake.ts';\nimport y from './real.ts';\n/* from './fake2.ts' */`),
+    ['./real.ts'],
+    '注释与真 import 混排时只留真的',
+  );
+
+  /* 方向三:字符串里的 `//` 不能被当成注释(否则会吃掉后面的真 import) */
+  eq(
+    relativeSpecifiers(`const u = 'http://x'; import b from './after.ts';`),
+    ['./after.ts'],
+    "字符串里的 // 不是注释,后面的 import 仍须被抓到",
+  );
+  /* 模板字符串同理 */
+  eq(
+    relativeSpecifiers('const t = `http://a/${b}`; import c from \'./tmpl.ts\';'),
+    ['./tmpl.ts'],
+    '模板字符串里的 // 不是注释',
+  );
+  /* 未闭合块注释:吃到末尾即可,不得抛错 */
+  eq(relativeSpecifiers(`const a = 1; /* 没闭合 from './x.ts'`), [], '未闭合块注释不抛错');
+  /* 转义引号:不得提前结束字符串导致误判 */
+  eq(
+    relativeSpecifiers(`const s = 'it\\'s'; import d from './esc.ts';`),
+    ['./esc.ts'],
+    '转义引号不破坏状态机',
+  );
 });
 
 test('分层不变量:只有 three/** 可以 import three,纯逻辑层零三方依赖', () => {
@@ -3221,6 +3344,359 @@ test('染色 uniform 是单槽位:表结构印证 dyeUploadCount 的 0/1 语义'
     ok(!s.type.includes('array'), `${s.name} 不是数组型`);
     ok(!/\d+$/.test(s.name), `${s.name} 没有编号后缀(不存在备用槽位)`);
   }
+});
+
+/* ═══════════ 顶点填充管线(补上「只报数量不查性质」的洞)═══════════ */
+
+/*
+ * 背景:buildChunkGeometry 曾经**只分配顶点缓冲、从不写入** ——
+ * position 数组全是 0,地形一个三角形都画不出来。
+ *
+ * 而本文件原来 3226 行测试**全部是绿的**,因为它们断言的是
+ * `vertexCount` 这个**数字**(它一直是对的)。
+ *
+ * 这是「只报数量不查性质」的典型:数量对、内容空,门禁看不见。
+ * 下面这些测试断言的是**顶点内容**,能真正抓住这类缺陷。
+ */
+
+/** 造一个有高低差的 16×16 chunk:左半 GROUND、右半 PLATFORM */
+function makeSlopedChunk(): { key: string; cx: number; cy: number; tiles: Uint32Array } {
+  const tiles = new Uint32Array(256);
+  for (let y = 0; y < 16; y += 1) {
+    for (let x = 0; x < 16; x += 1) {
+      tiles[y * 16 + x] = packTile({
+        elev: x < 8 ? Elevation.GROUND : Elevation.PLATFORM,
+        base: 1,
+        floor: 1,
+        wire: 0,
+        obj: 0,
+      });
+    }
+  }
+  return { key: 'slope', cx: 2, cy: 3, tiles };
+}
+
+test('顶点填充:position 数组非零(不是「只分配不写入」)', () => {
+  const g = emitChunkGeometry(makeSlopedChunk(), 0);
+  ok(g.vertexCount > 0, '有顶点');
+  let nonZero = 0;
+  for (let i = 0; i < g.positions.length; i += 1) if (g.positions[i] !== 0) nonZero += 1;
+  ok(nonZero > 0, `position 数组非零(实测 ${nonZero} / ${g.positions.length})`);
+  /*
+   * 关键:不能只断言「有非零」就够 —— 全零会红,但「只填了 x 不填 y」
+   * 也能通过。所以再断言三个分量各自都有非零。
+   */
+  let nx = 0; let ny = 0; let nz = 0;
+  for (let v = 0; v < g.vertexCount; v += 1) {
+    if (g.positions[v * 3] !== 0) nx += 1;
+    if (g.positions[v * 3 + 1] !== 0) ny += 1;
+    if (g.positions[v * 3 + 2] !== 0) nz += 1;
+  }
+  ok(nx > 0, 'x 分量有数据');
+  ok(ny > 0, 'y 分量有数据');
+  ok(nz > 0, 'z 分量有数据');
+});
+
+test('顶点填充:写出与计数同源(几何数 = buildChunkQuads 数)', () => {
+  const chunk = makeSlopedChunk();
+  for (const lod of [0, 1, 2, 3]) {
+    const batch = buildChunkQuads(chunk, lod);
+    const g = emitChunkGeometry(chunk, lod);
+    eq(g.faceCount, batch.faceCount, `LOD${lod} 面数与计数一致`);
+    eq(g.vertexCount, batch.vertexCount, `LOD${lod} 顶点数与计数一致`);
+    eq(g.batch.topQuads, batch.topQuads, `LOD${lod} 顶面数一致`);
+    eq(g.batch.sideQuads, batch.sideQuads, `LOD${lod} 侧面数一致`);
+  }
+});
+
+test('顶点填充:自检能抓住「清零点」与「索引越界」', () => {
+  const g = emitChunkGeometry(makeSlopedChunk(), 0);
+  eq(validateChunkGeometry(g), null, '正常几何自检通过');
+
+  /* 反例 1:把顶点清零 —— 这正是原来那版的实际状态 */
+  const zeroed = { ...g, positions: new Float32Array(g.positions.length) };
+  ok(validateChunkGeometry(zeroed) !== null, '全零顶点必须被自检抓住');
+
+  /* 反例 2:索引越界 */
+  const bad = { ...g, indices: new Uint32Array(g.indices) };
+  bad.indices[0] = 999999;
+  ok(validateChunkGeometry(bad) !== null, '索引越界必须被自检抓住');
+
+  /* 反例 3:顶点数与数组长度不符 */
+  const short = { ...g, positions: new Float32Array(6) };
+  ok(validateChunkGeometry(short) !== null, 'positions 长度不符必须被抓');
+});
+
+test('顶点填充:每个 quad 的 4 个顶点坐标符合预期(不只数量)', () => {
+  const chunk = makeSlopedChunk();
+  const g = emitChunkGeometry(chunk, 0);
+
+  /*
+   * 第一个面应是顶面:4 个顶点的 z 相同,且在 x/y 上构成 1×1 的单位方块
+   * (LOD0 时 merge=1)。区块原点 = (cx·16, cy·16) = (32, 48)。
+   */
+  const z0 = g.positions[2]!;
+  eq(g.positions[0], 32, '首面左下角 x = cx·16');
+  eq(g.positions[1], 48, '首面左下角 y = cy·16');
+  eq(g.positions[3], 33, '第二个顶点 x = +1');
+  eq(g.positions[4], 48, '第二个顶点 y 不变');
+  eq(g.positions[6], 32, '第三个顶点 x 不变');
+  eq(g.positions[7], 49, '第三个顶点 y = +1');
+  eq(g.positions[9], 33, '第四个顶点 x = +1');
+  eq(g.positions[10], 49, '第四个顶点 y = +1');
+  for (let v = 0; v < 4; v += 1) {
+    eq(g.positions[v * 3 + 2], z0, `首面第 ${v} 个顶点 z 相同(平四边形)`);
+  }
+
+  /* 顶面法线必须朝 +Z */
+  for (let v = 0; v < 4; v += 1) {
+    eq(g.normals[v * 3 + 2], 1, `顶面第 ${v} 顶点法线朝 +Z`);
+  }
+});
+
+test('顶点填充:索引落在各面自己的 4 个顶点内', () => {
+  const g = emitChunkGeometry(makeSlopedChunk(), 0);
+  for (let f = 0; f < g.faceCount; f += 1) {
+    const base = f * 4;
+    for (let k = 0; k < 6; k += 1) {
+      const v = g.indices[f * 6 + k]!;
+      ok(v >= base && v < base + 4, `第 ${f} 面索引 ${v} 落在 [${base}, ${base + 4})`);
+    }
+  }
+});
+
+test('顶点填充:空 chunk 不产生顶点,且不报错', () => {
+  const g = emitChunkGeometry({ key: 'e', cx: 0, cy: 0, tiles: new Uint32Array(256) }, 0);
+  eq(g.faceCount, 0, '空 chunk 无面');
+  eq(g.vertexCount, 0, '空 chunk 无顶点');
+  eq(g.positions.length, 0, 'positions 为空数组');
+  eq(validateChunkGeometry(g), null, '空 chunk 自检通过(不误报)');
+});
+
+test('顶点填充:UV 与法线都已写出(不是只填 position)', () => {
+  const g = emitChunkGeometry(makeSlopedChunk(), 0);
+  let uvNz = 0;
+  for (let i = 0; i < g.uvs.length; i += 1) if (g.uvs[i] !== 0) uvNz += 1;
+  ok(uvNz > 0, `UV 有数据(实测 ${uvNz})`);
+
+  let nrmNz = 0;
+  for (let i = 0; i < g.normals.length; i += 1) if (g.normals[i] !== 0) nrmNz += 1;
+  ok(nrmNz > 0, `法线有数据(实测 ${nrmNz})`);
+
+  eq(g.uvs.length, g.vertexCount * 2, 'UV 长度 = 顶点数×2');
+  eq(g.normals.length, g.vertexCount * 3, '法线长度 = 顶点数×3');
+});
+
+/* ────────── 面板布局(纯逻辑层,2026-11-12 新增)──────────
+ *
+ * 这些断言守的是「8 个客户端模块接进 boot.ts」时暴露出的**真实缺陷**:
+ * UI 面板的算术从 DOM 绘制里被抽到 `ui/panel_layout.ts`,
+ * 于是「文字溢出面板」「底行压住砖块」这类错误可以在 node 里断言,
+ * 而不必靠肉眼看截图。
+ */
+import {
+  CELL_INSET,
+  EASEL_TOOLBAR_RESERVE_PX,
+  INVENTORY_TOTAL_ROWS,
+  PITCH_BOTTOM_CLEARANCE,
+  PITCH_FOOTER_H,
+  RECIPE_INDENT_PX,
+  bossHudShowsLabels,
+  brickRect,
+  indentRecipeRows,
+  layoutBossHudBand,
+  layoutBlueprintHud,
+  layoutEaselPanel,
+  layoutInventoryPanel,
+  layoutPitchPanel,
+  layoutRecipePanel,
+  layoutFitsViewport,
+  paletteRect,
+  rectVisible,
+  slotRect,
+} from '../client/src/ui/panel_layout.ts';
+
+const VW = 1280;
+const VH = 800;
+
+test('面板布局:所有面板都完整落在视口内', () => {
+  /*
+   * ⚠ 两个 helper 的入参形态**不同**,混用会抛 `Cannot read properties of undefined`:
+   *   · `rectVisible(rect, w, h)`      —— 收**裸矩形**
+   *   · `layoutFitsViewport(layout, w, h)` —— 收**布局对象**(内部取 `.panel`)
+   * 我第一版给后者传了裸矩形,直接红。
+   */
+  const rects = [
+    layoutInventoryPanel(VW, VH).panel,
+    layoutEaselPanel(VW, VH).panel,
+    layoutPitchPanel(VW, VH).panel,
+    layoutRecipePanel(VW, VH, 20).panel,
+    layoutBossHudBand(VW, VH),
+    layoutBlueprintHud(VW, VH).hint,
+  ];
+  for (const p of rects) {
+    ok(rectVisible(p, VW, VH), `矩形 (${p.x},${p.y},${p.w},${p.h}) 完整可见`);
+    ok(p.x >= 0 && p.y >= 0, `矩形 (${p.x},${p.y},${p.w},${p.h}) 左上角非负`);
+    ok(p.x + p.w <= VW + 0.5 && p.y + p.h <= VH + 0.5, `矩形 (${p.x},${p.y},${p.w},${p.h}) 右下角不越界`);
+  }
+  /* 布局对象形态走另一个 helper */
+  ok(layoutFitsViewport(layoutInventoryPanel(VW, VH), VW, VH), '背包布局在视口内');
+  ok(layoutFitsViewport(layoutEaselPanel(VW, VH), VW, VH), '画架布局在视口内');
+  ok(layoutFitsViewport(layoutPitchPanel(VW, VH), VW, VH), '音高布局在视口内');
+});
+
+test('面板布局:窄视口下也不越界(不能只在 1280 宽成立)', () => {
+  for (const [w, h] of [[640, 480], [360, 640], [1920, 1080]]) {
+    const inv = layoutInventoryPanel(w, h);
+    ok(inv.panel.x >= 0, `${w}×${h} 背包左边界 >= 0`);
+    ok(inv.panel.y >= 0, `${w}×${h} 背包上边界 >= 0`);
+    ok(inv.panel.x + inv.panel.w <= w + 1, `${w}×${h} 背包右边界不越界`);
+    /* 格子必须真的落在面板内 —— 越界会让点击命中算到面板外面去 */
+    const first = slotRect(inv, 0);
+    const last = slotRect(inv, inv.cols * inv.rows - 1);
+    ok(first.x >= inv.panel.x, '首格在面板内');
+    ok(last.x + last.w <= inv.panel.x + inv.panel.w + 1, '末格右边界在面板内');
+    ok(last.y + last.h <= inv.panel.y + inv.panel.h + 1, '末格下边界在面板内');
+  }
+});
+
+test('面板布局:格子尺寸自洽(格子数 × 格宽 = 网格宽)', () => {
+  const L = layoutInventoryPanel(VW, VH);
+  eq(L.cols * L.rows, L.cols * L.rows, '网格格数 = 列×行');
+  /* 单元格 inset 不能把格子吃光 */
+  ok(CELL_INSET * 2 < L.cell, `内缩 ${CELL_INSET}×2 < 格宽 ${L.cell}`);
+  const r0 = slotRect(L, 0);
+  const r1 = slotRect(L, 1);
+  eq(r1.x - r0.x, L.cell, '相邻格水平间距 = 格宽');
+  const rRow = slotRect(L, L.cols);
+  eq(rRow.y - r0.y, L.cell, '相邻行垂直间距 = 格高');
+});
+
+test('面板布局:slotRect 下标超界不崩(越界返回面板内矩形)', () => {
+  const L = layoutInventoryPanel(VW, VH);
+  const r = slotRect(L, 99999);
+  ok(Number.isFinite(r.x) && Number.isFinite(r.y), '越界下标仍返回有限坐标');
+});
+
+test('面板布局:音高砖底部信息行不压住砖块(实测踩过的重叠)', () => {
+  const L = layoutPitchPanel(VW, VH);
+  /* 底行必须计入面板高度 —— 初版忘了,导致「已选 N 档」压在第二行砖上 */
+  ok(PITCH_FOOTER_H > 0, '底行高度 > 0');
+  ok(L.panel.h >= 28 + 2 * L.brickH + PITCH_FOOTER_H, '面板高度含底行');
+  /* 底行顶端必须在所有砖块底端之下(严格不相交) */
+  const lastBrick = L.bricks[L.bricks.length - 1]!;
+  ok(L.footer.y >= lastBrick.y + lastBrick.h, `底行 y=${L.footer.y} >= 末砖底 y=${lastBrick.y + lastBrick.h}`);
+  ok(L.footer.y + L.footer.h <= L.panel.y + L.panel.h + 1, '底行不超出面板');
+  /* 底部还要让开页面常驻提示条 */
+  ok(VH - (L.panel.y + L.panel.h) >= 40, `面板底部留白 ${VH - (L.panel.y + L.panel.h)} >= 40(让开 #hint)`);
+  eq(PITCH_BOTTOM_CLEARANCE >= 40, true, 'PITCH_BOTTOM_CLEARANCE 足够大');
+});
+
+test('面板布局:音高砖共 32 块且下标映射连续', () => {
+  const L = layoutPitchPanel(VW, VH);
+  eq(L.bricks.length, 32, '32 块砖');
+  for (let i = 0; i < 32; i += 1) {
+    const r = brickRect(L, i);
+    ok(r !== null, `砖 ${i} 存在`);
+    ok(r!.x >= L.panel.x && r!.y >= L.panel.y, `砖 ${i} 在面板内`);
+    ok(r!.x + r!.w <= L.panel.x + L.panel.w + 1, `砖 ${i} 右边界在面板内`);
+  }
+  eq(brickRect(L, 32), null, '越界下标返回 null');
+  eq(brickRect(L, -1), null, '负下标返回 null');
+  /* 第 16 块应换到第二行 */
+  const b0 = brickRect(L, 0)!;
+  const b16 = brickRect(L, 16)!;
+  eq(b16.x, b0.x, '第 16 块回到第一列');
+  eq(b16.y - b0.y, L.brickH, '第 16 块下移一行');
+});
+
+test('面板布局:画架面板宽度装得下工具条文字(实测溢出)', () => {
+  const L = layoutEaselPanel(VW, VH);
+  /* 初版宽度取 max(画布, 调色盘),工具条约 317px 直接溢到面板外草地上 */
+  ok(EASEL_TOOLBAR_RESERVE_PX >= 320, `工具条预留 ${EASEL_TOOLBAR_RESERVE_PX} >= 320`);
+  ok(L.toolbar.w >= EASEL_TOOLBAR_RESERVE_PX, `工具条可用宽 ${L.toolbar.w} >= 预留`);
+  ok(L.panel.w >= EASEL_TOOLBAR_RESERVE_PX, '面板宽度 >= 工具条所需');
+  ok(L.toolbar.x + L.toolbar.w <= L.panel.x + L.panel.w + 1, '工具条不超出面板');
+});
+
+test('面板布局:画布与调色盘都不超出面板', () => {
+  const L = layoutEaselPanel(VW, VH);
+  ok(L.canvas.x >= L.panel.x, '画布左边界在面板内');
+  ok(L.canvas.y >= L.panel.y, '画布上边界在面板内');
+  ok(L.canvas.x + L.canvas.w <= L.panel.x + L.panel.w + 1, '画布右边界在面板内');
+  ok(L.canvas.y + L.canvas.h <= L.panel.y + L.panel.h + 1, '画布下边界在面板内');
+  /* 调色盘 32 格 */
+  for (let i = 0; i < 32; i += 1) {
+    const r = paletteRect(L, i);
+    ok(r.x + r.w <= L.panel.x + L.panel.w + 1, `色 ${i} 右边界在面板内`);
+    ok(r.y + r.h <= L.panel.y + L.panel.h + 1, `色 ${i} 下边界在面板内`);
+  }
+  /* 调色盘与画布不重叠 */
+  ok(L.palette.y >= L.canvas.y + L.canvas.h, '调色盘在画布下方,不重叠');
+  /* 工具条在调色盘下方 */
+  ok(L.toolbar.y >= L.palette.y + L.palette.h, '工具条在调色盘下方');
+});
+
+test('面板布局:配方行缩进随深度单调递增', () => {
+  const rows = indentRecipeRows([0, 0, 0, 0], [0, 1, 2, 3]);
+  /*
+   * ⚠ `indentRecipeRows` 返回的是 `{...row, depth, indent}` —— 偏移量在 **`indent`**,
+   * 不是 `x`。我第一版按 `x` 断言,4 条全红且报 `undefined`。
+   */
+  eq(rows.length, 4, '4 行');
+  for (let i = 1; i < rows.length; i += 1) {
+    ok(rows[i]!.indent > rows[i - 1]!.indent, `第 ${i} 行比第 ${i - 1} 行更缩进`);
+  }
+  eq(rows[0]!.indent, 0, '深度 0 不缩进');
+  eq(rows[1]!.indent - rows[0]!.indent, RECIPE_INDENT_PX, '每级缩进 = RECIPE_INDENT_PX');
+  eq(rows[3]!.indent, 3 * RECIPE_INDENT_PX, '深度 3 缩进 = 3 级');
+  /* 深度相同则缩进相同 */
+  const same = indentRecipeRows([0, 0], [2, 2]);
+  eq(same[0]!.indent, same[1]!.indent, '同深度同缩进');
+  /* 负深度与小数必须被规范化(否则会算出负缩进 / 半像素) */
+  const weird = indentRecipeRows([0, 0, 0], [-3, 1.7, 2.2]);
+  eq(weird[0]!.depth, 0, '负深度夹到 0');
+  eq(weird[1]!.depth, 1, '1.7 截断为 1');
+  eq(weird[2]!.depth, 2, '2.2 截断为 2');
+  ok(weird.every((r) => r.indent >= 0), '缩进永不为负');
+});
+
+test('面板布局:配方面板高度随节点数增长但有上限', () => {
+  const few = layoutRecipePanel(VW, VH, 3).panel;
+  const many = layoutRecipePanel(VW, VH, 500).panel;
+  ok(many.h >= few.h, '节点多则面板高');
+  ok(many.h <= VH, `面板高 ${many.h} 不超过视口 ${VH}`);
+});
+
+test('面板布局:背包页数与总容量一致', () => {
+  const L = layoutInventoryPanel(VW, VH);
+  eq(L.rows * L.cols, 160, '每页 160 格');
+  /* 21 行 336 格 → 3 页,与 inventory.ts 的常量必须吻合(两处不一致会错位) */
+  eq(INVENTORY_TOTAL_ROWS, 21, '总行数 21');
+});
+
+test('面板布局:Boss 血条带宽度随视口收窄,标签在窄屏隐藏', () => {
+  const wide = layoutBossHudBand(1920, VH);
+  const narrow = layoutBossHudBand(360, VH);
+  ok(wide.w <= 1920, '宽屏血条不超视口');
+  ok(narrow.w <= 360, '窄屏血条不超视口');
+  eq(bossHudShowsLabels(1920), true, '宽屏显示标签');
+  eq(bossHudShowsLabels(360), false, '窄屏隐藏标签');
+});
+
+test('面板布局:蓝图提示条居中且不超出视口', () => {
+  /* `layoutBlueprintHud` 返回 `{hint}` —— 提示条本身是 `hint`,不是顶层矩形 */
+  const p = layoutBlueprintHud(VW, VH).hint;
+  ok(p.x >= 0 && p.x + p.w <= VW + 1, '蓝图提示条水平不越界');
+  ok(p.y >= 0 && p.y + p.h <= VH + 1, '蓝图提示条垂直不越界');
+  /* 居中:左右留白应相等 */
+  const left = p.x;
+  const right = VW - (p.x + p.w);
+  ok(Math.abs(left - right) <= 1, `居中(左 ${left} ≈ 右 ${right})`);
+  /* 窄屏也必须在视口内 —— 提示条宽度固定 260,窄屏最容易越界 */
+  const narrow = layoutBlueprintHud(360, 640).hint;
+  ok(narrow.x >= 0, `窄屏左边界 ${narrow.x} >= 0`);
+  ok(narrow.x + narrow.w <= 360 + 1, `窄屏右边界 ${narrow.x + narrow.w} <= 360`);
 });
 
 report('WS-09');

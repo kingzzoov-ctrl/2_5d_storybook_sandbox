@@ -14,6 +14,7 @@
     "verify:docs": "node scripts/verify.ts --docs",
     "verify:content": "node scripts/verify.ts --content",
     "verify:integration": "node scripts/verify.ts --integration",
+    "verify:selfcheck": "node scripts/gate-selfcheck.ts",
     "backlog": "node scripts/backlog.ts",
     "backlog:blocking": "node scripts/backlog.ts --blocking",
     "content": "node scripts/content-lock.ts",
@@ -22,9 +23,11 @@
     "content:update": "node scripts/content-lock.ts --update",
     "test": "node scripts/verify.ts --all",
     "sim": "node server/src/sim/demo.ts",
-    "typecheck": "node scripts/typecheck.ts"
+    "typecheck": "node scripts/typecheck.ts",
+    "dev:client": "vite",
+    "build:client": "vite build",
+    "preview:client": "vite preview"
   },
-  "dependencies": {},
   "optionalDependencies": {
     "@colyseus/schema": "^2.0.34",
     "better-sqlite3": "^11.3.0",
@@ -32,6 +35,7 @@
     "three": "^0.169.0"
   },
   "devDependencies": {
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vite": "^8.3.8"
   }
 }

@@ -262,6 +262,14 @@ test('管线5:暴击率边界与爆伤上限 3.0', () => {
   eq(edgeLow.critRolled, true, 'roll < critRate 即暴击(边界下沿)');
   const edgeHigh = computeDamage({ attacker: a, target, weapon: w, critRoll: 0.0701, dodgeRoll: 0.99 });
   eq(edgeHigh.critRolled, false, 'roll ≥ critRate 不暴击(边界上沿)');
+  /* 本行是 `eq(计算值, 导出常量)` 形态 —— 两侧同源,数学上恒真。
+   * 【task-23 定性结论:保留,不改为字面量】理由(注入实测):
+   *   注入 BASE_CRIT_DMG 1.5→2.5 ⇒ 本套件 43/44 变红(红在相邻的字面量断言),
+   *   即**该常量已被同套件独立锚点覆盖**,本行是冗余而非漏洞。
+   *   与 `REFLECT_RADIUS` 的处置不同 —— 那一条注入后 44/44 全绿(无守卫),故必须改;
+   *   本条注入会红(有守卫),属 verify.ts 白名单里已登记的**候选**,非缺陷。
+   *   改为字面量会使 `WS-10::BASE_CRIT_DMG` 条目失真 —— 那需要同步改 verify.ts,
+   *   不在本任务写域,故保持原样。 */
   eq(edgeLow.critMul, BASE_CRIT_DMG, '基础爆伤 150%');
   near(edgeLow.finalDamage, noCrit.finalDamage * 1.5, 0.6, '暴击伤害约为 1.5 倍');
 
@@ -286,8 +294,24 @@ test('管线6:护甲减伤为递减曲线,永不归零', () => {
   const soft = computeDamage({ attacker, target: createTarget({ id: 's', name: '软', hp: 9e9, maxHp: 9e9, def: 120 }), weapon: w, critRoll: 0.99, dodgeRoll: 0.99 });
   const hard = computeDamage({ attacker, target: createTarget({ id: 'h', name: '硬', hp: 9e9, maxHp: 9e9, def: 240 }), weapon: w, critRoll: 0.99, dodgeRoll: 0.99 });
   eq(soft.mitigationMul, 0.5, 'DEF=120 → 系数 0.5');
+  eq(soft.finalDamage, 11, 'DEF=120 时最终伤害 = 11(设计基线)');
   ok(hard.finalDamage < soft.finalDamage, 'DEF 更高则最终伤害更低');
-  ok(hard.finalDamage >= MIN_DAMAGE, `最低伤害保底 ${MIN_DAMAGE}`);
+  eq(hard.finalDamage, 7, 'DEF=240 时最终伤害 = 7(设计基线)');
+
+  /* 最低伤害保底 —— 这里原本只有 `ok(hard.finalDamage >= MIN_DAMAGE)`,
+   * 两个问题叠加使它**永不生效**:
+   *   1 右侧 `MIN_DAMAGE` 取自被测模块;实现里是 `Math.max(MIN_DAMAGE, raw)`,
+   *     故该不等式对**任意**常量值恒真(构造上无法失败);
+   *   2 `hard.finalDamage` 实测 7,离保底 1 很远,**保底分支从未被执行**。
+   * 实测注入:`MIN_DAMAGE` 1→0 时本套件仍 **44/44 全绿**。
+   * 修法:用**真正触发保底**的场景(DEF 1200 ⇒ 未取整 raw≈0.0 ⇒ 被抬到 1),
+   * 并锚定字面量 1。这样常量一漂移就红,且保底分支真被执行一次。 */
+  const ironwall = computeDamage({
+    attacker, target: createTarget({ id: 'w', name: '铁壁', hp: 9e9, maxHp: 9e9, def: 5000 }),
+    weapon: w, critRoll: 0.99, dodgeRoll: 0.99,
+  });
+  eq(ironwall.finalDamage, 1, 'DEF=5000 时被最低伤害保底抬到 1(保底分支可达)');
+  eq(MIN_DAMAGE, 1, 'MIN_DAMAGE = 1(设计基线,非取自实现)');
 
   /* 幽灵泡泡/无敌墙:takenMul=0 → 完全免疫 */
   const ghost = computeDamage({ attacker, target: createTarget({ id: 'g', name: '幽灵泡泡', hp: 100, maxHp: 100, takenMul: 0 }), weapon: w, critRoll: 0.99, dodgeRoll: 0.99 });
@@ -373,9 +397,27 @@ test('管线:闪避与超距分支短路,均不产生伤害', () => {
   eq(far.outOfReach, true, '超距攻击不结算');
   eq(far.finalDamage, 0, '超距 0 伤害');
 
-  /* 闪避率硬上限 0.75 */
+  /* 闪避率硬上限 0.75 —— 原断言 `ok(capped.dodgeRate <= MAX_DODGE_RATE)` 是**空断言**:
+   * 右侧 `MAX_DODGE_RATE` 取自被测模块,而 `combatantStats` 里是
+   * `Math.min(eq.dodgeRate, MAX_DODGE_RATE)`,故该不等式对**任意**常量值恒真;
+   * 且生产数据下闪避上限只有 0.13(全部 9 件护甲中仅 724=0.10、730=0.03 提供闪避),
+   * **封顶分支从未被执行过**。实测注入:`MAX_DODGE_RATE` 0.75→0.99 时仍 44/44 全绿。
+   *
+   * 修法分两步,因为「封顶分支不可达」是**数据事实**,不能靠编造装备绕过:
+   *   1 断言当前装备组合的**真实数值** 0.13(字面量)⇒ 聚合逻辑漂移就红;
+   *   2 断言常量本身 = 0.75(字面量)⇒ 常量漂移就红;
+   *   3 用**直接构造的 target.dodgeRate** 验证封顶逻辑本身(不依赖装备数据),
+   *      使 `Math.min(..., MAX_DODGE_RATE)` 这条分支真被执行一次。 */
   const capped = combatantStats(1, [724, 730]);
-  ok(capped.dodgeRate <= MAX_DODGE_RATE, `闪避率 ${capped.dodgeRate} 不超过 0.75`);
+  eq(capped.dodgeRate, 0.13, '724(0.10) + 730(0.03) → 闪避 0.13(设计基线)');
+  eq(MAX_DODGE_RATE, 0.75, 'MAX_DODGE_RATE = 0.75(设计基线,非取自实现)');
+
+  /* 封顶分支可达性:直接给目标一个超上限闪避率,验证被钳到 0.75 */
+  const slippery = createTarget({ id: 'slip', name: '极滑', hp: 100, maxHp: 100, dodgeRate: 5.0 });
+  const justUnder = computeDamage({ attacker: a, target: slippery, weapon: w, critRoll: 0.99, dodgeRoll: 0.74 });
+  eq(justUnder.dodged, true, 'roll 0.74 < 钳后 0.75 → 仍闪避(封顶为 0.75 而非 5.0)');
+  const justOver = computeDamage({ attacker: a, target: slippery, weapon: w, critRoll: 0.99, dodgeRoll: 0.76 });
+  eq(justOver.dodged, false, 'roll 0.76 > 封顶 0.75 → 命中(证明封顶真的生效)');
 });
 
 test('击退/减伤/暴击的随机分布经 mulberry32 注入可复现', () => {
@@ -819,6 +861,9 @@ test('幽灵泡泡:期间完全免伤且不能移动/攻击/被治疗', () => {
   const d = createDowned(p, EQUIP, 0, 0);
   eq(ghostDamageMul(d), 0, '幽灵泡泡免伤乘区为 0');
   const ctl = ghostControl(d);
+  /* 【task-23 定性结论:保留,不改为字面量】同 `BASE_CRIT_DMG` ——
+   * 注入 GHOST_MOVE_MUL 0→0.5 ⇒ 变红(相邻 `eq(ctl.moveMul, 0)` 抓住),故常量有守卫。
+   * 属 verify.ts 白名单已登记候选,非缺陷;改字面量需同步 verify.ts,不在写域。 */
   eq(ctl.moveMul, GHOST_MOVE_MUL, '位移乘数 0(不能自主移动)');
   eq(ctl.moveMul, 0, '位移被完全限制');
   eq(ctl.canAttack, false, '不能攻击');
@@ -894,6 +939,9 @@ test('227 泡泡水枪:连中 3 发把人装进大泡泡,并可直接灭高炉�
   eq(s3.trapped, true, '第 3 发成功困人');
   eq(s3.downed.state, BodyState.BUBBLED, '状态变为 BUBBLED');
   eq(s3.downed.bubbleStacks, 0, '层数清零');
+  /* 【task-23 定性结论:保留,不改为字面量】同 `BASE_CRIT_DMG` ——
+   * 注入 BUBBLE_TRAP_SEC 5.0→9.0 ⇒ 变红(相邻字面量断言抓住),故常量有守卫。
+   * 属 verify.ts 白名单已登记候选,非缺陷;改字面量需同步 verify.ts,不在写域。 */
   eq(s3.downed.invulnSec, BUBBLE_TRAP_SEC, '困人计时 = 5 秒');
 
   /* 227 水枪灭火:3 格内火格强度归零 */

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#121a2b">
+<title>绘本沙盒 · 2.5D</title>
+<style>
+  /* 移动端优先:禁止滚动与橡皮筋,撑满视口 */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #121a2b;
+    color: #e8eefc;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    touch-action: none;
+  }
+  #app { width: 100%; height: 100%; position: relative; }
+  /* three 的 canvas 撑满容器 */
+  #app canvas { display: block; width: 100% !important; height: 100% !important; }
+  #hint {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #8fa6c8; background: rgba(18,24,38,.8);
+    padding: 6px 14px; border-radius: 20px; pointer-events: none;
+    border: 1px solid rgba(120,150,210,.22); white-space: nowrap;
+  }
+  #fatal {
+    display: none; position: fixed; inset: 0; padding: 24px;
+    background: #121a2b; font: 13px/1.7 ui-monospace, Menlo, Consolas, monospace;
+    color: #ff9d9d; z-index: 100; overflow: auto; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hint">WASD / 方向键 平移 · 手机单指拖动</div>
+<pre id="fatal"></pre>
+<script type="module">
+  /*
+   * 启动失败时把错误直接显示出来 —— headless 截图能拍到,
+   * 避免「白屏但控制台里其实有异常」这种查不出来的情况。
+   */
+  const showFatal = (msg) => {
+    const el = document.getElementById('fatal');
+    el.style.display = 'block';
+    el.textContent = String(msg);
+  };
+  window.addEventListener('error', (e) => showFatal(e.error?.stack || e.message));
+  window.addEventListener('unhandledrejection', (e) => showFatal(e.reason?.stack || e.reason));
+</script>
+<script type="module" src="./src/main.ts"></script>
+</body>
+</html>

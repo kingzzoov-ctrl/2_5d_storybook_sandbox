@@ -182,9 +182,9 @@ async function auditIdentity(plan: { lines: string[] } | null): Promise<void> {
   const f = reg.contentFingerprints();
   add({
     group: G, label: '内容指纹 overall',
-    hb: 'v1-fa111d71(既有锚点)', hbLine: null,
+    hb: 'v1-eaefa38b(既有锚点)', hbLine: null,
     code: `v${f.version}-${f.overall}`, codeRef: 'server/src/content/registry.ts#contentFingerprints',
-    verdict: f.overall === 'fa111d71' && f.version === 1 ? 'MATCH' : 'MISMATCH',
+    verdict: f.overall === 'eaefa38b' && f.version === 1 ? 'MATCH' : 'MISMATCH',
     note: '锚点来自 README 状态块',
   });
   const cap = reg.contentCapacity().find((c: { space: string }) => c.space.includes('OBJ'));
@@ -1299,7 +1299,7 @@ async function auditAlchemy(plan: { lines: string[] } | null): Promise<void> {
     'server/src/alchemy/attributes.ts#EPSILON_MAX');
   numCheck(G, 'ε 截断正态标准差', 0.12, qLine, at.EPSILON_SIGMA,
     'server/src/alchemy/attributes.ts#EPSILON_SIGMA',
-    '手册 §5.3 写 N(1.0, 0.12²) 即 σ=0.12;代码取 0.122(差 0.002,影响 <1%)');
+    '手册 §5.3/L568 写 N(1.0, 0.12^2) 即 σ=0.12;代码已于 2026-11-12 由 0.122 改为 0.12 对齐');
 
   /* 专精等级范围:Lv_prof ∈ [1, 10] */
   const profLine = qLine;

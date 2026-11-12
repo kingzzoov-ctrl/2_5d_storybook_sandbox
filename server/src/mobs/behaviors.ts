@@ -70,6 +70,34 @@ export interface MobWorld {
   emit(kind: string, payload?: Record<string, number | string>): void;
 }
 
+/**
+ * 生物 AI 的独立状态槽。
+ *
+ * ## 为什么不是纯 `Record<string, number>`
+ *
+ * 它**原先**声明为 `Record<string, number>`,但 `GingerImpAi` 往里写过字符串
+ * (`mem.taunt = '你抓不到我'`,见下方焦糖小人分支)—— 这是一处**类型谎报**:
+ * 编译期说「值都是数字」,运行期却有字符串。它长期没被发现,是因为
+ * **仓库默认零依赖、`tsc` 不可用**(`scripts/typecheck.ts` 会打印「已跳过」),
+ * 所以整仓的类型错误从不进任何门禁。
+ *
+ * ## 为什么不直接放宽成 `number | string`
+ *
+ * 实测过:那样会让 `behaviors.ts` 内部 **76 处参与算术的 `mem` 读取**
+ * 全部报「算术操作数不能是联合类型」,整仓类型错误从 196 涨到 315。
+ * 为了容纳**一个**字符串键而给其余 300 个数值键全部加判空/断言,
+ * 是把成本摊给所有调用方。
+ *
+ * ## 现在的写法:精确描述实际形状
+ *
+ * `Record<string, number>` 保住绝大多数键的数值语义(算术照旧、零连锁),
+ * 交叉成员 `{ taunt?: string }` 如实标出唯一的字符串键。
+ * 交叉类型里具名成员优先,所以 `mem.taunt` 读作 `string | undefined`、
+ * 可赋字符串,而 `mem.other ?? 0` 仍是 `number` —— 已用探针脚本验证两侧都有牙齿
+ * (把 `taunt` 当 number 用、或把普通键当 string 用,都会报错)。
+ */
+export type MobMem = Record<string, number> & { taunt?: string };
+
 export interface MobRuntime {
   id: string;
   def: MobDef;
@@ -80,7 +108,7 @@ export interface MobRuntime {
   maxHp: number;
   facingDeg: number;
   /** 独立 AI 状态槽,按需取用。 */
-  mem: Record<string, number>;
+  mem: MobMem;
   fsm: MobFsm;
   alive: boolean;
   /** 本生物需要每帧推进的预警几何集合。 */

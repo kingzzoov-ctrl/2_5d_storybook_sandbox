@@ -998,7 +998,7 @@ test('[README] 内容指纹与容量锚点未漂移', () => {
      故本文件顶部用静态 `import` 引入 registry(见文件头 import 段)。 */
   const f = contentFingerprints();
   eq(f.version, 1, '版本号');
-  eq(f.overall, 'fa111d71', '内容指纹 overall');
+  eq(f.overall, 'eaefa38b', '内容指纹 overall');
   const objs = contentCapacity().filter((c) => c.space.includes('OBJ'));
   ok(objs.length > 0, '存在 OBJ 容量账本');
   eq(objs[0].freeCount, 3775, 'OBJ 可用号');

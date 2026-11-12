@@ -29,6 +29,7 @@ import {
   projectGridToScreen,
 } from '../stage/iso_camera.ts';
 import { type ChunkInput, buildChunkQuads } from '../stage/tile_mesh.ts';
+import { emitChunkGeometry, validateChunkGeometry } from '../stage/chunk_geometry.ts';
 import { SHADER_PROGRAMS, SHADER_UNIFORMS, type ShaderName } from '../stage/shaders.ts';
 import type { ParticlePool } from '../stage/particles.ts';
 import { AURA_ANCHORS, ICON_SIZE, type WeaponTextureBundle } from '../stage/entity_sprites.ts';
@@ -81,20 +82,26 @@ export function cameraForward(): THREE.Vector3 {
 /**
  * 把 `buildChunkQuads` 的面数结果落成真实 BufferGeometry。
  *
- * 顶点属性只分配不填充 —— 实际顶点由装配层按地形数据写入;
- * 索引缓冲由 `quadIndexBuffer` 生成(纯函数,已被测试覆盖)。
+ * **本函数曾经只分配缓冲、从不写入** —— position 数组全是 0,地形一个三角形
+ * 都画不出来,而 3226 行 WS-09 测试全绿(它们只断言 `vertexCount` 这个数字)。
+ * 现在顶点由 `stage/chunk_geometry.emitChunkGeometry` 产出,与计数同源。
  */
 export function buildChunkGeometry(chunk: ChunkInput, lod: number): THREE.BufferGeometry {
-  const batch = buildChunkQuads(chunk, lod);
+  const emitted = emitChunkGeometry(chunk, lod);
+  const err = validateChunkGeometry(emitted);
+  if (err !== null) {
+    /* 几何与计数不一致是**结构性错误**,不能静默通过 —— 直接抛,让它在开发期就炸出来 */
+    throw new Error(`buildChunkGeometry: ${err}`);
+  }
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(batch.vertexCount * 3), 3));
-  geom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(batch.vertexCount * 2), 2));
+  geom.setAttribute('position', new THREE.BufferAttribute(emitted.positions, 3));
+  geom.setAttribute('uv', new THREE.BufferAttribute(emitted.uvs, 2));
+  geom.setAttribute('normal', new THREE.BufferAttribute(emitted.normals, 3));
   geom.setAttribute('aLodMerge', new THREE.BufferAttribute(
-    new Float32Array(batch.vertexCount).fill(lodMergeSize(lod)),
+    new Float32Array(emitted.vertexCount).fill(lodMergeSize(lod)),
     1,
   ));
-  const index = quadIndexBuffer(batch.faceCount);
-  geom.setIndex(new THREE.BufferAttribute(index, 1));
+  geom.setIndex(new THREE.BufferAttribute(emitted.indices, 1));
   return geom;
 }
 

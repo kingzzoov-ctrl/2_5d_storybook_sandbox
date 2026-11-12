@@ -72,6 +72,13 @@ export interface TelegraphGeometry {
   center: TelegraphVertex;
   /** 屏幕投影后的外圈(供 2D overlay 直绘) */
   screenOuter: { x: number; y: number }[];
+  /**
+   * 屏幕投影后的内圈(ANNULUS / CROSS 副臂才非空)。
+   *
+   * 调用方用 `fill('evenodd')` 同时喂外圈与内圈即可得到真实的「环」;
+   * 只填外圈会画成实心盘(见 `buildTelegraph` 里的实测说明)。
+   */
+  screenInner: { x: number; y: number }[];
   /** 屏幕上的椭圆半轴,供 Canvas2D ctx.ellipse 快路径 */
   screenRadii: { rx: number; ry: number };
 }
@@ -167,6 +174,25 @@ export function buildTelegraph(spec: TelegraphSpec, cam: IsoCamera): TelegraphGe
     const p = projectGridToScreen(v.x, v.y, v.z, cam);
     return { x: p.x, y: p.y };
   });
+  /**
+   * 内圈的屏幕投影。
+   *
+   * ## 为什么必须提供(实测踩过)
+   *
+   * `ANNULUS` 的语义是**环**,中间要挖空。调用方只拿到 `screenOuter` 时
+   * 只能填成一个**实心圆盘** —— 第一版 UI 覆盖层就是这样,
+   * 地面预警"圈"变成一大坨橙色实心块,把立牌全糊住了。
+   *
+   * 内圈本来就已经算好了(`inner`),只是没投影。这里补上投影,
+   * 由调用方用 `evenodd` 填充规则挖空(不能只画内圈描边 —— 那不挖空)。
+   *
+   * 非 ANNULUS/CROSS 的 shape 内圈为空数组,此时退化为实心多边形,
+   * 与「CIRCLE 就该是实心圆」的语义一致。
+   */
+  const screenInner = inner.map((v) => {
+    const p = projectGridToScreen(v.x, v.y, v.z, cam);
+    return { x: p.x, y: p.y };
+  });
 
   /* 椭圆半轴:世界圆在屏幕上的投影(用于 Canvas2D 快路径) */
   const k = cam.scale * cam.zoom;
@@ -175,7 +201,7 @@ export function buildTelegraph(spec: TelegraphSpec, cam: IsoCamera): TelegraphGe
     ry: radius * Math.SQRT1_2 * Math.sin((35 * Math.PI) / 180) * k,
   };
 
-  return { spec, outer, inner, center: { x: cx, y: cy, z: cz }, screenOuter, screenRadii };
+  return { spec, outer, inner, center: { x: cx, y: cy, z: cz }, screenOuter, screenInner, screenRadii };
 }
 
 /** 蓄力进度 0..1(帧率无关的线性推进,便于玩家读秒) */

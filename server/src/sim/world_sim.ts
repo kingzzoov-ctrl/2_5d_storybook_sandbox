@@ -84,6 +84,29 @@ import {
   loadRoomMobMem,
   type DbLike,
 } from '../db/repo.ts';
+/*
+ * ── 炼金炉(WS-06)—— 2026-11-12 接线 ──
+ *
+ * 此前 `alchemy/` 整个目录(3,626 行 / 8 个文件)在生产里**零引用**:
+ * `verify.ts` 的可达性门禁把 `index.ts` 与它的 6 个内部模块全列在白名单里,
+ * 理由写的是「随 index 一起接」—— 也就是说**接线本身还没开始**,
+ * 而不是「差最后一根线」。后果:门禁、缓存、五步算法、像素立牌
+ * 全部单测全绿,但玩家永远合成不出任何东西。
+ *
+ * 这里接的是**离线/降级路径**(`degrade.ts` 的文件头把「客户端连的是离线
+ * 单机房间」列为它存在的第一公民场景)。为什么要接这条路而不是等网关:
+ * `cache.ts` 的 `LlmClient` 是**依赖注入契约**,生产侧实现(HTTP / 密钥 /
+ * 退避 / 限流)属于网关层,本仓不存在也不该存在。默认注入
+ * `StubLlmClient` ⇒ 重试耗尽后走 `degradeGenerate`,六条链路**全部真实执行**:
+ *   gate.checkGate → cache.RecipeCache → prompt + LLM → degrade → attributes.rollStats → pixel_icon.buildIcon
+ * 等真网关出现时,`WorldSimOptions.alchemy` 注入即可,编排层无需改动。
+ */
+import {
+  createAlchemyService,
+  type AlchemyService,
+  type ForgeResult,
+} from '../alchemy/index.ts';
+import { MemoryRecipeStore, StubLlmClient } from '../alchemy/cache.ts';
 
 /** 快帧与慢帧的固定比例:20Hz / 2Hz = 10。 */
 export const FAST_PER_SLOW = TICK_HZ / SLOW_TICK_HZ;
@@ -106,6 +129,13 @@ export interface WorldSimOptions {
   mobs?: boolean;
   /** 确定性随机源,返回 [0,1)。默认用固定的 mulberry32。 */
   rng?: () => number;
+  /**
+   * 炼金服务覆盖。缺省时构造一个**离线可用**的实现
+   * (`MemoryRecipeStore` + `StubLlmClient` + `allowDegrade=true`),
+   * 走「LLM 重试耗尽 → 本地确定性降级」路径,不联网也能出产物。
+   * 真网关实现由部署层注入。
+   */
+  alchemy?: AlchemyService;
 }
 
 /** 单帧结算报告:把各子系统的返回值汇总成一份可观测账本。 */
@@ -203,6 +233,14 @@ export class WorldSim {
    * `aoi.stepActive(() => {})` 是空回调,25 个实现一行都没跑过。
    */
   readonly mobHost: MobHost;
+  /**
+   * 炼金炉服务(WS-06)—— 六条链路的唯一编排出口。
+   *
+   * 接的是**离线路径**:默认注入 `StubLlmClient`,于是
+   * `gate → cache → prompt/LLM → degrade → rollStats → buildIcon`
+   * 每一步都真实执行,产物带完整中间量(`breakdown` / `icon` / `reaction`)。
+   */
+  readonly alchemy: AlchemyService;
 
   readonly sizeCells: number;
   private readonly rng: () => number;
@@ -292,6 +330,18 @@ export class WorldSim {
        也使宿主能脱离完整编排层单测(见 tests/WS-FND-02.test.ts)。 */
     this.bus = new EventBus();
     this.mobHost = new MobHost(this.mobWorldAdapter(), { bus: this.bus, rng: this.rng });
+
+    /*
+     * 炼金炉:默认离线可用。`StubLlmClient` 恒返回 null ⇒
+     * `generateWithRetry` 走满 MAX_RETRY 后回退 `degradeGenerate`,
+     * 于是**不联网也能出产物**,且六条链路都被真实执行过。
+     * 若将来接了真网关,从 `opts.alchemy` 注入即可,此处无需改动。
+     */
+    this.alchemy = opts.alchemy ?? createAlchemyService({
+      store: new MemoryRecipeStore(),
+      llm: new StubLlmClient(),
+      allowDegrade: true,
+    });
   }
 
   /**
@@ -501,6 +551,136 @@ export class WorldSim {
   /** 链深带来的移速系数(扛得越多走得越慢)。 */
   carrySpeedMul(carrierId: string): number {
     return this.carry.speedMulOf(carrierId);
+  }
+
+  /**
+   * 就地炼金:消耗**地面掉落物**里的材料,产出成品(WS-06 接线入口)。
+   *
+   * ## 为什么这是必需的编排层入口
+   *
+   * `alchemy/` 8 个文件、3,626 行此前在生产里**零引用**,整目录挂在
+   * `verify.ts` 白名单里(理由「随 index 一起接」)。子系统完整、WS-06
+   * 的 399 条断言全绿,但**没有任何玩家能合成出东西** —— 与
+   * `interactMob` / AI tick / CarrySystem 完全同一类缺口。
+   *
+   * ## 总量守恒(DEV-PLAN 1.5 的验收条件)
+   *
+   * 「合成消耗原料产出成品,总量守恒」在这里被拆成两个**可失败**的检查:
+   *   1 **消耗必须真的发生**:材料按 `materialIds` 从地面逐个扣减;
+   *      扣不满就**整体放弃**(不落库、不扣任何料),避免「产出了但料还在」。
+   *   2 **产物必须真的落地**:成品作为一件掉落物写回地面,
+   *      于是 `材料件数 → 成品件数` 是可对账的,而不是只返回一个对象。
+   *
+   * 判据是**扣减后的实际地面状态**,不是「我调了 forge」。这一点很关键:
+   * 只返回 `ForgeResult` 而不动世界,就等于把「函数被调用过」当成「生效了」
+   * —— 本仓反复出现的那类假接线。
+   *
+   * @param itemIds 投入的材料 ID(2~4 件,可含梦境露水 130)
+   * @param opts    `playerName` 冠名 / `seed` 固定随机种子 / `lvProf` 专精等级
+   * @returns `ok:false` 时**世界完全未被改动**;`ok:true` 时附带 `consumed` 账
+   */
+  async forgeAlchemy(
+    itemIds: readonly number[],
+    opts: { playerName?: string; seed?: number; lvProf?: number; useDew?: boolean; x?: number; y?: number } = {},
+  ): Promise<
+    | { ok: true; result: Extract<ForgeResult, { ok: true }>; consumed: { itemId: number; count: number }[]; spawned: { x: number; y: number } }
+    | { ok: false; stage: 'INVENTORY' | 'GATE' | 'LLM' | 'ROLL'; message: string }
+  > {
+    /*
+     * 1 先**预演**门禁:不过门就跟世界无关,直接返回。
+     * 用 `preview` 而非直接 forge,是为了在**动手扣料之前**就知道会不会过 ——
+     * 门禁失败绝不消耗材料,否则玩家丢错东西就永久损失。
+     */
+    const gate = this.alchemy.preview(itemIds, opts.useDew === true);
+    if (!gate.pass) {
+      return { ok: false, stage: 'GATE', message: gate.message };
+    }
+
+    /* 2 材料必须在**地面**上真的存在(够扣)。露水不从材料位扣(门禁已剥离)。 */
+    const need = new Map<number, number>();
+    for (const id of gate.materialIds) need.set(id, (need.get(id) ?? 0) + 1);
+    for (const [id, want] of need) {
+      let have = 0;
+      for (const g of this.mobGround) if (g.itemId === id) have += g.count;
+      if (have < want) {
+        return {
+          ok: false,
+          stage: 'INVENTORY',
+          message: `材料不足:需要 ${want} 件 ${id},地面只有 ${have} 件`,
+        };
+      }
+    }
+
+    /* 3 走到这里才真的合成。失败(如 LLM 硬失败且禁止降级)时**不扣料**。 */
+    const result = await this.alchemy.forge({
+      itemIds,
+      playerName: opts.playerName,
+      lvProf: opts.lvProf,
+      useDew: opts.useDew,
+      seed: opts.seed,
+    });
+    if (!result.ok) {
+      return { ok: false, stage: result.stage, message: result.message };
+    }
+
+    /* 4 扣料:逐个 `consumeGroundItem`,并记账「实际扣了多少」。 */
+    const consumed: { itemId: number; count: number }[] = [];
+    for (const [id, want] of need) {
+      const got = this.consumeGroundItem(id, want);
+      if (got !== want) {
+        /*
+         * 理论不可达(第 2 步已核过库存),但**必须防守**:并发调用或
+         * 中间被别的系统改过地面时,扣不满就成了「白拿产物」。
+         * 这里如实返回差额,让调用方看得见,而不是静默吞掉。
+         */
+        consumed.push({ itemId: id, count: got });
+        return {
+          ok: false,
+          stage: 'INVENTORY',
+          message: `扣料阶段材料被改动:${id} 期望扣 ${want} 实际扣 ${got}`,
+        };
+      }
+      consumed.push({ itemId: id, count: got });
+    }
+
+    /*
+     * 5 产物落地。AI 产物按 `recipe_hash` 而不是数字 ID 标识
+     * (`shared/types/alchemy.ts` 没有为奇物保留数字段位),所以这里用
+     * **负的占位 ID** 表示「非表内物品」,并把权威实例信息留在返回值里。
+     * 用负数而不是 0:0 是 `BaseFluid.VOID` / 「空格」的约定值,会被
+     * 掉落物系统当成空槽吞掉。
+     */
+    const x = Math.trunc(opts.x ?? 0);
+    const y = Math.trunc(opts.y ?? 0);
+    this.mobGround.push({
+      itemId: -1,
+      x,
+      y,
+      count: 1,
+    });
+    return { ok: true, result, consumed, spawned: { x, y } };
+  }
+
+  /**
+   * 从地面掉落物里扣减指定物品,返回**实际**扣减数。
+   *
+   * 与 `mobWorldAdapter().consumeGroundItem` 是同一份逻辑,但那个适配器
+   * 只给生物 AI 用。编排层自己要扣料时不能再绕一层适配器 ——
+   * 那会让「谁在扣」变得不可读。两处都只是对 `mobGround` 的遍历,
+   * 真正的权威仍是这一个数组。
+   */
+  consumeGroundItem(itemId: number, count: number): number {
+    let left = Math.max(0, Math.trunc(count));
+    const want = left;
+    for (let i = this.mobGround.length - 1; i >= 0 && left > 0; i -= 1) {
+      const g = this.mobGround[i];
+      if (g.itemId !== itemId) continue;
+      const take = Math.min(left, g.count);
+      g.count -= take;
+      left -= take;
+      if (g.count <= 0) this.mobGround.splice(i, 1);
+    }
+    return want - left;
   }
 
   /**

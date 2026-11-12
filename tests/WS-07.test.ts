@@ -2814,6 +2814,169 @@ test('CR-14 U1 装配层:合法操作不被误拒 + 凭证不跨 tick', () => {
   eq(again.rejectCode, InventoryReject.FROM_NOTHING, '过期凭证应报 FROM_NOTHING');
 });
 
+/* ═══════════ WR-14 U2:移速/攻速阈值与客户端声明 ═══════════ */
+
+/* 背景见 `docs/CHANGE_REQUESTS.md` CR-14 U2。两组断言分开:
+ *   · U2-a:**已声明的设计取舍** —— 上限随客户端声明放大(有界)。这是 §7 明写的口径,
+ *           因此本组把它**钉住**,而不是当成缺陷:将来真做服务端核算时,这里会变红并提示改口径。
+ *   · U2-b:**真缺陷** —— 非数字声明会让钳位公式产生 NaN,`dist > NaN` 恒为 false
+ *           ⇒ TELEPORT / SPEED / ATTACK_RATE 三道检查**同时失效**(比 U2 本身更严重)。
+ *           该缺陷与「上限多大」无关:即便把上限设成 1.0 也照样失守。 */
+
+test('WR-14 U2-a 声明倍率确实抬高上限(已声明设计取舍,非缺陷;有界)', () => {
+  /* 这不是要修的 bug,是 §7「一律钳到上限,不自证」的后果:声明越高,上限越高。
+   * 本断言把它钉住 —— 若哪天改口径为服务端核算,此处必须同步改。 */
+  const tolerance = 1.25;
+  const capOf = (mul: number): number => BASE_MOVE_SPEED * mul * tolerance;
+
+  near(capOf(1.0), 5.625, 1e-9, '裸装声明 1.0 → 5.625 格/秒');
+  near(capOf(2.55), 14.34375, 1e-9, '满声明 2.55 → 14.34375 格/秒');
+  ok(capOf(2.55) > capOf(1.0), '上限随声明放大 —— 这正是 U2 描述的取舍');
+
+  /* 有界:钳在 MAX_SPEED_BONUS_MUL,不会无限放大。 */
+  near(maxDisplacementPerTick(2.55), maxDisplacementPerTick(1e9), 1e-12, '超过上限即被钳');
+  const hardCap = BASE_MOVE_SPEED * MAX_SPEED_BONUS_MUL * tolerance;
+  ok(capOf(2.55) <= hardCap + 1e-9, `上限不超过硬顶 ${hardCap} 格/秒`);
+  near(capOf(2.55) / BASE_MOVE_SPEED, 3.1875, 1e-4,
+    '相对裸装基线最坏 3.19 倍(有界,不是无界加速)');
+});
+
+test('WR-14 U2-b 【首要】非数字声明不得让 TELEPORT 检查失效', () => {
+  /* 缺陷本体:`Math.max(0, {})` = NaN ⇒ allowed = NaN ⇒ `dist > NaN + 1e-9` 恒 false
+   * ⇒ 单帧瞬移被**直接放行**。而 `{"speedMul":{}}` 经 JSON 反序列化即可到达网络层,
+   * 类型标注拦不住运行时(`room.colyseus.ts:166` 的入参类型不产生运行时校验)。
+   *
+   * 实测只有「转数值得 NaN」的输入会让钳位失效。以下**不是**缺陷路径,不得误伤:
+   *   `null` / `[]` / `true` → 分别转 0 / 0 / 1,钳位仍有效(见下一条反向对照)。 */
+  for (const raw of ['{"speedMul":{}}', '{"speedMul":"abc"}']) {
+    const declared = JSON.parse(raw).speedMul;
+    const s = createAcState('cheat', 0, 0, 0);
+    /* 单帧跳 200 格 —— 远超任何合法上限。 */
+    const v = checkMove(s, { tick: 1, x: 200, y: 0, z: 0, speedMul: declared });
+    eq(v.allowed, false, `${raw}:单帧跳 200 格必须被拒`);
+    eq(v.violation?.kind, ViolationKind.TELEPORT, `${raw}:拒因应为 TELEPORT`);
+    eq(v.corrected?.x, 0, `${raw}:应回退到权威坐标`);
+  }
+
+  /* 反向对照:合法声明下当然也拒 —— 证明上面的红不是「本来就拒」。 */
+  const okState = createAcState('legal', 0, 0, 0);
+  eq(checkMove(okState, { tick: 1, x: 200, y: 0, z: 0, speedMul: 1.0 }).allowed, false,
+    '数值声明下同样拒(对照组)');
+
+  /* 边界说明:以下输入**不是**缺陷路径(转数值分别为 0/0/1,钳位仍有效),
+   * 修完之前它们就已是绿的 —— 钉在这里防止修法把安全输入误伤成放行。 */
+  for (const safe of [null, [], true, undefined]) {
+    const st = createAcState('safe', 0, 0, 0);
+    eq(checkMove(st, { tick: 1, x: 200, y: 0, z: 0, speedMul: safe as number }).allowed, false,
+      `安全输入 ${String(safe)} 应仍被拒(不得因修 NaN 而放行)`);
+  }
+});
+
+test('WR-14 U2-b 非数字声明不得让窗口式 SPEED 检查失效', () => {
+  /* 形状照搬 E03:每帧 0.30 格 —— 单帧上限 0.36 内(合法),但 6 格/秒超出窗口上限 5.625。
+   * 声明为 NaN 时帧上限与窗口上限都变 NaN,两道检查同时静默放行。 */
+  for (const declared of [JSON.parse('{"speedMul":{}}').speedMul, 'abc']) {
+    const s = createAcState('cheat', 0, 0, 0);
+    let rejected = false;
+    for (let i = 1; i <= 21; i += 1) {
+      const v = checkMove(s, { tick: i, x: i * 0.30, y: 0, z: 0, speedMul: declared });
+      if (!v.allowed) { rejected = true; break; }
+    }
+    ok(rejected, `声明 ${JSON.stringify(declared)}:持续 0.30 格/帧(6 格/秒)应被窗口式检测抓到`);
+    ok(s.violations.some((v) => v.kind === ViolationKind.SPEED),
+      `声明 ${JSON.stringify(declared)}:应有 SPEED 违规`);
+  }
+
+  /* 对照组:同样的位移形状,声明合法数值 1.0 时必须被拒 —— 证明上面的红来自 NaN 而非位移本身。 */
+  const ctl = createAcState('legal', 0, 0, 0);
+  let ctlRejected = false;
+  for (let i = 1; i <= 21; i += 1) {
+    const v = checkMove(ctl, { tick: i, x: i * 0.30, y: 0, z: 0, speedMul: 1.0 });
+    if (!v.allowed) { ctlRejected = true; break; }
+  }
+  ok(ctlRejected, '合法声明 1.0 下同一位移形状应被拒(对照组)');
+});
+
+test('WR-14 U2-b 非数字声明不得让 ATTACK_RATE 检查失效', () => {
+  for (const declared of [JSON.parse('{"claimedBonus":{}}').claimedBonus, 'abc']) {
+    const s = createAcState('cheat', 0);
+    checkAttack(s, 0, 0);
+    let rejected = false;
+    /* 每帧攻击(间隔 1 帧),基线需 8 帧。声明为 NaN 时 minInterval 变 NaN,`< NaN` 恒 false。 */
+    for (let t = 1; t <= 10; t += 1) {
+      const v = checkAttack(s, t, declared);
+      if (!v.allowed) { rejected = true; break; }
+    }
+    ok(rejected, `声明 ${JSON.stringify(declared)}:每帧攻击应被拒`);
+    ok(s.violations.some((v) => v.kind === ViolationKind.ATTACK_RATE),
+      `声明 ${JSON.stringify(declared)}:应有 ATTACK_RATE 违规`);
+  }
+
+  /* 对照组:合法数值同样拒。 */
+  const s2 = createAcState('legal', 0);
+  checkAttack(s2, 0, 0);
+  eq(checkAttack(s2, 1, 0).allowed, false, '数值声明下每帧攻击也拒(对照组)');
+});
+
+test('WR-14 U2-b 经真实入口 `applyMove` / `applyAttack` 同样挡住', () => {
+  /* 函数级之外再钉装配层:证明缺陷能穿过 RoomRuntime 到达玩家状态。 */
+  const rt = new RoomRuntime({ roomId: 'wr14', ownerId: 'p0', clock: fixedClock(1000) });
+  rt.join({ userId: 'cheat' });
+
+  const badMul = JSON.parse('{"speedMul":{}}').speedMul;
+  const mv = rt.applyMove('cheat', { tick: 1, x: 200, y: 0, z: 0, speedMul: badMul });
+  eq(mv.allowed, false, 'applyMove 必须挡住非数字声明的瞬移');
+  eq(mv.violation?.kind, ViolationKind.TELEPORT);
+  eq(rt.playerState('cheat')?.x, 0.5, '实体坐标不应被改(出生点 0.5)');
+
+  const badBonus = JSON.parse('{"claimedBonus":{}}').claimedBonus;
+  eq(rt.applyAttack('cheat', badBonus).allowed, true, '首次攻击放行');
+  eq(rt.applyAttack('cheat', badBonus).allowed, false,
+    '同一 tick 二次攻击必须被拒(非数字声明不豁免攻速)');
+});
+
+test('WR-14 U2-b 合法声明与缺省仍有原有行为(未误伤)', () => {
+  /* 非有限值的修复只应影响「产生 NaN」的输入;其余路径行为必须不变。 */
+  near(maxDisplacementPerTick(1), 4.5 * DT * 1.6, 1e-9, '默认倍率 1');
+  near(maxDisplacementPerTick(2.55), maxDisplacementPerTick(2.55), 1e-12, '数值声明原样');
+  near(maxDisplacementPerTick(Number.POSITIVE_INFINITY), maxDisplacementPerTick(2.55), 1e-12,
+    'Infinity 仍被钳到上限(原本就正确,不得回归)');
+  near(maxDisplacementPerTick(0), 0, 1e-12, '声明 0 → 0');
+
+  const s = createAcState('legal', 0, 0, 0);
+  const perTick = BASE_MOVE_SPEED * DT;
+  let reported = 0;
+  for (let i = 1; i <= 40; i += 1) {
+    if (!checkMove(s, { tick: i, x: i * perTick, y: 0, z: 0 }).allowed) reported += 1;
+  }
+  eq(reported, 0, '合法移速不受影响');
+});
+
+test('WR-14 U2-b 口径一致:实现注释不再声称服务端自行核算', () => {
+  /* 这一条测的是**注释**这个制品本身(故读源码文本),因为 U2 的病灶之一
+   * 就是注释与 §7 口径矛盾。注释不在行为层可测,只能对其文本断言。 */
+  const src = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'anticheat.ts'), 'utf8');
+  ok(!src.includes('服务端会与服务端自己的账比对'),
+    '`MoveIntent.speedMul` 的旧注释(声称服务端自行核对)必须已改掉');
+
+  /* 引用标错修正:移速 +10% 的出处是手册 729,不是 719/731。
+   * 注意:文档里**记录这个错误**时会出现该字样,故不能断言「全文不含」——
+   * 要断言的是它**不再被当作取值来源**。 */
+  ok(!/719\/731 移速/.test(src), 'MAX_SPEED_BONUS_MUL 注释不得再把移速出处写作 719/731');
+  ok(src.includes('729'), '应改为手册 729(夜影吸血蝙蝠斗篷,移速 +10%)');
+
+  /* 新注释必须说明「钳位而非自证」这条口径,与 §7 一致。 */
+  ok(/钳|不自证/.test(src), '注释应写明钳位/不自证口径');
+
+  /* 文档同源:参数表里的取值来源必须是 729,不得再是 719/731。 */
+  const doc = readFileSync(join(ROOT_DIR, 'docs', 'WS-07-net-persist.md'), 'utf8');
+  ok(!/719\/731 移速/.test(doc), '文档参数表不得再把移速出处写作 719/731');
+  ok(doc.includes('729'), '文档应引用手册 729');
+  /* §7 口径说明必须存在(U2 澄清落点),否则口径又只剩注释一处。 */
+  ok(doc.includes('不自证'), '§7 应保留「不自证」口径');
+  ok(/装备数据|无装备槽/.test(doc), '§7 应说明服务端为何无法自行核算(缺装备数据)');
+});
+
 /* ═══════════════ 收尾 ═══════════════ */
 
 report('WS-07');
