@@ -1277,6 +1277,22 @@ test('C25 房间 tick 每 20 帧把 HP 与 mem 落盘(接线守护)', () => {
   /* 第 20 帧:一次落盘 */
   rt.step();
   eq(rt.state.meta.tick, 20, '第 20 帧');
+
+  /* ⚠️ task-59 起,这里的 HP **不再是常量 37**。
+     `RoomRuntime.step()` 现在会推进世界(`host.advance(1)`),于是
+     `vitals.stepTimers()` 每帧跑 ⇒ `PLAYER_REGEN_PER_SEC = 1.0` 生效:
+     20 帧 × `dt 0.05` = 1.0 秒 ⇒ **37 → 38**。
+
+     原来的 `eq(..., 37)` 是在「世界从不推进」的前提下写的,它把一个
+     **偶然的常量**当成了判据。本用例的**原意是「落盘接线生效」**,
+     不是「HP 恰好是 37」—— 故改为「落盘值 == 落盘时刻的权威值」,
+     并**显式**钉住「回血确实发生了」这件事,免得后人以为可以忽略。
+     ⇒ 区分力没有被削弱:若 `saveToDb` 没被调用,库里仍是建号时的
+       `hp`(100),不会等于 `hpAtSave`。 */
+  const hpAtSave = sim.vitals.get('p1')!.hp;
+  ok(hpAtSave > 37,
+    `世界推进后 HP 已回升:${hpAtSave}(1 血/秒 × 1 秒)⇒ 推进确实生效`);
+
   const rep = rt.lastSaveReport;
   ok(rep !== null, '第 20 帧应发生落盘');
   eq(rep!.tick, 20, '落盘发生在第 20 帧');
@@ -1284,11 +1300,24 @@ test('C25 房间 tick 每 20 帧把 HP 与 mem 落盘(接线守护)', () => {
   eq(rep!.memRow, 1, 'mem 写进 1 行');
 
   /* 断言的是**库里的状态值**,不是「函数被调用过」 */
-  eq(getUser(db, 'p1')?.hp, 37, 'users.hp 读回 37');
+  eq(getUser(db, 'p1')?.hp, hpAtSave, 'users.hp 落的是**落盘时刻**的权威值');
+  ok(getUser(db, 'p1')?.hp !== 37,
+    '且确实不是建号/播种时的 37 ⇒ 落盘读的是活世界,不是初始夹具');
   const roomRow = db.get('rooms', { id: 'room_alpha' })!;
   eq(roomRow.world_tick, 20, 'world_tick 与存档同帧落盘');
   const mem = JSON.parse(roomRow.mob_mem_json as string) as Record<string, Record<string, unknown>>;
-  eq(mem.mob_ginger_imp.escapeTimer, 7.5, 'mem 内容落库');
+
+  /* ⚠️ 同一根因:`escapeTimer` 是**倒计时**,每帧 `- dt`
+     (`behaviors.ts:891`:`rt.mem.escapeTimer = (rt.mem.escapeTimer ?? GINGER_ESCAPE_SEC) - dt`)。
+     世界一推进它就递减:播种 7.5,20 帧 × 0.05 = 1.0 秒 ⇒ **6.5**。
+     与 HP 一样,原来的 `eq(..., 7.5)` 是在「世界从不推进」时写的常量判据。
+     本用例**证明的是 mem 被落库**,故改为:落库值 == 落库时刻的运行时值,
+     并显式验证「它确实递减了」(那才是「世界在跑」的证据)。 */
+  const memAtSave = sim.mobHost.runtimeOf('mob_ginger_imp')!.mem.escapeTimer;
+  ok(memAtSave < 7.5,
+    `mem 倒计时确实在走:7.5 → ${memAtSave}(20 帧 × dt)—— 推进生效的旁证`);
+  eq(mem.mob_ginger_imp.escapeTimer, memAtSave, 'mem 落的是**落盘时刻**的运行时值');
+  ok(mem.mob_ginger_imp.escapeTimer !== undefined, 'mem 内容确实落库(不是空对象)');
 
   /* 读档侧:全新世界 + 新房间,从库里拿回来 */
   const sim2 = new WorldSim({ sizeCells: 32 });
@@ -1296,8 +1325,9 @@ test('C25 房间 tick 每 20 帧把 HP 与 mem 落盘(接线守护)', () => {
   sim2.addMob('mob_ginger_imp', 'MEADOW', 10, 10);
   const loaded = sim2.loadFromDb(db, 'room_alpha');
   eq(loaded.hpApplied, 1, '读回 1 名玩家');
-  eq(sim2.vitals.get('p1')!.hp, 37, 'HP 端到端读回 37');
-  eq(sim2.mobHost.runtimeOf('mob_ginger_imp')!.mem.escapeTimer, 7.5, 'mem 端到端读回一致');
+  eq(sim2.vitals.get('p1')!.hp, hpAtSave, 'HP 端到端读回与落盘值一致');
+  eq(sim2.mobHost.runtimeOf('mob_ginger_imp')!.mem.escapeTimer, memAtSave,
+    'mem 端到端读回与落盘值一致(倒计时也不失真)');
 
   /* `worldSaveHost` 为 null 时必须**不撒谎**:不得留下一个假的落盘报告 */
   const rt2 = new RoomRuntime({ roomId: 'room_beta', ownerId: 'owner', clock: c.clock }, db);

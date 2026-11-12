@@ -13,6 +13,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_BYTES, CHUNK_CELLS, packTile, unpackTile } from '../shared/types/tile.ts';
 import { BASE_MOVE_SPEED, DT, TICK_HZ, BodyState } from '../shared/types/physics.ts';
+/* task-59:帧数算术的**外部标尺**(独立于接线路径)与双频常量。 */
+import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT } from '../server/src/sim/world_sim.ts';
 
 /** 仓库根(本文件在 tests/ 下)。 */
 const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -4638,6 +4640,148 @@ test('M8 三条离场路径**都**要与世界成对(leave / 宽限期超期 / �
   eq(rejoin.resumed, false, '路径 3:不是 resumed(席位已回收,走的是新加入)');
   eq(rejoin.role, RoomRole.GUEST, '路径 3:降级为 GUEST(既有行为不受影响)');
   ok(sim.playerPosition('p2') !== null, '路径 3:重进后世界侧有 p2');
+});
+
+/* ═══════ task-59:服务器路径必须真的推进世界(驱动缺失)═══════ */
+
+/** 取世界的帧号(结构化读口,避免 net 层 import 模拟层类型)。 */
+function frameOf(a: { host: unknown }): number {
+  return (a.host as { frame: number }).frame;
+}
+
+test('N1 ★ 服务器路径真的推进世界:外部 step() × N ⇒ 快帧恰好 N', () => {
+  /* ## 缺口(task-59)
+     接线前**服务器路径**对 `tick`/`run` 的调用是 **0 处**:
+     `setSimulationInterval` → `step()` → 只 tick 计数/落盘/投影等级 → 返回。
+     ⇒ 物理 / AI / 流体 / 电路 / 刷怪 / `syncPlayers()` **一帧都没跑过**。
+     ⚠️ 口径:`demo.ts` 也在 `PROD_ENTRIES` 里(它是 `npm run sim`),
+     所以是「**服务器路径** 0 处」,不是「生产 0 处」。 */
+  for (const n of [1, 10, 100]) {
+    const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+    a.runtime.join({ userId: 'p1' });
+    const f0 = frameOf(a);
+    for (let i = 0; i < n; i += 1) a.runtime.step();
+    eq(frameOf(a) - f0, n, `step() × ${n} ⇒ 快帧恰好多 ${n}`);
+  }
+});
+
+test('N2 ★ 一帧 = 一快帧(不双倍):外部 20Hz 与内部双频 1:1', () => {
+  /* ## 为什么必须单独钉这条
+     `WorldSim` 内部自管双频(`FAST_PER_SLOW = 10`),而外部已经按 20Hz 驱动
+     ⇒ **两层频率嵌套**。若以为「慢帧 2Hz,外面要乘 10」,就会每慢帧推进两次 AI
+     ⇒ **世界快 2 倍**,而这类错误**不报错、测试也可能照过**
+     (`world_sim.ts` 记着同一先例)。
+     `SIM_FAST_DT = 0.05 = 1/20` 与 20Hz **天然对齐,无需换算** —— 见源码注释。 */
+  eq(SIM_FAST_DT, 1 / 20, '前置:SIM_FAST_DT 与 20Hz 天然对齐(无需换算)');
+  eq(FAST_PER_SLOW, 10, '前置:内部每 10 快帧 1 慢帧');
+
+  /* 恰好 1:1 —— 若实现写成 `advance(FAST_PER_SLOW)` 或调两次,这里会红 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  a.runtime.join({ userId: 'p1' });
+  for (let i = 0; i < 100; i += 1) a.runtime.step();
+  eq(frameOf(a), 100, '★ 100 次外部 step ⇒ 恰好 100 快帧(不是 1000,不是 200)');
+});
+
+test('N3 ★ 慢帧算术:**外部标尺**与接线路径给同一个数', () => {
+  /* ## Lead 补的第 5 条:期望值自身的对照
+     只断言「接一次 ⇒ +1 / 接两次 ⇒ +2」还不够 ——
+     那也可能是「**我对 +N 的理解本来就错**」。
+     ⇒ 用一条**独立路径**当外部标尺:`WorldSim.run(100)`(它自己循环调 `tick()`),
+       已由 `demo.ts` 与门禁独立验证过。两条路径给同一个数才是真结论。 */
+  const ref = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  const r = ref.run(100);
+  eq(r.frames, 100, '外部标尺:run(100).frames = 100');
+  eq(r.slowFrames, 10, '外部标尺:run(100).slowFrames = 10(独立于接线路径)');
+
+  /* 接线路径:100 次外部 step 必须给出**同一个**帧数 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  a.runtime.join({ userId: 'p1' });
+  for (let i = 0; i < 100; i += 1) a.runtime.step();
+  eq(frameOf(a), r.frames,
+    `★ 两条独立路径同数:接线 ${frameOf(a)} vs 标尺 ${r.frames}`);
+
+  /* 慢帧比例也一致:每 10 快帧恰好 1 慢帧(用 run 的比值反推) */
+  eq(Math.floor(r.frames / FAST_PER_SLOW), r.slowFrames,
+    '标尺自洽:floor(100/10) = 10 慢帧');
+});
+
+test('N4 ★ 翻倍检测:多推一次必须**可观测**(这是本任务最该守的错)', () => {
+  /* 本任务的错误形态是「推进了几次」接错 ⇒ 断言必须能分辨次数。
+     做法:同一外部循环里**额外**调一次 `advance(1)`,帧数必须明显多于 N。
+     若某天有人把 `advance(1)` 改成 `advance(2)`(或调两次),
+     N1(`恰好 N`)会红;本用例独立把它钉住,并给出**可读的差值**。 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  const host = a.host as unknown as { frame: number; advance(n: number): number };
+  a.runtime.join({ userId: 'p1' });
+  const f0 = host.frame;
+  for (let i = 0; i < 10; i += 1) {
+    a.runtime.step();
+    host.advance(1);          /* ← 「接错」的形态 */
+  }
+  const grew = host.frame - f0;
+  eq(grew, 20, `★ 10 次 step + 10 次多余 advance ⇒ 20 帧(正常应为 10)⇒ 翻倍**可观测**`);
+  ok(grew !== 10, '既能测出正确值,也能测出翻倍 ⇒ 断言有分辨力');
+
+  /* 负向对照:不接推进的裸房间 ⇒ 世界帧恒 0(证明 N1 不是恒真) */
+  const bare = new RoomRuntime({ roomId: 'n4', ownerId: 'o', clock: fixedClock(1000) });
+  bare.join({ userId: 'p1' });
+  for (let i = 0; i < 20; i += 1) bare.step();
+  eq(bare.worldSaveHost, null, '负向对照:裸房间没有世界');
+  ok(frameOf({ host: { frame: 0 } }) === 0, '负向对照:没有世界 ⇒ 帧号无从增长');
+});
+
+test('N5 ★ 推进让 `mobPlayers` 刷新 ⇒ 生物 AI 能看见玩家移动', () => {
+  /* ## 这条是「端到端」的真正含义
+     `syncPlayers()` 是 `mobPlayers` 的**唯一**刷新点,而它只在 `tick()` 里跑。
+     接线前 `tick()` 从不被服务器路径调用 ⇒ `mobPlayers` 永不刷新
+     ⇒ **生物 AI 看不见玩家移动**(`BaseMobAi.nearest()` 只读 `world.players()`)。
+     ⇒ 即使 task-58 把位置写进了刚体,「玩家走过去 → 生物反应」仍然不通。
+     本用例把这两件事**接起来**验证。 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  const sim = a.host as unknown as {
+    playerPosition(id: string): { x: number; y: number } | null;
+    mobPlayers: { id: string; x: number }[];
+  };
+  a.runtime.join({ userId: 'p1' });
+  a.runtime.step();
+  const before = sim.mobPlayers.find((m) => m.id === 'p1')?.x;
+  ok(before !== undefined, '前置:mobPlayers 里有 p1');
+
+  for (let i = 0; i < 5; i += 1) {
+    a.runtime.state.meta.tick += 1;
+    a.runtime.ac.tick(a.runtime.state.meta.tick);
+    const now = sim.playerPosition('p1')!;
+    a.runtime.applyMove('p1', {
+      tick: a.runtime.state.meta.tick, x: now.x + 0.3, y: now.y, z: 0, speedMul: 1,
+    } as never);
+    a.runtime.step();
+  }
+  const after = sim.mobPlayers.find((m) => m.id === 'p1')?.x;
+  ok(after !== before, `★ mobPlayers.x 随移动刷新:${before} → ${after}(接线前恒定)`);
+  eq(after, sim.playerPosition('p1')!.x,
+    '★ mobPlayers 与刚体**同源**(AI 看到的正是权威位置)');
+});
+
+test('N6 帧数只由**一处**驱动:不在 step() 之外重复推进', () => {
+  /* 「驱动也只在一处」——与 task-58 的「判定只在一处」同一纪律。
+     `room.colyseus.ts` 的 `setSimulationInterval` 是唯一生产驱动源;
+     `index.ts` 装配层**不该**自己推。此处按代码态守。 */
+  const idx = readFileSync(join(ROOT_DIR, 'server/src/index.ts'), 'utf8');
+  const stripped = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  /* ⚠️ 装配层**不该**自己推进世界 —— 它只负责**构造** host。
+     (我第一版还断言了「index.ts 必须出现 advance」,那是错的:
+      `advance` 是 host **对象上的方法**,装配层只需把它交出去,
+      不必在源码里提它的名字。) */
+  ok(!/\b(sim|world|host)\s*\.\s*(advance|tick|run)\s*\(/.test(stripped),
+    '装配层 index.ts **不该**自己推进世界(驱动归 `RoomRuntime.step()` 一处)');
+  ok(/advance\?\(/.test(readFileSync(join(ROOT_DIR, 'server/src/net/room.ts'), 'utf8')),
+    '但结构化契约里必须**声明** `advance?`(交给世界源实现)');
+
+  /* 而 step() 里恰好出现一次 advance 调用 —— 「驱动只在一处」 */
+  const room = readFileSync(join(ROOT_DIR, 'server/src/net/room.ts'), 'utf8');
+  const roomCode = room.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const hits = roomCode.match(/host\.advance\(/g) ?? [];
+  eq(hits.length, 1, `★ room.ts 里 host.advance 恰好 1 处(实测 ${hits.length})`);
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

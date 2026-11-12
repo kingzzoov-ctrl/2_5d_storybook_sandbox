@@ -2181,6 +2181,65 @@ export class WorldSim {
     return { x: b.x, y: b.y };
   }
 
+  /**
+   * **世界推进的权威入口**(task-59):推进 `n` 个**快帧**。
+   *
+   * ## 为什么需要它(第三项装配缺口:驱动缺失)
+   *
+   * 接线前实测(**服务器路径** 0 处调用推进):
+   * ```
+   * room.colyseus.ts  setSimulationInterval(20Hz) → RoomRuntime.step()
+   * room.ts:1058      step() = meta.tick++ / ac.tick / 落盘 / 投影等级 → 返回
+   *                   **不推进 sim**
+   * index.ts          `tick`/`run` 关键词 0 命中
+   * ⇒ 物理 / AI / 流体 / 电路 / 刷怪 / syncPlayers() **一帧都没跑过**
+   * ```
+   * ⚠️ 口径:`demo.ts` 也在 `PROD_ENTRIES` 里(它是 `npm run sim`),
+   * 所以严谨说法是「**服务器路径** 0 处」,不是「生产 0 处」。
+   *
+   * 后果不只是「世界不动」:`syncPlayers()` 只在 `tick()` 里跑
+   * ⇒ `mobPlayers` 永不刷新 ⇒ **生物 AI 看不见玩家移动**
+   * ⇒ 「玩家走过去 → 生物反应」端到端不通(即使位置写入已通)。
+   *
+   * ## ⚠️ 双频嵌套:为什么这里**只能**逐帧调 `tick()`,不能自己乘 `FAST_PER_SLOW`
+   *
+   * 两层频率**嵌套**:
+   * ```
+   * 外层  setSimulationInterval 20Hz  →  RoomRuntime.step()  每秒 20 次
+   * 内层  WorldSim 自管双频            →  tick() 内部按计数决定 FAST / SLOW
+   * ```
+   * 实测:`tick()` 连调 12 次的相位是 `FAST×9 SLOW FAST×2`
+   * ⇒ **一次 `tick()` 就是一帧**,快慢**由内部计数决定**。
+   * ⇒ `advance(1)` 对应外部一帧,**恰好 1:1**。
+   *
+   * `SIM_FAST_DT = 0.05 = 1/20`(实测 `=== 1/20` 为 `true`)与外部 20Hz
+   * **天然对齐,无需任何换算**。⚠️ 下一个人若以为「慢帧按 2Hz,所以外面要乘
+   * `FAST_PER_SLOW`」,就会**每慢帧推进两次 AI**,世界快 2 倍 ——
+   * 而这类错误**不报错、测试也可能照过**(本文件下方记着同一先例)。
+   *
+   * 所以本方法的契约是「**n 个快帧**」,不是「n 秒」也不是「n 个慢帧」。
+   * 需要按时间量推进请用 `runForSeconds`(它自己做换算)。
+   *
+   * ## 为什么用 `tick()` 而不是 `run(n)`
+   *
+   * 实测二者**完全等价**(`run(n)` 就是循环调 `tick()`):
+   * ```
+   * run(100): frames=100 slowFrames=10
+   * 手调 100 次 tick(): slow=10
+   * ```
+   * 但 `tick()` 与外部「一次 step 一帧」**一一对应**,多帧循环写在
+   * `run()` 里会掩盖「到底推进了几帧」。产线用 `tick()` 更不容易接错。
+   *
+   * @param n 快帧数。负数/非有限值按 0 处理(不抛错,与 `run` 同取舍)。
+   * @returns 实际推进的快帧数(便于调用方断言「推进了几次」)。
+   */
+  advance(n = 1): number {
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    const count = Math.trunc(n);
+    for (let i = 0; i < count; i += 1) this.tick();
+    return count;
+  }
+
   /** 移除玩家(生命值一并清掉)。 */
   removePlayer(id: string): boolean {
     const had = this.playerIds.delete(id);

@@ -435,6 +435,24 @@ export interface WorldSaveHost {
   addPlayer?(playerId: string, x: number, y: number): void;
   /** 把玩家从世界移除(离场)。与 `addPlayer` 成对,避免刚体残留。 */
   removePlayer?(playerId: string): boolean;
+  /**
+   * 推进世界 **n 个快帧**(task-59:驱动缺失)。
+   *
+   * ## 为什么是「快帧数」而不是秒
+   *
+   * `WorldSim` 自管**内部双频**(`FAST_PER_SLOW = 10`),而 `tick()` 一次
+   * 就是一帧(实测相位 `FAST×9 SLOW FAST×2`)。
+   * ⇒ `advance(1)` 对应外部一帧,**恰好 1:1**,不需要换算。
+   * `SIM_FAST_DT = 0.05 = 1/20` 与 20Hz 天然对齐。
+   *
+   * ## ⚠️ 调用方**绝不可**再乘 `FAST_PER_SLOW`
+   *
+   * 若以为「慢帧 2Hz,外面要乘 10」,就会每慢帧推进两次 AI ⇒ **世界快 2 倍**。
+   * 这类错误不报错、测试也可能照过(`WorldSim.advance` 的 docblock 记录了同一先例)。
+   *
+   * 可选:世界源不实现它时,`step()` 整段跳过 —— 与 `saveToDb` 同一 null 契约。
+   */
+  advance?(frames: number): number;
 }
 
 /**
@@ -1059,6 +1077,45 @@ export class RoomRuntime {
     if (this.status !== RoomStatus.OPEN) return new Uint8Array(0);
     this.state.meta.tick += 1;
     this.ac.tick(this.state.meta.tick);
+
+    /* ── 推进世界(task-59:驱动缺失)──
+       接线前**服务器路径**对 `tick`/`run` 的调用是 **0 处**
+       (`setSimulationInterval` → 本方法 → 只 tick 计数/落盘/投影等级 → 返回)
+       ⇒ 物理 / AI / 流体 / 电路 / 刷怪 / `syncPlayers()` 一帧都没跑过。
+       最要命的是 `syncPlayers()`:它是 `mobPlayers` 的唯一刷新点,
+       不跑 ⇒ **生物 AI 看不见玩家移动**。
+
+       ## 为什么是 `advance(1)` 且**只能**写 1
+       `WorldSim` 内部自管双频(`FAST_PER_SLOW=10`),一次 `tick()` 就是一帧
+       (实测相位 `FAST×9 SLOW FAST×2`);`SIM_FAST_DT = 0.05 = 1/20` 与外部
+       20Hz **天然对齐**。⇒ 外部一帧 = 内部一快帧,**恰好 1:1**。
+
+       ⚠️ **绝不可**写成 `advance(FAST_PER_SLOW)` 或在本方法里再调一次 ——
+       那会每慢帧推进两次 AI,世界快 2 倍,而**不报错、测试也可能照过**
+       (`world_sim.ts` 自己记着这个先例)。翻倍检测断言见 WS-07 的 N 系列。
+
+       ## 为什么放在 `ac.tick` 之后、落盘之前
+       - 在 `ac.tick` 之后:反作弊的服务端时钟先单调前进,世界再推进 ——
+         两者**互不换算**(见下),顺序只影响「本帧读到哪个值」;
+       - 在落盘之前:20 帧节流写库时,存下的是**推进后**的世界,
+         与 `world_tick` 同版(否则存的是上一帧的世界)。
+       - 在 `syncLevelProjections` 之前:等级投影读的是推进后的权威。
+
+       ## ⚠️ 三个时钟**互不联动**,不要试图让它们相等
+       ```
+       room.state.meta.tick  本方法 +1(房间 20Hz)
+       WorldSim.frame        advance 推进(世界帧)
+       ac.s.lastTick         服务端时钟水位(反作弊自己的)
+       ```
+       实测三者各自增长。**强行让 `sim.frame` 去喂 `ac.tick` 会把
+       「客户端申报 tick」与「服务端帧号」混成一个字段** —— 那正是 task-55
+       修掉的病根。`MAX_MOVE_CATCHUP_TICKS` 只要求**服务端时钟单调**,
+       本方法已用 `meta.tick` 保证,不需要与 `sim.frame` 对齐。 */
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.advance === 'function') {
+      host.advance(1);
+    }
+
     this.reapExpiredDisconnects();
     this.checkIdleSleep();
     if (this.db) {

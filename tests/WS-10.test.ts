@@ -55,9 +55,9 @@ import {
 import { ITEM_BY_ID } from '../shared/constants/items.ts';
 import { BOSS_LIST } from '../shared/constants/bosses.ts';
 import { MOB_BY_ID } from '../shared/constants/mobs.ts';
-import { BASE_MOVE_SPEED, DT } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
 import { maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT, SIM_SLOW_DT } from '../server/src/sim/world_sim.ts';
 import { mobCombatProfile, MOB_DEF_BASE, MOB_DEF_PER_LEVEL, MOB_ELEMENT_BY_ID } from '../server/src/combat/damage.ts';
 
 const rng = mulberry32(0x5eed10);
@@ -2930,6 +2930,141 @@ test('T58-6 ★ `removePlayer` 真的有牙:旁路状态不跨轮继承(位置�
      它是 J8-1 的结论,也是「为什么不能靠位置断言」的证据。 */
   eq(s.playerPosition('p1')!.x, s2.playerPosition('p1')!.x,
     '如实记录:**位置**在两条路径下相同 ⇒ 位置断言区分不出 removePlayer 是否被调用');
+});
+
+/* ═══════ task-59:`advance` —— 世界推进的权威入口 ═══════ */
+
+test('T59-1 ★ `advance(n)` 就是 n 个快帧,且与 `run(n)` 等价', () => {
+  /* ## 为什么要有这条
+     task-59 的缺口是「**服务器路径**从不推进世界」(0 处调用)。
+     补上驱动之后,最该守的是「**推进了几帧**」—— 因为接错的表现是
+     「世界快 2 倍/慢 10 倍」而**不报错、测试也可能照过**。
+     `advance(n)` 的两种写法(`run(n)` 与循环 `tick()`)必须给**同一个数**。 */
+  /* ⚠️ 我第一版两条都写错了,记在这里免得后人重踩:
+     1) 复用同一个实例跨迭代 ⇒ `b.frame` 是**累计值**而 `ra.frames` 是**单次数**
+        ⇒ 第 3 轮 11 vs 10 假红。必须每次用**新实例**比。
+     2) `advance(n)` 本身是对的(实测 advance(10) ⇒ frame 10),错的是我的期望。 */
+  for (const n of [0, 1, 10, 100]) {
+    const a = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+    const b = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+    const ra = a.run(n);
+    const ret = b.advance(n);
+    eq(ret, n, `advance(${n}) 返回推进的帧数`);
+    eq(b.frame, ra.frames, `advance(${n}) 后的帧号 == run(${n}).frames(每条独立实例)`);
+  }
+  /* 边界:负数/非有限值按 0 处理,不抛错(`run` 同取舍) */
+  const c = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  eq(c.advance(-5), 0, 'advance(-5) ⇒ 0');
+  eq(c.advance(Number.NaN), 0, 'advance(NaN) ⇒ 0');
+  eq(c.frame, 0, '两次无效调用后帧号仍为 0');
+});
+
+test('T59-2 ★ 慢帧算术:每 10 快帧恰好 1 慢帧(两侧扫)', () => {
+  /* `FAST_PER_SLOW = 10`。慢帧是**世界状态的真实推进**(2Hz),
+     算错会让 AI/流体/刷怪频率整体偏移。两侧都扫,不只测一个点。 */
+  for (const [n, expectSlow] of [[9, 0], [10, 1], [11, 1], [20, 2], [100, 10]] as [number, number][]) {
+    const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+    const r = s.run(n);
+    eq(r.slowFrames, expectSlow, `${n} 快帧 ⇒ 恰好 ${expectSlow} 慢帧`);
+    eq(Math.floor(n / FAST_PER_SLOW), expectSlow, `与 floor(${n}/${FAST_PER_SLOW}) 口径一致`);
+  }
+});
+
+test('T59-3 ★ `SIM_FAST_DT` 与 20Hz 天然对齐 —— 不需要任何换算', () => {
+  /* 这条是**写给下一个人的**。若他以为「慢帧按 2Hz,所以外面要乘 FAST_PER_SLOW」,
+     就会每慢帧推进两次 AI ⇒ 世界快 2 倍(`world_sim.ts` 记着同一先例:不报错、
+     测试也可能照过)。把「天然对齐」钉成断言,免得有人引入那个换算。
+
+     ⚠️ **本断言的守备范围(注入时别误判)**:它**只守常量关系**,
+     不守「推进了几次」。实测:注入「`advance` 双倍」时本断言**不会红**
+     —— 那是**正确**的,不是覆盖不全。
+     推进次数由 **T59-1 / T59-4 / WS-07 的 N1/N2** 守。
+     常量断言与行为断言的**失效条件本来就不同**:前者要常量被改才红,
+     后者要调用被改就红。⇒ 若某次注入只让本断言没红,先查注入改的是哪一类。 */
+  eq(SIM_FAST_DT, 1 / 20, `SIM_FAST_DT = ${SIM_FAST_DT} === 1/20`);
+  eq(TICK_HZ, 20, 'TICK_HZ = 20');
+  eq(FAST_PER_SLOW, Math.round(SIM_SLOW_DT / SIM_FAST_DT),
+    'FAST_PER_SLOW 与两个 DT 的关系自洽(1 慢帧 = FAST_PER_SLOW 快帧)');
+
+  /* 关键:**一次 tick = 一帧**,不是「一次 tick = 一个慢帧」 */
+  const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  const phases: string[] = [];
+  for (let i = 0; i < 12; i += 1) phases.push(s.tick().phase);
+  eq(phases.filter((p) => p === 'SLOW').length, 1,
+    `12 次 tick() 里恰好 1 个慢帧(实测相位 ${phases.join(' ')})`);
+  eq(s.frame, 12, 'frame 与 tick 次数 1:1');
+});
+
+test('T59-4 ★ 翻倍检测:多推一次必须**可观测**(本任务最该守的错)', () => {
+  /* 用两条独立路径给同一个数,再人为「接错」,必须能分辨:
+     ```
+     正确:  advance(100) ⇒ frame 100
+     翻倍:  advance(100) 调两次 ⇒ frame 200
+     ```
+     若断言只写 `frame > 0`,两种都过 ⇒ 没牙。 */
+  const right = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  right.advance(100);
+  const wrong = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  wrong.advance(100);
+  wrong.advance(100);          /* ← 「接错」:多推一次 */
+  eq(right.frame, 100, '正确写法:100');
+  eq(wrong.frame, 200, '翻倍写法:200');
+  ok(right.frame !== wrong.frame, '★ 两种情况**可分辨** ⇒ 断言有区分力(不是恒真)');
+});
+
+test('T59-5 `advance` 真的让**子系统**跑起来(不只是计数器)', () => {
+  /* 「帧号涨了」不等于「子系统跑了」。挑一个实测过的可观测量:
+     `syncPlayers()` 只在 `tick()` 里跑 ⇒ 它把 `physics.bodies` 投影成
+     `mobPlayers`。判据:推进后 `mobPlayers` 与刚体**同源**。
+
+     ⚠️ **不要**用「生物的 `physics.bodies` 位移」当判据 —— 我第一版就是这样,
+     结果假红(`x=14.000` 没动)。原因是 **task-58 实测过的既有事实**:
+     生物移动走的是 `MobRuntime`(`host.ts:449` 的 `rt.x = fsm.x`),
+     **不写 `physics.bodies`** ⇒ 刚体本来就不动。那是既有设计,不是缺陷。
+     ⇒ 改用 `mobPlayers` 的**刷新**当判据(它才是 `tick()` 的直接产物)。 */
+  const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  s.addPlayer('p1', 10, 10);
+  const b = s.physics.bodies.get('p1')!;
+  b.x = 25.5;                    /* 直接改**权威**,看 tick() 是否把它投影出去 */
+  const mpBefore = s.mobPlayers.find((m) => m.id === 'p1')?.x;
+  ok(mpBefore !== 25.5, `前置:mobPlayers 还是旧值 ${mpBefore}(证明下面不是恒真)`);
+
+  s.advance(1);
+  eq(s.frame, 1, '推进了 1 帧');
+  eq(s.mobPlayers.find((m) => m.id === 'p1')?.x, 25.5,
+    '★ `advance(1)` 让 `syncPlayers()` 跑过 ⇒ 权威位置被投影到 `mobPlayers`');
+  ok(s.mobPlayers.some((m) => m.id === 'p1'),
+    '且 `mobPlayers` 里含玩家(`syncPlayers` 按 playerIds 过滤,不混入生物)');
+});
+
+test('T59-6 ★ 端到端:推进让**生物 AI 看得见**玩家移动', () => {
+  /* 这是 task-59 与 task-58 的**交汇点**,也是「端到端」的真正含义:
+     ```
+     task-58  玩家位置写进 physics.bodies
+     task-59  tick() 跑 ⇒ syncPlayers() 把刚体投影成 mobPlayers
+     ⇒ 生物 AI 的 `nearest()` 才读得到玩家
+     ```
+     缺任一项,「玩家走过去 → 生物反应」都不通。本用例把两件事连起来验。 */
+  const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  s.addPlayer('p1', 10, 10);
+  s.advance(1);
+  const near0 = s.mobPlayers.find((m) => m.id === 'p1');
+  ok(near0 !== undefined, '前置:mobPlayers 里有玩家');
+
+  /* 经**权威入口**移动(不是直接改刚体) */
+  s.applyPlayerMove('p1', 30, 10);
+  s.advance(1);
+  eq(s.mobPlayers.find((m) => m.id === 'p1')?.x, 30,
+    '★ 移动 + 推进 ⇒ mobPlayers 跟着到 30 ⇒ **生物 AI 看得见玩家走到哪**');
+
+  /* 负向对照:只移动、**不推进** ⇒ mobPlayers 停在旧值
+     ⇒ 证明「推进」这一步是必需的,不是可有可无 */
+  const t = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
+  t.addPlayer('p1', 10, 10);
+  t.advance(1);
+  t.applyPlayerMove('p1', 30, 10);
+  eq(t.mobPlayers.find((m) => m.id === 'p1')?.x, 10,
+    '负向对照:移动后**不推进** ⇒ mobPlayers 不动 ⇒ 推进是必需的');
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */
