@@ -107,6 +107,11 @@ function pickServerReason(src: string): string {
   if (b < 0) return '';
   const block = src.slice(a, b);
   /* 逐行找 `['server/...', '理由'],` —— 理由里不许含单引号(有则跳过,避免替换歧义) */
+  /* ⚠️ 本正则要求「路径与理由**同行**且同行 `]` 闭合」——
+     这是**刻意**的:本函数要拿理由文本去构造 `String.replace`,
+     而多行条目(理由用 `+` 拼接)无法用单行锚点替换。
+     故多行条目被**显式跳过**:宁可换一条,也不误选后替换失败。
+     (计数用的是另一套更宽的正则 —— 两者目的不同,不该共用。) */
   for (const m of block.matchAll(/^\s*\['(server\/[^']+)',\s*'([^']+)'\]/gm)) {
     const reason = m[2] as string;
     if (reason.includes("'")) continue;
@@ -464,7 +469,11 @@ const CASES: Case[] = [
       const src = readFileSync(join(ROOT, 'scripts', 'verify.ts'), 'utf8');
       const a = src.indexOf('const UNREACHABLE_EXEMPT = new Map<string, string>([');
       const b = src.indexOf(']);', a);
-      const n = [...src.slice(a, b).matchAll(/^\s*\['[^']+',\s*'[^']*'\]/gm)].length;
+      /* ⚠️ 只认**行首路径**,不要求「理由与 `]` 同行」——
+         白名单条目可以写成**多行**(理由用 `+` 拼接),而原先的正则
+         无论是「同行闭合」还是「同行不闭合」都会漏计多行条目。
+         实测:漏计 3 条 ⇒ 自检报假失败(26/27)。**这是 Lead 引入的 bug。** */
+      const n = [...src.slice(a, b).matchAll(/^\s*\['[^']+',/gm)].length;
       /* 既断言「用了实测值」,也断言「没写死上一个值」 */
       return new RegExp(`欠账构成\\(${n} 条全部待接`);
     })(),
