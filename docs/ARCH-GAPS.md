@@ -260,6 +260,60 @@ colyseus 包:type=undefined / main=./build/index.js / exports=(无) / 实测 v0.
 
 **另** `server/src/party/scoring.ts`(401 行)按同一口径也在此类。
 
+### 第四类空缺:「玩家 → 怪物」这条伤害方向**整条不存在**(Lead 实测)
+
+**这不是「公式简化」,是「没有这条路」。** 它最初被写成 `task-33` 时,
+前提是「八步公式 505 行没接,生产走 `vitals.ts` 简化式,把简化式换成八步即可」。
+**实测后发现该前提把两个相反方向混为一谈:**
+
+| 方向 | 函数 | 生产调用点 |
+| :--- | :--- | :-: |
+| **怪 → 玩家** | `vitals.mobHitDamage(level, mul)` → `VitalsSystem.applyHit` | **2**(在跑) |
+| **玩家 → 怪** | `combat/damage.computeDamage(AttackInput)` | **0** |
+
+`computeDamage` 的签名是 `attacker: CombatantStats` → `target: TargetProfile`;
+`mobHitDamage(level, mul)` 只吃**等级**与倍率。**两者方向相反、输入类型无交集。**
+⇒ 按任务书字面「把 B 换成 A」,等于**用玩家攻击公式去算怪打玩家** —— 那不是修缺陷,是引入缺陷。
+
+#### 真正缺的是什么
+
+`world_sim` 有 `damageMob(mobId, amount, ...)`,但 **`amount` 由调用方给定**,
+而**没有任何生产调用方**:
+
+```
+damageMob            生产 1 处(只有它自己的定义行)
+computeDamage        生产 0 处
+applyDamage          生产 0 处
+reflectFrom / planSkillHits / healTarget / shieldPercent   全部 0 处
+```
+
+`net/room.colyseus.ts:170` 的 `attack` 报文 → `room.ts:638 applyAttack()`,
+而 `applyAttack` **只做反作弊**(`this.ac.attack(...)`)——
+**它不算伤害、不改任何生物血量、不返回伤害值。**
+
+⇒ **玩家按下攻击键,服务端只校验「你有没有作弊」,然后什么都不发生。**
+
+#### 与第二层是**同一个失败模式**
+
+| | 消息 | 走什么 | 结果 |
+| :--- | :--- | :--- | :--- |
+| 第二层 | `action` | `authorize()` 纯查表 | **成功分支为空** |
+| **第四类** | `attack` | `ac.attack()` 纯查表 | **成功分支为空** |
+
+两者都是「**校验通过 + 无执行**」,且**都不报错**(`action` 至少还会在 `!allowed` 时发 `reject`;
+`attack` 连拒绝路径都只有反作弊违规才走)。玩家视角:**攻击键与放置键都是死的,且没有任何反馈。**
+
+#### 为什么门禁结构上查不到 —— 与第三层同因
+
+`combat/damage.ts` 在白名单里,理由是「生产走 `vitals.ts` 简化路径,待接线」。
+**这句话半真半假**:怪→玩家确实走简化路径(真的),但**玩家→怪根本没有路径**。
+⇒ 白名单理由里的「简化路径」这个说法**掩盖了「另一条方向完全缺失」**——
+因为读者会以为「有两条路,一条简化一条完整」,而实际是「**只有一条,且是反向的**」。
+
+**「理由说了什么」必须在门禁里被校验** —— 这正是 `PROGRESS.md` 陷阱 16 的形态
+(「事实陈述会过期,必须机器校验」),但这次**理由从一开始就是错的**,不是过期。
+
+
 ### ⚠️ 两道门禁对这批模块的**口径不一致**(实测发现)
 
 | 模块 | `verify.ts` 白名单 | `orphan-audit.ts` | 差异根因 |
