@@ -2302,6 +2302,89 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
   eq(s.vitals.get('p1')!.downed, false, '移开伤害源后 40 帧内没有再次倒地(排除状态未清的死循环)');
   eq(s.vitals.get('p1')!.totalTaken, takenAfterRevive, 'totalTaken 未再增长 —— 确实没有再挨打');
   eq(s.downedOf('p1'), undefined, '没有重新生成泡泡');
+
+  /* ═══ task-64:复活宽限无敌的「有牙」自检(不新增 test() 块)═══
+ *
+ * 背景:revive() 此前把复活无敌写进**死的**那套(`DownedState.invulnSec`,
+ * 读它的 `isInvulnerable()` 生产零调用),同时把**活的** `vitals.iframeSec`
+ * 置 0 ⇒ 复活后起手就被下一拳打死。修法是写进活字段。
+ *
+ * ⚠️ 但修完**没有任何门禁守着它**:本文件里 `iframeSec` / `blockedByIframe` /
+ * `applyHit` / `beginFrame` 各出现 **0 次**。实测:把 revive 内存 patch 回
+ * `iframeSec = 0`,**94/94 仍全绿** —— 也就是「修了,但无名」,后续任何人
+ * 都能静默回退它。下面这块就是为它补的牙。
+ *
+ * ⚠️ **本块刻意不新增 `test()`**:`harness.report()` 按 `test()` 计数,
+ * 新增会把 94 变 95,而 `README.md:183` 那张表的数字是 Lead 的写域。
+ * 故把断言放进现有 `task44-7` 块内(与 task-63 同一规格)。
+ *
+ * ⚠️ 两个坑(均已在本机实测复现,不是照抄):
+ *  1. **`beginFrame()` 必调**。不调则 `hitThisFrame` 的**同帧去重**会让
+ *     `applied=0`,**看起来像无敌生效**,实际测的是去重 —— 那是一条假绿。
+ *     实测:坏实现 + 不调 beginFrame ⇒ 第 2 拳 `applied=0 blockedByIframe=false`。
+ *  2. **`applyHit` 是 5 参** `(attackerId, playerId, level, mul, distance)`,
+ *     第 3 参是**数字**不是对象。实测传 `('p1', 20)` ⇒ `playerId=20` ⇒
+ *     `players.get(20)` 为 undefined ⇒ 走 `if (!v) return base` 早退 ⇒
+ *     `applied=0 blockedByIframe=false`(看起来像"被挡住了",实则是**没打**);
+ *     传对象当 level ⇒ `mobHitDamage({})` = NaN ⇒ `applied=NaN`。
+ *     **两种错法都会导出假结论。**
+ *
+ * ⚠️ 帧数**不能写死**:慢帧(2Hz)相位决定归零所需帧数。实测复活后
+ *   相位 0 需 10 帧、相位 1 需 9 帧、相位 9 只需 1 帧 ⇒ 固定帧数会随
+ *   上游时序漂移而假红/假绿。故用「循环到归零 + 上限」,上限仍能抓住
+ *   反方向的「永久无敌」。
+ */
+{
+  const g = partyWorld([
+    { id: 'p1', x: 24, y: 24 },
+    { id: 'p2', x: 64, y: 24 },
+  ], 'mob_lava_elem', [24, 26]);
+  for (let i = 0; i < 600 && !g.vitals.get('p1')!.downed; i += 1) g.tick();
+  ok(g.vitals.get('p1')!.downed, 'task-64 前置:先倒地');
+  g.setPlayerPos('p2', 24.3, 24);
+  for (let i = 0; i < 60 && g.lastRevive === null; i += 1) g.tick();
+  ok(g.lastRevive !== null, 'task-64 前置:复活发生了');
+  eq(g.lastRevive!.method, ReviveMethod.TOUCH, 'task-64 前置:复活方式是 TOUCH');
+
+  const gv = g.vitals.get('p1')!;
+  /* ⚠️ 期望值写**字面量 0.5**(设计基线),不写 `MANUAL_REVIVE_INVULN` ——
+     后者正是被 `revive.ts:222` 写进 `DownedState` 的那个常量,
+     用它当期望值就是**同义反复**(常量改成任何值两边同步移动,断言无法失败)。
+     实测:门禁 `--strict-taut` 抓到本条为「新增未登记的同义反复候选」。
+     与本文件 task44-7 既有写法(`eq(s.lastRevive!.invulnSec, 0.5, ...)`)一致。 */
+  eq(gv.iframeSec, 0.5,
+    'task-64 前置:复活宽限无敌落在**活字段** vitals.iframeSec 上(不是 downedStates.invulnSec —— 后者是死的)');
+
+  /* 把两人移到远处:**熔岩怪若还在旁边会持续打 p1 并把 iframeSec 重新武装**,
+     导致后面「到期后打得中」永不成立。实测:不隔离时 20 帧后 iframeSec 仍 >0。 */
+  g.setPlayerPos('p1', 300, 300);
+  g.setPlayerPos('p2', 300, 300);
+
+  /* ── 后果 1:宽限期内打不中(读**生产判定**的返回值,不读内部变量)── */
+  g.vitals.beginFrame();                                    /* ← 坑 1 */
+  const hit1 = g.vitals.applyHit('task64_probe', 'p1', 1, 1.0, 0);   /* ← 坑 2:5 参 */
+  eq(hit1.applied, 0, 'task-64 后果1:复活后第一拳 applied === 0(修前为 6)');
+  eq(hit1.blockedByIframe, true,
+    'task-64 后果1:挡掉的原因**确是 iframe**(同帧去重早退时此字段为 false,故这条能分辨两种 applied=0)');
+  eq(gv.hp, 50, 'task-64 后果1:HP 未被扣(仍是复活时的 50)');
+
+  /* ── 后果 2:宽限期内「只增不减」的累计量也不增长 ── */
+  const takenBefore = gv.totalTaken;
+  let guardFrames = 0;
+  while (gv.iframeSec > 0 && guardFrames < 30) { g.tick(); guardFrames += 1; }
+  eq(gv.iframeSec, 0, `task-64 后果2:宽限在 30 帧内到期(实测 ${guardFrames} 帧)`);
+  ok(guardFrames < 30, `task-64 后果2:不是「永不衰减」的永久无敌(帧数 ${guardFrames} < 上限 30)`);
+  eq(gv.totalTaken, takenBefore,
+    'task-64 后果2:宽限期内 totalTaken 未增长(只增不减的量,最能说明确实没挨打)');
+  eq(gv.downed, false, 'task-64 后果2:宽限期内没有再次倒地');
+
+  /* ── 后果 3:到期后必须**真的失效**(防反方向的「永久无敌」)── */
+  g.vitals.beginFrame();
+  const hit2 = g.vitals.applyHit('task64_probe', 'p1', 1, 1.0, 0);
+  ok(hit2.applied > 0, `task-64 后果3:宽限到期后正常受击(applied=${hit2.applied} > 0)`);
+  eq(hit2.blockedByIframe, false, 'task-64 后果3:到期后不再被 iframe 挡');
+  ok(gv.hp < 50, `task-64 后果3:HP 真的下降(${gv.hp} < 50)`);
+  }
 });
 
 test('task44-8:713 命中 → 灼烧 DoT 真的逐帧扣血(原先生产零消费)', () => {
