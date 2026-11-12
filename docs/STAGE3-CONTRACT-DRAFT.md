@@ -301,3 +301,139 @@ Lead 预测:「删后 `pan.x/pan.y` 没人读了 ⇒ 相机平移变死写」
 ⇒ WS-12 需要**两条**判据:一条强(行为,往返)、一条弱(文本,接线点),
 且弱判据要**显式标注**,不混进「全部通过」。
 
+---
+
+## 12. ★★★ 跨端线上契约(服务端这半**必须**先读这节,否则会独立实现出静默错误)
+
+**背景**:阶段 3 的客户端侧已完成(commit `0c8b72b`),但服务端那半**尚未开工**。
+一旦两端独立实现,下面三条各自都会产生**不报错**的失败 ⇒ 所以本节的每一条
+都附**实测证据**,不是设计约定。
+
+### 12.1 ★★ 上行/下行**帧头不对称** —— 服务端必须剥第 1 字节
+
+```
+下行(服务端 → 客户端)= **裸协议字节,无 tag**
+  实测 room.ts 三处出口全部直接返回 .bytes:
+    L642   const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
+    L1154  return prevSnapshot ? encodeDelta(prevSnapshot, this.state).bytes : new Uint8Array(0);
+    L1349  return encodeFull(this.state, this.state.meta.tick).bytes;
+  ⇒ 客户端**已兼容**(首字节不是 0x02 就按裸包处理)✓
+
+上行(客户端 → 服务端)= **[1 字节 tag][payload]**
+  实测 client/src/net/session.ts:
+    L127  const FRAME_TEXT   = 0x01;   ← 握手 JSON(welcome/hello)
+    L128  const FRAME_BINARY = 0x02;   ← 二进制协议包
+    L133  out[0] = isText ? FRAME_TEXT : FRAME_BINARY;
+  ⇒ ★ **服务端必须剥掉首字节**再交给 `decodePacket`
+```
+
+**★ 不剥会怎样?我穷举了全部 256 个 tag 值(实测,不是推断)**:
+```
+实测:0 / 256 个 tag 值会**静默**通过 —— **全部抛出**。
+  · tag = 0x02(真实现)⇒ `协议版本不匹配:2`
+  · tag = 0x01(= PROTOCOL_VERSION 的值)⇒ `未知实体种类:0`
+⇒ 所以这条**不会静默**,是一条清晰错误 ✓
+⇒ ⚠️ 但**仍然是契约的一部分**,理由有两条:
+  1 若 `PROTOCOL_VERSION` 将来改成 2,而 tag 恰好也是 2,
+    那时的行为**未被验证**(我测的是 PROTOCOL_VERSION=1 的现状)
+  2 一条错误的**可读性**不是"可以不写"的理由 —— 对接方会先花时间猜
+⇒ 结论:写进契约,并**两侧各留一条断言**(上行带 tag / 下行无 tag)。
+```
+
+### 12.2 ★★★ 重连的真相:**靠 `userId`,不靠 token**(注释与实现不符)
+
+```
+实测 server/src/net/room.ts:
+  L15   注释:「`RECONNECT_GRACE_MS`(30 秒)内用**同一 token** 回来 → 直接恢复快照」
+  L574  const existing = this.members.get(input.userId);   ← ★ 真实判据是 **userId**
+  L578  const token = this.mintToken();                    ← token 是**造出来返回给客户端**的
+  L589  return { ok: true, ..., token, snapshot, resumed: true };
+  L1367 private mintToken(): string                        ← 只被调用,从不被读入
+
+  实证:输入里读 token 的次数 = **0**
+        `input.token` 0 次 / `input?.token` 0 次 / `.token` 作为读 0 次
+        客户端侧:`session.ts` / `main.ts` 里 token 出现 **0 次**
+  ⇒ 而 `JoinResult.token?: string`(L251)是**返回类型**里的字段 ⇒ **只写不读**
+```
+
+**⇒ 两条不一致(都在服务端写域)**:
+```
+1 **注释与实现不符** —— 注释说 token,实现用 userId
+  ⇒ 危害:对接方读注释 ⇒ 会去实现 token 校验 ⇒ 而它**永远不会被触发**
+    ⇒ 「我实现了重连」+「重连从未生效」同时为真
+2 ★ 裸 WS 服务端若**每连接随机生成 id** ⇒ 重连走**全新加入**,
+  旧席位留在 30 秒宽限期内 ⇒ **同一玩家出现两个**
+  ⇒ **不报错、不抛、日志正常** —— 只有玩家自己看到"我重连后变成两个人"
+```
+
+**⇒ 硬要求(裸 WS 服务端)**:`userId` 必须**跨连接稳定**,
+不能每连接随机生成。若无法稳定 ⇒ 必须在协议里引入客户端侧持有的 id
+(但那是**改契约**,会波及黄金形状 ⇒ 需先裁)。
+
+**⚠️ 本轮不动它的理由**:重连**不在**阶段 3 的验收判据内
+(判据只有「圆心 == 权威玩家位置」)⇒ 按本仓既有规则
+「**一个改动如果服务的功能不在当前验收判据里,就不该挡在关键路径上**」,
+记为待办(见 §13),不夹进本轮。
+
+### 12.3 ★★ 0 字节帧是**正常**的,不是坏包
+
+```
+实测 room.ts:1154 —— `prevSnapshot` 为 null 时 `step()` 返回 **空 Uint8Array**
+而空数组交给 decodePacket 会**抛异常**(`报文截断:需要 1 字节,剩余 0`)
+⇒ 服务端侧:0 字节表示「本 tick 无差量」,**不是**错误
+⇒ 客户端侧:`session` 必须**跳过** 0 字节帧(已实现,WS-12 有断言)
+⇒ ★ 服务端不要把 0 字节当成"编码失败"去重试或补发 —— 那会改变协议语义
+```
+
+### 12.4 握手字段的**两侧来源**(已核对,4 个字段无缺)
+
+| 字段 | 服务端从哪来 | 实测 |
+| :--- | :--- | :--- |
+| `playerId` | `userId`(服务端**自己**产生) | `room.colyseus.ts:136 userId: client.sessionId` |
+| `roomId` | `RoomRuntimeOptions.roomId` | `room.ts:259` |
+| `protocolVersion` | `PROTOCOL_VERSION` 常量 | `shared/net/delta.ts` |
+| `contentClaim` | `encodeContentClaim`(在 `server/content/`) | `handshake.ts` |
+
+**★ 客户端侧 `hello.contentClaim` 阶段 3 恒为 `null`**(实测 `session.ts:210`),
+因为指纹算法仍在 `server/`(CR-26 已裁:上移但排后)⇒ 见 §12.5。
+
+### 12.5 ★★★ 「静默丢弃」方向:**服务端当前不读 `contentClaim`**
+
+```
+实测:
+  client/src/net/session.ts:169  open 里发 hello,**含** contentClaim 字段 ✓
+  server/src/net/room.colyseus.ts:134
+    override onJoin(client, options: { passwordHash?: string; asGuest?: boolean })
+    ⇒ **类型里没有 contentClaim** ⇒ 服务端**根本没读它**
+  colyseus.ts 全文 `contentClaim` 出现 **0 次**
+```
+
+**⇒ 危害形态与"挡在门外"根本不同**:
+```
+挡在门外(客户端没发、服务端要校验)⇒ **可见**(没人能进来)⇒ 会有人报
+静默丢弃(客户端发了、服务端不读)⇒ 外部**一切正常**,
+  而内容指纹**从来没被比对过** ⇒ **没人会来报**
+```
+⇒ ★ 所以这是**两个方向、两种危害**,判据必须**分别**钉
+(WS-FND-03 已补方向 2,见该套件的丙类)。
+⇒ ⚠️ 且它**此刻无危害**:客户端发的是**字面 `null`**(丢一个 null 不损失信息)
+⇒ 判据钉的是「**线上发的是不是真指纹**」,在**危险那一刻**红,
+而不是在"接线中途"红(否则就是陷阱 71:把缺陷编码成期望值)。
+
+---
+
+## 13. ★ 本契约**未**覆盖的(如实,不当已解决)
+
+```
+[ ] **重连语义的一致性**(§12.2)—— 注释改对 / userId 跨连接稳定,二者至少要做一个
+    ⇒ 不在阶段 3 判据内 ⇒ 记为待办,不挡关键路径
+[ ] **WS 分片帧** —— 未测。内置客户端在 70000 B 时未分片,但不保证所有实现都不分片
+[ ] **ping/pong** —— 客户端只处理 close(0x8),**未回 pong**
+    ⇒ 长连接可能被对端判死;接生产前必须处理
+[ ] **真机延迟/丢包手感** —— 未测(只有 prediction.ts 的 LossyChannel 模拟)
+[ ] `createdAt` 等 room.ts:259 `RoomRuntimeOptions` 的**其余字段**未逐个核对
+[ ] 本节所有实测均在 **PROTOCOL_VERSION = 1** 下取得;
+    版本号变更后 §12.1 的"全部 256 个 tag 都抛"**需重测**
+```
+
+
