@@ -56,7 +56,10 @@ const REBASE = process.argv.includes('--baseline');
  */
 export const ORPHAN_KNOWN = new Map<string, string>([
   /* ── 服务端:等编排层接线 ── */
-  ['server/src/wiring/components.ts', 'WS-08 40 项电路件;待 wiring 编排入口真正求值'],
+  /* ⚠ `wiring/components.ts` **不在此表** —— 它被 `world_sim.ts:72` 以
+     **裸 import**(`import '../wiring/components.ts';`)引用,因此**可达**。
+     我的初版扫描器用正则找 `from '…'`,漏掉裸 import,把它误报成 orphan。
+     详见 `extractRelativeImports` 的注释与「词法自检」一节。 */
   ['server/src/wiring/logistics.ts', 'WS-08 物流(传送带/分拣/机械臂);待接 components 求值'],
   ['server/src/party/modes.ts', 'WS-11 派对模式;待编排层按房间模式分发'],
   ['server/src/social/afk.ts', 'WS-11 挂机检测;待房间 tick 调用'],
@@ -108,6 +111,82 @@ const relOf = (p: string): string => relative(ROOT, p).split(sep).join('/');
 const text = new Map<string, string>();
 for (const f of [...prodFiles, ...testFiles]) text.set(relOf(f), readFileSync(f, 'utf8'));
 
+/**
+ * 提取**代码态**下的相对导入路径。
+ *
+ * ## ⚠ 这里曾经是个真 bug(务必读)
+ *
+ * 初版用的是 `/(?:from\s*|import\s*\(\s*)['"](\.[^'"]*)['"]/g` 这个正则。
+ * 它漏掉**裸 import**(side-effect import):
+ *
+ * ```ts
+ * import '../wiring/components.ts';   // ← 无 from,正则抓不到
+ * ```
+ *
+ * 后果:`world_sim.ts:72` 正是这么引 `components.ts` 的,**真的可达**,
+ * 但脚本报它「生产零引用」⇒ **我的门禁误报**。
+ *
+ * 反证过程:`verify.ts` 的 `extractRelativeImports`(逐字符扫描)能正确解析
+ * 出它,且 `components.ts` **不在** verify 的白名单里 ⇒ verify 认为它可达。
+ * 两者对同一文件给出相反结论 ⇒ **我的脚本错了**,不是 verify 错。
+ *
+ * **教训**:判定「谁引用谁」必须用**同一套词法**,否则两个门禁会互相矛盾,
+ * 而矛盾时无法判断该信哪个。故此处改为与 `verify.ts` 同构的逐字符扫描,
+ * 并显式覆盖裸 import。
+ */
+function extractRelativeImports(text: string): string[] {
+  const out: string[] = [];
+  const n = text.length;
+  const isId = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9_$]/.test(c);
+  let i = 0;
+  while (i < n) {
+    const c = text[i] as string;
+    /* 注释:整段跳过 */
+    if (c === '/' && text[i + 1] === '*') { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+    if (c === '/' && text[i + 1] === '/') { const e = text.indexOf('\n', i); i = e < 0 ? n : e; continue; }
+    /* 字符串:整段跳过 —— 否则字符串里的 `from './x.ts'` 会变成幽灵依赖 */
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c;
+      i += 1;
+      while (i < n) { if (text[i] === '\\') { i += 2; continue; } if (text[i] === q) { i += 1; break; } i += 1; }
+      continue;
+    }
+    if (isId(c) && !isId(text[i - 1])) {
+      let j = i;
+      while (j < n && isId(text[j])) j += 1;
+      const word = text.slice(i, j);
+      /* `import` 覆盖三种形态:`import x from '…'`(由后续 `from` 接)、
+         `import '…'`(**裸 import**)、`import('…')`(动态) */
+      if (word === 'import' || word === 'from') {
+        let k = j;
+        while (k < n && /\s/.test(text[k] as string)) k += 1;
+        /* 裸/动态 import 形态:`import(` 或 `import '` 紧邻 */
+        if (word === 'import' && text[k] === '(') {
+          k += 1;
+          while (k < n && /\s/.test(text[k] as string)) k += 1;
+        }
+        const q = text[k];
+        if (q === "'" || q === '"') {
+          let e = k + 1;
+          let spec = '';
+          while (e < n) {
+            if (text[e] === '\\') { spec += text[e + 1]; e += 2; continue; }
+            if (text[e] === q) break;
+            spec += text[e]; e += 1;
+          }
+          if (spec.startsWith('.')) out.push(spec);
+          i = e + 1;
+          continue;
+        }
+      }
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}
+
 /** 解出相对说明符后反解成绝对路径再比 —— 避免 `./x.ts` / `./x` 写法漏判。 */
 function referencedBy(target: string, froms: string[], self: string): string[] {
   const tAbs = resolve(ROOT, target);
@@ -117,8 +196,8 @@ function referencedBy(target: string, froms: string[], self: string): string[] {
     if (r === self) continue;
     const src = text.get(r) ?? '';
     const dir = dirname(resolve(ROOT, r));
-    for (const m of src.matchAll(/(?:from\s*|import\s*\(\s*)['"](\.[^'"]*)['"]/g)) {
-      let cand = resolve(dir, m[1]!);
+    for (const spec of extractRelativeImports(src)) {
+      let cand = resolve(dir, spec);
       if (!existsSync(cand)) {
         for (const ext of ['.ts', '/index.ts']) if (existsSync(cand + ext)) { cand += ext; break; }
       }
@@ -126,6 +205,58 @@ function referencedBy(target: string, froms: string[], self: string): string[] {
     }
   }
   return hits;
+}
+
+/* ── 词法自检:导入扫描必须覆盖全部形态 ──
+ *
+ * 这一节是**为上面那个真 bug 立的碑**。初版正则漏掉裸 import,导致
+ * `components.ts`(被 `world_sim.ts:72` 裸引)被误报为「生产零引用」。
+ * 若不立此自检,同类漏判会再次静默发生 —— 而误报方向是**掩盖**:
+ * 它让人以为某个模块没接线,于是不必去查,欠账被高估而非暴露。
+ *
+ * 每条断言:样本源码 → 必须解析出的说明符。任一不满足即 fail。 */
+{
+  const cases: [string, string, string[]][] = [
+    ['具名 import', "import { X } from './a.ts';", ['./a.ts']],
+    ['默认 import', "import X from './b.ts';", ['./b.ts']],
+    ['类型 import', "import type { T } from './c.ts';", ['./c.ts']],
+    ['裸 import(side-effect)', "import './d.ts';", ['./d.ts']],
+    ['裸 import 相对上级', "import '../wiring/e.ts';", ['../wiring/e.ts']],
+    ['动态 import', "import('./f.ts');", ['./f.ts']],
+    ['再导出', "export * from './g.ts';", ['./g.ts']],
+    ['具名再导出', "export { Y } from './h.ts';", ['./h.ts']],
+    ['双引号', 'import { Z } from "./i.ts";', ['./i.ts']],
+    ['注释里的 import 不算', "// import { A } from './ghost.ts'\nconst x = 1;", []],
+    ['块注释里的 import 不算', "/* import './ghost.ts' */\nconst x = 1;", []],
+    ['字符串里的 from 不算', 'const s = "from \'./ghost.ts\'";', []],
+    ['模板串里的 import 不算', 'const t = `import x from "./ghost.ts"`;', []],
+    ['多个 import', "import a from './j.ts';\nimport './k.ts';", ['./j.ts', './k.ts']],
+    ['第三方包不算', "import { p } from 'three';", []],
+    ['node 内置不算', "import { f } from 'node:fs';", []],
+  ];
+  const bad: string[] = [];
+  for (const [name, src, want] of cases) {
+    const got = extractRelativeImports(src).slice().sort();
+    const exp = want.slice().sort();
+    if (got.join(',') !== exp.join(',')) {
+      bad.push(`${name}:期望 [${exp.join(', ')}] 实际 [${got.join(', ')}]`);
+    }
+  }
+  /* 阳性对照:必须真的存在一条裸 import,否则上面那组是**装饰**(恒真)。
+     `world_sim.ts` 引 `components.ts` 用的就是裸 import。 */
+  const wsSrc = readFileSync(join(ROOT, 'server/src/sim/world_sim.ts'), 'utf8');
+  const hasBare = /import\s+['"]\.\.\/wiring\/components\.ts['"]/.test(wsSrc);
+  const parsedIt = extractRelativeImports(wsSrc).some((s) => s.includes('components'));
+  if (!hasBare) bad.push('阳性对照失效:world_sim.ts 里已没有裸 import components.ts(本自检需换锚点)');
+  else if (!parsedIt) bad.push('阳性对照失效:扫描器仍看不见 world_sim.ts 的裸 import components.ts');
+
+  if (bad.length > 0) {
+    console.log(`\n  ✗ 导入扫描器词法自检未通过(${bad.length} 处):`);
+    for (const b of bad) console.log(`      ${b}`);
+    console.log('  ⇒ 判定「谁引用谁」出错,本审计的全部数字都不可信');
+    process.exit(1);
+  }
+  console.log(`  ✓ 导入扫描器词法自检通过(${cases.length} 形态 + 1 阳性对照)`);
 }
 
 /* ── 找出所有 L2 orphan ── */
