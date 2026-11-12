@@ -59,18 +59,46 @@ function makeWorld(): WorldSim {
   /* 每个慢帧都重新驱动一次(驱动态是帧内状态,不是持久开关)。 */
   sim.addWireDrive(10, 10, WireColor.RED, true);
 
-  /* 实体:2 玩家 + 3 生物 */
+  /* 实体:2 玩家 + 3 生物
+     ⚠️ 这里原先写的是 `'m1'/'m2'/'m3'` —— **三个假 ID**。
+     `addMob` 查不到 `MOB_BY_ID` 时**不静默忽略**,而是推进 `unknownMobs`,
+     但演示脚本没读它,于是表现为「生物存在但不行为」:
+     实测 `unknownMobs = ['m1','m2','m3']`,三个都是空壳,`runtimeOf()` 返回 null。
+
+     **为什么这个 bug 值得留一段注释**:本文件是 `PROD_ENTRIES` 之一,
+     是「可达性门禁」里 sim 层的**唯一入口**。一个假 ID 会让整整一层
+     「看起来可达、实际什么都没跑」—— 而那正是本仓反复出现的缺陷形态。
+     ⇒ 改用冻结层真实 ID(`shared/constants/mobs.ts`),并在下方**自检**非空壳。 */
   sim.addPlayer('p1', 12, 12);
   sim.addPlayer('p2', 20, 14);
-  sim.addMob('m1', 'PLAINS', 16, 18);
-  sim.addMob('m2', 'PLAINS', 18, 18);
-  sim.addMob('m3', 'FOREST', 22, 20);
+  sim.addMob('mob_sheep', 'PLAINS', 16, 18);
+  sim.addMob('mob_boar', 'PLAINS', 18, 18);
+  sim.addMob('mob_squirrel', 'FOREST', 22, 20);
 
   return sim;
 }
 
 console.log('══════ 世界模拟冒烟 ══════');
 const sim = makeWorld();
+
+/* ── 自检:演示世界里不许有空壳生物 ──────────────────────────────
+   这段守的是上面那条注释里的 bug。`addMob` 对未知 ID 会推进
+   `unknownMobs` 而**不报错**,于是「三个生物全是空壳」与
+   「三个生物都在跑」在屏幕上的区别**只有「活跃生物」一列的数字** ——
+   而那个数字原先也不为 0(空壳仍被 `spawn` 与 `aoi.registerMob` 登记)。
+   ⇒ 不读 `unknownMobs` 就**无法从输出看出问题**。
+
+   为什么做成打印而不是测试断言:本文件是**演示**,不是测试 ——
+   它的价值在于「人一眼能看到」。把空壳数打进表头,任何人跑一次就知道。 */
+if (sim.unknownMobs.length > 0) {
+  console.log(
+    `⚠️ 自检失败:演示世界有 ${sim.unknownMobs.length} 个**空壳**生物 `
+    + `(${sim.unknownMobs.join(', ')}) —— 它们只被 spawn/AOI 登记,没有任何 AI 行为。\n`
+    + '   改用 shared/constants/mobs.ts 里的真实 ID。\n',
+  );
+  process.exitCode = 1;
+}
+
 console.log(`尺寸          ${sim.sizeCells} × ${sim.sizeCells} 格`);
 console.log(`快帧 / 慢帧   ${SIM_FAST_DT}s (20Hz) / ${SIM_SLOW_DT}s (2Hz),比例 1:${FAST_PER_SLOW}`);
 console.log(`初始快照      ${JSON.stringify(sim.snapshot())}`);
