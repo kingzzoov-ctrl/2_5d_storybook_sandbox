@@ -111,7 +111,15 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-const PROD_DIRS = ['server/src', 'client/src'];
+/* ⚠️⚠️ `shared` 必须在列 —— 与 `verify.ts` 的 `prodDirs` **同一口径**。
+ *
+ * 2026-11-13 实测(带双向对照):
+ *   零引用文件放 `shared/types/`  ⇒ 本行数字 Δ0(空洞)
+ *   零引用文件放 `server/src/net/` ⇒ 数字 Δ1(正确报警)
+ * ⇒ 两处必须同时改:若只改一处,两个门禁会给出**互相矛盾**的基数,
+ *   而「orphan ⊆ 可达性白名单」那条交叉自检建立在两者口径一致的前提上。
+ */
+const PROD_DIRS = ['server/src', 'client/src', 'shared'];
 const prodFiles = PROD_DIRS.flatMap((d) => walk(join(ROOT, d)));
 const testFiles = walk(join(ROOT, 'tests'));
 

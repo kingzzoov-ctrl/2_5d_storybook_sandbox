@@ -77,6 +77,13 @@ const suiteCounts = new Map<string, number>();
 /** `checkFrozen` 实际通过的不变量条数(README 的 `冻结层不变量 N/N` 用它校验)。 */
 let frozenInvariantCount = 0;
 
+/* 可达性节算出的三个数,**暴露给 README 校验用**(README 的「demo 独有 N 个」曾长期过期
+   而无人发现 —— 因为门禁算了它、打印它,却**没有拿它对过任何东西**)。
+   -1 = 本模式未跑可达性节 ⇒ 不校验(而不是当 0 比,那会报假红)。 */
+let reachProdTotal = -1;
+let reachProdReachable = -1;
+let reachDemoOnly = -1;
+
 /**
  * `checkFrozen` 是否**真的跑过**。
  *
@@ -929,6 +936,21 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/social/afk.ts', 'WS-11 挂机攒露水,等房间每帧驱动(与 room 的 AFK 同名异义)'],
   /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
      经 `WorldSim` 的慢帧 `tickLogisticsStep` 驱动。已从本表摘除。 */
+
+  /* ── shared/**:本表**此前完全没有这个目录**,与 client/** 是同一个病 ──
+   *
+   * 2026-11-13:把 `shared` 加进 `prodDirs` 后,全目录 9 个文件里 8 个在闭包内,
+   * 只有下面这条不可达 —— 说明**加它是安全的**,不是把一堆东西一次性塞进白名单。
+   * (那 8 个:`constants/{bosses,items,mobs}.ts` · `net/delta.ts` ·
+   *  `types/{alchemy,entities,physics,tile,wire}.ts`) */
+  ['shared/testing/harness.ts',
+    '测试夹具(`ok`/`eq`/`test`/`results` 与汇总打印)。生产侧真 importer = **0** —— '
+    + '它**只被 tests/** 消费**(21 个测试文件的公共 harness)。'
+    + '属「gate-only」家族:与 `server/src/content/baseline.ts` 同判据'
+    + '(门禁真消费它,生产不消费),**不是欠账**。'
+    + '⚠️ 但它与那几条有个关键区别:它住在 `shared/`,而 `shared/` 是**跨层契约目录**,'
+    + '客户端与服务端都能 import ⇒ **接线条件是「两侧都不该接」,不是「等谁接线」**。'
+    + '若哪天它被生产 import,那反而是缺陷(会把测试依赖拖进生产闭包),本表自检会报「已可达,应移出」。'],
 ]);
 
 /**
@@ -1366,7 +1388,24 @@ function findFileByName(name: string): string | null {
  */
 function checkReachability(): void {
   console.log('\n[生产可达性]');
-  const prodDirs = ['server/src', 'client/src'];
+  /* ⚠️⚠️ `shared` 必须在列 —— 这不是风格问题,是一个**曾经的真实覆盖空洞**。
+   *
+   * 2026-11-13 由 client-stage 发现、Lead 带对照实测确认:
+   *   往 `shared/types/` 放一个**零引用**文件 ⇒ 本行数字 **Δ0**,门禁毫无反应;
+   *   往 `server/src/net/` 放同样一个零引用文件 ⇒ 数字 **Δ1** 并报「新增未登记」。
+   * ⇒ 同一枚探针,两个方向,结果相反 —— `shared/**` 整个不在被检查的集合里。
+   *
+   * 为什么这个空洞在切分**之后**才第一次有后果:
+   *   CR-24 把 27 个协议符号搬到 `shared/types/wire.ts`、整个编解码器搬到
+   *   `shared/net/delta.ts`。**本仓最重要的跨层契约**由此落在两个审计门禁之外。
+   *   后果具体到一条:若哪天 `schema.ts` 不再 `export * from wire.ts`(回到两份实现),
+   *   `wire.ts` 会变成零引用 —— 而两个门禁**都不会报**。
+   *   ⇒ 巧合的是,**CR-20 要防的正是那个场景** ⇒ 门禁在这里结构上帮不上忙。
+   *
+   * 同族:陷阱 68「路径读文本不进依赖图」—— 两者都是
+   *   「有的东西做门禁的人**没想过它属于被检查的集合**」。
+   */
+  const prodDirs = ['server/src', 'client/src', 'shared'];
   const prodAll: string[] = [];
   for (const d of prodDirs) prodAll.push(...walk(join(ROOT, d), ['.ts']));
 
@@ -1506,6 +1545,9 @@ function checkReachability(): void {
     }
   }
   const reachableProd = prodAll.length - unreachableCount;
+  reachProdTotal = prodAll.length;
+  reachProdReachable = reachableProd;
+  reachDemoOnly = demoOnlyCount;
   const summary =
     `生产可达性:可达 ${reachableProd} / 不可达 ${unreachableCount} `
     + `(共 ${prodAll.length},入口 ${entries.length} 个,白名单 ${UNREACHABLE_EXEMPT.size} 条)`
@@ -3950,6 +3992,46 @@ async function checkIntegration(): Promise<void> {
     );
   } else {
     pass(`README 冻结层不变量计数与实测一致(${frozenActual})`);
+  }
+
+  /* ── README 的「生产可达性 A/B」与「demo 独有 N 个」──
+   *
+   * 这两行此前**都没有**门禁:可达性那行是我 2026-11-13 才接上的(见下),
+   * 而「demo 独有」更隐蔽 —— 门禁**算了它、也打印了它**,却从没拿它对过任何东西。
+   * 后果实测:`server/src/index.ts` 成为第 4 入口后(task-57),「demo 独有」
+   * 从 39 塌到 1,而 README 正文一直写着 39(56.5%)。**打印 ≠ 校验。**
+   * ⇒ 教训:一个数被打印出来,只证明它被计算过;不证明有人看着它。
+   */
+  const rpAll = [...readmeText.matchAll(/生产可达性\s+(\d+)\/(\d+)/g)];
+  if (reachProdTotal < 0) {
+    console.log('      · 本模式未运行可达性节,README 可达性计数未校验');
+  } else if (rpAll.length !== 1) {
+    fail(`README.md 里出现 ${rpAll.length} 处「生产可达性 A/B」—— 应恰好 1 处(防影子行)`);
+  } else if (Number(rpAll[0]![1]) !== reachProdReachable || Number(rpAll[0]![2]) !== reachProdTotal) {
+    fail(
+      `README 声称「生产可达性 ${rpAll[0]![1]}/${rpAll[0]![2]}」,实测 `
+        + `${reachProdReachable}/${reachProdTotal} —— 应更新 README`,
+    );
+  } else {
+    pass(`README 生产可达性与实测一致(${reachProdReachable}/${reachProdTotal})`);
+  }
+
+  const doAll = [...readmeText.matchAll(/demo 独有\s+(\d+)\s*个/g)];
+  if (reachDemoOnly < 0) {
+    console.log('      · 本模式未算出 demo 独有数,README 该项未校验');
+  } else if (doAll.length !== 1) {
+    /* ⚠ 这条会**在 README 引述历史值时误报** —— 本轮我就需要写「曾是 39 个」。
+       所以正文里若要提旧值,必须避开 `demo 独有 N 个` 这个字形(我改用「曾是『…39』」)。 */
+    fail(
+      `README.md 里出现 ${doAll.length} 处「demo 独有 N 个」—— 应恰好 1 处。`
+        + `若正文要引述历史值,请避开此字形(否则门禁无法区分"现状"与"引述")`,
+    );
+  } else if (Number(doAll[0]![1]) !== reachDemoOnly) {
+    fail(
+      `README 声称「demo 独有 ${doAll[0]![1]} 个」,实测 ${reachDemoOnly} 个 —— 应更新 README`,
+    );
+  } else {
+    pass(`README demo 独有数与实测一致(${reachDemoOnly} 个)`);
   }
 
   const backlogCounts = await countBacklog();
