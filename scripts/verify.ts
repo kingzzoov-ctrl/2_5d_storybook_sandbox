@@ -673,6 +673,33 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/build/grid.ts', 'WS-03 建造网格,待接入'],
   ['server/src/build/rooms.ts', 'WS-03 BFS 房间检测,待接入'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图,待客户端接线'],
+  /* ══════════════════════════════════════════════════════════════════════
+   * ⚠️ 为什么本表 22 条,而 `orphan-audit.ts` 只有 13 条?(差 9 条)
+   *
+   * 这里的「不可达」是**传递可达性**:从 `PROD_ENTRIES` 三个根做 import 闭包,
+   * 走不到即不可达。⇒ 一个模块**即使被生产代码 import**,只要那个 referrer
+   * 自己也到不了,它照样不可达。闭包是**传递**的。
+   *
+   * `orphan-audit.ts` 的「orphan」是**直接引用**:只要 `server/src` 或
+   * `client/src` 里有**任何人** import 它,就不算 orphan —— **不看 referrer
+   * 自己可不可达**。它不传递。
+   *
+   * ⇒ 差集里 **9/9 都是「有生产引用、但引用者自己在白名单里」**
+   *   (Lead 逐条核对过 referrer;`db/driver.sqlite.ts` 是特例:
+   *    生产 ref 0 个,唯一 importer 是 `verify.ts:2742` 的 `await import`)。
+   *
+   * ## 这个区别为什么值得写在这里
+   *
+   * 本仓实际发生过一次**误判**:把它解释成「`import type` 不产生运行时边,
+   * 所以 orphan 多算了」。那个解释**是错的**,而且**会误导修法**:
+   *   - 按「类型边」解释 ⇒ 以为把 `import type` 改成值导入就能消掉差异;
+   *   - 按「传递性」解释 ⇒ 那些 referrer 自己仍不可达,**改了也不消差**。
+   * 两种解释给出**完全相反的建议**。逐条实测后只有 1 条是纯类型边
+   * (`coop/rush_order.ts`),其余 8 条有真实值引用。
+   *
+   * ⇒ **两套清单都对,但判据不同,不应合并、不应互相「对齐」。**
+   *   改这里之前先确认你改的是**传递性判据**还是**直接引用判据**。
+   * ══════════════════════════════════════════════════════════════════════ */
   ['server/src/combat/damage.ts', 'WS-10 八步伤害公式 —— 生产走 vitals.ts 简化路径,待接线'],
   ['server/src/combat/progression.ts', 'WS-10 击杀结算,待接入'],
   ['server/src/combat/revive.ts', 'WS-10 复活/无敌,待接入'],
