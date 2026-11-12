@@ -1388,7 +1388,31 @@ export class WorldSim {
 
     /* 1 组装攻击方面板 —— 装备/等级 → CombatantStats(武器/护甲词条在此聚合)。 */
     const wearing = opts.wearing ?? this.wearingOf(playerId);
-    const level = Math.max(1, Math.trunc(opts.level ?? 1));
+    /* ⚠ `Math.trunc(NaN)` 仍是 `NaN`,`Math.max(1, NaN)` 也是 `NaN`
+     * (`Math.max` 遇 `NaN` 返回 `NaN`)⇒ 非数字等级会一路穿到 `levelMul`,
+     * 使 `finalDamage = NaN`,再经 `Math.max(MIN_DAMAGE, NaN)` 写进生物 HP ——
+     * **HP 被永久污染成 NaN,该生物此后永远打不死**(实测:再补一刀合法值也无效)。
+     * 与 `comboMul` 是同一类(自报标量未消毒),故同一处置。
+     *
+     * ## 这里**只**拒绝「不是数字」,不重复做上下界钳制
+     *
+     * 上下界(1 … MAX_LEVEL)已经由 `combatantStats` 内部
+     * `Math.max(1, Math.min(MAX_LEVEL, level))` 负责,而它对 `+Infinity`
+     * 和 `-Infinity` 都处理正确(`+Inf`→30、`-Inf`→1)。
+     * 我第一版在这里**又**夹了一次 `Math.min(MAX_LEVEL, …)` ——
+     * 那是同一个概念的第二份实现:注入实验 J13(删掉我这里那份)时
+     * **全部断言保持绿**,因为 `combatantStats` 那份顶着。
+     * 这正是本仓点名的缺陷形态(我自己在 task-44 的复活半径上刚踩过一次)。
+     * ⇒ 单一真相:钳制归 `combatantStats`,这里只兜它兜不住的 `NaN` 与非数字。
+     *
+     * 已用**等价变异体证明**记录在案(不硬造断言):把 `Math.max(1, Math.min(30, …))`
+     * 加回来,对 27 个输入(含 `±Infinity` / `NaN` / `1e308` / 非数字 / `null` /
+     * 小数)经 `combatantStats` 后 `level` **逐个相同,差异 0 处** ——
+     * 即在当前位置它是**惰性**的。这类变异体保持绿是正确的,不是断言没牙。 */
+    const rawLevel: unknown = opts.level;
+    const level = typeof rawLevel === 'number' && !Number.isNaN(rawLevel)
+      ? Math.trunc(rawLevel)
+      : 1;
     const attacker = combatantStats(level, [...wearing]);
     const weaponId = opts.weaponId ?? attacker.flags.weaponId;
     const weapon = weaponId > 0 ? weaponById(weaponId) : null;

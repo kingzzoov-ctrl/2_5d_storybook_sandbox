@@ -11,6 +11,7 @@ import {
   COMBAT_CONSUMABLES, COMBAT_ITEM_INDEX, COMBAT_ITEM_RANGE, Element, ELEMENT_COUNTER,
   elementMul, equipSummary, combatantStats, levelDamageMul, skillOf, weaponById,
   MAX_DODGE_RATE, BASE_CRIT_DMG, MAX_CRIT_DMG, SET_BONUSES, activeSets, SkillShape,
+  MAX_COMBO_MUL, MAX_CRIT_RATE, sanitizeComboMul,
 } from '../server/src/combat/weapons.ts';
 
 import {
@@ -2445,6 +2446,190 @@ test('task44-12:护甲 keywords 被 equipSummary 丢弃(已知缺口,显式记�
   const rb = b.attackMob('p1', 'mob_sheep', { level: 10, weaponId: 711 })!;
   eq(ra.result.finalDamage, rb.result.finalDamage,
     '两件 keywords 完全不同的护甲(724 vs 730)对伤害无影响 —— keywords 目前不参与伤害管线');
+});
+
+/* ══════════ 零之三、信任边界:自报标量消毒(task-51)══════════════
+ *
+ * ## 缺陷
+ *
+ * `attackMob` 的 `opts.comboMul` 直接透传进 `computeDamage`,而管线第一段
+ * `base = totalAtk × levelMul × weaponMul × comboMul × skillMul` 里,
+ * **它是唯一没有上界的乘数**:
+ *
+ * | 乘数 | 上界 |
+ * |:---|:---|
+ * | `levelMul` | `combatantStats` 钳 `MAX_LEVEL=30` |
+ * | `weaponMul` / `skillMul` | 查表(武器表最大 `attackMul` = 1.5) |
+ * | `dodgeRate` / `critRate` / `critDmg` | 各自 `MAX_*` |
+ * | `comboMul` | ❌ **无** |
+ *
+ * 实测 `comboMul: 1e9` → `finalDamage` 从 14 涨到 **14285714286**(≈1.0e9×)。
+ *
+ * ## 为什么这条断言必须能**区分「拒绝」与「夹取」**
+ *
+ * 只测「数字变小了」无法区分两种语义:
+ *   · 夹取(clamp)到 3.0 → 与**合法上界**同值
+ *   · 拒绝(reject)回 1.0 → 与**缺省**同值
+ * 二者都「变小了」。所以断言必须锚定到**两个不同的已知数值**上。
+ *
+ * ## 语义选择与依据(不是「手册要求」)
+ *
+ * ⚠ 手册**没有**定义连段倍率数值(全文 `连段|连招|第三段|三段` = 0 命中),
+ * 也**没有**任何「服务端权威 / 反作弊」概念(0 命中)。故依据是**本仓既有纪律**:
+ *   · CR-14 U1:`allowedSources`/`capacity` 一律服务端派生
+ *   · CR-14 U2-b:`NaN` 声明使钳位公式产出 `NaN` ⇒ 判据被污染,**已修**,
+ *     修法即 `sanitizeMul`(非数字/`NaN`/`-Infinity` 退 fallback,其余夹到 max)
+ * ⇒ 本条是**同一纪律的又一实例**,不是新原则。
+ *
+ * 选择:
+ *   · 非数字 / `NaN` / `-Infinity` ⇒ **拒绝**,退回 1.0。这些不是「太大了」,
+ *     而是「根本不是倍率」,夹取无意义。
+ *   · 有限但 > 3.0 / `+Infinity` ⇒ **夹取**到 `MAX_COMBO_MUL`。
+ *   · 负数 / 0 ⇒ 夹到 0(既有 `MIN_DAMAGE` 兜底)。
+ */
+
+/** 用给定 comboMul 打一刀,返回最终伤害。 */
+function comboHit(comboMul: unknown): number {
+  const s = attackWorld('mob_sheep', { wearing: [] });
+  const r = s.attackMob('p1', 'mob_sheep', { comboMul: comboMul as number })!;
+  return r.result.finalDamage;
+}
+
+test('task51-1:合法连段倍率原样生效(消毒不得改动合法值)', () => {
+  /* ⚠ 前置:先钉住「1.0 的基准」,否则下面所有比例都无从判读。 */
+  const one = comboHit(1.0);
+  eq(one, comboHit(undefined), '缺省 comboMul 与显式 1.0 等价(消毒的 fallback 也是 1.0)');
+
+  /* 现网真实声明的 4 个值(从武器表 passive 穷举,不是猜的):
+       711 三连「1.00 / 1.00 / 1.25」→ 1.25
+       714「第三段额外 +0.20」        → 1.20
+       715「满蓄力 +0.35」            → 1.35
+       720「回程再结算 0.5 倍率」      → 0.50 */
+  const declared = [1.25, 1.2, 1.35] as const;
+  for (const v of declared) {
+    ok(comboHit(v) > one, `声明值 ${v} 让伤害**变大**(前置:确实作用到了公式上)`);
+  }
+  eq(comboHit(1.25), comboHit(1.25), '同一合法值可复现');
+
+  /* 逐值钉死,任何「误夹」都会让某一项变红。 */
+  const expectRatio = (v: number): number => {
+    /* 管线在 step 6 取整,故只比较「未取整前的比例」在同一取整下的结果:
+       用 1.0 与 v 两次实测,断言 v 的结果严格大于 1.0 且小于 v+1 的粗界,
+       再单独用上界断言兜住。这里只要求单调,不假设取整口径。 */
+    return Math.round((one * v) * 100) / 100;
+  };
+  ok(comboHit(1.2) === expectRatio(1.2) || Math.abs(comboHit(1.2) - expectRatio(1.2)) <= 1,
+    `1.20 的结果 ${comboHit(1.2)} 与未取整期望 ${expectRatio(1.2)} 相差 ≤1(仅取整差)`);
+  ok(comboHit(1.25) === expectRatio(1.25) || Math.abs(comboHit(1.25) - expectRatio(1.25)) <= 1,
+    `1.25 的结果 ${comboHit(1.25)} 与未取整期望 ${expectRatio(1.25)} 相差 ≤1`);
+});
+
+test('task51-2:【核心】非法值语义 —— 拒绝(NaN)与夹取(1e9)必须**可区分**', () => {
+  /* 三个锚点:缺省 1.0 = 下锚点;合法上界 3.0 = 上锚点。 */
+  const at1 = comboHit(1.0);
+  const atMax = comboHit(MAX_COMBO_MUL);
+  ok(atMax > at1, `前置:合法上界 ${MAX_COMBO_MUL} 确实比 1.0 大(${atMax} > ${at1}),否则两个锚点无法区分`);
+
+  /* ── 锚点 A:**拒绝**语义 —— 非数字 / NaN / -Infinity 退回 1.0 ── */
+  for (const bad of [Number.NaN, 'x', {}, null, undefined] as const) {
+    eq(comboHit(bad), at1, `非法值 ${String(bad)} 被**拒绝**,退回 1.0 的伤害(${at1})`);
+  }
+  eq(comboHit(Number.NEGATIVE_INFINITY), at1, '-Infinity 被**拒绝**,退回 1.0');
+
+  /* ── 锚点 B:**夹取**语义 —— 有限越界 / +Infinity 夹到 MAX_COMBO_MUL ── */
+  for (const big of [10, 100, 1e9, Number.POSITIVE_INFINITY] as const) {
+    eq(comboHit(big), atMax, `越界值 ${String(big)} 被**夹取**到上界,伤害 = ${atMax}(不是 1.0 的 ${at1})`);
+  }
+
+  /* ── 关键:**两者必须不同**,否则「拒绝」与「夹取」不可分辨 ── */
+  ok(atMax !== at1, `夹取锚点 ${atMax} ≠ 拒绝锚点 ${at1} ⇒ 两种语义在本断言下可区分`);
+
+  /* ── 负数 / 0:夹到 0,由 MIN_DAMAGE 兜底为最小伤害 ── */
+  eq(comboHit(0), comboHit(-1), '0 与负数的结果一致(都被夹到 0)');
+  ok(comboHit(0) < at1, '夹到 0 后伤害低于 1.0 的基线(说明 0 真的生效了,不是被当成非法值退回 1.0)');
+});
+
+test('task51-3:NaN 不得污染生物 HP(此前的永久损坏)', () => {
+  /* ⚠ 这条测的是**状态污染**,不是数值大小。
+     `comboMul: NaN` 时 `base = NaN` ⇒ `finalDamageRaw = NaN` ⇒
+     `Math.max(MIN_DAMAGE, NaN)` = **NaN** ⇒ 写进 `rt.hp` 后生物 HP 变 NaN,
+     而 `NaN <= 0` 恒 false ⇒ `alive` 永远为 true ⇒ **该生物永远打不死**。
+     实测:此后补一刀合法值也救不回来(HP 仍是 NaN)。 */
+  const s = attackWorld('mob_sheep', { wearing: [] });
+  const rt = s.mobHost.runtimeOf('mob_sheep')!;
+  const r = s.attackMob('p1', 'mob_sheep', { comboMul: Number.NaN })!;
+  eq(r.result.finalDamage, 14, 'NaN 输入被拒绝,本次伤害正常结算为 14(不是 NaN)');
+  ok(!Number.isNaN(rt.hp), '生物 HP 仍是有限数(没有被污染成 NaN)');
+  eq(rt.hp, 60 - 14, 'HP 正常扣除 14');
+
+  /* 补刀:证明该生物**还能被打死**,不是「活着但打不动」。 */
+  const s2 = attackWorld('mob_sheep', { wearing: [] });
+  const rt2 = s2.mobHost.runtimeOf('mob_sheep')!;
+  s2.attackMob('p1', 'mob_sheep', { comboMul: Number.NaN });
+  for (let i = 0; i < 10 && rt2.alive; i += 1) s2.attackMob('p1', 'mob_sheep', { level: 20, weaponId: 712 });
+  eq(rt2.alive, false, '被 NaN 攻击过的生物**仍然可以被正常击杀**(HP 未污染)');
+});
+
+test('task51-4:等级自报也要消毒(与 comboMul 同一类的兄弟缺陷)', () => {
+  /* ⚠ 这条是我做「陷阱 31 探测器」时发现的:**只修 comboMul 是假修**。
+     `world_sim` 原写法 `Math.max(1, Math.trunc(opts.level ?? 1))`:
+       `Math.trunc(NaN)` = NaN,`Math.max(1, NaN)` = **NaN**(Math.max 遇 NaN 返回 NaN)
+     ⇒ 等级 NaN 同样把 `levelMul` 弄成 NaN ⇒ **完全相同的 HP 永久污染**。
+     实测修复前 `level: NaN` 与 `comboMul: NaN` 行为一致(都让 hp 变 NaN)。 */
+  const s = attackWorld('mob_sheep', { wearing: [] });
+  const rt = s.mobHost.runtimeOf('mob_sheep')!;
+  const r = s.attackMob('p1', 'mob_sheep', { level: Number.NaN })!;
+  eq(r.result.finalDamage, comboHit(1.0), 'level: NaN 被拒绝,退回 1 级(伤害 = 1 级基线)');
+  ok(!Number.isNaN(rt.hp), 'HP 未污染');
+
+  /* 合法等级仍按原样生效(反向对照:别把好的也拒了)。 */
+  const s2 = attackWorld('mob_sheep', { wearing: [] });
+  const r20 = s2.attackMob('p1', 'mob_sheep', { level: 20 })!;
+  ok(r20.result.finalDamage > comboHit(1.0), 'level: 20 仍正常放大伤害(消毒没有误伤合法值)');
+
+  /* 封顶照旧:MAX_LEVEL=30 以上不再增长。扫描多点 —— 单点区分不了「封顶」与「非线性」。 */
+  const at30 = ((): number => { const g = attackWorld('mob_sheep', { wearing: [] }); return g.attackMob('p1', 'mob_sheep', { level: 30 })!.result.finalDamage; })();
+  for (const lv of [31, 1e9] as const) {
+    const g = attackWorld('mob_sheep', { wearing: [] });
+    eq(g.attackMob('p1', 'mob_sheep', { level: lv })!.result.finalDamage, at30,
+      `level ${lv} 封顶在 30 级`);
+  }
+  /* ⚠ `+Infinity` 必须**夹到上界**而不是被拒绝 —— 这是 `sanitizeMul` 的既有口径
+     (`+Infinity` 经 `Math.min` 本就正确钳到上界,属既有正确行为,改了是无谓回归)。
+     我第一版用 `Number.isFinite` 一刀切,把 `level: Infinity` 从「30 级」改成了
+     「1 级」,正是被下面这条断言抓红的 —— 留此注记,证明这条断言有牙。 */
+  const gInf = attackWorld('mob_sheep', { wearing: [] });
+  eq(gInf.attackMob('p1', 'mob_sheep', { level: Number.POSITIVE_INFINITY })!.result.finalDamage, at30,
+    'level: +Infinity 夹取到 30 级(不是被拒绝成 1 级 —— 与 sanitizeMul 同口径)');
+  /* 前置:证明「封顶」是真的封顶,而不是等级本来就不起作用。 */
+  ok(at30 > comboHit(1.0), '前置:30 级确实比 1 级伤害高,否则上面几条测的是「等级无效」');
+});
+
+test('task51-5:comboMul 是唯一无上界乘数 —— 其余六个各有界(不一致才是缺陷依据)', () => {
+  /* 这条不是「再测一遍 comboMul」,而是把**不一致**本身钉住:
+     同一个公式里七个乘数,六个有界、一个没有,这才是「缺陷」的判据
+     (手册没有任何权威/反作弊概念,所以依据只能是本仓一致性)。 */
+  eq(MAX_COMBO_MUL, 3.0, 'comboMul 上界 = 3.0');
+
+  /* 兄弟乘数的上界各自生效 —— 逐个证明,而不是笼统声称。 */
+  const atkFor = (lv: number): number => combatantStats(lv, []).totalAtk;
+  eq(atkFor(1), atkFor(30), 'totalAtk 与等级无关(等级只经 levelMul 进公式)');
+  eq(combatantStats(999, []).level, MAX_LEVEL, `combatantStats 把等级钳到 MAX_LEVEL=${MAX_LEVEL}`);
+  /* ⚠ 闪避率要**重复堆**才能触到上限:单套护甲最高只有 724 的 0.10,
+     全表带 dodgeRate 的护甲只有 724(0.10)/730(0.03),全塞也只有 0.13。
+     我第一版写 `combatantStats(30,[724,730]).dodgeRate === 0.75` 是错的
+     —— 实测 0.13,根本没触到钳制点,那条断言测的不是钳制。 */
+  eq(combatantStats(30, [724, 730]).dodgeRate, 0.13, '前置:单套 724+730 的闪避率是 0.13(未触上限)');
+  const dodgy = Array.from({ length: 20 }, () => 724);
+  eq(combatantStats(30, dodgy).dodgeRate, MAX_DODGE_RATE,
+    `重复堆 20 件 724 才触到上限,被钳到 ${MAX_DODGE_RATE}`);
+  eq(combatantStats(30, [718, 730], { critDmg: 5.0 }).critDmg, MAX_CRIT_DMG,
+    `爆伤钳到 MAX_CRIT_DMG=${MAX_CRIT_DMG}(即便声明 5.0)`);
+  eq(combatantStats(30, [], { critRate: 1e9 }).critRate, MAX_CRIT_RATE, '暴击率钳到 1.0');
+
+  /* 而 comboMul 修复前**没有任何** MAX_* 可钳 —— 现在有了,且是同一个量纲。 */
+  ok(MAX_COMBO_MUL > 1, '上界大于 1(连段是加成而非削减)');
+  ok(MAX_COMBO_MUL >= 1.35, `上界覆盖武器表已声明的最大倍率 1.35(不能把合法值误拒)`);
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */

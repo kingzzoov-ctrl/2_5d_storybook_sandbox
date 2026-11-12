@@ -42,9 +42,9 @@
  */
 
 import { test, ok, eq, near, includes, inRange, report } from '../shared/testing/harness.ts';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import {
   CONTENT_FINGERPRINT_VERSION,
@@ -1189,6 +1189,308 @@ test('C05 被测模块只从 shared/** 读取内容,不反向写入(源码级检
   /* registry.ts 现在还应从冻结层 types 读 ItemCategory 作权威类别清单。 */
   const reg = readFileSync(join(ROOT, 'server/src/content/registry.ts'), 'utf8');
   ok(reg.includes('ItemCategory'), 'registry.ts 应引用冻结层 ItemCategory');
+});
+
+/* ═══════ task-43:content/** 三模块的**归属判定**固化为断言 ═══════
+
+ * 这三个模块的白名单理由原写「待接入」—— 暗示它们是**欠账**。
+ * 实测它们的引用者分四类,而「待接入」这个说法**混淆了两件不同的事**:
+ *   - `registry.ts` 被 `baseline.ts` / `handshake.ts` 引用,而那两个自己也不可达
+ *     ⇒ 「被一个也不可达的模块引用」**不等于**「已接」;
+ *   - `baseline.ts` 只被 `scripts/**` 引用 ⇒ 它是 **gate-only**,不是欠账;
+ *   - `handshake.ts` 只被测试引用,且它等的**客户端网络层不存在**。
+
+ * ⇒ 下面把「引用者是谁」和「引用者自己可不可达」两件事**分别**钉住,
+ *   因为只测前者正是本仓出现过的误判(`orphan-audit` 只认 `server/src`+`client/src`,
+ *   于是 gate-only 模块被误报成 orphan)。
+ */
+
+/* ── task-43 的测量工具:一个**代码态**相对导入提取器 + 可达性闭包 ──
+ *
+ * ⚠️ 为什么不写死引用者名单:第一版我写的是
+ *   `const refs = [{ file: 'server/src/content/baseline.ts', reachable: false }, ...]`
+ * —— 那是**拿我写的字面量对我自己**,永远绿,不具任何分辨力(本仓称「同义反复」)。
+ * ⇒ 改为**从源码实算**,并在下面用已知答案的样本自证提取器有效。
+ */
+function codeState(text: string): string {
+  let out = '';
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i] as string;
+    if (c === '/' && text[i + 1] === '*') { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; out += ' '; continue; }
+    if (c === '/' && text[i + 1] === '/') { const e = text.indexOf('\n', i); i = e < 0 ? n : e; out += ' '; continue; }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c; i += 1;
+      while (i < n) { if (text[i] === '\\') { i += 2; continue; } if (text[i] === q) { i += 1; break; } i += 1; }
+      out += '""'; continue;
+    }
+    out += c; i += 1;
+  }
+  return out;
+}
+
+/** 剥掉**注释**但保留字符串内容 —— 用于按路径/标识符匹配。
+ *
+ * ⚠️ 为什么不能用上面那个 `codeState`:`codeState` 把字符串**内容**也抹成 `""`,
+ * 于是 `'./x.ts'` 这个路径本身消失了 —— 我的 `importersOf` 第一版正是这样
+ * 全数报 0(**被自证步骤当场抓住**,否则会得出一份全错的判定表)。
+ * ⇒ 两个函数职责不同:判「是不是代码」用 `codeState`,找「路径/名字」用这个。 */
+function stripCommentsOnly(text: string): string {
+  let out = '';
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i] as string;
+    if (c === '/' && text[i + 1] === '*') { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; out += ' '; continue; }
+    if (c === '/' && text[i + 1] === '/') { const e = text.indexOf('\n', i); i = e < 0 ? n : e; out += ' '; continue; }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c; out += c; i += 1;
+      while (i < n) {
+        if (text[i] === '\\') { out += text[i] ?? ''; out += text[i + 1] ?? ''; i += 2; continue; }
+        out += text[i] ?? ''; if (text[i] === q) { i += 1; break; } i += 1;
+      }
+      continue;
+    }
+    out += c; i += 1;
+  }
+  return out;
+}
+
+/** 该文件**代码态**下 import 的所有相对路径(含裸 import 与 re-export)。 */
+function relImportsOf(rel: string): string[] {
+  const cs = stripCommentsOnly(readFileSync(join(ROOT, rel), 'utf8'));
+  const out: string[] = [];
+  for (const m of cs.matchAll(/(?:from|import)\s*\(?\s*["'](\.[^"']*)["']/g)) out.push(m[1] as string);
+  return out;
+}
+
+/** 收集全仓 .ts 文件(相对 posix 路径)。 */
+function allTs(): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    if (!existsSync(d)) return;
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.ts')) out.push(relative(ROOT, p).replace(/\\/g, '/'));
+    }
+  };
+  for (const d of ['server', 'client', 'shared', 'tests', 'scripts']) walk(join(ROOT, d));
+  return out.filter((f) => !f.startsWith('_bw'));
+}
+
+/** 从入口集合做**传递**可达闭包(与 verify.ts 的 reachableClosure 同语义)。 */
+function closure(entries: string[]): Set<string> {
+  const seen = new Set<string>();
+  const stack = entries.filter((e) => existsSync(join(ROOT, e)));
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const dir = dirname(cur);
+    for (const spec of relImportsOf(cur)) {
+      for (const cand of [`${spec}.ts`, spec, `${spec}/index.ts`]) {
+        const norm = relative(ROOT, join(ROOT, dir === '.' ? '' : dir, cand)).replace(/\\/g, '/');
+        if (existsSync(join(ROOT, norm)) && !seen.has(norm)) { stack.push(norm); break; }
+      }
+    }
+  }
+  return seen;
+}
+
+const T43_FILES = allTs();
+/** 谁(在给定目录前缀内)import 了 target —— **代码态**统计,注释不算。 */
+function importersOf(target: string, prefixes: string[]): string[] {
+  const short = target.slice(target.lastIndexOf('/') + 1);
+  const re = new RegExp(`${short.replace('.', '\\.')}["']`);
+  return T43_FILES.filter((f) => f !== target
+    && prefixes.some((p) => f.startsWith(p))
+    && re.test(stripCommentsOnly(readFileSync(join(ROOT, f), 'utf8'))));
+}
+
+test('FND1-T43-1 registry.ts 的生产引用者**自己也不可达** ⇒ 它没有生产路径,不算「已接」', () => {
+  /* ⚠️ 先自证测量工具有效(本仓陷阱 25 的推广:探针必须自证,不只注入)。 */
+  const selfRefs = importersOf('server/src/build/grid.ts', ['server/src/']);
+  ok(selfRefs.length >= 3, `探针自证:build/grid.ts 应有 ≥3 个生产引用者(实测 ${selfRefs.length};若为 0 说明提取器坏了)`);
+  /* 已知语义样本:闭包必然含入口自身。 */
+  const sanity = closure(['server/src/sim/demo.ts']);
+  ok(sanity.has('server/src/sim/demo.ts'), '探针自证:闭包应含入口自身');
+
+  const reach = closure(['server/src/sim/demo.ts', 'server/src/net/room.colyseus.ts', 'client/src/main.ts']);
+  const prodImporters = importersOf('server/src/content/registry.ts', ['server/src/', 'client/src/']);
+
+  /* 事实 1:确实有生产侧模块 import 它(所以不是「零引用」的死代码)。 */
+  ok(prodImporters.length >= 1, `registry.ts 应至少有 1 个生产侧引用者(实测 ${prodImporters.length})`);
+  /* 事实 2 —— **本任务的关键判定**:那些引用者没有一个可达。 */
+  const reachableImporters = prodImporters.filter((f) => reach.has(f));
+  eq(reachableImporters.length, 0,
+    'registry.ts 的生产引用者应**全部不可达** ⇒ 「被一个也不可达的模块引用」不等于「已接」'
+    + `(实测可达的引用者:${reachableImporters.join(', ') || '无'})`);
+  /* 事实 3:它自己也不可达,所以在白名单里 —— 且**不**因「有生产引用」被放行。 */
+  ok(!reach.has('server/src/content/registry.ts'), 'registry.ts 自身应不可达');
+  const verifySrc = readFileSync(join(ROOT, 'scripts/verify.ts'), 'utf8');
+  ok(verifySrc.includes("'server/src/content/registry.ts'"), 'registry.ts 应在可达性白名单里');
+  /* 它属于「差集」那一类:有生产引用但引用者不可达(与 training 白名单条目不同)。 */
+  ok(importersOf('server/src/content/registry.ts', ['server/src/', 'client/src/']).length > 0
+    && reachableImporters.length === 0,
+  'registry.ts 属「有生产引用但引用者不可达」这一类(差集),而非「零引用」');
+});
+
+test('FND1-T43-2 baseline.ts 是 gate-only:生产侧引用者为 0,但被门禁与测试真实使用', () => {
+  /* 归属判据:它在 `server/src`/`client/src` 里**零**引用者 ⇒ 不是生产欠账;
+     但它在 `scripts/**` 与 `tests/**` 里被真实引用 ⇒ 也不是死代码。
+     ⇒ 唯一正确的类别是 **gate-only**(独立类别,不并入生产侧)。 */
+  const prodImporters = importersOf('server/src/content/baseline.ts', ['server/src/', 'client/src/']);
+  eq(prodImporters.length, 0,
+    `baseline.ts 在生产侧应零引用者(gate-only 的判据;实测 ${prodImporters.join(', ')})`);
+
+  const gateImporters = importersOf('server/src/content/baseline.ts', ['scripts/']);
+  const testImporters = importersOf('server/src/content/baseline.ts', ['tests/']);
+  ok(gateImporters.length >= 1, `baseline.ts 应被 scripts/** 真实引用(实测 ${gateImporters.join(', ')})`);
+  ok(testImporters.length >= 1, `baseline.ts 应被 tests/** 真实引用(实测 ${testImporters.join(', ')})`);
+
+  /* ⚠️ 关键:门禁的**动态** `await import()` 也要算进去 —— 否则会误判为「只在测试里」。
+     `verify.ts` 用的是 `await import('../server/src/content/baseline.ts')`,
+     静态 `from` 扫不到。这里显式验证两种形态都存在。 */
+  const verifySrc = readFileSync(join(ROOT, 'scripts/verify.ts'), 'utf8');
+  const dyn = /import\(\s*['"][^'"]*content\/baseline\.ts['"]\s*\)/.test(verifySrc);
+  ok(dyn, 'verify.ts 以**动态 import()** 引用 baseline.ts(静态扫描会漏掉这类引用)');
+  const lockSrc = readFileSync(join(ROOT, 'scripts', 'content-lock.ts'), 'utf8');
+  ok(/from\s+['"][^'"]*content\/baseline\.ts['"]/.test(lockSrc),
+    'content-lock.ts 以**静态 import** 引用 baseline.ts(与上一条合并覆盖两种形态)');
+});
+
+test('FND1-T43-4 registry.ts 的**运行时能力**在生产无人消费(能力级判据)', () => {
+  /* 三条事实合并出的结论:registry.ts 的三类能力运行时消费者为 0 ——
+     (a) 内容指纹 (b) 容量报告 (c) 内容审计。它们的消费者全在门禁/测试。
+     这里用**代码态**统计,避免注释里的名字被误当成消费(实测 raid.ts:345
+     曾让 contentFingerprints 看似「有生产引用」,实际那是一行文档注释)。 */
+  const FACT = ['contentFingerprints', 'contentCapacity', 'auditContent', 'capacityReport'];
+  const REG = 'server/src/content/registry.ts';
+  const reach = closure(['server/src/sim/demo.ts', 'server/src/net/room.colyseus.ts', 'client/src/main.ts']);
+  /* ⚠️ 必须**排除定义模块自身** —— 注入实测抓出的缺陷:
+     若 registry.ts 因为别的原因进了闭包(例如 demo → baseline → registry),
+     它自己**定义**这些名字,于是被算成「消费了自己的导出」,假红。
+     ⇒ 「无人消费」的判据只对**外部**消费者成立。 */
+  const consumedInReach: string[] = [];
+  for (const f of [...reach]) {
+    if (f === REG) continue;
+    const cs = codeState(readFileSync(join(ROOT, f), 'utf8'));
+    for (const fn of FACT) if (new RegExp(`\\b${fn}\\b`).test(cs)) consumedInReach.push(`${f}:${fn}`);
+  }
+  eq(consumedInReach.length, 0,
+    `registry.ts 的运行时能力不应被可达闭包内任何**外部**文件消费(实测:${consumedInReach.join(', ') || '无'})`);
+
+  /* 反面证据(证明它们**不是**死代码):门禁确实在用。 */
+  const lockSrc = readFileSync(join(ROOT, 'scripts', 'content-lock.ts'), 'utf8');
+  ok(/contentFingerprints|auditContent/.test(stripCommentsOnly(lockSrc)),
+    'content-lock.ts 真实消费 registry 的指纹/审计能力(证明不是死代码)');
+
+  /* 并钉住「注释里的命中不算消费」这个反例本身,防止将来有人把统计退化成 grep。 */
+  const raidSrc = readFileSync(join(ROOT, 'server/src/bosses/raid.ts'), 'utf8');
+  ok(raidSrc.includes('contentFingerprints'), 'raid.ts 原文**出现**过该名字(注释里)');
+  ok(!/\bcontentFingerprints\b/.test(codeState(raidSrc)),
+    '但 raid.ts 的**代码态**不含它 ⇒ 那是文档注释,不是消费(grep 会误判此处)');
+});
+
+test('FND1-T43-5 可达性是**传递**的:接上 baseline 会连带让 registry 也可达', () => {
+  /* 这条把 T43-1 与 T43-2 的**耦合**钉住 —— 注入 I2 实测:
+     给 demo 加一行 `import baseline.ts`,红的**不止** T43-2,还有 T43-1 与 T43-4,
+     因为 `baseline.ts` 自己 import `registry.ts`(demo → baseline → registry)。
+     ⇒ 这正是「不等号」存在的原因:一个模块的「已接」与否,取决于整条链,
+       而不是它的**直接**引用者有几个。若有人把可达性改成只看直接引用,
+       这里的断言会红。 */
+  const regSrc = readFileSync(join(ROOT, 'server/src/content/registry.ts'), 'utf8');
+  ok(regSrc.length > 0, 'registry.ts 可读');
+  const baseImports = relImportsOf('server/src/content/baseline.ts');
+  ok(baseImports.some((s) => s.includes('registry.ts')),
+    `baseline.ts 应 import registry.ts ⇒ 存在传递边 demo→baseline→registry(实测:${baseImports.join(', ')})`);
+  const hsImports = relImportsOf('server/src/content/handshake.ts');
+  ok(hsImports.some((s) => s.includes('registry.ts')),
+    `handshake.ts 也应 import registry.ts(第二条传递边;实测:${hsImports.join(', ')})`);
+});
+
+test('FND1-T43-3 content/handshake.ts 的三条阻塞**已被 task-37 钉住**,此处只钉归属', () => {
+  /* ⚠️ 我原本在这里**重写**了三条阻塞断言,后来发现
+     `tests/WS-FND-03.test.ts:263-306` 的 task-37 段落**已经**逐条钉住了它们
+     (room.ts 不提 contentClaim / DEFAULT_CONTENT_POLICY 为 STRICT /
+     客户端零网络能力 / delta.ts 也不校验)。
+     ⇒ 重复断言会让同一事实有两份维护点,且主题错位(handshake 属 WS-FND-03)。
+     这里只保留「归属判定」这一层,**不重复那三条**。 */
+  const fnd03 = readFileSync(join(ROOT, 'tests', 'WS-FND-03.test.ts'), 'utf8');
+  ok(
+    fnd03.includes('task-37') && fnd03.includes('contentClaim') && fnd03.includes('DEFAULT_CONTENT_POLICY'),
+    '三条阻塞应仍由 WS-FND-03 的 task-37 段落守住(若被删,这里会红)',
+  );
+
+  /* 「等 X」与「待接入」的区别:handshake 的白名单理由必须**指名阻塞物**,
+     不能只说「待接入」—— 后者暗示「有明确接线点只差一行」,而实测它等的是
+     **不存在的客户端网络层**。两条理由的处置成本差一个数量级。 */
+  const verifySrc = readFileSync(join(ROOT, 'scripts', 'verify.ts'), 'utf8');
+  const m = /'server\/src\/content\/handshake\.ts',\s*'([^']*)'/.exec(verifySrc);
+  ok(m !== null, 'verify.ts 白名单应有 handshake.ts 条目');
+  const reason = m?.[1] ?? '';
+  ok(reason.length > 0, `handshake.ts 的白名单理由非空(实测:«${reason}»)`);
+});
+
+test('FND1-T43-6 gate-only 是可判定的独立类别:判据必须区分「登记」与「真消费」', () => {
+  /* ⚠️ 这里钉住我在本任务中**犯过并自查出**的一个判据错误。
+     我的第一版把 `scripts/verify.ts` / `scripts/orphan-audit.ts` 里的
+     **白名单登记条目**(字符串)也算成了「引用」——那会得出「10/14 是 gate-only」
+     的**虚高**结论,进而建议把一批**真欠账**改归 gate-only ⇒ 白名单被洗白。
+
+     「登记」是**证据**(门禁说它不可达);「真 import」是**消费**(门禁在用它)。
+     ⇒ gate-only 的判据只能建立在**真 import** 上。 */
+  const BASELINE = 'server/src/content/baseline.ts';
+  const cs = (f: string): string => stripCommentsOnly(readFileSync(join(ROOT, f), 'utf8'));
+
+  /* 真消费:静态 `from` 或动态 `import()` —— 两者都要算,缺一即漏。 */
+  const lockSrc = cs('scripts/content-lock.ts');
+  const drillSrc = cs('scripts/extension-drill.ts');
+  ok(/from\s+["'][^"']*content\/baseline\.ts["']/.test(lockSrc),
+    'content-lock.ts 以**静态 from** 真消费 baseline.ts');
+
+  /* 反面:orphan-audit.ts 里的出现是**登记**,不是消费。 */
+  const oaSrc = cs('scripts/orphan-audit.ts');
+  ok(oaSrc.includes('content/baseline.ts'), 'orphan-audit.ts 里**出现**过该路径(登记条目)');
+  ok(!/(?:from|import)\s*\(?\s*["'][^"']*content\/baseline\.ts["']/.test(oaSrc),
+    '但 orphan-audit.ts **不是**在 import 它 ⇒ 那是登记,不是消费(判据必须剔除这一种)');
+
+  /* 动态 import 也是真消费 —— verify.ts 用 `await import(...)` 加载并真的跑它。
+     ⚠️ 必须**排除 `typeof import(...)`** —— 那是**类型查询**,不产生运行时边,
+     任务书明确说「`import type` 引用不算运行时依赖」。
+     这个缺陷是被注入 I4 的**生效自检**当场抓出的:我的正则原本会被
+     `verify.ts:3644` 的 `let mod: typeof import('../.../baseline.ts');` 满足,
+     于是即使把真 import 改成字符串,断言仍然绿 ⇒ 报「真消费」而实际只剩类型引用。 */
+  const vsCs = cs('scripts/verify.ts');
+  /** 一处 import() **不是** typeof 类型查询 ⇒ 算真消费。 */
+  const isRealDynImport = (text: string): boolean =>
+    [...text.matchAll(/import\(\s*["'][^"']*content\/baseline\.ts["']\s*\)/g)]
+      .some((m) => !/typeof\s+$/.test(text.slice(Math.max(0, (m.index ?? 0) - 10), m.index ?? 0)));
+  ok(isRealDynImport(vsCs),
+    'verify.ts 以**动态 import()** 真消费 baseline.ts,且不是 typeof 类型查询');
+  /* 并存:同一文件里**也有**一个 type-only 形态 —— 钉住它不算数。 */
+  ok(/typeof\s+import\(\s*["'][^"']*content\/baseline\.ts["']\s*\)/.test(vsCs),
+    'verify.ts 里确实存在 `typeof import(...)` 类型查询(它**不**算运行时消费)');
+
+  /* 结论:baseline.ts 的生产侧真 importer 数为 0,门禁侧真 importer 数 ≥2。 */
+  const prodImporters = importersOf(BASELINE, ['server/src/', 'client/src/']);
+  eq(prodImporters.length, 0, 'baseline.ts 生产侧真 importer 应为 0');
+  const gateReal = ['scripts/content-lock.ts', 'scripts/extension-drill.ts', 'scripts/verify.ts']
+    .filter((f) => f === 'scripts/verify.ts'
+      ? isRealDynImport(cs(f))
+      : /from\s+["'][^"']*content\/baseline\.ts["']/.test(cs(f)));
+  ok(gateReal.length >= 2, `baseline.ts 门禁侧真 importer 应 ≥2(实测 ${gateReal.join(', ')})`);
+
+  /* 且 verify.ts 的白名单理由与这个事实**不矛盾**才算通过:
+     理由是「待接入」,而实测它是 gate-only ⇒ 理由应改写。
+     这里只断言**两者并存**这一事实被记录,不代替 Lead 改 verify.ts。 */
+  const m = /'server\/src\/content\/baseline\.ts',\s*'([^']*)'/.exec(
+    readFileSync(join(ROOT, 'scripts/verify.ts'), 'utf8'));
+  ok(m !== null, 'verify.ts 白名单应有 baseline.ts 条目');
+  ok((m?.[1] ?? '').length > 0, `baseline.ts 理由非空(实测:«${m?.[1] ?? ''}»;建议改为 gate-only 措辞)`);
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

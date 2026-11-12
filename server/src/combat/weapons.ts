@@ -707,6 +707,86 @@ export const MAX_CRIT_DMG = 3.0;
 export const BASE_CRIT_RATE = 0.05;
 export const BASE_CRIT_DMG = 1.5;
 
+/**
+ * 普攻连段倍率(`comboMul`)的设计上界。
+ *
+ * ## 为什么需要一个上界
+ *
+ * `comboMul` 是伤害管线第一段里**唯一没有上界**的乘数:
+ *
+ * | 乘数 | 上界来源 |
+ * |:---|:---|
+ * | `levelMul` | `combatantStats` 钳 `Math.min(MAX_LEVEL, level)` |
+ * | `weaponMul` | 查表 `weapon.attackMul`,武器表最大 1.5 |
+ * | `skillMul` | 查表 `skill.damageMul` |
+ * | `dodgeRate` | `Math.min(…, MAX_DODGE_RATE)` |
+ * | `critRate` | `Math.min(1.0, …)` |
+ * | `critDmg` | `Math.min(…, MAX_CRIT_DMG)` |
+ * | `comboMul` | ❌ **无 —— 本常量补上** |
+ *
+ * 同一个公式里七个乘数六个有界、一个没有,这是**不一致**而不是设计。
+ * 实测 `comboMul: 1e9` 让 `finalDamage` 从 14 涨到 **1.4e10**(约 1.0e9×)。
+ *
+ * ## 为什么是 3.0,而不是「查表」
+ *
+ * 手册**没有**定义连段倍率数值(全文扫 `连段|连招|第三段|三段` = 0 命中);
+ * 倍率只散落在各武器的 `passive` 文案里,且**每把武器不同**:
+ *
+ * | 武器 | 声明 | 折算倍率 |
+ * |:---|:---|:---|
+ * | 711 | 普攻三连(1.00 / 1.00 / **1.25**) | 1.25 |
+ * | 714 | 第三段额外 **+0.20** | 1.20 |
+ * | 715 | 满蓄力 **+0.35** | 1.35 |
+ * | 720 | 回程再结算 **0.5** 倍率 | 0.50 |
+ *
+ * ⇒ 合法值是**逐武器不同**的标量,不是全局离散集合
+ *   (实测这几个值互不相同,任何「查 {1.00, 1.00, 1.25} 表」的实现都会
+ *   把 714 合法的 1.20 与 720 合法的 0.50 一起**误拒**)。
+ *
+ * 因此采用与 `MAX_CRIT_DMG` **同一形态**:给一个宽松的设计上界,
+ * 取值依据 = 已声明最大值 1.35 的约 2.2 倍,任何高于 3.0 的值都无法由
+ * 现有武器表解释。这与 `MAX_CRIT_DMG = 3.0`(基础 1.5、表内加成上限约 2.0)
+ * 的「宽松上界」口径一致。
+ *
+ * ## 非法值语义(与「夹取」不同)
+ *
+ * - **非数字 / `NaN` / `-Infinity`** ⇒ 退回 `1.0`(**拒绝**)。
+ *   这些不是「太大了」,而是「根本不是一个倍率」,夹取无意义
+ *   —— 这正是 CR-14 U2-b 的形态:`NaN` 让下游 `Math.max(MIN_DAMAGE, NaN)`
+ *   产出 `NaN`,`hp` 被永久污染成 `NaN`,生物**永远打不死**。
+ * - **有限但过大** ⇒ 夹到 `MAX_COMBO_MUL`(**夹取**)。
+ * - **`+Infinity`** ⇒ 经 `Math.min` 自然夹到上界(与 `sanitizeMul` 同口径)。
+ */
+export const MAX_COMBO_MUL = 3.0;
+
+/**
+ * 消毒一个「自报倍率」标量(连段倍率等)。
+ *
+ * ## 为什么返回 `fallback` 而不是 `0`
+ *
+ * 与 `anticheat.ts` 的 `sanitizeMul` 同理:取 `0` 会让该次攻击恒为最小伤害,
+ * 等于用坏输入把自己锁死;取 `fallback` 则退化为「没有这段加成」,
+ * 攻击仍按基线正常结算。兜底**不构成放水面** —— 声明一个合法的上界值
+ * 得到的结果与兜底不同,而非法值不再能放大任何东西。
+ *
+ * ## ⚠ 与 `server/src/net/anticheat.ts:242` 的 `sanitizeMul` 是同形函数
+ *
+ * 两者语义一致(非数字/`NaN`/`-Infinity` 退 `fallback`,其余夹到 `[0, max]`)。
+ * `anticheat.ts` 那份是私有且面向「移速/攻速」域,本任务写域不含该文件,
+ * 故此处独立实现并**显式登记这处重复**(不静默):将来若要收敛为单一实现,
+ * 应把它提到共享模块并让两边同时引用 —— 属跨域改动,留给后续裁决。
+ */
+export function sanitizeMul(declared: unknown, fallback: number, max: number): number {
+  if (typeof declared !== 'number') return fallback;
+  if (Number.isNaN(declared) || declared === Number.NEGATIVE_INFINITY) return fallback;
+  return Math.min(Math.max(0, declared), max);
+}
+
+/** 连段倍率消毒:见 `MAX_COMBO_MUL`。缺省与非法值都退回 `1.0`(无连段加成)。 */
+export function sanitizeComboMul(declared: unknown): number {
+  return sanitizeMul(declared, 1.0, MAX_COMBO_MUL);
+}
+
 export function emptySummary(): EquipSummary {
   return {
     atk: 0, def: 0, hpBonus: 0, dodgeRate: 0, critBonus: 0, critDmgBonus: 0,

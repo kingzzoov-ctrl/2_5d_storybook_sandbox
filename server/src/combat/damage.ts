@@ -22,6 +22,7 @@ import {
   MAX_DODGE_RATE,
   PRANK_HAMMER_KNOCKBACK,
   elementMul,
+  sanitizeComboMul,
   type CombatantStats,
   type SkillDef,
   type WeaponDef,
@@ -334,7 +335,16 @@ export function computeDamage(input: AttackInput): DamageResult {
   /* 1 基础 = ATK总 × 等级倍率 × 武器倍率 × 连段 × 技能倍率 */
   const levelMul = 1 + 0.03 * (attacker.level - 1);
   const weaponMul = weapon ? weapon.attackMul : 1.0;
-  const comboMul = input.comboMul ?? 1.0;
+  /* 连段倍率消毒 —— 详见 `MAX_COMBO_MUL`。
+     ⚠ 这是本公式里**唯一**的自报标量:其余六个乘数都有界
+     (`levelMul` 经 MAX_LEVEL、`weaponMul`/`skillMul` 查表、
+     `dodgeRate`/`critRate`/`critDmg` 各有 MAX_*)。
+     未消毒时 `comboMul: 1e9` 让最终伤害从 14 涨到 1.4e10;
+     `comboMul: NaN` 更糟 —— `Math.max(MIN_DAMAGE, NaN)` 得 `NaN`,
+     生物 HP 被永久污染,此后**永远打不死**(实测补刀也无效)。
+     消毒放在这里而不是调用方:这是唯一消费该值的地方,
+     放调用方会漏掉其它调用(也与 `dodgeRate`/`critRate` 的就地钳制同形)。 */
+  const comboMul = sanitizeComboMul(input.comboMul);
   const skillMul = skill ? skill.damageMul : 1.0;
   const base = attacker.totalAtk * levelMul * weaponMul * comboMul * skillMul;
   steps.push({
