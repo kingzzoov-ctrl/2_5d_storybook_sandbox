@@ -42,7 +42,7 @@ import { Chunk, type TileFields } from '../world/chunk.ts';
 import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 import { PhysicsWorld, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
-import { AoiManager, type AoiPlayer } from '../mobs/aoi.ts';
+import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { SignalGraph } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
@@ -355,6 +355,40 @@ export function mulberry32(seed: number): () => number {
 }
 
 /**
+ * 玩家**装备与手持**的权威档案。
+ *
+ * ## 为什么必须与 `mobPlayers` 分开存(US2/task-47 的权威裁决)
+ *
+ * `mobPlayers` 是**每帧重建的派生视图**:`syncPlayers()` 从 `physics.bodies`
+ * 重新组装它(位置权威是 `PhysicsWorld`)。它原先把 `wearing` 写成字面量
+ * `[]` —— 于是**装配层灌进来的装备在下一帧被抹掉**,表现为
+ * 「`setMobPlayers` 之后立刻攻击有效,`tick()` 一次之后就退回裸装」。
+ *
+ * 实测(M1,本次接线前的探针):
+ * ```
+ * setMobPlayers([{wearing:[712]}]) → 立刻攻击 finalDamage = 76
+ * sim.tick()                       → 再攻击 finalDamage = 10(退回裸装)
+ * tick 后 mobPlayers 的 wearing     = [[]]
+ * ```
+ * ⇒ 装备**不能**存在派生视图里。它需要自己的持有者,即本结构。
+ *
+ * ## 权威归属(引 `docs/AUTHORITY-MAP.md` §「#4 权威归属主张」)
+ *
+ * > `wearing` / `heldItem` → **新结构「玩家档案」**(接线前不存在);
+ * > `room` = 投影;`vitals` / `combatantStats` = 消费
+ *
+ * 本结构就是那个「玩家档案」。等级**不在**这里 —— 等级的权威是
+ * `progresses`(`progression.ts`),两者是不同族的状态,不合并持有。
+ */
+export interface PlayerProfile {
+  wearing: readonly number[];
+  heldItem: number;
+}
+
+/** 空档案常引用 —— 无记录时返回它,避免每次分配。 */
+const EMPTY_PROFILE: PlayerProfile = { wearing: [], heldItem: 0 };
+
+/**
  * 可运行的世界。
  *
  * 持有顺序即**初始化顺序**:地形 → 物理 → 电路 → 生物。
@@ -516,6 +550,17 @@ export class WorldSim {
    * 本轮的接线目标是让击杀**真的会结算**,不是定义存档契约(那是 US2/存档线的范围)。
    */
   private readonly progresses = new Map<string, PlayerProgress>();
+
+  /**
+   * 装备/手持的**权威档案**(玩家 ID → 档案)。
+   *
+   * 见 `PlayerProfile` 的长注释:它必须独立于每帧重建的 `mobPlayers`,
+   * 否则装配层的装备会被 `syncPlayers()` 抹掉。
+   *
+   * 谁写:装配层 `setMobPlayers` / `setProfile`。谁读:`wearingOf`(战斗)、
+   * `syncPlayers`(投影给生物 AI)。
+   */
+  private readonly profiles = new Map<string, PlayerProfile>();
 
   /** 最近一次击杀结算结果(供断言与 UI;null = 尚未发生击杀)。 */
   lastKillSettle: ShareResult | null = null;
@@ -1291,6 +1336,91 @@ export class WorldSim {
     return this.mobHost.interact(mobId, itemId, p);
   }
 
+  /**
+   * **权威攻击入口**(US2/task-47):玩家攻击某只生物。
+   *
+   * ## 与 `attackMob` 的分工(这就是信任边界)
+   *
+   * `attackMob(playerId, mobId, opts)` 的 `opts` 含 `level` / `wearing` /
+   * `weaponId` / `comboMul` —— 全是**调用方自报值**,是给测试注入夹具用的。
+   * 本方法**不接受任何面板参数**:等级取 `progresses`(权威),装备取
+   * `profiles`(权威)。网络层只调本方法;客户端报文**只允许**携带意图
+   * (`mobId`),不得携带面板数据 —— 与 CR-14 U1 的
+   * `allowedSources` / `capacity` 同一条纪律。
+   *
+   * ## 两道闸,而且它们拦的不是同一件事
+   *
+   * - **身份闸**:`playerId` 必须在 `playerIds` 里(是玩家不是生物)。
+   *   生物也活在 `physics.bodies` 里,不查这一条,「用一只生物打另一只」
+   *   就能借道 `mobDistance` 通过距离校验。
+   * - **AOI 闸**:该玩家到目标的距离 ≤ `AOI_WAKE_DISTANCE`(32 格)。
+   *   睡着的怪(附近没有任何玩家)不该被谁打到;这也是「目标必须在模拟层
+   *   真的活跃」的近似。**用距离直接判,不用 `aoi.isActive`** —— 后者被
+   *   生物互相唤醒污染了,见方法内注释。
+   * - **reach 闸**:由 `computeDamage` 的第 0a 步按武器 `reach` 拦
+   *   (`outOfReach`)。阈值**复用**管线既有值,不另起一套
+   *   (与 `checkAttack` 同一纪律)。这一道比 AOI 更严,是最终的「打得到吗」。
+   *
+   * 三道合取 ⇒ 「你能打到它」= 「你是玩家」∧「它在活跃半径内」∧「在武器射程内」。
+   *
+   * ⚠️ 为什么 `aoi.isActive` **不能**替代「到该玩家的距离」:
+   * `AoiManager.players` 里混进了生物自身(`sim.players` 由 `physics.bodies`
+   * 全体构成),生物互相唤醒 ⇒ 实测距玩家 **50 格** 的生物 `isActive=true`。
+   * ⇒ 它回答的是「**有没有任意**玩家在它附近」,不是「**这个**玩家在不在」。
+   * 那是 `server/src/mobs/` 的既有缺陷(不在本任务写域),已记入报告未做项。
+   *
+   * ## `comboMul` 为什么不在这里出现(明确未做项)
+   *
+   * 连段倍率来自**客户端输入节奏**(普攻三段的第 3 段 = 1.25)。
+   * 服务端接受自报即 CR-14 U2 同族缺口;而 task-51 只给它加了**上界**,
+   * 「有上界」≠「有权威」。服务端目前**没有连段状态机**,凭空造一个属于
+   * 超范围 ⇒ 这里固定按普攻第 1 段(`comboMul` 缺省 1.0)结算。
+   *
+   * @returns `hit === null` 且 `outcome === 'OK'` = 没有这只生物(不静默造伤害);
+   *          `outcome === 'OUT_OF_AOI'` = 目标不在活跃区,未结算。
+   */
+  attackMobAuthorized(
+    playerId: string,
+    mobId: string,
+    opts: { fromDeg?: number } = {},
+  ): {
+    outcome: 'OK' | 'OUT_OF_AOI';
+    hit: { result: PipelineDamageResult; hpLoss: number; events: string[] } | null;
+  } {
+    /* 闸 0:`playerId` 必须是**登记过的玩家**,不是生物。
+       否则攻击者可用一只生物当「玩家」去打另一只(它同样在
+       `physics.bodies` 里,`mobDistance` 能算出距离)。 */
+    if (!this.playerIds.has(playerId)) return { outcome: 'OUT_OF_AOI', hit: null };
+
+    const rt = this.mobHost.runtimeOf(mobId);
+    if (rt === null) return { outcome: 'OK', hit: null };
+
+    /* 闸 1:AOI —— 判据是「**这个**玩家到它的距离 ≤ AOI 唤醒半径」。
+     *
+     * ⚠️ 刻意**不用** `aoi.isActive(mobId)`。实测(`_us2_gate2.ts`):
+     * `AoiManager.players` 里混进了**生物自身**(它是 `sim.players`,
+     * 而 `sim.players` 由 `physics.bodies` 全体构成,生物也在其中),
+     * 于是生物互相唤醒 —— 实测一只距玩家 **50 格** 的生物 `isActive=true`。
+     * ⇒ `isActive` 回答不了「你能否打到它」,拿它当授权闸等于没闸。
+     * 那是 `server/src/mobs/` 的既有缺陷(不在本任务写域),
+     * 这里用**玩家到生物的权威距离**直接判定,语义才是对的。
+     *
+     * 距离读 `physics.bodies`(服务端权威位置,由 `applyMove` 带反作弊上界写入)
+     * ⇒ 客户端无法伪造「我在它旁边」。 */
+    const distance = this.mobDistance(playerId, mobId);
+    if (!Number.isFinite(distance) || distance > AOI_WAKE_DISTANCE) {
+      return { outcome: 'OUT_OF_AOI', hit: null };
+    }
+
+    const hit = this.attackMob(playerId, mobId, {
+      level: this.levelOf(playerId),
+      wearing: this.wearingOf(playerId),
+      comboMul: 1.0,
+      ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
+    });
+    return { outcome: 'OK', hit };
+  }
+
   /* ── 玩家 → 生物 的伤害入口(task-33 接线)─────────────────────────
    *
    * ## 为什么必须新增入口,而不是「让 damageMob 内部算一下」
@@ -1492,14 +1622,19 @@ export class WorldSim {
     return { result, hpLoss, events: ai?.events ?? [] };
   }
 
-  /** 取玩家已装备物品(装配层经 `setMobPlayers` 灌入;无记录则为空)。 */
+  /**
+   * 取玩家已装备物品(**权威档案**;无记录则为空)。
+   *
+   * ⚠ 读的是 `profiles`(权威)而**不是** `mobPlayers`(每帧重建的派生视图)。
+   * 原实现读 `mobPlayers.find(...).wearing`,而 `syncPlayers()` 每帧把该字段
+   * 写成 `[]` ⇒ 装备在第二帧起失效。详见 `PlayerProfile` 注释。
+   */
   private wearingOf(playerId: string): readonly number[] {
-    const p = this.mobPlayers.find((x) => x.id === playerId);
-    /* `?? []` 不是洁癖:装配层漏传 `wearing` 时 `p.wearing` 是 `undefined`,
+    /* `?? []` 不是洁癖:档案里 `wearing` 可能是 `undefined`(外部构造),
        直接返回会让调用方在 `[...wearing]` 处抛 `TypeError: wearing is not iterable`。
        本仓的取舍是「生产路径上不 throw」——漏传装备应当退化成**按裸装结算**
        (玩家看得见伤害数字变小),而不是让整次攻击崩掉。 */
-    return p?.wearing ?? [];
+    return this.profiles.get(playerId)?.wearing ?? [];
   }
 
   /** 取玩家朝向(度)。 */
@@ -1696,6 +1831,23 @@ export class WorldSim {
   /** 某玩家当前成长档案的快照(供断言;不存在则返回 null)。 */
   progressSnapshotOf(playerId: string): PlayerProgress | null {
     return this.progresses.get(playerId) ?? null;
+  }
+
+  /**
+   * 玩家的**权威等级**(供网络层投影到 `state.players[].level`)。
+   *
+   * 为什么单开一个方法而不是让房间读 `progressOf().level`:
+   * 房间是**结构化**依赖(`WorldSaveHost`),不能引用模拟层类型;
+   * 返回一个数字就把依赖面收到最小。
+   *
+   * ⚠ 用 `progressSnapshotOf` 的语义(**不新建档案**):没有档案 = 还没参与过
+   * 任何结算 = 等级 1。若这里用 `progressOf`,房间每帧给每个玩家调一次,
+   * 会让**所有**在场玩家凭空多出一个 lv1/exp0 的档案 ——
+   * 那正是 `settleKill` 里被断言抓过的同一类副作用
+   * (「档案存在与否」这个可观测值被污染)。
+   */
+  levelOf(playerId: string): number {
+    return (this.progresses.get(playerId) ?? { level: 1 }).level;
   }
 
   /** 取玩家幽灵泡泡状态(不存在 = 未倒地)。 */
@@ -1934,6 +2086,9 @@ export class WorldSim {
     if (!this.playerIds.has(id)) return undefined;
     const b = this.physics.bodies.get(id);
     if (b === undefined) return undefined;
+    /* 装备/手持从权威档案取 —— 原为字面量 `wearing: []`,与 `syncPlayers`
+       是同一处病根的第二份实现(见 `PlayerProfile`)。 */
+    const prof = this.profiles.get(id) ?? EMPTY_PROFILE;
     return {
       id,
       x: b.x,
@@ -1941,8 +2096,8 @@ export class WorldSim {
       z: b.z,
       facingDeg: b.facingDeg ?? 0,
       afk: false,
-      heldItem: 0,
-      wearing: [],
+      heldItem: prof.heldItem,
+      wearing: prof.wearing,
       playingInstrument: false,
     };
   }
@@ -2251,20 +2406,32 @@ export class WorldSim {
      * 于是所有「发现玩家」的行为(冲锋/伏击/逃跑/驯化)**永不触发**,
      * 而 `tick` 确实在跑、不抛异常 —— 生物只是安静地站着。
      * 实测证据:未同步时 `mob_boar` 的 `mem` 是 `{}`。
+     *
+     * ## ⚠ `wearing` / `heldItem` 必须从 `profiles` 投影,不能写字面量 `[]`
+     *
+     * 这里原先是 `wearing: []`。那是**把派生视图当权威用**:本方法每帧执行,
+     * 于是装配层经 `setMobPlayers` 灌入的装备**下一次 tick 就被抹成裸装**
+     * (实测:灌 `[712]` 后立刻攻击 76 伤害,`tick()` 一次后掉回 10)。
+     * 位置同样由本方法每帧重建,但位置的权威**本来就在** `physics.bodies`,
+     * 所以那是正确的投影;装备的权威不在物理层,照抄这个形状就丢了状态。
+     * ⇒ 装备改为从 `profiles` 取(权威),`afk` 仍取 AOI 视图。
      */
     this.mobPlayers = this.players
       .filter((p) => this.playerIds.has(p.id))
-      .map((p) => ({
-        id: p.id,
-        x: p.x,
-        y: p.y,
-        z: 0,
-        facingDeg: 0,
-        afk: p.afk,
-        heldItem: 0,
-        wearing: [],
-        playingInstrument: false,
-      }));
+      .map((p) => {
+        const prof = this.profiles.get(p.id) ?? EMPTY_PROFILE;
+        return {
+          id: p.id,
+          x: p.x,
+          y: p.y,
+          z: 0,
+          facingDeg: 0,
+          afk: p.afk,
+          heldItem: prof.heldItem,
+          wearing: prof.wearing,
+          playingInstrument: false,
+        };
+      });
   }
 
   /** 注册一只生物:物理刚体 + AOI 记录 + 刷怪计数 + **宿主登记**。 */
@@ -2288,9 +2455,55 @@ export class WorldSim {
    */
   readonly unknownMobs: string[] = [];
 
-  /** 给生物 AI 用的玩家视图(供 `MobWorld.players()`)。 */
+  /**
+   * 给生物 AI 用的玩家视图(供 `MobWorld.players()`)。
+   *
+   * ## 它同时是「装配层灌装备」的入口(US2 起)
+   *
+   * 传入项里 `wearing` / `heldItem` 会被写进**权威档案** `profiles`,
+   * 而位置 / `afk` 只是本帧视图(它们的权威分别是 `PhysicsWorld` / 房间成员态)。
+   *
+   * ⚠ 历史坑:早期版本只赋 `this.mobPlayers = players`,而 `syncPlayers()`
+   * 每帧用 `wearing: []` 重建该字段 ⇒ 灌进来的装备**下一帧就被抹掉**。
+   * 现在装备写进 `profiles`,`syncPlayers()` 反向从 `profiles` 取,
+   * 于是「灌一次就能跨帧存活」(由 WS-10 `生产接线15` 钉住)。
+   */
   setMobPlayers(players: WorldPlayer[]): void {
     this.mobPlayers = players;
+    /* 把装备类字段收进权威档案。位置不在这里收 —— 它归 `physics.bodies`。 */
+    for (const p of players) {
+      this.profiles.set(p.id, {
+        wearing: Array.isArray(p.wearing) ? [...p.wearing] : [],
+        heldItem: typeof p.heldItem === 'number' ? p.heldItem : 0,
+      });
+    }
+  }
+
+  /**
+   * 设置单个玩家的装备档案(装配层更细粒度的入口)。
+   *
+   * 与 `setMobPlayers` 的区别:后者是**整表覆盖**(顺带刷新本帧 AI 视图),
+   * 本方法只动一名玩家的装备,不影响 `mobPlayers` 里的其他字段。
+   * 网络层「装备变更报文」应走这条,而不是重建整张表。
+   */
+  setProfile(playerId: string, patch: Partial<PlayerProfile>): void {
+    const cur = this.profiles.get(playerId) ?? EMPTY_PROFILE;
+    this.profiles.set(playerId, {
+      wearing: patch.wearing !== undefined ? [...patch.wearing] : cur.wearing,
+      heldItem: patch.heldItem !== undefined ? patch.heldItem : cur.heldItem,
+    });
+    /* 同步到 AI 视图,免得生物看见的装备比战斗用的晚一帧。 */
+    const inView = this.mobPlayers.find((p) => p.id === playerId);
+    if (inView !== undefined) {
+      const next = this.profiles.get(playerId)!;
+      inView.wearing = next.wearing;
+      inView.heldItem = next.heldItem;
+    }
+  }
+
+  /** 某玩家的装备档案(只读;无记录返回空档案 —— 不返回 undefined,少一层可选链)。 */
+  profileOf(playerId: string): PlayerProfile {
+    return this.profiles.get(playerId) ?? EMPTY_PROFILE;
   }
 
   /** 给生物 AI 的地面掉落物(供 `MobWorld.groundItems()` / `spawnItem`)。 */

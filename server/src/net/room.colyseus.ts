@@ -18,7 +18,7 @@
 
 import { Room, Client } from 'colyseus';
 import { RoomSchema, BossSchema, PlayerSchema, WildlifeSchema, assertSchemaReady } from './schema.colyseus.ts';
-import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions } from './room.ts';
+import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions, type WorldSaveHost } from './room.ts';
 import { DT } from '../../../shared/types/physics.ts';
 import { AccessMode } from '../db/repo.ts';
 import type { DbLike } from '../db/repo.ts';
@@ -52,6 +52,25 @@ export interface NetPersistRoomOptions {
   clock: { nowMs: () => number };
   db: DbLike | null;
   registryOwnerId: string;
+  /**
+   * 世界源(US2 装配位)。**由调用方构造**并传进来。
+   *
+   * ## 为什么类型是 `WorldSaveHost` 而不是具体的模拟层
+   *
+   * `WorldSaveHost` 是 `room.ts` 里的**结构化接口**(只声明房间用到的方法),
+   * 所以这里引用它**不引入任何新的依赖边** —— `room.colyseus.ts` 本就
+   * `import './room.ts'`。若改成 import `WorldSim` 类型,就等于在装配层
+   * 硬绑模拟层,并把 `scripts/backlog.ts` 的 US2 探针**误报为已开**。
+   *
+   * ## ⚠️ 目前**没有生产调用方构造它**
+   *
+   * `server/src/index.ts` **不存在**(`gameServerConfig` 的 docstring 说
+   * 「由 server/src/index.ts 调用」,但该文件全仓不存在)。
+   * ⇒ 本参数**通了,但生产里传的是 `undefined`** ⇒ `host` 保持 null。
+   * ## 这**不算**「接线完成**」**:契约已正确 + 有装配位,**但没人构造 host**。
+   * 补法是新建 `server/src/index.ts`(既有缺口,非本任务引入)。
+   */
+  host?: WorldSaveHost | null;
 }
 
 export type RoomCreateOptions = {
@@ -93,6 +112,12 @@ export class NetPersistRoom extends Room<RoomSchema> {
       passwordHash: options.passwordHash ?? null,
       maxPlayers: this.maxClients,
       worldSeed: options.worldSeed,
+      /* US2 装配位:世界源经构造参传入。
+         ⚠️ `this.deps?.host ?? null` —— 今天 `server/src/index.ts` 不存在,
+         所以 `deps` 由谁注入仍是开的;此处**通了但传 null**。
+         不谎报:null 时 `saveToDb`/`levelOf`/`attackMobAuthorized` 三处
+         整段跳过(由 `tests/WS-07.ts` 的 K1 断言钉住)。 */
+      host: this.deps?.host ?? null,
     };
     this.runtime = new RoomRuntime(rtOpts, this.deps?.db ?? null);
 
@@ -167,9 +192,39 @@ export class NetPersistRoom extends Room<RoomSchema> {
       const verdict = this.runtime.applyMove(client.sessionId, msg);
       if (!verdict.allowed) client.send('correct', verdict.corrected ?? null);
     });
-    this.onMessage('attack', (client, msg: { claimedBonus?: number }) => {
-      const verdict = this.runtime.applyAttack(client.sessionId, msg?.claimedBonus ?? 0);
-      if (!verdict.allowed) client.send('reject', { kind: 'ATTACK' });
+    /* ⚠️ 报文里**只接受「打谁」**(mobId)与客户端的攻速声明。
+       `level` / `wearing` / `weaponId` / `comboMul` 一律由服务端从权威档案
+       派生(`applyAttack` → `attackMobAuthorized` 的签名里根本没有它们);
+       报文若仍带这四个字段会被**忽略**(不是报错:老客户端仍能连)。
+       这与 `inventory` 通道同一形态(见 CR-14 U1)。 */
+    this.onMessage('attack', (client, msg: { claimedBonus?: number; mobId?: string }) => {
+      const verdict = this.runtime.applyAttack(
+        client.sessionId,
+        msg?.claimedBonus ?? 0,
+        typeof msg?.mobId === 'string' ? msg.mobId : undefined,
+      );
+      if (!verdict.allowed) {
+        client.send('reject', { kind: 'ATTACK' });
+        return;
+      }
+      /* 成功回执:接线前这里**什么都不发**(空成功路径)。
+         回执形态参照 `reject` / `correct` 的既有做法(单通道 + 小对象),
+         带上真实结算值,让客户端能据此播伤害数字而**不必自己算一遍**。 */
+      const rep = this.runtime.lastAttackReport;
+      if (rep === null) {
+        /* 反作弊放行但没有世界/没有目标 —— 不谎报命中。 */
+        client.send('attackResult', { resolved: false });
+        return;
+      }
+      client.send('attackResult', {
+        resolved: rep.hit,
+        mobId: rep.mobId,
+        outcome: rep.outcome,
+        hpLoss: rep.hpLoss,
+        finalDamage: rep.finalDamage,
+        outOfReach: rep.outOfReach,
+        dodged: rep.dodged,
+      });
     });
     /* ⚠️ 报文里**只接受 ops**。`allowedSources` / `capacity` / `beforeTotal`
        一律由服务端在 `RoomRuntime.applyInventory` 内派生 —— 它们曾是
@@ -192,15 +247,27 @@ export class NetPersistRoom extends Room<RoomSchema> {
   }
 }
 
-/** 注册到 Colyseus 的服务端入口辅助(由 server/src/index.ts 调用)。 */
+/**
+ * 注册到 Colyseus 的服务端入口辅助(由 `server/src/index.ts` 调用 ——
+ * ⚠️ 该文件**当前不存在**,见 `NetPersistRoomOptions.host` 的说明)。
+ *
+ * ⚠️ `deps` 在这里**无法转交给房间**:`server.define` 只登记构造器,
+ * 实例化时由 Colyseus 调 `onCreate`,没有任何地方能把 `deps` 递给它。
+ * 原实现因此写了 `void deps`(**丢弃**)。保留这个参数是给将来
+ * `index.ts` 一个统一注入点,但**它现在确实什么都没做** ——
+ * 不写 `void deps` 会让读者以为它被用上了。
+ * 真正的注入路径是 `room.withDeps(deps)`(见那里的注释)。
+ */
 export function gameServerConfig(deps: NetPersistRoomOptions): {
   initializeGameServer: (server: { define: (name: string, handler: unknown) => void }) => void;
+  /** 原样回传,便于 `index.ts` 调 `withDeps` —— 目前无调用方。 */
+  deps: NetPersistRoomOptions;
 } {
   return {
     initializeGameServer: (server) => {
       server.define('net_persist_room', NetPersistRoom as unknown as new () => unknown);
-      void deps;
     },
+    deps,
   };
 }
 

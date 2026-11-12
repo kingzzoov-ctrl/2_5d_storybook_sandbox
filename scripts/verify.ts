@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { FluidField } from '../server/src/world/fluid.ts';
 import { collectOpenItems, detectStale } from './backlog.ts';
+import { ENTRY_LOAD_EXEMPT } from './entry_load_exempt.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 
@@ -626,6 +627,22 @@ function checkStrippable(): void {
  * 门禁随即失去意义。
  */
 const PROD_ENTRIES = [
+  /* ── 服务端装配入口(2026-11-12 task-57 补)──
+   *
+   * ⚠️ **这里此前没有它,后果是本门禁把入口报成「未登记的不可达模块」。**
+   *
+   * 它是 `room.colyseus.ts:225` 注释所指的那个文件(「由 server/src/index.ts 调用」),
+   * 补出来之前:`WorldSaveHost` 契约(含 `saveToDb` / `levelOf` / `attackMobAuthorized`)
+   * 在运行期**恒为 null** —— 第 9 例「测试全绿 + 生产零消费」。
+   *
+   * ⚠️ 为什么排在 `room.colyseus.ts` **之前**:它不是「谁被谁 import」的中间节点,
+   * 而是**装配根**。本表只用于可达性闭包与入口可加载性,顺序无功能含义,
+   * 但把装配根放第一个便于阅读。
+   *
+   * 实测(加入后):闭包 76 → 77,**净增仅自身**,
+   * 「原先只在 demo 可达、现在生产可达」的模块 **0 个**(demo 独有仍是 39)。
+   * ⇒ 登记干净,不掩盖任何既有的可达性缺陷。 */
+  'server/src/index.ts', // 生产装配入口(createHost / assemble / createServer)
   'server/src/sim/demo.ts', // npm run sim
   'server/src/net/room.colyseus.ts', // Colyseus 房间被 server 装配层实例化
 
@@ -647,6 +664,112 @@ const PROD_ENTRIES = [
    * 两者的对应关系由 `checkReachability` 里的断言守住(见 `CLIENT_HTML`)。 */
   'client/src/main.ts', // client/index.html → <script src="./src/main.ts">
 ];
+
+/**
+ * **入口可加载性豁免登记** —— 表本身已抽到 `scripts/entry_load_exempt.ts`
+ * 作为**单一事实来源**,理由见该文件头部(核心:`verify.ts` 无导出且顶层执行,
+ * 测试若 import 本文件会顺带把整个门禁跑一遍)。
+ *
+ * ⚠️ **这里只 import,不复制。** 谁需要这张表就去 import ——
+ * 本仓已多次踩到「两份实现并存」(陷阱 31/41),复制一份就是第三次。
+ */
+// ENTRY_LOAD_EXEMPT 见 `scripts/entry_load_exempt.ts` 的 import。
+
+/**
+ * 在**子进程**里加载一个模块,只判断「能不能加载」。
+ *
+ * ⚠️ 为什么不用 `await import()`:本入口表里的 `demo.ts` **加载即执行**
+ * (它顶层就跑 200 帧模拟并打印表格)。用 `import()` 会让门禁真的跑一遍模拟,
+ * 既慢又会污染门禁输出。子进程隔离还顺带避免「加载失败后模块缓存被污染」。
+ *
+ * ## ★ 判据用**错误类型**,不用消息字符串 —— 这是实测出来的,不是偏好
+ *
+ * 第一版我用一张消息白名单(`Invalid or unexpected token|Unexpected token|...`)。
+ * 自检立刻抓到它漏了:
+ * ```
+ * 注入 `export const x = @@@ bad @@@;`  ⇒ 消息是 **"Expected ident"** ⇒ 白名单没命中
+ * ⇒ 判据误报「可加载」                                          ← 自检抓到
+ * ```
+ * ⇒ **消息白名单永远漏**(解析器措辞随语法种类变),必须按**类型**判。
+ * 实测各形态(Node 24.13.0):
+ * ```
+ * 语法坏 `@@@`      name=SyntaxError      code=ERR_INVALID_TYPESCRIPT_SYNTAX
+ * 装饰器            name=SyntaxError      code=(无)
+ * enum              name=SyntaxError      code=ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX
+ * namespace         name=SyntaxError      code=ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX
+ * import 缺模块/包   name=Error            code=ERR_MODULE_NOT_FOUND
+ * 命名导入自 CJS     name=SyntaxError      code=(无)
+ * ── 以下**不算**不可加载 ──
+ * 运行时 ReferenceError(`document is not defined`)  name=ReferenceError
+ * ```
+ *
+ * ## 归纳:本函数只回答「Node 的 **模块图 + 语法** 能否吃下它」
+ *
+ * ```
+ * 判为不可加载:name === 'SyntaxError'(装饰器/enum/namespace/语法错/CJS 命名导入)
+ *              或 code ∈ { ERR_MODULE_NOT_FOUND, ERR_INVALID_TYPESCRIPT_SYNTAX }
+ * 判为可加载:  其余(含 ReferenceError —— 环境缺失是**运行环境**问题,
+ *              不是模块图问题;`client/src/main.ts` 就是这一类)
+ * ```
+ * ⇒ 它**不**回答「模块逻辑跑得起来吗」(那是集成测试的事)。
+ */
+function entryLoadable(rel: string): { ok: boolean; reason: string } {
+  const probe
+    = `import(${JSON.stringify('./' + rel)}).then(() => { process.exit(0); }, (e) => {`
+      + 'const name = String(e && e.constructor && e.constructor.name);'
+      + 'const code = String((e && e.code) || "");'
+      + 'const msg = String((e && e.message) || e).replace(/\\s+/g, " ").slice(0, 140);'
+      + "const badCode = code === 'ERR_MODULE_NOT_FOUND' || code === 'ERR_INVALID_TYPESCRIPT_SYNTAX'"
+      + "  || code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX';"
+      + "if (name === 'SyntaxError' || badCode) {"
+      + 'process.stderr.write("LOAD_FAIL::" + (code || name) + " | " + msg);'
+      + 'process.exit(3); }'
+      + 'process.exit(0);'
+      + '});';
+  const r = spawnSync(process.execPath, ['-e', probe], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+  const err = `${r.stderr ?? ''}`;
+  const hit = /LOAD_FAIL::([^\n]*)/.exec(err);
+  if (hit) return { ok: false, reason: hit[1]!.trim().slice(0, 180) };
+  /* 退出码 3 = 判据命中(上面已 return);非 0 非 3 = 子进程自身崩了 ⇒ 也要报 */
+  if (r.status !== 0) {
+    return { ok: false, reason: `子进程退出 ${r.status}:${err.replace(/\s+/g, ' ').slice(0, 100)}` };
+  }
+  return { ok: true, reason: '' };
+}
+
+/** 入口可加载性:不在 `ENTRY_LOAD_EXEMPT` 里的生产入口必须能被 Node 加载。 */
+function checkEntryLoadable(): void {
+  console.log('\n[入口可加载性]');
+  const bad: string[] = [];
+  let exempt = 0;
+  for (const e of PROD_ENTRIES) {
+    const why = ENTRY_LOAD_EXEMPT.get(e);
+    if (why !== undefined) {
+      exempt += 1;
+      if (why.trim() === '') bad.push(`${e}(豁免理由为空 —— 必须写清原因与出路)`);
+      continue;
+    }
+    const r = entryLoadable(e);
+    if (!r.ok) bad.push(`${e}(${r.reason})`);
+  }
+  /* 豁免表里出现「已不在 PROD_ENTRIES 的条目」也是失真 ——
+     否则豁免会越积越多,最后没人敢删。 */
+  for (const k of ENTRY_LOAD_EXEMPT.keys()) {
+    if (!PROD_ENTRIES.includes(k)) bad.push(`${k}(豁免条目已不在 PROD_ENTRIES —— 应删除该豁免)`);
+  }
+  if (bad.length > 0) {
+    fail(`入口不可加载(${bad.length} 处):${bad.join('; ')}`);
+    return;
+  }
+  pass(
+    `入口可加载性:${PROD_ENTRIES.length - exempt} 个入口实测可加载,`
+    + `${exempt} 个已登记豁免(均写明原因与出路)`,
+  );
+}
 
 /**
  * 客户端 HTML 入口 → 它加载的 TS 模块。
@@ -2179,11 +2302,52 @@ const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([
     successPath: '位置已由 applyMove 写入权威状态(p.x/p.y/p.z),执行完成于调用内',
     evidence: '实测 room.ts applyMove 含 p.x = intent.x / p.y / p.z 真状态赋值',
   }],
-  ['server/src/net/room.colyseus.ts::attack', {
-    successPath: '**无** —— applyAttack 只做反作弊校验,不算伤害、不改血量',
-    evidence: '实测 applyAttack 体无真状态赋值(仅 ac.attack + pendingViolations.push);'
-      + '且玩家→怪伤害方向生产零调用,见 docs/ARCH-GAPS.md 第四类空缺',
-  }],
+  /* ✅ `attack` **已于 task-47(阶段 A)移出本表** —— 它不再是「无执行」形态。
+     移出依据(Lead 独立实测,不是采信报告):
+       `room.colyseus.ts:194` handler 现在在 `if (!verdict.allowed) {...return}` 之后
+       还有 `client.send('attackResult', {...})` ⇒ 成功分支**不再为空**;
+       而本门禁的形态判据正是「最后一句是 `if (!allowed...)`」(见 `findVerdictHandlers`
+       L2236)⇒ 形态已变,继续登记会被 `checkInertHandlers` 判为**登记失真**并报错。
+
+     实测(Lead 探针,`mob_sheep`,`combatRng: () => 0.5`):
+       sim.attackMobAuthorized('p1','mob_sheep')  ⇒ outcome=OK hit=true hpLoss=10 finalDamage=10
+       经 RoomRuntime.applyAttack(host 已装配,tick=20):
+         lastAttackReport={tick:20, mobId:'mob_sheep', outcome:'OK', hpLoss:10,
+                           finalDamage:10, hit:true, outOfReach:false, dodged:false}
+       ⇒ **成功路径真的产出了结算值**(handler 据此发 `attackResult`)。
+
+     ⚠️ **但这里必须同时写明一句,否则会过度声称「已修」**:
+       上述实测是在**手动装配** `rt.worldSaveHost = <sim>` 的前提下做的。
+
+       **[2026-11-12 task-57 修订] 本段引用句已过期,更新如下(结论未变):**
+       ```
+       那时:room.colyseus.ts:97 从不设 worldSaveHost
+             :232 gameServerConfig 直接 `void deps;`  ⇒ deps 被丢弃
+             server/src/index.ts 不存在 ⇒ 没有真 host
+       现在:net-persist 已把 host 改成**构造参**(RoomRuntimeOptions.host),
+             onCreate 里 `host: this.deps?.host ?? null`(通了但传 null);
+             gameServerConfig 改成回传 deps;
+             **build-wiring 已补出 server/src/index.ts**(createHost / assemble / createServer)
+             ⇒ 生产装配路径**已存在**,host **不再是恒 null**。
+       ```
+       ⇒ 所以本段旧结论「生产里 worldSaveHost 恒为 null」**已不成立**。task-57 已交付。
+
+       ⚠️ **但「已装配」不等于「游戏能跑」** —— net-persist 另实测出一处**并列**缺口:
+       `room.ts` 的 `applyMove` 只写 `state.players[].x/y/z`(L723-728),
+       **从不写 `physics.bodies`**(全文件代码态 0 处命中),而 `world_sim.ts:1647`
+       的 `mobDistance` 读的正是 `physics.bodies` ⇒ 玩家不在 sim 里
+       ⇒ `mobDistance` 返回 `Infinity` ⇒ **永久 `OUT_OF_AOI`,攻击永不结算**。
+       Lead 独立复现(A 对照):
+       ```
+       只经 RoomRuntime(玩家不进 sim)⇒ outcome=OUT_OF_AOI, hpLoss=0
+       先 sim.addPlayer(...)          ⇒ outcome=OK,          hpLoss=10
+       ```
+       ⇒ 而 `room.ts:748` 的注释写着「位置权威在 `physics.bodies`,由 `applyMove` 写入」
+         —— **注释与代码不符**。已另立任务。
+
+       ⇒ **本门禁判定的是「handler 的成功分支是否为空」(形态层),它在形态上已修好。**
+         「它在生产运行期端到端可达吗」是**装配层**的问题(two gaps),不归本门禁。
+         两句话必须分开,不能合并成「已修」。 */
   ['server/src/net/room.colyseus.ts::action', {
     successPath: '**无** —— authorize 是纯查表函数,授权通过后无执行、无回执',
     evidence: '实测 authorize 体零状态赋值;且 22 个 RoomAction 无分发器,'
@@ -3946,6 +4110,10 @@ checkReachability();
 /* 生产零引用(第二套判据)—— 必须紧跟在可达性之后:
    它的核心不变量是「orphan ⊆ 可达性白名单」,依赖上面那一步算出的 UNREACHABLE_EXEMPT。 */
 checkOrphanList();
+/* 入口可加载性 —— 必须紧跟可达性:
+   可达性把 PROD_ENTRIES 当**根**,但只做词法分析、从不执行;
+   本道补上「那个根自己能不能被 Node 加载」。两者是同一批入口的两面。 */
+checkEntryLoadable();
 /* 入口执行层 —— 查「handler 被调用了但成功路径为空」,与上面两道查"谁引用谁"的门禁互补。 */
 checkInertHandlers();
 checkTautology();

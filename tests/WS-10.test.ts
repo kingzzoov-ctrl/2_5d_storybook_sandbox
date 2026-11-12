@@ -6,6 +6,12 @@
  */
 
 import { test, ok, eq, near, includes, inRange, mulberry32, report } from '../shared/testing/harness.ts';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** 仓库根(本文件在 tests/ 下)。 */
+const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 import {
   WEAPONS, WEAPON_BY_ID, BREACH_PICK, PRANK_HAMMER_KNOCKBACK, ARMORS, ARMOR_BY_ID,
   COMBAT_CONSUMABLES, COMBAT_ITEM_INDEX, COMBAT_ITEM_RANGE, Element, ELEMENT_COUNTER,
@@ -2630,6 +2636,160 @@ test('task51-5:comboMul 是唯一无上界乘数 —— 其余六个各有界(�
   /* 而 comboMul 修复前**没有任何** MAX_* 可钳 —— 现在有了,且是同一个量纲。 */
   ok(MAX_COMBO_MUL > 1, '上界大于 1(连段是加成而非削减)');
   ok(MAX_COMBO_MUL >= 1.35, `上界覆盖武器表已声明的最大倍率 1.35(不能把合法值误拒)`);
+});
+
+/* ─────────── US2(task-47):权威攻击入口 + 装备权威归属 ─────────── */
+
+/** 权威入口的固定夹具:固定 RNG,排除暴击/闪避对伤害比较的干扰。 */
+function authWorld(wearing: number[] = [], d = 1, at: [number, number] = [10, 10]): WorldSim {
+  const s = new WorldSim({ sizeCells: 128, combatRng: () => 0.5 });
+  s.addPlayer('p1', at[0], at[1]);
+  if (wearing.length > 0) s.setProfile('p1', { wearing });
+  s.addMob('mob_sheep', 'MEADOW', at[0] + d, at[1]);
+  return s;
+}
+
+test('US2-1:装备经 setMobPlayers 灌入后**跨帧存活**(修 syncPlayers 抹除)', () => {
+  /* ## 这条守的是本任务发现的真缺陷(不是新功能)
+     `syncPlayers()` 每帧从 `physics.bodies` 重建 `mobPlayers`,而它原先把
+     `wearing` 写成字面量 `[]` —— 于是装配层灌进来的装备**下一帧被抹掉**。
+     实测(接线前):灌 [712] 后立刻攻击 76 伤害,`tick()` 一次掉回 10。
+     ⇒ 装备不能存在**派生视图**里,必须有独立持有者(`profiles`)。
+
+     ## ⚠ 修法是**一对**改动,单点注入测不出(故障注入实测)
+     1 `wearingOf` 改成读 `profiles`(权威);
+     2 `syncPlayers` 改成从 `profiles` 投影(而不是写字面量 `[]`)。
+     只改 (1):`mobPlayers` 里仍有对的值 ⇒ 读哪边都对 ⇒ **全绿**;
+     只改 (2):`wearingOf` 仍读 `mobPlayers`,而它已被正确投影 ⇒ 也全绿。
+     **两处同时复原**才复现原缺陷 ⇒ 只有那种注入能让本断言变红
+     (实测 J-A2:81/82,红 US2-1)。这正是本仓陷阱 31 的形态 ——
+     「一条注入没红」有**两种**解释,本次实测确认是「第二份实现顶着」。 */
+  const s = new WorldSim({ sizeCells: 48, combatRng: () => 0.5 });
+  s.addPlayer('p1', 24, 24);
+  s.addMob('mob_sheep', 'MEADOW', 25, 24);
+  s.setMobPlayers([{
+    id: 'p1', x: 24, y: 24, z: 0, facingDeg: 0, afk: false,
+    heldItem: 0, wearing: [712], playingInstrument: false,
+  }]);
+
+  eq([...s.profileOf('p1').wearing], [712], '档案立即记下装备');
+  const before = s.attackMob('p1', 'mob_sheep')!.result.finalDamage;
+
+  /* 推进多帧 —— 接线前这里就会把 wearing 抹成 [] */
+  for (let i = 0; i < 5; i += 1) s.tick();
+  eq([...s.profileOf('p1').wearing], [712], 'tick×5 后档案里装备**仍在**');
+  const after = s.attackMob('p1', 'mob_sheep')!.result.finalDamage;
+  eq(after, before, '固定 RNG 下跨帧伤害一致(装备没丢)');
+
+  /* 反向对照:真裸装必须显著更低 —— 否则上面「一致」可能只是装备本来就不起作用。 */
+  const bare = new WorldSim({ sizeCells: 48, combatRng: () => 0.5 });
+  bare.addPlayer('p1', 24, 24);
+  bare.addMob('mob_sheep', 'MEADOW', 25, 24);
+  const bareDmg = bare.attackMob('p1', 'mob_sheep')!.result.finalDamage;
+  ok(before > bareDmg, `装 712(${before})必须高于裸装(${bareDmg})⇒ 装备真的参与结算`);
+});
+
+test('US2-2:权威入口的**三道闸** —— 身份 / 到该玩家的距离 / 武器 reach', () => {
+  /* ## 闸 1:身份(生物不得当攻击者)
+     生物也在 `physics.bodies` 里 ⇒ 不查身份就能「用一只生物打另一只」。 */
+  const s0 = new WorldSim({ sizeCells: 128, combatRng: () => 0.5 });
+  s0.addPlayer('p1', 10, 10);
+  s0.addMob('mob_sheep', 'MEADOW', 11, 10);
+  s0.addMob('mob_boar', 'MEADOW', 12, 10);
+  eq(s0.attackMobAuthorized('p1', 'mob_sheep').outcome, 'OK', '玩家攻击 ⇒ 放行到结算');
+  const asMob = s0.attackMobAuthorized('mob_boar', 'mob_sheep');
+  eq(asMob.outcome, 'OUT_OF_AOI', '拿生物当攻击者 ⇒ 身份闸拦住');
+  eq(asMob.hit, null, '身份闸拦住时不产生结算结果');
+
+  /* ## 闸 2:到**该玩家**的距离(两侧都要扫,单点区分不了「闸」与「碰巧」) */
+  for (const [d, expectOk] of [[1, true], [31, true], [32, true], [33, false], [60, false]] as [number, boolean][]) {
+    const s = authWorld([], d);
+    const r = s.attackMobAuthorized('p1', 'mob_sheep');
+    eq(r.outcome === 'OK', expectOk,
+      `距离 ${d} 格 ⇒ ${expectOk ? '进入结算' : '被 AOI 闸拦下'}(边界 32)`);
+  }
+
+  /* ## 闸 3:武器 reach(在 AOI 内但超出射程)—— 阈值由管线 0a 步定,不另起一套 */
+  const reachOf = (wearing: number[]): number => {
+    let max = -1;
+    for (const d of [1, 2, 3, 4, 5, 8, 10, 12, 13, 14, 16, 20]) {
+      const s = authWorld(wearing, d);
+      if ((s.attackMobAuthorized('p1', 'mob_sheep').hit?.hpLoss ?? 0) > 0) max = Math.max(max, d);
+    }
+    return max;
+  };
+  const bareReach = reachOf([]);
+  const bowReach = reachOf([715]);
+  /* 边界 = reach + MAX_REACH_TOLERANCE(1.5):
+     裸装 1.8+1.5 = 3.3 ⇒ 整数最大 3;
+     弓 12.0+1.5 = 13.5 ⇒ 整数最大 13。
+     实测确认(逐整数扫,不跳点)。 */
+  eq(bareReach, 3, `裸装(1.8+1.5=3.3)最大命中 3 格,实际 ${bareReach}`);
+  eq(bowReach, 13, `弓 715(12+1.5=13.5)最大命中 13 格,实际 ${bowReach}`);
+  ok(bowReach > bareReach, '长弓必须比裸装打得远(否则 reach 没参与)');
+  ok(bowReach < 32, 'reach 闸比 AOI(32)更严 ⇒ 它才是最终判据');
+});
+
+test('US2-3:★伪造面板进不了结算(本任务的灵魂断言)', () => {
+  /* ## 判据不是「服务端写了个 sanitize」,而是**结构性事实**:
+     `attackMobAuthorized` 的形参表里**没有** level/wearing/weaponId/comboMul
+     ⇒ 客户端报文里的面板字段**没有入口可进**。
+     这比「加了校验」更强:校验可能被绕过,不存在的入口不会。 */
+  const withForge = authWorld([712], 1);
+  const dmgWith712 = withForge.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage;
+
+  /* 模拟「报文里塞满面板」:唯一能被网络层读取的是 mobId,其余字段被丢弃 */
+  const r = withForge.attackMobAuthorized('p1', 'mob_sheep');
+  eq(r.hit!.result.finalDamage, dmgWith712,
+    '再次攻击(报文可塞任意面板)伤害不变 ⇒ 面板对结算无影响');
+
+  /* ## 更强的证据:用**同一世界**改客户端「自称」,服务端派生值不变。
+     做法:世界里的权威档案是 [712],而「客户端自称」是别的 —— 结算只认档案。 */
+  const s = authWorld([711], 1);   /* 权威:711(弱) */
+  const authoritative = s.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage;
+  const s712 = authWorld([712], 1); /* 对照:权威 712(强) */
+  const stronger = s712.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage;
+  ok(stronger > authoritative,
+    `权威装备变了伤害才变(711→${authoritative} / 712→${stronger})⇒ 结算读的是**权威档案**`);
+
+  /* ## 结构性证据:源码形参表(注释会漂移,形参不会) */
+  const src = readFileSync(join(ROOT_DIR, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const sig = /attackMobAuthorized\(\s*([^)]*)\)/.exec(src);
+  ok(sig !== null, '找得到 attackMobAuthorized 的签名');
+  const params = sig![1]!;
+  for (const bad of ['level', 'wearing', 'weaponId', 'comboMul']) {
+    ok(!params.includes(bad),
+      `权威入口形参里不得出现 ${bad}(实际: ${params.replace(/\s+/g, ' ').trim()})`);
+  }
+  ok(params.includes('playerId') && params.includes('mobId'),
+    '形参只有「谁打谁」这类意图/身份 —— 面板数据无从传入');
+});
+
+test('US2-4:权威等级来自 progression,不是调用方自报(与 attackMob 的口径分界)', () => {
+  /* `attackMob({ level })` 的 level 是**自报值**;`attackMobAuthorized` 读
+     `progresses`。这条把两者的**分界**钉住:改了权威等级,伤害才跟着变。 */
+  const s = authWorld([], 1);
+  const at1 = s.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage;
+
+  /* 升级权威档案(与网络层无关,直接改 simulation 侧) */
+  const p = s.progressOf('p1');
+  Object.assign(p, setLevel(p, 30));
+  eq(s.levelOf('p1'), 30, 'levelOf 读到权威等级');
+
+  const s2 = authWorld([], 1);
+  const p2 = s2.progressOf('p1');
+  Object.assign(p2, setLevel(p2, 30));
+  const at30 = s2.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage;
+  ok(at30 > at1, `30 级(${at30})必须高于 1 级(${at1})⇒ 等级真的进了结算`);
+
+  /* ⚠️ 而 `attackMob` 的 opts.level 仍是自报(测试夹具用)—— 这是**刻意**保留的
+     分界:网络层只调授权入口,故自报值不可达。此处如实记录该分界存在。 */
+  const selfReported = authWorld([], 1).attackMob('p1', 'mob_sheep', { level: 30 })!;
+  const authoritative30 = authWorld([], 1);
+  Object.assign(authoritative30.progressOf('p1'), setLevel(authoritative30.progressOf('p1'), 1));
+  ok(selfReported.result.finalDamage > authoritative30.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage,
+    '自报 level:30 与权威 level:1 会给出**不同**伤害 ⇒ 两条路真的分开了(授权入口不吃自报)');
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */

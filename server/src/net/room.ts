@@ -54,6 +54,7 @@ import {
   type PlayerState,
   type RoomState,
 } from './schema.ts';
+import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 
 /** 空集合常引用 —— `grantedSourcesFor` 无凭证时返回它,避免每次分配。 */
 const EMPTY_SOURCE_SET: ReadonlySet<string> = new Set<string>();
@@ -263,9 +264,51 @@ export interface RoomRuntimeOptions {
   passwordHash?: string | null;
   maxPlayers?: number;
   worldSeed?: number;
+  /**
+   * 世界存档源(可选;**US2 起从构造参数注入**,理由见下)。
+   *
+   * ## 为什么改成构造参,而不是继续用「建完再赋值」
+   *
+   * 原先只有字段 `worldSaveHost = null` 可写,于是装配层必须
+   * 「先 `new RoomRuntime(...)`,再 `rt.worldSaveHost = host`」。
+   * 实测后果:**生产里这个赋值一处都没有**(全仓 6 处赋值,5 处在临时探针、
+   * 1 处在 `tests/WS-FND-02.test.ts`),`room.colyseus.ts` 全文
+   * 无 `worldSaveHost` ⇒ 该契约在运行期**恒为 null**
+   * (含既有的 `saveToDb`,那是**存量**缺口,不是本任务引入的)。
+   *
+   * 构造参数让「有没有世界」在**建房间的那一刻**就必须表态,
+   * 而不是靠事后一个可选赋值 —— 后者漏掉时**没有任何东西报错**。
+   * 字段仍然保留可写(测试/渐进接入用),但生产装配走构造参。
+   *
+   * ⚠️ 仍需要有人**构造** host(`server/src/index.ts` 目前不存在)⇒
+   * 本参数只保证「有了就能传进来」,不保证「一定有人构造」。
+   */
+  host?: WorldSaveHost | null;
 }
 
 /* ═══════════════════════════ 4. RoomRuntime ═══════════════════════════ */
+
+/**
+ * 一次攻击结算的实际结果(供成功回执 + 断言)。
+ *
+ * 字段全部是**基本类型**:它要能跨 `net` → 传输层边界被序列化,
+ * 也刻意不引用模拟层的 `PipelineDamageResult`(理由同 `WorldSaveHost`)。
+ */
+export interface AttackReport {
+  tick: number;
+  playerId: string;
+  mobId: string;
+  /** `OUT_OF_AOI` = 目标不在活跃区,未结算;`OK` = 走到结算了。 */
+  outcome: 'OK' | 'OUT_OF_AOI';
+  /** 真实掉血(已钳制;尸体恒 0 —— task-33 契约)。 */
+  hpLoss: number;
+  /** 公式给出的伤害(可能被格挡/闪避归零,故与 `hpLoss` 不同)。 */
+  finalDamage: number;
+  /** 目标存在且结算了(`false` 通常意味着 `mobId` 不存在)。 */
+  hit: boolean;
+  outOfReach: boolean;
+  dodged: boolean;
+}
 
 /**
  * 房间可挂载的「世界存档源」。
@@ -277,12 +320,18 @@ export interface RoomRuntimeOptions {
  * `net → sim → db` 的编译期依赖,并把它变成 `room.ts` 的硬约束 ——
  * 那是本任务不需要的耦合。
  *
- * 这里只声明**用到的那一个方法**:谁提供它都行(模拟层满足它),
+ * 这里只声明**用到的那几个方法**:谁提供它都行(模拟层满足它),
  * 房间不关心实现。于是接线成本是一行,且不引入新的可达性边。
  *
  * ⚠️ 注意:本文件**有意不出现**模拟层的类型名 —— 一旦这里 import 了它,
  * US2 才真的变成过时条目(`scripts/backlog.ts` 的 US2 探针正盯着本文件)。
  * 现在两者依然互不依赖,只是**结构上可组合**。
+ *
+ * ## US2 起新增的攻击面(同样只用结构化类型)
+ *
+ * `attackMobAuthorized` 的返回被**就地展开成基本类型**,不引用
+ * `PipelineDamageResult` 等模拟层类型 —— 否则 `net` 就依赖 `combat` 了。
+ * 房间只关心四个整数/字符串:结果形态、掉了多少血、是否命中、目标死活。
  */
 export interface WorldSaveHost {
   saveToDb(
@@ -290,6 +339,48 @@ export interface WorldSaveHost {
     roomId: string,
     nowMs: number,
   ): { hpSaved: number; hpSkipped: number; memRow: number };
+  /**
+   * 玩家对某只生物发起一次**权威**攻击(等级/装备由模拟层自己派生)。
+   *
+   * 与 `saveToDb` 同一取舍:这是**结构化**声明,不 import 模拟层类型。
+   *
+   * @returns `null` = 没有这只生物;**`outcome`** 区分「结算了」与
+   *          「目标不在活跃区(AOI 外)」—— 后者不是错误,是闸门。
+   */
+  attackMobAuthorized(
+    playerId: string,
+    mobId: string,
+  ): {
+    outcome: 'OK' | 'OUT_OF_AOI';
+    /**
+     * `null` = 生物不存在。
+     *
+     * ⚠ 形状必须与 `WorldSim.attackMobAuthorized` **逐字段对齐** ——
+     * 伤害在 `result.finalDamage`(嵌套),不在顶层。
+     * 我第一版把 `finalDamage` 写在顶层,于是真实对象里它是
+     * `undefined`,经 `?? 0` 静默变成 0:回执永久上报「0 伤害」而
+     * **没有任何东西报错**(`worldSaveHost` 是结构化接口 + 装配处用了
+     * `as never`,两侧类型不对齐也不会红)。这类「字段路径写错」在本仓
+     * 属高发(见陷阱 2:签名/字段猜错),故这里写明嵌套关系。
+     */
+    hit: {
+      /** **已钳制**的真实掉血(task-33 契约;尸体恒 0)。 */
+      hpLoss: number;
+      result: {
+        finalDamage: number;
+        outOfReach: boolean;
+        dodged: boolean;
+      };
+    } | null;
+  };
+  /**
+   * 玩家的**权威等级**(来自进度档案 `progression`,不是网络投影)。
+   *
+   * 房间用它把 `state.players[].level` 从「恒 1 的默认值」变成**投影**
+   * (见 `syncLevelProjections`)。可选:老的世界源没实现它时,
+   * 等级投影整段跳过 —— 不报错,也不假装同步过。
+   */
+  levelOf?(playerId: string): number;
 }
 
 /**
@@ -344,6 +435,10 @@ export class RoomRuntime {
     this.state = createRoomState(this.id);
     this.ac = new AntiCheatRoom();
     this.lastActivityMs = this.clock.nowMs();
+    /* 世界源从构造参注入(见 `RoomRuntimeOptions.host` 的长注释):
+       缺省仍为 null,但**装配层现在有地方可传** —— 此前只能事后赋值,
+       而生产里那个赋值一处都不存在。 */
+    this.worldSaveHost = opts.host ?? null;
     if (db) {
       createRoom(db, {
         id: opts.roomId,
@@ -635,11 +730,72 @@ export class RoomRuntime {
     return v;
   }
 
-  applyAttack(userId: string, claimedBonus = 0): Verdict {
+  /**
+   * 攻击报文 → 反作弊闸 → **模拟层结算**(US2/task-47 接线)。
+   *
+   * ## 接线前 vs 接线后(实测)
+   *
+   * 接线前 `applyAttack` 只做 `ac.attack` 并丢弃结果:
+   * ```
+   * room.ts:638-642  applyAttack → this.ac.attack(...) → pendingViolations.push → return v
+   * ```
+   * 实测:玩家的生物 hp 60 → 攻击一次 → **60**(`lastHits` 长度 0、`hitCount` 0)。
+   * 即「按攻击键什么都不发生」。
+   *
+   * ## 协议设计(为什么是 `mobId` 而不是坐标/最近敌人)
+   *
+   * 报文携带**意图**:打**哪一只**(`mobId`)。
+   * - 客户端**不传**坐标:位置权威在 `physics.bodies`,由 `applyMove` 写入。
+   *   若让客户端传目标坐标,等于把「我在哪」这个判据交回客户端。
+   * - 客户端**不传** `level` / `wearing` / `weaponId` / `comboMul`:
+   *   这些是面板数据,一律由模拟层从权威档案派生
+   *   (`attackMobAuthorized` 的签名里根本没有它们)。
+   * - 服务端**不信任** `mobId` 本身 —— 它只是「我想打这只」,
+   *   能否打到由两道闸决定(AOI 活跃区 + 武器 `reach`)。
+   *
+   * ⇒ 客户端的自由度只剩「选择目标」,而**目标的合法性与可达性全在服务端**。
+   * 这是 CR-14 U1/U2 那族纪律在网络入口上的兑现。
+   *
+   * @param mobId 客户端指定的目标;缺省/非法时按「无目标」处理(不结算)。
+   */
+  applyAttack(userId: string, claimedBonus = 0, mobId?: string): Verdict {
     const v = this.ac.attack(userId, this.state.meta.tick, claimedBonus);
     if (v.violation) this.pendingViolations.push(v.violation);
+    if (!v.allowed) {
+      this.lastAttackReport = null;
+      return v;
+    }
+
+    /* 反作弊放行后才结算。没有世界 / 没有目标 ⇒ 只记「闸后无执行」,不谎报成功。 */
+    const host = this.worldSaveHost;
+    if (host === null || typeof mobId !== 'string' || mobId === '') {
+      this.lastAttackReport = null;
+      return v;
+    }
+
+    const authorized = host.attackMobAuthorized(userId, mobId);
+    const hit = authorized.hit;
+    this.lastAttackReport = {
+      tick: this.state.meta.tick,
+      playerId: userId,
+      mobId,
+      outcome: authorized.outcome,
+      hpLoss: hit?.hpLoss ?? 0,
+      finalDamage: hit?.result.finalDamage ?? 0,
+      hit: hit !== null,
+      outOfReach: hit?.result.outOfReach ?? false,
+      dodged: hit?.result.dodged ?? false,
+    };
     return v;
   }
+
+  /**
+   * 上一次攻击结算的实际结果;`null` = **没有发生结算**。
+   *
+   * 与 `lastSaveReport` 同一取舍:`null` 让「没接线」与「接了但这次没打中」
+   * 在断言里**可区分**,而不是都表现为「无事发生」。
+   */
+  lastAttackReport: AttackReport | null = null;
 
   /**
    * 反作弊物品检查 —— **权威值一律由服务端派生**(CR-14 U1)。
@@ -799,7 +955,57 @@ export class RoomRuntime {
         }
       }
     }
+    /* ⚠️ 必须在 `if (this.db)` **之外** —— 等级投影与有没有数据库无关。
+       (放进去的话,纯内存模式 `db === null` 就永远不同步等级,
+       而那正是测试最常用的形态。) */
+    this.syncLevelProjections();
     return prevSnapshot ? encodeDelta(prevSnapshot, this.state).bytes : new Uint8Array(0);
+  }
+
+  /**
+   * 把**权威等级**投影到 `state.players[].level`(W2「level 双写者」的裁决)。
+   *
+   * ## 两份等级的关系(这是 US2 必须显式处理的那一条)
+   *
+   * | 存在哪 | 是谁 | 谁会写 |
+   * | :--- | :--- | :--- |
+   * | `WorldSim.progresses[].level` | **权威**(升级经 `progression.ts` 真发生在这里) | 击杀结算 |
+   * | `state.players[].level` | **投影**(网络编码 + `carryCapacityOf` 读它) | **本方法** |
+   *
+   * 接线前实测:`room.ts` 里 `level` 赋值 **0 处** ⇒ 该字段恒为 schema
+   * 默认值 `1`,于是 30 级玩家的容量仍算 8(预期 37),而网络下发的等级
+   * 也是 1。**两套等级各活各的**(见 `docs/AUTHORITY-MAP.md` W2)。
+   *
+   * ## 为什么是「投影」而不是「双向同步」
+   *
+   * 只允许**权威 → 投影**单向流动。反向写(把 `state.players[].level`
+   * 灌回 `progresses`)会让两处互为依据、谁最后写谁算数 —— 那正是
+   * `CR-14 U1` 的病根形态(`beforeTotal` 由本帧 ops 反推 ⇒ 判据自指)。
+   *
+   * ## 为什么放在 `step()` 而不是 `applyAttack` 里
+   *
+   * 升级不只是攻击造成的(救援、任务、打盹经验都会发经验),
+   * 挂在攻击上会漏掉其余路径。放在每帧推进里,「权威一变,投影随即一致」,
+   * 且与 `saveToDb` 的 20 帧节流**同一个 tick 编号**,落盘与下发不会错位。
+   *
+   * ## 上界
+   *
+   * 这里**夹一次**上界。理由不是「模拟层可能溢出」(`combatantStats`
+   * 内部已钳到 `MAX_LEVEL`),而是**本字段的消费者不钳**:
+   * `carryCapacityOf` 直接 `8 + (lv - 1)`,而 `progression.statsAtLevel` 的口径
+   * 是 `8 + (L-1)` 且 `L` 已被钳 ⇒ 投影越界会让两处口径分歧。
+   * 该上界此前是**惰性**的(level 恒 1),接线后即时生效 ——
+   * 由 `WS-07 E18` 两侧扫描钉住(level=30 ⇒ 37;level=31 ⇒ 仍 37)。
+   */
+  private syncLevelProjections(): void {
+    const host = this.worldSaveHost;
+    if (host === null || typeof host.levelOf !== 'function') return;
+    for (const p of this.state.players) {
+      const lv = host.levelOf(p.id);
+      if (!Number.isFinite(lv)) continue;
+      const clamped = Math.max(1, Math.min(MAX_LEVEL, Math.trunc(lv)));
+      if (p.level !== clamped) p.level = clamped;
+    }
   }
 
   /**

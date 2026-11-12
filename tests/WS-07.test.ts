@@ -138,6 +138,9 @@ import {
   can,
   bootstrap,
 } from '../server/src/net/room.ts';
+/* task-57:生产装配入口 —— K5/K5b 用**生产路径**(而非手动赋值)证明接线。
+   ⚠️ 只依赖 `index.ts`(它刻意不 import colyseus 壳),故本套件仍可在 Node 下加载。 */
+import { assemble } from '../server/src/index.ts';
 
 import {
   BASE_ATTACK_INTERVAL_S,
@@ -4094,6 +4097,239 @@ test('task-38:包与装配层的模块形态 —— 列举式核对(防只读一
     'colyseus 在**四个依赖字段之一**里有声明 ⇒ 「未声明」这个全称结论不成立');
   eq(pkg.dependencies === undefined || Object.keys(pkg.dependencies).length === 0, true,
     'dependencies 确实为空 —— 但这**只是四个字段之一**,不能据此推「未装」');
+});
+
+/* ═══════════════ US2(task-47)网关联动契约 ═══════════════ */
+
+/**
+ * 一个**最小结构化 host 假件** —— 只实现房间会调的三个方法。
+ *
+ * ⚠️ 它**证明的是「契约设计正确」,不是「接线生效」**。
+ * 这两个命题必须分开说:本假件由测试**手动传入**,而生产里
+ * `server/src/index.ts` 不存在 ⇒ 没有人构造真 host(见 K5)。
+ */
+function fakeHost(o: {
+  level?: (id: string) => number;
+  onAttack?: (player: string, mob: string) => void;
+  hpLoss?: number;
+} = {}): {
+  saveToDb: () => { hpSaved: number; hpSkipped: number; memRow: number };
+  attackMobAuthorized: (p: string, m: string) => {
+    outcome: 'OK' | 'OUT_OF_AOI';
+    hit: { hpLoss: number; result: { finalDamage: number; outOfReach: boolean; dodged: boolean } } | null;
+  };
+  levelOf: (id: string) => number;
+} {
+  return {
+    saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+    attackMobAuthorized: (p, m) => {
+      o.onAttack?.(p, m);
+      return {
+        outcome: 'OK',
+        hit: {
+          hpLoss: o.hpLoss ?? 7,
+          result: { finalDamage: o.hpLoss ?? 7, outOfReach: false, dodged: false },
+        },
+      };
+    },
+    levelOf: o.level ?? (() => 1),
+  };
+}
+
+test('K1 host 为 null 时整个契约**整段跳过**:不报错、不假装、不留假回执', () => {
+  /* 这条钉住的是「没接线」与「接了但没打中」**可区分**。
+     若三处都不判 null,后果分别是:
+       · saveToDb:落盘报告谎报 hpSaved 数(实际没存)
+       · attackMobAuthorized:凭空造伤害(更糟)
+       · levelOf:把等级投影成本地猜测值
+     ⇒ 三者都必须「什么都不做」,且可观测。 */
+  const { rt } = newRoom(null);
+  eq(rt.worldSaveHost, null, '缺省构造 ⇒ host 为 null(生产就是这一支)');
+  rt.join({ userId: 'p1' });
+
+  /* ⚠️ 落盘那一段**必须带 db**,否则没有区分力。
+     第一版我写 `newRoom(null)` —— 而落盘分支嵌在 `if (this.db) { if (tick%20===0) ... }`
+     里,没有库时它根本不会执行,于是 `lastSaveReport` 无论 host 是否为 null
+     都是 null ⇒ 断言**恒真**(故障注入 J5 把 F18 判红、K1 归绿,正是这次抓到的)。
+     ⇒ 用带库的房,才真的走到 `if (this.worldSaveHost)` 那一行。 */
+  {
+    const db = new MemoryDb();
+    migrate(db, 1000);
+    const { rt: rtDb } = newRoom(db);
+    rtDb.join({ userId: 'owner' });
+    eq(rtDb.worldSaveHost, null, '带库的房:host 仍为 null(缺省)');
+    for (let i = 0; i < 40; i += 1) rtDb.step();
+    eq(rtDb.state.meta.tick, 40, '真的推进到 40 帧(跨过两次 tick%20==0)');
+    eq(rtDb.lastSaveReport, null,
+      'host=null 且真的走到落盘时机 ⇒ lastSaveReport 仍为 null(不谎报已落盘)');
+    /* 前置:证明「走到时机」这件事本身不是空的 —— world_tick 照常落盘(那一段与 host 无关)。 */
+    eq(getRoom(db, 'room_alpha')?.world_tick, 40,
+      '前置:world_tick 已落盘 ⇒ 确实执行到了落盘位置,不是整段被跳过');
+  }
+
+  /* 以下部分复用上面那个无库房 rt(攻击/等级投影与 db 无关)*/
+
+  /* 攻击:反作弊放行,但**不结算**、**不发假回执** */
+  rt.state.meta.tick = 100;
+  const v = rt.applyAttack('p1', 0, 'mob_sheep');
+  eq(v.allowed, true, '反作弊层照常放行(它与世界源无关)');
+  eq(rt.lastAttackReport, null, 'host=null ⇒ 不留攻击报告 ⇒ 上层发 `resolved:false`,不谎报命中');
+
+  /* 3 等级:投影不执行 ⇒ 保持 schema 默认值 1(而不是被猜成别的) */
+  const p = rt.state.players.find((x) => x.id === 'p1')!;
+  eq(p.level, 1, 'host=null ⇒ 等级投影整段跳过,保持默认 1(不猜)');
+  eq(rt.carryCapacityOf('p1'), 8, '容量按 level=1 ⇒ 8(与接线前一致,没有静默变化)');
+});
+
+test('K2 装配位存在:`host` 可经**构造参**注入(此前只能事后赋值)', () => {
+  /* 接线前 `worldSaveHost` 只有字段可写 ⇒ 装配必须「new 完再赋值」,
+     而生产里那个赋值**一处都不存在**。构造参让「有没有世界」在
+     建房间那一刻就必须表态。 */
+  const rt = new RoomRuntime({
+    roomId: 'k2', ownerId: 'o', clock: fixedClock(1000), host: fakeHost(),
+  });
+  ok(rt.worldSaveHost !== null, '构造参 host 真的被接上了(不是被忽略)');
+
+  /* 生效自检:注入后运行时取值真的变了(避免「注入了但没生效」判成断言没牙) */
+  rt.join({ userId: 'p1' });
+  rt.state.meta.tick = 100;
+  rt.applyAttack('p1', 0, 'mob_sheep');
+  ok(rt.lastAttackReport !== null, '生效自检:有 host ⇒ 真的产生了攻击报告');
+  eq(rt.lastAttackReport!.hpLoss, 7, '结算值来自 host(回执带的是 host 给的掉血)');
+});
+
+test('K3 权威等级经 host 投影到 state.players[].level(两侧扫描)', () => {
+  let lv = 1;
+  const rt = new RoomRuntime({
+    roomId: 'k3', ownerId: 'o', clock: fixedClock(1000), host: fakeHost({ level: () => lv }),
+  });
+  rt.join({ userId: 'p1' });
+  const p = rt.state.players.find((x) => x.id === 'p1')!;
+
+  /* 逐档扫描(单点区分不了「投影生效」与「本来就相等」) */
+  const cases: [number, number][] = [[1, 8], [10, 17], [20, 27], [30, 37], [31, 37], [9999, 37]];
+  for (const [input, expectCap] of cases) {
+    lv = input;
+    rt.step();
+    const expectLv = Math.max(1, Math.min(30, input));
+    eq(p.level, expectLv, `权威 ${input} ⇒ 投影等级 ${expectLv}`);
+    eq(rt.carryCapacityOf('p1'), expectCap, `权威 ${input} ⇒ 容量 ${expectCap}`);
+  }
+  /* 封顶两侧:30 与 31 **必须同为 37** —— 若只扫单点,「封顶」与
+     「线性增长」在这次测里不可区分。 */
+  lv = 30; rt.step();
+  const at30 = p.level;
+  lv = 31; rt.step();
+  eq(p.level, at30, '边界两侧:31 不得比 30 更高(封顶真的存在)');
+});
+
+test('K4 伪造面板进不了结算:报文只允许携带意图', () => {
+  /* 这是本任务的**灵魂**:客户端自报 `level`/`wearing`/`comboMul`
+     不得影响服务端派生值。判据用**结构性事实**:
+       `applyAttack` 的签名里根本没有面板参数 ⇒ 报文无从透传。 */
+  const seen: string[] = [];
+  const rt = new RoomRuntime({
+    roomId: 'k4', ownerId: 'o', clock: fixedClock(1000),
+    host: fakeHost({ onAttack: (p, m) => seen.push(`${p}:${m}`) }),
+  });
+  rt.join({ userId: 'p1' });
+  rt.state.meta.tick = 100;
+
+  /* 模拟一个「什么都报」的恶意报文:handler 只取 mobId,其余字段被丢弃 */
+  const evil = { mobId: 'mob_sheep', claimedBonus: 0, level: 9999, wearing: [712], comboMul: 1e9 };
+  rt.applyAttack('p1', evil.claimedBonus, evil.mobId);
+  eq(seen.length, 1, '攻击真的到达了模拟层');
+  eq(seen[0], 'p1:mob_sheep', '模拟层收到的只有「谁打谁」——没有任何面板字段');
+
+  /* 结构性证据:`applyAttack` 的形参表里没有面板位。
+     (签名是判据的**唯一**来源,注释可以漂移,形参不会。) */
+  const src = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.ts'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const sig = /applyAttack\(([^)]*)\)/.exec(src);
+  ok(sig !== null, '找得到 applyAttack 的签名');
+  const params = sig![1]!;
+  for (const bad of ['level', 'wearing', 'weaponId', 'comboMul']) {
+    ok(!params.includes(bad), `applyAttack 形参里不得出现 ${bad}(实际: ${params.trim()})`);
+  }
+  ok(params.includes('mobId'), '只允许 mobId 这类**意图**参数出现');
+});
+
+test('K5 ★ 装配入口**真的存在并注入 host**(原「缺口钉住」已按承诺改写为正向断言)', () => {
+  /* ## 这条的历史(重要,不要删)
+     它原本写的是 **`eq(entryExists, false)`** —— 「钉住缺口本身」。
+     当时的实测:`server/src/**` 里 `worldSaveHost = ...` 赋值 **0 处**,
+     `server/src/index.ts` **不存在** ⇒ 新接的 `levelOf` / `attackMobAuthorized`
+     与既有的 `saveToDb` **三者在运行期都不可达**(第 9 例「测试全绿 + 生产零消费」)。
+
+     ⚠️ 那条断言当时就写明:「一旦有人补出 index.ts 并注入 host,本断言会变红
+     —— 那时应当**改写成正向断言**,而不是删掉。」task-57 补出了 `index.ts`
+     ⇒ 它**如期变红**(实测 181/182,红 K5)⇒ **现改写为正向断言**。 */
+  const entry = join(ROOT_DIR, 'server', 'src', 'index.ts');
+  ok(existsSync(entry), '`server/src/index.ts` 存在(装配入口已补)');
+
+  const idxSrc = readFileSync(entry, 'utf8').replace(/\r\n/g, '\n');
+  /* 入口必须**真的**把 host 放进 rtOpts —— 而不是只定义了个 createHost */
+  ok(/host,/.test(idxSrc), 'assemble() 把 host 放进 rtOpts(不是只造了不用)');
+  ok(/new RoomRuntime\(/.test(idxSrc), '入口真的构造了 RoomRuntime');
+
+  /* ## 用**生产路径**证明接线通了(与我 K2/K3 的**手动假件**是两件事)
+     手动注入只能证明「契约可用」;这里证明「生产装配路径真的会注入」。 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  ok(a.runtime.worldSaveHost !== null,
+    '★ 经 `assemble()` 后 `runtime.worldSaveHost` 非 null ⇒ 接线在生产路径上真的发生');
+  eq(a.runtime.worldSaveHost, a.host, '运行时拿到的正是入口构造的那个 host(同一个对象)');
+
+  /* ## 两侧对照:不装配就没有 —— 否则上面那条可能只是「恒有」
+     这正是原 K1 钉住的不变量,这里作**负向对照**保留。 */
+  const bare = new RoomRuntime({ roomId: 'bare', ownerId: 'o', clock: fixedClock(1000) });
+  eq(bare.worldSaveHost, null, '负向对照:不经装配时不传 host ⇒ 仍为 null(不是恒有)');
+});
+
+test('K5b ★ 经生产装配后,攻击与等级**真的结算**(不再 resolved:false)', () => {
+  /* 这条是 K5 的**行为级**证据:光「host 非 null」还不够,
+     要真的走通「报文 → 反作弊 → 模拟层结算 → 回执」全链。 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  /* 世界初始化不属于本任务;这里显式放入玩家与怪,便于把焦点放在**接线**上。 */
+  const sim = a.host as unknown as {
+    addPlayer(id: string, x: number, y: number): void;
+    addMob(id: string, biome: string, x: number, y: number): void;
+  };
+  sim.addPlayer('p1', 10, 10);
+  sim.addMob('mob_sheep', 'MEADOW', 11, 10);
+
+  a.runtime.join({ userId: 'p1' });
+  a.runtime.state.meta.tick = 100;
+  const v = a.runtime.applyAttack('p1', 0, 'mob_sheep');
+  eq(v.allowed, true, '反作弊放行');
+  const rep = a.runtime.lastAttackReport;
+  ok(rep !== null, '★ 经**生产装配**后产生了攻击报告(接线前恒为 null ⇒ resolved:false)');
+  eq(rep!.outcome, 'OK', '结算走到 OK');
+  ok(rep!.hpLoss > 0, `真实掉血 ${rep!.hpLoss} > 0 ⇒ 确实打中了(不是空转)`);
+  eq(rep!.finalDamage, 10, '伤害值来自权威档案(裸装 10)');
+
+  /* 对照:同一路径不装配时**不谎报** —— 让「接通」与「没接通」可区分。 */
+  const bare = new RoomRuntime({ roomId: 'bare2', ownerId: 'o', clock: fixedClock(1000) });
+  bare.join({ userId: 'p1' });
+  bare.state.meta.tick = 100;
+  bare.applyAttack('p1', 0, 'mob_sheep');
+  eq(bare.lastAttackReport, null, '负向对照:不装配 ⇒ 报告为 null(上层发 resolved:false)');
+});
+
+test('K6 装配位不得让 US2 探针误报:net 层仍不含模拟层符号(代码态)', () => {
+  /* `scripts/backlog.ts` 的 US2 探针是 `/WorldSim|world_sim/`,跑在
+     **代码态**文本上(注释与字符串都被擦掉)。
+     ⇒ 用 `WorldSaveHost` 这个**结构化接口**就安全;
+       一旦有人改成 import 模拟层类型,US2 会**误报为已开**。
+     本断言用与探针**同一口径**(去注释)复核这一点,防止将来改动踩它。 */
+  const strip = (s: string): string => s
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  const files = ['server/src/net/room.ts', 'server/src/net/room.colyseus.ts'];
+  for (const f of files) {
+    const code = strip(readFileSync(join(ROOT_DIR, f), 'utf8').replace(/\r\n/g, '\n'));
+    ok(!/WorldSim|world_sim/.test(code),
+      `${f} 的**代码态**不含 WorldSim/world_sim(注释里提到不算)⇒ US2 探针不会误报`);
+  }
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

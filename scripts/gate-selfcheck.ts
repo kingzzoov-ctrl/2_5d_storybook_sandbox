@@ -144,14 +144,30 @@ const CASES: Case[] = [
   } as Case,
   {
     group: 'T37',
-    name: 'attack handler 加上成功执行 ⇒ 登记应报「不再是该形态」',
-    file: 'server/src/net/room.colyseus.ts',
-    from: '',
-    to: '',
+    name: '把**已修好的** attack 重新塞回登记 ⇒ 应报「不再是该形态」',
+    /* ⚠️ 本用例于 task-47(阶段 A)被**换向**,原因值得记下:
+       原用例「给 attack 加成功执行 ⇒ 应报不再是该形态」在 attack **已被移出登记**
+       之后**永远不可能变红** —— 它注入的 handler 门禁已不再检查。
+       ⇒ 变红失败**不等于**「门禁失效」,而是**用例本身过期**。
+       这与 T37 自己注释里的警告是同一件事(`pickVerdictGuard` 的理由),
+       只是这次过期的是**登记侧**而不是锚点侧。
+
+       ⇒ 换向后的用例测**相反且更有价值**的方向:
+         把一条**已经修好**(handler 有成功路径)的登记项重新加回注册表 ⇒
+         门禁必须报「不再是该形态」,否则
+         **这份登记会腐烂成一份假的清单**(登记说「无执行」而实际有执行)。
+
+       ⇒ 它钉住的不变量是:`VERDICT_HANDLER_KNOWN` 里的每一条都必须
+         **真的**处于「成功路径为空」形态。 */
+    file: 'scripts/verify.ts',
+    from: 'const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([\n',
+    to: 'const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([\n'
+      + "  ['server/src/net/room.colyseus.ts::attack', "
+      + "{ successPath: '**无**', evidence: 'gate-selfcheck 注入项' }],\n",
     expect: 'red',
     wantMsg: /不再是该形态/,
     args: ['--frozen'],
-    mark: 'inert-attack',
+    mark: '',
   } as Case,
 
   /* ═══ T34:新增的「生产零引用」门禁必须能失败 ═══
@@ -448,7 +464,14 @@ const CASES: Case[] = [
     from: "'client/src/main.ts', // client/index.html → <script src=\"./src/main.ts\">",
     to: '/* 自检探针:故意摘掉客户端入口 */',
     expect: 'any',
-    wantMsg: /入口 2 个/,
+    /* ⚠️ 本数字 = `PROD_ENTRIES.length - 1`(摘掉一条后剩下的)。
+       它**随 PROD_ENTRIES 增删而变**,是本用例唯一需要手工跟的数字。
+       本轮实测修正:task-57 补入 `server/src/index.ts` 后
+         PROD_ENTRIES 3 → 4 ⇒ 摘掉客户端出口后由 `2 个` 变 **`3 个`**。
+       与 T32-d「白名单条数必须取实测」是**同一类要求**,只是这一条自带一个常量。
+       ⇒ 维护规则:改了 `PROD_ENTRIES` 的**条数**,就回来改这里;
+         忘了改的表现是「消息未命中 ✗」(而 `expect: 'any'` 会让它看起来像软失败)。 */
+    wantMsg: /入口 3 个/,
     args: ['--frozen'],
   },
 
