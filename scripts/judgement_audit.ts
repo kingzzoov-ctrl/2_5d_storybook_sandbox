@@ -39,10 +39,38 @@
  * 本脚本**不写任何文件**。它自己在运行前后对所有被扫文件取 SHA-256,
  * 若发现任何变化就 `fail` —— 用**自证**代替「我保证我没改」。
  *
+ * ## ⚠️ 两个「扫到自己」的坑(都在开发中真实踩到)
+ *
+ * ```
+ * ① 本工具会扫到**它自己的登记表**(scripts/judgement_baseline.ts)
+ *    理由:登记表里逐条抄了被报行的原文当 needle(那是它判定的依据)
+ *    ⇒ 若不显式跳过,登记表自己会被扫出 4 处 C 形态
+ *    ⇒ 而且它是**永远新增**(自己扫自己)⇒ **门禁永远红,且看起来像"每天多 4 个问题"**
+ *    ⇒ 已修:扫到 0 个文件/命中数异常时先看这里
+ *
+ * ② `where` 的行文本**可能含冒号**,不能用 split(':') 解析
+ *    where 的格式是 `path:LINE  行文本`,而行文本自身就常有冒号:
+ *       正则里的 \s*:  /  URL 里的 https://  /  三元 a ? b : c
+ *    ⇒ `split(':')` 会在行内第一个冒号处截断 ⇒ lineText 只剩半句
+ *    ⇒ **已登记的项匹配不上 ⇒ 被误报成「新增」**
+ *    ⇒ 实测首跑报了 7 处「新增」,其中 4 处其实是已登记的
+ *    ⇒ 已修:用 `indexOf(':')` 只切第一个冒号
+ * ```
+ *
+ * ⇒ 两者的共同形态:**工具的口径比它处理的对象窄,而对象是它自己**。
+ *   这类比「扫被测代码」时口径窄更隐蔽 —— 输出看起来像「发现了新问题」。
+ *
+ * ## 启发式边界要标**在输出上**(不能只写在注释里)
+ *
+ * 给出 `heuristic` 字段的检测器,其命中会在输出里带 `[X?]` 前缀与说明。
+ * 理由:**没人读 JSDoc,但所有人都会读门禁输出**。
+ * 不标的话,看输出的人会把「启发式候选」当成「确证缺陷」。
+ *
  * 用法:
  * ```
- * node scripts/judgement_audit.ts          # 报告
- * node scripts/judgement_audit.ts --strict # 有未登记命中即 exit 1
+ * node scripts/judgement_audit.ts              # 报告,命中不导致失败
+ * node scripts/judgement_audit.ts --baseline   # ★ 门禁模式:只对**超出登记表的新增**报红
+ * node scripts/judgement_audit.ts --strict     # 人工审计:任何命中都红(接门禁别用,会全红)
  * ```
  */
 
@@ -218,6 +246,15 @@ type Detector = {
   what: string;
   /** 为什么这算问题 */
   why: string;
+  /**
+   * ★ 启发式标记 —— **标注边界必须标在输出上,不能只标在 JSDoc 里(没人读 JSDoc)**。
+   *
+   * 给出这个字段的检测器,其每条命中都会带上 `[C?]` 前缀与这里的说明。
+   * 用途:防止看门禁输出的人把「启发式候选」当成「确证缺陷」。
+   *
+   * 留空 = 该检测器的判定是**确定性**的(命中即确证形态存在)。
+   */
+  heuristic?: string;
   /** 在给定源码文本上找命中项(返回人可读的定位串) */
   detect: (source: string, path: string) => string[];
   /** ★ 区分力自检:脏样本必须命中,干净样本必须不命中 */
@@ -401,6 +438,19 @@ const hasDynamicImportCoverage = (s: string): boolean =>
 const DET_C: Detector = {
   id: 'C',
   what: 'import 探测只认 from,未覆盖裸副作用导入与动态 import()',
+  /**
+   * ★ 启发式边界(Lead 2026-11-13 要求「标注要标在输出上」)。
+   *
+   * 本检测器**连续三版**都是同一个失效形态:
+   * ```
+   * 「检测器自己的覆盖判定」比「被测代码的真实覆盖」**窄** ⇒ 假阳性
+   * ```
+   * 已登记的 18 处里,5 处标注为「假阳性」,全部属于这类。
+   * ⇒ 判定偏窄是本检测器的**已知属性**,不是待修 bug
+   *   (继续修 = 用工作量换一个仍不完美的判定;不标注 = 用不完美冒充完美)。
+   * ⇒ 故输出上必须带 `[C?]`,提示**逐条人工复核**。
+   */
+  heuristic: '本检测器的「覆盖判定」已知偏窄 —— 报出的「未覆盖」必须逐条人工复核,不能直接当缺陷',
   why: '`import\'./x.ts\'` 与 `await import(\'./x.ts\')` 都不含 from ⇒ 漏检 ⇒ 依赖图少边 ⇒ 可达性/单一来源类判据静默失效(task-57:我 FND9-14 初版即此形态,已修)',
   detect: (source, path) => {
     const out: string[] = [];
@@ -580,10 +630,15 @@ for (const d of DETECTORS) {
   const selfOk = selfResults.find((r) => r.id === d.id)?.ok === true;
   const newCount = hits.filter((h) => !h.registered).length;
   const mark = newCount === 0 ? '✓' : '⚠';
+  /* ★ 启发式标记打**在输出上**(不是只在 JSDoc 里 —— 没人读 JSDoc) */
+  const hz = d.heuristic === undefined ? '' : ` [${d.id}?]`;
   console.log(`  ${mark} ${d.id} ${d.what}:${hits.length} 处${newCount > 0 ? ` —— 新增 ${newCount}` : ''}${selfOk ? '' : '(自检未过,勿信)'}`);
+  if (d.heuristic !== undefined) {
+    console.log(`      ⚠️ [${d.id}?] ${d.heuristic}`);
+  }
   for (const h of hits) {
     const tag = h.registered ? `[已登记·${h.verdict}]` : '[新增]';
-    console.log(`      ${tag} ${h.where}`);
+    console.log(`      ${tag}${hz} ${h.where}`);
   }
 }
 
@@ -624,7 +679,18 @@ if (USE_BASELINE && (bad || newHits.length > 0)) {
   } else {
     console.log(`\n[--baseline] ✗ 有 ${newHits.length} 处**未登记**的新增命中 ⇒ exit 1`);
     console.log('  逐条处置:① 修 ② 定性后登记进 scripts/judgement_baseline.ts ③ 修检测器(若是假阳性)');
-    for (const h of newHits) console.log(`      [${h.detector}] ${h.where}`);
+    for (const h of newHits) {
+      const d = DETECTORS.find((x) => x.id === h.detector);
+      const hz = d?.heuristic === undefined ? '' : ` [${h.detector}?]`;
+      console.log(`      [${h.detector}]${hz} ${h.where}`);
+    }
+    /* ★ 启发式类的边界说明也要出现在这里 —— 决定「修 or 登记」的人看的是这段输出 */
+    const hzUsed = newHits
+      .map((h) => DETECTORS.find((x) => x.id === h.detector))
+      .filter((x) => x?.heuristic !== undefined);
+    for (const d of new Set(hzUsed)) {
+      if (d?.heuristic !== undefined) console.log(`      ⚠️ [${d.id}?] ${d.heuristic}`);
+    }
   }
   process.exit(1);
 }
