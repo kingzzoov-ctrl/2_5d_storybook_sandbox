@@ -2412,11 +2412,28 @@ test('G06 端到端:16 人满房 + 1 人被踢 + 1 人重连,计数正确', () =
 /* ═══════════════════════════════════════════════════════════════════════
  * H. Colyseus 装配层字段等价校验(task-13)
  *
- * 背景:`server/src/net/schema.colyseus.ts` 有 45 个 `@type` 装饰器,
+ * 背景:`server/src/net/schema.colyseus.ts` 有 **44 个行首** `@type` 装饰器
+ * (第 45 处是 `:182` 注释里的残留文本,不生效 —— 两个数都对,口径不同),
  * 装饰器在 Node strip-only 下是**运行时拒绝**(`.ts`/`.js` 都抛
- * `Invalid or unexpected token`),且 Colyseus 是 optionalDependency
- * 未安装 —— 所以**不能 import 该文件来测**。而 `assertSchemaReady()`
- * 在生产被 `room.colyseus.ts:73` 调用,却零测试驱动。
+ * `Invalid or unexpected token`)—— 所以**不能 import 该文件来测**。
+ *
+ * ⚠️ **本注释在 2026-11-12 修正过两处**(原写「45 个」+「Colyseus 未安装」):
+ *   1. 「Colyseus 是 optionalDependency **未安装**」→ 实测 **已装 v0.15.57**
+ *      (在 `optionalDependencies` 而非 `dependencies`,后者是 `{}` —— 只看后者会误判)。
+ *      ⇒ **「不能 import」的真因只有一个:装饰器**,与包无关。原注释把两条理由并列,
+ *        其中一条是错的:后来者装了包、以为能 import,会发现仍不行却不知为何。
+ *      (**修法也因此不同**:缺包 `npm i` 即可;装饰器需构建步骤或改用零依赖替身。)
+ *   2. 装饰器计数 44(行首,真实生效)vs 45(含 `:182` 注释残留)。
+ *
+ * ⚠️ **第二个独立阻塞点(同日发现,与包无关)**:本文件的依赖
+ * `room.colyseus.ts:19` 用的是**命名导入** `import { Room, Client } from 'colyseus'`,
+ * 而 `colyseus` 是 **CommonJS**(`type` 未设、`main: ./build/index.js`)——
+ * 命名导入会抛 `Named export 'Room' not found`。实测:
+ * `import { Room }` ✗ / `import c from 'colyseus'` ✓ / `import * as c` ✓。
+ * ⇒ **就算把 44 处装饰器全去掉,该文件依然 import 失败。修法清单是两条,不是一条。**
+ *
+ * 注:`readFileSync` 文本解析的做法**本身仍然正确**(理由见下),只是给后来者的归因错了。
+ * 而 `assertSchemaReady()` 在生产被 `room.colyseus.ts:73` 调用,却零测试驱动。
  *
  * 做法:**文本解析 + 集合比对**,把判据独立复现,不依赖装饰器能否执行。
  * 这不是「退而求其次」—— 它测的是**源码事实**(字段名、注解类型、生产调用点),
@@ -3251,6 +3268,254 @@ test('task-40 判定:prediction 是**客户端**模块,已搬到 client/src/net/
  *      搬迁后它会自己报出 `server/src/net/prediction.ts(文件不存在)`。
  *      在此再断言一遍属于同一判据的第二套词法 —— 正是本仓已发生过
  *      「两套词法互相矛盾」的教训。 */
+
+/* ═══ task-38:「动作面」缺陷 —— 授权存在,执行不存在 ═══ */
+
+/* 这一类缺陷**两套清单都查不出**,因为它不是「模块不可达」:
+ * `room.ts` 可达、`authorize` 可达、`RoomAction` 可达 —— 全都可达。
+ * 缺的是**「被授权之后的那一步」**。
+ *
+ * 判据不是可达性,而是**「授权数量 vs 执行数量」的落差**。
+ * 门禁查不到「声明了 22 个动作、只有 3 个能真的发生」这种形态。 */
+
+test('task-38 【真缺陷】RoomAction 声明 22 个动作,生产只有 3 条通道能改变世界', () => {
+  /* ① 动作面:声明了多少 */
+  const declared = Object.values(RoomAction);
+  eq(declared.length, 22, 'RoomAction 声明 22 个动作');
+
+  /* ② 通道面:客户端真实能发的消息 */
+  const roomColyseus = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
+  const messages = [...roomColyseus.matchAll(/this\.onMessage\('(\w+)'/g)].map((m) => m[1]!);
+  eq(messages.join(','), 'move,attack,inventory,action',
+    '客户端消息面恰好 4 条');
+
+  /* ③ ★ 核心:其中 'action' **只验权限,不执行动作**。
+   *    证明方式:该 handler 的函数体里除 authorize 外**没有第二个 runtime 调用**。 */
+  const actionHandler = /onMessage\('action'[\s\S]*?\n    \}\);/.exec(roomColyseus)![0];
+  includes(actionHandler, 'authorize', "action handler 调 authorize");
+  const otherCalls = [...actionHandler.matchAll(/this\.runtime\.(\w+)\s*\(/g)]
+    .map((m) => m[1]!).filter((n) => n !== 'authorize');
+  eq(otherCalls.length, 0,
+    `action handler 除 authorize 外无其它 runtime 调用 ⇒ 授权后**没有执行者**`
+    + `(若不为 0,实际调用:${otherCalls.join(', ')})`);
+  ok(!/else/.test(actionHandler),
+    'action handler 没有 else 分支 ⇒ allowed=true 时**静默返回**,连回执都没有');
+
+  /* ④ 三条真正生效的通道作对照 —— 证明「通道」这个概念本身是可行的。 */
+  const performing: string[] = [];
+  for (const m of messages) {
+    if (m === 'action') continue;
+    const seg = new RegExp(`onMessage\\('${m}'[\\s\\S]*?\\n    \\}\\);`).exec(roomColyseus)![0];
+    const call = /this\.runtime\.(\w+)\s*\(/.exec(seg);
+    if (call) performing.push(`${m}→${call[1]}`);
+  }
+  eq(performing.length, 3,
+    `能改变世界的通道恰好 3 条:${performing.join(', ')}`);
+  for (const want of ['applyMove', 'applyAttack', 'applyInventory']) {
+    ok(performing.some((p) => p.endsWith(want)), `${want} 在生效通道里`);
+  }
+});
+
+test('task-38 【真缺陷】authorize 是**纯判定**:房主被允许全部 22 个动作,状态却零变化', () => {
+  /* ★ 这是「静默空操作」的运行时实证 —— 不是读代码推断的。
+   * 若无此断言,「22 个动作被允许」会被误读成「22 个功能可用」。 */
+
+  const c = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: 't38_action', ownerId: 'owner', clock: c.clock });
+
+  const a = rt.join({ userId: 'owner' });
+  eq(a.ok, true, '房主加入');
+  eq(a.role, RoomRole.OWNER, '房主角色是 OWNER');
+
+  /* ① 房主**被允许**全部动作 —— 权限系统看起来完全可用。 */
+  const declared = Object.values(RoomAction);
+  const allowedList = declared.filter((act) => rt.authorize('owner', act).allowed);
+  eq(allowedList.length, declared.length,
+    `OWNER 被允许全部 ${declared.length} 个动作(权限系统自身是完整的)`);
+
+  /* ② ★ 但把它们**全跑一遍**,权威状态**一个字节都不变**。
+   *    用序列化长度作指纹:`cloneState()` 是纯数据快照,能反映任何字段变化。 */
+  const before = JSON.stringify(rt.cloneState());
+  for (const act of declared) rt.authorize('owner', act);
+  const after = JSON.stringify(rt.cloneState());
+  eq(JSON.stringify(rt.cloneState()), before,
+    'authorize 无副作用(纯查表)—— 是事实,但**不足以**推出「无执行层」');
+
+  /* 2b ★ 真正的支点:成功分支为空。`if (!gate.allowed) reject;` 之后**再无语句**。
+   *    (我第一版把「2a 的零变化」当结论 —— 那是错的证据链,mob-boss-ai 指出、
+   *     我复核后确认成立:`authorize` 是纯函数,纯函数当然不改状态。
+   *     更糟:若有人给 action 加真执行却仍让 authorize 保持纯,旧断言会**照样绿**。) */
+  const roomColyseus2 = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
+  const actionBody = /onMessage\('action'[\s\S]*?\n    \}\);/.exec(roomColyseus2)![0];
+  const codeLines2 = actionBody.split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^\/[\/*]|^\*/.test(l));
+  /* ⚠️ 期望值是 **4** 不是 3 —— 我第一版写 3 并失败:
+   *    handler 的代码行是「onMessage 头 / authorize / reject / `});` 收尾」。
+   *    断言写错时**先怀疑自己**:实测打印后才定的这个数。 */
+  eq(codeLines2.length, 4,
+    `action handler 只有 4 行代码(onMessage 头 / authorize / reject / 收尾)`
+    + ` ⇒ 成功分支确为空(实际 ${codeLines2.length} 行:${codeLines2.map((l) => l.slice(0, 30)).join(' ‖ ')})`);
+
+  /* ③ 对照组:applyMove 立刻改变状态 —— 证明「(2) 的零变化」是因为
+   *    authorize 不执行,而不是因为快照机制不敏感。
+   *    ⚠️ 两点实测踩坑:
+   *      a) `cloneState().players` 是**数组**(不是 Map),元素含 `id`。
+   *      b) 位移必须**合法**:反作弊上限 `maxDisplacementPerTick() ≈ 0.36`,
+   *         我第一版写 `x0 + 5` 被卡掉,于是「x 没变」——**那会让对照组自证失败**,
+   *         误得出「快照机制不敏感」的反向结论。 */
+  rt.join({ userId: 'p2' });
+  type Snap = { players: { id: string; x: number }[] };
+  const findX = (): number => {
+    const s = rt.cloneState() as unknown as Snap;
+    const row = s.players.find((q) => q.id === 'p2');
+    ok(row !== undefined, '能在快照里按 id 找到 p2');
+    return row!.x;
+  };
+  const x0 = findX();
+  const step = maxDisplacementPerTick() * 0.5;   /* 半个上限,确保合法 */
+  const mv = rt.applyMove('p2', { tick: 1, x: x0 + step, y: 0.5, z: 0 });
+  eq(mv.allowed, true, `位移 ${step.toFixed(4)} 在上限内,反作弊放行`);
+  const x1 = findX();
+  ok(x1 !== x0,
+    `applyMove 把 x 从 ${x0} 改到 ${x1} ⇒ 快照机制是敏感的,`
+    + `所以上面的「零变化」是真结论,不是断言写错`);
+
+  /* ④ 第二个敏感性对照:`meta` 分区也在快照里,且真能被驱动。
+   *    这同时是 task-38 的另一条证据:`partyMode` **可驱动**,
+   *    而 `partyTimer` / `scoreA` / `scoreB` **从不被驱动**(全仓只在
+   *    schema.ts 内出现,无任何赋值点)。 */
+  type Meta = { meta: { partyMode: number; partyTimer: number; scoreA: number; scoreB: number } };
+  const metaBefore = (rt.cloneState() as unknown as Meta).meta;
+  eq(metaBefore.partyMode, 0, '初始 partyMode = 0(NONE)');
+  eq(metaBefore.partyTimer, 0, 'partyTimer 初始 0');
+  rt.setPartyModeBy('owner', PartyMode.PAINT_WAR);
+  const metaAfter = (rt.cloneState() as unknown as Meta).meta;
+  eq(metaAfter.partyMode, Object.values(PartyMode).indexOf(PartyMode.PAINT_WAR),
+    `setPartyModeBy 真的改了快照里的 partyMode(${metaBefore.partyMode} → ${metaAfter.partyMode})`
+    + ` ⇒ meta 分区也在快照覆盖内`);
+  /* ★ 但计分与计时**从来不跟着动** —— 这就是「有字段、无运行时」的实证。 */
+  eq(metaAfter.partyTimer, 0, 'partyTimer 仍为 0 ⇒ 从无代码驱动它');
+  eq(metaAfter.scoreA, 0, 'scoreA 仍为 0 ⇒ 从无代码驱动它');
+  eq(metaAfter.scoreB, 0, 'scoreB 仍为 0 ⇒ 从无代码驱动它');
+});
+
+test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是执行者', () => {
+  /* 这条把 task-38 的「暂不接」判据精确化。
+   * 我原先与 mob-boss-ai 都判「等 US2(room 持有 sim)」,
+   * 但更精确的说法是:**等待「动作执行管线」这一层** ——
+   * 权限位早就定义好了,连房主都已被授权,唯独没有执行者。 */
+  const declared = Object.values(RoomAction);
+
+  /* 驯服:taming.ts 若要被驱动,需要一个「繁殖/驯服」动作的入口。 */
+  ok(declared.includes(RoomAction.BREED_TAME),
+    'RoomAction.BREED_TAME **已定义** ⇒ 驯服不是「没人想过」');
+
+  /* 派对:modes.ts 同理。 */
+  ok(declared.includes(RoomAction.START_PARTY), 'RoomAction.START_PARTY 已定义');
+  ok(declared.includes(RoomAction.SET_PARTY_MODE), 'RoomAction.SET_PARTY_MODE 已定义');
+
+  /* 而这三个都**没有执行者**(由 verify.ts 的 ACTION_PERMISSION 定义域可证:
+   * 它们只有「需要哪个权限位」的登记,没有对应的执行方法)。 */
+  const roomSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  for (const missing of ['breedTame', 'startParty', 'beginPartyMode']) {
+    ok(!new RegExp(`\\b${missing}\\s*\\(`).test(roomSrc),
+      `room.ts 没有 ${missing}() ⇒ 该动作无执行者`);
+  }
+
+  /* ⇒ 结论固化:动作**声明**数远大于**可执行**数。这个落差是本缺陷的度量。 */
+  const executable = ['MOVE', 'ATTACK', 'PLACE_BLOCK', 'BREAK_BLOCK', 'PICKUP_ITEM',
+    'DROP_ITEM', 'CRAFT', 'USE_ALCHEMY_FURNACE', 'OPEN_CHEST', 'USE_OWN_CHEST', 'SLEEP',
+    'START_PARTY', 'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
+    'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME'];
+  eq(executable.length, declared.length, '逐条枚举覆盖全部动作(防止未来加动作时漏登记)');
+});
+
+/* ═══ task-38:「可达 ≠ 可跑」—— 生产入口可跑性的**结构**判据 ═══ */
+
+/* 这一类缺陷两套清单都查不出:模块**可达**(甚至是生产入口),却**无法加载**。
+ *
+ * ⚠️ 本组用**静态**判据,不 `await import()` —— 实测发现动态 import **不是安全探针**:
+ * `server/src/sim/demo.ts` 的顶层会**直接跑 200 帧模拟并打印整张报告**
+ * (它是 `npm run sim` 的入口,顶层即副作用)。在测试里 import 它会真的跑一遍模拟。
+ * ⇒ 所以这里改为**静态判定「已知阻塞形态」**,与 `schema.colyseus.ts` 那组的做法一致。 */
+
+test('task-38 【真缺陷】生产入口 room.colyseus.ts 无法加载 —— 两个**独立**阻塞点', () => {
+  const rcSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
+
+  /* 阻塞点 1:依赖链上的 `schema.colyseus.ts` 含装饰器(Node strip-only 不解析)。
+   * ⇒ `room.colyseus.ts` 自己 **0 处装饰器**,是被依赖拖垮的。 */
+  const ownDecos = [...rcSrc.matchAll(/^\s*@(\w+)/gm)].length;
+  eq(ownDecos, 0, 'room.colyseus.ts 自身 **0 处**装饰器 ⇒ 它是被依赖拖垮的');
+
+  const scSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'schema.colyseus.ts'), 'utf8');
+  const depDecos = [...scSrc.matchAll(/^\s*@(\w+)/gm)].length;
+  /* ⚠️ 行首计数 = **真实生效**的装饰器数(44)。
+   *    `@type(` 的字面出现数是 45 —— 差 1 处在 `:182` 注释里(残留文本,不生效)。
+   *    两个数都对;断言取**行首**口径,因为它才是「会被解析的」。 */
+  eq(depDecos, 44, 'schema.colyseus.ts 有 44 处**生效**装饰器(行首口径;含注释为 45)');
+  ok(rcSrc.includes('schema.colyseus'),
+    'room.colyseus.ts 确实依赖 schema.colyseus.ts ⇒ 被其装饰器拖垮');
+
+  /* 阻塞点 2(与包无关、与装饰器无关):命名导入 ↔ CommonJS。
+   * ⇒ **就算 44 处装饰器全去掉,该文件依然 import 失败。修法清单是两条。** */
+  includes(rcSrc, "import { Room, Client } from 'colyseus'",
+    '用的是**命名导入**');
+  const cjs = JSON.parse(readFileSync(join(ROOT_DIR, 'node_modules', 'colyseus', 'package.json'), 'utf8'));
+  ok(cjs.type === undefined,
+    `colyseus 是 CommonJS(\`type\` 未设)—— 命名导入会抛 Named export not found`);
+  ok(typeof cjs.main === 'string' && cjs.main.endsWith('.js'),
+    `colyseus 的 main = ${cjs.main} ⇒ CJS 入口`);
+
+  /* ★ 并证明它「已装」—— 原注释写「未安装」是**过期的**。
+   *   包在 `optionalDependencies` 而非 `dependencies`(后者是 `{}`)——
+   *    只读后者会误判「未装」(我与 mob-boss-ai 各踩过一次)。 */
+  const pkg = JSON.parse(readFileSync(join(ROOT_DIR, 'package.json'), 'utf8'));
+  ok(!pkg.dependencies || !pkg.dependencies.colyseus,
+    '`dependencies` 里**没有** colyseus —— 只看这个字段会误判「未装」');
+  ok(typeof pkg.optionalDependencies?.colyseus === 'string',
+    `colyseus 在 optionalDependencies(${pkg.optionalDependencies?.colyseus})⇒ 声明已装`);
+  /* ⚠️ 我第一版写 `parseInt(cjs.version) >= 0` —— **恒真**(任何版本号都 ≥ 0),
+   *    故障注入(把版本改成 0.15.0)漏掉了。这是本仓反复出现的「同义反复断言」。
+   *    改成:**实测版本必须满足清单声明的 semver 下界**(`^0.15.17` ⇒ ≥ 0.15.17)。
+   *    这样「装了但是个不满足声明的旧版」也会红。 */
+  const declared = String(pkg.optionalDependencies.colyseus).replace(/^[\^~]/, '');
+  const num = (s: string): number[] => (s.split('.').map((x) => Number.parseInt(x, 10)));
+  const [aMaj, aMin, aPat] = num(cjs.version);
+  const [dMaj, dMin, dPat] = num(declared);
+  const installedGeDeclared = aMaj! > dMaj!
+    || (aMaj === dMaj && (aMin! > dMin! || (aMin === dMin && aPat! >= dPat!)));
+  ok(installedGeDeclared,
+    `实测 v${cjs.version} 满足清单声明的 ^${declared}(下界)`
+    + ` ⇒ **确已安装**,原注释「未安装」已过期`);
+
+  /* 判据固化:凡生产入口,必须能被加载。这里断言「已知不可加载的入口」清单
+   * 与我们实测一致 —— 若将来有人修好了,本条会红,提醒**同步删除本断言**。 */
+  const verifySrc = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8');
+  includes(verifySrc, "'server/src/net/room.colyseus.ts'",
+    'room.colyseus.ts 在 PROD_ENTRIES 里(是生产入口)');
+  ok(rcSrc.includes('onMessage'),
+    '它确实承载客户端消息面 ⇒ 「入口跑不到」意味着这些 handler 零测试可覆盖');
+});
+
+test('task-38:包与装配层的模块形态 —— 列举式核对(防只读一个字段的全称结论)', () => {
+  /* 我踩过的坑:`dependencies = {}` ⇒ 判「未装」。
+   * `mob-boss-ai` 同型踩过一次。
+   * ⇒ 这件事本身就是一条陷阱:**用一个不完整的字段得出全称结论**。
+   * 本断言把「相关字段」**逐条列举**,漏读任何一个都会在本条里暴露。 */
+  const pkg = JSON.parse(readFileSync(join(ROOT_DIR, 'package.json'), 'utf8'));
+  const fields = ['dependencies', 'optionalDependencies', 'devDependencies', 'peerDependencies'];
+  for (const f of fields) {
+    const has = pkg[f] !== undefined;
+    console.log(`    [task-38] package.json.${f}: ${has ? JSON.stringify(pkg[f]).slice(0, 78) : '(未定义)'}`);
+  }
+  /* 至少有一条路径声明了 colyseus —— 「包声明」这个结论必须覆盖全部四个字段才能下。 */
+  const declaredAnywhere = fields.some((f) => typeof pkg[f]?.colyseus === 'string');
+  ok(declaredAnywhere,
+    'colyseus 在**四个依赖字段之一**里有声明 ⇒ 「未声明」这个全称结论不成立');
+  eq(pkg.dependencies === undefined || Object.keys(pkg.dependencies).length === 0, true,
+    'dependencies 确实为空 —— 但这**只是四个字段之一**,不能据此推「未装」');
+});
 
 /* ═══════════════ 收尾 ═══════════════ */
 
