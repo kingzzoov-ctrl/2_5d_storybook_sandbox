@@ -1982,6 +1982,79 @@ function checkTautology(): void {
 }
 
 
+/* --------- 2.6 生产零引用(L2 测试专用)门禁 ---------
+ *
+ * 与 `checkReachability()` **判据不同,故两套清单不该互相「对齐」**:
+ *
+ * | | 判据 | 是否传递 |
+ * | :--- | :--- | :--- |
+ * | `UNREACHABLE_EXEMPT` | **传递可达性** —— 从 `PROD_ENTRIES` 做 import 闭包 | **是** |
+ * | `ORPHAN_KNOWN` | **直接引用** —— `server/src`/`client/src` 里有人 import 就算 | **否** |
+ *
+ * ⇒ 实测两者差 9 条(22 vs 13),**9/9 都是「有生产引用、但引用者自己也在白名单里」**。
+ * 这个区别有实际后果:若按「类型边」去解释(本仓真发生过这次误判),
+ * 会以为把 `import type` 改成值导入就能消差 —— 实际不会,那些 referrer 自己仍不可达。
+ *
+ * ## 为什么两道都要,即使 orphan 是可达性的子集
+ *
+ * 实测 `ORPHAN_KNOWN`(13)⊆`UNREACHABLE_EXEMPT`(22),**只在 orphan 里的 = 0 条**。
+ * 即本门禁**不增加检测面**,它增加的是**第二个判据的措辞**:
+ *   可达性说「到不了」;orphan 说「**生产零引用但测试有**」——
+ *   后者能区分「没人写」与「有人测但不接」。同一份欠账,两种说法决定了怎么立项。
+ *
+ * ## 为什么在这里直接读 `ORPHAN_KNOWN` 而不再跑一遍扫描
+ *
+ * `orphan-audit.ts` 是**独立可跑的脚本**(顶层执行 + `process.exit`),不能作为模块
+ * import。若在这里重写一套扫描,就会引入**第三套词法** —— 本仓记着
+ * 「判定『谁引用谁』必须共用一套词法」,而 Lead 自己曾因此写出错任务书(task-42)。
+ * ⇒ 采用**最小侵入**:解析它的 `ORPHAN_KNOWN` 字面量表,与可达性白名单做**集合关系**
+ *   校验。扫描本身仍由那个脚本负责(它是 SSOT)。
+ */
+function checkOrphanList(): void {
+  console.log('\n[生产零引用]');
+  const src = readFileSync(join(ROOT, 'scripts/orphan-audit.ts'), 'utf8');
+  const a = src.indexOf('export const ORPHAN_KNOWN');
+  if (a < 0) {
+    fail('找不到 scripts/orphan-audit.ts 的 ORPHAN_KNOWN 表(门禁口径失效)');
+    return;
+  }
+  const b = src.indexOf(']);', a);
+  if (b < 0) {
+    fail('ORPHAN_KNOWN 表未闭合 —— 解析失败,本门禁不可信');
+    return;
+  }
+  const orphan = new Map<string, string>();
+  for (const m of src.slice(a, b).matchAll(/\[\s*'([^']+)'\s*,\s*'([^']*)'\s*\]/g)) {
+    orphan.set(m[1]!, m[2]!);
+  }
+  if (orphan.size === 0) {
+    fail('ORPHAN_KNOWN 解析出 0 条 —— 正则与表格形态不符,本门禁不可信');
+    return;
+  }
+
+  const bad: string[] = [];
+  for (const [rel, reason] of orphan) {
+    if (!existsSync(join(ROOT, rel))) bad.push(`${rel}(文件不存在)`);
+    else if (!reason || reason.trim().length < 8) bad.push(`${rel}(未写明理由)`);
+    /* 关键不变量:orphan 必须是可达性白名单的**子集**。
+       若不是,说明某模块「生产零引用」却**不在**不可达清单里 ——
+       那意味着两种判定出现**无法调和的**矛盾,两者必有一错。
+       这个不变量是本门禁最有价值的部分:它把「两套口径是否自洽」变成可机器检查的。 */
+    else if (!UNREACHABLE_EXEMPT.has(rel)) {
+      bad.push(`${rel}(是 orphan 却不在可达性白名单 —— 两套判据矛盾)`);
+    }
+  }
+
+  if (bad.length > 0) {
+    fail(`生产零引用清单失真(${bad.length} 处):${bad.slice(0, 5).join('; ')}`);
+    return;
+  }
+  pass(
+    `生产零引用清单自洽(${orphan.size} 条已登记,全部 ⊆ 可达性白名单;`
+    + `差集 ${UNREACHABLE_EXEMPT.size - orphan.size} 条是「有生产引用但引用者也不可达」)`,
+  );
+}
+
 /* ───────────────────── 3. 文档结构检查 ───────────────────── */
 
 function checkDocs(): void {
@@ -3580,6 +3653,9 @@ if (!frozenOnly && !docsOnly && !contentOnly) runTests();
 checkStrippable();
 /* 生产可达性:只依赖源码文本,不依赖测试结果,故紧随语法扫描之后。 */
 checkReachability();
+/* 生产零引用(第二套判据)—— 必须紧跟在可达性之后:
+   它的核心不变量是「orphan ⊆ 可达性白名单」,依赖上面那一步算出的 UNREACHABLE_EXEMPT。 */
+checkOrphanList();
 checkTautology();
 checkClientTrust();
 if (!frozenOnly && !only && !contentOnly) checkDocs();
