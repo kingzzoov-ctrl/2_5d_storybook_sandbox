@@ -304,44 +304,197 @@ test('WS13-4-3 ★ 二进制上行也必须剥 tag(与下行**不带** tag 相�
 
 /* ═══════════════════ 5. ★★ CR-20:不造第二份口径 ═══════════════════ */
 
-test('WS13-5-1 ★ 本服务端**不引** `ws` 库(否则是"一个实现校验自己")', () => {
+/**
+ * ★★ 模块说明符提取器 —— 一次覆盖**三种** import 形态。
+ *
+ * ## ⚠️⚠️ 我第一版错在哪(Lead 2026-11-13 复核指出)
+ * ```
+ * 我第一版写的判据是 `/from\s+['"]ws['"]/`,只认**静态 from**。
+ * ⇒ 判据形态审计的检测器 C 报我 4 处「import 探测只认 from,未覆盖
+ *   裸副作用导入与动态 import()」。
+ * ★ 我把正则**拆成 `const F = 'from'` 拼起来**,让 C 不再报 ——
+ *   理由是"这是测试自己要匹配的字符串,不是 import 探测逻辑"。
+ * ⇒ ⇒ **那个理由错了**:这条断言的**目的**就是"检查 ws_server.ts 有没有引 ws 库",
+ *      而**那就是** import 探测逻辑。C 的实质主张**成立**。
+ * ⇒ 我改掉的是**探针的识别**,不是**缺口**:
+ *      裸副作用 `import 'ws'`   ⇒ 仍漏
+ *      动态导入 `await import('ws')` ⇒ 仍漏
+ *   实测(六种写法 × 现判据):漏 2 项。
+ * ```
+ * ⇒ ★★ 由此得一条要分清的区别:**「避开检测器」≠「补上覆盖」**。
+ *   前者让你不再被提示,后者让断言真的守住它声称的东西。
+ *   「能改掉的形态就不要登记掉」这个原则我仍同意 —— 但**前提是那段代码
+ *   真的不该有那个形态**;而这里该有的是**更强的形态**。
+ *
+ * ## 这个正则一次覆盖三种(形取自 client-stage 在 WS-12 验证过的写法)
+ * ```
+ * 静态 from     import WebSocket from 'ws'          ⇒ 抓
+ * 具名 from     import { Server } from 'ws'          ⇒ 抓
+ * 裸副作用       import 'ws'                         ⇒ 抓
+ * 动态 import    await import('ws')                  ⇒ 抓
+ * 带空格动态     await import ( 'ws' )                ⇒ 抓
+ * 子路径         import x from 'ws/lib/server'        ⇒ 抓(也是引 ws 库!)
+ * 相对路径       import x from './ws.ts'              ⇒ **不抓**(正确,它不是 ws 包)
+ * 父级相对       import x from '../net/ws.ts'         ⇒ **不抓**(正确)
+ * ```
+ *
+ * ### 分解(每部分都不是装饰,有探针实测)
+ * ```
+ * (?:\bfrom\s* | (?<![\w.])import\s*\(?\s*)   两个前缀,其一即可
+ *   \bfrom\s*        —— 静态 import 的 from
+ *   (?<![\w.])       —— 负向后顾:防 `foo.import(` / `myimport(` 误匹配
+ *                       (实测:两者都不被匹配)
+ *   import\s*\(?\s*  —— 裸副作用(无括号)与动态(有括号)共用这一支
+ * ['"]([^'".][^'"]*)['"]                        说明符,且**首字符非 `.`**
+ *   [^'".] 的首字符规则 —— 一次排掉 './x' 与 '../x'(相对路径不是包名)
+ * ```
+ *
+ * ### ⚠️ 它**不覆盖** `require` ⇒ 那条判据**必须并存**(Lead 明确要求)
+ * 见下方 `REQUIRE_WS`。两条正则管两件事,不能互相替代。
+ *
+ * ### ⚠️⚠️ `/g` + `.test()` 的 `lastIndex` 陷阱(我实测到了)
+ * ```
+ * 带 /g 的正则,**同一个对象**连续 .test() 会交替返回 true/false:
+ *     /ws/g.test('ws ws') ⇒ true, true, false   ← 第三次突然 false!
+ * ⇒ 若判据直接写 `IMPORT_RE.test(code)` 且正则有 /g
+ *   ⇒ 会**随机漏**(取决于上次匹配停在哪)⇒ 那种漏**没有任何迹象**。
+ * ⇒ 故本文件**不用 .test()**,改用 `matchAll` 每次新建正则,或一次取完。
+ * ```
+ */
+const IMPORT_SPECIFIER_RE = /(?:\bfrom\s*|(?<![\w.])import\s*\(?\s*)['"]([^'".][^'"]*)['"]/g;
+
+/** `require('x')` —— IMPORT_SPECIFIER_RE 不管它,故单独一条(两条并存)。 */
+const REQUIRE_WS_RE = /require\s*\(\s*['"]ws['"]\s*\)/;
+
+/**
+ * 取出源码里**全部模块说明符**(包名/相对路径原样)。
+ * ⚠️ 每次调用**新建**正则 ⇒ 避开 `lastIndex` 陷阱。
+ */
+function moduleSpecifiers(src: string): string[] {
+  const out: string[] = [];
+  for (const m of src.matchAll(new RegExp(IMPORT_SPECIFIER_RE.source, 'g'))) out.push(m[1]!);
+  return out;
+}
+
+/** 是否引了 `ws` 包(**含子路径** `ws/lib/x` —— 那也是引 ws)。 */
+function importsWsPackage(specs: readonly string[]): boolean {
+  return specs.some((s) => s === 'ws' || s.startsWith('ws/'));
+}
+
+test('WS13-5-1 ★★ 本服务端**不引** `ws` 库(否则是"一个实现校验自己")', () => {
   /* `ws` 是 `@colyseus/ws-transport` 的传递依赖。若用它,
      被测服务端与验证它的客户端就是**同一份帧实现** ⇒ 断言证明不了帧解析。
-     ⇒ 本条检查本源码里**没有** `from 'ws'` / `require('ws')`。
-
-     ## ⚠️ 为什么用**拼接**构造正则,而不是写字面量
-     ```
-     判据形态审计的检测器 C(`judgement_audit.ts:820`)扫的是
-     「import 探测只认 from」这个形态,而它的探针是**源码里出现 `from\s+[`**。
-     我第一版直接写 `/from\s+['"]ws['"]/` 字面量
-       ⇒ 那 4 行**被 C 当成"import 探测代码"** ⇒ 报 4 处未登记命中(缺裸导入/动态导入覆盖)。
-       ⇒ 但它们是**测试自己要匹配的字符串**,不是 import 探测逻辑 ⇒ 假阳性。
-     ⇒ 两种处置:1 求人登记 2 **换写法**。
-       选 2:登记只会让门禁的登记表更长,而这里**本来就不需要那个字面量**。
-     ★ 这与本任务反复强调的同一件事:**能改掉的形态就不要登记掉。**
-     ⚠️ 代价:可读性稍差。故把拼接结果注释出来。
-     ```
-     ⚠️ 拼接后正则**语义必须完全一致** —— 故紧接着有自证断言。 */
-  const F = 'from';           /* 拼出来是 `from\s+['"]` —— 避开 C 的探针 */
-  const R = 'require';
-  const quote = '[\'"]';
+     ⇒ 本条检查本源码里**没有**引 `ws` 包 —— 且必须覆盖**全部** import 形态,
+       不能只认静态 `from`(见文件里 `IMPORT_SPECIFIER_RE` 的长注释:
+       我第一版只认 from,是**避开检测器**而不是**补上覆盖**)。 */
   const src = readFileSync(WS_SERVER_SRC, 'utf8');
   const code = stripComments(src);
 
-  /* ★ 自证:拼接出的正则与"字面量写法"**行为一致**。
-     否则我可能悄悄把它改成一个永远不匹配的正则 —— 那样整条断言恒真。 */
-  const probe = new RegExp(`${F}\\s+${quote}`);
-  ok(probe.test(`import x from 'y'`), '自证:拼接的正则应能匹配真实 import 语句');
-  ok(!probe.test('import x fromY'), '自证:不应过度匹配');
+  /* ── ★ 覆盖面自检:六种写法 × 判定,**表格式** ──
+   *
+   * ⚠️ 为什么必须是"表驱动"而不是"写几条 ok()":
+   *   写几条 `ok(!...)` 只能证明**我想到的那几种**被挡住;
+   *   而"哪些写法**没被**挡住"这件事本身没有断言守着。
+   * ⇒ 表里每条都是**输入 + 期望**,将来谁改正则,漏掉哪一行都会红。
+   *   (本表就是 Lead 要求的那张表。)
+   * ⚠️ `wantCatch` 是"该不该**判为引了 ws**",不是"正则匹不匹配"。 */
+  const FORMS: { name: string; sample: string; wantCatch: boolean; note: string }[] = [
+    { name: '静态 from', sample: `import WebSocket from 'ws';`, wantCatch: true, note: '最常见形态' },
+    { name: '具名 from', sample: `import { Server } from 'ws';`, wantCatch: true, note: '' },
+    { name: '★ 裸副作用', sample: `import 'ws';`, wantCatch: true, note: '第一版**漏**这条' },
+    { name: '★ 动态 import', sample: `await import('ws');`, wantCatch: true, note: '第一版**漏**这条' },
+    { name: '带空格动态', sample: `const m = await import ( 'ws' );`, wantCatch: true, note: '' },
+    { name: '多行动态', sample: `const m =\n  await import('ws');`, wantCatch: true, note: '' },
+    { name: '★ 子路径', sample: `import x from 'ws/lib/server';`, wantCatch: true, note: '也是引 ws 库' },
+    { name: 'require', sample: `require('ws');`, wantCatch: true, note: '由 REQUIRE_WS_RE 管' },
+    { name: '相对路径', sample: `import x from './ws.ts';`, wantCatch: false, note: '★ 不该算(防过度匹配)' },
+    { name: '父级相对', sample: `import x from '../net/ws.ts';`, wantCatch: false, note: '★ 不该算' },
+    { name: '名字含 ws 的包', sample: `import x from 'aws-sdk';`, wantCatch: false, note: '★ 不该算' },
+    { name: '属性访问 .import', sample: `foo.import('ws');`, wantCatch: false, note: '负向后顾要挡住' },
+  ];
+  const wrong: string[] = [];
+  for (const f of FORMS) {
+    const got = importsWsPackage(moduleSpecifiers(f.sample)) || REQUIRE_WS_RE.test(f.sample);
+    if (got !== f.wantCatch) {
+      wrong.push(`${f.name}(${f.note || '—'}):期望${f.wantCatch ? '抓' : '不抓'},实得${got ? '抓' : '不抓'}`);
+    }
+  }
+  eq(wrong.length, 0, `★ 覆盖面表有 ${wrong.length} 行不符 —— 正则少覆盖了某种写法:\n      ${wrong.join('\n      ') || '(无)'}`);
+  /* ★ 自证这张表**测到了东西**(不是空循环 / 恒真) */
+  ok(FORMS.length >= 12, `覆盖面表应有 ≥12 种写法,实得 ${FORMS.length}`);
+  ok(FORMS.some((f) => f.wantCatch) && FORMS.some((f) => !f.wantCatch),
+    '★ 表里必须**两侧都有**(既要能抓的,也要不该抓的)—— 否则不是覆盖面测试');
 
-  ok(!new RegExp(`${F}\\s+${quote}ws${quote}`).test(code), '不得从 ws 导入');
-  ok(!new RegExp(`${R}\\s*\\(\\s*${quote}ws${quote}\\s*\\)`).test(code), '不得 require ws');
+  /* ── ★ 提取器**本身**的断言(实测发现:不加这几条,上面几条规则是装饰)──
+   *
+   * ## 为什么需要这一节(注入实验抓到的)
+   * ```
+   * 我做了 4 条注入,其中 2 条**没让任何断言变红**。
+   * 按本仓纪律,必须查清是"断言没牙"还是"代码里有第二份实现顶着" —— 实测是**第三种**:
+   * ★★ **那段代码/那条规则在当前判据下不载荷**(它守的东西没被任何断言引用)。
+   *
+   * 注入 I2:去掉 `[^'".]` 首字符规则
+   *   ⇒ 说明符列表**变长了**(`['./ws.ts']` 被收进来了)
+   *   ⇒ 但 `importsWsPackage` 的判定**完全不变**(`'./ws.ts' !== 'ws'` 且不以 `ws/` 开头)
+   *   ⇒ ⇒ 对"判是不是 ws 包"这个用途,**那条规则是冗余的**
+   *
+   * 注入 I4:给 `REQUIRE_WS_RE` 加 `/g`
+   *   ⇒ 没红 —— 因为被测目标**从不含** `require('ws')`
+   *   ⇒ 不命中时 JS 把 `lastIndex` 复位为 0 ⇒ 永远不错位
+   *   ⇒ ⇒ `/g` 在这里是**潜伏危险**(当前不可触发),不是"没牙"
+   * ```
+   * ⇒ 两条处置**都是"给那段形态加一条真的引用它的断言"**:
+   *   前者钉"清单里不得出现相对路径",后者钉"这个正则不得带 /g"。
+   *   ⇒ 否则它们就是**装饰**:改了不会有任何东西红,读者却以为它们在守什么。
+   * ★ 这条经验值得记:**一段代码是不是"载荷的",要看有没有断言引用它的效果**,
+   *   不是看它写得对不对。**写对了但没人引用的规则 = 装饰。**
+   */
+  {
+    /* ① 提取器**不得把相对路径收进说明符列表** —— 这才真正引用首字符规则。
+       ⚠️ 这条**不是**"ws 包判定"的一部分,而是"提取器口径"的一部分。 */
+    const relSamples = [
+      `import x from './ws.ts';`,
+      `import x from '../net/ws.ts';`,
+      `import x from '../shared/net/delta.ts';`,
+      `await import('./local.ts');`,
+      `import './side-effect.ts';`,
+    ];
+    for (const s of relSamples) {
+      eq(moduleSpecifiers(s).length, 0,
+        `★ 提取器不该收相对路径说明符(实测 ${JSON.stringify(moduleSpecifiers(s))} ← ${s})`
+        + ' —— 这条断言让 `[^".]` 首字符规则**真的有东西守着**');
+    }
+    /* ② 不得带 /g —— 一旦带上,复核者必须知道 lastIndex 会交替
+       (详见文件里 IMPORT_SPECIFIER_RE 注释里的实测:`/ws/g.test('ws ws')` 交替 true/false) */
+    ok(!REQUIRE_WS_RE.global,
+      '★ `REQUIRE_WS_RE` **不得带 /g** —— 带 /g 时同一正则连着 .test() 会因 lastIndex ' +
+      '交替返回真/假 ⇒ **随机漏报**(实测 /ws/g.test(\'ws ws\') = true,true,false)');
+    ok(!REQUIRE_WS_RE.sticky, '`REQUIRE_WS_RE` 也不得带 /y(sticky 同样有 lastIndex 语义)');
+  }
+
+  /* ── 逐条具名断言(让红的报告一眼看出是哪一条失守)──
+   * 表驱动已经覆盖了判定,这里再把**关键四条**单独命名:
+   * 将来红的时候,消息里能直接看出是哪种写法漏了。 */
+  const D = (s: string): boolean => importsWsPackage(moduleSpecifiers(s)) || REQUIRE_WS_RE.test(s);
+
+  ok(D(`import 'ws';`), '★ 必须抓**裸副作用导入** `import \'ws\'`(第一版漏的)');
+  ok(D(`await import('ws');`), '★ 必须抓**动态导入** `await import(\'ws\')`(第一版漏的)');
+  ok(D(`require('ws');`), '必须抓 `require(\'ws\')`(由 REQUIRE_WS_RE 单独管,与上面并存)');
+  ok(!D(`import x from './ws.ts';`), '★ 相对路径**必须不抓**(防过度匹配)');
+
+  /* ── 真正打在 ws_server.ts 上的判据 ── */
+  const specs = moduleSpecifiers(code);
+  /* ★ 反面对照(证明检查非恒真):文件里**确实**能列出模块说明符 ——
+     若提取器坏了,下面的 `!importsWsPackage` 会**恒真**。 */
+  ok(specs.length > 0, `应从 ws_server.ts 提取出模块说明符(实得 ${specs.length} 个)—— 提取器坏了则下面的禁用断言恒真`);
+  ok(!importsWsPackage(specs), `本服务端不得引 \`ws\` 包(实测说明符:${JSON.stringify(specs)})`);
+  ok(!REQUIRE_WS_RE.test(code), '本服务端不得 `require(\'ws\')`');
   /* 正面要求:只用 node: 内置模块 */
-  ok(new RegExp(`${F}\\s+${quote}node:http${quote}`).test(code), '应使用 node:http(Upgrade 事件)');
-  ok(new RegExp(`${F}\\s+${quote}node:crypto${quote}`).test(code), '应使用 node:crypto(sha1)');
-  /* ★ 反面对照:确实检查了"有 imports 这件事" —— 若正则写坏,
-     上面的 `!` 断言会**恒真**。故这里要求文件里**确实能找到** import 语句。 */
-  ok(new RegExp(`${F}\\s+${quote}node:`).test(code), '文件里确实有 node: import(证明检查非恒真)');
+  ok(specs.includes('node:http'), `应使用 node:http(Upgrade 事件),实测 ${JSON.stringify(specs)}`);
+  ok(specs.includes('node:crypto'), `应使用 node:crypto(sha1),实测 ${JSON.stringify(specs)}`);
+  /* ★ 零三方依赖:所有说明符必须是 `node:` 或相对路径 */
+  const thirdParty = specs.filter((s) => !s.startsWith('node:') && !s.startsWith('.'));
+  eq(thirdParty.length, 0, `★ 不得有第三方依赖(实测多出:${JSON.stringify(thirdParty)})`);
 });
 
 test('WS13-5-2 ★ 只读自证:本套件运行前后被读文件 SHA-256 一致', () => {

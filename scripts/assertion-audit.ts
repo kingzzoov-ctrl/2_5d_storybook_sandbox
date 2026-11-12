@@ -96,9 +96,9 @@
  * ```
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, relative, sep, dirname } from 'node:path';
+import { join, relative, sep, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /* ⚠️ 必须用 `fileURLToPath`:手拼 `new URL(...).pathname` 在 Windows 上得到
@@ -1751,9 +1751,57 @@ function findDupGroups(files: readonly string[]): DupGroup[] {
 
 /* ══════════════════ 运行 ══════════════════ */
 
-const testFiles = existsSync(TEST_DIR)
-  ? readdirSync(TEST_DIR).filter((f) => f.endsWith('.ts')).map((f) => join(TEST_DIR, f))
-  : [];
+/**
+ * 扫描根里的测试文件清单。
+ *
+ * ## ★★ 为什么必须过滤 `_` 前缀(实测抓到的口径不一致)
+ * ```
+ * 本仓 `.gitignore:37` 是 `_*` ⇒ 这些文件**不进交付物**。
+ * 另外两个扫描器**都**跳过它们:
+ *    scripts/verify.ts:1876          `basename(p).startsWith('_') ⇒ continue`
+ *    scripts/judgement_audit.ts:1650 路径任一段以 `_` 开头 ⇒ skip
+ * ★ 而我这份**没有过滤** —— 实测:放一个 `tests/_xaudit_probe.test.ts`,
+ *    文件数 23 → **24**,输出里出现 `_xaudit_probe` ⇒ 我的主分类器**扫到了它**。
+ * ⚠️ 更难看的是:**同一个文件里两套口径**——
+ *    `[g]` 的 `scanDimMismatch()`(L2118 附近)walk 时**有** `_` 过滤,
+ *    而这里**没有** ⇒ 同一份报告里,`[g]` 不看的文件 `[乙]/[丙]/[h]` 却在看。
+ * ```
+ * ## 后果(为什么这不是洁癖)
+ * ```
+ * 有人放个 `tests/_probe.test.ts` 进去 ⇒ 另两个工具跳过、我这份会扫
+ * ⇒ 我可能报出命中,而那是**不存在于交付物里**的代码
+ * ⇒ 报的"问题"读者**永远找不到**(他看不到那个文件,因为它被 gitignore 了)
+ * ⇒ ★ 这类误报最坏的地方不是噪音,是**让人怀疑整份报告**。
+ * ```
+ * ## 为什么今天看不出来
+ * ```
+ * 实测 `tests/` 下 **23 个文件,0 个 _ 前缀** ⇒ 差异**当前不可观测**。
+ * ⇒ 正因如此更该修:**一个只在"别人犯了某个错"时才显形的口径差异,
+ *   永远不会被自己发现**。而我自己就是那个"别人"(我本轮放了 6 个 `_` 探针在
+ *   `default-workspace/` 根 —— 侥幸不在 `tests/` 下,否则就会触发)。
+ * ```
+ *
+ * ## ★★ 为什么必须抽成**一个函数**(我第一版的自检自己又实现了一遍 —— CR-20)
+ * ```
+ * 我第一版:生产用一条 `.filter(...)`,而**自检里又写了一条一样的 filter**。
+ * ⇒ 注入实测:把**生产那条**删掉 ⇒ 自检**照样绿**
+ *   —— 因为它测的是**自己那份副本**,不是生产清单。
+ * ⇒ ★ 这正是本仓 CR-20「不造第二份口径」的教科书形态:
+ *     两条同时存在时看不出问题(都"对"),删掉一条也不红(另一条顶着)。
+ * ⇒ 故:过滤只在**本函数里出现一次**,生产与自检**都**调它。
+ *   现在删掉里面那个 filter ⇒ 生产清单与自检**一起**变 ⇒ 红。
+ * ```
+ */
+function listTestFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith('.ts'))
+    /* ★ 与 verify.ts:1876 / judgement_audit.ts:1650 / 本文件 [g] 的 walk() 同口径 */
+    .filter((f) => !f.startsWith('_'))
+    .map((f) => join(dir, f));
+}
+
+const testFiles = listTestFiles(TEST_DIR);
 
 const allScanned = [
   ...testFiles,
@@ -1768,10 +1816,53 @@ if (testFiles.length === 0) {
   process.exit(1);
 }
 
+/* ★★ `_` 前缀过滤的**自证**(防止它哪天被"顺手删掉")
+ *
+ * ```
+ * `listTestFiles()` 里那条 `.filter((f) => !f.startsWith('_'))` 是**静默生效**的:
+ *   删掉它,今天**没有任何断言会红**(实测 tests/ 下 0 个 _ 文件)。
+ * ⇒ ⇒ 那就是一段"改了没人知道"的代码 —— 与本任务反复记的**装饰**同族。
+ * ⇒ 故:造一个真实 `_` 文件,要求它**不出现在** `listTestFiles()` 的结果里。
+ *   ★ 关键是**调生产那个函数**,不是自己重算 —— 否则又是 CR-20(见函数头注释)。
+ * ```
+ * ⚠️ 用**真实临时文件**而不是 mock:mock 测不出 `readdirSync` 的行为。 */
+{
+  const probeName = '_audit_selfcheck_probe.test.ts';
+  const probePath = join(TEST_DIR, probeName);
+  /* 先查"当前有没有已存在的 _ 文件漏进来"(非探针的、别人放的) */
+  const leaked = listTestFiles(TEST_DIR).filter((p) => basename(p).startsWith('_'));
+  if (leaked.length > 0) {
+    console.log(`✗ \`_\` 前缀文件漏进扫描清单(${leaked.length} 个):`
+      + `${leaked.map((p) => relative(ROOT, p)).join(', ')}`);
+    console.log('  ⇒ 这些文件被 .gitignore 排除(= 不在交付物里)⇒ 报它们等于报"找不到的东西"。');
+    process.exit(1);
+  }
+  try {
+    writeFileSync(probePath, "import { eq } from '../shared/testing/harness.ts';\neq(1, 1, '探针');\n");
+    /* ★ 这里**必须**调生产函数 `listTestFiles` —— 那才是"测它"而不是"又实现一遍" */
+    const again = listTestFiles(TEST_DIR);
+    if (again.some((p) => basename(p) === probeName)) {
+      console.log(`✗ \`_\` 前缀过滤**失效**:探针 ${probeName} 被 listTestFiles() 收进来了`);
+      console.log('  ⇒ 这会报出 gitignore 掉的代码 ⇒ 读者永远找不到那些"问题"。');
+      process.exit(1);
+    }
+    console.log(`  ✓ [自检] \`_\` 前缀过滤生效(造探针 ${probeName} ⇒ listTestFiles() 未收录)`);
+  } finally {
+    /* ★ 必须删掉 —— 不能给仓库留垃圾 */
+    try { unlinkSync(probePath); } catch { /* 已不在 */ }
+  }
+}
+
 const shaOf = (f: string): string => createHash('sha256').update(readFileSync(f)).digest('hex');
 const before = new Map(testFiles.map((f) => [f, shaOf(f)]));
 
-console.log('[断言值来源审计] 只读,不修改任何文件');
+/* ⚠️ 这句声明必须**精确**,否则它自己会变成一句假话。
+   `[只读自证]` 只覆盖 `testFiles` 里那些文件 —— 而上面那条 `_` 过滤自检
+   **会创建一个探针文件再删掉**。它不进 `testFiles` ⇒ 自证仍成立,
+   但"不修改任何文件"这个**字面**说法与事实有出入 ⇒ 改成写清边界。 */
+console.log('[断言值来源审计] 只读:被扫描文件运行前后 SHA-256 不变(见末尾 `[只读自证]`)');
+console.log('  ⚠️ 唯一例外:`_` 前缀过滤自检会**临时创建再删除**一个 tests/_*.test.ts 探针;');
+console.log('     该探针不进扫描清单,故不影响上面的自证 —— 但声明必须写清这点。');
 console.log(`  扫描根:tests/   文件数:${testFiles.length}\n`);
 
 /* ── 1. 自检 ── */
@@ -2252,7 +2343,8 @@ const changed: string[] = [];
 for (const [f, h0] of before) if (shaOf(f) !== h0) changed.push(relative(ROOT, f).split(sep).join('/'));
 console.log('\n[只读自证]');
 if (changed.length === 0) {
-  console.log(`  ✓ ${testFiles.length} 个文件运行前后 SHA-256 全部一致 —— 本脚本未修改任何文件`);
+  console.log(`  ✓ ${testFiles.length} 个文件运行前后 SHA-256 全部一致 —— 被扫描文件未被本脚本修改`);
+  console.log('     (⚠️ 声明范围仅限被扫描文件;`_` 过滤自检的临时探针不在其列,见开头说明)');
 } else {
   console.log(`  ✗ ${changed.length} 个文件变化(不应发生):${changed.slice(0, 5).join(', ')}`);
 }
