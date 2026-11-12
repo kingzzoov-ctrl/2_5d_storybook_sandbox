@@ -259,6 +259,50 @@ ok(
   'handshake.ts 不依赖网络层(可独立测试)',
 );
 okHas(hsSrc, 'ContentPolicy', '导出策略常量');
+
+/* ═══════════ task-37:handshake 的主人归属判定 ═══════════ */
+
+/* 这三条把「handshake 为何是真欠账、但为何**不能现在接线**」钉住。
+ * 它们是**接线的前置条件清单** —— 条件变了就该来改这里,并据此接线。 */
+
+console.log('\n— task-37 归属判定:handshake 是真欠账但被三前提阻塞 —');
+
+/* 前提1:生产 join 路径没有承载 contentClaim 的位置。 */
+const roomSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+ok(!roomSrcT37.includes('contentClaim'),
+  'room.ts 完全不提 contentClaim(join 无该入参位)⇒ 接线要先改 join 签名');
+ok(!roomSrcT37.includes('verifyContentCompatibility'),
+  'room.ts 不调用内容校验 ⇒ 现状是「完全不校验」而非「另有机制替代」');
+
+/* 前提2:默认策略 STRICT,而它拒绝「未提供指纹」的客户端。 */
+eq(h.DEFAULT_CONTENT_POLICY, h.ContentPolicy.STRICT, '默认策略为 STRICT');
+const strictNull = h.verifyContentCompatibility(null, h.ContentPolicy.STRICT);
+ok(strictNull.ok === false,
+  'STRICT + 无指纹 ⇒ 拒绝(故「无条件接线」会把所有现有客户端挡在门外)');
+ok(strictNull.reason?.includes('未提供内容指纹') === true,
+  `拒因指明是「未提供指纹」(实测:${strictNull.reason?.slice(0, 40)}...)`);
+
+/* 前提3:客户端没有网络层 ⇒ 发不出声明。 */
+import { readdirSync, statSync } from 'node:fs';
+function walkClient(d: string, a: string[] = []): string[] {
+  for (const e of readdirSync(d)) {
+    if (['node_modules', '.git', 'dist'].includes(e)) continue;
+    const p = join(d, e);
+    statSync(p).isDirectory() ? walkClient(p, a) : /\.ts$/.test(e) && a.push(p);
+  }
+  return a;
+}
+const clientNet = walkClient(join(ROOT, 'client')).filter((f) =>
+  /WebSocket|colyseus|fetch\(/.test(readFileSync(f, 'utf8')));
+eq(clientNet.length, 0, '客户端零网络能力 ⇒ 无通道发送 contentClaim(接线需先补网络层)');
+
+/* 三项合起来:现状**没有**替代机制在做内容一致性校验 —— 缺口是真实的。 */
+const deltaSrcT37 = readFileSync(join(ROOT, 'server', 'src', 'net', 'delta.ts'), 'utf8');
+ok(!deltaSrcT37.includes('contentFingerprint'),
+  'delta.ts 也不做内容校验 ⇒ 两端内容错配在生产上确实无人拦截');
+
+/* 顺带钉住「不该顺手修正」的历史指纹:handshake 里的旧指纹是故意保留的记录。 */
+okHas(hsSrc, 'fa111d71', 'handshake.ts 保留旧指纹 fa111d71(历史记录,刻意不改)');
 okHas(hsSrc, 'checkSaveContent', '导出存档校验');
 
 /* ═══════════ 12. 指纹与内容表真的对应 ═══════════ */

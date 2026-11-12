@@ -8,7 +8,7 @@
  */
 
 import { test, ok, eq, near, includes, inRange, report } from '../shared/testing/harness.ts';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_BYTES, CHUNK_CELLS, packTile, unpackTile } from '../shared/types/tile.ts';
@@ -2975,6 +2975,193 @@ test('WR-14 U2-b 口径一致:实现注释不再声称服务端自行核算', ()
   /* §7 口径说明必须存在(U2 澄清落点),否则口径又只剩注释一处。 */
   ok(doc.includes('不自证'), '§7 应保留「不自证」口径');
   ok(/装备数据|无装备槽/.test(doc), '§7 应说明服务端为何无法自行核算(缺装备数据)');
+});
+
+/* ═══════════ task-37:「生产零引用」的主人归属判定 ═══════════ */
+
+/* 背景:Lead 的 `orphan-audit.ts` 把「除自身外只有 `tests/**` 引用」判为欠账。
+ * 判定后发现该判据混了两种不同的问题,本组把结论钉住(理由与行号见
+ * `tests/WS-FND-03.test.ts` 的 F1~F6 与 docs 说明)。 */
+
+/** 某源码文件里是否以 **import 语句** 引用了 target(路径字样 + 语句形态双判)。 */
+function importsTarget(file: string, target: string): boolean {
+  for (const l of readFileSync(join(ROOT_DIR, file), 'utf8').split('\n')) {
+    if (!l.includes(target)) continue;
+    if (/^\s*import\b|await\s+import\(|^\s*\}\s*from\s*['"]/.test(l)) return true;
+  }
+  return false;
+}
+
+test('task-37 判定1:`memory_db.ts` 是**测试替身**,不该按「欠账」处置', () => {
+  /* 它是 `DbLike` 的第二个实现 —— `repo.ts:35` 定义接口,`driver.sqlite.ts:125`
+   * 与 `memory_db.ts:96` 是两个实现。生产走 sqlite,测试走内存,这是**架构意图**
+   * (memory_db.ts:4 自述「用途:测试与本地冒烟」)。
+   * 关键:门禁 `verify.ts:2797` 真的**用它**做双后端语义对照 —— 它有活干。 */
+  const gateUsesIt = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8')
+    .includes("await import('../server/src/db/memory_db.ts')");
+  ok(gateUsesIt, '门禁真的 import 了 memory_db(它是「门禁在用」而非「没人用」)');
+
+  /* 两个实现同名接口 —— 证明它是**替身**而不是漏接的生产件。 */
+  const memSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'db', 'memory_db.ts'), 'utf8');
+  ok(/implements\s+DbLike/.test(memSrc), 'memory_db 实现 DbLike 接口(是替身而非孤儿)');
+  const drvSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'db', 'driver.sqlite.ts'), 'utf8');
+  ok(/implements\s+DbLike/.test(drvSrc), 'driver.sqlite 实现同一 DbLike(SQLite 侧)');
+
+  /* 接口定义在生产模块里,两个实现都依赖它 —— 生产侧确实「知道」这个抽象。 */
+  const repoSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'db', 'repo.ts'), 'utf8');
+  ok(/export\s+interface\s+DbLike/.test(repoSrc), 'DbLike 定义在生产模块 repo.ts:35');
+
+  /* 生产侧引用 DbLike(经结构化类型注入)证明抽象是活的。 */
+  for (const f of ['server/src/net/room.ts', 'server/src/sim/world_sim.ts',
+    'server/src/db/driver.sqlite.ts', 'server/src/net/room.colyseus.ts']) {
+    ok(importsTarget(f, '/db/repo.ts') || importsTarget(f, './repo.ts'),
+      `${f} 从 repo.ts 取 DbLike(生产侧依赖该抽象)`);
+  }
+});
+
+test('task-37 判定2:`baseline.ts` 的主人是**门禁**,Lead 的口径确实错了', () => {
+  /* 关键事实:`verify.ts:3212` 是**代码级**动态 import(不是注释),
+   * 且返回值被真正使用(`:3220 mod.diffBaseline(mod.readBaseline())`)。
+   * 另有 `content-lock.ts:22` 与 `extension-drill.ts:42` 两处 import。
+   * 故它是**门禁模块** —— 运行时不调它是**正确**的,不该算运行时欠账。 */
+  const vSrc = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8');
+  ok(vSrc.includes("await import('../server/src/content/baseline.ts')"),
+    'verify.ts 以代码级动态 import 引 baseline.ts(:3212)');
+  ok(vSrc.includes('mod.diffBaseline(mod.readBaseline())'),
+    '且真的调用了它的函数(:3220)—— 不是只 import 不用');
+
+  ok(importsTarget('scripts/content-lock.ts', 'content/baseline.ts'),
+    'content-lock.ts 也 import 它(:22)');
+  ok(importsTarget('scripts/extension-drill.ts', 'content/baseline.ts'),
+    'extension-drill.ts 也 import 它(:42)');
+
+  /* 反向:生产侧确实零引用 —— 这是**预期**的(内容锁不是运行时职责)。 */
+  let prodRefs = 0;
+  for (const f of ['server/src/net/room.ts', 'server/src/net/room.colyseus.ts',
+    'server/src/sim/world_sim.ts']) {
+    if (importsTarget(f, 'content/baseline.ts')) prodRefs += 1;
+  }
+  eq(prodRefs, 0, '生产侧零引用属预期(运行时不做内容锁比对)');
+});
+
+test('task-37 判定3:把 `scripts/**` 并入「生产侧」会**掩盖**真实欠账', () => {
+  /* Lead 提的修法(把 scripts/** 算生产侧)会带来方向性危险:
+   * 模块只要「被某个门禁读了一下」就从缺账里消失,而它**运行时仍不执行**。
+   * 以 `cooking.ts` 为例:门禁 `data-conformance.ts:674` 拿它的 FOODS 比对手册,
+   * 但生产交互系统从不调用它 —— 这是**两种不同的缺陷**,不能混为一谈。 */
+  ok(importsTarget('scripts/data-conformance.ts', 'combat/cooking.ts'),
+    '门禁确实 import 了 cooking.ts(:674)');
+
+  /* 而生产侧确实没接 —— 所以它「被门禁引用」不等于「已接线」。 */
+  let prodRefs = 0;
+  for (const f of ['server/src/net/room.ts', 'server/src/sim/world_sim.ts']) {
+    if (importsTarget(f, 'combat/cooking.ts')) prodRefs += 1;
+  }
+  eq(prodRefs, 0, '但生产侧零引用 —— 门禁引用不能当作已接线的证据');
+});
+
+test('task-37 判定4:`logistics.ts` 已被生产引用,应从清单移出', () => {
+  /* `orphan-audit.ts` 自己的自检已报「已可达,应移出」。
+   * 依据:`world_sim.ts:48-59` 以**值导入**取 `tickLogistics` / `loadConveyor`。
+   *
+   * ⚠ 断言必须解析 **import 块本身**,不能用 `/tickLogistics/.test(src)` ——
+   * 后者会被方法名 `tickLogisticsStep`(:1316)或注释命中而**恒真**,
+   * 属「同义反复」。下面的 importValueNames 只取 import 语句里的标识符。 */
+  const wsSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
+  ok(importsTarget('server/src/sim/world_sim.ts', 'wiring/logistics.ts'),
+    'world_sim.ts import 了 logistics.ts(:48-59)');
+
+  const imported = importValueNames(wsSrc, '../wiring/logistics.ts');
+  ok(imported.includes('tickLogistics'),
+    `以**值**导入 tickLogistics(实际导入值:${imported.join(', ') || '无'})`);
+  ok(imported.includes('loadConveyor'),
+    `以**值**导入 loadConveyor(实际导入值:${imported.join(', ') || '无'})`);
+  /* 反例:类型导出不算「运行时加载该模块」—— strip-only 下会被擦掉。 */
+  ok(!imported.some((n) => n.startsWith('type ')),
+    '导入列表里没有残留的裸 `type X`(类型项应已剔出值列表)');
+});
+
+/**
+ * 抽出 `from '...spec'` 那个 import 块里的**值**导入标识符。
+ * 只解析 import 语句本身,不扫全文 —— 避免被方法名/注释命中而恒真。
+ */
+function importValueNames(src: string, spec: string): string[] {
+  /* 逐个 import 语句扫描,而不是一个跨行贪婪正则 —— 后者会从**更早**的
+   * import 块一路吃到本块(`[^}]` 会跨越中间那些 `}`)。 */
+  const lines = src.split('\n');
+  const esc = spec.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!new RegExp(`from\\s*['"][^'"]*${esc}['"]`).test(lines[i]!)) continue;
+    /* 已经在一行里闭合(`import { a, b } from '...'`)。 */
+    const oneLine = /import\s*\{([^}]*)\}/.exec(lines[i]!);
+    if (oneLine) return splitNames(oneLine[1]!);
+    /* 多行形态:向上找最近的 `import {`。 */
+    for (let j = i - 1; j >= 0 && i - j < 30; j -= 1) {
+      const m = /import\s*\{/.exec(lines[j]!);
+      if (!m) continue;
+      const block = lines.slice(j, i + 1).join('\n');
+      const inner = /\{([\s\S]*)\}/.exec(block);
+      return inner ? splitNames(inner[1]!) : [];
+    }
+  }
+  return [];
+}
+
+function splitNames(s: string): string[] {
+  return s
+    .split(',')
+    .map((x) => x.replace(/\s+/g, ' ').trim())
+    .filter((x) => x.length > 0 && !x.startsWith('type ') && !x.startsWith('//'));
+}
+
+test('task-37 判定5:`handshake.ts` 是**真欠账**,但接线被 3 个前提阻塞', () => {
+  /* 它是三个模块里唯一「谁都不引」的:production 0 / scripts 0。
+   * 判定为真欠账 —— 但**不能直接接线**,理由是可实测的: */
+  const hSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'content', 'handshake.ts'), 'utf8');
+
+  /* 前提1:生产 join 签名里没有承载 contentClaim 的位置。 */
+  const roomSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  ok(/join\(input:\s*\{\s*userId: string;/.test(roomSrc),
+    'room.ts:369 的 join 入参无 contentClaim 位');
+  ok(!/contentClaim/.test(roomSrc), 'room.ts 完全不提 contentClaim');
+
+  /* 前提2:默认策略是 STRICT,而 STRICT 对「未提供指纹」是拒绝。 */
+  ok(/DEFAULT_CONTENT_POLICY[^=]*=\s*ContentPolicy\.STRICT/.test(hSrc),
+    '默认策略为 STRICT(handshake.ts:90)');
+  const strictNull = exactSameRejectsNull();
+  ok(strictNull, 'STRICT + 无指纹 ⇒ 拒绝进场(故无条件接线会让所有客户端进不来)');
+
+  /* 前提3:客户端没有网络层,发不出声明。 */
+  const mainSrc = readFileSync(join(ROOT_DIR, 'client', 'src', 'main.ts'), 'utf8');
+  ok(!/WebSocket|colyseus|fetch\(/.test(mainSrc),
+    'client/src/main.ts 无任何网络能力 —— 无法发送 contentClaim');
+});
+
+/** 复刻 handshake 的 STRICT-无指纹分支(纯函数,避免 import 其模块带来的耦合)。 */
+function exactSameRejectsNull(): boolean {
+  const src = readFileSync(join(ROOT_DIR, 'server', 'src', 'content', 'handshake.ts'), 'utf8');
+  /* 该分支必须存在且返回 ok:false。 */
+  return /if \(!claim[\s\S]{0,400}?ok: false/.test(src);
+}
+
+test('task-37 判定6:两个目标模块在**两套清单**里的口径必须一致', () => {
+  /* `verify.ts` 的 `UNREACHABLE_EXEMPT`(判据=从 PROD_ENTRIES 不可达)
+   * 与 `orphan-audit.ts` 的 `ORPHAN_KNOWN`(判据=只有 tests/** 引用)
+   * 是**两套判据**。同一模块在两套里结论不同 ⇒ 无法判断该信哪个
+   * (这正是 task-34 要记入 PROGRESS 的教训之一)。 */
+  const vSrc = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8');
+  const aSrc = readFileSync(join(ROOT_DIR, 'scripts', 'orphan-audit.ts'), 'utf8');
+
+  for (const mod of ['server/src/db/memory_db.ts', 'server/src/content/baseline.ts']) {
+    ok(vSrc.includes(`'${mod}'`), `${mod} 在 verify 白名单里`);
+    ok(aSrc.includes(`'${mod}'`), `${mod} 在 orphan 清单里`);
+  }
+
+  /* 反例证明两套判据确实会分叉:`driver.sqlite.ts` 在 verify 白名单里,
+   * 却**不在** orphan 清单里(因为它被 verify 自己 import 了)——
+   * 同一文件两套结论相反,这就是「两套词法判定互相矛盾」。 */
+  ok(vSrc.includes("'server/src/db/driver.sqlite.ts'"), 'driver.sqlite 在 verify 白名单');
+  ok(!aSrc.includes("['server/src/db/driver.sqlite.ts'"), '但**不在** orphan 清单');
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

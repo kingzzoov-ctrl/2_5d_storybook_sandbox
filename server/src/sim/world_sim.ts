@@ -45,6 +45,18 @@ import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowRe
 import { AoiManager, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { SignalGraph } from '../wiring/graph.ts';
+import {
+  tickLogistics,
+  loadConveyor,
+  type ArmWorld,
+  type ArmState,
+  type ConveyorState,
+  type DrillState,
+  type LogisticsLine,
+  type LogisticsTickReport,
+  type SorterState,
+  type Stack,
+} from '../wiring/logistics.ts';
 /* ── 副作用 import:必须保留 ──
  *
  * `components.ts` **没有任何导出被本文件调用**,它的作用是**模块加载时**
@@ -107,6 +119,24 @@ import {
   type ForgeResult,
 } from '../alchemy/index.ts';
 import { MemoryRecipeStore, StubLlmClient } from '../alchemy/cache.ts';
+/*
+ * ── Boss 副本(WS-05)—— 2026-11-12 接线 ──
+ *
+ * `bosses/` 三个文件 1,261 行此前在生产里零引用(见 `bossRaid` 字段注释)。
+ * 这里只 import 运行时容器;破防/阶段/掉落的算法仍留在各自模块,
+ * 本层不复制任何一条判定。
+ */
+import {
+  BossRaidRuntime,
+  type BossSnapshot,
+  type BossTickReport,
+} from '../bosses/runtime.ts';
+import type {
+  OfferingPort,
+  SummonWithOfferingRequest,
+  SummonWithOfferingResult,
+} from '../bosses/raid.ts';
+import type { BreakResult } from '../bosses/breaks.ts';
 
 /** 快帧与慢帧的固定比例:20Hz / 2Hz = 10。 */
 export const FAST_PER_SLOW = TICK_HZ / SLOW_TICK_HZ;
@@ -241,6 +271,24 @@ export class WorldSim {
    * 每一步都真实执行,产物带完整中间量(`breakdown` / `icon` / `reaction`)。
    */
   readonly alchemy: AlchemyService;
+  /**
+   * Boss 副本运行时(WS-05)—— 2026-11-12 接线。
+   *
+   * 此前 `bosses/` 三个文件(`raid` 413 + `phases` 401 + `breaks` 447 = 1,261 行)
+   * 在生产里**零引用**:`verify.ts` 的可达性门禁把三条全挂在白名单里,
+   * 理由写「待接入 tickMobs」—— 也就是**接线还没开始**,而不是「差最后一根线」。
+   * 后果:八条破防、三阶段技能、人数缩放、个人掉落全部单测全绿,
+   * 但玩家永远召不出 Boss、也永远打不破防。
+   *
+   * **为什么不能挂 `tickMobs`**:8 个 Boss **全部不在** `MOB_BY_ID` 里
+   * (实测 `addMob('boss_jelly_king', …)` → `undefined`),`MobHost` 里
+   * 根本没有 Boss 实体,挂过去等于挂在空集合上。故用独立容器持有 `BossState`。
+   *
+   * **为什么挂慢帧**:`tickBoss` 的 `dt` 以秒计(`CAST_INTERVAL_SEC` /
+   * `TIME_SHIELD_SEC` / `stunnedSec` 全是秒),与 `SIM_SLOW_DT = 0.5` 同量纲;
+   * 挂快帧会让护盾/眩晕以 10 倍速流失 —— 不报错,但行为全错。
+   */
+  readonly bossRaid: BossRaidRuntime;
 
   readonly sizeCells: number;
   private readonly rng: () => number;
@@ -288,6 +336,40 @@ export class WorldSim {
   lastMobTicks: MobTickResult[] = [];
   /** 累计 AI 抛错次数。 */
   mobErrors = 0;
+  /**
+   * 最近一次慢帧的 Boss 推进结果(供诊断与断言)。
+   *
+   * 与 `lastMobTicks` 同一模式:把「这一帧推进了几个 Boss、谁切了阶段」
+   * 暴露成可观测量。没有它,「Boss 没接线」与「Boss 在场但恰好没切阶段」
+   * 从外面看不出区别。
+   */
+  lastBossTick: BossTickReport = { ticked: 0, phaseSwitched: [], stunEnded: [] };
+  /**
+   * 最近一次慢帧的**物流推进结果**(供诊断与断言)。
+   *
+   * 为什么需要它:`wiring/components.ts` 的 `LOGISTICS_*` 求值器**只维护
+   * 通电标志**(`running`/`powered`),从不搬运物品;真正的搬运逻辑在
+   * `wiring/logistics.ts`(`stepConveyor`/`stepSorter`/`stepArm`/`stepDrill`)。
+   *
+   * 这两份曾经**互不引用** —— 后果是「件通电了,但货一动不动」:
+   * `componentsEvaluated` 非零、`running=1`,而 `movedCells` 恒为 0。
+   * 这类缺陷不会抛错,也不会让既有断言变红(WS-08 第 13 节测的是纯函数,
+   * 全都绿);只有断言「生产真的搬运」时才暴露。
+   */
+  lastLogisticsTick: LogisticsTickReport = {
+    beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0,
+  };
+  /**
+   * 物流流水线节点表:由 `SignalGraph` 里已注册的 `LOGISTICS_*` 件**每慢帧重建**。
+   *
+   * 刻意不缓存成长期状态:件的增删/移动由 `addComponent` / `removeComponent`
+   * 驱动(生产里还可能随存档恢复重建),缓存会与真实件表脱节。
+   * 重建成本 O(件数),LOGISTICS_* 件典型数量在个位数到几十。
+   */
+  private readonly logisticsBelts = new Map<string, ConveyorState>();
+  private readonly logisticsSorters = new Map<string, SorterState>();
+  private readonly logisticsArms = new Map<string, ArmState>();
+  private readonly logisticsDrills = new Map<string, DrillState>();
 
   constructor(opts: WorldSimOptions = {}) {
     this.sizeCells = Math.max(16, Math.trunc(opts.sizeCells ?? 64));
@@ -342,6 +424,10 @@ export class WorldSim {
       llm: new StubLlmClient(),
       allowDegrade: true,
     });
+
+    /* Boss 副本运行时(WS-05)。构造即接线 —— 没有开关:
+       「默认关着」正是这个缺陷能潜伏五轮的原因。 */
+    this.bossRaid = new BossRaidRuntime();
   }
 
   /**
@@ -728,6 +814,50 @@ export class WorldSim {
     return r;
   }
 
+  /* ── Boss 副本的三个生产入口(WS-05)─────────────────────────────
+   *
+   * **为什么不能只靠 import**:
+   * 可达性门禁走的是**静态 import 图** —— `world_sim` import 了 `bosses/runtime`,
+   * 图上门禁就绿了。但「图里可达」与「生产真的会执行」是两件事:
+   * 本轮修的正是这个缺陷(bosses/ 三个文件 1,261 行单测全绿、生产零引用)。
+   * 若只加 import 不加调用点,门禁会绿,而 `summon`/`tryBreak` 依旧**永不执行** ——
+   * 只是把「不可达」换成了「可达但不调用」,缺陷形态不变。
+   *
+   * 所以这三个方法就是**真实的调用点**:网络层 / 交互层调用它们,
+   * 它们再转发到 `bossRaid`。`tickBosses` 已由 `tick()` 每慢帧自动调用。
+   */
+
+  /**
+   * 祭坛召唤(含祭品消耗,D-03)。
+   *
+   * `port` 由装配层注入(`db` 层把普通物品背包包成 `OfferingPort`)——
+   * 编排层不 import 存储层,保持 `bosses/**` 对数据库零依赖。
+   */
+  summonBoss(req: SummonWithOfferingRequest, port: OfferingPort): SummonWithOfferingResult {
+    return this.bossRaid.summon(req, port);
+  }
+
+  /**
+   * 对 Boss 造成伤害。
+   *
+   * 与 `damageMob` 分开:8 个 Boss **不在** `MOB_BY_ID` 里,
+   * 走 `damageMob` 会查不到 def 而静默返回 null。
+   * 返回 `null` 表示该 Boss 不在场。
+   */
+  damageBoss(bossId: string, amount: number): { toShield: number; toHp: number } | null {
+    return this.bossRaid.damage(bossId, amount);
+  }
+
+  /** 尝试破防(八条沙盒机关破防的唯一入口)。 */
+  tryBreakBoss(bossId: string, input: unknown): BreakResult {
+    return this.bossRaid.tryBreak(bossId, input);
+  }
+
+  /** 在场 Boss 的只读快照(供网络层同步 `boss_hud`)。 */
+  bossSnapshots(): BossSnapshot[] {
+    return this.bossRaid.snapshots();
+  }
+
   /** 按 ID 取玩家(位置实时从物理刚体读,不是缓存快照)。 */
   private playerById(id: string): WorldPlayer | undefined {
     if (!this.playerIds.has(id)) return undefined;
@@ -1063,6 +1193,221 @@ export class WorldSim {
     this.vitals.stepTimers(SIM_SLOW_DT);
   }
 
+  /* ══════════════════ 自动化物流接线(WS-08)══════════════════ */
+
+  /**
+   * 给 `logistics.ts` 的机械臂用的格子世界适配器。
+   *
+   * 语义映射(三处都需要显式转换,不能直接传 `this`):
+   *  - `take(x,y)`:地面掉落物住在 `mobGround`(`{itemId,x,y,count}`),
+   *    而物流要的是 `Stack`(`{id,count}`)——字段名不同,必须转。
+   *  - `feed(deviceId,...)`:目标设备是否在场由 **OBJ 层**决定(`objIdAt`),
+   *    而 `mobGround` 只记掉落物。混用会得到「机械臂对着空气投喂」。
+   *  - `deviceAt(x,y)`:同上,查 OBJ 层。
+   */
+  private armWorld(): ArmWorld {
+    return {
+      take: (x: number, y: number): Stack | null => {
+        for (let i = this.mobGround.length - 1; i >= 0; i -= 1) {
+          const g = this.mobGround[i]!;
+          if (g.x !== x || g.y !== y || g.count <= 0) continue;
+          const out: Stack = { id: g.itemId, count: g.count };
+          if (g.count <= 1) this.mobGround.splice(i, 1);
+          else g.count -= 1;
+          return out;
+        }
+        return null;
+      },
+      feed: (deviceId: number, x: number, y: number, _item: Stack): boolean => {
+        /* 目标设备必须在 OBJ 层真实存在;不存在就不算投喂成功。
+           返回 false 会让机械臂保持持有,下一循环继续找目标 ——
+           这比「假装成功」更能暴露配置错误。 */
+        const r = Math.max(1, 3);
+        for (let dy = -r; dy <= r; dy += 1) {
+          for (let dx = -r; dx <= r; dx += 1) {
+            if (this.grid.objIdAt(x + dx, y + dy) === deviceId) return true;
+          }
+        }
+        return false;
+      },
+      deviceAt: (x: number, y: number): number => this.grid.objIdAt(x, y),
+    };
+  }
+
+  /**
+   * 从 `SignalGraph` 的件表重建物流流水线节点。
+   *
+   * 每慢帧重建:件的增删/移动由 `addComponent`/`removeComponent` 驱动
+   * (存档恢复也会重建件表),缓存长期状态会与真实件表脱节。
+   *
+   * **幂等性**:同一件 ID 复用同一个 state 对象,因此进度/计时跨帧累积 ——
+   * 若每帧新建 `ConveyorState`,传送带的 `progress` 会永远停在 0.5,
+   * 表现成「通电了但永远走不满一格」,而不报任何错。
+   */
+  private collectLogisticsLine(): LogisticsLine {
+    const belts: LogisticsLine['belts'] = [];
+    const sorters: LogisticsLine['sorters'] = [];
+    const arms: LogisticsLine['arms'] = [];
+    const drills: LogisticsLine['drills'] = [];
+
+    for (const comp of this.wiring.components.values()) {
+      switch (comp.kind) {
+        case 'LOGISTICS_CONVEYOR': {
+          let st = this.logisticsBelts.get(comp.id);
+          if (!st) {
+            st = { progress: 0, dir: comp.params.dir ?? 1, item: null, movedCells: 0 };
+            this.logisticsBelts.set(comp.id, st);
+          }
+          st.dir = comp.params.dir ?? st.dir;
+          belts.push({ x: comp.x, y: comp.y, state: st });
+          break;
+        }
+        case 'LOGISTICS_SORTER': {
+          let st = this.logisticsSorters.get(comp.id);
+          if (!st) {
+            st = {
+              conveyor: { progress: 0, dir: comp.params.dir ?? 1, item: null, movedCells: 0 },
+              filterIds: [],
+              defaultRoute: 'RIGHT',
+              matchRoute: 'FORWARD',
+              routed: new Map(),
+            };
+            this.logisticsSorters.set(comp.id, st);
+          }
+          const fid = comp.params.filterId ?? 0;
+          st.filterIds = fid > 0 ? [fid] : [];
+          sorters.push({ x: comp.x, y: comp.y, state: st });
+          break;
+        }
+        case 'LOGISTICS_ARM': {
+          let st = this.logisticsArms.get(comp.id);
+          if (!st) {
+            st = {
+              phase: 'IDLE', elapsed: 0, held: null, targetDevice: 0,
+              reach: 3, delivered: 0, idleCycles: 0,
+            };
+            this.logisticsArms.set(comp.id, st);
+          }
+          arms.push({ x: comp.x, y: comp.y, state: st });
+          break;
+        }
+        case 'LOGISTICS_DRILL': {
+          let st = this.logisticsDrills.get(comp.id);
+          if (!st) {
+            st = { elapsed: 0, oreId: comp.params.oreId ?? 0, produced: 0, stalledTicks: 0, buffer: null };
+            this.logisticsDrills.set(comp.id, st);
+          }
+          st.oreId = comp.params.oreId ?? st.oreId;
+          drills.push({ x: comp.x, y: comp.y, state: st });
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return { belts, sorters, arms, drills };
+  }
+
+  /**
+   * 推进一次物流(慢帧 2Hz)。**电源取自件求值结果**,不自己读线:
+   * `components.ts` 已经按「绿线/手动」算好 `running`/`powered`,
+   * 这里重复读线会导致两处判据不一致(一边说通电、一边说没通)。
+   */
+  private tickLogisticsStep(): void {
+    const comps = [...this.wiring.components.values()];
+    if (comps.length === 0) {
+      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0 };
+      return;
+    }
+
+    const line = this.collectLogisticsLine();
+    if (line.belts.length + line.sorters.length + line.arms.length + line.drills.length === 0) {
+      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0 };
+      return;
+    }
+
+    /* 电源:按件 kind 聚合「是否至少有一个通电」。单条流水线共用一路动力,
+       与 `components.ts` 里 428/429/430/431 都用 `WireColor.GREEN` 一致。 */
+    const anyOn = (kind: string): boolean => {
+      for (const c of comps) {
+        if (c.kind !== kind) continue;
+        if ((c.state.running ?? 0) > 0 || (c.state.powered ?? 0) > 0) return true;
+      }
+      return false;
+    };
+
+    this.lastLogisticsTick = tickLogistics(line, this.armWorld(), {
+      belt: anyOn('LOGISTICS_CONVEYOR') || anyOn('LOGISTICS_SORTER'),
+      arm: anyOn('LOGISTICS_ARM'),
+      drill: anyOn('LOGISTICS_DRILL'),
+    });
+
+    /* 把物流侧的可观测量回写到件 state,让 `wiring.get(id).state` 能被断言 ——
+       否则「件通电了但没搬运」与「件正常搬运」在件表里长得一模一样。 */
+    for (const b of line.belts) {
+      const st = this.logisticsBelts.get(this.componentIdOf(b.x, b.y, 'LOGISTICS_CONVEYOR'));
+      if (st) {
+        const c = this.wiring.get(this.componentIdOf(b.x, b.y, 'LOGISTICS_CONVEYOR'));
+        if (c) { c.state.movedCells = st.movedCells; c.state.progress = st.progress; }
+      }
+    }
+    for (const a of line.arms) {
+      const id = this.componentIdOf(a.x, a.y, 'LOGISTICS_ARM');
+      const c = id ? this.wiring.get(id) : undefined;
+      if (c) { c.state.delivered = a.state.delivered; c.state.idleCycles = a.state.idleCycles; }
+    }
+    for (const d of line.drills) {
+      const id = this.componentIdOf(d.x, d.y, 'LOGISTICS_DRILL');
+      const c = id ? this.wiring.get(id) : undefined;
+      if (c) { c.state.produced = d.state.produced; c.state.stalledTicks = d.state.stalledTicks; }
+    }
+  }
+
+  /** 按 (x,y,kind) 反查件 ID。物流节点只带坐标,回写 state 时需要 ID。 */
+  private componentIdOf(x: number, y: number, kind: string): string {
+    for (const c of this.wiring.components.values()) {
+      if (c.x === x && c.y === y && c.kind === kind) return c.id;
+    }
+    return '';
+  }
+
+  /**
+   * 把该格的**地面掉落物**装上传送带(公开入口,供生产与测试调用)。
+   *
+   * 为什么必须有这个入口:`stepConveyor` 对空带(`item === null`)直接
+   * `moved: false`,而 `item` 没有任何自动来源 —— 缺这一步的后果是
+   * 「传送带通电正常、`running=1`、但永远搬不动任何东西」,
+   * 且不抛错。装载是**外部动作**(玩家放货 / 机械臂投料),不能由 tick 自己猜。
+   *
+   * @returns 是否装载成功(该格无带 / 带已满 / 该格无货 都返回 false)
+   */
+  loadConveyorAt(x: number, y: number): boolean {
+    const id = this.componentIdOf(x, y, 'LOGISTICS_CONVEYOR');
+    if (id === '') return false;
+    /* 惰性建表:调用方可能在**首个慢帧之前**就装载(玩家开局放货),
+       而 `logisticsBelts` 由慢帧的 `collectLogisticsLine()` 填充。
+       不惰性建的话,「过早装载」会静默返回 false,看起来像「这格没有传送带」。 */
+    let st = this.logisticsBelts.get(id);
+    if (!st) {
+      const comp = this.wiring.get(id);
+      st = { progress: 0, dir: comp?.params.dir ?? 1, item: null, movedCells: 0 };
+      this.logisticsBelts.set(id, st);
+    }
+    if (st.item) return false;
+
+    for (let i = this.mobGround.length - 1; i >= 0; i -= 1) {
+      const g = this.mobGround[i]!;
+      if (g.x !== x || g.y !== y || g.count <= 0) continue;
+      const okLoad = loadConveyor(st, { id: g.itemId, count: g.count });
+      if (okLoad) {
+        this.mobGround.splice(i, 1);
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
   /** 给 `SpawnWorld` 用的适配器,把 WorldGrid 的格查询转成刷怪层要的语义。 */
   private spawnWorld(): SpawnWorld {
     return {
@@ -1134,6 +1479,17 @@ export class WorldSim {
            此前没有任何地方结算它们 —— 16 只敌对/捣蛋生物的攻击打不到玩家。
            见 server/src/combat/vitals.ts 与 docs/DAMAGE-LOOP.md。 */
         this.resolveMobStrikes();
+        /* ── 慢帧 2Hz:Boss 副本推进(WS-05)──
+           阶段切换 / 时间护盾回血 / 破防眩晕倒计时全是**时间驱动**的,
+           必须每帧都跑:漏掉的话「8 秒未破盾则回血」永远不会发生。
+
+           量纲必须与 `SIM_SLOW_DT` 一致(0.5 秒)。放快帧会让护盾与眩晕
+           以 10 倍速流失 —— 这类错误不抛异常,只是时间凭空快 10 倍。
+
+           放在生物 AI **之后**:Boss 的破防输入(玩家投喂/摆机关)来自
+           上一帧的世界状态,同帧内先让生物与世界结算完再推进 Boss,
+           避免「谁先响应」取决于调用顺序。 */
+        this.lastBossTick = this.bossRaid.tickBosses(SIM_SLOW_DT);
       } else {
         activeMobs = this.aoi.activeMobs.size;
       }
@@ -1207,6 +1563,16 @@ export class WorldSim {
            这个才说明「件真的被求值了」。两者相等不代表接线正确 ——
            注册表为空时 `wireCellsLive` 照样非零(泛洪由 `drive` 驱动,与件无关)。 */
         componentsEvaluated = st.componentsEvaluated;
+        /* ── 慢帧 2Hz:自动化物流(传送带 428 / 分拣 429 / 机械臂 430 / 钻头 431)──
+           必须放在 `wiring.tick()` **之后**:物流的驱动信号来自件求值产出的
+           `state`(`running`/`powered`),先跑物流会读到上一帧的标志,
+           表现成「通电后晚一帧才动」——不报错,只是时序错一拍。
+
+           为什么单独有这一步:`components.ts` 的 `LOGISTICS_*` 求值器只维护
+           **通电标志**,不搬运任何物品。真正的搬运在 `wiring/logistics.ts`。
+           这两份此前互不引用,于是件通电了、货却一动不动,而
+           `componentsEvaluated` 与 `running` 都正常 —— 单看这些指标看不出问题。 */
+        this.tickLogisticsStep();
       }
 
       /* ── 慢帧 2Hz:刷怪决策 ── */

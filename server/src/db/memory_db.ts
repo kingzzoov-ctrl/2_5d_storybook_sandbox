@@ -9,6 +9,19 @@
  *
  * 它**不是** SQL 引擎:不解析 SELECT / JOIN / CHECK / VIEW / TRIGGER。
  * 需要真 SQL 语义的场景走 `driver.sqlite.ts`(依赖注入 better-sqlite3)。
+ *
+ * ## ⚠ 主人归属(task-37 判定,2026-11-12):**测试替身**,不是欠账
+ *
+ * `DbLike` 是 `repo.ts:35` 定义的生产接口,本文件与 `driver.sqlite.ts:125`
+ * 是它的**两个实现**:生产走 SQLite,测试走内存 —— 这是**架构意图**
+ * (文件头自述「用途:测试与本地冒烟」)。
+ *
+ * ⇒ 「生产零引用」在本模块上是**正确架构**,不该按欠账处置。
+ * 且它并非「没人用」:`scripts/verify.ts:2797` 真的 import 它,
+ * 与真实 SQLite 做**双后端语义对照**(见 `verify.ts` 的双后端节)。
+ *
+ * 把它留在缺账清单里,是审计口径把「实现之一」误当「漏接模块」;
+ * 正确归类是**测试替身**(需新类别标签,见 task-37 报告)。
  */
 
 import { TABLE_PRIMARY_KEYS, type DbLike, type KeyParts, type Row } from './repo.ts';

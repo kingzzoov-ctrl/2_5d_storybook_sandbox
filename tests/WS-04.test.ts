@@ -1021,6 +1021,22 @@ test('W4-45 牧场自动产出:按周期产出,同类 ≥3 只额外 +1', () => 
   const two = [createPetRecord('mob_sheep')!, createPetRecord('mob_sheep')!];
   for (const p of two) { feedPet(p, 123); sendToRanch(two, p); }
   eq(tickRanch(two, 600)[0].count, 1, '2 只无群体加成');
+
+  /* ── 周期下沿(补齐单边盲区)──────────────────────────────────────────
+   * 上面那两条只钉了**上沿**:`tickRanch(pets, 600)` 能产出、
+   * `601` 不能。但 `now - lastProduceAt < RANCH` 这个判据对
+   * **任何 RANCH ≤ 600** 都成立(600 < RANCH 为假)⇒ 把实现改成
+   * `RANCH_PRODUCE_SEC = 2` 或 `10` 时,两条断言仍全绿(实测扫描:
+   * 2/10/100/300/500/590/599 **全部漏检**)。
+   *
+   * 故补一条**受控下沿**:让 `lastProduceAt = 1`,于是
+   * `tickRanch(_, 600)` 的 elapsed 恰为 **599**(比周期短 1 秒)。
+   * 正确实现必须「不产出」;而 RANCH ≤ 599 的实现会产出 ⇒ 立刻报错。
+   * 与上沿合起来,周期值 600 被**双向钉死**。 */
+  const edge = [createPetRecord('mob_sheep', 1)!];
+  for (const p of edge) { feedPet(p, 123); sendToRanch(edge, p); }
+  eq(tickRanch(edge, 600).length, 0, '周期差 1 秒不产出(599s < 600s)');
+  eq(tickRanch(edge, 601).length, 1, '满周期即产出(600s,下沿紧邻上沿)');
 });
 
 test('W4-46 背物资指令:负载随等级增长、移速惩罚', () => {

@@ -35,6 +35,10 @@ import {
   CRAB_SHELL_DR, WHALE_CRYSTAL_COUNT, CIRCUIT_COLORS, CHRONOS_CIRCUIT_COUNT,
   PULL_MIN_PLAYERS, PULL_FORCE_THRESHOLD,
 } from '../server/src/bosses/breaks.ts';
+/* task-35 生产接线:WorldSim 持有 Boss 副本运行时,并用内存版 OfferingPort 断言消耗。 */
+import { WorldSim } from '../server/src/sim/world_sim.ts';
+import type { BossRaidRuntime } from '../server/src/bosses/runtime.ts';
+import { makeMemoryOfferingPort } from '../server/src/bosses/runtime.ts';
 
 /* ═════════════════════ 1. 冻结层与祭品 ═════════════════════ */
 
@@ -966,6 +970,204 @@ test('W5-44 自反馈漏洞:战利品不得含自身祭品(CR-15 已修复,含�
   const inLoot = summonItemsInLoot();
   eq(inLoot.length, 0, '战利品里不得出现任何祭品(734..741)');
   eq(SUMMON_ITEM_MIN <= 739 && 739 <= SUMMON_ITEM_MAX, true, '739 确实在祭品区段内(区段判据本身有效)');
+});
+
+/* ═════════════════════ task-35:生产路径接线 ═════════════════════ */
+
+/*
+ * ## 这一组为什么必须先红
+ *
+ * 本仓已**第 5 次**出现同一形态的缺陷:实现存在 + 单测全绿 + 生产永不执行。
+ * `raid.ts`(413 行)、`breaks.ts`(447 行)、`phases.ts`(401 行)正是其中一组 ——
+ * 上面 44 条用例把它们的**函数级**行为测得很好,却没有一条问过:
+ * **生产 tick 会不会走到它们?**
+ *
+ * 答案是否定的。实测证据(接线前):
+ *   · `WorldSim` 的 28 个成员里,匹配 `boss|raid|summon|break` 的是 **0 个**;
+ *   · `sim.addMob('boss_jelly_king', 10, 10)` → `undefined`
+ *     (8 个 Boss **全部**不在 `MOB_BY_ID` 里,`addMob` 查不到 def 就返回 undefined);
+ *   · `sim.interactMob('boss_jelly_king', 734, 'p1')` → `false`;
+ *   · `sim.tick()` 跑 40 帧,成员集合**未变**。
+ *
+ * 所以下面这几条在接线前**必然红** —— 它们断言的是「生产真的走到了」,
+ * 而不是「函数本身能工作」。没有红过就接线,等于没验证过缺陷存在。
+ */
+
+test('W5-45 生产可达:WorldSim 必须持有 Boss 副本运行时(接线前为红)', () => {
+  const sim = new WorldSim({ sizeCells: 48 });
+  const anySim = sim as unknown as Record<string, unknown>;
+  const raid = anySim['bossRaid'] as BossRaidRuntime | undefined;
+  ok(raid !== undefined && raid !== null,
+    'WorldSim 必须持有 Boss 副本运行时 bossRaid —— 否则 bosses/** 生产永不执行');
+  /* 正对照:拿到的必须是真东西,不是占位对象 */
+  eq(typeof raid?.summon, 'function', 'bossRaid.summon 必须是可调用的生产入口');
+  eq(typeof raid?.damage, 'function', 'bossRaid.damage 必须是可调用的生产入口');
+  eq(typeof raid?.tryBreak, 'function', 'bossRaid.tryBreak 必须是可调用的生产入口');
+});
+
+test('W5-46 生产路径破防:Boss 承伤累积到阈值 → 真的推进阶段', () => {
+  const sim = new WorldSim({ sizeCells: 48 });
+  const raid = sim.bossRaid;
+  ok(raid !== null, 'bossRaid 必须已接线');
+
+  /* 先把果冻王召出来(走生产入口,含祭品消耗) */
+  const port = makeMemoryOfferingPort({ p1: { 734: 1 } });
+  const s = raid!.summon(
+    {
+      bossId: 'boss_jelly_king', itemId: 734, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 2, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  eq(s.ok, true, '正确祭品 + 祭坛 → 召唤成立');
+  eq(raid!.stateOf('boss_jelly_king')?.phaseIndex, 0, '开局是 P1');
+
+  /* 承伤累积:打到 20% 血(果冻王 P3 阈值 0.25) */
+  const st = raid!.stateOf('boss_jelly_king')!;
+  const before = st.hp;
+  raid!.damage('boss_jelly_king', Math.round(before * 0.85));
+  eq(raid!.stateOf('boss_jelly_king')!.hp < before, true, '承伤后血量确实下降');
+
+  /* 推进一帧慢帧,让阶段机重算下标 */
+  raid!.tickBosses(0.5);
+  eq(raid!.stateOf('boss_jelly_king')!.phaseIndex, 2,
+    '承伤累积到 20% 血 → 真的进入 P3(这是生产路径推出来的,不是直接写 state)');
+});
+
+test('W5-47 生产路径破防:满足破防条件 → breakAchieved 置位并进入眩晕窗口', () => {
+  const sim = new WorldSim({ sizeCells: 48 });
+  const raid = sim.bossRaid!;
+  const port = makeMemoryOfferingPort({ p1: { 734: 1 } });
+  raid.summon(
+    {
+      bossId: 'boss_jelly_king', itemId: 734, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 2, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  const st = raid.stateOf('boss_jelly_king')!;
+  raid.damage('boss_jelly_king', Math.round(st.hp * 0.85));
+  raid.tickBosses(0.5);
+  eq(raid.stateOf('boss_jelly_king')!.breakAchieved, false, '条件未满足时未破防(负对照)');
+
+  /* 生产入口投喂:点燃的 228 顺吸力扔进嘴 */
+  const r = raid.tryBreak('boss_jelly_king', {
+    phaseIndex: 2, suctionActive: true, feedItem: 228, lit: true,
+    distanceToMouth: 1.5, mouthRadius: 3,
+  });
+  eq(r.ok, true, '生产入口判定破防成立');
+  const after = raid.stateOf('boss_jelly_king')!;
+  eq(after.breakAchieved, true, '破防态真的置位');
+  eq(after.stunnedSec, BREAK_STUN_SEC['boss_jelly_king'], '进入 6 秒眩晕窗口');
+  /* 这里**刻意写字面量 1.00**,不用 `BREAK_CRIT_BONUS`:
+     后者会让断言变成同义反复(`applyBreak` 就是赋这个常量,任何值都能过),
+     于是常量漂移时断言照样绿。手册 §4.3 对破防窗口的要求是
+     「全队上去暴打全暴击」⇒ 暴击加成 = +100% = 倍率增量 1.00。
+     写死了才能抓住常量被改动。 */
+  eq(after.critBonus, 1.00, '全队暴击加成 +100%(手册 §4.3「全暴击」,字面量锚定)');
+
+  /* 负对照:条件不满足时同一入口必须返回 false 且不改状态 */
+  const r2 = raid.tryBreak('boss_beaver_mecha', { damDestroyed: false, mechShortCircuited: false });
+  eq(r2.ok, false, '未满足条件 → 不破防');
+});
+
+test('W5-48 生产路径召唤:祭品真的被消耗(D-03),库存随之减少', () => {
+  const sim = new WorldSim({ sizeCells: 48 });
+  const raid = sim.bossRaid!;
+  const bag: Record<string, Record<number, number>> = { p1: { 741: 1 } };
+  const port = makeMemoryOfferingPort(bag);
+
+  eq(port.countOf('p1', 741), 1, '献祭前有 1 个祭品');
+  const s = raid.summon(
+    {
+      bossId: 'boss_chronos_colossus', itemId: 741, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 4, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  eq(s.ok, true, '召唤成立');
+  eq(s.offeringConsumed, true, 'D-03:祭品必须被消耗');
+  eq(port.countOf('p1', 741), 0, '库存真的从 1 变成 0');
+  eq(raid.stateOf('boss_chronos_colossus') !== undefined, true, 'Boss 实体已进入生产运行时');
+
+  /* 负对照:库存为空时同一入口必须失败且**不扣任何东西** */
+  const s2 = raid.summon(
+    {
+      bossId: 'boss_sky_whale', itemId: 740, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 4, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  eq(s2.ok, false, '没有祭品 → 召唤失败');
+  eq(s2.reason, SummonReject.NO_OFFERING, '拒绝理由是 NO_OFFERING');
+  eq(s2.offeringConsumed, false, '失败路径恒为未消耗');
+  eq(port.countOf('p1', 740), 0, '没有凭空扣掉不存在的东西');
+});
+
+test('W5-49 生产 tick 真的推进 Boss 状态(不是摆设字段)', () => {
+  const sim = new WorldSim({ sizeCells: 48 });
+  const raid = sim.bossRaid!;
+  const port = makeMemoryOfferingPort({ p1: { 734: 1 } });
+  raid.summon(
+    {
+      bossId: 'boss_jelly_king', itemId: 734, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 2, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  const cd0 = raid.stateOf('boss_jelly_king')!.castCd;
+  const sec0 = raid.stateOf('boss_jelly_king')!.phaseSec;
+  /* 走**生产 tick 路径**(WorldSim.tick),而不是直接调 tickBosses */
+  for (let i = 0; i < 40; i += 1) sim.tick();
+  const st = raid.stateOf('boss_jelly_king')!;
+  eq(st.phaseSec > sec0, true, 'WorldSim.tick 真的推进了 Boss phaseSec');
+  eq(st.castCd !== cd0 || st.casts > 0, true, '施法倒计时/计数在生产 tick 下发生变化');
+});
+
+test('W5-50 生产入口真的存在:WorldSim 暴露 summon/damage/break/snapshot(不只是 import 图可达)', () => {
+  /*
+   * 这一条防的是**「可达但不调用」** —— 只加 import 不加调用点时,
+   * 静态可达性门禁会绿,而 summon/tryBreak 依旧永不执行,缺陷形态不变。
+   * 所以这里断言的是 WorldSim **自己**有这四个可调用入口。
+   */
+  const sim = new WorldSim({ sizeCells: 48 });
+  const anySim = sim as unknown as Record<string, unknown>;
+  for (const m of ['summonBoss', 'damageBoss', 'tryBreakBoss', 'bossSnapshots']) {
+    eq(typeof anySim[m], 'function', `WorldSim 必须暴露 ${m} 作为真实调用点`);
+  }
+
+  /* 端到端:走 WorldSim 自己的人口,而不是直接摸 bossRaid */
+  const port = makeMemoryOfferingPort({ p1: { 741: 1 } });
+  const s = sim.summonBoss(
+    {
+      bossId: 'boss_chronos_colossus', itemId: 741, hasAltar: true,
+      altarX: 200, altarY: 200, townCenterX: 0, townCenterY: 0,
+      playerCount: 4, alreadyAlive: false, ownerId: 'p1',
+    },
+    port,
+  );
+  eq(s.ok, true, '经 WorldSim.summonBoss 召唤成立');
+  eq(port.countOf('p1', 741), 0, '经 WorldSim 这条路也真的扣了祭品');
+
+  const snaps = sim.bossSnapshots();
+  eq(snaps.length, 1, 'snapshot 能看到刚召出的 Boss');
+  eq(snaps[0]!.bossId, 'boss_chronos_colossus', 'snapshot 的 Boss ID 正确');
+  eq(snaps[0]!.hpRatio, 1, '满血开局');
+
+  /* 经 WorldSim 入口造成伤害 */
+  const d = sim.damageBoss('boss_chronos_colossus', 1000);
+  eq(d !== null, true, '经 WorldSim.damageBoss 能打到 Boss');
+  eq(d!.toHp > 0, true, '伤害真的落在血量上');
+  eq(sim.bossSnapshots()[0]!.hpRatio < 1, true, 'snapshot 反映掉血');
+
+  /* 未知 Boss 的负对照 */
+  eq(sim.damageBoss('boss_not_exist', 100), null, '未知 Boss → null(不抛错)');
+  eq(sim.tryBreakBoss('boss_not_exist', {}).ok, false, '未知 Boss 破防 → false');
 });
 
 report('WS-05');

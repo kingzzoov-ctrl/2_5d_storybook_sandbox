@@ -23,6 +23,7 @@ import {
   registeredKinds,
   secondsToTicks,
 } from '../server/src/wiring/graph.ts';
+import { WorldSim } from '../server/src/sim/world_sim.ts';
 import {
   CHANNEL_MAX,
   CHANNEL_MIN,
@@ -1386,6 +1387,111 @@ test('WT-08-60 2 万线格实测:一次 tick 耗时远低于 2Hz 帧预算', () 
   eq(fullMode.colorsFlooded, 4, '全量每帧泛洪四色');
   ok(fullMode.cellsScanned >= 20000, `全量应扫遍全部 2 万格,实际 ${fullMode.cellsScanned}`);
   ok(fullMode.cellsScanned > s.cellsScanned * 50, `全量扫描 ${fullMode.cellsScanned} 应是脏模式 ${s.cellsScanned} 的 50 倍以上`);
+});
+
+/* ══════════════════ 14. 物流在**生产路径**上是否真的搬运 ══════════════════ */
+
+/**
+ * 本节与第 13 节的区别是**判据的对象**:
+ *  - 第 13 节直接调 `stepConveyor(...)` 等纯函数 —— 只证明「逻辑正确」;
+ *  - 本节经由 `new WorldSim(...).tick()` —— 证明「生产真的走它」。
+ *
+ * 这两件事在本仓被反复证明**不等价**(「实现存在 + 测试全绿 + 生产零引用」
+ * 已出现 5 次)。第 13 节全绿而本节全红,正是 `logistics.ts` 此前的状态。
+ */
+test('WT-08-53 生产路径:传送带真的搬运货物(而不是只设 running 标志)', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  sim.wiring.addComponent(createComponent('belt1', 'LOGISTICS_CONVEYOR', 5, 5, {
+    params: { dir: 1 },
+    state: { running: 0, dir: 1, movedCells: 0 },
+  }));
+  sim.wiring.addWire(5, 5, WireColor.GREEN);
+  sim.addWireDrive(5, 5, WireColor.GREEN, true);
+
+  /* 载货:传送带的 `item` 由装载动作填入,没有装载就永远不走 ——
+     `stepConveyor` 对空带直接返回 `moved: false`。这里走 WorldSim 的公开
+     装载入口(地面掉落物 → 传送带),而不是直接改件 state。 */
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  sim.loadConveyorAt(5, 5);
+
+  /* 慢帧每 10 快帧一次 ⇒ 20 慢帧 = 200 快帧。传送带 2 帧走 1 格,
+     20 慢帧足够走 10 格;推 200 帧留足余量。 */
+  for (let i = 0; i < 200; i += 1) sim.tick();
+  const st = sim.wiring.get('belt1')!.state;
+
+  eq(st.running, 1, '通电 → running=1(components.ts 求值器确实跑了)');
+  ok(
+    st.movedCells > 0,
+    `生产路径上传送带应搬运货物,实际 movedCells=${st.movedCells}`
+    + '(为 0 说明 logistics.ts 未被生产调用:件只通电,不搬运)',
+  );
+});
+
+test('WT-08-54 生产路径:机械臂真的把地面货物投喂给设备', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  sim.wiring.addComponent(createComponent('arm1', 'LOGISTICS_ARM', 8, 8, {
+    state: { powered: 0, delivered: 0, idleCycles: 0 },
+  }));
+  sim.wiring.addWire(8, 8, WireColor.GREEN);
+  sim.addWireDrive(8, 8, WireColor.GREEN, true);
+  /* 投喂目标:斗柜 503(在 ARM_TARGETS 内),必须在 OBJ 层真实存在 */
+  sim.setCell(8, 6, { obj: 503 });
+  /* 货物放在机械臂抓取半径内 */
+  sim.setGroundItems([{ id: 151, x: 7, y: 8, count: 1 }]);
+
+  /* 机械臂单循环 4 慢帧;推 200 快帧 = 20 慢帧 = 5 个循环 */
+  for (let i = 0; i < 200; i += 1) sim.tick();
+  const st = sim.wiring.get('arm1')!.state;
+
+  eq(st.powered, 1, '通电 → powered=1');
+  ok(
+    st.delivered > 0,
+    `生产路径上机械臂应投喂成功,实际 delivered=${st.delivered}(为 0 说明未接线)`,
+  );
+});
+
+test('WT-08-55 生产路径:采矿钻头真的按 10 秒周期产出矿石', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  sim.wiring.addComponent(createComponent('drill1', 'LOGISTICS_DRILL', 3, 3, {
+    params: { oreId: 151 },
+    state: { powered: 0, oreId: 151, produced: 0 },
+  }));
+  sim.wiring.addWire(3, 3, WireColor.GREEN);
+  sim.addWireDrive(3, 3, WireColor.GREEN, true);
+
+  /* ⚠️ 帧数换算容易错(我第一版就错了):DRILL_PERIOD_TICKS=20 是**慢帧**数,
+     而慢帧每 10 快帧一次 ⇒ 10 秒 = 20 慢帧 = **200 快帧**。
+     只推 42 帧只有 4 个慢帧,远不够一个周期,会误判成「没接线」。 */
+  const FAST_PER_SLOW = 10;
+  const needFrames = DRILL_PERIOD_TICKS * FAST_PER_SLOW * 2; /* 2 个周期,留余量 */
+  for (let i = 0; i < needFrames; i += 1) sim.tick();
+  const st = sim.wiring.get('drill1')!.state;
+
+  eq(st.powered, 1, '通电 → powered=1');
+  ok(
+    st.produced >= 2,
+    `生产路径上钻头 ${needFrames} 帧(${DRILL_PERIOD_TICKS * 2} 慢帧)应产出 ≥2 块,`
+    + `实际 produced=${st.produced}(为 0 说明未接线)`,
+  );
+});
+
+test('WT-08-56 生产路径断电对照:断电时物流必须完全静止', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  sim.wiring.addComponent(createComponent('belt2', 'LOGISTICS_CONVEYOR', 5, 5, {
+    params: { dir: 1 },
+    state: { running: 0, dir: 1, movedCells: 0 },
+  }));
+  /* 刻意**不**通电 */
+  sim.wiring.addWire(5, 5, WireColor.GREEN);
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+
+  for (let i = 0; i < 20; i += 1) sim.tick();
+  const st = sim.wiring.get('belt2')!.state;
+
+  eq(st.running, 0, '未通电 → running=0');
+  eq(st.movedCells, 0, '断电时不得搬运任何货物');
+  eq(sim.groundItems.length, 1, '货物应原地不动');
+  eq(sim.groundItems[0]!.x, 5, '货物 x 坐标不变');
 });
 
 report('WS-08');

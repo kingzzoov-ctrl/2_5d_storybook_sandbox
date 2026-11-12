@@ -654,9 +654,20 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   /* WS-06 炼金 7 条(index + 6 内部模块)已于 2026-11-12 接线,
      入口 `WorldSim.forgeAlchemy()`。已从白名单摘除 —— 不在表里
      却仍不可达会让门禁报「未登记」,这正是本表存在的意义。 */
-  ['server/src/bosses/breaks.ts', 'WS-05 Boss 破防,待接入 tickMobs'],
-  ['server/src/bosses/phases.ts', 'WS-05 Boss 阶段,待接入 tickMobs'],
-  ['server/src/bosses/raid.ts', 'WS-05 副本编排,待接入'],
+  /* ── WS-05 Boss 3 条已于 2026-11-12 接线,整块摘除 ──
+   *
+   * `bosses/` 三文件 1,261 行此前在生产里零引用。接线方式:
+   * `WorldSim.tick()` 慢帧 → `bossRaid.tickBosses(SIM_SLOW_DT)`
+   * → `phases.tickBoss`(阶段/护盾/眩晕);
+   * `bossRaid.summon` → `raid.summonBossWithOffering`(校验 + 扣祭品);
+   * `bossRaid.tryBreak` → `breaks.evaluateBreak` → `phases.applyBreak`。
+   *
+   * **挂慢帧而非 `tickMobs` 的理由(值得留档)**:`tickBoss` 的 dt 以**秒**计
+   * (`CAST_INTERVAL_SEC` / `TIME_SHIELD_SEC` / `stunnedSec`),与
+   * `SIM_SLOW_DT=0.5` 同量纲。挂快帧会让护盾与眩晕**以 10 倍速流失** ——
+   * 不抛异常、只是时间凭空快 10 倍。这类量纲错配不会自我暴露。
+   *
+   * 且 Boss 不是生物:8 个 Boss 全不在 `MOB_BY_ID`,挂 `tickMobs` 等于挂在空集合上。 */
   ['server/src/build/autotile.ts', 'WS-03 自动贴图,待客户端接线'],
   ['server/src/build/blueprint.ts', 'WS-03 蓝图接力队列,待接入'],
   ['server/src/build/grid.ts', 'WS-03 建造网格,待接入'],
@@ -680,7 +691,8 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫,待接入'],
   ['server/src/prank/toys.ts', 'WS-11 玩具,待接入'],
   ['server/src/social/afk.ts', 'WS-11 挂机/生态箱,待接入'],
-  ['server/src/wiring/logistics.ts', 'WS-08 物流,待接入'],
+  /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
+     经 `WorldSim` 的慢帧 `tickLogisticsStep` 驱动。已从本表摘除。 */
 ]);
 
 /**

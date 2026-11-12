@@ -38,8 +38,18 @@ interface Case {
   group: string;
   name: string;
   file: string;
-  /** 必须唯一命中的原文 */
-  from: string;
+  /**
+   * 必须唯一命中的原文。
+   *
+   * **允许写成函数**:函数收到抽样时的 `verify.ts` 全文,返回锚点。
+   * 这是为了防一类**反复发生**的假失败:锚点写死在某条白名单理由上,
+   * 而白名单会随接线**单调收缩**(43→35→27→23→…),那条理由一旦被摘,
+   * 探针就报「锚点命中 0 次」。
+   *
+   * 本项目已因此**修过两次**(客户端 8 条接线、WS-05 三条接线)。
+   * 与其每次手改锚点,不如让它**从活的清单里自己取**。
+   */
+  from: string | ((src: string) => string);
   /** 替换为 */
   to: string;
   /**
@@ -63,6 +73,36 @@ interface Case {
    * 此时改用 `notMsg` 精确断言**那一条**消息已消失 —— 这才是本用例要测的东西。
    */
   notMsg?: RegExp;
+}
+
+/**
+ * 从 `verify.ts` 的 `UNREACHABLE_EXEMPT` 里挑一条**仍在册的**服务端理由,
+ * 返回可直接用于 `String.replace` 的引号形式(含两侧单引号)。
+ *
+ * **为什么需要它**:T32 那两条「理由过时」探针原先写死锚点
+ * (`'WS-05 Boss 破防,待接入 tickMobs'`)。而白名单会随接线**单调收缩**
+ * —— WS-05 三条一通,那句理由就被摘了,探针随即报「锚点命中 0 次」。
+ *
+ * 这是**同一类假失败在本轮第二次发生**(第一次是客户端 8 条接线后)。
+ * 与其每次手改,不如让锚点从活清单里自取。
+ *
+ * 选服务端条目而非客户端:客户端条目已全部摘除(接线 + orphan 审计双重确认)。
+ * 若未来连服务端清单也空了,本函数返回空串 —— 调用处会报「探针失效」,
+ * 那时应删掉这两条用例(它们要测的对象已不存在)。
+ */
+function pickServerReason(src: string): string {
+  const a = src.indexOf('const UNREACHABLE_EXEMPT = new Map<string, string>([');
+  if (a < 0) return '';
+  const b = src.indexOf(']);', a);
+  if (b < 0) return '';
+  const block = src.slice(a, b);
+  /* 逐行找 `['server/...', '理由'],` —— 理由里不许含单引号(有则跳过,避免替换歧义) */
+  for (const m of block.matchAll(/^\s*\['(server\/[^']+)',\s*'([^']+)'\]/gm)) {
+    const reason = m[2] as string;
+    if (reason.includes("'")) continue;
+    return `'${reason}'`;
+  }
+  return '';
 }
 
 const CASES: Case[] = [
@@ -267,9 +307,11 @@ const CASES: Case[] = [
     group: 'T32',
     name: '白名单理由写回「本仓无装配入口」⇒ 必须报理由过时',
     file: 'scripts/verify.ts',
-    /* 锚在一条**仍在册**的服务端条目上:它确实「等接线」,
-       且本仓确实**有**装配入口 ⇒ 写回「本仓无装配入口」必然是假话。 */
-    from: "'WS-05 Boss 破防,待接入 tickMobs'",
+    /* 锚点**自取**:从当前清单里挑一条仍在册的服务端理由。
+       它确实「等接线」,且本仓确实**有**装配入口 ⇒ 写回
+       「本仓无装配入口」必然是假话。
+       不写死是因为清单会随接线收缩 —— 本项目已因此修过两次。 */
+    from: (src) => pickServerReason(src),
     to: "'客户端子系统,本仓无装配入口'",
     expect: 'red',
     wantMsg: /理由过时/,
@@ -279,8 +321,7 @@ const CASES: Case[] = [
     group: 'T32',
     name: '理由里引用不存在的文件 ⇒ 必须报理由过时',
     file: 'scripts/verify.ts',
-    /* 同上:锚在仍在册的服务端条目上 */
-    from: "'WS-05 Boss 阶段,待接入 tickMobs'",
+    from: (src) => pickServerReason(src),
     to: "'待接入客户端装配层(参照 ghost_assembly.ts 的接法)'",
     expect: 'red',
     wantMsg: /理由过时/,
@@ -447,13 +488,27 @@ for (const c of CASES) {
     failures += 1; dropLab(); continue;
   }
   const src = readFileSync(p, 'utf8');
-  if (c.from !== '') {
-    const n = src.split(c.from).length - 1;
+  /* `from` 可为函数:从当前文件内容里**自取**锚点,避免写死的锚点随
+     白名单收缩而失效(见接口注释)。
+     ⚠ 必须区分两种"空":
+       · `from: ''`(字面空串)= **有意不改**,合法(有些用例只断言消息)
+       · `from` 是函数却返回空 = **解析器失效**,必须报错,否则会退化成
+         「跑了个空操作还判通过」的假证据。
+     初版把两者混为一谈,于是 3 个 `from: ''` 的用例被误报"探针失效" ——
+     这正是本脚本自身最该防的那类错误。 */
+  const isDerived = typeof c.from === 'function';
+  const fromText = isDerived ? (c.from as (s: string) => string)(src) : (c.from as string);
+  if (isDerived && fromText === '') {
+    console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:锚点解析器返回空串(清单可能已空)`);
+    failures += 1; dropLab(); continue;
+  }
+  if (fromText !== '') {
+    const n = src.split(fromText).length - 1;
     if (n !== 1) {
       console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:锚点命中 ${n} 次(需恰好 1 次)`);
       failures += 1; dropLab(); continue;
     }
-    writeFileSync(p, src.replace(c.from, c.to), 'utf8');
+    writeFileSync(p, src.replace(fromText, c.to), 'utf8');
     /* 自证:读回确认内容真的变了 —— 防「空操作探针」假证据 */
     if (readFileSync(p, 'utf8') === src) probeOk = false;
   }

@@ -55,12 +55,22 @@ const REBASE = process.argv.includes('--baseline');
  * 理由必须 ≥8 字符且说清**卡在哪**,否则自检报「未写明理由」。
  */
 export const ORPHAN_KNOWN = new Map<string, string>([
+  /* ── 已接线的组(entries 保留在此仅作历史记录,不再列于表中)──
+   *
+   * 2026-11-12 两批接线,本表从 25 条收缩到 14 条:
+   *   · WS-06 炼金 7 条 → `WorldSim.forgeAlchemy()`
+   *   · WS-05 Boss 3 条 → `WorldSim` 慢帧 `bossRaid.tickBosses()`
+   *   · WS-08 物流 1 条 → `WorldSim` 慢帧 `tickLogisticsStep()`
+   *   · 客户端 8 条 → `three/ui_binding.ts` + `ui/panel_layout.ts`
+   * 每次接通,本表的自检都报一次「已可达,应移出」——
+   * **本表自检至今抓出过我 8 次误登记。** 若没有那道自检,
+   * 白名单会越积越宽而门禁全程绿色。
+   */
   /* ── 服务端:等编排层接线 ── */
-  /* ⚠ `wiring/components.ts` **不在此表** —— 它被 `world_sim.ts:72` 以
+  /* ⚠ `wiring/components.ts` **不在此表** —— 它被 `world_sim.ts:84` 以
      **裸 import**(`import '../wiring/components.ts';`)引用,因此**可达**。
      我的初版扫描器用正则找 `from '…'`,漏掉裸 import,把它误报成 orphan。
      详见 `extractRelativeImports` 的注释与「词法自检」一节。 */
-  ['server/src/wiring/logistics.ts', 'WS-08 物流(传送带/分拣/机械臂);待接 components 求值'],
   ['server/src/party/modes.ts', 'WS-11 派对模式;待编排层按房间模式分发'],
   ['server/src/social/afk.ts', 'WS-11 挂机检测;待房间 tick 调用'],
   ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫;待接 applyPrank'],
@@ -70,8 +80,6 @@ export const ORPHAN_KNOWN = new Map<string, string>([
   ['server/src/combat/damage.ts', 'WS-10 八步公式;生产走 vitals.ts 简化路径,待接线'],
   ['server/src/combat/cooking.ts', 'WS-10 烹饪;待接入交互系统'],
   ['server/src/combat/revive.ts', 'WS-10 救援;待接入玩家倒地流程'],
-  ['server/src/bosses/raid.ts', 'WS-05 副本编排;待 tickMobs 调用'],
-  ['server/src/bosses/breaks.ts', 'WS-05 Boss 破防;待 tickMobs 调用'],
   ['server/src/mobs/taming.ts', 'WS-04 驯服;待交互系统调用'],
   ['server/src/net/prediction.ts', 'WS-07 客户端预测;待 rollback 路径接入'],
   ['server/src/db/memory_db.ts', 'WS-07 内存库;生产走 sqlite 驱动,仅测试用'],
