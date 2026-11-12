@@ -77,7 +77,6 @@ export const ORPHAN_KNOWN = new Map<string, string>([
   ['server/src/build/blueprint.ts', 'WS-03 蓝图接力;待客户端蓝图面板接线'],
   ['server/src/build/rooms.ts', 'WS-03 BFS 房间识别;待建造流程调用'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图;待客户端接线'],
-  ['server/src/combat/damage.ts', 'WS-10 八步公式;生产走 vitals.ts 简化路径,待接线'],
   ['server/src/combat/revive.ts', 'WS-10 救援;待接入玩家倒地流程'],
   ['server/src/mobs/taming.ts', 'WS-04 驯服;待交互系统调用'],
   ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块);等客户端网络层 —— 服务端侧不该接'],

@@ -753,10 +753,8 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
    * ⇒ **两套清单都对,但判据不同,不应合并、不应互相「对齐」。**
    *   改这里之前先确认你改的是**传递性判据**还是**直接引用判据**。
    * ══════════════════════════════════════════════════════════════════════ */
-  ['server/src/combat/damage.ts', 'WS-10 八步伤害公式 —— 生产走 vitals.ts 简化路径,待接线'],
   ['server/src/combat/progression.ts', 'WS-10 击杀结算,待接入'],
   ['server/src/combat/revive.ts', 'WS-10 复活/无敌,待接入'],
-  ['server/src/combat/weapons.ts', 'WS-10 武器表,随 damage.ts 一起接'],
   /* `combat/cooking.ts` 已于 2026-11-12 接线(task-39):
      `WorldSim` 真的调用 `createKitchenState` / `feedStation` / `tryCook` / `potCount`
      (各 2~4 处**真实调用点**,不是只 import)。已从本表摘除。 */
@@ -1427,6 +1425,11 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
   ['WS-09::SLOTS_PER_ROW', '已知:断言右侧取自 inventory.ts,待换字面量'],
   /* ── WS-10 ── */
   ['WS-10::BASE_CRIT_DMG', '已知:断言右侧取自 weapons.ts,待换字面量'],
+  ['WS-10::PRANK_HAMMER_KNOCKBACK',
+    '已双重锚定:同伴字面量断言 eq(PRANK_HAMMER_KNOCKBACK, 8.0) 使改常量必红,'
+    + '故本条无区分力缺口 —— 与 REFLECT_RADIUS 同一修法'],
+  ['WS-10::REFLECT_RADIUS',
+    '已双重锚定:同伴字面量断言 eq(REFLECT_RADIUS, 3) 使改常量必红'],
   ['WS-10::BUBBLE_TRAP_SEC', '已知:断言右侧取自 revive.ts,待换字面量'],
   ['WS-10::GHOST_MOVE_MUL', '已知:断言右侧取自 revive.ts,待换字面量'],
   /* `WS-10::REFLECT_RADIUS` 已移出:Lead 改成字面量 3 + `eq(REFLECT_RADIUS, 3)` 双重锚定。
