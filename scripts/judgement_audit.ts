@@ -78,7 +78,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { findBaseline, JUDGEMENT_BASELINE } from './judgement_baseline.ts';
+import { findBaseline, JUDGEMENT_BASELINE, G_CANDIDATE_WATERMARK } from './judgement_baseline.ts';
 
 /* ⚠️ 用 `fileURLToPath`,不要手拼 `new URL(...).pathname` ——
    后者在 Windows 上给出 `/C:/…`(带前导斜杠),我第一版就因此扫到 **0 个文件**,
@@ -255,6 +255,45 @@ type Detector = {
    * 留空 = 该检测器的判定是**确定性**的(命中即确证形态存在)。
    */
   heuristic?: string;
+  /**
+   * ★ 本检测器与**门禁**的关系(默认 `'block'`)。
+   *
+   * ```
+   * 'block'  —— 未登记的命中 ⇒ 门禁红。适用于「命中即确证坏形状」的判据
+   *             (A/B/C/D/F:报的是**具体代码形状**,能逐条定性)
+   * 'advise' —— 未登记的命中 ⇒ **只告警,不拦门禁**;但**数量增长**会拦。
+   *             适用于「命中只是候选,要看差异才能定性」的判据(目前只有 G)
+   * ```
+   *
+   * ## 为什么需要 `'advise'`(2026-11-13,Lead 裁决「甲」)
+   *
+   * ```
+   * G 一接入 --baseline,门禁立刻红了 42 处 —— 而这**不是"交了坏东西"**,
+   * 是「新检测器的初始语料尚未定性」。
+   * ⇒ 若让 42 条候选直接决定门禁红绿,所有人要立刻面对 42 条人工判断
+   * ⇒ 门禁变成噪声源 ⇒ **最终没人看门禁**(比不接更糟)
+   * ```
+   *
+   * ⇒ 正确的门禁语义是「**把"数量增长"当信号,而不是把"有没有"当信号**」:
+   * ```
+   * 今天 42 条 ⇒ 告警,门禁绿(存量已知)      ← 水位 G_CANDIDATE_WATERMARK
+   * 明天 43 条 ⇒ **门禁红**(有人新引入了这类形态)
+   * ```
+   * ⇒ 同时满足:① 不阻塞别人 ② G 的价值保留(人能看到候选)
+   *   ③ 不变成永久噪声(**增长**仍会红)。
+   */
+  gate?: 'block' | 'advise';
+  /**
+   * ★ 可选:**需要全局视野**的检测器用这个,与 `detect` 并存但不互相替代。
+   *
+   * 给出的检测器,主扫描循环会**改调它**(而不是逐文件调 `detect`)。
+   * `detect` 仍必须实现 —— 因为区分力自检(框架 E)只在**单段样本**上跑它。
+   *
+   * ⇒ 用途:像 G 这种「跨文件同名不同物」的判据**结构上**做不到逐文件判定,
+   *   但它单文件内也成立(同文件两个容器共享领域字段),故两者是同一判据的
+   *   两个视野,不是两份实现。
+   */
+  detectAll?: (files: readonly string[]) => string[];
   /** 在给定源码文本上找命中项(返回人可读的定位串) */
   detect: (source: string, path: string) => string[];
   /** ★ 区分力自检:脏样本必须命中,干净样本必须不命中 */
@@ -508,6 +547,202 @@ const DET_D: Detector = {
   minDirtyHits: 1,
 };
 
+/* ══════════════════ G 的支撑:容器抽取 + 配对判定 ══════════════════ */
+
+/** G 用的类型容器:一个带字段集合的类型声明。 */
+type GContainer = {
+  /** 人可读名,如 `CombatantStats(interface)` 或 `FoodBuff.statMods`(嵌套) */
+  name: string;
+  file: string;
+  line: number;
+  fields: string[];
+};
+
+/**
+ * ★ **通用字段词表** —— G 判据的核心,**也是最需要人工复核的地方**。
+ *
+ * 判定原则:一个字段名出现在**任何**实体上都属正常,则收入本表。
+ * ```
+ * 身份/键      id key name slot type kind
+ * 位置         x y z pos position radius range
+ * 通用生命     hp maxHp mp def atk damage value amount
+ * 时间         time sec dt atSec elapsedSec durationSec remainingSec startedAtSec clock
+ * 元数据       desc note label title text msg reason code version hash seed phase
+ * 容器/载荷    data extra meta payload options items list rows entries map set table
+ * 布尔状态     ok active enabled visible alive downed dead
+ * 审计列       created_at updated_at createdAt updatedAt file line verdict
+ * ```
+ * **不进本表的就是「领域字段」** —— 如 `critDmg` / `moveMul` / `armorPen` /
+ * `gravityMul` / `recipe_hash`,它们出现在两个不同容器里才有信息量。
+ *
+ * ## ⚠️ 已知误报形态(必读 —— 这是"标注边界",不是"假装无边界")
+ *
+ * ```
+ * 1 **同名本身是完全正常的** —— `id` / `name` / `level` / `x` / `y` / `hp`
+ *   出现在任何实体上都对。⇒ 所以判据**不是**「同名」,而是
+ *   「同名 ∧ **共享 ≥3 个领域字段** ∧ 各有独有字段」。
+ *   实测:去掉领域字段这一层,本仓从 42 对(可人工读完)膨胀到 159 对(全是噪音)。
+ *
+ * 2 **跨文件同名不同物不能只看名字** —— 必须比字段集合。
+ *   单个字段名在各处出现是无信息的;「**一整组字段**重合而各自还有独有字段」
+ *   才说明两个容器在描述同一概念的不同版本。
+ *   ⇒ 已做:判据取的是**字段集合的交集大小**,不是名字是否相同。
+ *
+ * 3 **同目录/同文件的兄弟接口可能是故意的变体**(窄化的 options、
+ *   定义表 vs 聚合统计、运行时态 vs 结果视图),不是缺陷。
+ *   实测:真例 `statMods ↔ CombatantStats` **同在 combat/** ⇒
+ *   「跨子系统」过滤器**会把它滤掉**(试过,反而更差)。
+ *   ⇒ 故**不加**跨目录/跨文件过滤,靠「领域字段」这一层收敛。
+ *
+ * 4 本词表是启发式的,偏一点候选就翻倍或清空 ⇒ 所以它**只在 `gate:'advise'`
+ *   模式下使用**(见 `Detector.gate`),不让它单独决定门禁红绿。
+ * ```
+ */
+const GENERIC_FIELDS = new Set([
+  'id', 'key', 'name', 'slot', 'type', 'kind',
+  'x', 'y', 'z', 'pos', 'position', 'radius', 'range',
+  'hp', 'maxHp', 'mp', 'def', 'atk', 'damage', 'value', 'amount',
+  'time', 'sec', 'dt', 'atSec', 'elapsedSec', 'durationSec', 'remainingSec', 'startedAtSec', 'clock',
+  'desc', 'note', 'label', 'title', 'text', 'msg', 'reason', 'code', 'version', 'hash', 'seed', 'phase',
+  'data', 'extra', 'meta', 'payload', 'options', 'items', 'list', 'rows', 'entries', 'map', 'set', 'table',
+  'ok', 'active', 'enabled', 'visible', 'alive', 'downed', 'dead', 'result', 'out',
+  'created_at', 'updated_at', 'createdAt', 'updatedAt', 'file', 'line', 'verdict',
+  'count', 'size', 'index', 'idx', 'level', 'state', 'flags', 'tags', 'element', 'source',
+  'steps', 'float', 'phaseIndex', 'phaseName', 'playerId', 'mobId', 'bossId', 'targetId', 'attackerId',
+  'canAttack', 'canBeHealed', 'canBeHit', 'canSpawn', 'canMove',
+]);
+
+const isGenericField = (f: string): boolean => GENERIC_FIELDS.has(f);
+
+/**
+ * 从一段源码里抽出所有类型容器(interface / type 别名),**含一层嵌套对象**。
+ *
+ * ## ⚠️ 为什么要支持嵌套(我第一版漏了,三个真例全漏)
+ * ```
+ * FoodBuff 的形状是:
+ *   interface FoodBuff { ...; statMods: { atkMul: number; hpFlat: number; ... }; }
+ * ⇒ 只取顶层字段会得到 `statMods` 一个名字,**看不到 atkMul**
+ * ⇒ 三个真例(atkMul/critRate/moveMul)**一个都抽不到** ⇒ 检测器形同虚设。
+ * ⇒ 故嵌套对象按 `Parent.child` 单独成为一个容器,与真例的表述方式一致。
+ * ```
+ * 位置靠 `codeOnlyMask`(位置保持)保证 ⇒ 行号可靠。
+ */
+function collectContainers(source: string, path: string): GContainer[] {
+  const text = codeOnlyMask(source);
+  const out: GContainer[] = [];
+  const RE_DECL = /(?:^|\n)\s*(?:export\s+)?(?:declare\s+)?(interface|type)\s+([A-Za-z_$][\w$]*)[^\n{]*\{/g;
+
+  for (const m of text.matchAll(RE_DECL)) {
+    const kind = m[1] as string;
+    const name = m[2] as string;
+    const start = (m.index ?? 0) + m[0].length - 1;
+    let depth = 0;
+    let end = start;
+    for (let i = start; i < text.length; i += 1) {
+      if (text[i] === '{') depth += 1;
+      else if (text[i] === '}') { depth -= 1; if (depth === 0) { end = i; break; } }
+    }
+    const body = text.slice(start + 1, end);
+    const lineOf = (off: number): number => text.slice(0, start + 1 + off).split('\n').length;
+
+    let d = 0;
+    let nestedName: string | null = null;
+    let nestedStart = 0;
+    let offset = 0;
+    const top: string[] = [];
+    const nested: GContainer[] = [];
+
+    for (const bl of body.split('\n')) {
+      const t = bl.trim();
+      const open = (bl.match(/\{/g) ?? []).length;
+      const close = (bl.match(/\}/g) ?? []).length;
+      if (d === 0) {
+        const fm = /^([A-Za-z_$][\w$]*)\??\s*:/.exec(t);
+        if (fm !== null) {
+          const fn = fm[1] as string;
+          if (open > close && /:\s*\{\s*$/.test(t)) { nestedName = fn; nestedStart = offset; }
+          else top.push(fn);
+        }
+      } else if (d === 1 && nestedName !== null) {
+        const fm = /^([A-Za-z_$][\w$]*)\??\s*:/.exec(t);
+        if (fm !== null) {
+          let nc = nested[nested.length - 1];
+          if (nc === undefined) {
+            nc = { name: name + '.' + nestedName, file: path, line: lineOf(nestedStart), fields: [] };
+            nested.push(nc);
+          }
+          nc.fields.push(fm[1] as string);
+        }
+      }
+      d += open - close;
+      if (d === 0) nestedName = null;
+      offset += bl.length + 1;
+    }
+    if (top.length > 0) out.push({ name: name + '(' + kind + ')', file: path, line: lineOf(0), fields: top });
+    for (const nc of nested) if (nc.fields.length > 0) out.push(nc);
+  }
+  return out;
+}
+
+/** G 的一个命中:两个容器 + 它们的领域字段交集。 */
+type GPair = { a: GContainer; b: GContainer; shared: string[] };
+
+/** 判据:非通用共享 ≥3 ∧ 各有独有字段 ∧ 不同容器名。 */
+const G_MIN_SHARED = 3;
+
+function gPairs(all: readonly GContainer[]): GPair[] {
+  const out: GPair[] = [];
+  for (let i = 0; i < all.length; i += 1) {
+    for (let j = i + 1; j < all.length; j += 1) {
+      const a = all[i]!;
+      const b = all[j]!;
+      if (a.name === b.name) continue;
+      /* ★ **故意不加「跳过同文件」过滤** —— 实测决定,三次试错:
+         保留「跨文件」27 对 ← 去掉 42 对,两者都捞到全部 3 个真例。
+         去掉的理由有三条,任一条都足够:
+         ① 它**结构上让框架 E 的自检永久失败**:`detect` 自检只传**一个** path
+            ⇒ 脏样本里两个接口必然同 file ⇒ 判据永不命中 ⇒
+            「脏样本只报 0 条」—— 而扫描却报 27 处(正是"抓不到自己声称要抓的东西")
+         ② 更坏的是它让 `detect` 与 `detectAll` **行为不一致且无法察觉**
+            ⇒ 这就是本仓反复出现的「两份实现漂移」形态,由我自己引入
+         ③ 它的假设(**同文件的两个容器一定是"有意分区"**)从未验证
+         (Lead 给的判据是「同名 ∧ 类型/字段集合不同」,本就没有"跨文件"这一条。) */
+      const bSet = new Set(b.fields);
+      const aSet = new Set(a.fields);
+      const shared = [...new Set(a.fields)].filter((f) => bSet.has(f) && !isGenericField(f));
+      if (shared.length < G_MIN_SHARED) continue;
+      /* 必须**各有独有** —— 两侧字段集完全相同的重复定义是 A 形态的活,不是 G 的 */
+      if (a.fields.filter((f) => !bSet.has(f)).length === 0) continue;
+      if (b.fields.filter((f) => !aSet.has(f)).length === 0) continue;
+      out.push({ a, b, shared });
+    }
+  }
+  return out;
+}
+
+/**
+ * 把一个 G 命中渲染成 `where` 串。
+ *
+ * ## ★ 关键:输出**把差异摆出来**,不替人下结论
+ * ```
+ * 前缀必须保持 `path:LINE  文本` 形态 —— 登记表按 indexOf(':') 解析它。
+ * ```
+ * ⇒ 每行给出 `[共享]`(领域字段交集,即"疑似同一概念"的证据)
+ *   与 `[独有A]/[独有B]`(各自独有,即"两个版本"的证据)。
+ * ⇒ **让"是不是同一概念两份实现"这个判断留给人** ——
+ *   这正是 C 检测器学到的教训:「启发式判定的诚实做法是标注边界」。
+ */
+function renderG(p: GPair): string {
+  const onlyA = p.a.fields.filter((f) => !new Set(p.b.fields).has(f));
+  const onlyB = p.b.fields.filter((f) => !new Set(p.a.fields).has(f));
+  const cap = (xs: readonly string[], n = 6): string =>
+    xs.length <= n ? xs.join(',') : xs.slice(0, n).join(',') + '…(+' + (xs.length - n) + ')';
+  const bShort = p.b.file.split('/').pop() ?? '';
+  return p.a.file + ':' + p.a.line + '  ' + p.a.name + ' <-> ' + p.b.name + '@' + bShort + ':' + p.b.line
+    + '  共享[' + p.shared.join(',') + ']'
+    + '  独有A[' + cap(onlyA) + ']  独有B[' + cap(onlyB) + ']';
+}
+
 /** F:派生进程后不看退出码 / 把「无输出」当通过。 */
 /**
  * ★ 关键语义区分(我第一版把两者混为一谈,造成 3 处假阳性):
@@ -553,8 +788,114 @@ const DET_F: Detector = {
   minDirtyHits: 1,
 };
 
+/* ══════════════════ G:同名不同物(跨文件符号归属)══════════════════ */
+
+/**
+ * ## 为什么 G 与 A~F **不是同一类检测器**(Lead 的 CR-20 判据)
+ *
+ * ```
+ * A~F = **文本形态扫描** —— 在单个文件的一段文本上匹配一个正则/模式
+ * G   = **符号归属判定** —— 比较两个**类型容器的字段集合**
+ * ⇒ A~F 的判据类型**结构上答不了** G 的问题,不是"还没写正则"
+ * ⇒ 所以 G 是「不同种类」的检测器,不是"A~F 之外再多一条正则"
+ * ```
+ *
+ * ## 它抓的具体形态
+ * ```
+ * 一个标识符作为**字段名**出现在 ≥2 个类型容器里,
+ * 而两个容器共享了 ≥3 个**领域字段**且各自还有独有字段。
+ *
+ * 真例(Lead 与 build-wiring 共同确认 3 个,全部落在 cooking.ts 的 FoodBuff.statMods 上):
+ *   atkMul   FoodBuff.statMods ↔ weapons.ts SetBonusDef / BuffInput
+ *   critRate FoodBuff.statMods ↔ weapons.ts CombatantStats
+ *   moveMul  FoodBuff.statMods ↔ weapons.ts CombatantStats / ArmorDef
+ * ```
+ *
+ * ## 为什么这条判据值得存在(它差点让 B 的结论反过来)
+ * ```
+ * 查 task-64 任务 B 时,我把「字段名有消费者吗」当判据,得到:
+ *   atkMul   ✓9 外部   critRate ✓12 外部   moveMul  ✓13 外部
+ * ⇒ 若直接采信计数,结论是「**已有 statMods 消费通道**」⇒ B 的答案完全反了。
+ * ⇒ 逐行读每一处才发现:三处**全是同名不同物**
+ * ```
+ * ⇒ 故 G 的意义 = 把这种"计数看起来有消费者"的形态**在计数阶段就拦住**。
+ */
+const DET_G: Detector = {
+  id: 'G',
+  what: '同名不同物:两个类型容器共享 ≥3 个领域字段、各有独有字段',
+  why:
+    '按字段名计数判断「有没有消费者」时,同名不同物会让计数**看起来有消费者**,'
+    + '而实际那个消费点吃的是另一个类型 ⇒ 判据反向。task-64 任务 B 实测:'
+    + 'atkMul/critRate/moveMul 三处「外部消费者」全部是同名不同物。',
+  heuristic:
+    '本检测器输出的是**候选清单,不是缺陷判定** —— 「两个容器共享领域字段」'
+    + '既可能是同一概念两份实现(危险),也可能是层间有意传递(正常)。'
+    + '必须人工看每条的[共享]/[独有]差异。'
+    + '⚠️ 两条已知误报边界:(1) **同名本身完全正常** —— id/name/level/x/y/hp 出现在'
+    + '任何实体上都对,故判据不是"同名",而是「同名 ∧ 共享 ≥3 个**领域字段** ∧ 各有独有」;'
+    + '(2) **同名不同物不能只靠名字判** —— 必须比字段集合,单个字段名在各处出现是无信息的。'
+    + '另:领域词表(GENERIC_FIELDS)本身是启发式的,偏一点候选就翻倍。',
+  /* ★ 只告警不拦门禁 —— 理由见 `Detector.gate` 的 JSDoc(Lead 裁决「甲」) */
+  gate: 'advise',
+  detect: (source, path) => gPairs(collectContainers(source, path)).map(renderG),
+  detectAll: (files) => {
+    const all: GContainer[] = [];
+    for (const f of files) {
+      const rf = rel(f);
+      /* 跳过本脚本自身与登记表 —— 与主循环同一条理由(它们抄了命中原文,会自扫) */
+      if (rf === 'scripts/judgement_audit.ts' || rf === 'scripts/judgement_baseline.ts') continue;
+      all.push(...collectContainers(readFileSync(f, 'utf8'), rf));
+    }
+    return gPairs(all).map(renderG);
+  },
+  /**
+   * ★ 脏样本必须**复刻真例的形状**,包括**嵌套容器**那一步。
+   *
+   * ⚠️ 我第一版脏样本写错了(自检报「脏样本只报 0 条」,而扫描却有 27 处命中 ——
+   *    正是"检测器抓不到它声称要抓的东西"的典型症状):
+   * ```
+   * 错版:两个假接口只共享 `atkMul` **一个**字段 ⇒ 共享数 1 < 3 ⇒ 判据不命中
+   * ⇒ 教训:区分力自检的脏样本**必须是判据的边界构造**,不是"随便造个像的"
+   * ```
+   * 本版复刻 `FoodBuff.statMods ↔ CombatantStats`
+   * (共享 critRate/critDmg/moveMul 三个领域字段;且 A 侧走**嵌套**抽取路径)。
+   */
+  dirty: [
+    'interface FoodBuff {',
+    '  durationSec: number;',
+    '  statMods: {',
+    '    atkMul: number;',
+    '    critRate: number;',
+    '    critDmg: number;',
+    '    moveMul: number;',
+    '    hpFlat: number;',
+    '  };',
+    '}',
+    'interface CombatantStats {',
+    '  critRate: number;',
+    '  critDmg: number;',
+    '  moveMul: number;',
+    '  armorPen: number;',
+    '  baseAtk: number;',
+    '}',
+  ].join('\n'),
+  /**
+   * 干净样本守两条边界:
+   * ```
+   * 1 两容器**字段集完全相同** ⇒ 「各有独有字段」守卫 ⇒ 不报
+   * 2 且字段**全是通用词** ⇒ 「非通用共享 ≥3」守卫 ⇒ 不报
+   * ⇒ 两条守卫各被 (1)(2) 覆盖。
+   * ```
+   */
+  clean: [
+    'interface PlayerRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
+    'interface MobRow { id: string; name: string; hp: number; maxHp: number; x: number; y: number; }',
+  ].join('\n'),
+  minDirtyHits: 1,
+};
+
 /* E 不是独立检测器:它是**自检框架**本身(每个检测器都要过区分力自检)。 */
-const DETECTORS: readonly Detector[] = [DET_A, DET_B, DET_C, DET_D, DET_F];
+const DETECTORS: readonly Detector[] = [DET_A, DET_B, DET_C, DET_D, DET_F, DET_G];
 
 /* ══════════════════ 运行 ══════════════════ */
 
@@ -607,22 +948,33 @@ const perDetector = new Map<string, Hit[]>();
 
 for (const d of DETECTORS) {
   const hits: Hit[] = [];
-  for (const f of scanFiles) {
-    const src = readFileSync(f, 'utf8');
-    /* 跳过本脚本自身:B 形态在本脚本里是**故意带防护的**,不应被自己报。
-       ⚠️ 同时跳过**登记表**:它里面逐条抄了被报行的原文作为 needle
-       ⇒ 不跳过的话,登记表自己会被扫出 4 处 C 形态,且是**永远新增**(自己扫自己)。 */
-    const rf = rel(f);
-    if (rf === 'scripts/judgement_audit.ts' || rf === 'scripts/judgement_baseline.ts') continue;
-    for (const where of d.detect(src, rel(f))) {
-      const reg = findBaseline(d.id, where);
-      hits.push({
-        detector: d.id,
-        where,
-        registered: reg !== undefined,
-        verdict: reg?.verdict ?? '未登记(新增)',
-      });
-    }
+  /* ★ 有 `detectAll` 的检测器(目前只有 G)走**全局视野** ——
+     它的判据是「两个容器的字段集合比较」,结构上做不到逐文件判定。
+     ⚠️ 这里**不是两份实现**:`detectAll` 与 `detect` 是同一判据的两个视野
+     (同一文件内也成立),且 `detect` 仍被框架 E 的区分力自检使用。 */
+  const wheres: string[] = d.detectAll !== undefined
+    ? d.detectAll(scanFiles)
+    : (() => {
+        const acc: string[] = [];
+        for (const f of scanFiles) {
+          const src = readFileSync(f, 'utf8');
+          /* 跳过本脚本自身:B 形态在本脚本里是**故意带防护的**,不应被自己报。
+             ⚠️ 同时跳过**登记表**:它里面逐条抄了被报行的原文作为 needle
+             ⇒ 不跳过的话,登记表自己会被扫出 4 处 C 形态,且是**永远新增**(自己扫自己)。 */
+          const rf = rel(f);
+          if (rf === 'scripts/judgement_audit.ts' || rf === 'scripts/judgement_baseline.ts') continue;
+          acc.push(...d.detect(src, rf));
+        }
+        return acc;
+      })();
+  for (const where of wheres) {
+    const reg = findBaseline(d.id, where);
+    hits.push({
+      detector: d.id,
+      where,
+      registered: reg !== undefined,
+      verdict: reg?.verdict ?? '未登记(新增)',
+    });
   }
   perDetector.set(d.id, hits);
   allHits.push(...hits);
@@ -637,7 +989,17 @@ for (const d of DETECTORS) {
     console.log(`      ⚠️ [${d.id}?] ${d.heuristic}`);
   }
   for (const h of hits) {
-    const tag = h.registered ? `[已登记·${h.verdict}]` : '[新增]';
+    /* ★ 标签必须区分「拦门禁的新增」与「候选型(仅告警)」——
+       ⚠️ 这里踩过一次:候选型最初也打 `[新增]`,而 `verify.ts` 的接线
+       **正是 grep `[新增]` 明细行**来生成失败项的 ⇒ G 的 42 条进了门禁失败列表,
+       门禁红了 8 项,而汇总口径明明写的是"新增 0"。
+       ⇒ 教训:**改口径时,输出标签也要跟着改** —— 否则下游按旧标签解析,
+         出现「汇总说 0、明细说 42」的自相矛盾(与本仓形态 F 同族:
+         两处说法不一致,而任一处都不自称不一致)。 */
+    const isAdvise = (d.gate ?? 'block') === 'advise';
+    const tag = h.registered
+      ? `[已登记·${h.verdict}]`
+      : (isAdvise ? '[候选·仅告警]' : '[新增]');
     console.log(`      ${tag}${hz} ${h.where}`);
   }
 }
@@ -666,26 +1028,88 @@ for (const d of DETECTORS) {
   console.log(`    ${d.id}  ${String(n).padStart(3)} 处(新增 ${nNew})  ${d.what}`);
 }
 const newHits = allHits.filter((h) => !h.registered);
-console.log(`  合计命中:${allHits.length} 处;其中 **新增 ${newHits.length}** 处,已登记 ${allHits.length - newHits.length} 处`);
+
+/* ★ 把「**拦门禁**的」与「**只告警**的」分开 —— 见 `Detector.gate` 的 JSDoc
+   (2026-11-13 Lead 裁决「甲」)。两者区别是**结构性的**,不是程度差异:
+     block  —— 命中即"坏形状",能逐条定性 ⇒ 未登记就红
+     advise —— 命中是"候选",要看差异才能定性 ⇒ 未登记只告警;
+               但**数量增长**要红(把"增长"当信号,不是把"有没有"当信号) */
+const gateOf = (id: string): 'block' | 'advise' =>
+  DETECTORS.find((d) => d.id === id)?.gate ?? 'block';
+const blockNew = newHits.filter((h) => gateOf(h.detector) === 'block');
+const adviseNew = newHits.filter((h) => gateOf(h.detector) === 'advise');
+
+/* ⚠️ 这一行的「新增」口径 = **拦门禁的未登记命中数**(`blockNew`),不是 `newHits`。
+   理由:候选型检测器(G)的命中按设计**不要求逐条登记**(靠水位守卫),
+   若把它们计入"新增",门禁一接上就 42 条要人工看 ⇒ 变成噪声源(Lead 裁决「甲」)。
+   ⇒ 候选型的量在下一行**单独**报出,不藏。
+   ⇒ 上游 `verify.ts` 解析本行的第二个数字作为"新增";它另有
+     「exit≠0 但新增=0 ⇒ 报不一致」的兜底 —— 于是**水位超限**(exit 1、新增 0)
+     仍会让门禁红。这个组合是刻意设计的,不是巧合。 */
+console.log(`  合计命中:${allHits.length} 处;其中 **新增 ${blockNew.length}** 处,已登记 ${allHits.length - newHits.length} 处`);
+console.log(`     └─ 口径:新增 = **拦门禁**类未登记 ${blockNew.length} 处;候选型未登记 ${adviseNew.length} 处按设计不计入(见水位守卫)`);
+if (adviseNew.length > 0) {
+  console.log(`    └─ 其中**拦门禁** ${blockNew.length} 处 / **仅告警** ${adviseNew.length} 处(候选型检测器,见下)`);
+}
 
 const bad = selfFail > 0 || changed.length > 0;
 
-/* ⚠️ 两种失败**必须分开**:
+/* ── ★ 候选型检测器的**水位守卫**(甲方案的核心)──
+   ```
+   候选数 ≤ 水位 ⇒ 只是告警,门禁绿(存量已知)
+   候选数 > 水位 ⇒ **门禁红**(说明有人新引入了这类形态)  ← 这才是信号
+   ```
+   ⚠️ 为什么这样判:候选型检测器的命中**无法逐条定性**(G 是启发式),
+   若让它「有没有」决定红绿,门禁一接上就 42 条要人工看 ⇒ 变成噪声源。
+   ⇒ 水位比的是**总命中数**,不是「新增数」。 */
+const adviseTotals = new Map<string, number>();
+for (const d of DETECTORS) {
+  if (d.gate !== 'advise') continue;
+  adviseTotals.set(d.id, (perDetector.get(d.id) ?? []).length);
+}
+console.log('\n[候选型检测器水位守卫]');
+let watermarkBreach = false;
+for (const [id, total] of adviseTotals) {
+  const wm = id === 'G' ? G_CANDIDATE_WATERMARK : 0;
+  if (total > wm) {
+    watermarkBreach = true;
+    console.log(`  ✗ ${id}:候选 ${total} 条 **超过水位 ${wm}** ⇒ 说明新引入了这类形态 ⇒ 必须处理`);
+    console.log('     处置:1 若是真·两份实现 ⇒ 修 2 若确认是有意传递 ⇒ 上调 G_CANDIDATE_WATERMARK 并写理由');
+  } else {
+    console.log(`  ✓ ${id}:候选 ${total} 条 / 水位 ${wm} ⇒ 存量已知,告警不拦`);
+  }
+}
+
+/* ── 候选清单单独打印(让人能看到、能人工定性)── */
+if (adviseNew.length > 0) {
+  console.log('\n[⚠ 需人工定性的候选]');
+  for (const h of adviseNew) {
+    console.log(`  [${h.detector}?] ${h.where}`);
+  }
+  const d0 = DETECTORS.find((x) => x.id === adviseNew[0]!.detector);
+  if (d0?.heuristic !== undefined) console.log(`  ⚠️ [${d0.id}?] ${d0.heuristic}`);
+  console.log('  ⚠️ 上列**不是缺陷**,是「配对存在」的候选 —— 请读每条的[共享]/[独有]差异再定性。');
+}
+
+/* ⚠️ 三种出口**必须分开**:
    `--strict`  裸严格:任何命中都红(人工审计用;**接门禁别用它**,已登记项会被误杀)
-   `--baseline` 门禁模式:只看**超出登记表的新增**(与 ENTRY_LOAD_EXEMPT 等登记表同模式) */
-if (USE_BASELINE && (bad || newHits.length > 0)) {
+   `--baseline` 门禁模式:只看**超出登记表的新增**(与 ENTRY_LOAD_EXEMPT 等登记表同模式)
+   ★ 且 `--baseline` 下**只有 `gate:'block'` 的检测器**能拦;候选型走水位守卫。 */
+if (USE_BASELINE && (bad || blockNew.length > 0 || watermarkBreach)) {
   if (bad) {
     console.log('\n[--baseline] ✗ 检测器自检失败或只读被破坏 ⇒ exit 1');
+  } else if (watermarkBreach) {
+    console.log('\n[--baseline] ✗ 候选型检测器**超过水位** ⇒ exit 1(见上方水位守卫)');
   } else {
-    console.log(`\n[--baseline] ✗ 有 ${newHits.length} 处**未登记**的新增命中 ⇒ exit 1`);
-    console.log('  逐条处置:① 修 ② 定性后登记进 scripts/judgement_baseline.ts ③ 修检测器(若是假阳性)');
-    for (const h of newHits) {
+    console.log(`\n[--baseline] ✗ 有 ${blockNew.length} 处**未登记**的新增命中 ⇒ exit 1`);
+    console.log('  逐条处置:1 修 2 定性后登记进 scripts/judgement_baseline.ts 3 修检测器(若是假阳性)');
+    for (const h of blockNew) {
       const d = DETECTORS.find((x) => x.id === h.detector);
       const hz = d?.heuristic === undefined ? '' : ` [${h.detector}?]`;
       console.log(`      [${h.detector}]${hz} ${h.where}`);
     }
     /* ★ 启发式类的边界说明也要出现在这里 —— 决定「修 or 登记」的人看的是这段输出 */
-    const hzUsed = newHits
+    const hzUsed = blockNew
       .map((h) => DETECTORS.find((x) => x.id === h.detector))
       .filter((x) => x?.heuristic !== undefined);
     for (const d of new Set(hzUsed)) {
@@ -699,4 +1123,9 @@ if (STRICT && (bad || allHits.length > 0)) {
   process.exit(1);
 }
 if (bad) process.exit(1);
-console.log('\n✓ 审计完成(未加 --strict / --baseline,命中不导致失败)');
+if (USE_BASELINE) {
+  const advTotal = [...adviseTotals.values()].reduce((a, b) => a + b, 0);
+  console.log(`\n✓ 审计完成(--baseline):拦门禁类新增 0 处;候选型 ${advTotal} 条在水位内(仅告警)`);
+} else {
+  console.log('\n✓ 审计完成(未加 --strict / --baseline,命中不导致失败)');
+}
