@@ -170,19 +170,37 @@ function matchBracket(masked: string, open: number): number {
 
 /* ══════════════════════ 3. 顶层逗号切分 ══════════════════════ */
 
-/** 按「相对本层」的顶层逗号切分实参。掩码过的文本里没有字符串内容,故括号计数可靠。 */
-function splitArgs(masked: string): string[] {
-  const parts: string[] = [];
+/**
+ * 按「相对本层」的顶层逗号切分实参,**返回区间**而不是子串。
+ *
+ * ★ 为什么返回区间:同一个切分结果要同时用于**掩码版**(判据)与**原文版**(展示)。
+ *   而两者的字符偏移**完全相同**(掩码器保证等长),所以区间可以复用。
+ *
+ * ★★★ 前置条件:传入的必须是**掩码过**的文本。
+ *   原文里字符串内的逗号会被当成顶层逗号 ⇒ 切错。
+ *   实测:`splitArgs("'a,b', x")` ⇒ **3 段**(应为 2):`"a` / `b'"` / `x`。
+ *   ⚠️ 而 2026-11-13 修之前,`extractAssertions` 里**有一处**正是这么调的
+ *     (`splitArgs(src.slice(...))`)⇒ 那些行含逗号字符串的断言,
+ *     展示出来的「期望值」是被切断的。危害在于:
+ *     报告里的期望值正是人用来判断"这条判据有没有牙"的依据 ⇒ 会被误导。
+ */
+function splitArgRanges(masked: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
   let d = 0;
   let start = 0;
   for (let i = 0; i < masked.length; i += 1) {
     const c = masked[i]!;
     if (c === '(' || c === '[' || c === '{') d += 1;
     else if (c === ')' || c === ']' || c === '}') d -= 1;
-    else if (c === ',' && d === 0) { parts.push(masked.slice(start, i)); start = i + 1; }
+    else if (c === ',' && d === 0) { out.push([start, i]); start = i + 1; }
   }
-  parts.push(masked.slice(start));
-  return parts;
+  out.push([start, masked.length]);
+  return out;
+}
+
+/** 按「相对本层」的顶层逗号切分实参。掩码过的文本里没有字符串内容,故括号计数可靠。 */
+function splitArgs(masked: string): string[] {
+  return splitArgRanges(masked).map(([a, b]) => masked.slice(a, b));
 }
 
 /* ══════════════════════ 4. 提取 test 块与断言 ══════════════════════ */
@@ -232,15 +250,25 @@ function extractTests(src: string, masked: string): TestBlock[] {
     const titleRaw = src.slice(open + 1, masked.indexOf(',', open) > 0 ? masked.indexOf(',', open) : close);
     const title = titleRaw.replace(/\s+/g, ' ').trim().slice(0, 120);
 
-    /* 找回调体的 `{` */
+    /* 找回调体的 `{`
+     *
+     * ★★★ 2026-11-13 修:原实现从 `close + 1` 往后找 ⇒ **方向反了**。
+     * `close` 是**整个 `test(...)` 调用**的右括号,它位于回调体**之后**
+     * (实测 WS-10: open=4223, close=5082, 而回调体的 `{` 在 4278)。
+     * ⇒ 从 close+1 往后永远找不到 `{`,只会撞上 `;` 或 200 字符窗口耗尽
+     * ⇒ `bodyOpen < 0` ⇒ **每一块都被 `continue` 丢弃** ⇒ 断言恒 0。
+     * 实测后果:该工具对 WS-10(893 个断言调用 / 97 个 test 块)报「断言 0 条」,
+     * 对**每一个**文件都是 0 —— 一个恒报 0 的工具比没有工具更危险:
+     * 它看起来"跑过了",而它的 0 会被读成"这里没有断言"。
+     * ⇒ 正确方向:在 **`open` 与 `close` 之间**找回调体的 `{`(取第一个)。
+     */
     let bodyOpen = -1;
-    for (let i = close + 1; i < masked.length && i < close + 200; i += 1) {
+    for (let i = open + 1; i < close; i += 1) {
       if (masked[i] === '{') { bodyOpen = i; break; }
-      if (masked[i] === ';') break;
     }
     if (bodyOpen < 0) continue;
     const bodyClose = matchBracket(masked, bodyOpen);
-    if (bodyClose < 0) continue;
+    if (bodyClose < 0 || bodyClose > close) continue;
 
     blocks.push({
       name: title, line: lineOf(src, m.index), start: m.index, end: bodyClose,
@@ -269,15 +297,24 @@ function extractAssertions(src: string, masked: string, from: number, to: number
     if (close < 0 || close > to) continue;
 
     const argsMasked = masked.slice(open + 1, close);
-    const args = splitArgs(argsMasked);
-    const argsRaw = splitArgs(src.slice(open + 1, close));
+    /* ★ 用**同一套**区间切分,再分别从掩码版(判据)与原文版(展示)取子串。
+       掩码器保证等长 ⇒ 偏移一致 ⇒ 区间可复用。
+       这样就不会再出现"把原文喂给只接受掩码文本的函数"那个错。 */
+    const ranges = splitArgRanges(argsMasked);
+    const rawArgsSrc = src.slice(open + 1, close);
+    const rawAt = (k: number): string => {
+      const r = ranges[k];
+      if (r === undefined) return '';
+      return rawArgsSrc.slice(r[0], r[1]);
+    };
+    const args = ranges.map(([a, b]) => argsMasked.slice(a, b));
 
     out.push({
       fn,
       line: lineOf(src, m.index),
-      actualText: (argsRaw[0] ?? '').replace(/\s+/g, ' ').trim().slice(0, 90),
-      expectedText: (argsRaw[1] ?? '').replace(/\s+/g, ' ').trim().slice(0, 90),
-      messageText: (argsRaw[argsRaw.length - 1] ?? '').replace(/\s+/g, ' ').trim().slice(0, 60),
+      actualText: rawAt(0).replace(/\s+/g, ' ').trim().slice(0, 90),
+      expectedText: rawAt(1).replace(/\s+/g, ' ').trim().slice(0, 90),
+      messageText: rawAt(ranges.length - 1).replace(/\s+/g, ' ').trim().slice(0, 60),
       __maskedActual: args[0] ?? '',
       __maskedExpected: args[1] ?? '',
     } as Assertion & { __maskedActual: string; __maskedExpected: string });
@@ -470,27 +507,107 @@ function selftest(): number {
   };
 
   console.log('── 掩码器 ──');
+  /* ★★★ 2026-11-13 修:原样本第 4 行把 `eq(` 写在**模板文本**里
+   * (`const t = \`eq(${realVar}, 3) ...\``),却期望它被算成"真断言"。
+   * 那是**错的期望**:ES 规范里模板**文本**不是代码,只有 `${...}` 内才是。
+   * ⇒ 掩码器抹掉它**是对的**(这与它抹注释/字符串/正则同一个道理)。
+   * ⇒ 该样本真正验证的是「模板里的代码(在 ${} 内)**保留**」,
+   *   而原样本的 `${realVar}` 里**没有** `eq(`,于是它既没验证"保留",
+   *   又错误地要求"保留",导致自检恒红。
+   * ⇒ 正确样本:让 `${}` 里真的放一条断言,模板文本里放一条假的。
+   *   —— 这才同时测到两个方向(该抹的抹、该留的留)。 */
   const dirty = [
     "// eq(shouldNotAppear, 1)  注释里的断言",
     "const s = 'eq(alsoNot, 2)  字符串里的断言';",
     "const re = /eq\\(nope\\)/;",
-    "const t = `eq(${realVar}, 3)  模板里的真代码`;",
+    "const t = `eq(tplTextNotCode, 3) 模板**文本**里的假断言`;",
     "eq(realVar, 4, '真断言');",
+    "const u = `外壳${eq(realInTpl, 5, '模板里的真断言')}尾部`;",
   ].join('\n');
   const dm = maskSource(dirty);
   chk(!dm.includes('shouldNotAppear'), '注释内容被掩掉');
   chk(!dm.includes('alsoNot'), '字符串内容被掩掉');
   chk(!dm.includes('nope'), '正则字面量内容被掩掉');
-  chk(dm.includes('realVar'), '模板 ${...} 内的**真代码保留**(不被整块掩掉)');
+  chk(!dm.includes('tplTextNotCode'), '★ 模板**文本**里的 `eq(` 被掩掉(它不是代码)');
+  chk(dm.includes('realInTpl'), '★ 模板 `${...}` 内的**真代码保留**(不被整块掩掉)');
   chk(dm.length === dirty.length, '掩码后长度不变(行号可靠)');
   const found = extractAssertions(dirty, dm, 0, dirty.length);
-  chk(found.length === 2, `只抽出 2 条真断言(其余在注释/字符串/正则里),实测 ${found.length}`);
+  chk(found.length === 2, `只抽出 2 条真断言(L5 裸断言 + L6 模板内断言),实测 ${found.length}`);
   chk(found.some((f) => f.line === 5), '行号定位到第 5 行的真断言');
+  chk(found.some((f) => f.line === 6), '行号定位到第 6 行(模板 `${}` 里的真断言)');
 
   console.log('── 顶层逗号切分 ──');
-  const sp = splitArgs("f(a, g(b, c), [1, 2], 'x,y', { k: 1 }) ");
-  chk(sp.length === 5, `嵌套括号/数组/对象/字符串里的逗号不切分,实测 ${sp.length} 段`);
+  /* ★★★ 2026-11-13 修(第二次):原样本传的是 **原文**
+   * `"f(a, g(b, c), [1, 2], 'x,y', { k: 1 })"` —— 两个错:
+   *   1 含最外层 `f(...)` ⇒ 深度从 1 起算 ⇒ 顶层逗号 0 个
+   *   2 ★ 它含 `'x,y'`(字符串内的逗号),而 `splitArgs` 的**前置条件是掩码文本**
+   *     ⇒ 原文喂进去必然把 `'x,y'` 切断 ⇒ 6 段
+   * ⇒ ⇒ 两次修的都是**同一个形态**:我用**违反前置条件的输入**去测一个函数,
+   *   然后把它的(正确)行为判成失败。
+   * ⇒ 正确样本:先掩码,再切分 —— 这正是**真实调用点**的做法。 */
+  const spRaw = "a, g(b, c), [1, 2], 'x,y', { k: 1 } ";
+  const spMasked = maskSource(spRaw);
+  chk(spMasked.length === spRaw.length, '样本掩码后等长(偏移可直接对照原文)');
+  /* ⚠️ 我在这条上连错两次,记下来:第一次猜"抹成 `'   '`"(形状猜死),
+     第二次猜"掩码后不含逗号"(但**结构性逗号**还在,它们本来就该在)。
+     ⇒ 正确做法是**量出差值**,而不是猜某个绝对形态:
+       原文 7 个逗号(含字符串里那 1 个),掩码后应是 6 个 ⇒ 差**恰好 1**。
+     ⇒ ★ 这条断言的性质是"**恰好少一个**",它同时钉住两件事:
+       字符串内那个被抹了、且**只有它**被抹(没有误伤结构逗号)。 */
+  const commas = (t: string): number => t.split(',').length - 1;
+  chk(commas(spRaw) === 7, `原文逗号 7 个(含字符串里 1 个),实测 ${commas(spRaw)}`);
+  chk(
+    commas(spMasked) === 6,
+    `★ 掩码后恰好 6 个 ⇒ 只少了字符串里那一个,实测 ${commas(spMasked)}`,
+  );
+  const sp = splitArgs(spMasked);
+  chk(sp.length === 5, `嵌套括号/数组/对象里的逗号不切分,实测 ${sp.length} 段`);
   chk(sp[4]!.trim() === '{ k: 1 }', '最后一段完整');
+  /* ★ 并钉住"违反前置条件会怎样" —— 把它做成**已知的错**,而不是踩到它 */
+  chk(splitArgs(spRaw).length === 6, '★ 反例:原文喂进去 ⇒ 6 段(证明前置条件是真约束,不是提醒)');
+
+  console.log('── ★ 单引号字符串里的逗号(必须靠掩码,不能靠原文) ──');
+  /* 这条钉住 2026-11-13 修掉的第二个真缺陷:
+     展示用的 actualText/expectedText 曾把**原文**喂给只接受掩码文本的切分函数
+     ⇒ 含逗号的字符串会被切断。用区间切分后两侧同源,不再可能不一致。 */
+  {
+    const code = "eq(call('a,b'), 1, 'm')";
+    const mk = maskSource(code);
+    const openI = code.indexOf('(');
+    const closeI = matchBracket(mk, openI);
+    const ranges = splitArgRanges(mk.slice(openI + 1, closeI));
+    const rawSrc = code.slice(openI + 1, closeI);
+    const asRaw = rawSrc.slice(ranges[0]![0], ranges[0]![1]).trim();
+    chk(ranges.length === 3, `顶层逗号 3 段(实际/期望/消息),实测 ${ranges.length}`);
+    chk(asRaw === "call('a,b')", `★ 展示文本未被字符串内的逗号切断,实测 ${JSON.stringify(asRaw)}`);
+    const asMasked = mk.slice(openI + 1, closeI).slice(ranges[0]![0], ranges[0]![1]).trim();
+    chk(asMasked === 'call(     )', `判据文本用掩码版(字符串内容已抹),实测 ${JSON.stringify(asMasked)}`);
+  }
+
+  console.log('── ★ test 块提取(2026-11-13 修掉的恒 0 缺陷)──');
+  /* 这条钉住第一个真缺陷:原实现从**整个调用**的右括号之后找回调体 `{`
+     ⇒ 方向反了 ⇒ 每块都被丢弃 ⇒ 对每个文件都报"断言 0 条"。
+     这里用一个最小样例 + 一个真文件双层验证。 */
+  {
+    const mini = "test('t', () => {\n  eq(1, 1, 'm');\n  ok(true, 'm2');\n});";
+    const mm = maskSource(mini);
+    const bl = extractTests(mini, mm);
+    chk(bl.length === 1, `最小样例抽出 1 个 test 块,实测 ${bl.length}`);
+    chk(
+      bl.length === 1 && extractAssertions(mini, mm, bl[0]!.bodyStart, bl[0]!.end).length === 2,
+      '该块内抽出 2 条断言',
+    );
+    /* 真文件:必须有大量块(若方向再反了,这里会立刻归零) */
+    const realTf = join(ROOT, 'tests', 'WS-10.test.ts');
+    const realSrc = readFileSync(realTf, 'utf8');
+    const realMk = maskSource(realSrc);
+    const realBlocks = extractTests(realSrc, realMk);
+    chk(realBlocks.length > 50, `真文件 WS-10 抽出 ${realBlocks.length} 个 test 块(>50)`);
+    const realAssert = realBlocks.reduce(
+      (s, b) => s + extractAssertions(realSrc, realMk, b.bodyStart, b.end).length, 0,
+    );
+    chk(realAssert > 500, `真文件合计断言 ${realAssert} 条(>500)—— 修之前这里是 0`);
+  }
 
   console.log('── 标识符抽取 ──');
   const ids = collectIdents('s.vitals.applyHit(x) + KEEP * 2 ');
