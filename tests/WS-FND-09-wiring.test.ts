@@ -314,9 +314,82 @@ test('FND9-14 豁免表是**单一事实来源**:verify.ts 必须 import 它,不
     'verify.ts 应 import ./entry_load_exempt.ts(而非自带副本)');
 
   /* 3) 反向:豁免模块**不得** import verify.ts ——
-        否则测试 import 它时会连带把整个门禁跑一遍(嵌套执行 ⇒ 假绿/假红)。 */
-  ok(!/from\s+['"][^'"]*verify\.ts['"]/.test(exemptMod),
-    'entry_load_exempt.ts 不得 import verify.ts(会连带执行整个门禁)');
+        否则测试 import 它时会连带把整个门禁跑一遍(嵌套执行 ⇒ 假绿/假红)。
+     ⚠️ **必须剥注释后再判**。我第一版直接对原文跑正则,结果是**假红**:
+        `entry_load_exempt.ts` 的文档注释里**引用**了一句反例
+        `import { ENTRY_LOAD_EXEMPT } from '../scripts/verify.ts'`
+        —— 那是在说明「为什么不能这么做」,不是真的 import。
+        ⇒ 这与我把 `@type` 数成 49(把注释里**讨论**该词的行算成装饰器)
+          是**同一形状**:对「文本出现」判真假,却不管它是不是**代码**。
+        ⇒ 这里只剥注释、**保留字符串内容**(import 路径就在字符串里)。
+     ⚠️⚠️ **`(^|[^:])` 前缀是刻意写的,不是冗余 —— 不要顺手删掉。**
+        它防的是「行内两个斜杠并非注释开头」的情况,最典型的是 **URL**
+        (下例的第一段是字符串内容,两个斜杠出现在 `http:` 之后,不该被当注释起点):
+
+            const url = 'http://example.com/a';      // 真注释在这里
+
+        若去掉这个前缀(即用裸的两个斜杠起头),则 URL 里的那两个斜杠会被当成注释起点,
+        **从那里到行尾全部被删** ⇒ 行内 `const …='http:` 变成半截。
+        对本判据的后果是:**字符串内容被截断 ⇒ 里面的 import 路径可能看不全**
+        ⇒ 判据**静默失效但仍然绿**。⇒ 与本仓记过的「判据工具自己需要被验证」
+        (陷阱 44 同族)正是同一件事,故此处显式留证。
+        ⚠️ 本式**不**处理正则字面量或字符串里的转义斜杠 —— 本文件不需要;
+           那类情况应交由本仓已有的 `stripCommentsAndStrings` 处理,不要在此扩展。
+        ⚠️ 另注:本段注释里**故意不写出那段正则的完整字面量**,因为它以
+           「星号紧跟斜杠」结尾,会**提前闭合本块注释** —— 我加这段说明时
+           正好踩了它一次,实测报 `ERR_INVALID_TYPESCRIPT_SYNTAX`。 */
+  const stripCommentsOnly = (src: string): string =>
+    src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
+  /* 判据工具自检(两道):
+     ① 必须真的**变短** —— 否则说明正则不匹配,后续判据会退化成「对原文跑正则 ⇒ 恒真」。
+     ② 必须**保住字符串里的 URL/路径** —— 否则 ① 仍可能通过而语义已错。 */
+  ok(stripCommentsOnly(exemptMod).length < exemptMod.length,
+    '剥注释应使源码变短 —— 否则工具没生效(判据会退化成恒真)');
+  eq(
+    stripCommentsOnly("const u = 'http://x/a.ts';\n// 注释\n"),
+    "const u = 'http://x/a.ts';\n\n",
+    '剥注释必须保住字符串里的斜杠(防 URL 被截断 ⇒ 判据静默失效)',
+  );
+  eq(stripCommentsOnly('const p = 1; // 尾注释\n'), 'const p = 1; \n', '行尾注释应被剥掉');
+
+  /* ⚠️ **必须同时覆盖四种 import 形态**。我第一版只写了
+     `from\s*['"]…verify\.ts['"]` —— 于是**裸副作用导入** `import './verify.ts';`
+     (没有 `from`)**完全不被抓到**。而它恰恰是最危险的形态:它正是我在故障注入里
+     让本模块 import verify.ts 时**实际造成无限递归 fork(76 个 node 进程)**的那种写法。
+     ⇒ 漏掉它 = 这条断言守不住它本来要守的那件事。由 J8 真值表发现。 */
+  const importsVerify = (src: string): boolean => {
+    const s = stripCommentsOnly(src);
+    return (
+      /* 1) import ... from '…/verify.ts' */
+      /\bimport\b[^;]*\bfrom\s*['"][^'"]*verify\.ts['"]/.test(s)
+      /* 2) 裸副作用导入 import '…/verify.ts' */
+      || /\bimport\s*['"][^'"]*verify\.ts['"]/.test(s)
+      /* 3) 再导出 export ... from '…/verify.ts' */
+      || /\bexport\b[^;]*\bfrom\s*['"][^'"]*verify\.ts['"]/.test(s)
+      /* 4) 动态 import('…/verify.ts') */
+      || /\bimport\s*\(\s*['"][^'"]*verify\.ts['"]\s*\)/.test(s)
+    );
+  };
+
+  /* 判据自检(J8 真值表):四条负例必须**都**被判为「有导入」。
+     少了这个自检,上面那条 `ok(!importsVerify(...))` 可能是恒真。 */
+  const MUST_FLAG: [string, string][] = [
+    ['named from', "import { x } from '../scripts/verify.ts';"],
+    ['裸副作用导入', "import './verify.ts';"],
+    ['再导出', "export { x } from './verify.ts';"],
+    ['动态 import', "const m = await import('./verify.ts');"],
+  ];
+  for (const [label, src] of MUST_FLAG) {
+    ok(importsVerify(src), `判据应能抓到「${label}」形态的 verify.ts 导入`);
+  }
+  /* 正例:注释里的引用、无关文件、仅字符串提及 —— 都不应误报。 */
+  ok(!importsVerify("/* 反例:import { X } from './verify.ts' */"), '注释里的引用不应误报');
+  ok(!importsVerify("import { x } from './other.ts';"), '无关文件不应误报');
+  ok(!importsVerify("const p = './verify.ts'; // 见 verify.ts"), '仅字符串提及不应误报');
+
+  ok(!importsVerify(exemptMod),
+    'entry_load_exempt.ts 不得以任何形态 import verify.ts(注释里的反例引用不算)');
 });
 
 report('WS-FND-09');

@@ -381,6 +381,60 @@ export interface WorldSaveHost {
    * 等级投影整段跳过 —— 不报错,也不假装同步过。
    */
   levelOf?(playerId: string): number;
+  /**
+   * 把一次**已获准**的移动写进世界(权威位置 = `physics.bodies`)。
+   *
+   * ## 为什么需要它(task-58 的缺口)
+   *
+   * 接线前全仓**没有任何地方**把 `MoveIntent` 送进模拟层:
+   * ```
+   * room.ts        applyMove 只写 state.players[].x/y/z
+   * server/src/net 写 physics.bodies 的位置/速度:**0 处**
+   * world.ts:460   刚体位移只由 b.x += b.vx*dt 积分驱动
+   * world_sim.ts   mobDistance 读 physics.bodies
+   * ```
+   * ⇒ 玩家在模拟层里**永久静止** ⇒ 距目标恒超 AOI ⇒ `attackMobAuthorized`
+   *   **永久 OUT_OF_AOI** ⇒ 攻击永不结算。
+   *
+   * ## 反作弊**不在这里判**(判据只在一处)
+   *
+   * 合法性由 `anticheat.checkMove` 判定(见 `applyMove`)。本方法是**执行**,
+   * 假设输入已获准。详见 `WorldSim.applyPlayerMove` 的 docblock。
+   *
+   * 可选:老的世界源不实现它时,`applyMove` 退回「只写 state」——
+   * 与 `levelOf` / `saveToDb` 同一 null 契约,不报错也不假装。
+   */
+  applyPlayerMove?(playerId: string, x: number, y: number): boolean;
+  /**
+   * 读回玩家的**权威位置**。与 `applyPlayerMove` 成对:
+   * 写入后从权威读回、投影到 `state`,才能让**击退/搬运**对客户端可见
+   * (那两条走 `applyImpulse` 改速度,不经过 `applyPlayerMove`)。
+   */
+  playerPosition?(playerId: string): { x: number; y: number } | null;
+  /**
+   * 把玩家**登记进世界**(进场)。与 `applyPlayerMove` 是**一对**。
+   *
+   * ## 为什么它必须与移动转发同时存在(task-58 实测发现的第四条链路)
+   *
+   * 实测(生产路径 `assemble()` → `join()`):
+   * ```
+   * room 里 state.players.x           = 0.5(房间出生点)
+   * sim 里 playerPosition('p1')       = **null**   ← 模拟层不认识这个玩家
+   * ⇒ applyPlayerMove 返回 false ⇒ 移动转发**静默无效**
+   * ```
+   * `sim.addPlayer()` 的**生产调用者实测为 0**(只有 `demo.ts` 调)。
+   * ⇒ 只修「移动转发」而不登记玩家,等于给一个不存在的刚体写坐标 ——
+   *   断言会绿(写入方法返回 false 但无人检查),而玩家在模拟层里依然不存在。
+   *
+   * ## 出生点以**房间的**为准
+   *
+   * 调用方传 `state.players[].x/y`(房间已按 `spawnPoint()` 定好),保证
+   * 「反作弊播种坐标」与「刚体坐标」**同源**。若两者不同,第一次移动会被
+   * 判成瞬移(实测:反作弊在 0.5、刚体在 10 ⇒ 报「单帧位移 13.649 格」)。
+   */
+  addPlayer?(playerId: string, x: number, y: number): void;
+  /** 把玩家从世界移除(离场)。与 `addPlayer` 成对,避免刚体残留。 */
+  removePlayer?(playerId: string): boolean;
 }
 
 /**
@@ -488,6 +542,14 @@ export class RoomRuntime {
         this.members.delete(input.userId);
         this.state.players = this.state.players.filter((p) => p.id !== input.userId);
         this.ac.leave(input.userId);
+        /* ⚠️ 世界侧必须**一并**移除 —— 这条路径与 `leave()` 是两处,
+           漏了它会让「宽限期超期重进」的玩家在模拟层里**留下旧刚体**,
+           而随后 `addPlayer` 又会 spawn 一次(位置 = 出生点),
+           表现为「重进后位置被悄悄拉回出生点」。 */
+        const hostStale = this.worldSaveHost;
+        if (hostStale !== null && typeof hostStale.removePlayer === 'function') {
+          hostStale.removePlayer(input.userId);
+        }
       }
     }
 
@@ -546,6 +608,17 @@ export class RoomRuntime {
     /* 反作弊状态以**实际出生坐标**播种,否则会把出生点位移误判成瞬移。 */
     const body = this.state.players.find((p) => p.id === input.userId);
     this.ac.join(input.userId, this.state.meta.tick, body?.x ?? 0, body?.y ?? 0, body?.z ?? 0);
+
+    /* ★ 同时把玩家登记进**世界**(task-58):`sim.addPlayer` 此前生产调用者为 0,
+       于是模拟层不知道有这个玩家 ⇒ `applyPlayerMove` 静默无效,
+       距离开闸读刚体 ⇒ 永久 `OUT_OF_AOI`。
+       ⚠️ 用**同一个** `body.x/y` 播种,保证反作弊与刚体**同源** ——
+       两者不同会让第一次移动被判瞬移(实测差 13.649 格)。
+       没有世界时整段跳过(与 `saveToDb`/`levelOf` 同一 null 契约)。 */
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.addPlayer === 'function') {
+      host.addPlayer(input.userId, body?.x ?? 0, body?.y ?? 0);
+    }
     this.touch(now);
 
     const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
@@ -588,6 +661,12 @@ export class RoomRuntime {
     this.members.delete(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
     this.ac.leave(userId);
+    /* 世界侧一并移除:留着刚体与 `playerIds` 会让**同名玩家重新加入时**
+       继承上一轮的进度/生命值(与 `removePlayer` 注释里「温泉计时被继承」同族)。 */
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.removePlayer === 'function') {
+      host.removePlayer(userId);
+    }
     if (s.role === RoomRole.OWNER && this.members.size > 0) {
       /* 房主走了:把 OWNER 传给最早的在线 ADMIN/MEMBER。 */
       const next = [...this.members.values()]
@@ -714,16 +793,68 @@ export class RoomRuntime {
 
   /* ── 4.3 反作弊转发 ── */
 
+  /**
+   * 移动报文 → 反作弊闸 → **写入世界**(task-58 接线)。
+   *
+   * ## 权威归属(与 `docs/AUTHORITY-MAP.md` 的 W2 同一形态)
+   *
+   * ```
+   * physics.bodies            = **权威**(位置与速度的真值)
+   * state.players[].x/y/z     = **只读投影**(网络下发用)
+   * ```
+   * 与 `level` 的处理**逐点同构**:`progresses.level` 权威,
+   * `state.players[].level` 每帧由 `syncLevelProjections()` 单向投影。
+   * ⇒ 位置是 W2「双写者」形态的**新实例**,不是新机制。
+   *
+   * ## 为什么必须**从权威读回**,而不是照抄客户端声明
+   *
+   * 接线前这里写的是 `p.x = intent.x`(照抄声明)。但那只是「玩家自己走」
+   * 那一条路径;`physics.bodies` 还会被**击退/搬运**改(`applyImpulse` /
+   * `carry.ts`),那些路径**不经过本方法**。
+   * ⇒ 若照抄声明,击退后会出现:
+   * ```
+   * physics.bodies.x = 99(被击退的真实位置)
+   * state.players.x  = 0.7(客户端仍声称自己在原地)
+   * ⇒ 客户端以为自己在怪旁边,距离闸读权威说不在 ⇒ **永久 OUT_OF_AOI**
+   * ```
+   * ⇒ 读回让「击退/搬运对客户端可见」,并消除这条死锁。
+   *
+   * ## 反作弊只有**一处**判定
+   *
+   * `ac.move` → `checkMove` 是唯一判定点(上界、非有限值、窗口速率)。
+   * `host.applyPlayerMove` **不做**第二次判定 —— 理由见
+   * `WorldSim.applyPlayerMove` 的 docblock(不制造第二份等效实现;
+   * 第二处还会掩盖第一处失效)。
+   *
+   * ## `host` 为空时退回旧行为
+   *
+   * 没有世界 ⇒ 无可读回的权威 ⇒ 照抄声明(与 `levelOf`/`saveToDb`
+   * 同一 null 契约)。这不是「两份实现」:写入点始终只有这一处,
+   * 分支判据是「有没有世界」。
+   */
   applyMove(userId: string, intent: Omit<MoveIntent, 'playerId'>): Verdict {
     const v = this.ac.move({ ...intent, playerId: userId }, 3);
     if (!v.allowed) {
       if (v.violation) this.pendingViolations.push(v.violation);
       return v;
     }
+
+    /* 1 先写进世界(权威)。没有世界则跳过 —— 不报错,不假装。 */
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.applyPlayerMove === 'function') {
+      host.applyPlayerMove(userId, intent.x, intent.y);
+    }
+
+    /* 2 再把**权威值**投影到 state。
+       有世界就从权威读回(含击退/搬运的结果);没有世界就只有声明值可写。
+       ⚠️ z **不从权威读**:本次只接 x/y(跨轴混用是新的分叉点,见未做项)。 */
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {
-      p.x = intent.x;
-      p.y = intent.y;
+      const auth = host !== null && typeof host.playerPosition === 'function'
+        ? host.playerPosition(userId)
+        : null;
+      p.x = auth?.x ?? intent.x;
+      p.y = auth?.y ?? intent.y;
       p.z = intent.z;
     }
     this.touch(this.clock.nowMs());
@@ -745,7 +876,11 @@ export class RoomRuntime {
    * ## 协议设计(为什么是 `mobId` 而不是坐标/最近敌人)
    *
    * 报文携带**意图**:打**哪一只**(`mobId`)。
-   * - 客户端**不传**坐标:位置权威在 `physics.bodies`,由 `applyMove` 写入。
+   * - 客户端**不传**坐标:位置权威在 `physics.bodies`,由 `applyMove`
+   *    **经 `host.applyPlayerMove` 写入**(task-58 起为真)。
+   *    ⚠️ 本句此前写「由 `applyMove` 写入」而当时**并没有**这条写路径
+   *    (全仓写 `physics.bodies` 的位置:**0 处**)—— 注释说的是**方向**,
+   *    不是**事实**。task-58 补齐了写入,本句才成为对事实的陈述。
    *   若让客户端传目标坐标,等于把「我在哪」这个判据交回客户端。
    * - 客户端**不传** `level` / `wearing` / `weaponId` / `comboMul`:
    *   这些是面板数据,一律由模拟层从权威档案派生

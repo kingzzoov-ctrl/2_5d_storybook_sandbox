@@ -55,6 +55,8 @@ import {
 import { ITEM_BY_ID } from '../shared/constants/items.ts';
 import { BOSS_LIST } from '../shared/constants/bosses.ts';
 import { MOB_BY_ID } from '../shared/constants/mobs.ts';
+import { BASE_MOVE_SPEED, DT } from '../shared/types/physics.ts';
+import { maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
 import { WorldSim } from '../server/src/sim/world_sim.ts';
 import { mobCombatProfile, MOB_DEF_BASE, MOB_DEF_PER_LEVEL, MOB_ELEMENT_BY_ID } from '../server/src/combat/damage.ts';
 
@@ -2790,6 +2792,144 @@ test('US2-4:权威等级来自 progression,不是调用方自报(与 attackMob �
   Object.assign(authoritative30.progressOf('p1'), setLevel(authoritative30.progressOf('p1'), 1));
   ok(selfReported.result.finalDamage > authoritative30.attackMobAuthorized('p1', 'mob_sheep').hit!.result.finalDamage,
     '自报 level:30 与权威 level:1 会给出**不同**伤害 ⇒ 两条路真的分开了(授权入口不吃自报)');
+});
+
+/* ═══════ task-58:`applyPlayerMove` —— 玩家移动的权威写入点 ═══════ */
+
+test('T58-1 ★ applyPlayerMove 真的写进 `physics.bodies`(不是「调过方法」)', () => {
+  /* 判据必须是**权威位置的前后差**(`playerPosition` 读 `physics.bodies`),
+     不能是「方法返回 true」—— 方法体整个空掉时返回 true 仍然为真。
+     接线前的实测:`applyMove` 写 `state` 5 次、`physics.bodies` 恒不动 ⇒ 分叉 1.5 格。 */
+  const s = authWorld();
+  const before = s.playerPosition('p1')!;
+  eq(s.applyPlayerMove('p1', 12.5, 10), true, '写入返回 true');
+  const after = s.playerPosition('p1')!;
+  eq(after.x, 12.5, '★ 权威 x 真的变了(接线前恒为出生点)');
+  eq(before.x, 10, '对照:写入前是出生点 10 ⇒ 确实是这次调用改的');
+});
+
+test('T58-2 位置写入后**无漂移**:积分器不会把它挪回去', () => {
+  /* 这是选「位置方案」而非「速度方案」的关键论据之一。
+     位置写入绕过积分(`vx` 恒 0),故不经过摩擦衰减;速度写入则会被
+     `integrateHorizontal` 先衰减再积分(实测 4.5 → 3.24,一帧只走 0.162)。
+     ⇒ 两侧都测:写入后推 1 帧、推 50 帧,位置都必须**逐位不变**。 */
+  const s = authWorld();
+  s.applyPlayerMove('p1', 12.5, 10);
+  s.tick();
+  eq(s.playerPosition('p1')!.x, 12.5, '推 1 帧后仍精确等于写入值(无摩擦衰减)');
+  for (let i = 0; i < 50; i += 1) s.tick();
+  eq(s.playerPosition('p1')!.x, 12.5, '推 50 帧后仍精确不变 ⇒ 位置方案稳定');
+
+  /* 对照:速度方案会被摩擦吃掉 —— 证明上面「无漂移」不是恒真。 */
+  const b = s.physics.bodies.get('p1')!;
+  b.vx = BASE_MOVE_SPEED;
+  s.tick();
+  ok(Math.abs(b.x - 12.5) > 1e-6,
+    `对照:写 vx 后位置**会**变(${b.x.toFixed(4)})⇒ 两条路径行为确实不同`);
+  ok(Math.abs(b.x - 12.5) < 0.2,
+    `且位移远小于 v×DT(${BASE_MOVE_SPEED * DT})⇒ 摩擦先衰减再积分,与客户端预测对不上`);
+});
+
+test('T58-3 身份检查:生物不得冒充玩家改坐标(与反作弊正交)', () => {
+  /* `physics.bodies` 里玩家与生物**混在一起**(`addPlayer` 与 `addMob`
+     都调 `physics.spawn`)。不查这一条就能用一只生物冒充玩家。
+     判据是「**是不是玩家**」,与「位移合不合法」正交 ⇒ **不构成**反作弊的第二份实现。 */
+  const s = authWorld();
+  const mobBefore = { ...s.physics.bodies.get('mob_sheep')! };
+  eq(s.applyPlayerMove('mob_sheep', 99, 99), false,
+    '★ 生物作为「玩家」写入 ⇒ 被拒(返回 false)');
+  eq(s.physics.bodies.get('mob_sheep')!.x, mobBefore.x, '生物的刚体**没有**被改');
+
+  eq(s.applyPlayerMove('nobody', 1, 1), false, '未登记的 id ⇒ 被拒');
+  eq(s.playerPosition('nobody'), null, '未登记的 id ⇒ 读位置返回 null');
+
+  /* 非有限值也必须挡住:写入 NaN 会让 `mobDistance` 恒 NaN,
+     而 `NaN > 阈值` 恒 false ⇒ **距离闸永久失效**(本仓高发坑)。 */
+  eq(s.applyPlayerMove('p1', Number.NaN, 10), false, 'NaN 被拒(否则距离闸永久失效)');
+  eq(s.applyPlayerMove('p1', 10, Number.POSITIVE_INFINITY), false, 'Infinity 被拒');
+  eq(s.playerPosition('p1')!.x, 10, '被拒的写入**没有**留下任何痕迹');
+});
+
+test('T58-4 ★ 世界侧**没有第二道反作弊**(用「撤销第一道」证明)', () => {
+  /* ## 为什么需要这条(Lead 指定的形态)
+     断言「超界被拒」只能证明**至少有一道**。要证明 physics 侧**没有**第二道,
+     必须让第一道失效、再看第二道是否接手 —— 「用注入证明不存在」。
+     做法:直接调 `applyPlayerMove`(绕过 `checkMove`),给一个远超上界的位移。
+     若世界照收 ⇒ 无第二道;若被拒 ⇒ 有第二道(与「判据只在一处」矛盾)。 */
+  const s = authWorld();
+  const bound = maxDisplacementPerTick(1);
+  ok(bound > 0 && bound < 1, `前置:上界确实存在且极小 = ${bound.toFixed(6)} 格/帧`);
+
+  const far = 5000;
+  eq(s.applyPlayerMove('p1', far, s.playerPosition('p1')!.y), true,
+    `★ 世界**照收** ${far} 格位移 ⇒ physics 侧没有任何上界(判据只在 checkMove)`);
+  eq(s.playerPosition('p1')!.x, far, '权威位置真的被写成超界值 ⇒ 也没有隐式钳制');
+
+  /* ⚠️ 真入口的对照(`checkMove` **会**拦)在 WS-07 的 M4/M5 ——
+     反作弊住在 `RoomRuntime`(net 层),不在 `WorldSim` 里。
+     本文件只证明「世界侧没有第二道」,不越界断言网络层。 */
+});
+
+test('T58-5 边界残余(如实记录):世界侧不钳制,钳制由物理在 tick 时做', () => {
+  /* ## 这条记录一个**已知残余**,不是「修好了」
+     `applyPlayerMove` 只管「写在哪」,**不做边界钳制** —— 因为边界归物理层
+     (`world.ts:670` 在 `tick` 时把刚体钳回 `bounds`)。若这里也钳一次,
+     就是**第二份边界实现**(与「反作弊只在一处」同一条纪律)。
+     实测残余:
+       · 写入 `maxX + 5` ⇒ 权威立刻读到 `maxX + 5`
+       · 推 1 帧 ⇒ 被 `world.ts:670` 钳回 `maxX`
+       · 再推 2 帧 ⇒ **稳定停在边界**(不会持续增长)
+     性质:**一次性收敛**,非持续。非越权:反作弊限单帧 ≤ 0.36 格,
+     而窗口速率(5.63 格/秒)限住了总量 ⇒ 走不到世界外。 */
+  const s = authWorld();
+  const maxX = s.sizeCells - 1;
+  const over = maxX + 5;
+  eq(s.applyPlayerMove('p1', over, 10), true, '写入被接受(不做边界判定)');
+  eq(s.playerPosition('p1')!.x, over, '权威立刻 = 越界值(世界侧无钳制)');
+
+  s.tick();
+  eq(s.playerPosition('p1')!.x, maxX, '★ 推 1 帧 ⇒ 被**物理层**钳回边界(`world.ts:670`)');
+  s.tick();
+  s.tick();
+  eq(s.playerPosition('p1')!.x, maxX, '★ 再推 2 帧 ⇒ 稳定停在边界 ⇒ 残余**一次性收敛**');
+
+  /* 阴性对照:界内的合法写入**不被**钳制 —— 否则上面「钳回」可能是恒真的。 */
+  const s2 = authWorld();
+  s2.applyPlayerMove('p1', 20, 10);
+  s2.tick();
+  eq(s2.playerPosition('p1')!.x, 20, '对照:界内写入不被钳制 ⇒ 上面的钳制是**边界特有**行为');
+});
+
+test('T58-6 ★ `removePlayer` 真的有牙:旁路状态不跨轮继承(位置看不出差别)', () => {
+  /* ## 这条的来源:故障注入 J8-1 把我的一条断言判成「没牙」
+     M8 路径 3 原本断言「超期重进后刚体位置 == 出生点」。撤掉那个分支的
+     `removePlayer` **没有让它变红** —— 因为 `physics.spawn` 是 `Map.set`(**覆盖**),
+     位置照样是出生点。逐字段对拍(位置/刚体数/`playerIds`/`vitals`/`profile`)
+     **全部相同**;唯一区分得出的是 `removePlayer` 清掉的**旁路状态**。
+     ⇒ 有牙的判据必须落在旁路状态上,本用例把它钉住。 */
+  const s = authWorld();
+  /* 播「上一轮的残余」:温泉计时(roomEffects 是私有,按既有做法直取) */
+  const re = (s as never as { roomEffects: Map<string, unknown> }).roomEffects;
+  re.set('p1', { soakMs: 999_999 });
+  eq(re.has('p1'), true, '前置:已播种房间效果残余');
+
+  s.removePlayer('p1');
+  s.addPlayer('p1', 10, 10);
+  eq(re.has('p1'), false,
+    '★ 重进后**不继承**上一轮的温泉计时(这才是 removePlayer 的可观测差别)');
+
+  /* 阴性对照:不调 removePlayer 时残余**会**留下 ⇒ 上面不是恒真。 */
+  const s2 = authWorld();
+  const re2 = (s2 as never as { roomEffects: Map<string, unknown> }).roomEffects;
+  re2.set('p1', { soakMs: 999_999 });
+  s2.addPlayer('p1', 10, 10);        /* 直接重 spawn,不 remove */
+  eq(re2.has('p1'), true,
+    '对照:不调 removePlayer ⇒ 残余**留下** ⇒ 两条路径确实不同');
+
+  /* 而**位置**在两条路径下相同 —— 如实记录这个「看不见」的事实,
+     它是 J8-1 的结论,也是「为什么不能靠位置断言」的证据。 */
+  eq(s.playerPosition('p1')!.x, s2.playerPosition('p1')!.x,
+    '如实记录:**位置**在两条路径下相同 ⇒ 位置断言区分不出 removePlayer 是否被调用');
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */

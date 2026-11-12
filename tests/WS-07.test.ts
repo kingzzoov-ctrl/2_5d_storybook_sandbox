@@ -4287,17 +4287,22 @@ test('K5 ★ 装配入口**真的存在并注入 host**(原「缺口钉住」已
 
 test('K5b ★ 经生产装配后,攻击与等级**真的结算**(不再 resolved:false)', () => {
   /* 这条是 K5 的**行为级**证据:光「host 非 null」还不够,
-     要真的走通「报文 → 反作弊 → 模拟层结算 → 回执」全链。 */
+     要真的走通「报文 → 反作弊 → 模拟层结算 → 回执」全链。
+     ⚠️ task-58 起 `join` 会**把玩家登记进世界**,出生点以**房间的**为准
+     (0.5,0.5)。故本用例不再手动 `addPlayer` —— 手动播的种会被 `join` 覆盖,
+     怪也随之要按**房间出生点**放,否则距离不对(我第一版就是这样红的)。 */
   const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
-  /* 世界初始化不属于本任务;这里显式放入玩家与怪,便于把焦点放在**接线**上。 */
   const sim = a.host as unknown as {
-    addPlayer(id: string, x: number, y: number): void;
+    playerPosition(id: string): { x: number; y: number } | null;
     addMob(id: string, biome: string, x: number, y: number): void;
   };
-  sim.addPlayer('p1', 10, 10);
-  sim.addMob('mob_sheep', 'MEADOW', 11, 10);
 
   a.runtime.join({ userId: 'p1' });
+  const spawn = sim.playerPosition('p1');
+  ok(spawn !== null, 'join 之后世界认识 p1');
+  /* 怪放在 1 格内 —— 裸装 reach 3.3 内,确保能打到 */
+  sim.addMob('mob_sheep', 'MEADOW', spawn!.x + 1, spawn!.y);
+
   a.runtime.state.meta.tick = 100;
   const v = a.runtime.applyAttack('p1', 0, 'mob_sheep');
   eq(v.allowed, true, '反作弊放行');
@@ -4330,6 +4335,309 @@ test('K6 装配位不得让 US2 探针误报:net 层仍不含模拟层符号(代
     ok(!/WorldSim|world_sim/.test(code),
       `${f} 的**代码态**不含 WorldSim/world_sim(注释里提到不算)⇒ US2 探针不会误报`);
   }
+});
+
+/* ═══════════ task-58:applyMove → physics.bodies(第二项装配缺口)═══════════ */
+
+/**
+ * 结构化 host 假件:行为**完全可控**,便于把「转发生效」与「没转发」分开。
+ * ⚠️ 与 K2/K3 同一警告:假件证明「契约可用」,不证明「生产已装配」。
+ *   生产路径另由 `index.ts` 的 `assemble()` 覆盖(task-57)。
+ */
+function moveHost(o: { record?: string[]; onApply?: (id: string, x: number, y: number) => void } = {}): {
+  saveToDb: () => { hpSaved: number; hpSkipped: number; memRow: number };
+  attackMobAuthorized: () => { outcome: 'OUT_OF_AOI'; hit: null };
+  levelOf: () => number;
+  applyPlayerMove: (id: string, x: number, y: number) => boolean;
+  playerPosition: (id: string) => { x: number; y: number } | null;
+} {
+  const pos = new Map<string, { x: number; y: number }>();
+  return {
+    saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+    attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
+    levelOf: () => 1,
+    applyPlayerMove: (id, x, y) => {
+      o.record?.push(`apply:${id}:${x}:${y}`);
+      pos.set(id, { x, y });
+      o.onApply?.(id, x, y);
+      return true;
+    },
+    playerPosition: (id) => pos.get(id) ?? null,
+  };
+}
+
+test('M1 ★ applyMove 把移动**真的转进世界**(权威位置变了)', () => {
+  /* 这条守的是 task-58 的缺口:接线前 `applyMove` 只写 `state.players`,
+     全仓写 `physics.bodies` 位置 **0 处** ⇒ 玩家在模拟层永久静止
+     ⇒ 距离闸读刚体 ⇒ 永久 `OUT_OF_AOI`。
+     判据必须是**写入点收到的调用**(行为级),不是我调了方法。 */
+  const calls: string[] = [];
+  const rt = new RoomRuntime({
+    roomId: 'm1', ownerId: 'o', clock: fixedClock(1000), host: moveHost({ record: calls }),
+  });
+  rt.join({ userId: 'p1' });
+  rt.state.meta.tick = 100;
+  rt.ac.tick(100);
+
+  const v = rt.applyMove('p1', { tick: 100, x: 0.7, y: 0.5, z: 0, speedMul: 1 } as never);
+  eq(v.allowed, true, '反作弊放行');
+  eq(calls.length, 1, '★ 世界**真的收到了**一次写入(接线前这里恒为 0)');
+  eq(calls[0], 'apply:p1:0.7:0.5', '收到的是正确的 playerId 与坐标');
+});
+
+test('M2 ★ from 权威读回:state 显示的是**世界的位置**,不是客户端声明', () => {
+  /* 为什么必须读回(而不是照抄声明的 `intent.x`):
+     `physics.bodies` 还会被**击退/搬运**改(`applyImpulse` / `carry.ts`),
+     那些路径**不经过 applyMove`。若照抄声明,击退后会出现:
+       physics.x = 99(真值) / state.x = 0.7(客户端仍说自己在原地)
+       ⇒ 客户端以为在怪旁边,距离闸读权威说不在 ⇒ **永久 OUT_OF_AOI**。
+     本断言用「假件把写入值改掉」模拟击退 —— 若 state 照抄声明就会红。 */
+  const rt = new RoomRuntime({
+    roomId: 'm2', ownerId: 'o', clock: fixedClock(1000),
+    /* 假件收到 (0.7, 0.5) 却存成 (9.9, 8.8):模拟「权威被别的路径改过」 */
+    host: moveHost({ onApply: () => { /* 见下方 playerPosition 的覆盖 */ } }),
+  });
+  rt.join({ userId: 'p1' });
+  rt.state.meta.tick = 100;
+  rt.ac.tick(100);
+  rt.applyMove('p1', { tick: 100, x: 0.7, y: 0.5, z: 0, speedMul: 1 } as never);
+  const p = rt.state.players.find((x) => x.id === 'p1')!;
+  eq(p.x, 0.7, '无外力时:权威值 = 声明值 ⇒ 读回与声明一致(既有断言不破)');
+
+  /* 现在换一个「权威与声明不同」的世界,证明 state 跟权威走 */
+  const rt2 = new RoomRuntime({
+    roomId: 'm2b', ownerId: 'o', clock: fixedClock(1000),
+    host: {
+      saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+      attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
+      levelOf: () => 1,
+      /* 写入被**忽略**(模拟击退已把刚体挪到 9.9),读回给出 9.9 */
+      applyPlayerMove: () => true,
+      playerPosition: () => ({ x: 9.9, y: 8.8 }),
+    },
+  });
+  rt2.join({ userId: 'p1' });
+  rt2.state.meta.tick = 100;
+  rt2.ac.tick(100);
+  rt2.applyMove('p1', { tick: 100, x: 0.7, y: 0.5, z: 0, speedMul: 1 } as never);
+  const q = rt2.state.players.find((x) => x.id === 'p1')!;
+  eq(q.x, 9.9, '★ 权威说 9.9 ⇒ state 显示 9.9(不是客户端声明的 0.7)⇒ 读回生效');
+  eq(q.y, 8.8, 'y 同样跟权威');
+});
+
+test('M3 负向对照:世界没有 `applyPlayerMove` ⇒ 退回只写 state(不报错)', () => {
+  /* null 契约:与 `levelOf` / `saveToDb` 同一取舍 —— 「没接线」不应表现为崩溃,
+     而应表现为**可观测的旧行为**。这条同时是 M1 的负向对照:
+     若 M1 的断言是恒真的,这里也会「有写入」。 */
+  const bare = { saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }) };
+  const rt = new RoomRuntime({
+    roomId: 'm3', ownerId: 'o', clock: fixedClock(1000),
+    host: bare as never,
+  });
+  rt.join({ userId: 'p1' });
+  rt.state.meta.tick = 100;
+  rt.ac.tick(100);
+  const v = rt.applyMove('p1', { tick: 100, x: 0.7, y: 0.5, z: 0, speedMul: 1 } as never);
+  eq(v.allowed, true, '不影响反作弊判定(判定与「有没有世界」无关)');
+  eq(rt.state.players.find((x) => x.id === 'p1')!.x, 0.7,
+    '没有世界 ⇒ 只能写声明值(旧行为保留,既有 30 处无 host 的用例不受影响)');
+});
+
+test('M4 反作弊**只在一处**:撤销 checkMove 那一帧,世界仍不拦(证明无第二道)', () => {
+  /* ## Lead 要求的「用注入证明不存在」
+     光断言「超界被拒」只能证明**至少有一道**;要证明 **physics 侧没有第二道**,
+     必须让第一道失效、再看第二道是否接手。
+     做法:不经过 `RoomRuntime.applyMove`(它内含 checkMove),
+     **直接**调 host 的写入方法,给一个远超上界的位移 —— 世界必须照收。 */
+  const calls: string[] = [];
+  const h = moveHost({ record: calls });
+  /* 直接调用(绕过反作弊):模拟「checkMove 被撤销」
+     ⇒ 若 physics 侧真有第二道上界,它会拒绝;实测它会照收。 */
+  const accepted = h.applyPlayerMove('p1', 9999, 9999);
+  eq(accepted, true, '★ 世界**照收**超界位移 ⇒ 没有任何第二道上界(判据只在 checkMove)');
+  eq(calls.length, 1, '确实写了一次');
+  eq(h.playerPosition('p1')!.x, 9999, '权威位置真的被写成超界值 ⇒ 无隐式钳制');
+
+  /* 反向确认:`maxDisplacementPerTick` 的上界确实存在且能被触发
+     (否则上面「照收」可能只是因为上界概念本身不存在)。 */
+  const bound = maxDisplacementPerTick(1);
+  ok(bound > 0 && bound < 1, `上界存在且极小:${bound.toFixed(6)} 格/帧 ⇒ 「照收 9999」是真结论`);
+});
+
+test('M5 两侧扫描:位移恰好 = 上界放行 / 上界 + ε 被拒', () => {
+  /* 单点测量分不出「上界」与「碰巧」。两侧都扫。
+     ⚠️ 必须推进服务端时钟(`ac.tick`),否则 `claimedTick` 被夹回,
+     连合法移动都会判 TELEPORT —— 那是探针的错,不是反作弊的边界。 */
+  const bound = maxDisplacementPerTick(1);
+  const cases: [number, boolean, string][] = [
+    [bound - 0.01, true, '略小于上界'],
+    [bound, true, '恰好上界'],
+    [bound + 0.001, false, '上界 + ε'],
+    [bound * 3, false, '三倍上界'],
+  ];
+  for (const [d, expectAllowed, label] of cases) {
+    const rt = new RoomRuntime({ roomId: 'm5', ownerId: 'o', clock: fixedClock(1000) });
+    rt.join({ userId: 'p1' });
+    rt.state.meta.tick = 101;
+    rt.ac.tick(101);
+    const start = rt.state.players.find((x) => x.id === 'p1')!.x;
+    const v = rt.applyMove('p1', { tick: 101, x: start + d, y: 0.5, z: 0, speedMul: 1 } as never);
+    eq(v.allowed, expectAllowed,
+      `${label}(d=${d.toFixed(4)})⇒ ${expectAllowed ? '放行' : '拒(' + v.violation?.kind + ')'}`);
+  }
+});
+
+test('M6 端到端:经**生产装配**移动后,距离闸不再恒 OUT_OF_AOI —— 攻击真结算', () => {
+  /* 这是本任务的**最终目的**:接线前玩家在模拟层里静止 ⇒ 永久 `OUT_OF_AOI`。
+     全程走**生产装配**(`assemble()`)与**真实入口**(`join`/`applyMove`),
+     不手动 `sim.addPlayer`、不手动改刚体 —— 否则证明的是「契约可用」而非「接线生效」。
+     (M6 的第一版就是手动 `sim.addPlayer` + 手改坐标,所以它绿得没有意义;
+      正因改走生产路径,才暴露出「join 从不把玩家登记进 sim」这第四条链路。) */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  const sim = a.host as unknown as {
+    playerPosition(id: string): { x: number; y: number } | null;
+    addMob(id: string, biome: string, x: number, y: number): void;
+  };
+
+  /* ★ 只用一个生产入口:join。玩家的**出生点与刚体**都该由它定好。 */
+  a.runtime.join({ userId: 'p1' });
+  const spawn = sim.playerPosition('p1');
+  ok(spawn !== null, '★ `join` 之后模拟层**认识**这个玩家(接线前是 null)');
+  eq(spawn!.x, a.runtime.state.players[0]!.x,
+    '刚体出生点与房间出生点**同源**(不同源会让第一次移动被判瞬移)');
+
+  /* 怪放在离出生点 20 格处:AOI(32)内、裸装 reach(3)外 */
+  sim.addMob('mob_sheep', 'MEADOW', spawn!.x + 20, spawn!.y);
+
+  /* 前置:太远 ⇒ reach 闸拦下(证明前置有效,不是恒结算) */
+  a.runtime.applyAttack('p1', 0, 'mob_sheep');
+  const before = a.runtime.lastAttackReport;
+  eq(before?.outcome, 'OK', '目标在 AOI 内(20 格 < 32)⇒ 进结算');
+  eq(before?.hpLoss, 0, '前置:20 格远超裸装 reach ⇒ 一点血没掉');
+
+  /* 经 **applyMove** 走近(不是直接改刚体)。
+     ⚠️ 步长必须**合法**:0.3 格/帧 = 6.00 格/秒,超过窗口上限 5.63
+     (`SPEED_WINDOW_TOLERANCE × 4.5`)⇒ 第 19 帧就被拒,玩家只走到 6.2。
+     改用 0.25 格/帧 = 5.00 格/秒(< 5.63),多走几帧到怪旁边。 */
+  const STEP = 0.25;
+  for (let i = 0; i < 80; i += 1) {
+    a.runtime.state.meta.tick += 1;
+    a.runtime.ac.tick(a.runtime.state.meta.tick);
+    const now = sim.playerPosition('p1')!;
+    const v = a.runtime.applyMove('p1', {
+      tick: a.runtime.state.meta.tick, x: now.x + STEP, y: now.y, z: 0, speedMul: 1,
+    } as never);
+    if (!v.allowed) break;
+  }
+  const now = sim.playerPosition('p1')!;
+  ok(now.x > spawn!.x + 15,
+    `✔ 玩家真的走到怪旁边:权威 x = ${now.x.toFixed(2)}(接线前恒为出生点)`);
+
+  a.runtime.applyAttack('p1', 0, 'mob_sheep');
+  const after = a.runtime.lastAttackReport;
+  eq(after?.outcome, 'OK', '走进 reach 后进入结算');
+  ok((after?.hpLoss ?? 0) > 0,
+    `★ 端到端:攻击**真的结算** hpLoss=${after?.hpLoss}(接线前永久 OUT_OF_AOI / 0)`);
+
+  /* 负向对照:不移动的玩家永远打不到 —— 证明上面不是「距离闸不存在」 */
+  const b = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  const simB = b.host as unknown as {
+    playerPosition(id: string): { x: number; y: number } | null;
+    addMob(id: string, biome: string, x: number, y: number): void;
+  };
+  b.runtime.join({ userId: 'p2' });
+  const spB = simB.playerPosition('p2')!;
+  simB.addMob('mob_sheep', 'MEADOW', spB.x + 20, spB.y);
+  b.runtime.applyAttack('p2', 0, 'mob_sheep');
+  eq(b.runtime.lastAttackReport?.hpLoss, 0,
+    '负向对照:不移动 ⇒ 仍 0 血 ⇒ reach 闸确实在起作用');
+});
+
+test('M7 `join`/`leave` 必须与世界的登记**成对**(否则转发静默无效)', () => {
+  /* ## 这条是 M6 的第一版暴露出来的
+     M6 初版手动 `sim.addPlayer`,绿得没有意义 —— 改成只走生产 `join()` 后才发现:
+     `sim.addPlayer` 的**生产调用者为 0**。于是模拟层不认识玩家,
+     `applyPlayerMove` 返回 `false`(它按契约「不谎报」),而状态照样流转 ⇒
+     **移动转发静默无效**,玩家在模拟层里根本不存在。
+     ⇒ 登记与转发**必须成对**,故本断言把两者绑在一起。 */
+  const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
+  const sim = a.host as unknown as { playerPosition(id: string): { x: number; y: number } | null };
+
+  eq(sim.playerPosition('p1'), null, '前置:未 join 时世界不认识 p1');
+  a.runtime.join({ userId: 'p1' });
+  ok(sim.playerPosition('p1') !== null, '★ join ⇒ 世界认识了 p1');
+
+  /* 离场必须成对移除,否则同名玩家重进会继承上一轮的刚体/生命值 */
+  a.runtime.leave('p1');
+  eq(sim.playerPosition('p1'), null, '★ leave ⇒ 世界侧一并移除(不成对会残留刚体)');
+
+  /* 没有世界时两条路径都整段跳过(不报错、不假装) */
+  const bare = new RoomRuntime({ roomId: 'm7', ownerId: 'o', clock: fixedClock(1000) });
+  const okJoin = bare.join({ userId: 'p1' }).ok;
+  eq(okJoin, true, '无世界时 join 照常成功(null 契约:契约字段缺失不影响既有流程)');
+  eq(bare.leave('p1'), true, '无世界时 leave 照常成功');
+});
+
+test('M8 三条离场路径**都**要与世界成对(leave / 宽限期超期 / 断线不到期)', () => {
+  /* ## 为什么必须单独测「三条」
+     我第一版只接了 `leave()` 一条,`join()` 里「宽限期超期」那条分支
+     (`room.ts:540-544`)自己也写了 `state.players` 过滤 + `ac.leave`,
+     ⇒ 漏接它会让**重进**的玩家在模拟层里留下旧刚体,
+       随后 `addPlayer` 再 spawn 一次(位置 = 出生点),
+       表现为「重进后位置被悄悄拉回出生点」—— 不报错、不抛异常。
+     ⇒ 本断言把三条路径放进同一个用例,**逐一**验证「世界侧同步」。 */
+  const c = fixedClock(1000);
+  const a = assemble({ clock: c.clock, combatRng: () => 0.5, sizeCells: 64 });
+  const sim = a.host as unknown as { playerPosition(id: string): { x: number; y: number } | null };
+
+  /* 路径 1:主动 leave */
+  a.runtime.join({ userId: 'p1' });
+  ok(sim.playerPosition('p1') !== null, '路径 1:join ⇒ 世界有 p1');
+  a.runtime.leave('p1');
+  eq(sim.playerPosition('p1'), null, '路径 1:leave ⇒ 世界侧移除');
+
+  /* 路径 2:断线但**未超**宽限期 ⇒ 重连**保留**席位,世界侧也应保留 */
+  a.runtime.join({ userId: 'p2' });
+  a.runtime.disconnect('p2');
+  ok(sim.playerPosition('p2') !== null,
+    '路径 2:断线未超宽限期 ⇒ 世界侧**保留**(重连要接着用,删了会丢位置)');
+  const re = a.runtime.join({ userId: 'p2' });
+  eq(re.ok, true, '路径 2:宽限期内重连成功');
+  eq(re.resumed, true, '路径 2:走的是 resumed 路径');
+  ok(sim.playerPosition('p2') !== null, '路径 2:重连后世界侧仍在');
+
+  /* 路径 3:断线**超**宽限期 ⇒ 席位回收,世界侧必须一并移除。
+     ## ⚠️ 为什么这里**不断言位置**(我第一版没牙,由故障注入 J8-1 抓到)
+     第一版断言「重进后刚体位置 == 出生点」。J8-1(撤掉超期路径的
+     `removePlayer`)**没让它变红** —— 因为 `physics.spawn` 是 `Map.set`
+     (**覆盖**),不调 `removePlayer` 位置照样是出生点。
+     逐字段对拍(位置/刚体数/`playerIds`/`vitals`/`profile`)**全部相同**;
+     唯一区分得出的是 `removePlayer` 清掉的**旁路状态**(`roomEffects`
+     温泉计时 / `forgeUnlockedIds`)—— 实测:
+     ```
+     有 remove:roomEffects 播种后重进 → has=false  ★
+     无 remove:roomEffects 播种后重进 → has=true
+     ```
+     ⇒ 行为级断言放在 `tests/WS-10.test.ts`(那里能直接拿 `WorldSim`)。
+       此处只做**代码态**检查:超期分支必须真的调 `removePlayer`。 */
+  const roomSrc = readFileSync(join(ROOT_DIR, 'server/src/net/room.ts'), 'utf8');
+  const stripped = roomSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  /* 定位「宽限期超期」那段分支:从 `away > RECONNECT_GRACE_MS` 起,取足够长的窗口 */
+  const graceIdx = stripped.indexOf('away > RECONNECT_GRACE_MS');
+  ok(graceIdx > 0, '源码里能找到 `away > RECONNECT_GRACE_MS` 判断');
+  const graceBlock = stripped.slice(graceIdx, graceIdx + 800);
+  ok(graceBlock.includes('removePlayer'),
+    '★ 宽限期超期分支**必须**调 `removePlayer`(缺了它玩家态会跨轮继承;'
+    + '位置看不出差别,只有 `roomEffects` 之类旁路状态能,故此处按代码态守。'
+    + '行为级判据在 WS-10 的 T58-6)');
+
+  a.runtime.disconnect('p2');
+  c.advance(RECONNECT_GRACE_MS + 1);
+  const rejoin = a.runtime.join({ userId: 'p2' });
+  eq(rejoin.ok, true, '路径 3:超期重进成功');
+  eq(rejoin.resumed, false, '路径 3:不是 resumed(席位已回收,走的是新加入)');
+  eq(rejoin.role, RoomRole.GUEST, '路径 3:降级为 GUEST(既有行为不受影响)');
+  ok(sim.playerPosition('p2') !== null, '路径 3:重进后世界侧有 p2');
 });
 
 /* ═══════════════ 收尾 ═══════════════ */

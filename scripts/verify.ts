@@ -2174,12 +2174,42 @@ function checkTautology(): void {
     /* 局部名 → 定义模块相对路径(剥注释 + 沿转发链解析,见 parseNamedImports) */
     const nameToMod = parseNamedImports(src, resolveDef);
 
-    /* import 区行号(跳过) */
+    /* import 区行号(跳过)。
+       ⚠️ **退出条件必须覆盖三种 import 形态**,否则 `inImport` 会**永真**
+       ⇒ 其后所有行被 skip ⇒ 本套件的检查**静默失效而门禁仍绿**。
+       实测(2026-11-12,build-wiring 只读审计发现 + Lead 复核):
+       ```
+       正常 named import      跳过  1/5   ✓
+       仅裸副作用导入          跳过  4/4   ✗ **正文全被跳过**
+       裸导入后接 named        跳过  2/5   ✓(第二行的 from 让它退出)
+       动态 import()          跳过  0/3   ✓(它不以 `import` 开头)
+       多行 named import      跳过  4/6   ✓(从 `import {` 到 `} from`)
+       ```
+       ⇒ 触发条件是**顶层裸副作用导入** `import './x.ts';`。
+       **当前全仓 21 个套件触发 0 个**(已逐个实测)⇒ 属**潜伏**缺陷,
+       一旦有人加一行 `import './setup.ts';`,该套件的同义反复检查就无声失效。
+
+       ⚠️ 注意 `lines` 来自 `stripCommentsAndStrings(src)` ——
+       字符串已被替换成 `""`,所以 `/from\s*['"]/` **仍能匹配**
+       (`from './x.ts'` → `from ""`)。我一度以为剥字符串会让引号消失、
+       于是**所有**套件都触发 —— **实测证伪**(21 个套件触发 0 个,不是 21 个)。
+       ⇒ 记录这条是因为:它是我在这一处**唯一一次方向正确的怀疑**,而它被实测否掉了。 */
     const importLines = new Set<number>();
     let inImport = false;
     lines.forEach((l, i) => {
       if (/^\s*import\b/.test(l)) inImport = true;
-      if (inImport) { importLines.add(i); if (/from\s*['"]/.test(l)) inImport = false; }
+      if (inImport) {
+        importLines.add(i);
+        /* 三种结束形态:named/re-export 的 `from`、裸副作用的整行 `import "…"`、
+           多行 import 的收尾。⚠️ 不要在这里再写第四份 import 正则 ——
+           `parseNamedImports` 已有权威实现;此处只判「本行是否结束 import 语句」。 */
+        if (/from\b/.test(l)
+          || /^\s*import\s*$/.test(l)
+          || /^\s*import\s*["']/.test(l)
+          || /^\s*import\s*\(/.test(l)) {
+          inImport = false;
+        }
+      }
     });
 
     /* 正文实际引用到的生产常量名 —— 这一步把范围收窄到「本套件真的在乎」的常量。
@@ -4090,6 +4120,45 @@ function runTests(): void {
 
 /* ───────────────────── main ───────────────────── */
 
+/**
+ * **被 `import` 时不得执行门禁** —— 这不是风格问题,是防无限递归。
+ *
+ * ## 缺陷形态(2026-11-12 由 build-wiring 的故障注入**意外触发**,Lead 复核成立)
+ *
+ * 本文件此前**没有**任何守卫:`node scripts/verify.ts` 与
+ * `import './scripts/verify.ts'` 的行为**完全相同** —— 都执行整个门禁。
+ * 而门禁里 `runTests()` 会 `spawnSync(process.execPath, [f])` **无条件 spawn 全部测试文件**。
+ *
+ * ⇒ 于是「某个模块 import 了 verify.ts」这件事会**链式爆炸**:
+ * ```
+ * 测试 A spawn → 测试 B → import 了 M → M import verify.ts
+ *   → verify.ts 顶层执行 → runTests() spawn 全部测试 → 又跑测试 A ⇒ **无限递归**
+ * ```
+ * **实测发生过两次**:build-wiring 为验证「判据能否抓到 import verify.ts」,
+ * 让 `entry_load_exempt.ts` 真的 import 了一次 ⇒ **76 个 node 进程**;
+ * 它第二次人工复核时又触发一次 ⇒ 46 个。合计清理 **122 个进程**。
+ * ⚠️ **超时拦不住**:每一层都在 spawn 新进程,所以「设 400s 超时」无效。
+ *
+ * ## 为什么这让「不得 import verify.ts」那条断言**永远不可能报红**
+ *
+ * 递归的后果是**进程爆炸**,不是一条可读的失败 —— 判据**没有机会报告自己被骗了**。
+ * ⇒ 那条断言的价值在**阻止**(预防),不在**检测**。
+ * **⇒ 而预防是可以在根因处做掉的:加上下面这个守卫,递归就不可能发生。**
+ *   这才是「用结构消除一类缺陷」,而不是「加一条抓不住的断言去警告它」。
+ *
+ * ## 实现
+ *
+ * Node 24 有 `import.meta.main`(实测:`typeof === 'boolean'`,直接执行时 `true`)。
+ * ```
+ * node scripts/verify.ts        ⇒ import.meta.main === true  ⇒ 跑门禁 ✓
+ * import('./scripts/verify.ts') ⇒ import.meta.main === false ⇒ **只导出,不执行** ✓
+ * ```
+ * ⚠️ 守卫**必须包住整个 `main` 块**(包括 `--all` 的口径歧义检查)——
+ * 只包住后半段的话,`import` 仍会执行前半段,递归照样发生。
+ * ⚠️ **不要改用 `process.argv[1]` 比对**:实测在 `-e` 形态下 `process.argv[1]` 是
+ * `[eval]`(不是文件路径),`pathToFileURL` 直接抛错;而 `import.meta.main` 无此问题。
+ */
+if (import.meta.main) {
 const t0 = Date.now();
 
 /* `--all` 的口径歧义必须当场报错,不能靠"恰好等于不传 flag"糊过去。
@@ -4137,3 +4206,4 @@ const adviseSuffix = advises === 0
 console.log(`\n${verdict}${adviseSuffix} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
 }
+} /* ← 关闭 `if (import.meta.main)` 守卫(理由见该处长注释) */

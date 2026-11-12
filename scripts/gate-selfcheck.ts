@@ -659,8 +659,73 @@ const only = ((): string | undefined => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 })();
 
+/* ⚠️ 计数器必须在这里声明:T33(下方)在用例表**之外**先跑并自增它们。
+   我曾把这两行留在表循环之前 —— 那在 T33 之后,`const` 的 TDZ 会让 T33 抛错。
+   ⇒ **顺序是承重的**,不要因为"看着更整齐"往上/往下挪。 */
 let failures = 0;
 let passed = 0;
+
+/* ── T33:`import` 守卫(防无限递归)—— 在用例表**之外**单独跑 ──
+ *
+ * ## 为什么它不能写成表里的一条 `Case`
+ *
+ * 表里每条用例的形态是「改文件 → 跑 verify → 看红绿」。而本条的期望是
+ * **「import verify.ts 不产生任何输出」**,它要跑的不是 `runVerify`(那是 `node` 直接执行),
+ * 而是 `import()` —— **动作不同**。硬塞进表里会把「探针改了内容」与
+ * 「import 无输出」两件事混进同一个判定,反而说不清。
+ *
+ * ## 它守的是什么
+ *
+ * build-wiring 的故障注入**意外触发过两次无限递归**(合计 122 个 node 进程):
+ * ```
+ * 某模块 import verify.ts ⇒ verify.ts 顶层执行 ⇒ runTests() 无条件 spawn 全部测试
+ *   ⇒ 被 spawn 的测试又 import 那个模块 ⇒ **递归**
+ * ⚠️ 超时拦不住(每层都在 spawn 新进程)
+ * ```
+ * ⇒ 修法是在根因处加 `if (import.meta.main)` 守卫(见 verify.ts 该处长注释)。
+ *
+ * ⚠️ **这条检查必须存在**:守卫一旦被删(比如有人觉得 `import.meta.main` 是冗余),
+ * 递归缺陷**立刻回来**,而**没有任何别的检查会报红** ——
+ * 因为递归的表现是进程爆炸,不是一条可读的失败行。
+ * ⇒ 这正是 build-wiring 报告的形态:「那条预防性断言没有机会报红」。
+ *   **⇒ 所以要在外面再包一层检查,专门验证那个守卫还在。**
+ */
+{
+  console.log('\n[T33] `import verify.ts` 不得执行门禁(防无限递归的守卫还在吗)');
+  dropLab();
+  /* ⚠️ 必须用**子进程 + 硬超时**:若守卫已失效,这个 import 会跑整个门禁
+     (含 spawn 全部测试),`-e` 里直接 await 会把自检本身卡死。 */
+  const probe
+    = "import('./scripts/verify.ts').then("
+      + "() => { process.stdout.write('IMPORT_OK'); },"
+      + " (e) => { process.stdout.write('IMPORT_ERR:' + String(e && e.message).slice(0, 60)); });";
+  const r = spawnSync(process.execPath, ['-e', probe], {
+    cwd: ROOT, encoding: 'utf8', timeout: 120_000,
+  });
+  const out = `${r.stdout ?? ''}`;
+  /* 判据:import 成功,且 stdout **没有**门禁的特征输出。 */
+  const imported = out.includes('IMPORT_OK');
+  const ranGate = /生产可达性|入口可加载性|全部通过|项失败|冻结层不变量/.test(out);
+  const guarded = imported && !ranGate;
+  const timedOut = r.error !== undefined && r.error !== null;
+  console.log(`  子进程 exit=${r.status} 超时=${timedOut ? '**是**' : '否'}`);
+  console.log(`  import 成功:${imported ? '✓' : '✗'};  含门禁输出:${ranGate ? '**是**' : '否'}`);
+  if (guarded) {
+    console.log('  ⇒ ✓ 守卫有效(import 只导出、不执行)');
+    passed += 1;
+  } else {
+    console.log('  ⇒ ✗✗ 守卫失效 —— `import.meta.main` 包裹可能被删掉了');
+    console.log('     一旦失效,任何 import verify.ts 的模块都会**无限递归 spawn**(超时拦不住)');
+    failures += 1;
+  }
+  dropLab();
+}
+
+/* ⚠️ T33 **不得在这里打印汇总** —— 用例表(下方)还没跑。
+   我第一版在这里加了一行汇总,于是自检打出**两个**结论:
+   「✓ 全部通过(1 通过 / 1 合计)」和真正的「(28 通过 / 28 合计)」。
+   ⇒ 两个都读作「全部通过」时不会有人发现,但**一个绿一个红时必被误读**。
+   ⇒ 汇总只在**文件末尾**打印一次。 */
 
 /* ── 基线:干净副本 ──
    若基线有红(通常是队友在飞的改动),**不中止**,而是把它当作差值基准 ——

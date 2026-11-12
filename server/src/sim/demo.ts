@@ -201,6 +201,56 @@ const sa = JSON.stringify(a.snapshot());
 const sb = JSON.stringify(b.snapshot());
 if (sa !== sb) problems.push(`同种子两次运行的终态不一致:\n    A=${sa}\n    B=${sb}`);
 
+/* ── 自检:参考实现必须**真的能移动玩家** ──
+ *
+ * ## 为什么这段必须有(task-58 / Lead 定为必修)
+ *
+ * 此前 `addPlayer('p1', 12, 12)` 之后就再没动过,`makeWorld()` 里的玩家
+ * **一直静止**。后果:「模拟层支持玩家移动」这件事**从未被端到端证明过** ——
+ * 而 `attackMobAuthorized` 的距离闸读 `physics.bodies`,
+ * 玩家不动 ⇒ 距目标恒定 ⇒ 永远 `OUT_OF_AOI`。
+ *
+ * 本仓铁律是「**参考实现必须端到端能跑**」:`demo.ts` 在 `PROD_ENTRIES` 里,
+ * 它是 `npm run sim`。若只接 room 侧而 demo 仍静止,就等于又一次
+ * 「测试全绿 + 参考实现不跑」—— 那正是本项目反复出现的病灶。
+ *
+ * ## 判据必须是**权威位置**的位移,不是「调过方法」
+ *
+ * 只断言「我调用了 applyPlayerMove」毫无区分力(方法体可以整个空掉)。
+ * ⇒ 断言 `playerPosition()`(读 `physics.bodies`)的**前后差值**。
+ */
+const moveWorld = makeWorld();
+const p1Before = moveWorld.playerPosition('p1');
+/* 沿 +x 走 20 帧,每帧 0.2 格(≈ BASE_MOVE_SPEED 4.5 × DT 0.05 × 0.89,合法) */
+const MOVE_FRAMES = 20;
+const MOVE_STEP = 0.2;
+for (let i = 0; i < MOVE_FRAMES; i += 1) {
+  const now = moveWorld.playerPosition('p1');
+  if (now === null) break;
+  moveWorld.applyPlayerMove('p1', now.x + MOVE_STEP, now.y);
+  moveWorld.tick();
+}
+const p1After = moveWorld.playerPosition('p1');
+const movedX = (p1After?.x ?? 0) - (p1Before?.x ?? 0);
+const expectMoved = MOVE_FRAMES * MOVE_STEP;
+if (p1Before === null || p1After === null) {
+  problems.push('playerPosition() 返回 null —— 玩家不在 physics.bodies 里');
+} else if (Math.abs(movedX - expectMoved) > 1e-6) {
+  problems.push(
+    `玩家位移 ${movedX.toFixed(4)} ≠ 期望 ${expectMoved.toFixed(4)}`
+    + `(权威位置 = physics.bodies;若为 0 说明 applyPlayerMove 没写进去)`,
+  );
+}
+/* 派生视图必须跟着走 —— `syncPlayers()` 只在 tick() 里跑。
+   这一条同时证明「AI 能看见玩家移动」(mobPlayers 是 AI 的唯一输入源)。 */
+const mp1 = moveWorld.mobPlayers.find((m) => m.id === 'p1');
+if (mp1 === undefined || Math.abs(mp1.x - (p1After?.x ?? -999)) > 1e-6) {
+  problems.push(
+    `mobPlayers 里 p1.x=${String(mp1?.x)} 与权威 ${String(p1After?.x)} 不一致`
+    + ' ⇒ syncPlayers 没把位置投影出去,生物 AI 将看不见玩家移动',
+  );
+}
+
 if (problems.length > 0) {
   console.log('自检失败:');
   for (const p of problems) console.log('  ✗ ' + p);
@@ -209,5 +259,9 @@ if (problems.length > 0) {
 console.log('自检通过:');
 console.log('  ✓ 世界按 20Hz/2Hz 双频推进,慢帧比例精确 1:10');
 console.log('  ✓ 全部子系统可同时实例化并协同运行(地形/物理/流体/电路/AOI/刷怪)');
-console.log(`  ✓ 电路**件**真的被求值:${evaluatedTotal} 次(线通电 ${snap.wireCells} 格)`);
+console.log('  ✓ 电路**件**真的被求值:' + `${evaluatedTotal} 次(线通电 ${snap.wireCells} 格)`);
+console.log(
+  `  ✓ 玩家**真的能移动**:权威位移 ${movedX.toFixed(3)} 格(${MOVE_FRAMES} 帧 × ${MOVE_STEP}),`
+  + `mobPlayers 同步到 ${(mp1?.x ?? 0).toFixed(3)}`,
+);
 console.log('  ✓ 同种子两次运行终态逐字节一致(确定性成立)');

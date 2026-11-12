@@ -103,7 +103,7 @@
 | `x,y,z` | `PhysicsWorld.bodies.get(id)`<br>片段:`this.bodies.set(id, b)` | `PhysicsWorld`(单点写入,:243) | `playerById`(实时读,不缓存) | 写 1 / 读 14 | **`PhysicsWorld` 唯一** ✅ 现状最健康的一个 |
 | `facingDeg` | `body.facingDeg` | `PhysicsWorld` | `facingOf` | 1 | `PhysicsWorld` |
 | `vx,vy` | `mobs/fsm.ts` 各 FSM 实例 | 各 FSM | 各 FSM | — | `PhysicsWorld`(**注**:FSM 自己有 `vx/vy` 副本,属 §4.8 待判) |
-| `room.PlayerState.x,y,z` | `room.ts` `state.players[]` | `join()` 时播种 `spawn.x`;`applyMove` 更新 | 网络编码 | 2 | **投影** —— 必须由 `PhysicsWorld` 单向刷出 |
+| `room.PlayerState.x,y,z` | `room.ts` `state.players[]` | `join()` 时播种 `spawn.x`;`applyMove` 读回权威 | 网络编码 | 2 | **投影** —— 由 `PhysicsWorld` 单向刷出(**task-58 已实装**,见 §4.13) |
 
 ### 1.8 天气 / 时间
 
@@ -410,6 +410,80 @@ Lead: applyHit('p1', 1e9)   ⇒ attackerId='p1', playerId=1e9
 
 ---
 
+### 4.13 ★ 位置:W2 同族**形态**的新实例(task-58 实装)
+
+**这一条不是「表里没有所以另起」,而是 W2 那个形态的又一个实例。**
+口径:「W2 是同族**形态**,position 是它的**新实例**,故登记进本表」——
+若只写进 `room.ts` 注释,下一个人不会有系统地找到它;本表就是「系统地找到」的入口。
+
+#### 为什么 §1.7 的预测当年是对的,却一直没兑现
+
+§1.7 第 106 行早就写了答案:
+
+> | `room.PlayerState.x,y,z` | `room.ts` `state.players[]` | `join()` 时播种 `spawn.x`;`applyMove` 更新 | 网络编码 | 2 | **投影** —— 必须由 `PhysicsWorld` 单向刷出 |
+
+**方向从来是对的,事实一直不是。** task-58 之前实测(全仓):
+
+```
+applyMove 5 次合法移动:state.x 0.800 → 2.000,physics.bodies.x 恒 0.500
+⇒ 分叉 = 1.500 格
+写 physics.bodies 位置的**生产调用者** = 0 处
+```
+
+即:表里写「必须由 `PhysicsWorld` 单向刷出」,而那条刷出**根本不存在**。
+⇒ 与 §4.4 的 `carrySlots` 同族,是「**有预测 ≠ 有实装**」。
+(对照 §4.4 的「有上界 ≠ 有权威」。)
+
+#### W2 形态(逐点同构)
+
+| | W2 `level` | 本实例 `x,y,z` |
+| :--- | :--- | :--- |
+| **权威** | `progresses[].level` | `PhysicsWorld.bodies.get(id)` ✅ 现状已对 |
+| **投影** | `state.players[].level` | `state.players[].x/y/z` |
+| **投影写入点** | `syncLevelProjections()`,每 `step()` | `applyMove` 读回(经 `host.playerPosition`) |
+| **单向性** | 权威 → 投影,投影不回写 | 同 |
+| **钳制** | 钳 `[1, MAX_LEVEL]`(因 `carryCapacityOf` 不钳) | **不钳** —— 边界归物理(`world.ts:670`),此处钳会成为第二份实现 |
+| **缺字段时的契约** | `levelOf` 可选,缺失整段跳过 | `playerPosition` 可选,缺失退回声明值 |
+
+#### 权威归属裁决(不留「待定」)
+
+```
+x,y,z
+  权威   = PhysicsWorld.bodies.get(id)      ← 刚体是唯一真值
+  投影   = state.players[].x/y/z            ← 网络下发,只读
+  写入点 = **唯一**:RoomRuntime.applyMove → host.applyPlayerMove(反作弊放行后)
+  读回   = host.playerPosition(让击退/搬运对客户端可见)
+  边界   = 归 PhysicsWorld.world.ts:670(不在此处钳制)
+```
+
+**残余(如实记录,非「已修」)**:`applyPlayerMove` 不做边界钳制,故越界写入
+会**存活一帧**(权威读数为越界值),下一帧被 `world.ts:670` 钳回,再推帧稳定在边界。
+性质 = **一次性收敛**;且非越权(反作弊限单帧 ≤ 0.36 格,窗口速率限总量,走不到界外)。
+断言见 `tests/WS-10.test.ts` T58-5。
+
+#### 为什么「反作弊」不构成位置的第二权威(与 §4.4 对照)
+
+反作弊(`anticheat.checkMove`)**拥有规则**,不拥有状态 —— 它判「位移是否合法」,
+不存位置。这与 §4.4 的 `carrySlots` 第二份实现**性质相反**:那里是**两份状态实现**,
+这里是**规则与状态分离**。⇒ 判据落在 `checkMove` **一处**;
+`applyPlayerMove` 只执行、不判定(在 physics 侧再判一次就会回到 §4.4 的病灶:
+两处判据必然漂移,且第二处会**掩盖**第一处失效)。
+
+#### 与本文档总原则的关系
+
+§7 的贯穿原则「**纯函数拥有规则,持有者拥有状态,网络层只投影**」
+在位置这一项上首次**三点齐全**:
+
+```
+规则   → anticheat.checkMove(纯判定)
+持有者 → PhysicsWorld(状态)
+投影   → state.players[](只投影,不产状态)
+```
+
+⇒ task-58 修的不是「少写一行」,而是**补上了缺失的持有者入口**。
+
+---
+
 ## 5. 方法论:我的判据是怎么定的
 
 | 结论类型 | 判据 | 为什么不用别的 |
@@ -499,7 +573,7 @@ Lead: applyHit('p1', 1e9)   ⇒ attackerId='p1', playerId=1e9
 | `level` / `exp` / `maxHp` 基准 / `carrySlots` | **`progression`** | `room` / DB = 只读投影;**删除 `room.ts:747` 内联公式** |
 | `wearing` / `heldItem` | **新结构「玩家档案」**(现在不存在) | `room` = 投影;`vitals` / `combatantStats` = 消费 |
 | `weaponId` | **不存储**,由 `wearing` 派生 | 三个存储点全部改投影 |
-| `x,y,z` / `facingDeg` | **`PhysicsWorld`** ✅ 现状已对 | `room` = 投影 |
+| `x,y,z` / `facingDeg` | **`PhysicsWorld`** ✅ 现状已对 | `room` = 投影(**task-58 起为真**,见 §4.13) |
 | 背包明细 | **`users.inventory_json`** | `room.inventoryTotals` = 缓存;`grantedSources` = 反作弊凭证 |
 | 复活读条 / 泡泡 | **`WorldSim.downedStates`** | `revive.ts` = 纯规则;`vitals` = 只给瞬时判定 |
 | `roomEffects`(温泉等) | **`WorldSim`** | `effects.ts` = 纯规则;**需要新加落盘**,否则 §4.6 缺口常在 |

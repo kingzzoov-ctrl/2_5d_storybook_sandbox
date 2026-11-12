@@ -2112,6 +2112,75 @@ export class WorldSim {
     this.syncPlayers();
   }
 
+  /**
+   * **玩家移动的权威写入点**(task-58)。把一次已获准的移动写进 `physics.bodies`。
+   *
+   * ## 为什么是「位置」而不是「速度」
+   *
+   * 三条理由,第一条决定性(实测):
+   *
+   * 1. **速度方案与客户端预测永久对不上**。`prediction.ts:70-82` 的 `predictStep`
+   *    自述「故意**不含**摩擦衰减 —— 连续输入时速度项主导」,算的是 `v * DT`:
+   *    ```
+   *    客户端预测:4.5 × 0.05 = 0.2250 格/帧
+   *    服务端写 vx=4.5 ⇒ 实测一帧 dx = 0.1620,vx 衰减 4.5 → 3.24
+   *    ⇒ 差 28.0%
+   *    ```
+   *    那句注释假设的前提是「位置由别处直接写入、速度项主导」——
+   *    在**速度方案**下该前提不成立,`reconcile` 会持续 `SMOOTH`/`SNAP`。
+   * 2. 反作弊上界 `maxDisplacementPerTick()` 是**位移**量纲(实测 0.36 格/帧),
+   *    而 `checkMove` 判的也是 `dist(新旧坐标)`。速度方案要多做一次换算,
+   *    换算式本身成为新的对不齐点。
+   * 3. **本仓既有先例全是「直接写位置」**:生物 FSM 走 `host.ts:449` 的
+   *    `rt.x = fsm.x`(实测生物的 `physics.bodies` 200 帧完全不动),
+   *    叠罗汉走 `carry.ts` 的 `body.vx/.vy` 直赋。位置方案与它们同构。
+   *
+   * 代价(如实写):本方法**绕过积分**,故不自动获得摩擦/传送带/碰撞反弹。
+   * 这是刻意的 —— `MoveIntent` 携带的是**目标坐标**(见 `anticheat.ts:283-299`),
+   * 契约本身就是位置语义,速度方案反而要反推。
+   *
+   * ## ⚠️ 反作弊**不在这里再判一次**(本仓纪律:不制造第二份等效实现)
+   *
+   * 合法性判定**唯一**在 `anticheat.ts` 的 `checkMove`(由 `RoomRuntime.applyMove`
+   * 调用)。本方法假设输入**已获准**,只做写入。
+   *
+   * 若在此再加一道上界检查,会产生两份等效实现,后果有二:
+   * - 两处判据将来必然漂移(一处改常量、另一处没改),而**门禁查不出**;
+   * - 更坏:第二处会**掩盖**第一处失效 —— 若 `checkMove` 哪天被绕过,
+   *   测试仍可能全绿(因为这里还在夹)⇒ 真缺陷被藏起来。
+   *
+   * (本仓已两次实测到「两份实现互相顶着」:task-47 的 `wearingOf`/`syncPlayers`
+   * 单点注入查不出,task-50 的陷阱 31/41。)
+   *
+   * ## 身份检查**不是**反作弊的第二份实现
+   *
+   * 它拦的是**另一件事**:`physics.bodies` 里玩家与生物**混在一起**
+   * (`addPlayer` 与 `addMob` 都调 `physics.spawn`),不查这一条
+   * 就能用一只生物冒充玩家去改坐标。判据是「**是不是玩家**」,
+   * 与「位移合不合法」正交,故不构成重复。
+   *
+   * @returns 是否真的写入了(未登记的 id 返回 `false`,不抛错 —— 与
+   *          `attackMobAuthorized` 的「不谎报」同取舍)。
+   */
+  applyPlayerMove(playerId: string, x: number, y: number): boolean {
+    if (!this.playerIds.has(playerId)) return false;
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return false;
+    /* 非有限值挡在这里:写入 NaN 会让 `mobDistance` 恒 NaN ⇒ 距离闸永久失效,
+       而 `NaN` 的比较恒 false 属本仓高发坑(见 `checkMove` §6.0 值域门)。 */
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    b.x = x;
+    b.y = y;
+    return true;
+  }
+
+  /** 玩家当前的**权威位置**(读 `physics.bodies`,不是派生视图)。 */
+  playerPosition(playerId: string): { x: number; y: number } | null {
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return null;
+    return { x: b.x, y: b.y };
+  }
+
   /** 移除玩家(生命值一并清掉)。 */
   removePlayer(id: string): boolean {
     const had = this.playerIds.delete(id);
