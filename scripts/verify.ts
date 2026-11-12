@@ -1329,14 +1329,70 @@ function checkReachability(): void {
      总数有没有跟着变:那是区分「修复落地」和「有人动了别处」的唯一依据。 */
   const unreachableCount = unreachable.length;
   const wl = whitelistBreakdown();
+  /* ── 「生产」这个词有多强?—— 实测 demo 独有数 ──────────────
+   *
+   * `prodAll` 是**两个生产目录里所有 .ts 文件**(server/src + client/src),
+   * `reach` 是三入口闭包。可达 = prodAll ∩ reach。
+   * 而三个入口里 `server/src/sim/demo.ts` 自述是「可手动运行的演示」
+   * (不是服务端、不是客户端)。
+   * ⇒ 若不注明,读者会把「生产可达 67」读成「服务端/客户端运行时都能到」,
+   *    而实测**过半**只依赖 demo 这一个入口。
+   *
+   * 实测(用本文件的 lexer 量的,两次口径必须对齐):
+   *   · 全仓 .ts 共 83,其中可达 67
+   *   · **demo 独有 53 个**(去掉 demo 入口,这 53 个从可达变不可达)
+   *   ⇒ 67 个「可达」里 53 个(79.1%)**只有 demo 能到**
+   *
+   * ⚠️ 注意分母:**53 / 67(可达数)**,不是 53 / 83(全量)。
+   *    上一版我写成 `/ prodAll.length` 得到 63.9% —— 那个分母混了
+   *    「全部文件」与「可达文件」,与本行的声称(可达里有多少只靠 demo)
+   *    不一致。**这正是陷阱 27 说的「数字的语义要与事实同强度」。**
+   *
+   * 为什么**保留「生产可达」而不改词**:这些模块确实会被运行时加载
+   * (demo 是可执行的),叫「激活可达」会丢掉这层有用信息。
+   * 正确做法是**说清它是谁的并集**,而不是换个模糊的词。 */
+  let demoOnlyCount = 0;
+  if (entries.includes('server/src/sim/demo.ts')) {
+    try {
+      const noDemo = reachableClosure(entries.filter((e) => e !== 'server/src/sim/demo.ts'));
+      /* ⚠ 两个坑,都是我自己踩的:
+       *
+       * 坑 1:`reach` 是 **Set**,没有 `.filter`。上一版写成 `reach.filter(...)`
+       *   抛 TypeError 被 catch 吞成 -1,整行**静默不打印** ——
+       *   而「不显示」在输出上与「无误」无法区分。⇒ 修法与下方 catch 打印原因。
+       *
+       * 坑 2(更隐蔽):上一版在 **`reach`(74 个)上数**,
+       *   而本行措辞说的是「**上列可达数里**」(prodAll 口径,67 个)。
+       *   `reach` 里多出的 7 个是 `shared/**`(不属于 server/src、client/src)。
+       *   ⇒ 在 reach 上数得 **38**,与措辞声张的 67 口径**不自洽**;
+       *     独立复核实得 **37**(67 - 30)。**差 1 就是某个 shared 文件。**
+       *   ⇒ 必须与 `prodAll` 求交,让数字与措辞同口径(陷阱 27)。 */
+      const reachableProdSet = new Set(prodAll.map(relOf).filter((r) => reach.has(resolve(ROOT, r))));
+      const noDemoProd = new Set(prodAll.map(relOf).filter((r) => noDemo.has(resolve(ROOT, r))));
+      demoOnlyCount = [...reachableProdSet].filter((r) => !noDemoProd.has(r)).length;
+    } catch (e) {
+      demoOnlyCount = -1;
+      console.warn(`  i         └─ ⚠ demo 独有数**测量失败**(${(e as Error).message.slice(0, 60)})—— 不是「为 0」`);
+    }
+  }
+  const reachableProd = prodAll.length - unreachableCount;
   const summary =
-    `生产可达性:可达 ${prodAll.length - unreachableCount} / 不可达 ${unreachableCount} `
+    `生产可达性:可达 ${reachableProd} / 不可达 ${unreachableCount} `
     + `(共 ${prodAll.length},入口 ${entries.length} 个,白名单 ${UNREACHABLE_EXEMPT.size} 条)`
     + (unlisted.length > 0 ? ` —— 其中未登记 ${unlisted.length} 个` : '');
-  /* 条数**取实测**,不写死 —— 旧版这里硬编码「50 条」,而白名单早已降到 43
-     (WS-06 炼金 7 条接线后摘除),于是门禁自己印着一个过时数字。
-     这与 README 的过时数字是同一类缺陷,只不过发生在**门禁的输出**里,
-     更难被发现:读者倾向于相信门禁自己说的话。 */
+  /* ⚠ 这行是**断言强度**问题,不是措辞问题(见 docs/PROGRESS.md 陷阱 27):
+     门禁印的每个数字都在断言事实,所以「可达 67」这个数字所声称的
+     本体必须与它实际覆盖的本体一致。 */
+  const entryNote =
+    `        └─ 入口构成:server/src/net/room.colyseus.ts(真服务端)`
+    + ` / client/src/main.ts(真客户端)`
+    + ` / server/src/sim/demo.ts(**手动演示**,自述非测试非服务)`
+    + (demoOnlyCount >= 0
+      ? `\n  i         └─ ⚠ 上列可达数里 **demo 独有 ${demoOnlyCount} 个**`
+        + `(去掉 demo 入口就不可达 —— 占可达数的 `
+        + `${(demoOnlyCount / Math.max(1, reachableProd) * 100).toFixed(1)}%)`
+        + `;「生产可达」是**三入口并集**,不等于「服务端/客户端运行时可达」`
+      : '');
   const breakdown =
     `        └─ 欠账构成(${UNREACHABLE_EXEMPT.size} 条全部待接,按卡点分类):等客户端入口 ${wl.clientShell}`
     + ` / 等编排层接线 ${wl.wiring} / 等服务端机制 ${wl.mechanism}`
@@ -1366,6 +1422,9 @@ function checkReachability(): void {
      若只在失败时打印,接线做完那天它就消失 —— 与 R6/S11 那个
      「数字只在绿灯时打印」是同一个坑,方向相反。 */
   console.log(`  i ${breakdown}`);
+  /* 入口构成行**无条件打印**:它说的是「这个数字覆盖谁」,
+     在通过时同样需要 —— 甚至更需要(绿灯时读者不会去追问口径)。 */
+  if (entryNote !== '') console.log(`  i ${entryNote}`);
 }
 
 /* ───────────── 2.5 同义反复候选检查(S11)───────────── */
