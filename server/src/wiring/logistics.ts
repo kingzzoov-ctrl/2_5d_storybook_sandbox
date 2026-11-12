@@ -258,6 +258,11 @@ export interface ArmWorld {
   feed(deviceId: number, x: number, y: number, item: Stack): boolean;
   /** 该格是否有指定设备 */
   deviceAt(x: number, y: number): number;
+  /**
+   * 把货**落到地面**(可选)。返回 `false` 表示该格收不下(越界/满了),
+   * 此时调用方会退回原格而不是销毁。
+   */
+  drop?(x: number, y: number, item: Stack): boolean;
 }
 
 export interface ArmStepResult {
@@ -429,6 +434,78 @@ export interface LogisticsTickReport {
   armGrabs: number;
   armFeeds: number;
   drillOres: number;
+  /** 出货口的货成功交给了下游(带/分拣器/设备)。 */
+  exitsDelivered: number;
+  /** 出货口的货无处可去,已**落到地面**(不是销毁)。 */
+  exitsDropped: number;
+  /** 出货口的货下游堵住,已**退回原格待运**(不是销毁)。 */
+  exitsHeld: number;
+}
+
+/**
+ * 交付一个出货口(`exit`)的货 —— 这是本文件最容易漏的一步。
+ *
+ * ## 为什么必须有这个函数(真缺陷,不是重构)
+ *
+ * `stepConveyor` / `stepSorter` 在搬满一格时会把货放进返回值的 `exit`,
+ * **同时把 `state.item` 清空**。也就是说:货的归属权在那一刻被**移交**给了调用方。
+ *
+ * 而 `tickLogistics` 原先只做 `if (r.moved) rep.beltMoves += 1;` ——
+ * **完全丢弃 `exit`**。后果是货被搬离本格的一瞬间就从世界上消失:
+ * 既不在带内,也不在地面,也不在任何设备里。实测(32 格世界):
+ * ```
+ * loadConveyorAt(5,5) 装 1 件 151 → 第 30 帧 movedCells=1,而地面为空、任何格都找不到 151
+ * ```
+ * 这类缺陷**不抛错、不影响既有断言** —— 因为唯一消费 `exit` 的是
+ * `tests/WS-08.test.ts:1051` 的 `loadConveyor(st, r.exit!.item)`,
+ * **测试自己补齐了编排层该做的事**,于是「测试全绿」掩盖了「生产丢货」。
+ *
+ * ## 交付顺序(不可颠倒)
+ *
+ * 1. 下游是传送带/分拣器 ⇒ 交给它(只有它能接住才交付)
+ * 2. 目标格有设备 ⇒ 投喂
+ * 3. 兜底 ⇒ **落地**
+ * 4. 落地也没有(宿主未实现 `drop`)⇒ **退回原格**,绝不清空
+ *
+ * ## 为什么「退回原格」而不是「直接落地」
+ *
+ * 传送带只有 1 个承载位,下游堵住是**常态**(不是异常)。此时把货挤到地面
+ * 会让「生产线上堵车」变成「地上撒一地货」—— 行为看着像在工作,实际是错的。
+ * 退回原格 = 「原地等下一帧再试」,与真实流水线一致。
+ */
+function deliverExit(
+  line: LogisticsLine,
+  world: ArmWorld,
+  fromX: number,
+  fromY: number,
+  dx: number,
+  dy: number,
+  item: Stack,
+): 'delivered' | 'dropped' | 'held' {
+  const tx = fromX + dx;
+  const ty = fromY + dy;
+
+  /* 1) 下游是传送带(或分拣器的带体):交给它。空带才收。 */
+  for (const b of line.belts) {
+    if (b.x === tx && b.y === ty) {
+      return loadConveyor(b.state, item) ? 'delivered' : 'held';
+    }
+  }
+  for (const s of line.sorters) {
+    if (s.x === tx && s.y === ty) {
+      return loadConveyor(s.state.conveyor, item) ? 'delivered' : 'held';
+    }
+  }
+
+  /* 2) 目标格有设备:投喂。坐标传**目标格**,让宿主按自己的半径找设备。 */
+  const dev = world.deviceAt(tx, ty);
+  if (dev !== 0 && world.feed(dev, tx, ty, item)) return 'delivered';
+
+  /* 3) 兜底:落地。货必须存在于世界的某个位置。 */
+  if (world.drop && world.drop(tx, ty, item)) return 'dropped';
+
+  /* 4) 这一格放不下 ⇒ 退回原格待运。 */
+  return 'held';
 }
 
 /**
@@ -440,19 +517,77 @@ export function tickLogistics(
   world: ArmWorld,
   powered: { belt: boolean; arm: boolean; drill: boolean },
 ): LogisticsTickReport {
-  const rep: LogisticsTickReport = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0 };
+  const rep: LogisticsTickReport = {
+    beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0,
+    exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0,
+  };
   for (const d of line.drills) {
     const r = stepDrill(d.state, powered.drill);
     if (r.produced) rep.drillOres += 1;
   }
+
+  /*
+   * 传送带与分拣器**先把本帧的出货口全部收集起来,再统一交付**。
+   *
+   * 为什么不能边 step 边交付:同一帧内 A 带把货交给下游 B 带,B 带若在同一
+   * 循环里已经 step 过,货就得等到下一帧 —— 这是对的;但若 B 带**还没** step,
+   * 它会在本帧内再走一格,于是**同一帧货被搬了两格**,速度凭空翻倍。
+   * 收集后再交付,保证「同一帧内货物只被搬运一次」这个原有约定不被破坏。
+   */
+  const exits: { x: number; y: number; dx: number; dy: number; item: Stack; from: ConveyorState }[] = [];
+
   for (const b of line.belts) {
     const r = stepConveyor(b.state, powered.belt);
-    if (r.moved) rep.beltMoves += 1;
+    if (!r.moved) continue;
+    rep.beltMoves += 1;
+    if (r.exit) exits.push({ x: b.x, y: b.y, dx: r.exit.dx, dy: r.exit.dy, item: r.exit.item, from: b.state });
   }
   for (const s of line.sorters) {
     const r = stepSorter(s.state, powered.belt);
-    if (r.moved) rep.sorterMoves += 1;
+    if (!r.moved) continue;
+    rep.sorterMoves += 1;
+    if (r.exit) exits.push({ x: s.x, y: s.y, dx: r.exit.dx, dy: r.exit.dy, item: r.exit.item, from: s.state.conveyor });
   }
+
+  /*
+   * 统一交付出货口。任何一件都必须有明确去向 —— 交付/落地/**退回**,不许销毁。
+   *
+   * ⚠ `held` 分支必须真的把货放回去:`stepConveyor` 在搬满一格时已经执行了
+   * `state.item = null`,货的归属权已经移交出来。只把这件事记成「待运」而不
+   * 真的放回,货仍然消失 —— 那等于用一个计数器掩盖同一个缺陷。
+   *
+   * 退回有**两级兜底**,因为「退回原带」可能失败:
+   * 在 A→B→C 的带链里,B 本帧既把自己的货交出去(`exit`),**又**从上游 A
+   * 收到一件新货 —— 此时让 B 收回自己的货就无处安放了。
+   * (实测:故障注入 I5 下,链式场景真的走到这里并抛出。)
+   *
+   *   1. 退回原带(保持流水线语义:原地等下一帧再试)
+   *   2. 原带已被占 ⇒ 落到原格地面
+   *   3. 连地面都放不下 ⇒ 抛出。宁可响,也不静默销毁玩家的货。
+   */
+  for (const e of exits) {
+    const how = deliverExit(line, world, e.x, e.y, e.dx, e.dy, e.item);
+    if (how === 'delivered') {
+      rep.exitsDelivered += 1;
+      continue;
+    }
+    if (how === 'dropped') {
+      rep.exitsDropped += 1;
+      continue;
+    }
+    /* held:先试退回原带 */
+    if (loadConveyor(e.from, e.item)) {
+      rep.exitsHeld += 1;
+      continue;
+    }
+    /* 原带被上游货占了 ⇒ 落到原格地面 */
+    if (world.drop && world.drop(e.x, e.y, e.item)) {
+      rep.exitsDropped += 1;
+      continue;
+    }
+    throw new Error('物流:出货口无处可去(原带与原地都放不下),拒绝销毁货物');
+  }
+
   for (const a of line.arms) {
     const r = stepArm(a.state, world, a.x, a.y, powered.arm);
     if (r.grabbed) rep.armGrabs += 1;

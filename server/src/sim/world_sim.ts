@@ -394,6 +394,7 @@ export class WorldSim {
    */
   lastLogisticsTick: LogisticsTickReport = {
     beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0,
+    exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0,
   };
   /**
    * 物流流水线节点表:由 `SignalGraph` 里已注册的 `LOGISTICS_*` 件**每慢帧重建**。
@@ -1337,6 +1338,22 @@ export class WorldSim {
         return true;
       },
       deviceAt: (x: number, y: number): number => this.grid.objIdAt(x, y),
+      /*
+       * 出货口兜底落地点 —— 传送带把货搬出本格后,若下游没有人接,货落在这里。
+       *
+       * 没有这个方法时 `deliverExit` 只能退回原带,而原带在被搬走的那一刻
+       * 已经 `item = null` —— 于是「退回」实际上等于销毁(实测:1 件货被搬
+       * 一格后从世界上彻底消失,既不在地面也不在任何设备里)。
+       *
+       * 越界返回 false:让出口处掉头/停住,而不是把货挤出世界。
+       */
+      drop: (x: number, y: number, item: Stack): boolean => {
+        if (x < 0 || y < 0 || x >= this.sizeCells || y >= this.sizeCells) return false;
+        this.mobGround.push({
+          id: item.id, itemId: item.id, x, y, count: item.count,
+        } as GroundItem);
+        return true;
+      },
     };
   }
 
@@ -1422,13 +1439,13 @@ export class WorldSim {
   private tickLogisticsStep(): void {
     const comps = [...this.wiring.components.values()];
     if (comps.length === 0) {
-      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0 };
+      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0, exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0 };
       return;
     }
 
     const line = this.collectLogisticsLine();
     if (line.belts.length + line.sorters.length + line.arms.length + line.drills.length === 0) {
-      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0 };
+      this.lastLogisticsTick = { beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0, exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0 };
       return;
     }
 
@@ -1454,7 +1471,22 @@ export class WorldSim {
       const st = this.logisticsBelts.get(this.componentIdOf(b.x, b.y, 'LOGISTICS_CONVEYOR'));
       if (st) {
         const c = this.wiring.get(this.componentIdOf(b.x, b.y, 'LOGISTICS_CONVEYOR'));
-        if (c) { c.state.movedCells = st.movedCells; c.state.progress = st.progress; }
+        if (c) {
+          c.state.movedCells = st.movedCells;
+          c.state.progress = st.progress;
+          /*
+           * **必须连带着把「带内当前承载的货」也投影出去。**
+           *
+           * 漏这一行的后果不是「显示不全」,而是**可观测性谎言**:
+           * 货在 `logisticsBelts`(私有 Map)里正常待着,但从件表看
+           * `belt.item` 永远是 undefined —— 于是「货好好地在带上等着」
+           * 与「货被销毁了」在外部看起来**完全一样**。
+           *
+           * 实测:我的验收探针判「断电时货丢了」正是被这个假象骗了
+           * (实际货在带上没动,只是看不见)。缺可观测性会让排查方向彻底错。
+           */
+          c.state.item = st.item === null ? null : { id: st.item.id, count: st.item.count };
+        }
       }
     }
     for (const a of line.arms) {

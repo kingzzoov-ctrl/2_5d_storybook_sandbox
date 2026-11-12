@@ -1494,4 +1494,192 @@ test('WT-08-56 生产路径断电对照:断电时物流必须完全静止', () =
   eq(sim.groundItems[0]!.x, 5, '货物 x 坐标不变');
 });
 
+/* ══════════════════ 15. 出货口交付:货不许被摧毁 ══════════════════
+ *
+ * 本节钉住的是一个**真缺陷**(task-46):`stepConveyor` / `stepSorter` 在搬满
+ * 一格时会把货放进返回值的 `exit` 并**同时清空 `state.item`** ——
+ * 货的归属权在那一瞬移交给调用方。而 `tickLogistics` 原先只做
+ * `if (r.moved) rep.beltMoves += 1;`,**丢弃 `exit`** ⇒ 货被搬离的一瞬
+ * 就从世界上消失(既不回带内、也不落地、也不在任何设备里)。
+ *
+ * ## 为什么既有断言全绿而缺陷仍在
+ *
+ * 全仓唯一消费 `exit` 的是本节之前第 13 节的 `loadConveyor(st, r.exit!.item)`
+ * —— **测试自己补齐了编排层该做的事**。于是纯函数层「逻辑正确」拿了满分,
+ * 生产路径「货被销毁」却无人断言。这是本仓第 6 次出现
+ * 「实现存在 + 测试全绿 + 生产不执行/不正确」这一族缺陷。
+ *
+ * ## 判据:总量守恒
+ *
+ * 不用「货在哪」断言(实现可以换位置),而用**总数守恒**:
+ * 装载 N 件 → 跑 M 帧 → 「地面 + 各带承载位 + 各设备内」恒为 N。
+ * 这样「交付给下游带」「投喂设备」「落到地面」三种正确去向都能通过,
+ * 而「凭空消失」必然失败。
+ */
+
+/** 清点世界里的全部货:地面 + 带/分拣器承载位 + 料理站锅内。 */
+function censusOf(sim: WorldSim): { ground: number; belts: number; pots: number; ids: number[] } {
+  const ids: number[] = sim.groundItems.map((g) => g.id);
+  const ground = sim.groundItems.reduce((a, g) => a + g.count, 0);
+  let belts = 0;
+  for (const c of sim.wiring.components.values()) {
+    const s = c.state as {
+      item?: { id?: number; count?: number } | null;
+      held?: { id?: number; count?: number } | null;
+    };
+    for (const it of [s.item, s.held]) {
+      if (it && typeof it.count === 'number') { belts += it.count; ids.push(it.id ?? -1); }
+    }
+  }
+  let pots = 0;
+  for (const dev of [506, 507, 508]) {
+    const k = sim.stationState(dev);
+    pots += Object.values(k.inputs).reduce((a, n) => a + n, 0);
+  }
+  return { ground, belts, pots, ids };
+}
+
+/** 造一条通电的物流件。 */
+function poweredComp(sim: WorldSim, id: string, kind: string, x: number, y: number, params: Record<string, unknown> = {}): void {
+  sim.wiring.addComponent(createComponent(id, kind, x, y, { state: {}, params }));
+  sim.wiring.addWire(x, y, WireColor.GREEN);
+  sim.addWireDrive(x, y, WireColor.GREEN, true);
+}
+
+test('WT-08-57 生产路径:带尾出货无处可去时,货落到地面(而不是被销毁)', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  poweredComp(sim, 'belt1', 'LOGISTICS_CONVEYOR', 5, 5, { dir: 1 });
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  ok(sim.loadConveyorAt(5, 5), '装载应成功(地面货进带)');
+
+  let dropped = 0;
+  for (let i = 0; i < 60; i += 1) {
+    sim.tick();
+    dropped += sim.lastLogisticsTick.exitsDropped;
+  }
+  const c = censusOf(sim);
+
+  ok(
+    c.ground + c.belts + c.pots === 1,
+    `货的总数应恒为 1(期望 1,实际 ground=${c.ground} belts=${c.belts} pots=${c.pots})`
+    + '—— 总数 <1 说明货被搬出传送带后凭空消失(tickLogistics 丢弃了 exit)',
+  );
+  eq(c.ground, 1, '出口没有下游 ⇒ 货应落到地面');
+  ok(c.ids.includes(151), `落地的应是同一件货 151(实际 ids=${JSON.stringify(c.ids)})`);
+  ok(dropped >= 1, `报告应记录落地次数(实际 exitsDropped=${dropped})`);
+});
+
+test('WT-08-58 生产路径:带尾接下游带时,货交付给下游(守恒)', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  poweredComp(sim, 'b1', 'LOGISTICS_CONVEYOR', 5, 5, { dir: 1 });
+  poweredComp(sim, 'b2', 'LOGISTICS_CONVEYOR', 6, 5, { dir: 1 });
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  sim.loadConveyorAt(5, 5);
+
+  let delivered = 0;
+  for (let i = 0; i < 80; i += 1) {
+    sim.tick();
+    delivered += sim.lastLogisticsTick.exitsDelivered;
+  }
+  const c = censusOf(sim);
+
+  ok(delivered >= 1, `应至少有 1 次交付给下游(实际 exitsDelivered=${delivered})`);
+  ok(
+    c.ground + c.belts + c.pots === 1,
+    `货的总数应恒为 1(期望 1,实际 ground=${c.ground} belts=${c.belts} pots=${c.pots})`,
+  );
+  const b2 = sim.wiring.get('b2')!.state as { movedCells?: number; item?: unknown };
+  ok(
+    (b2.movedCells ?? 0) > 0 || b2.item != null,
+    `下游带应真的收到货(movedCells=${b2.movedCells} item=${JSON.stringify(b2.item)})`,
+  );
+});
+
+test('WT-08-59 生产路径:带尾接料理站时,货被投喂进锅(守恒)', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  poweredComp(sim, 'belt1', 'LOGISTICS_CONVEYOR', 5, 5, { dir: 1 });
+  sim.setCell(6, 5, { obj: 506 }); /* 八人欢聚大汤锅 */
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  sim.loadConveyorAt(5, 5);
+
+  for (let i = 0; i < 80; i += 1) sim.tick();
+  const c = censusOf(sim);
+
+  ok(
+    c.ground + c.belts + c.pots === 1,
+    `货的总数应恒为 1(期望 1,实际 ground=${c.ground} belts=${c.belts} pots=${c.pots})`,
+  );
+  eq(c.pots, 1, '货应进锅(出口正对设备 ⇒ 走投喂而不是落地)');
+});
+
+test('WT-08-60 生产路径负对照:出口越界时货不丢(退回原带待运)', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  /* 带子在最右列且朝东 ⇒ 出货口越界,无处可放 */
+  poweredComp(sim, 'belt1', 'LOGISTICS_CONVEYOR', 31, 5, { dir: 1 });
+  sim.setGroundItems([{ id: 151, x: 31, y: 5, count: 1 }]);
+  sim.loadConveyorAt(31, 5);
+
+  let held = 0;
+  for (let i = 0; i < 120; i += 1) {
+    sim.tick();
+    held += sim.lastLogisticsTick.exitsHeld;
+  }
+  const c = censusOf(sim);
+
+  ok(
+    c.ground + c.belts + c.pots === 1,
+    `越界出口不得销毁货物(期望总数 1,实际 ground=${c.ground} belts=${c.belts} pots=${c.pots})`,
+  );
+  eq(c.belts, 1, '越界时货应退回原带待运(而不是蒸发,也不是被挤出世界)');
+  ok(held >= 1, `报告应记录退回次数(实际 exitsHeld=${held})`);
+});
+
+test('WT-08-61 生产路径负对照:下游带已满时,上游货不许被吞掉', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  poweredComp(sim, 'b1', 'LOGISTICS_CONVEYOR', 5, 5, { dir: 1 });
+  poweredComp(sim, 'b2', 'LOGISTICS_CONVEYOR', 6, 5, { dir: 1 });
+  /* 先占满下游带的唯一承载位(传送带容量 = 1 件) */
+  sim.setGroundItems([{ id: 152, x: 6, y: 5, count: 1 }]);
+  ok(sim.loadConveyorAt(6, 5), '下游带应先被占满');
+  /* 再往上游装第二件 */
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  ok(sim.loadConveyorAt(5, 5), '上游装载应成功');
+
+  for (let i = 0; i < 100; i += 1) sim.tick();
+  const c = censusOf(sim);
+
+  ok(
+    c.ground + c.belts + c.pots === 2,
+    `两件货都不许丢(期望总数 2,实际 ground=${c.ground} belts=${c.belts} pots=${c.pots})`
+    + '—— 下游堵住是常态,不能因此销毁上游的货',
+  );
+  ok(
+    c.ids.includes(151) && c.ids.includes(152),
+    `两件货都应仍在世界某处(实际 ids=${JSON.stringify([...c.ids].sort((a, b) => a - b))})`,
+  );
+});
+
+test('WT-08-62 可观测性:带内承载的货必须能从件表看到', () => {
+  const sim = new WorldSim({ sizeCells: 32, mobs: false });
+  sim.wiring.addComponent(createComponent('belt1', 'LOGISTICS_CONVEYOR', 5, 5, {
+    state: { progress: 0, dir: 1, item: null, movedCells: 0 },
+  }));
+  sim.setGroundItems([{ id: 151, x: 5, y: 5, count: 1 }]);
+  sim.loadConveyorAt(5, 5);
+
+  /* ⚠ 必须推过**一个完整慢帧**:件表里的 `item` 由 `tickLogisticsStep()`
+     每慢帧回写一次,而慢帧是第 10、20、30… 快帧。实测:第 1~9 帧读仍是 null,
+     第 10 帧才可见。装载后只推 1 帧就断言可见是**帧数换算错误**
+     (我第一版就犯了这个错,与本套件 WT-08-55 注释里记的是同一类坑)。 */
+  for (let i = 0; i < 10; i += 1) sim.tick();
+
+  /* 此后断电:货会一直待在带内不走。若件表看不到它,
+     「货在带上等着」与「货被销毁」在外部**完全一样** ——
+     缺可观测性会让排查方向彻底错(我自己就被骗过一次)。 */
+  const st = sim.wiring.get('belt1')!.state as { item?: { id?: number; count?: number } | null };
+  ok(st.item != null, `带内的货应可见(实际 item=${JSON.stringify(st.item)})`);
+  eq(st.item?.id, 151, '带内货的 ID 正确');
+  eq(st.item?.count, 1, '带内货的数量正确');
+});
+
 report('WS-08');
