@@ -2948,6 +2948,102 @@ colyseus 0.15.57 的依赖 5 个,其中
 [ ] 真机延迟/丢包(从未测)
 ```
 
+### 9. ★★★ 2026-11-13 实测补充(本节把 §7 的「未实测」四项划掉三项)
+
+```
+本节的实测全部**零依赖、本机回环、用完即清**(探针 _cr26.ts 已删除)。
+```
+
+**(1) §7 第 2 项「内置 WebSocket 二进制帧往返」—— ✅ 已实测,通过**
+
+```
+typeof WebSocket = function(Node 24.13.0)
+
+测法:自写最小 WS 服务端(node:http upgrade + node:crypto 算 Sec-WebSocket-Accept
+      + 手写帧解析/掩码还原),与**内置** WebSocket 对接。
+      刻意**不用**任何 ws 类库 —— 否则是同一个实现的自我一致性,不算独立验证。
+
+发 9 B [01 02 03 04 05 FA 80 00 FF]
+服务端回 [AA] + reverse(payload)
+期望 aaff0080fa0504030201
+实收 aaff0080fa0504030201
+⇒ ★ 逐字节一致 ✓
+```
+**⚠️ 并加了两条必要的对照(否则上一条不构成证据):**
+```
+【阴性对照】服务端故意改一个字节 ⇒ 「正确的断言」仍过、「故意错的断言」失败
+  ⇒ 证明该往返断言**不是恒真**
+【大帧】125 / 126 / 127 / 1000 / 70000 B 全部逐字节一致 ✓
+  ⇒ 覆盖了 WS 的三种长度编码(7bit / 16bit / 64bit),
+     否则只测 125 B 以下会漏掉长度分支(陷阱 66 家族③「只认一种写法」)
+```
+
+**(2) §7 第 1 项「ws-transport 能否挂裸连接」—— 结论:不必测了,它已不是决策变量**
+
+```
+实测依赖现状:
+  dependencies        : undefined        ← 刻意(零运行时依赖)
+  optionalDependencies: @colyseus/schema ^2.0.34 · better-sqlite3 ^11.3.0
+                        colyseus ^0.15.17 · three ^0.169.0
+  devDependencies     : typescript ^5.6.3 · vite ^8.3.8
+
+@colyseus/ws-transport 已装(v0.15.3),而 `ws`(v7.5.13)**在 node_modules 里存在**
+  ⇒ 但它是 ws-transport 的**传递依赖**,**不是本仓声明的直接依赖**
+```
+**★★ 为什么这条不重要了:**
+```
+原 §6 的分支乙说「服务端需要一个薄 ws 服务端 ⇒ 需显式声明 ws」。
+但上面 (1) 的实测证明:**服务端也可以零依赖做到** ——
+  node:http 的 `upgrade` 事件 + node:crypto 算 accept + 手写帧解析,约 90 行,
+  与内置 WebSocket 客户端**逐字节互通**。
+⇒ 于是「要 ws 还是不要 ws」不再是决策变量:
+   **两侧都能零依赖。** 真正的选择只剩「用不用 colyseus 那套协议栈」。
+⇒ 而那个选择本 CR §5 已经答了:`USE_COLYSEUS_PATCH = false`
+  ⇒ 本仓已关掉 colyseus 的 patch 通道 ⇒ 用它只为 socket 不经济。
+```
+
+**(3) §7 第 3 项「vite 能否打包 shared/** + 内置 WebSocket」—— 仍**未测**,如实保留**
+
+```
+[ ] vite 打包 `shared/**`(纯类型 + 纯逻辑,无 node 内置依赖)—— 未测
+    ⚠️ 但风险已降低:`shared/net/delta.ts` 的 import 只有 `../types/wire.ts`
+       (Lead 实测:server/** import = 0 处),它**不碰任何 node: 内置模块**
+       ⇒ 从"能不能打包"降级为"它是 ESM + 无副作用,标准情况"
+[ ] `node:crypto`(服务端算 accept)在客户端侧不需要 ⇒ 客户端产物无此依赖 ✓
+```
+
+**(4) §7 第 4 项「真机延迟/丢包」—— 仍未测,且本轮无法测**
+
+**(5) ★★ 因此 CR-26 的裁决建议(供 owner)**
+
+```
+采纳**分支乙**,但把它的形状收窄为:
+  服务端:一个**零依赖**薄 WS 服务端(node:http upgrade + 手写帧)
+          · 收帧 → decodePacket → RoomRuntime.applyMove(userId, intent)
+          · 每 tick → encodeDelta → 广播
+          · **不引入 ws,也不引入 colyseus 的 transport**
+  客户端:内置 WebSocket + decodePacket/applyPacket(皆从 shared/net/delta.ts 取)
+          · **零新增依赖**
+⇒ 好处:① 两侧都不新增依赖,零依赖约束**完整保住**
+        ② 协议自始至终只有**一份实现**(shared/net/delta.ts)
+        ③ 不需要为"间接依赖"做声明,也不再有"装没装"的分支
+⇒ ⚠️ 代价(如实):手写帧解析约 90 行**本仓自己维护**,
+   且**必须**处理 126/127 两种长度、掩码、分片(本次实测覆盖了前两项,
+   **分片(fragmentation)未测** —— 内置客户端在 70000 B 时**没有分片**,
+   但这不保证所有实现都不分片 ⇒ 接生产前必须确认或实现)
+```
+
+**(6) 本次实测**新增**的未测项(如实)**
+
+```
+[ ] WS **分片帧**(opcode 0x0 continuation)—— 未测。70000 B 单帧通过,
+    但协议允许分片;若某客户端实现分片,我的解析器会误判
+[ ] WS **控制帧**(ping/pong/close 握手)—— 我只处理了 close(0x8),
+    ping(0x9) 未回 pong ⇒ 长连接可能被对端判死
+[ ] 服务端**并发连接**与广播 —— 只测了单连接回环
+[ ] 背压 / 慢消费者 —— 未测
+```
+
 ### 8. 关联
 
 - **CR-24 / CR-25**(delta.ts 切分后客户端可直接用 ⇒ 是本 CR §6 的前提)
