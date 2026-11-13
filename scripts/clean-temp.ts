@@ -31,6 +31,14 @@
  * ⚠️ **匹配规则是刻意保守的**:文件名以 `_` 开头 + 常见文本扩展名。
  * 不动 `_design/` `_shots/` `_cdp_profile/`(它们是**目录**,不是残留)。
  * ⇒ 宁可漏掉一个奇怪命名的残留,也不误删正经文件。
+ *
+ * ⚠️ `_vss_restore/` 也**必须跳过**:那是 2026-11-13 一次误删事故后
+ * 从 VSS 卷影副本抢救出来的 **188 个外部文件**(非本仓产物,44.3 MB,
+ * 含三个大数据文件)。它的名字以 `_` 开头、内容是 `.ts/.txt` ⇒
+ * **恰好落进 TEMP_NAME 规则** ⇒ 若不跳过,`clean-temp` 会把抢救区当残留删掉。
+ * ⇒ ★ 这是「清理工具误伤数据」的同一形态第二次出现:匹配规则越保守越安全,
+ *   但**只要它按名字匹配,就永远会命中不该命中的东西** ——
+ *   故新增任何"抢救/备份"目录时,都要同步加进这里。
  */
 import { readdirSync, statSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -39,7 +47,7 @@ const ROOT = process.cwd();
 const DRY = process.argv.includes('--dry-run');
 /** 与 verify.ts 的 checkTempResidue 保持**同一份规则** —— 改一处要改两处(CR-20 的形态)。 */
 const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
-const SKIP_DIR = /^(node_modules|_design|_shots|_cdp_profile|\.git)$/;
+const SKIP_DIR = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|\.git)$/;
 const TEMP_NAME = /^_.*\.(ts|js|mjs|txt|md|log|json)$/;
 
 interface Hit { rel: string; abs: string; size: number; inAuditRoot: boolean; head: string }

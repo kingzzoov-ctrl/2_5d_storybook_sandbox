@@ -3215,12 +3215,17 @@ function checkTempResidue(): void {
   console.log('\n[临时残留]');
   const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
   const hits: { rel: string; size: number; inAuditRoot: boolean }[] = [];
+  /* ⚠️ `_vss_restore` 必须跳过 —— 它是 2026-11-13 误删事故后从 VSS 抢救出的
+     **188 个外部文件**(44.3 MB),名字以 `_` 开头、内容是 `.ts/.txt`
+     ⇒ 恰好落进下面的临时残留规则。它与 `scripts/clean-temp.ts` 的 SKIP_DIR
+     **同一份规则的两处副本**(CR-20 的形态)—— 改一处必须改两处。 */
+  const SKIP = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|\.git)$/;
   const walk = (dir: string, rel: string): void => {
     if (!existsSync(dir)) return;
     for (const n of readdirSync(dir)) {
       const full = join(dir, n);
       const r = rel ? `${rel}/${n}` : n;
-      if (/^(node_modules|_design|_shots|_cdp_profile|\.git)$/.test(n)) continue;
+      if (SKIP.test(n)) continue;
       let st;
       try { st = statSync(full); } catch { continue; }
       if (st.isDirectory()) { walk(full, r); continue; }
