@@ -15,6 +15,7 @@
     "verify:content": "node scripts/verify.ts --content",
     "verify:integration": "node scripts/verify.ts --integration",
     "verify:selfcheck": "node scripts/gate-selfcheck.ts",
+    "count-audit": "node scripts/count-audit.ts",
     "backlog": "node scripts/backlog.ts",
     "backlog:blocking": "node scripts/backlog.ts --blocking",
     "content": "node scripts/content-lock.ts",
