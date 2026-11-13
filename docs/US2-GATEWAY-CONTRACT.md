@@ -113,26 +113,65 @@ room.inventoryTotals 只存总量;users.inventory_json 是明细
 ### 2.4 裁决 4 —— W1 钳制**唯一选址在 `vitals.ts`**
 
 ```ts
-/* server/src/combat/vitals.ts 的 revive() 内 */
-v.hp = Math.min(v.maxHp, Math.max(1, hp ?? v.maxHp));
-```
-**⚠️ 但用户给的表达式有一个洞,必须补**:`Math.max(1, NaN)` 返回 **`NaN`**
-(`Math.max` 遇 `NaN` 传播)——实测 `revive('p1', NaN)` ⇒ `hp = NaN`。
-`NaN` 比 `-5` 更危险:**它让所有后续比较恒 false**(与 `checkMove` 的 6.0 值域门同族)。
-⇒ 实现必须为:
-```ts
+/* server/src/combat/vitals.ts 的 revive() 内 —— 最终形态(见 §2.4.1 的订正) */
 const want = hp ?? v.maxHp;
 const safe = Number.isFinite(want) ? want : v.maxHp;
-v.hp = Math.min(v.maxHp, Math.max(1, safe));
-```
-**⚠️ 且下界 `Math.max(1, ...)` 改变了既有语义**:
-```
-原式 v.hp = hp ?? v.maxHp ⇒ `revive(id, 0)` 现在给 hp=0(仍 downed 状态的边缘)
-新式给 hp=1 ⇒ 复活后**至少 1 血**,不再与 maxHp 无关地落到 0。
-⇒ 这是**有意的**:复活后 hp=0 会立刻再次 downed,是个死循环入口。
-   但它是行为变更 ⇒ 必须在契约与测试里**显式登记**。
+v.hp = Math.min(v.maxHp, Math.max(0, safe));      // ★ 下界 0,不是 1
 ```
 **`revive.ts` 侧职责**:只算期望值 `hpAfter` 并传入,**不重复钳制**(两侧都钳 = 两份实现)。
+
+#### 2.4.1 ★★★ 订正(2026-11-13,Lead):本契约原写的「下界 1」**已被实测推翻**
+
+**原写**:`Math.max(1, hp ?? v.maxHp)`,理由「复活后 hp=0 会立刻再次 downed,是死循环入口」。
+
+**该理由不成立**,三条实测:
+
+```
+① hp=0 且 downed=false **不会自动再倒**
+   `downed = true` 全仓只有一处:`vitals.ts:520` 的 `if (v.hp === 0)`
+   —— 而它在 `applyHit` 里(「被**打到** 0」),`revive()` 自己 `v.downed=false` 且不检查 hp。
+   实测:revive(0) 后 hp=0 / downed=false;推进 400 帧后 hp 反而被 regen 抬到 20。
+
+② ★★ 决定性的:hp=0 与 hp=1 挨同一拳,**逐字段完全相同**
+     hp=0  起手 → applied=6 hp=0 downed=true
+     hp=1  起手 → applied=6 hp=0 downed=true     ← 与 hp=0 **一模一样**
+     hp=20 起手 → applied=6 hp=14 downed=false
+   ⇒ 一级生物一拳 6 点,1 血与 0 血**都是一拳倒**
+   ⇒ **「下界 1」达成不了它声明的目的**(防复活即倒)。
+
+③ 复活侧**根本传不出 0**:`REVIVE_HP_RATIO = 0.5`
+     Lv.1  touchRevive = 50 / flagRevive = 50 / featherRevive = 100
+     Lv.30 touchRevive = 268 / flagRevive = 268 / featherRevive = 535
+   ⇒ Lv.1..30 的最小值是 **50** ⇒ 下界 1 在复活语义下**从未被触发**
+   ⇒ 它**唯一**的效果是改掉**读档**语义(`world_sim.ts:2463` `importVitals` 传 `hp=0`)
+```
+
+**⇒ 结论:真正的状态机不变量是 `0 ≤ hp ≤ maxHp`(不是 `1 ≤ hp ≤ maxHp`)。**
+> ★ 判据:「不变量的作用是**排除会引发错误的状态**」。
+> `hp=0` 不引发错误(会被 regen 抬起 / 不自动倒 / 一拳倒与 hp=1 无异)⇒ 它不是非法态。
+
+**由此保留的**两条**真缺陷**(与「下界 1」无关,必须照修):
+```
+(a) `Math.max(1, NaN)` 返回 **NaN** ⇒ 实测 `revive(id, NaN)` 就是 hp=NaN。
+    NaN 让所有后续比较恒 false ⇒ 比负数危险 ⇒ 必须用 `Number.isFinite` 兜底。
+(b) 无上界 ⇒ `revive(id, 535)` ⇒ hp=535 > maxHp=100(W1 本体)⇒ `Math.min(v.maxHp, …)`。
+```
+**最终期望值表**:
+| 输入 | 期望 | 依据 |
+| :--- | :--- | :--- |
+| `revive(id, 535)` | `hp == maxHp` | (b) 上界 |
+| `revive(id, NaN)` | `hp == maxHp` | (a) 兜底为「默认值」,与 `hp ?? v.maxHp` 同族 |
+| `revive(id, -5)` | `hp == 0` | 下界 0;与 `importVitals` 的 `clamp(row.hp,0,maxHp)` **一致** |
+| `revive(id, 0)` | `hp == 0` | ★ **订正**:原契约写「⇒ 1」,**撤销**;与读档语义一致 |
+| `revive(id, 1)` | `hp == 1` | 直传 |
+| `revive(id, undefined)` | `hp == maxHp` | 满血默认 |
+
+**⚠️ 于是原 §9 验收 ⑩「revive(id,0) ⇒ hp==1(行为变更,显式登记)」作废**,
+改为「`revive(id,0) ⇒ hp==0`,**与 `importVitals` 读档语义一致**」。
+
+**⚠️ 且这一订正让「选址」变成唯一解**:下界 1 若保留,`importVitals` 的
+「忠实还原存档 0 HP」这条**既有契约**(`tests/WS-FND-02.test.ts` C22)就被覆盖 ——
+即**地板 1 只伤读档、没换来任何保护**。故不需要 `floor` 参数区分语义(原选项 Y)。
 
 ---
 
@@ -262,8 +301,9 @@ function projectPlayer(view: SimReadView, playerId: string, out: PlayerProjectio
    ⇒ 这是「单向」的**唯一**可证伪方式
 ⑦ 裁决 4:revive(id, 535) ⇒ hp == 100(不超上限)
 ⑧ 裁决 4:revive(id, NaN) ⇒ hp == maxHp(不是 NaN)
-⑨ 裁决 4:revive(id, -5) ⇒ hp == 1(不是负数)
-⑩ 裁决 4:revive(id, 0) ⇒ hp == 1(**行为变更**,显式登记)
+⑨ 裁决 4:revive(id, -5) ⇒ hp == 0(不是负数,与读档一致)
+⑩ 裁决 4:revive(id, 0) ⇒ hp == 0(**订正**:与 importVitals 读档语义一致,见 §2.4.1)
+⑩b 回归:WS-FND-02 C22 **必须仍绿**(它是「下界 0」的既有契约,订正后应恢复)
 ⑪ 端到端:真 WS 往返,客户端收到的 level/maxHp 与 SSOT 一致
 ⑫ 门禁四旗 EXIT=0;新增断言全部有牙(注入必红)
 ```
