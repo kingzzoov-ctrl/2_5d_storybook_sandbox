@@ -83,19 +83,80 @@ interface WorldSaveHost {
 }
 ```
 
-### 2.2 复用而非新增的部分
+### ★★★ 2.1.1 契约订正(2026-11-13,Lead 自查发现)**——这一节推翻了 §2.1 的措辞**
 
 ```
-已存在、**不需新增**的权威写口(实测):
-  WorldSim.importVitals(data)      —— 走 vitals.revive ⇒ 顺带清 downed/iframe ✓
-  WorldSim.setProfile(id, patch)   —— 装备等档案字段
-  WorldSim.applyPlayerMove(id,x,y) —— 位置
-  WorldSim.syncMaxHp(id, maxHp)    —— US2 已落地的派生上限
-  WorldSim.addPlayer(id,x,y)       —— 登记刚体
-  progression.setLevel(progress,L) —— 等级(纯函数,返回新对象,需回写 Map)
-★ 结论:**恢复不需要新的权威写口,只需要一个"把它们按对顺序串起来"的口**
-  ⇒ 故 §2.1 的新增口是**编排意图**的表达,内部转发到上述既有方法。
+★ Lead 后来实测发现:**「重建权威」这件事 WorldSim 里**早就有了**,
+  而我在 §2.1 让它去"新增一个口然后转发到既有方法" —— 方向多余。
+
+实测(两个方向都查了):
+  写侧:`WorldSaveHost.saveToDb(db, roomId, nowMs)`        ← 早有
+  读侧:`WorldSim.loadFromDb(db, roomId)`                   ← **也早有**,但**没人调**
+        server/src/sim/world_sim.ts:2673
+        body: importVitals(loadVitalsFromUsers(db, this.vitals.ids()))
+              + importMobMem(loadRoomMobMem(db, roomId))
+  ⇒ 与之对偶的 repo 侧 `loadVitalsFromUsers`(repo.ts:786)/ `loadRoomMobMem`(repo.ts:833) 也早有。
+
+⇒ ★★ 所以真正的缺口**比我原来写的更窄**:
+     `WorldSaveHost` **没有把 loadFromDb 暴露出去**(11 个成员里 load 侧 **0 个**)
+     ⇒ 房间拿不到读口 ⇒ 它只能自己解析 room 快照 ⇒ 而那是**投影值**,不是权威。
 ```
+
+**订正后的 §2.1 契约(取代上面的 `restoreFromProfile`)**:
+
+```ts
+interface WorldSaveHost {
+  /**
+   * **读档**:从 DB 把权威状态读回世界。与 `saveToDb` 对偶。
+   *
+   * ⚠️ 这是**结构契约对既有能力的暴露**,不是新机制 ——
+   *    内部就是 `WorldSim.loadFromDb`(已存在、已被 WS-FND-02 测试覆盖)。
+   * 返回各段落生效计数,供调用方断言(hpApplied / memApplied / memSkipped)。
+   */
+  loadFromDb?(db: DbLike, roomId: string): {
+    hpApplied: number; memApplied: number; memSkipped: number;
+  };
+}
+```
+
+```
+★★ 为什么改成这个形态(而不是 `restoreFromProfile(playerId, profile)`)
+  1 既不重复 **也不越权**:`profile` 那个形态要求房间**先解析出** level/hp ——
+    而权威的派生规则(等级→maxHp、maxHp 钳制)全在模拟层;
+    房间一旦自己算 ⇒ **第二份派生实现**(陷阱 80 的形态)。
+  2 「谁该被还原」由模拟层定:`loadVitalsFromUsers` 只读**显式给出的** ID,
+    其 docblock 明写「把全表读进来会让"谁该被还原"取决于 DB 里恰好有谁
+    ⇒ **那正是幽灵玩家的来源**」。房间不该参与这个决定。
+  3 `loadFromDb` 内部**已经**用了 `syncMaxHp` 的等价顺序保障 ——
+    它走 `importVitals → vitals.revive`,而 revive 的上界取自**当帧** maxHp。
+    ⚠️ 但**顺序仍需订正**:若驱逐玩家的 maxHp 尚未按 level 同步过,
+      revive 会按旧上限(100)钳住 ⇒ 故 §4.1 增加一步。
+```
+
+
+### 2.2 复用而非新增的部分(★ 经 §2.1.1 订正后)
+
+```
+已存在、**不需新增**的权威口(实测):
+  写侧(经 host):
+    WorldSim.importVitals(data)      —— 走 vitals.revive ⇒ 顺带清 downed/iframe ✓
+    WorldSim.setProfile(id, patch)   —— 装备等档案字段
+    WorldSim.applyPlayerMove(id,x,y) —— 位置
+    WorldSim.syncMaxHp(id, maxHp)    —— US2 已落地的派生上限
+    WorldSim.addPlayer(id,x,y)       —— 登记刚体
+    progression.setLevel(progress,L) —— 等级(纯函数,返回新对象,需回写 Map)
+  读侧(★ 本节订正新增,**此前漏了**):
+    WorldSim.loadFromDb(db, roomId)  —— **整个权威恢复已实现**(world_sim.ts:2673)
+    repo.loadVitalsFromUsers(db,ids) —— 只读显式 ID(防幽灵玩家),repo.ts:786
+    repo.loadRoomMobMem(db, roomId)  —— repo.ts:833
+
+★ 结论(订正后):**恢复不需要新增任何权威写口,也不需要新增读口逻辑** ——
+  `WorldSim.loadFromDb` **已经是完整的恢复**;
+  缺的只是**把它暴露进 `WorldSaveHost`** 并在房间路径上调用。
+  ⇒ ⇒ 本任务的实质从「造一条恢复路径」降级为「**暴露一条既有路径并接线**」。
+  ⇒ ★ 这是**好消息**:工作量小得多,且风险低(既有逻辑已被 WS-FND-02 覆盖)。
+```
+
 
 ### 2.3 装配口(第 2、3 项欠账的落点)
 
@@ -145,22 +206,50 @@ export function assemble(deps: AssembleDeps = {}): Assembled;
 
 ## §4 算法
 
-### 4.1 恢复顺序(不可换)
+### 4.1 恢复顺序(不可换 ★ 经 §2.1.1 订正)
 
 ```
 1 校验:该 userId 在本房间**已登记**(members 里有)
     ⇒ 未登记 ⇒ 走正常 join,不恢复(防"凭空造玩家")
-2 读档:`loadReconnectSnapshot(db, roomId, userId)` ⇒ blob | undefined
-    ⇒ undefined ⇒ 走正常 join(首次进入)
-3 解码 blob → 该玩家的 state 行(**只取自己**) 
-4 ★ **先写权威**:`host.restoreFromProfile(id, profile)`
-    内部顺序:addPlayer → applyPlayerMove → syncMaxHp → importVitals → setProfile
-    ⚠️ syncMaxHp 必须在 importVitals **之前**:
-       否则 hp 先按旧上限(可能 100)钳住,升级玩家的血会被截回。
+2 ★ **登记进世界**(顺序关键):`host.addPlayer(id, x, y)`
+    ⚠️ 必须在读档**之前**:`loadFromDb` 内部走
+       `loadVitalsFromUsers(db, this.vitals.ids())` ——
+       而 `vitals.ids()` **只含已登记玩家** ⇒ 未登记则**读不回来**。
+       (实测依据:repo.ts:782 docblock「只读**显式给出的** ID」
+        + world_sim.ts:2677 传的正是 `this.vitals.ids()`)
+3 ★ **读档(权威)**:`host.loadFromDb(db, roomId)`
+    ⇒ 内部 = `importVitals(loadVitalsFromUsers(...))` + `importMobMem(loadRoomMobMem(...))`
+    ⇒ ⚠️ hp 走 `vitals.revive` ⇒ **上界取自当帧 maxHp**
+       ⇒ 故 **第 3.5 步不可省**(见下)
+3.5 ★ **先按等级同步 maxHp** 再让 hp 落位:
+    `projectPlayer` 里 level 先投影 ⇒ `syncMaxHpOf` 用派生值刷新 vitals.maxHp
+    ⇒ 若驱逐玩家的 maxHp 仍是 100(旧上限),revive 会把 535 的存档血钳到 100。
+    ⚠️ 实现上最稳的顺序(与 US2 §4 同源):
+       先 `syncMaxHpOf(id)`(让上限=当前 level 的派生值)
+       → 再 `loadFromDb`
+       → 再 `projectPlayer`
+4 位置:room 快照里的 x/y/z 是**投影值** ⇒
+    ⚠️ 只作为**兜底**(世界里没有该刚体时用);有权威则用 `playerPosition(id)` 读回
 5 ★ **再投影**:`projectPlayer(view, id, state.players[i])`(US2 唯一写者)
 6 播种反作弊:`ac.join(id, tick, x, y, z)` 用**恢复后**的实际坐标
     ⇒ 不用存档里的坐标:刚体可能因碰撞被推开,两者不同会被判瞬移(实测差 13.649 格)
 ```
+
+### 4.1.1 为什么「登记必须先于读档」是硬约束(不是风格)
+
+```
+★ 这条是**反直觉**的:直觉上"先读档再登记"更自然(先有数据才有玩家)。
+  但实测代码决定了相反的顺序:
+    world_sim.ts:2677  loadVitalsFromUsers(db, this.vitals.ids())
+    repo.ts:782        只读**显式给出的** ID ——
+                       「把全表读进来会让"谁该被还原"取决于 DB 里恰好有谁
+                        ⇒ **那正是幽灵玩家的来源**」
+  ⇒ 故 `vitals.ids()` 就是「谁该被还原」的**唯一权威**;
+    未登记 ⇒ 不在 ids ⇒ 读回 0 条 ⇒ **恢复静默无效**
+    (而外部表现与"没有存档"完全一样 —— 又一次陷阱 89 的形态!)
+⇒ 判据:**任何"读回"接口,先查它的 id 来源是"我传的"还是"它自己扫的"。**
+```
+
 
 ### 4.2 为什么第 4 步必须在第 5 步之前
 
