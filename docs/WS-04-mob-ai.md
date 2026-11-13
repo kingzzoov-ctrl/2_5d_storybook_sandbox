@@ -479,3 +479,126 @@ applySafeZoneShield.length === 5                          // 元数锁定,禁止
 6. **`helmAbsorbs` 无上限累加**:长时间战斗会无限增长(实测 800 帧后 >5)。数值上不影响(层数已封顶),但若要做成就统计需要定期归零策略。
 7. **刷怪决策的 `roll` 来源**:测试传入显式 `roll`,生产由服务器 RNG 提供。是否需要用房间种子保证跨服一致?
 8. **45° 避障的「左撇优先」**:当前左侧优先。是否应改为「离目标更近的一侧优先」以改善追击手感?会改变确定性,需确认是否影响回放。
+
+## 11. 追加(task-72):`taming.ts` 的宿主可用性评估
+
+> 本节是 **task-72 只读评估**的产物,追加于 2026-11-13。不改动上文任何结论。
+
+### 11.1 先纠正白名单理由里的一处事实
+
+白名单原文(`scripts/verify.ts:1347`):
+
+```
+'WS-04 牧场驯服,等宠物容器 + 驯服交互(tameItem 无人消费)'
+```
+
+**实测:「`tameItem` 无人消费」这半句的事实描述是错的。**
+
+```
+taming.ts:124  if (def.tameItem === undefined) return { ok:false, reason:'not_tameable' };
+taming.ts:127  if (itemId !== def.tameItem)  return { ok:false, reason:'wrong_item' };
+```
+
+⇒ `feedPet(pet, itemId)` **明确消费** `def.tameItem`(用它校验喂的物品对不对)。
+⇒ 所以"`tameItem` 无人消费"不成立;真正无人消费的是 **`feedPet` 这个函数本身**
+(它导出后被测试引用 17 次、**生产 0 次**)。
+
+⚠️ 这个措辞差别要紧:**"某个字段没人读"** 与 **"整个入口没人调"** 是两种缺陷,
+修法也不同(前者是数据没接上,后者是**容器不存在**)。照原措辞去查会找错方向。
+
+### 11.2 「宠物容器」到底缺什么(实测)
+
+`taming.ts` 的五个入口,**第一个入参清一色是 `pets` 数组**:
+
+```
+createPetRecord(mobId, now): PetRecord|null        // :92   造记录(无容器)
+deployPet(pets: PetRecord[], pet, wearing)          // :164  出战
+undeployPet(pets: PetRecord[], pet)                 // :184  收队
+sendToRanch(pets: PetRecord[], pet): boolean        // :190  送牧场
+tickRanch(pets: PetRecord[], now): RanchYield[]     // :208  牧场产出
+```
+
+⇒ **模块的设计是"容器由调用方传入"**(纯函数风格,便于单测),它自己从不持有 `pets`。
+
+而实测生产侧:
+
+```
+SRCH('PetRecord') 在 server/src 的次数 = 10  →  全部在 taming.ts 自身
+world_sim.ts 含 'pets' = false   'pet' = false   'Pet' = false
+world_sim.ts 含 'taming' = false 'ranch' = false 'Ranch' = false
+SRCH('roster') = 0
+生产 import taming.ts 的文件 = **0**
+```
+
+⇒ **没有任何生产对象持有 `pets` 数组**。这就是"等宠物容器"的实测含义。
+
+### 11.3 「牧场」这个房间类型**已经存在**(纠正一个可能的误解)
+
+```
+shared/constants/bosses.ts:194
+{ key: 'ECO_RANCH', name: '生态牧场', required: [529], optional: [357, 360],
+  bonus: '圈养动物自动进食并每日产出毛团/温泉橘。' }
+```
+
+⇒ `ROOM_RECIPES` 里**有** `ECO_RANCH`(9 种配方之一),房间能**被识别**。
+⇒ 所以缺的**不是**"牧场房间类型",而是:
+
+```
+1 房间里没有「圈养的动物」这个实体集合(容器)
+2 没有"在牧场里喂食"的交互点(驯服交互)
+3 没有把 tickRanch 挂进慢帧的位置(它需要 (pets, now))
+```
+
+⚠️ 这里有个已登记的相邻缺陷可作旁证:`ECO_RANCH` 的玩家增益(bonus)实测**未实现** ——
+见对应的 task-48(「9 种动态房间的玩家增益一条都没实现」)。
+
+### 11.4 谁该持有 `pets`(回答"是 WorldSim 缺个口,还是牧场没实现")
+
+**两者都不是**,实测是**第三种**:
+
+```
+不是「WorldSim 缺一个口」 —— 加一个 `pets: PetRecord[]` 字段很容易,
+  但它的**内容从哪来**?必须有"玩家喂了某只生物 → 生成 PetRecord"这条交互链。
+不是「牧场房间没实现」 —— ECO_RANCH 配方存在、能被识别(见 11.3)。
+```
+
+缺的是**「生物 → 宠物」的状态迁移触发点**:
+
+```
+现在:  生物(MobHost/AOI 里的实体) ──✗ 无通道 ──→ PetRecord
+需要:  玩家对生物使用 tameItem ⇒ 服务端在 AOI 内校验距离/材质
+       ⇒ 消耗物品 ⇒ createPetRecord ⇒ 塞进 owner 的 pets
+```
+
+⇒ 这是一个**交互入口**(它需要"玩家使用了物品 X 对实体 Y"这一动作),
+而 `RoomAction` 里恰好有一类这样的动作,且执行层目前是空的 ——
+见 `docs/ARCH-GAPS.md` 的「动作执行层」空缺。
+
+### 11.5 定性
+
+**定性:B —— 宿主不存在,需新建上游。**
+
+```
+缺什么:
+  1 容器:某个生产对象持有 pets: PetRecord[](现在 0 个)
+  2 交互入口:玩家对生物使用 tameItem 的服务端处理(现在不存在)
+  3 驱动:把 tickRanch(pets, now) 挂进慢帧
+
+为什么不能"先接一半":
+  · 只加容器 ⇒ 容器永远是空的(pets 无来源)⇒ tickRanch 恒返回 []
+    而"恒返回空数组"与"没接线"在观测上同形 ⇒ 假可达。
+  · 只加交互 ⇒ createPetRecord 造出的记录无处安放(每次调用都丢)。
+  ⇒ 三者构成一条链,断一环整条都不通 ⇒ 必须一起做。
+```
+
+### 11.6 处置建议
+
+白名单理由建议改为(把错的那半句换掉):
+
+```
+'WS-04 牧场驯服:等「生物→宠物」状态迁移入口 + pets 容器 + 慢帧驱动;
+ (注:「tameItem 无人消费」原描述不准确 —— feedPet:127 消费它,
+  真正零生产调用的是 feedPet 本身)'
+```
+
+⚠️ **改写理由 ≠ 消掉欠账**。仍为白名单成员,可达性数字不变。
