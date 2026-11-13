@@ -705,6 +705,51 @@ function connect(url: string, userId?: string): {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
+/**
+ * ★ 轮询等待条件成立,取代**固定 sleep**。
+ *
+ * ## 为什么加它(task-78 的实测结论)
+ * ```
+ * 本套件有 9 处 `await sleep(N)`:400/300/400/250/250/60/250/300/300(ms)
+ * 全部形态都是「固定等一段 ⇒ 断言某件**异步**到达的事」。
+ * ⇒ 实测各段的**真实延迟**与门限的比值(各 200 样本,见 _t78_lat.ts):
+ *      startWsServer 返回   max 1.7ms
+ *      connect → open       max 6.3ms
+ *      open → welcome       max 8.0ms   (对照 sleep 250/300/400 ⇒ 余量 31~50x)
+ *      open → 首个二进制帧   max 8.0ms   (对照 sleep 400     ⇒ 余量 50x)
+ *   ⇒ 大部分余量充足。
+ * ⇒ ★ 但有一处**余量最紧**,单独实测(_t78_drop.ts,100 样本):
+ *      `dropConnectionsForTest() → onlineCount()==0` 耗时
+ *        p50 = 44.4ms, p99 = 45.8ms, max = 46.1ms
+ *      (其中含 dropConnectionsForTest **自身**内嵌的 sleep(30))
+ *      ⇒ 对应的门限是 L897 的 sleep(60) ⇒ 余量仅约 **1.3x**
+ *      ⇒ 而它等的还是"服务端处理 disconnect"这种**跨对象**的异步状态,
+ *        与另外几处(等自己进程内的 welcome)不同类。
+ * ```
+ * ## 所以这里改成轮询:判据**更强**,不是更松
+ * ```
+ * 旧:await sleep(60); eq(onlineCount(), 0)
+ *     · 若服务端**永不**处理 disconnect ⇒ 60ms 后红 ✓(有牙)
+ *     · 但若服务端只是**慢一点**(71ms)⇒ 也红 ✗(**假阳性**)
+ *     ⇒ 两种情况表现相同 ⇒ 判据**分不清**"坏了"与"慢了"
+ * 新:await waitUntil(() => onlineCount() === 0, 2000)
+ *     · 且**显式断言** waited >= 0(2 秒内必须成立)
+ *     · 若服务端**坏了** ⇒ 2s 后仍未归零 ⇒ 红 ✓(牙更硬:2s 是 44ms 的 45 倍)
+ *     · 若服务端只是**慢** ⇒ 绿 ✓(不再误报)
+ *     ⇒ 判据现在**能区分**"坏了"与"慢了" —— 这正是它以前缺的能力
+ * ```
+ * ⚠️ 它**不削弱**任何原有断言:`eq(members.size,1)` 与 `eq(onlineCount(),0)`
+ *    两条都保留,只是把"何时检查"从"固定 60ms"改成"等到生效或超时"。
+ */
+async function waitUntil(cond: () => boolean, budgetMs: number, stepMs = 5): Promise<number> {
+  const t0 = Date.now();
+  for (;;) {
+    if (cond()) return Date.now() - t0;
+    if (Date.now() - t0 > budgetMs) return -1;
+    await sleep(stepMs);
+  }
+}
+
 /** 安全关掉一个客户端 + 服务端(每一步都有超时,不会挂死套件)。 */
 async function teardown(clients: { ws: WebSocket; done: Promise<void> }[], srv: { close(): Promise<void> }): Promise<void> {
   for (const c of clients) { try { c.ws.close(); } catch { /* 已关 */ } }
@@ -894,7 +939,16 @@ async function main(): Promise<void> {
 
       await srv.dropConnectionsForTest();
       await withTimeout(first.done, 3000, '首次连接 close').catch(() => undefined);
-      await sleep(60);
+      /* ★ task-78:这里原来是 `await sleep(60)`。
+         实测 drop → onlineCount 归零需 p50=44.4ms / max=46.1ms(_t78_drop.ts,100 样本)
+         ⇒ 余量仅 1.3x,是全套件**最紧**的门限。
+         改成轮询后:
+           · 服务端**坏了**(永不归零)  ⇒ 2000ms 后仍未归零 ⇒ 红(余量 45x,牙更硬)
+           · 服务端只是**慢了**(71ms)   ⇒ 绿(不再假阳性)
+         ⇒ 判据第一次能区分「坏了」与「慢了」。 */
+      const waited = await waitUntil(() => room.onlineCount() === 0, 2000);
+      ok(waited >= 0,
+        `★ 异常断开后服务端应在 2s 内把玩家记为离线(实测 ${waited < 0 ? '超时未归零' : waited + 'ms'})`);
       /* ★ 席位应**仍在**(异常断开保留 30s 宽限)——
          若这里被删,说明实现走了 `leave()` ⇒ 重连必然失败 */
       eq(room.members.size, 1, '★ 异常断开后席位应**保留**(不是被删)');

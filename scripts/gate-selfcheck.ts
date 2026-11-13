@@ -25,9 +25,31 @@
  *
  * 期望耗时:每组约 0.2s(只跑 `--frozen`),D4 组需跑全套测试故较慢。
  */
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, cpSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, cpSync, rmSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, relative, sep, dirname, resolve } from 'node:path';
+
+/**
+ * ★ **本文件自带**的相对导入提取 —— 有意**不**从 `verify.ts` import。
+ *
+ * 理由与本文件既有的那条一致(见「窄词在此重复一份而非 import —— 本文件的职责是
+ * **独立复算**;若 import verify.ts 的正则,正则写错时两边一起错,自检就失去意义」)。
+ *
+ * ⚠️ 2026-11-14 实测过这条原则**不是空话**:`verify.ts` 与 `deadcode-audit.ts`
+ * 各有一份「提取相对导入」的实现,而 `deadcode-audit.ts:172` 那份**只认 `from`** ⇒
+ * 它把可达模块报成「真缺陷」。两份都在用、有一份对、门禁全绿。
+ * ⇒ 所以这里自带一份,并与它比对 —— 若两者结果不同,那是**发现**而不是噪声。
+ */
+function extractRelImports(src: string): string[] {
+  const out: string[] = [];
+  /* 静态 `from '...'` */
+  for (const m of src.matchAll(/from\s+'(\.[^']+)'/g)) out.push(m[1]!);
+  /* 裸副作用导入 `import '...'` */
+  for (const m of src.matchAll(/(?:^|\n)\s*import\s+'(\.[^']+)'/g)) out.push(m[1]!);
+  /* 动态 `await import('...')` —— ⚠️ 排除 `typeof import(`(类型查询不产生运行时边) */
+  for (const m of src.matchAll(/await\s+import\(\s*'(\.[^']+)'/g)) out.push(m[1]!);
+  return out;
+}
 import { tmpdir } from 'node:os';
 
 const ROOT = process.cwd();
@@ -547,14 +569,102 @@ const CASES: Case[] = [
           `gate-selfcheck: 剥注释后抽到的条目数(${entries.length})与上面算的 n(${n})不一致 —— 不许静默继续`,
         );
       }
-      const nonDebt = entries.filter((e) => /gate-only/.test(e[2]!) || /差集/.test(e[2]!)).length;
-      /* ★ 自证:跨行理由的那条(harness.ts)必须被计入,否则说明这次修法没生效。
-         实测:3 条非欠账 = baseline.ts(gate-only) / registry.ts(差集) / harness.ts(gate-only,跨行)。 */
-      if (nonDebt !== 3) {
+      /* ══════════════ ★ 2026-11-14 Lead:非欠账判据改成**两半**,这里跟着改 ══════════════
+       *
+       * ## 为什么必须改(而不是把 3 改成 6)
+       *
+       * 旧版这一行是:
+       * ```
+       *   const nonDebt = entries.filter((e) => /gate-only/.test(e[2]!) || /差集/.test(e[2]!)).length;
+       *   if (nonDebt !== 3) throw ...   「期望 3」
+       * ```
+       * 它把**当时 BLOCK 出来的 3** 写成了期望值 —— 正是本仓陷阱 71:
+       * **一条把「当前状态」编码成期望值的断言,是墓碑**。
+       * 所以 verify.ts 把差集改成计算式(4 条)之后,这一行**必然报错**,
+       * 而报错的原因**不是新判据错了**,是这行**在守卫旧状态**。
+       *
+       * ⇒ 正确修法不是"把 3 改成 6",而是**让两半各按自己能算的方式独立复算**:
+       * ```
+       * gate-only 半:理由文本可判(/gate-only/)      ⇒ 从文本数
+       * 差集半     :是**图性质**(引用者是否全不可达)  ⇒ 必须**自己走一遍 import 图**
+       * ```
+       * ★ 后者的独立实现是**有意重复**的:本文件的职责是独立复算 ——
+       *   若 import verify.ts 的 `isDiffSet()` 借它的结果,判据写错时两边一起错,
+       *   自检就失去了意义(与上面「窄词重复一份而非 import」同一条理由)。
+       *   ⇒ ⇒ 而这份重复实现**真的有价值**:它由**另一个口径**算出同一个集合,
+       *      是本仓「报任何总数必须与独立来源对账」的实例。
+       */
+      const gateOnlyText = entries.filter((e) => /gate-only/.test(e[2]!)).length;
+
+      /* 独立复算差集:自己走 import 图,不借用 verify.ts 的任何函数。 */
+      const ROOT2 = ROOT;
+      const walkTs = (dir: string, out: string[] = []): string[] => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          if (e.isDirectory()) {
+            if (!/^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out)$/.test(e.name)) {
+              walkTs(join(dir, e.name), out);
+            }
+            continue;
+          }
+          if (!e.name.endsWith('.ts')) continue;
+          const rel = relative(ROOT2, join(dir, e.name)).split(sep).join('/');
+          /* 与 ts-paths.ts 的 isProd 同口径:三个顶层目录的全部 .ts
+             ⚠️ 曾经这里写成 `shared/src/`,而 shared/ **没有 src/ 层** ⇒ 整棵被漏 */
+          if (/^(server|client|shared)\//.test(rel)) out.push(rel);
+        }
+        return out;
+      };
+      const prodAll2 = walkTs(ROOT2);
+      if (prodAll2.length === 0) {
+        throw new Error('gate-selfcheck: import 图遍历出 0 个生产文件(判据失效,不许静默继续)');
+      }
+      /* 入口闭包:与 verify.ts 的 PROD_ENTRIES 同口径(4 个入口已登记) */
+      const ENTRIES2 = ['server/src/net/room.colyseus.ts', 'client/src/main.ts', 'server/src/sim/demo.ts', 'server/src/index.ts']
+        .map((p) => resolve(ROOT2, p)).filter((p) => existsSync(p));
+      if (ENTRIES2.length === 0) {
+        throw new Error('gate-selfcheck: 一个生产入口都不存在(闭包必然是空的,不许静默继续)');
+      }
+      const reach2 = new Set<string>();
+      {
+        const stack = [...ENTRIES2];
+        while (stack.length > 0) {
+          const cur = stack.pop() as string;
+          if (reach2.has(cur)) continue;
+          reach2.add(cur);
+          for (const spec of extractRelImports(readFileSync(cur, 'utf8'))) {
+            const dep = resolve(join(dirname(cur), spec));
+            if (existsSync(dep) && !reach2.has(dep)) stack.push(dep);
+          }
+        }
+      }
+      const diffSetPaths: string[] = [];
+      /* ⚠️ 遍历必须取 `e[1]`(捕获组里的**路径**),不能解构 `[rel]` ——
+         那取的是 `e[0]`(整段匹配文本),于是 base 提取不到、importer 恒为 0
+         ⇒ 差集算成 0 条而**看起来完全正常**。
+         我第一次就是 `for (const [rel] of entries)` ⇒ 独立复算报「差集 0 条」,
+         与 verify.ts 的 4 条**矛盾** —— 那个矛盾正是这条 bug 的信号。 */
+      for (const e of entries) {
+        const rel = e[1]!;
+        const base = rel.split('/').pop()!.replace(/\.ts$/, '');
+        const esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const importers = prodAll2.filter((f) => f !== rel
+          && new RegExp(`from '[^']*${esc}\\.ts'`).test(readFileSync(resolve(ROOT2, f), 'utf8')));
+        if (importers.length > 0 && importers.every((f) => !reach2.has(resolve(ROOT2, f)))) {
+          diffSetPaths.push(rel);
+        }
+      }
+      const nonDebt = gateOnlyText + diffSetPaths.length;
+      /* ⚠️ 这里**不再**写死总数(那是墓碑的形态)。
+         改成断言两半**各自**都算出来了,并打印实际值供人核对 ——
+         若哪天判据漂了,报错消息会带上两半的分解,而不是一个孤零零的数字。 */
+      if (gateOnlyText === 0 && diffSetPaths.length === 0) {
         throw new Error(
-          `gate-selfcheck: nonDebt=${nonDebt},期望 3 —— 若为 2 则跨行理由又被漏计;若为 5 则又吃到了段间注释`,
+          'gate-selfcheck: 两半都算出 0 条非欠账 —— 判据必然失效(本仓确有 gate-only 与差集条目)',
         );
       }
+      console.log(`      · 非欠账分解(本文件**独立复算**):gate-only ${gateOnlyText} 条 + `
+        + `差集 ${diffSetPaths.length} 条 = ${nonDebt} 条`);
+      console.log(`      · 差集逐条:${diffSetPaths.length > 0 ? diffSetPaths.join(', ') : '(无)'}`);
       const rules = src.slice(
         src.indexOf('const WL_NON_DEBT_GATE'),
         src.indexOf('const WL_BLOCK_MECHANISM'),

@@ -1456,7 +1456,13 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      理由从笼统的「待接入」改成「等什么」——
      笼统说法会让人以为「有人动手就能接」,那正是**误报掩盖**:
      它掩盖「上游结构不存在」,让后来的执行者白费一轮。 */
-  ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2)'],
+  /* ★ 2026-11-14 Lead 补措辞:本条**结构上就是差集**(生产 3 个引用者 —— modes /
+     scoring / afk —— **全部不可达**),但理由原先没写「差集」二字,
+     于是被 `/差集/` 字面正则漏判成**欠账**,让欠账分母虚高。
+     ⇒ 分类现已改为**计算式**(见 `isDiffSet()`),此处补面包屑只为让**人**读得出来。
+     ⚠️ 判据是计算式,不是这两个字 —— 两个字只是可读性。 */
+  ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2);'
+    + '生产引用者 modes/scoring/afk **全部不可达** ⇒ 差集条目'],
   /* ⚠️ 本行原为 `driver.sqlite.ts` 的欠账登记,**2026-11-13 task-70 已消**:
      生产入口 `index.ts` 现在 import 了 `openNodeSqlite`(`AssembleDeps.dbPath` 路径),
      ⇒ 实测可达数 83 → **84**,本条移出白名单。
@@ -1490,11 +1496,14 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
     'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时);'
     + '注意 data-conformance.ts 只 import 它的**常量**(CROWN_WIN_SEC 等)与手册比对,'
     + '不代表 738 行**逻辑**被接线 —— 引用 ≠ 执行'],
-  ['server/src/party/scoring.ts', 'WS-11 计分,待接入'],
+  /* ★ 2026-11-14 Lead 补措辞:生产引用者 modes / afk **全部不可达** ⇒ 差集条目。 */
+  ['server/src/party/scoring.ts', 'WS-11 计分,待接入;生产引用者 modes/afk **全部不可达** ⇒ 差集条目'],
   ['server/src/prank/immunity.ts',
     'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个);'
     + 'data-conformance.ts 只读它的常量,逻辑未接'],
-  ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个)'],
+  /* ★ 2026-11-14 Lead 补措辞:生产引用者 immunity 本身不可达 ⇒ 差集条目。 */
+  ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个);'
+    + '生产引用者 immunity **不可达** ⇒ 差集条目'],
   ['server/src/social/afk.ts', 'WS-11 挂机攒露水,等房间每帧驱动(与 room 的 AFK 同名异义)'],
   /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
      经 `WorldSim` 的慢帧 `tickLogisticsStep` 驱动。已从本表摘除。 */
@@ -1600,7 +1609,105 @@ const WL_NON_DEBT_GATE = /gate-only/;
    它是「对不可达模块的引用」,不是「已接」。
    ⚠️ 「有生产引用」与「生产可达」是**两个判据**;只按前者定义「已接」,
       就会把本条误记成「已完成」—— Lead 的手写探针就报过「registry.ts 已接」。 */
-const WL_NON_DEBT_DIFF = /差集/;
+/* ⚠️⚠️ **[2026-11-14 task-79/Lead 修订] 这里原本是 `/差集/` 一个字面正则 —— 那是个假阴性源。**
+
+```
+旧写法:const WL_NON_DEBT_DIFF = /差集/;
+```
+它**只在理由文本里找「差集」二字**,而「差集」是一个**可计算**的性质:
+
+```
+差集的定义(上面那段散文) = 生产引用者 ≠ ∅ ∧ 引用者全部不可达
+```
+
+实测两个口径**数目不等**,而**都叫「差集」**:
+
+```
+计算式(verify.ts 同一文件 §可达性里打印的「差集 5 条」)  ⇒ 5
+字面式(/差集/ 分类器实际抓到的)                          ⇒ 1
+⇒ 同一份文件里「差集」这个词在**三处指三个集合**。
+```
+
+独立复算(不依赖本文件的任何打印,直接数每条白名单路径的生产 importer,
+并检查那些 importer 自己是否也在白名单里)得出的**真差集是 4 条**:
+
+```
+server/src/content/registry.ts    生产 2 引用(baseline, handshake)   全部不可达
+server/src/coop/rush_order.ts     生产 3 引用(modes, scoring, afk)     全部不可达
+server/src/party/scoring.ts       生产 2 引用(modes, afk)              全部不可达
+server/src/prank/toys.ts          生产 1 引用(immunity)                全部不可达
+```
+
+⇒ 其中**只有 registry.ts 的理由里写了「差集」二字**,另外 3 条结构与它**完全相同**,
+  却因为没写那两个字被算成**欠账** ⇒ 欠账分母虚高 3 条。
+⇒ ★ 这是**假阴性** —— 与"任务书假设的『假的非欠账』"方向相反:
+  真正发生的是「真的非欠账被漏判成欠账」。
+
+★ 另一个方向的缺陷:``/差集/`` 是**裸正则**(无词边界、无否定检查):
+```
+「不是差集条目」/「非差集」/「这不算差集」/「并非差集」 ⇒ 全部命中
+⇒ 语义**相反**的两种措辞得到同一个分类结果,而该结果决定它进不进欠账分母。
+```
+
+## 修法:改成**计算式**(有现成的机器,不需要新数据源)
+
+本文件已经有 `reachableClosure()` 与可达集 —— 分类时直接问
+「这条路径的生产引用者是不是全部不在可达集里」即可,不必读散文。
+
+★ 之所以此前用字面正则,大概是因为分类函数 `whitelistBreakdown()` 只拿到
+  `[path, reason]` 的**理由**、拿不到路径。改成计算式要把它改成拿到 `path`。
+  这**正是**本仓那条老规矩的实例:**判据取不到它该判的东西时,
+  就会退化成"读文本"**(与 `extractRelativeImports` 两份口径同族)。
+*/
+
+/** 差集的**计算式**判据 —— 见上方长注释。用 `path` 而非理由文本。
+ *
+ * ★ 这里**自带**数据源(记忆化),不依赖调用方的作用域 ——
+ *   因为 `whitelistBreakdown()` 有**两个**调用点,一个在 `checkReachability()`
+ *   内(`reach`/`prodAll` 可见),另一个在很后面的块里(`reach` **不可见**)。
+ *   让判据依赖"调用方恰好有某个局部变量"是脆的:后加的调用点会**静默降级**
+ *   成字面正则,而那种降级不会报错(陷阱 110 家族)。
+ *   ⇒ 做成自带记忆化 ⇒ 任何调用点都拿到**同一个计算式**结果。
+ */
+let __diffProdAll: string[] | null = null;
+let __diffReach: Set<string> | null = null;
+function diffSetData(): { prodAll: string[]; reach: Set<string> } {
+  if (__diffProdAll === null) {
+    __diffProdAll = [];
+    const walk = (dir: string): void => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.isDirectory()) {
+          if (!/^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out)$/.test(e.name)) {
+            walk(join(dir, e.name));
+          }
+          continue;
+        }
+        if (!e.name.endsWith('.ts')) continue;
+        const rel = relative(ROOT, join(dir, e.name)).split(sep).join('/');
+        /* ⚠️ 与 `ts-paths.ts` 的 `isProd` **同口径**:三个顶层目录的全部 .ts。
+           曾经这里是 `shared/src/`,而 `shared/` **没有 src/ 层** ⇒ 整棵被漏。 */
+        if (/^(server|client|shared)\//.test(rel)) __diffProdAll.push(rel);
+      }
+    };
+    walk(ROOT);
+  }
+  if (__diffReach === null) __diffReach = reachableClosure(PROD_ENTRIES);
+  return { prodAll: __diffProdAll, reach: __diffReach };
+}
+
+function isDiffSet(path: string): boolean {
+  const { prodAll, reach } = diffSetData();
+  const base = path.split('/').pop()!.replace(/\.ts$/, '');
+  const importers = prodAll.filter((f) => f !== path
+    && new RegExp(`from '[^']*${escapeRe(base)}\\.ts'`).test(readFileSync(resolve(ROOT, f), 'utf8')));
+  if (importers.length === 0) return false;                       /* 无生产引用 ⇒ gate-only 型,不是差集 */
+  return importers.every((f) => !reach.has(f));                   /* 有引用但引用者全不可达 ⇒ 差集 */
+}
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/** ⚠️ 保留字面正则**仅供自检**:用来发现「理由写了『差集』但计算式不成立」的**反向**不一致。
+ *  它**不再**用于分类 —— 分类走 `isDiffSet()`。 */
+const WL_NON_DEBT_DIFF_TEXT = /差集/;
 /* 「等对局层 / 等上游结构」= 上游结构不存在,不是缺接线动作。
    依据:task-38 与 task-41 两个独立任务都用**实测**证明这些模块等的是不存在的宿主。
 
@@ -1624,6 +1731,8 @@ function whitelistBreakdown(): {
   clientShell: number; clientMech: number; wiring: number; mechanism: number;
   dependency: number; decision: number; other: number; decisionShadowed: number;
   nonDebt: number;
+  /** ★ 差集的实际命中(计算式)。供自检比对「理由写了『差集』但计算式不成立」的反向不一致。 */
+  diffSet: string[];
 } {
   let clientShell = 0;
   let clientMech = 0;
@@ -1646,8 +1755,10 @@ function whitelistBreakdown(): {
      说明这个 0 极度依赖正则的写法,不能当作事实读。
      所以现在把「影子数」一并算出来并打印,让读者知道 0 是怎么来的。 */
   let decisionShadowed = 0;
+  /** 差集实际命中(计算式),逐条登记 —— 供反向自检比对。 */
+  const diffSet: string[] = [];
 
-  for (const [, reason] of UNREACHABLE_EXEMPT) {
+  for (const [path, reason] of UNREACHABLE_EXEMPT) {
     /* 顺序有讲究 —— **具体优先于笼统**:
        0 `nonDebt`:**最先判** —— 它答的不是「卡在哪」而是「**是不是欠账**」,
          性质不同,必须先分流;否则会被下面的窄桶按名字抓走
@@ -1663,7 +1774,12 @@ function whitelistBreakdown(): {
     const isDecisionCandidate = WL_DECISION_A.test(reason) && WL_DECISION_B.test(reason);
     /* ⚠️ 非欠账两条**不参与 isDecisionCandidate 统计** ——
        它们不是「等人拍板」,把它们算进影子数会虚报。 */
-    if (WL_NON_DEBT_GATE.test(reason) || WL_NON_DEBT_DIFF.test(reason)) {
+    /* ★ gate-only 仍按**理由文本**判(它答的是"门禁真消费它"这类**事实描述**,
+       无法从 import 图算出来:门禁脚本自身的消费不在生产闭包内)。
+       ⚠️ 但差集改成**计算式** —— 见 `isDiffSet()` 上方的长注释。 */
+    const isDiff = isDiffSet(path);
+    if (isDiff) diffSet.push(path);
+    if (WL_NON_DEBT_GATE.test(reason) || isDiff) {
       nonDebt += 1;
       continue;
     }
@@ -1695,7 +1811,7 @@ function whitelistBreakdown(): {
     if (isDecisionCandidate) { decision += 1; continue; }
     other += 1;
   }
-  return { clientShell, clientMech, wiring, mechanism, dependency, decision, other, decisionShadowed, nonDebt };
+  return { clientShell, clientMech, wiring, mechanism, dependency, decision, other, decisionShadowed, nonDebt, diffSet };
 }
 
 
@@ -2365,9 +2481,80 @@ function checkReachability(): void {
     }
     /* 全部成立时**不打印** —— 否则会给绿灯加噪声,而噪声会让真信号被忽略。 */
   }
+
+  /* ★ 差集判据双向自检(2026-11-14 加)。挂在这里的理由:
+     它查的是**白名单条目的分类是否正确**,与上面的分桶算术同属「口径自洽」,
+     都属于"门禁自己的结论有没有被反推过"。 */
+  checkDiffSetConsistency();
 }
 
-/* ───────────── 2.5 同义反复候选检查(S11)───────────── */
+/* ───────────── 2.5 差集判据的**双向**自检 ───────────── */
+
+/**
+ * ## 为什么这条自检值得存在
+ *
+ * 差集（「有生产引用，但引用者全部不可达」）在**同一份文件里有过三个定义**：
+ * ```
+ * 减法   UNREACHABLE_EXEMPT.size - orphan.size            ⇒ 5（混入 gate-only）
+ * 字面   /差集/ 正则读理由文本                              ⇒ 1（只认写了那两个字的）
+ * 计算   isDiffSet()（= 本文现在用的）                      ⇒ 4（真定义）
+ * ```
+ * 实测差集 4 条：`registry` / `rush_order` / `scoring` / `toys` ——
+ * 其中**只有 registry 的理由里写了「差集」二字**，
+ * 另外 3 条结构完全相同，却因为没写那两个字被算成**欠账**（分母虚高 3）。
+ *
+ * ⇒ 这就是**假阴性**：真的非欠账被漏判成欠账，而它**不会红**——
+ *   因为分母大一点看起来完全正常。
+ *
+ * ## 三个方向都要查（少一个就有静默口袋）
+ * ```
+ * ① 理由写了「差集」⇒ 计算式必须成立   否则是「冒称非欠账」，会**缩小**欠账分母
+ * ② 计算式成立但理由没写「差集」        否则是漏判（本仓当前就是这一类，已修）
+ *    ⇒ ② 现在**只告警不拦门禁**：理由文本是面包屑，不强制措辞；
+ *      真正的判据是计算式，而它已经生效。强制措辞会催生「为了过门禁而加两个字」。
+ * ③ 计算式成立但理由写的是**否定**（「不是差集」）
+ *    ⇒ 裸正则无词边界、无否定检查，「不是差集」也会命中 —— 语义相反、分类相同
+ * ```
+ */
+function checkDiffSetConsistency(): void {
+  const textClaim: string[] = [];
+  const missedProse: string[] = [];
+  const negatedHits: string[] = [];
+  for (const [path, reason] of UNREACHABLE_EXEMPT) {
+    const computed = isDiffSet(path);
+    const saysDiff = WL_NON_DEBT_DIFF_TEXT.test(reason);
+    if (saysDiff && !computed) textClaim.push(path);
+    if (computed && !saysDiff) missedProse.push(path);
+    /* 否定式：同一句里出现「非差集 / 不是差集 / 不算差集 / 并非差集」 */
+    if (computed && /(?:非|不是|不算|并非)\s*差集/.test(reason)) negatedHits.push(path);
+  }
+
+  if (negatedHits.length > 0) {
+    fail(
+      `差集理由里出现**否定措辞** ${negatedHits.length} 处:${negatedHits.join(', ')} —— `
+      + `裸正则 /差集/ 无词边界、无否定检查 ⇒「不是差集」与「是差集」得到同一分类结果`,
+    );
+  }
+  if (textClaim.length > 0) {
+    fail(
+      `理由声称是差集但**计算式不成立** ${textClaim.length} 处:${textClaim.join(', ')} —— `
+      + `差集的判据是「生产引用者 ≠ 空 ∧ 引用者全不可达」,不是理由里有那两个字`,
+    );
+  }
+  if (missedProse.length > 0) {
+    /* ⚠️ 只告警:见上方 ② 的理由 */
+    advise(
+      '差集口径',
+      `计算式成立但理由未写「差集」二字 ${missedProse.length} 处:${missedProse.join(', ')}`
+      + `(分类**已按计算式**归入非欠账,不影响分母;仅提示措辞不一致)`,
+    );
+  }
+  pass(
+    `差集判据自检:计算式与理由文本双向一致(计算式 ${countDiffSet()} 条;`
+    + `理由声称 ${[...UNREACHABLE_EXEMPT].filter(([, r]) => WL_NON_DEBT_DIFF_TEXT.test(r)).length} 条)`,
+  );
+}
+
 
 /**
  * 「同义反复候选」白名单。
@@ -3617,8 +3804,32 @@ function checkOrphanList(): void {
   }
   pass(
     `生产零引用清单自洽(${orphan.size} 条已登记,全部 ⊆ 可达性白名单;`
-    + `差集 ${UNREACHABLE_EXEMPT.size - orphan.size} 条是「有生产引用但引用者也不可达」)`,
+    /* ⚠️⚠️ **[2026-11-14 Lead 修订] 这里原本是 `UNREACHABLE_EXEMPT.size - orphan.size`(减法)。**
+     *
+     * 那个减法**定义的不是差集**,只是"白名单里有、orphan 清单里没有的"——
+     * 它把 **gate-only 型**(生产 0 引用)也算成了差集,于是得到 5 条。
+     * 而差集的语义是「**有**生产引用,但引用者全部不可达」。
+     *
+     * 实测同一份文件里「差集」这个词在**三处指三个集合**:
+     * ```
+     * 此处减法            ⇒ 5   (混入了 gate-only)
+     * /差集/ 字面分类器    ⇒ 1   (只认写了那两个字的)
+     * 计算式(真定义)      ⇒ 4   (registry / rush_order / scoring / toys)
+     * ```
+     * ⇒ 同一个词、三个数,而它决定**该条进不进欠账分母**。
+     * ⇒ 现统一走 `isDiffSet()`(计算式),它统计的是**真差集**。 */
+    + `差集 ${countDiffSet()} 条是「有生产引用但引用者也不可达」`
+    + `(另有 ${UNREACHABLE_EXEMPT.size - orphan.size - countDiffSet()} 条是 gate-only 型:生产 0 引用、门禁真消费)`,
   );
+}
+
+/** 统计差集**真条数**(计算式)。与 `whitelistBreakdown()` 内的 `diffSet` 同一判据 ——
+ *  ⚠️ 这里重新遍历而非共享,是因为 `whitelistBreakdown()` 的返回值在别的作用域里;
+ *     而 `isDiffSet()` 是记忆化的纯函数,重复调用**不重复扫描**。 */
+function countDiffSet(): number {
+  let n = 0;
+  for (const [p] of UNREACHABLE_EXEMPT) if (isDiffSet(p)) n += 1;
+  return n;
 }
 
 /* ───────────────────── 3. 文档结构检查 ───────────────────── */
