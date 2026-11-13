@@ -3806,11 +3806,36 @@ test('task-37 判定6:两个目标模块在**两套清单**里的口径必须一
     ok(aSrc.includes(`'${mod}'`), `${mod} 在 orphan 清单里`);
   }
 
-  /* 反例证明两套判据确实会分叉:`driver.sqlite.ts` 在 verify 白名单里,
-   * 却**不在** orphan 清单里(因为它被 verify 自己 import 了)——
-   * 同一文件两套结论相反,这就是「两套词法判定互相矛盾」。 */
-  ok(vSrc.includes("'server/src/db/driver.sqlite.ts'"), 'driver.sqlite 在 verify 白名单');
-  ok(!aSrc.includes("['server/src/db/driver.sqlite.ts'"), '但**不在** orphan 清单');
+  /* 反例证明两套判据确实会分叉。
+   *
+   * ⚠️ 2026-11-13 task-70 订正:原反例是 `driver.sqlite.ts`
+   *    (「在 verify 白名单里,但不在 orphan 清单里」)。
+   *    而 task-70 把它**接进了生产入口**(`index.ts` → `openNodeSqlite`)
+   *    ⇒ 它从 verify 白名单移出(可达数 83 → 84)⇒ **原反例失效**,本条测试变红。
+   *
+   * ★ 处置:不能"随便换个名字让测试绿" —— 那会把一条有信息量的断言换成装饰
+   *   (陷阱 100)。故实测重算了两套清单的差集:
+   * ```
+   *   verify 白名单 14 条 / orphan 清单 9 条
+   *   只在 verify(不在 orphan)= 5 条:
+   *     content/registry.ts · coop/rush_order.ts · party/scoring.ts ·
+   *     prank/toys.ts · shared/testing/harness.ts
+   *   只在 orphan(不在 verify)= 0 条
+   * ```
+   *   ⇒ 反例仍存在(不是"已收敛"),只需换成**当前真实**的那一条。
+   *   取 `registry.ts`:它的分叉**有原因且已写在两边**
+   *   (它被 `content/auditContent()` 读、也在测试里被读 ⇒
+   *    两套判据的**判据本身**不同:一个看"从 PROD_ENTRIES 可达",
+   *    一个看"是否只被 tests 引用")。
+   */
+  ok(vSrc.includes("'server/src/content/registry.ts'"),
+    'registry.ts 在 verify 白名单里(反例:两套判据分叉)');
+  ok(!aSrc.includes("['server/src/content/registry.ts'"),
+    '但**不在** orphan 清单 ⇒ 同一文件两套结论相反');
+  /* ★ 同时钉住 driver.sqlite 的**新**位置:它已可达,不该再出现在白名单里 ——
+     这条是 task-70 的成绩,写进断言比写在 commit message 里可靠。 */
+  ok(!vSrc.includes("'server/src/db/driver.sqlite.ts'"),
+    '★ driver.sqlite 已不在白名单(task-70 接进生产入口 ⇒ 可达)');
 });
 
 /* ═══════════ task-40:prediction.ts 的归属判定与搬迁 ═══════════ */

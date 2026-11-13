@@ -1346,8 +1346,16 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      笼统说法会让人以为「有人动手就能接」,那正是**误报掩盖**:
      它掩盖「上游结构不存在」,让后来的执行者白费一轮。 */
   ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2)'],
-  ['server/src/db/driver.sqlite.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
-  ['server/src/db/memory_db.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
+  /* ⚠️ 本行原为 `driver.sqlite.ts` 的欠账登记,**2026-11-13 task-70 已消**:
+     生产入口 `index.ts` 现在 import 了 `openNodeSqlite`(`AssembleDeps.dbPath` 路径),
+     ⇒ 实测可达数 83 → **84**,本条移出白名单。
+     ★ 只消了 sqlite 那条;**`memory_db.ts` 那条仍在**(见下一行)——
+       它是**测试专用**驱动,生产入口不应 import 它(会与真实驱动并存两份实现)。
+       故两条"同形"的欠账**处置不同**:一条靠接线消掉,另一条**本来就该留在测试侧**
+       ⇒ 这正是「同形不等于同因」的一例(陷阱 97 的同族)。 */
+  ['server/src/db/memory_db.ts',
+    '驱动按 DbLike 结构化类型注入,生产入口尚未注入(**测试专用**:'
+    + '生产入口若也 import 它,会与 driver.sqlite 并存两份实现)'],
   /* ⚠️ 本条的措辞在 2026-11-13 被订正 —— 原文写「(tameItem 无人消费)」,**事实不成立**:
      `taming.ts:81`(tameableDefs 过滤)、`:124`/`:127`(feedPet 校验物品)都在读该字段;
      `shared/constants/mobs.ts` 里 7 处赋值也说明它有生产者。

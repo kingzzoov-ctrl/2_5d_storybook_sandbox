@@ -57,6 +57,12 @@ import { WorldSim } from './sim/world_sim.ts';
 import { RoomRuntime, type RoomRuntimeOptions, type WorldSaveHost } from './net/room.ts';
 import { AccessMode } from './db/repo.ts';
 import type { DbLike } from './db/repo.ts';
+/* ★ task-70:生产入口终于有了 `driver.sqlite.ts` 的**消费者**。
+   接线前实测:`db/driver.sqlite.ts` 与 `db/memory_db.ts` 都只被**测试**引用
+   (`memory_db` 由测试直接 new,`driver` 亦然)⇒ 生产跑起来永远纯内存
+   ⇒ 与「读档恢复」直接冲突(没有库就没有档)。
+   ⇒ 见 `AssembleDeps.dbPath` 与 `resolveDb`。 */
+import { openNodeSqlite } from './db/driver.sqlite.ts';
 import type { Clock } from './net/anticheat.ts';
 
 /** 装配一次世界 + 运行时所需的全部外部依赖。 */
@@ -69,6 +75,24 @@ export interface AssembleDeps {
   clock?: Clock;
   /** 数据库;`null` = 纯内存(测试默认)。 */
   db?: DbLike | null;
+  /**
+   * SQLite 存档文件路径。**给出它就自动开真库**(task-70)。
+   *
+   * ## 为什么需要这个字段(而不是让调用方自己 `new SqliteDb(...)`)
+   *
+   * 实测:`db/driver.sqlite.ts` 与 `db/memory_db.ts` 在**生产入口里零消费者** ——
+   * 两者都是「按 `DbLike` 结构化类型注入」的设计,而**注入点只有测试**。
+   * ⇒ 表现为:生产路径跑起来永远是**纯内存**,重启即丢档,
+   *   而这与「读档恢复」直接冲突(没有库就没有档)。
+   * ⇒ 故这里给一个**生产入口自己开库**的路径。
+   *
+   * ## 与 `db` 的关系:`db` 优先
+   *
+   * `deps.db` 显式给了就用它(测试要注内存库);否则若给了 `dbPath` 就开真库;
+   * 两者都没有 ⇒ `null`(纯内存,现状不变)。
+   * ⇒ 顺序是「**显式注入 > 文件路径 > 无**」,不猜。
+   */
+  dbPath?: string;
   /** 世界边长(格),直接透传给 `WorldSim`。 */
   sizeCells?: number;
   /** 模拟随机流;注入后同种子完全可复现(测试用)。 */
@@ -154,8 +178,34 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
     host,
   };
 
-  const runtime = new RoomRuntime(rtOpts, deps.db ?? null);
+  const runtime = new RoomRuntime(rtOpts, resolveDb(deps));
   return { host, rtOpts, runtime };
+}
+
+/**
+ * 解析 `deps` 里的数据库来源(task-70)。
+ *
+ * ## 为什么把它抽成一个函数
+ *
+ * 「显式注入 > 文件路径 > 无」这个**优先级**本身是一条规则,
+ * 散在 `assemble()` 里会与 `rtOpts` 的构造纠缠,看不清。
+ * 抽出来之后它有一个**可单测的单一入口**,也便于将来加第三来源。
+ *
+ * ## 为什么开库放在这里而不是模块顶层
+ *
+ * 模块顶层开库会在**任何** import 本文件的场合(包括
+ * `scripts/verify.ts` 的「入口可加载性」子进程检查)都去碰文件系统 ——
+ * 那会让一个只读的加载性检查产生副作用。故只在**真的装配**时开。
+ */
+function resolveDb(deps: AssembleDeps): DbLike | null {
+  /* 1 显式注入优先 —— 测试与别处已有连接都走这条,行为与接线前**逐字一致**。 */
+  if (deps.db !== undefined) return deps.db;
+  /* 2 给了路径 ⇒ 开真库。`openNodeSqlite` 是零依赖实现(见其 docblock)。 */
+  if (typeof deps.dbPath === 'string' && deps.dbPath !== '') {
+    return openNodeSqlite(deps.dbPath);
+  }
+  /* 3 两者都没有 ⇒ 纯内存(现状:不落盘)。 */
+  return null;
 }
 
 /** `createServer()` 的产物。刻意不 `listen`,便于 CI 与测试零副作用地检查装配。 */
