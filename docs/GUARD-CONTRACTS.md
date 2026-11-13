@@ -188,7 +188,7 @@ if (next.level !== undefined) next.level = clampInt(next.level as number, 1, MAX
 
 // server/src/net/room.ts:446 —— 建 state.players[] 那一行,**不传 level**
 this.state.players.push(createPlayerState(input.userId, { name, x, y, z }));
-//   server/src/net/schema.ts:253 createPlayerState 的默认 level 是 1(:257);...patch 在后本可覆盖,但这里没传
+//   server/src/net/schema.ts:59 createPlayerState 的默认 level 是 1(:63);...patch 在后本可覆盖,但这里没传
 ```
 
 **实测四条**(探针 `_gc_level.ts`,已删):

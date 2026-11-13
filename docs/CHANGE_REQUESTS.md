@@ -2790,11 +2790,18 @@ delta.ts 体内**真用**  18 个;  import 了但体内 0 次 = **3 个**:
 「只被编码器用」→ 后来又判成「两边体内都不用」→ 看起来像"没人用的死表"
 
 ★ 而真相:它们**经 `tableFor(kind)` 返回可达**:
-   schema.ts:398  export function tableFor(kind: EntityKind): readonly FieldSpec[] {
-   L400  case EntityKind.ROOM:     return ROOM_FIELD_TABLE;
-   L401  case EntityKind.PLAYER:   return FIELD_TABLE;
-   L402  case EntityKind.WILDLIFE: return WILDLIFE_FIELD_TABLE;
-   L403  case EntityKind.BOSS:     return BOSS_FIELD_TABLE;
+   ★ 行号订正(2026-11-14,`scripts/doc-line-audit.ts` 机械发现): 〔引用〕
+     原文写 `schema.ts:398`〔引用〕,而 `server/src/net/schema.ts` **总共只有 191 行**
+     ⇒ 该行号**越界**,不可能存在。
+     实测真定义在 **`shared/types/wire.ts:333`**(`schema.ts` 只是 `export *` 再导出;
+     `schema.ts:40` 那行是它自己的 `import { tableFor, ... }`)。
+   ⇒ 下面四行引文按 `wire.ts` 的**逐字原文**抄录(实测 L333 起,一行一个 case,
+     不是原文里那样折行):
+   L333  export function tableFor(kind: EntityKind): readonly FieldSpec[] {
+   L335    case EntityKind.ROOM: return ROOM_FIELD_TABLE;
+   L336    case EntityKind.PLAYER: return FIELD_TABLE;
+   L337    case EntityKind.WILDLIFE: return WILDLIFE_FIELD_TABLE;
+   L338    case EntityKind.BOSS: return BOSS_FIELD_TABLE;
 
   实测(运行时):
    EntityKind.ROOM(1)     ⇒ tableFor ⇒ ROOM_FIELD_TABLE
