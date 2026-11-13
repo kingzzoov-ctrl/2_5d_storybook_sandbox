@@ -1103,3 +1103,209 @@ URL 里的 `//` 被当注释起点 ⇒ 后续真代码一起丢)。本次新增�
 被它全部抓出并拦了门禁 —— **该检测器有效**,故本文记下它的正确写法:
 `.replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')`。
 
+---
+
+## 第八层空缺:**判据只有两格,而答案是第三类**(task-71 的六条定性)
+
+### 一、分歧的由来(为什么必须记下来)
+
+task-71 要求把 WS-11 族 **6 条不可达欠账**分成「本轴能消 / 不能消」。
+`mob-boss-ai` 与 `build-wiring` **各自都拿实测支撑**,却得出**相反结论**:
+
+```
+build-wiring:4 条全 B(「等宿主」)
+mob-boss-ai :至少要分开判(「玩家要的宿主根本不存在,故不是缺宿主」)
+```
+
+Lead 的裁定方式值得单独记下 —— **它没有先比证据,而是先问判据**:
+
+```
+1 先问「你们共用了哪一句判据」        → 「缺宿主⇒B;有宿主缺调用点⇒A」
+2 再问「那句话覆盖了所有情况吗」      → ★ 只有两格,缺了第三格
+3 最后才测数据
+```
+
+> **陷阱 102(Lead 记)**:「两个有实测支撑的相反结论」最常见的原因,
+> **不是谁测错了,而是他们共用的判据缺了第三个分支**。
+> 处置顺序是先看**判据**,不是先比**证据** —— 本轮若先比证据,
+> 会因为双方证据都硬而僵住;先看判据,立刻发现它只有两格。
+
+### 二、★ 修正后的判据:三层法(同一句判据补上第三格)
+
+```
+第 1 层  它要不要宿主?        → 按**签名 + 纯度**(向内看)
+第 2 层  生产引用者有几个?    → 按**引用**(向外看)★ 双方都没查这一层
+第 3 层  缺的事件源是什么?    → 按**能力 grep**,不按名字
+```
+
+| 定性 | 含义 | 工作量 |
+| :--- | :--- | :--- |
+| **A** | 有宿主 + 缺调用点 ⇒ 接一根线 | 一天 |
+| **B** | 缺宿主 ⇒ 等别的模块 | 等 |
+| **C** | **宿主与调用者都缺** ⇒ 要新写一条输入管线 | 一周 |
+
+★ 双方错在**同一处**:都只查了第 1 层(函数需要什么),没查第 2 层(谁会调它)。
+而第 2 层的答案**同时否掉了 A 和 B** —— 没有宿主(否掉 A),
+也没有引用者(否掉「只是没人调」)。
+
+### 三、六条定性表(全部逐条实测)
+
+| 模块 | 定性 | 判据(实测 file:line) | 若 A ⇒ 那根线是什么 | 若 C ⇒ 缺哪条管线 |
+| :--- | :---: | :--- | :--- | :--- |
+| `coop/rush_order.ts` | **C** | 32 导出函数,8 个收「运行时对象」参数(`tendStation(s: StationRuntime, dt = 0)` L384 / `tickRushOrder(s: RushOrderSession, dt, opts)` L924)但**那些都是模块自定义结构,不是宿主**;生产 import 者 3 个**全是 `import type`**(`modes.ts:21` / `scoring.ts:15` / `afk.ts:14`)⇒ 运行期边 **0**;`verify.ts` 独立记录同一事实(锚文本:`逐条实测后只有 1 条是纯类型边`,行号随时会漂) | — | **玩家动作输入管线**:`submitDelivery` L967 / `fireRelayStage` L702 / `startRushOrder` L902 除定义外**无调用者**;无任何通道能把「交付/接力」事件送进来 |
+| `party/modes.ts` | **C** | 31 导出函数,23 个收 `PartyModeRuntime`/`BridgeRunRuntime`/`CrownRuntime` 等模块自定义结构;生产 import 者 **0**;`setPartyModeBy`(模式**选择**)只有定义 `room.ts:1227`,**生产调用 0**;`startPartyMode`/`createPartyMode` 除自身模块外无引用者。★ **理由文本需订正**:它写「有枚举与计分字段,无运行时」—— 实测 `room.ts` 只有 `partyMode: PartyMode` 这一个**模式选择**字段(`room.ts:780`),**没有任何计分字段**;`scoreA`/`scoreB`/`partyTimer` 在 `room.ts` 里出现 **0 次**,它们只存在于 schema/wire 层(`schema.colyseus.ts`、`shared/types/wire.ts`、`client/src/net/state_store.ts` 等)⇒ 那是**线格式已备**,不是**逻辑已备** | — | **对局运行时容器**:无任何容器持有 `PartyModeRuntime`;`tickPartyMode` 的驱动源(每帧/每局循环)**完全不存在** |
+| `party/scoring.ts` | **C** | 32 导出函数;生产 import 者 2 个(`modes.ts` 28 符号 / `afk.ts` 6 符号)**但两者本身皆不可达** ⇒ 它**结构上**正好落在 verify 自己给的差集定义里(锚文本:`差集 = 有生产引用,**但引用者全部不可达**`)。★ **但 verify 的实际归类里它不在差集内** —— 差集的**操作化**判据是「理由文本含『差集』」(`const WL_NON_DEBT_DIFF = /差集/`),而该判据**排在 `wiring` 之前**(先判 `NON_DEBT` 并 `continue`);`scoring.ts` 的理由文本是 `'WS-11 计分,待接入'` ⇒ 落到 `wiring`(缺接线动作)。**⇒ 这正是本条措辞的实质错误**:按 verify 自己的散文定义它该是差集,按 reason 文本它成了「待接入」 | — | 与 `modes.ts` **同一条**对局运行时;它不是「待接入」而是「**等它的调用者先能跑**」 |
+| `prank/immunity.ts` | **C** | 7 导出函数,收宿主类参数 **1** 个(`isImmuneToHostile(shieldOn, src: HostileSource)` —— `HostileSource` 是**字符串枚举**,不是宿主);`this` = 0;非纯调用 0;模块级可变 `let` 0;**生产 import 者 0**;且它**没有**像 `afk.ts` 那样存在「某个可被外部写入的触发字段」(它的 `ShieldState` 只能由 `createShield`/`toggleShield` 造)⇒ 连「缺一个写入者」这种半成品都还没有 | — | **整蛊施加入口**:按能力 grep(`applyPrank`/`triggerToy`/`stepOnToy`/`hitToy`/`prankAt`/`placeToy`/`useToy`/`throwToy`)**生产命中 0**;客户端 `onMessage` 只有 4 条(`room.colyseus.ts:191/200/233/239`)且**无 step/touch/prank 通道** |
+| `prank/toys.ts` | **C** | 12 导出函数,收宿主类参数 **1** 个(`hitBubble(b: BubbleRuntime)` —— `BubbleRuntime` 是**自身定义的数据结构**,L360);`this` = 0;非纯调用 0;模块级可变 `let` 0;**生产 import 者 1**(`immunity.ts:15`)但那是**不可达模块对不可达模块**的引用 ⇒ 运行期边 **0** | — | 与 `immunity.ts` **同一条**管线(两者由 `immunity.ts:15` 互相绑定,是**同一个 C**) |
+| `social/afk.ts` | **C**(★ 与 task-74 同一结构) | 28 导出函数,6 个收 `Stall`/`TrackRuntime`;**`tickAfk(p, nowSec, dt)` 只要 3 个标量** ⇒ 时间源(第 1 层)有(`world_sim.ts:3773` `get simSeconds()`);但**生产 import 者 0**;`backgroundedAtSec` 的写入者只有本模块(`afk.ts:101`/`:108`),`goBackground` 调用者只有 `tests/WS-11.test.ts`(8 处) | — | **「切后台」事件源**:与 task-74 实测的「`afk` 真值无触发源」是**同一结构** —— 客户端 0 处 `visibilitychange`/`blur`,消息面无通道 |
+
+### 四、Q1 / Q2 / Q3 的回答
+
+**Q1 —— `afk.ts` 的 host 需求是什么?WorldSim 能满足吗?**
+```
+tickAfk(p: AfkPlayer, nowSec: number, dt: number): number      (afk.ts:118)
+⇒ 只要 3 个标量。而现在**两个都现成**:
+    nowSec → world_sim.ts:3773  `get simSeconds()`(秒,注释明写)
+    dt=0.5 → world_sim.ts:240   `SIM_SLOW_DT = 1 / SLOW_TICK_HZ`
+⇒ ★ 时间源这一层**确实已满足** —— 这一点上 mob-boss-ai 的实测成立。
+⇒ 但第 2 层否掉了 A:生产 import 者 **0** ⇒ 没有「现成的宿主模块只差一行调用」。
+⇒ 第 3 层给出真正缺的:`AfkPlayer.backgroundedAtSec` 只能由 `goBackground` 置,
+  而它的调用者**只有测试**;生产里没有任何东西知道「玩家切了后台」。
+⇒ **判 C**:补上「切后台」事件源要**客户端新增消息通道**,不是接一根线。
+```
+★ 这条与 task-74 的关系:task-74 修的是 `MemberPresence.AFK`(连接态)那条通路;
+`afk.ts` 的 `tickAfk`(打盹攒露水的**玩法**)是**另一条**,两者同名异义、不应合并。
+
+**Q2 —— `toys.ts` 与 `immunity.ts` 共用的宿主存在吗?能否用 `vitals.applyHit` 承担?**
+```
+共用宿主:**不存在**,且两者之间**没有运行期边** ——
+  immunity.ts:15  import { PRANK_TOYS, PRANK_TOY_BY_ID, type ToyStateFlag } from './toys.ts'
+  ⇒ 是不可达模块对不可达模块的 import,两边都不可达 ⇒ 运行期边 0
+能否用 vitals.applyHit 承担?⇒ **不能**,而且这个提法本身是第 1 层的误用:
+  两个模块**全是纯函数**(`this` = 0 / 非纯调用 0 / 模块级可变 let = 0)
+  ⇒ 它们**不需要被"承担"**,只需要一个**调用者**
+  而 vitals.applyHit 的生产调用者实测**只有 1 处**
+  (`world_sim.ts:3084` `this.vitals.applyHit(h.attackerId, h.playerId, lv, 1.0, h.distance)`)
+  ⇒ 把玩具挂到它上面,等于**替玩具造一半执行层**,而事件源仍然没有
+⇒ **判 C**(不是 B,也不是 A)
+```
+★ 附带结论:`canLoot`(`raid.ts:428`)的**生产调用点也是 0 处**
+(全仓仅 4 处:1 处定义 + `tests/WS-05.test.ts:18/701/702/703` 的导入与 3 条断言)。
+它是同一族的又一条,但**不要与 afk 真值混为一谈**:那两条是**不同的债** ——
+```
+afk 真值  = 「真值有通路、但生产端没人写它」     ⇒ 修法是接生产端(task-74 已修)
+canLoot  = 「规则实现正确、但**从没被调用过**」  ⇒ 修法是**接调用点**,不是修真值
+```
+⇒ 「同形不等于同因」的又一例(与 `driver.sqlite` / `memory_db` 那条同族)。
+
+**Q3 —— 三条都指向的「对局层 / 对局运行时」是否已在规划里?**
+```
+实测:它**不存在**。但要分开两件事,否则会误判为「只差接线」:
+  ① **线格式已备**(可以被验证为真)
+     scoreA / scoreB / partyTimer 在 schema 与 wire 层都有:
+       server/src/net/schema.colyseus.ts、server/src/net/schema.ts、
+       shared/net/delta.ts、shared/types/wire.ts、client/src/net/state_store.ts
+     ⇒ 客户端**已经能接收**对局分数
+  ② **运行时不存在**(这才是病灶)
+     rush_order.ts  32 函数里 8 个收自定义 runtime 结构
+     modes.ts       31 函数里 23 个收自定义 runtime 结构
+     生产容器:WorldSim 侧 rush|RushOrder|PartyMode|StationRuntime|CrownRuntime
+     |BridgeRun|PaintWar|RelayChain|BeaverRuntime 全部 **0 次命中**;
+     room 侧只有 `partyMode: PartyMode`(`room.ts:780`)这一个**选择**字段,
+     无计分、无 timer、无 runtime
+     setPartyModeBy 只有定义(room.ts:1227),生产调用 **0**
+⇒ 结论:不是「已规划待接线」,而是**要新立运行时**。
+  ⇒ 三条应进「等下一层」,**不是本轴可消**。
+  ⇒ 与 build-wiring 的理由区分:不是「缺宿主」这种**被动等**,
+    而是「缺一整条对局管线」这种**要新写**(C)。
+  ⇒ ★ 而「线格式已备」这一点**很容易被当成「已接了一半」** ——
+    它恰好解释了为什么会有人判 B:看到 wire 层有字段,以为宿主就在旁边。
+     **线格式 ≠ 宿主**;一个是**能传什么**,一个是**谁来算**。
+```
+
+### 五、**这六条里能在 task-47 本轴消掉的实际是几条**
+
+> **0 条。**
+
+六条**全部判 C**。且这个结论与 `build-wiring` 的「4 条全 B」**结论相近、
+判据不同** —— 差别不在结果,在**处置建议**:
+
+```
+按 B 的说法:「等,上游来了就接」      ⇒ 结论是**现在什么都别做**
+按 C 的说法:「要新写一条输入管线」    ⇒ 结论是**这是一个可立项的工作量**(一周)
+```
+
+⇒ 这就是为什么第 3 层不能省:**B 与 C 在本轴的产出相同(都是 0),
+但对下一个执行者给出的信号完全相反** —— 一个让他走开,一个让他排期。
+「本轴消不掉」这句话本身**不充分**;它必须带上「那它靠什么才能消」。
+
+### 六、★ 本分类法的**不适用**之处(主动声明,不硬塞)
+
+有一类情况三分法也套不上,列出以免后来者误用:
+
+```
+1 **结构差集但未被登记为差集的条目**(scoring.ts 是本轮唯一实例)
+   它的实际形态:有 2 个生产 import 者,但**两个引用者自身都不可达**。
+   ⇒ 它既不是 A(没有一根能接的线 —— 引用者先得能跑)、
+     也不是 B(不缺宿主)、也不是 C(不需要新管线)
+   ⇒ 准确定性是「**等它的调用者先能跑**」= **传递性阻塞**,与「缺什么」正交。
+   ★ 关键区别:verify 里**真正被登记**为差集的是 `content/registry.ts`
+     (理由文本含「差集条目」);`scoring.ts` 的理由文本是「待接入」,
+     而 `WL_NON_DEBT_DIFF = /差集/` 是**按理由文本**判的 ⇒ 它落在 `wiring` 桶。
+   ⇒ **散文定义(「有生产引用 ∧ 引用者全不可达」)与操作化判据(理由文本含「差集」)
+     不是一回事** —— 前者是本轮新增的、更准的口径;后者是现行实现。
+     本仓为这件事单独开了一个桶,说明它自成一类这件事**已经被意识到**,
+     但**登记手段仍是靠人写对理由文本**,这正是 scoring.ts 漏网的原因。
+2 **本轴 0 条**这个结论本身**不等于「六条都不该做」**
+   ⇒ A/B/C 分的是「本轴能否消」,不是「有没有价值」
+```
+
+### 七、「我能证明的」vs「我不能证明的」
+
+**能证明的**
+```
+1 六条的生产 import 者数(逐模块实测):rush_order 3(全 import type)/
+  modes 0 / scoring 2(引用者皆不可达)/ immunity 0 / toys 1(引用者不可达)/ afk 0
+2 三个模块的宿主类参数数(toys 1 / immunity 1 / afk 6),且 `this` 全 0、
+  非纯调用全 0、模块级可变 let 全 0
+3 整蛊施加入口按**能力** grep:生产命中 **0**
+4 客户端消息通道确为 4 条,且无 step/touch/prank
+5 rush_order 是「纯类型边」那条 —— `verify.ts` **独立记录**了同一事实
+  (锚文本:`逐条实测后只有 1 条是纯类型边`)
+6 WorldSim 有秒级时间源(`world_sim.ts:3773 get simSeconds()`)与
+  `SIM_SLOW_DT`(`world_sim.ts:240`),且该驱动点在慢帧内
+7 六条里**没有任何一条**有生产调用点:`goBackground` 的生产调用者实测 0
+  (全仓唯一命中是它自己的定义 `afk.ts:99`)
+8 对局**线格式**确实已备而**运行时**确实不存在:
+  `scoreA`/`scoreB`/`partyTimer` 命中 schema/wire/client 五处、
+  `room.ts` 命中 0 处;WorldSim 对局类成员名命中 0
+```
+
+**不能证明的**
+```
+✗ 我**没有**独立复核 Lead 的三层法与陷阱 102 的普遍有效性
+  —— 我只在**这 6 条**上验证了它能给出不矛盾的结论
+✗ 「一周工作量」是 Lead 给的量级,我**没有**做过工时估算
+✗ 我**没有**验证「客户端加一条消息通道」在本仓现有架构下的具体改法
+  (那要动 room.colyseus.ts + client/src/net,不在本轴)
+✗ 我的第 2 层判据按**文件名匹配** import 说明符,
+  故 `export ... from` 重导出形式**可能漏计**(`immunity.ts:15` 是值导入、
+  `:17` 是 `export { SAFE_SHIELD_ITEM_ID } from './toys.ts'` 重导出);
+  我人工核对了这 6 条,但该判据若推广到全仓需先修
+✗ `scripts/data-conformance.ts` 里确有 `await import('../server/src/prank/toys.ts')`
+  这类**运行期**导入(文件头另有 modes 常量比对),我把它归在**脚本侧**、
+  未计入「生产 import 者」——
+  这个归口是**我的选择,不是实测结论**;若把 scripts/ 也算生产,
+  toys/immunity/modes 的计数各 +1,**但 A/B/C 定性不变**
+  (因为 data-conformance 只是读常量做手册比对,不执行玩法逻辑 ——
+   锚文本:`只 import 它的**常量**`)
+```
+
+### 八、这一层与第七层的关系(一句话)
+
+第七层(`afk` 真值全写死)修的是**一条通路**;第八层说明
+**同一族还有 6 条,而它们不是同一个病** ——
+第七层是「有宿主、有消费者、中间那根线断了」(⇒ 那次的修法是 A),
+第八层是「宿主和调用者都没有」(⇒ C)。
+**同一个 `afk` 名字,两处病灶,两种定性** —— 这就是为什么必须先问判据再比证据。
+

@@ -12,6 +12,7 @@
  *   node scripts/verify.ts --strict-taut   # 把「未登记的同义反复候选」升级为失败
  *   node scripts/verify.ts --strict-inert # 入口执行层:未登记项报错
  *   node scripts/verify.ts --strict-reach  # 把「未登记的不可达模块」升级为失败
+ *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(29 用例,约 163s)
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
@@ -469,7 +470,61 @@ const ADVISE_UPGRADE: Record<string, string> = {
   可达性: '--strict-reach',
   同义反复: '--strict-taut',
   入口执行层: '--strict-inert',
+  '门禁自检': '--strict-selfcheck',
 };
+
+/**
+ * ★ task-75:把 `scripts/gate-selfcheck.ts` 接进闸门(此前**从不运行**)。
+ *
+ * ## 修的是什么(实测)
+ *
+ * ```
+ * gate-selfcheck.ts   48300 B / 29 个用例 / 实测 163s / 全绿
+ * 全仓引用它的地方:verify.ts 的**三处注释**
+ *   L1876 / L3176 / L5260 —— 全是「见 gate-selfcheck 的 T35…」这类**行文引用**
+ * ⇒ ⇒ **一处调用都没有。**
+ * ```
+ * ⇒ 即:本仓最大的一份自检资产,**它的红没有任何代价** ——
+ *   它不对任何交付物产生后果,只在有人手动 `npm run verify:selfcheck` 时说话。
+ *   ⇒ 与陷阱 82「不拦门禁的自检脚本,它的红没有代价」**同一条**,只是这次是主门禁漏接。
+ *
+ * ## 为什么默认是**告警**而不是失败
+ *
+ * 163s 的耗时不能塞进每次 `--all` 的关键路径(全量才 14s,它会变成 12 倍)。
+ * ⇒ 默认只跑**一次轻量探测**,确认它「存在且可执行」,并把「本道门禁未纳入默认口径」
+ *   这件事**打印在汇总行里**(而不是假装没有它)。
+ * ⇒ 要真跑它:`--strict-selfcheck`(失败);或 `npm run verify:selfcheck`。
+ *
+ * ★ 为什么不在默认下就"什么都不做":那样汇总行的「全部通过」会**再次变成一个
+ *   不完整的绝对断言** —— 正是上面 `advise()` 那段长注释在防的事。
+ *   故本道门禁**必须**出现在汇总行里,哪怕它默认不跑。
+ */
+async function checkGateSelfcheck(): Promise<void> {
+  console.log('\n[门禁自检]');
+  const script = join(ROOT, 'scripts', 'gate-selfcheck.ts');
+  if (!existsSync(script)) {
+    fail('scripts/gate-selfcheck.ts 不存在 —— 门禁自检这道防线整体缺失');
+    return;
+  }
+  const strict = argv.includes('--strict-selfcheck');
+  if (!strict) {
+    /* 默认:只确认"它在",并把"未纳入默认口径"这件事说清。
+       ⚠️ 不打印 pass() —— 那会让 29 个用例的数字看起来像"已跑过"。 */
+    advise('门禁自检',
+      `scripts/gate-selfcheck.ts(29 用例,约 163s)**未纳入默认口径** —— `
+      + '它的红目前没有代价。加 --strict-selfcheck 才跑它并纳入退出码');
+    return;
+  }
+  const r = spawnSync(process.execPath, [script], { cwd: ROOT, encoding: 'utf8', timeout: 600_000 });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  if (r.status !== 0) {
+    const bad = out.split('\n').filter((l) => l.includes('✗')).slice(0, 10);
+    fail(`门禁自检失败(exit=${r.status}):\n      ${bad.join('\n      ')}`);
+    return;
+  }
+  const m = /(\d+)\s*通过\s*\/\s*(\d+)\s*合计/.exec(out);
+  pass(`门禁自检全部通过(${m ? `${m[1]}/${m[2]}` : '?'})`);
+}
 
 
 /* ───────────────────── 1. 冻结层不变量 ───────────────────── */
@@ -5288,6 +5343,14 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
    ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件",
       而 README 的数字都是**全量**口径 ⇒ 比了必然假红。 */
 if (!frozenOnly && !only) verifyReadmeNumbers();
+
+/* ★ task-75:门禁自检(见 `checkGateSelfcheck` 的长注释)。
+   ⚠️ 位置在 `verifyReadmeNumbers()` **之后**:它默认只 `advise()`,
+      而那行汇总要统计 `advises` ⇒ 必须排在汇总行之前。
+   ⚠️ `--only` / `--frozen` / `--docs` / `--content` / `--integration` 时跳过:
+      那些是**局部口径**,而"门禁自检是否纳入默认口径"是**整体**问题
+      ⇒ 在局部口径里报它会误导(看起来像那道局部门禁出了问题)。 */
+if (!frozenOnly && !only && !docsOnly && !contentOnly && !integrationOnly) await checkGateSelfcheck();
 
 /* ⚠️ 汇总行必须**自报它不覆盖什么**。见 `advise()` 的定义处长注释 ——
    实测过:造一个「新增未登记的不可达模块」后,默认口径仍打「全部通过」退出码 0,
