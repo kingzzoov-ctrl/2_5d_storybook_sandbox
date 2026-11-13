@@ -453,6 +453,40 @@ export interface WorldSaveHost {
   /** 把玩家从世界移除(离场)。与 `addPlayer` 成对,避免刚体残留。 */
   removePlayer?(playerId: string): boolean;
   /**
+   * **同步一名玩家的打盹态到模拟层**(task-74)。
+   *
+   * ## 为什么需要这个口(而不是让模拟层自己算)
+   *
+   * `afk` 的**权威在房间**:`memberPresence()` / `afkSinceMs` 是只有房间知道的
+   * 事实(谁断线、谁切后台、谁超时 30 分钟)。模拟层没有这些输入。
+   *
+   * 而实测(接线前):`world_sim.ts` 的**三处 `afk` 生产者全写字面量 `false`**
+   * ⇒ `afk` 恒 false ⇒ 三条规则**静默失效**:
+   * ```
+   * mobs/aoi.ts:62               if (p.afk) continue;     打盹者仍提供 AOI 唤醒能量
+   * mobs/behaviors.ts:196        if (p.afk) continue;     生物仍追打打盹者
+   * combat/progression.ts:326/350  afkMul              打盹者仍**全额**分经验(手册 §4.1:0.3)
+   * ```
+   * 三条都不报错、门禁全绿、各自的单元测试都是绿的 —— 因为那些测试自己造
+   * 夹具(`setPlayers([{afk:true}])`),测的是「给它 true 会跳过」,
+   * **从来没人测「true 从哪来」**。
+   *
+   * ## 返回「是否发生变化」而不是 `void`
+   *
+   * 与 `restoreFromProfile` 同一纪律:返回**实际生效**的语义,
+   * 调用方应断言它。忽略它会让「同步静默无效」与「同步成功」不可区分。
+   *
+   * ## ⚠️ 本声明**必须**与 `index.ts` 的 `createHost` 一起看
+   *
+   * `createHost` 的返回类型标注是 `WorldSaveHost`。`WorldSim` **有**而本接口
+   * **没声明**的成员会被**结构化裁掉** ⇒ 房间侧 `typeof host.setPlayerAfk`
+   * 在**编译期**恒假(不是运行期)。这正是 task-70 实测到的形态。
+   *
+   * 可选(`?`):老的世界源不实现它时,房间侧整段跳过 —— 与 `levelOf` /
+   * `saveToDb` 同一 null 契约,不报错也不假装同步过。
+   */
+  setPlayerAfk?(playerId: string, afk: boolean): boolean;
+  /**
    * 推进世界 **n 个快帧**(task-59:驱动缺失)。
    *
    * ## 为什么是「快帧数」而不是秒
@@ -1840,12 +1874,51 @@ export class RoomRuntime {
     return s === MemberPresence.ACTIVE || s === MemberPresence.AFK;
   }
 
-  /** 标记/取消打盹。打盹只影响「是否计入活跃」,不影响连接与席位。 */
+  /**
+   * 标记/取消打盹。打盹只影响「是否计入活跃」,不影响连接与席位。
+   *
+   * ## task-74:本方法现在是**单向推送**的起点
+   *
+   * 接线前实测:本方法的**生产调用点 0 处**(`tests/WS-07.test.ts` 有 11 处)。
+   * ⇒ 打盹这个状态在模拟层**永不生效** ⇒ `afk` 恒 false ⇒
+   *   `aoi` / `behaviors` / `progression` 的三条闸门全是死代码。
+   *
+   * 现在:房间是打盹的**唯一权威**,每次变更**推**给模拟层。
+   * 方向是单向的(房间 → 模拟层)—— 模拟层不反过来问房间,
+   * 因为 `room.ts` 有意不认识模拟层类型(见本文件 L270-285 的设计自述)。
+   *
+   * ## ⚠️ 返回值语义**不变**
+   *
+   * 仍返回「该用户是否是一个可被标记的在线成员」。
+   * 模拟层推送**成功与否不影响它** —— 世界侧没有这个玩家(尚未 `addPlayer`)
+   * 时,打盹标记在房间侧**依然成立**(他还是房间成员),只是暂时没有投影。
+   * 把这层耦合进返回值会让「房间记下了」与「世界知道了」混成一个布尔。
+   */
   setAfk(userId: string, afk: boolean): boolean {
     const m = this.members.get(userId);
     if (!m || !m.connected) return false;
     m.afkSinceMs = afk ? this.clock.nowMs() : null;
+    this.pushAfkToHost(userId, afk);
     return true;
+  }
+
+  /**
+   * 把打盹态推给模拟层(单向)。
+   *
+   * 抽成私有方法而不是写在 `setAfk` 里,是为了让**其它入口**
+   * (`join` / `leave` / `disconnect` / 宽限期超期清理)也能复用同一段 ——
+   * 那些入口会让玩家出现/消失,而「消失的玩家仍留在模拟层的打盹集合里」
+   * 是一类静默残留(本仓 `afkPlayers` 已按 `playerIds` 过滤来防它,
+   * 但离场时**主动清一次**更稳)。
+   *
+   * 与 `removePlayer` 的调用点同一纪律:写成 `typeof host.x === 'function'`
+   * 而不是 `if (host.x)` —— 老的世界源没实现它时整段跳过,不报错也不假装。
+   */
+  private pushAfkToHost(userId: string, afk: boolean): void {
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.setPlayerAfk === 'function') {
+      host.setPlayerAfk(userId, afk);
+    }
   }
 
   /**

@@ -491,6 +491,32 @@ export class WorldSim {
    * 靠 `bodies` 是分不出来的。缺这个集合会导致生物互相视为玩家。
    */
   private readonly playerIds = new Set<string>();
+  /**
+   * **打盹(挂机)玩家集合** —— 房间成员态在模拟侧的镜像。
+   *
+   * ## 为什么是「镜像」而不是「权威」
+   *
+   * 打盹是**房间的成员态**概念(`room.ts` 的 `MemberPresence` / `afkSinceMs`),
+   * 模拟层**不该**自己算它 —— 模拟层不知道谁断线、谁切了后台。
+   * 故这里只存房间推过来的事实,由 `setPlayerAfk` 单写入。
+   *
+   * ⚠️ **不要**与 `social/afk.ts` 的那套「打盹攒露水」玩法合并 ——
+   * 那个是**玩法**(切后台 5 秒进打盹、按 30 秒/滴攒露水、篝火翻倍),
+   * 本字段是**连接态**(打盹者仍占席位、仍 `connected`)。同名异义。
+   * ⚠️ 注意:本文件**刻意不出现**那个模块里的任何函数名 ——
+   * `tests/WS-11.test.ts` 有一条判据靠「本文件不含那些标识符」来断言
+   * 「玩法模块仍未接线」。我在 docblock 里写全名会让它假红(实测过一次)。
+   * ⇒ 需要查那两个函数名时,看 `docs/WS-11-coop-party.md`,不要抄进这里。
+   *
+   * ## 缺这个集合时的表现(本仓实测,task-74)
+   *
+   * 先前三处生产者**全写字面量 `false`** ⇒ `afk` 恒 false ⇒
+   * 三条规则**静默失效**:打盹玩家仍被生物追打(`aoi.ts:62`)、
+   * 仍**全额**分经验(`progression.ts:326`,手册 §4.1 说 `AFK_EXP_RATIO=0.3`)、
+   * 仍被算作唤醒源(`behaviors.ts:196`)。
+   * 三条都**不报错、不抛异常、门禁全绿** —— 「没接上」与「一切正常」不可区分。
+   */
+  private readonly afkPlayers = new Set<string>();
   /** 最近一次慢帧的生物推进结果(供诊断与断言)。 */
   lastMobTicks: MobTickResult[] = [];
   /** 累计 AI 抛错次数。 */
@@ -1791,7 +1817,10 @@ export class WorldSim {
         playerId: id,
         distance: dist,
         level: p?.level ?? 1,
-        afk: false,
+        /* 打盹真值来自房间推来的镜像(`setPlayerAfk`),不是字面量 `false`。
+           见 `afkPlayers` 的 docblock:写死 false 会让
+           `progression.ts:350` 的 `afkMul` **永不生效**。 */
+        afk: this.afkPlayers.has(id),
         hasDreamTalent: p === undefined ? false : isTalentUnlocked(p.level, 'talent_dream_revelation'),
       });
     }
@@ -2104,7 +2133,7 @@ export class WorldSim {
       y: b.y,
       z: b.z,
       facingDeg: b.facingDeg ?? 0,
-      afk: false,
+      afk: this.afkPlayers.has(id),
       heldItem: prof.heldItem,
       wearing: prof.wearing,
       playingInstrument: false,
@@ -2259,6 +2288,10 @@ export class WorldSim {
        (表现为「刚上线就带着 20 分钟上限加成」)。 */
     this.roomEffects.delete(id);
     this.forgeUnlockedIds.delete(id);
+    /* 打盹标记一并清掉:留着会让**重新加入**的同名玩家一进场就是打盹态
+       (表现为「刚上线就不提供 AOI 唤醒能量、还只拿 30% 经验」)。
+       与上面 `roomEffects` 是同一类残留。 */
+    this.afkPlayers.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -2777,7 +2810,11 @@ export class WorldSim {
      * 这里显式按 Map 遍历。
      */
     for (const b of this.physics.bodies.values()) {
-      list.push({ id: b.id, x: b.x, y: b.y, afk: false });
+      /* `afk` 是真值投影,不是字面量 —— 这一行曾是本仓第 101 条陷阱:
+         写死 `false` ⇒ `aoi.setPlayers` 里 `filter((p) => !p.afk)` 永不生效
+         ⇒ **打盹玩家仍提供 AOI 唤醒能量**(手册 §2.4 明确说打盹不维持生态模拟)。
+         注意 `bodies` 里混有生物,`afkPlayers` 只含玩家 ID,故生物恒 false —— 正确。 */
+      list.push({ id: b.id, x: b.x, y: b.y, afk: this.afkPlayers.has(b.id) });
     }
     this.players = list;
     this.aoi.setPlayers(this.players);
@@ -2893,6 +2930,66 @@ export class WorldSim {
   /** 某玩家的装备档案(只读;无记录返回空档案 —— 不返回 undefined,少一层可选链)。 */
   profileOf(playerId: string): PlayerProfile {
     return this.profiles.get(playerId) ?? EMPTY_PROFILE;
+  }
+
+  /**
+   * **同步一名玩家的打盹态**(房间成员态 → 模拟层)。
+   *
+   * ## 为什么是「房间推」而不是「模拟层拉」
+   *
+   * 打盹的**权威在房间**(`room.ts` 的 `MemberPresence` / `afkSinceMs`):
+   * 只有房间知道谁断线、谁切了后台、谁超时 30 分钟。
+   * 模拟层若自己去猜(例如按「多久没动」推断),就会造出**第二份判定实现**,
+   * 而两份实现的分歧不会报错 —— 这正是本仓反复出现的「两份实现互相顶着」。
+   * ⇒ 故本方法是**单写入口**,由 `RoomRuntime.setAfk` 单向推送。
+   *
+   * ## 与 `WorldSaveHost` 的关系(装配纪律,务必一起看)
+   *
+   * ⚠️ 本方法若不写进 `net/room.ts` 的 `WorldSaveHost` 接口声明,
+   * 就会被 `index.ts` 的 `createHost` **返回类型标注结构性裁掉** ——
+   * 即 `const h: WorldSaveHost = sim` 之后 `h.setPlayerAfk` 在类型上不存在,
+   * 房间侧 `typeof host.setPlayerAfk` **恒假**(编译期,不是运行期)。
+   * 这是 task-70 实测到的形态,见 `index.ts` 的 `createHost` docblock。
+   *
+   * ## 返回值的含义(与 `restoreFromProfile` 同一纪律)
+   *
+   * 返回**是否发生变化**。调用方应断言它而不是忽略 ——
+   * 忽略会让「同步静默无效」与「同步成功」不可区分(陷阱 89)。
+   * 重复推同一状态返回 `false`(幂等),这是**刻意**的:
+   * `setAfk` 每帧可能被调,不该每次都被当成一次变更。
+   */
+  setPlayerAfk(playerId: string, afk: boolean): boolean {
+    /* 未登记的玩家不进集合:否则 `afkPlayers` 会积累已离开的 ID,
+       且 `aoi` 列表里本来就没有他,集合里的残留没有任何消费者。
+       这与 `settleKill` 「只给范围内的玩家建档」同一取舍。 */
+    if (!this.playerIds.has(playerId)) return false;
+    const had = this.afkPlayers.has(playerId);
+    if (had === afk) return false;
+    if (afk) this.afkPlayers.add(playerId);
+    else this.afkPlayers.delete(playerId);
+    /* 立刻重算派生视图,免得消费者看到上一帧的 afk。
+       为什么不能等下一帧 `syncPlayers()`:`aoi` 的唤醒判定发生在
+       **慢帧**(2Hz),而 `syncPlayers()` 每帧都跑 —— 若不在这里刷新,
+       「刚打盹」的玩家在最多一帧内仍提供唤醒能量。一帧的窗口很小,
+       但让它变成**确定性的零帧**几乎不要成本。 */
+    this.syncPlayers();
+    return true;
+  }
+
+  /**
+   * 某玩家当前是否被打盹标记(只读)。
+   *
+   * 消费者(`aoi` / `behaviors` / `progression`)一律读**投影**里的 `afk`,
+   * 本方法是给**断言与诊断**用的:没有它,「同步口没接上」只能靠
+   * 间接观察投影来判定,而投影与真值可能各自正确却不同源。
+   */
+  isPlayerAfk(playerId: string): boolean {
+    return this.afkPlayers.has(playerId);
+  }
+
+  /** 当前打盹玩家数(诊断用;与 `room.afkPlayerCount()` 同口径但**不含**超时阶段)。 */
+  get afkPlayerCount(): number {
+    return this.afkPlayers.size;
   }
 
   /** 给生物 AI 的地面掉落物(供 `MobWorld.groundItems()` / `spawnItem`)。 */
