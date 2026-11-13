@@ -392,4 +392,51 @@ test('FND11-13 ★ 墓碑防护:生产里仍无人调 setAfk(补上触发源时�
     '对照:应解析出已知的 move/attack 通道,证明上一条不是空集假绿');
 });
 
+/* ═══════════ 7. ★ 第二个消费者:`afkMul` 真的改变经验结算(行为判据) ═══════════ */
+
+/** 跑一次「击杀 → 经验结算」,返回该玩家拿到的总经验。 */
+function expFromKill(afk: boolean): number {
+  const { host, runtime } = assemble({
+    roomId: `r11exp_${afk ? 'afk' : 'awake'}`, ownerId: 'o', clock: fixedClock(), sizeCells: 32,
+  });
+  const sim = host as unknown as {
+    addMob(id: string, biome: string, x: number, y: number): void;
+    damageMob(mobId: string, amount: number, kind: string, fromDeg: number): unknown;
+    progressOf(id: string): { totalExp: number };
+    setPlayerAfk(id: string, afk: boolean): boolean;
+  };
+  runtime.join({ userId: 'p1', passwordHash: null, asGuest: true });
+  /* 从**房间侧**注入(与 FND11-3 同一纪律,不直调模拟层)。 */
+  runtime.setAfk('p1', afk);
+  /* 击杀点 (1,1) 与玩家 (0.5,0.5) 的距离远小于 SHARE_RADIUS=24。 */
+  sim.addMob('mob_sheep', 'plains', 1, 1);
+  /* `damageMob(mobId, amount, kind, fromDeg)` —— 环境伤害直接给数,
+     是**全部**生物伤害的唯一收口(玩家普攻也走它)。 */
+  sim.damageMob('mob_sheep', 99_999, 'PHYSICAL', 0);
+  return sim.progressOf('p1').totalExp;
+}
+
+test('FND11-14 ★ 打盹只拿 30% 经验(第二个消费者,端到端行为判据)', () => {
+  /* 这条是 task-74 验收里「且 progression 的 afkMul 对它生效」那一半。
+     为什么**必须**单独测 AOI 之外:两条消费者走**完全不同的投影** ——
+       aoi 读的是 `this.players`(`syncPlayers` 第一处生产者)
+       progression 读的是 `participants`(`settleKill` 里的第三处生产者)
+     ⇒ 只测 AOI 会漏掉 settleKill 那一处(注入 B 的 3 红里就**没有**这条)。
+     手册 §4.1 / `shared/types/entities.ts`:`AFK_EXP_RATIO = 0.3`。 */
+  const awake = expFromKill(false);
+  const afk = expFromKill(true);
+
+  ok(awake > 0, `对照:清醒玩家击杀应拿到经验(实测 ${awake})`);
+  ok(afk > 0, `打盹玩家仍应拿到**部分**经验(0.3 倍,不是 0;实测 ${afk})`);
+  ok(afk < awake, `★ 打盹应少于清醒(实测 清醒 ${awake} / 打盹 ${afk})`);
+  /* 比值判据:0.3 经逐次取整后会落在 0.3 的一格内。
+     用区间而不是等号 —— 这段是**整数经验**,小样例必然有取整误差
+     (实测 15 → 5 = 0.333)。 */
+  const ratio = afk / awake;
+  ok(ratio >= 0.3 && ratio < 0.5,
+    `★ 比值应落在 0.3 附近(实测 ${ratio.toFixed(3)},期望 [0.3, 0.5))`);
+  /* 反向对照:若 `afk` 真是恒 false,两者必然**相等** —— 这条把它变成红。 */
+  ok(awake !== afk, '★ 若 afk 恒 false,两者会相等 ⇒ 本断言即变红');
+});
+
 report('WS-FND-11');

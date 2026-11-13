@@ -1041,9 +1041,28 @@ Lead 给的判据是:**「缺宿主」与「缺调用点」是两种不同的欠
 | 新增实现 | `WorldSim.setPlayerAfk` / `isPlayerAfk` / `afkPlayerCount`(单写入口) |
 | 推送点 | `RoomRuntime.setAfk` → `pushAfkToHost`(单向,房间 → 模拟层) |
 | 清理点 | `WorldSim.removePlayer` 清 `afkPlayers`(防重进继承上一轮状态) |
-| 新增套件 | `tests/WS-FND-11-afk.test.ts`,**13 条**,13/13 绿 |
-| 故障注入 | A 撤销推送 ⇒ **6 红**(基线绿);B 只还原 AOI 一处生产者 ⇒ **恰 3 红**(逐条区分力);C 删接口声明 ⇒ **恰 1 红**;D 伪造一个触发源 ⇒ **恰 1 红**(墓碑防护有牙) |
-| 还原核对 | 四处注入全部 SHA-256 逐字节一致,`INJECT-*` 残留 0 |
+| 新增套件 | `tests/WS-FND-11-afk.test.ts`,**14 条**,14/14 绿 |
+| 故障注入 | A 撤销推送 ⇒ **6 红**;B 还原 AOI 生产者 ⇒ **恰 3 红**;C 删接口声明 ⇒ **恰 1 红**;D 伪造触发源 ⇒ **恰 1 红**(墓碑防护有牙);E 还原 `settleKill` 生产者 ⇒ **恰 2 红**(含经验那条) |
+| 还原核对 | 五处注入全部与已提交基线**逐字节一致**(`git diff HEAD` 零输出),`INJECT-*` 残留 0 |
+
+### ★ 两个消费者必须**分开**测(它们在 `syncPlayers` 之外)
+
+`afk` 有两条**互不相干**的投影链,只测一条会漏掉另一条:
+
+| 消费者 | 读的是哪一处生产者 | 注入 B 会红吗 | 注入 E 会红吗 |
+| :--- | :--- | :---: | :---: |
+| `aoi` / `behaviors`(唤醒能量) | `syncPlayers` 的 `AoiPlayer` 列表 | ✅ | ✗ |
+| `progression` 的 `afkMul`(经验) | `settleKill` 的 `participants` | ✗ | ✅ |
+
+⇒ **实测数值**(端到端,走 `assemble`):
+```
+清醒  玩家击杀 mob_sheep ⇒ totalExp = 15
+打盹  玩家击杀 mob_sheep ⇒ totalExp =  5   (比值 0.333,对应 AFK_EXP_RATIO=0.3 + 取整)
+注入 E(把 settleKill 那处改回 false)⇒ 两者都变 15 ⇒ FND11-14 变红
+```
+★ 比值判据用**区间** `[0.3, 0.5)` 而不是等号 —— 这段是整数经验,
+  小样例必然有取整误差(实测 15→5 = 0.333 而非 0.300)。
+  写成等号会让断言在**正确的实现**上变红。
 
 ### ★ 墓碑防护:把「未做项」钉成一条**会红的**断言
 
