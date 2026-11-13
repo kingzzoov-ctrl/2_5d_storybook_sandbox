@@ -20,6 +20,10 @@ import {
 import {
   WorldGrid, digToDeep, isCanalIntake, findCanalIntakes, DIR_VECTORS, DIR_NAMES, CanalResult,
 } from '../server/src/world/grid.ts';
+/* task-80:建造层的 `TileGrid`/`EMPTY_TILE` 现在是世界层的消费方(唯一事实源)。
+   这条 import 同时也是「两层共享同一个空值」的**编译期**证据 ——
+   若 build 侧重新定义第二份字面量,下面那条 eq 会红。 */
+import { TileGrid, EMPTY_TILE as BUILD_EMPTY_TILE } from '../server/src/build/grid.ts';
 import {
   FluidField, FluidKind, fluidKindOfBase, baseOfFluidKind, VISCOSITY_FLOW,
   CAP, PHASE_MIN_AMOUNT, OBSIDIAN_ID, PUMICE_ID, FLUID_CELL_BUDGET,
@@ -88,6 +92,39 @@ test('Chunk 构造:256 格 Uint32Array 且初始为空格', () => {
   eq(c.get(0, 0), EMPTY_TILE, '左上角为空格');
   eq(c.get(15, 15), EMPTY_TILE, '右下角为空格');
   eq(c.getRoof(0, 0), 0, '屋顶层初始为空');
+
+  /* ★ task-80:「空格」的高度必须是**可走的地面**,不是深沟。
+     此前 `build/grid.ts` 与 `world/chunk.ts` 各有一份同名 `EMPTY_TILE`,
+     值为 0(elev=0 DEEP)与 1(elev=1 GROUND)—— 两处都是「越界读的返回值」,
+     于是同一个「空」在两层意味着不同高度。elev 差 1 有物理后果:
+     `physics/world.ts` 的地面高度是 `groundZ = elev - 1`。
+
+     这里断言的是**语义**(空 = 地面),不是字面量 ——
+     若有人把 EMPTY_TILE 改回 elev=0,这条会红,且红在「掉进坑」这个后果上。 */
+  const emptyFields = unpackTile(EMPTY_TILE);
+  eq(
+    emptyFields.elev,
+    Elevation.GROUND,
+    '空格的海拔必须是 GROUND(Z0 地面)—— elev=0 会让空格变成 Z-1 深沟',
+  );
+  eq(emptyFields.elev - 1, 0, '空格的地面高度 groundZ 必须是 0(groundZ = elev − 1)');
+  /* 空格的其余位必须真的是「空」,否则「空格」会带上物体/暗线 */
+  eq(emptyFields.obj, 0, '空格无物体');
+  eq(emptyFields.base, BaseFluid.VOID, '空格基底为 VOID');
+  eq(emptyFields.floor, 0, '空格无铺装');
+  eq(emptyFields.wire, 0, '空格无暗线');
+
+  /* ★ task-80:钉住「只保留一处定义」。
+     只断言「两个值相等」是不够的 —— 那样把两处都改成同一个字面量也能过,
+     而**重复定义本身就是根因**(下一个人还会改漂)。这里改为断言
+     `build/grid.ts` 的 EMPTY_TILE 与 `world/chunk.ts` 的 EMPTY_TILE
+     **是同一个值**,且它们的来源是**同一个模块**(前者 re-export 后者)。
+     实测过的漂移:两处各写一遍字面量 → 值差 1 → 蓝图越界区把世界挖成深沟。 */
+  eq(
+    BUILD_EMPTY_TILE,
+    EMPTY_TILE,
+    'build/grid.ts 的 EMPTY_TILE 必须与 world/chunk.ts 的一致(唯一事实源)',
+  );
 });
 
 test('get/set/withCell 与索引公式一致', () => {

@@ -339,6 +339,52 @@ total() + totalConsumedByPhase + totalConsumedLava === 初始总量
 | 网络抖动/丢包 | 幂等:同一 `serialize()` 反复发送结果一致;恢复靠 `deserialize` 全量重建,不依赖增量 |
 | 断线重连 | 服务端持 `WorldGrid`,客户端全量拉取分片即可;`serializeSnapshot()` 保屋顶层与位图用于本地回滚 |
 
+### 7.1 「虚空默认格」的高度 = Z0 地面,且只有一处定义(task-80)
+
+`EMPTY_TILE`(虚空/越界默认格)的**唯一事实源在本模块的 `world/chunk.ts`**,
+值为 `elev = Elevation.GROUND`(即 Z0 地面,`groundZ = elev − 1 = 0`)。
+
+建造层 `build/grid.ts` 不再自己定义第二份,而是
+`import { EMPTY_TILE } from '../world/chunk.ts'` 后 `export { EMPTY_TILE }`
+(re-export 保持 `TileGridLike` 的越界契约对外不变)。
+
+**为什么 elev 默认值不能是 0(必须取证,不能猜)**:
+
+| 旁证 | 位置 | 说明 |
+| :--- | :--- | :--- |
+| 地面高度公式 | `physics/world.ts` | `该格地面高度 z = elev - 1`,故 `elev=0` ⇒ **Z-1 深沟**、`elev=1` ⇒ Z0 |
+| 物理测试桩 | `physics/world.ts` 的 `FLAT_TERRAIN` | `elevAt: () => 1` —— 无地形时**假定 Z0 地面** |
+| 分片构造 | `Chunk` 构造函数 | 未写格填充 `EMPTY_TILE`(elev=1)⇒ 新建分片即平地 |
+| 演示世界 | `verify.ts` 建世界用 | `fillRect(8, 8, 39, 39, { floor: 1, elev: 1 })` |
+| 深沟的产生方式 | `world/grid.ts` 的 `digToDeep` | **显式**写 `{ elev: Elevation.DEEP }` ⇒ DEEP 必须是「主动挖的结果」,不能是「没数据时的默认」 |
+
+**改前的实测后果**(修复前两层各写一份字面量,值为 0 与 1):
+
+```
+captureBlueprint(收建造层 TileGrid)  越界/未写格 → 蓝图 elev=0(DEEP)
+  ↓ buildRelayQueue        每格一个任务(含 255 个空格任务)
+  ↓ WorldSim.startRelay → tickRelay   把 t.elev 写回世界
+  ↓ this.setCell(x, y, { elev: t.elev })
+实测:一张空的 16×16 蓝图把 256 格全挖成深沟;
+      世界格 (3,3) 从 elev=1(groundZ 0)变成 elev=0(groundZ −1)
+```
+
+**钉住它的断言**(防再漂):
+
+- `tests/WS-01.test.ts` 的 `Chunk 构造:...` 一条:
+  断言 `EMPTY_TILE.elev === Elevation.GROUND`、`groundZ === 0`,
+  并断言 `build/grid.ts` 的 `EMPTY_TILE` 与 `world/chunk.ts` 的**相等**
+  (只断言「两处值相同」不够 —— 那允许把两处都写成同一个字面量,
+  而**重复定义本身**才是根因)。
+- `tests/WS-03.test.ts` 的 `WT-03-60` 一条:
+  用生产函数 `captureBlueprint` 从一张**全未写**的建造层 `TileGrid` 描图,
+  断言描出的空格 `elev === Elevation.GROUND`;并断言蓝图接力
+  **不改动**落格处的地面高度。
+
+两条断言都做过故障注入验证(注入后各自变红):
+注入 ①`EMPTY_TILE` 改回 `elev=DEEP` ⇒ WS-01 47/50、WS-03 88/89;
+注入 ②只在建造层恢复第二份定义 ⇒ WS-01 49/50、WS-03 88/89。
+
 ---
 
 ## 8. 与其它子系统的耦合点

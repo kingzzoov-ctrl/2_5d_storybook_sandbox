@@ -80,9 +80,57 @@ export function walkTs(dir: string = ROOT): WalkResult {
   return { files, excluded };
 }
 
-/** 生产文件(server|client|shared 的 src 下)。 */
+/** 生产文件(`server/` · `client/` · `shared/` 下,**每条链只认「一层目录名」没有硬编码 `src/`**)。
+ *
+ * ## ★ 这里修过一次(2026-11-14),原因是**我自己的规则形状错了**
+ *
+ * 原文:
+ * ```
+ * return /^(server|client|shared)\/src\//.test(...)
+ * ```
+ * 而实测目录形状是:
+ * ```
+ * server/src/                 ← 有 src
+ * client/src/                 ← 有 src
+ * shared/constants/  shared/contracts/  shared/net/  shared/testing/  shared/types/
+ *                             ↑ ★ shared/ **没有 src/ 层**
+ * ```
+ * ⇒ `/^shared\/src\//` **永远匹配 0 个** ⇒ 整棵 `shared/`(10 个 .ts)被**静默排除**,
+ *   分母从 98 变成 88 —— 而 88 看起来完全正常,所以**一直没人发现**。
+ *
+ * ★★ 这是陷阱 110 的**同族新实例,但方向相反**:
+ * ```
+ * 陷阱 110:排除规则按**裸目录名** `build` 匹配 ⇒ 误排除源码目录 server/src/build/(5 个)
+ * 本条    :包含规则写死 `shared` + `src` + `/` 三截拼接 ⇒ 误排除整棵 shared/(10 个)
+ *           (⚠️ 原文本想强调 `src` 那一层,但把星级括号紧贴斜杠会拼出 `*`+`/`
+ *            而**提前关闭块注释** —— 本仓第三次踩这个坑,故此处改写为文字描述)
+ * ⇒ 共同点:规则用了一个**与「是不是生产源」无关的判据**
+ *           (110 用的是"目录叫不叫 build";本条用的是"有没有 src 层")
+ * ```
+ * ⇒ ★ 判据:**修"排除/包含规则"时要问「这条规则还会误伤谁」** ——
+ *   只修被报告的那一例,下一例会以同样形状等着。
+ *   (上次我修好了 `build/`,而**同一条思路的另一个受害者还在**,就是本条。)
+ *
+ * ## 修正后的口径:三个顶层目录下的 `.ts` 都算生产候选
+ * 依据(与 `scripts/orphan-audit.ts` 的 `PROD_DIRS` 对齐,也与 `verify.ts` 的 prodDirs 对齐):
+ * ```
+ * orphan-audit.ts  PROD_DIRS = ['server/src','client/src','shared']   ← 整棵 shared
+ * verify.ts        prodDirs  = ['server/src','client/src','shared']   ← 同一口径
+ * ⇒ 此前 88 是**唯一异类**,而"多数一致"不是理由 ——
+ *   理由是那 10 个文件里 9 个被生产侧大量 import
+ *   (`shared/types/tile.ts` 被 24 个文件 import、`items.ts` 19 个、`entities.ts` 18 个),
+ *   它们**显然是生产源**,不该被排除在分母外。
+ * ```
+ * ⚠️ `shared/testing/harness.ts` 也被算进来(它是测试基础设施)。
+ *    这是**刻意的**:分母是"生产候选",而"它生产零引用是否合理"由
+ *    `verify.ts` 的 `UNREACHABLE_EXEMPT` / `orphan-audit.ts` 的 `ORPHAN_KNOWN` **分表登记**。
+ *    ⇒ 分母与白名单是两件事:分母要**宽**(不能漏),白名单要**严**(每条给理由)。
+ */
 export function isProd(f: string): boolean {
-  return /^(server|client|shared)\/src\//.test(relative(ROOT, f).split(sep).join('/'));
+  const rel = relative(ROOT, f).split(sep).join('/');
+  /* 只按**顶层目录名**判定,不再要求第二层叫 `src` ——
+     因为 `shared/` 的第二层是 domains(constants/net/testing/types),不叫 src。 */
+  return /^(server|client|shared)\//.test(rel);
 }
 
 /** 相对路径(统一 `/`)。 */
@@ -99,7 +147,7 @@ if (process.argv[1]?.endsWith('ts-paths.ts')) {
 
   console.log('══ 分母(本仓唯一权威遍历器)══');
   console.log(`   全部 .ts : ${files.length}`);
-  console.log(`   生产     : ${prod.length}  (server/client/shared 的 src 下)`);
+  console.log(`   生产     : ${prod.length}  (server/ · client/ · shared/ 三个顶层目录下的全部 .ts)`);
   console.log(`   tests/   : ${tests.length}`);
   console.log(`   scripts/ : ${scripts.length}`);
 

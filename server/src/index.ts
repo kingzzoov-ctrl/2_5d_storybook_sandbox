@@ -45,7 +45,45 @@
  *
  * ⇒ 本入口**刻意只装到 `RoomRuntime` 这一层**,不依赖 Colyseus 包。
  *   于是「世界被装进运行时」这件事今天就能被**加载、构造、断言**。
- *   房间那一层(把 rtOpts 交给 colyseus 壳)等 CR 裁决后,只需在此加一行转发。
+ *
+ * ## ⚠️ 但「本文件能装」≠「生产链装上了」——本仓有**两条**装配路径(task-76)
+ *
+ * 本文件是 **A 路**;另一条是 **B 路**:`./net/room.colyseus.ts` 的 `onCreate`。
+ * 两者各写一份 `rtOpts`、各自 `new RoomRuntime(...)`,而**只有 A 路真接上 host**:
+ *
+ * ```
+ * A 路 本文件 assemble()             rtOpts.host = host         ★ 已接上 ✓
+ * B 路 room.colyseus.ts:onCreate()   rtOpts.host = this.deps?.host ?? null
+ *      而 deps 只由 room.withDeps(deps) 注入
+ *      ⇒ `git grep withDeps` 调用点 **0 处** ⇒ B 路 host **恒为 null** ★ 未交付
+ * ```
+ *
+ * ⚠️ 所以「生产装配路径已存在 / host 不再是恒 null」这句话**必须带口径** ——
+ *   它对 A 路成立,对 B 路不成立;台面上写成一句就是**过度声称**。
+ *
+ * ⚠️ 而「把 B 路接上」**不是加一行转发**:本文件一旦 import 本行的
+ *   `./net/room.colyseus.ts`(**任何**形式,哪怕只为复用装配),本文件立刻
+ *   变成**不可加载**(实测,见下节第 2 条),而它是 `PROD_ENTRIES` 成员
+ *   ⇒ 门禁的「入口可加载性」当场红。
+ *   ⇒ 故 B 路的接法与「在 A 路里复用」互斥;这正是它仍挂着 CR 的原因。
+ *
+ * ## 为什么不直接 import `./net/room.colyseus.ts`
+ *
+ * 它**当前无法被 Node 加载**,有两个独立原因(均已实测):
+ *
+ * 1. 命名导入自 CommonJS:`import { Room, Client } from 'colyseus'` →
+ *    `SyntaxError: Named export 'Client' not found.`
+ * 2. 传递依赖 `./net/schema.colyseus.ts` 含 **44** 处 `@type` 装饰器
+ *    (Colyseus 运行时必需,而 Node strip-only 无法擦除装饰器)
+ *
+ * ★ task-76 实测(把第 2 条从「据说」变成「量过」):构造一个只做
+ *   `import './server/src/net/room.colyseus.ts'` 的临时模块,用 `verify.ts`
+ *   `entryLoadable()` **同一判据**跑子进程:
+ * ```
+ * 基线 index.ts 本身            ⇒ ✓ 可加载
+ * 闭包里多一个 room.colyseus.ts ⇒ ★ SyntaxError: Invalid or unexpected token
+ * ```
+ *   ⇒ 即「不可加载」这件事**会经由 import 边传染给 A 路**,不是只影响 B 路自己。
  *
  * ## 可擦除语法铁律(本仓)
  *
@@ -104,6 +142,29 @@ export interface AssembleDeps {
   accessMode?: AccessMode;
   passwordHash?: string | null;
   maxPlayers?: number;
+  /**
+   * 世界随机种子 —— **房间参数**,由 `rtOpts` 承载,不传给 `WorldSim`。
+   *
+   * ## 本字段是 task-76 补上的,补的是一个**静默失效**
+   *
+   * 接线前的实测:`assemble()` 的 `rtOpts` 里写着 `worldSeed: deps.worldSeed`(L174),
+   * 而 `AssembleDeps` **没有** `worldSeed` 这个键。两个后果:
+   *
+   * ```
+   * 1 类型层:`tsc --noEmit` 报 TS2339 `Property 'worldSeed' does not exist`
+   *    ⇒ 但本仓用 Node 原生类型擦除,**不做类型检查** ⇒ 这条错误从不生效;
+   * 2 运行层:调用方传 `assemble({ worldSeed: 7 })`,那 7 **确实**流进了
+   *    `rtOpts.worldSeed` —— 因为对象字面量的键在运行期不看类型。
+   * ```
+   *
+   * ⇒ 这不是「坏了」,而是「**类型与实现不一致**」:类型说没有,实现说有,
+   *   于是任何**按类型**书写的调用方(以及 IDE 补全)都不会想到可以传种子,
+   *   而 `tests/WS-FND-09-wiring.test.ts` 的 FND9-9 一直在传 —— 它踩得到,
+   *   只是因为传的是**多余键**,类型擦除后无害。
+   * ⇒ 补上声明后,类型与实现一致;这条也是「类型擦除仓里,类型错误
+   *   只能靠 `npm run typecheck`(可选步骤)发现」的一个实例。
+   */
+  worldSeed?: number;
 }
 
 /** `assemble()` 的产物。`rtOpts` 可直接喂给 `new RoomRuntime(...)`。 */

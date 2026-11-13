@@ -51,7 +51,42 @@ export function patchEnabled(): boolean {
 export interface NetPersistRoomOptions {
   clock: { nowMs: () => number };
   db: DbLike | null;
-  registryOwnerId: string;
+  /**
+   * 房主(玩家)id —— 喂给 `RoomRuntimeOptions.ownerId`,用于权限判定。
+   *
+   * ★ task-76 订正:本字段**此前叫 `registryOwnerId`**,已改名为 `ownerId`。
+   *
+   * ## 为什么改名:同一语义字段不能有两个名字
+   *
+   * 两条装配路径都在给**同一个契约字段** `RoomRuntimeOptions.ownerId` 赋值:
+   * ```
+   * A 路 index.ts:191        ownerId: deps.ownerId ?? 'u_owner'
+   * B 路 room.colyseus.ts    ownerId: this.deps?.registryOwnerId ?? 'u_owner'
+   *                                              ^^^^^^^^^^^^^^^ 名字不同
+   * ```
+   * 判据是「同一语义字段,两个来源,必有一处是错的 —— 除非它们本就是两件事」。
+   * 实测它们**就是同一件事**,三条证据:
+   * ```
+   * 1 两者最终都落进 `new RoomRuntime(rtOpts, …)` 的同一个键 `ownerId`
+   *   (room.ts:277 声明;room.ts:825 `this.ownerId = opts.ownerId`);
+   * 2 该值用途唯一:room.ts:966 `input.userId === this.ownerId` ⇒ 判 OWNER 角色,
+   *   以及 :1187/:1202 的两条「不能改房主 / 不能踢房主」—— 都是**玩家**身份;
+   * 3 `bootstrap()`(room.ts:2151-2156)拿 ownerId 去 `createUser(db, {id: ownerId})`
+   *   ⇒ 它就是一个**用户 id**,不是「注册表的运维者」。
+   * ```
+   * ## 为什么 `registryOwnerId` 是**误导**而非「另一种说法」
+   * ```
+   * `RoomRegistry` 自身**没有** ownerId 字段 —— 它的 options 只有
+   *   clock / db / onEvict(room.ts:2076-2081),内部存 Map<string, RoomRuntime>;
+   * ownerId 是 `registry.create({roomId, ownerId})` 的**入参**,
+   *   随即原样转交 RoomRuntime ⇒ 它始终是**房间的** ownerId。
+   * ```
+   * ⇒ 名字里的 `registry` 暗示「注册表层特有的 owner」,而**并不存在**那样东西。
+   *   全仓 `registryOwnerId` 只有 2 处(本文件的声明与使用),`withDeps` 调用点 0 处
+   *   ⇒ 改名不触及任何调用方(零风险),且让两条路的字段名**逐字相等** ——
+   *   这正是 FND9-9 对 `rtOpts` 键集要求的同一条纪律。
+   */
+  ownerId: string;
   /**
    * 世界源(US2 装配位)。**由调用方构造**并传进来。
    *
@@ -62,13 +97,30 @@ export interface NetPersistRoomOptions {
    * `import './room.ts'`。若改成 import `WorldSim` 类型,就等于在装配层
    * 硬绑模拟层,并把 `scripts/backlog.ts` 的 US2 探针**误报为已开**。
    *
-   * ## ⚠️ 目前**没有生产调用方构造它**
+   * ## ⚠️ 目前**没有生产调用方构造它**(task-76 订正:此段此前说错了)
    *
-   * `server/src/index.ts` **不存在**(`gameServerConfig` 的 docstring 说
-   * 「由 server/src/index.ts 调用」,但该文件全仓不存在)。
-   * ⇒ 本参数**通了,但生产里传的是 `undefined`** ⇒ `host` 保持 null。
-   * ## 这**不算**「接线完成**」**:契约已正确 + 有装配位,**但没人构造 host**。
-   * 补法是新建 `server/src/index.ts`(既有缺口,非本任务引入)。
+   * 此段原文写「`server/src/index.ts` **不存在**」—— **那句早已过期**:
+   * `index.ts` 已由 task-57 补出(`createHost` / `assemble` / `createServer`)。
+   * 但**结论仍然成立**,而且理由变了 —— 这是本条最值得记住的地方:
+   *
+   * ```
+   * task-57 之前:index.ts 不存在 ⇒ 没有任何东西能构造 host
+   * task-57 之后:index.ts 存在,但它**不经过本文件** ——
+   *              它自己 `new RoomRuntime(rtOpts, db)`(index.ts:181),
+   *              与本文件是**两条平行的装配路径**
+   * ```
+   *
+   * ⇒ 故本参数在生产里**依然**是 `undefined` ⇒ `host` 依然保持 null。
+   *   本文件的 `deps` 只由 `withDeps(deps)` 注入,而全仓 `withDeps`
+   *   的调用点 **0 处**(唯一疑似是 L272 的注释)。
+   *
+   * ⇒ ★ 教训:一句「因为 X 所以 Y」里,**X 会过期而 Y 未必过期**。
+   *   只删过期的 X 而不复核 Y,会把一条仍然正确的警告连带删掉。
+   *   正确做法是**换掉论据并保留结论**(如上)。
+   *
+   * ## 这**不算**「接线完成」:契约已正确 + 有装配位,**但没人构造 host**。
+   * 补法是在部署层调 `room.withDeps({ ...deps, host })`,
+   * 或让本文件改为复用 `index.ts` 的 `assemble()`(见 `docs/TASK47-*` 的 CR 待裁)。
    */
   host?: WorldSaveHost | null;
 }
@@ -94,18 +146,48 @@ export class NetPersistRoom extends Room<RoomSchema> {
     this.setState(new RoomSchema());
 
     /* 单通道:关掉 Colyseus 的自动 patch 定时器。
-     * `patchRate = null` 是 Colyseus 关闭状态自动同步的官方开关 ——
-     * 之后 Schema 的变更仍会记录,但不会周期性下发。 */
+     *
+     * ★ task-76 实测订正:`this.patchRate = null` **关不掉**。
+     *   此前这里写的是**直接赋属性**,并注释说它是「官方开关」—— 两句都不对。
+     *
+     * ## 实测(读 @colyseus/core 0.15.57 的 build/Room.js)
+     *
+     * ```
+     * constructor L84       this.setPatchRate(this.patchRate)   ← patchRate 默认 50ms
+     *                       ⇒ setPatchRate 内部 setInterval(broadcastPatch, 50)
+     * setPatchRate  L177    this.patchRate = milliseconds;
+     *               L179    if (this._patchInterval) { clearInterval(...); _patchInterval = undefined }
+     *               L183    if (ms !== null && ms !== 0) { _patchInterval = setInterval(...) }
+     * broadcastPatch L267   **完全不读 this.patchRate**
+     * ```
+     *
+     * ⇒ 「关掉」这件事**只发生在 `setPatchRate` 内部的 clearInterval**。
+     *   直接写 `this.patchRate = null` 只是改了个**没有被读的字段**,
+     *   构造器建的那个 50ms 定时器**继续跑**,照旧周期性调 `broadcastPatch()`。
+     *
+     * ## 运行期证据(探针 `_t76_timer.ts`,子类覆写 `broadcastPatch` 计数)
+     *
+     * ```
+     * A 组 直接赋 patchRate = null    : 260ms 内 broadcastPatch 被调 4 次  ★ 没关掉
+     * B 组 setPatchRate(null)(官方)   : 260ms 内被调 0 次                  ✓ 真关掉
+     * C 组 完全不碰(默认 50ms)       : 260ms 内被调 4 次  ← 与 A 组同值
+     * ```
+     *
+     * ⇒ C 组与 A 组**同为 4 次**是这条证据的关键:它说明 A 组的定时器
+     *   与「根本没关」的运行状态**无法区分**。若不实测,只看 `patchRate` 字段
+     *   变没变(它确实变成了 null),会得出「已关闭」的相反结论。
+     *
+     * ⇒ 故这里改为调用官方关闭入口 `setPatchRate(null)`。 */
     if (!patchEnabled()) {
-      this.patchRate = null;
+      this.setPatchRate(null);
     } else {
-      this.patchRate = DT * 1000;
+      this.setPatchRate(DT * 1000);
     }
 
     const roomId = options.roomId ?? this.roomId;
     const rtOpts: RoomRuntimeOptions = {
       roomId,
-      ownerId: this.deps?.registryOwnerId ?? 'u_owner',
+      ownerId: this.deps?.ownerId ?? 'u_owner',
       clock: this.deps?.clock ?? { nowMs: () => Date.now() },
       name: options.name,
       accessMode: options.accessMode ?? AccessMode.PUBLIC,
@@ -113,10 +195,12 @@ export class NetPersistRoom extends Room<RoomSchema> {
       maxPlayers: this.maxClients,
       worldSeed: options.worldSeed,
       /* US2 装配位:世界源经构造参传入。
-         ⚠️ `this.deps?.host ?? null` —— 今天 `server/src/index.ts` 不存在,
-         所以 `deps` 由谁注入仍是开的;此处**通了但传 null**。
+         ⚠️ `this.deps?.host ?? null` —— `deps` 全仓**无人注入**
+         (grep withDeps ⇒ 调用点 0),故生产里此处**恒为 null**。
+         (task-76 订正:原注释把原因写成「index.ts 不存在」,该文件已存在;
+          但结论成立,因为 index.ts 走的是**另一条**装配路径,不经本文件。)
          不谎报:null 时 `saveToDb`/`levelOf`/`attackMobAuthorized` 三处
-         整段跳过(由 `tests/WS-07.ts` 的 K1 断言钉住)。 */
+         整段跳过(由 `tests/WS-07.test.ts` 的 K1 断言钉住)。 */
       host: this.deps?.host ?? null,
     };
     this.runtime = new RoomRuntime(rtOpts, this.deps?.db ?? null);
@@ -165,9 +249,14 @@ export class NetPersistRoom extends Room<RoomSchema> {
     if (packet.length > 0) this.broadcast('delta', packet);
 
     /* Schema 始终与权威状态保持同步 —— 这一步**无条件执行**。
-     * 是否把它的变更下发到网络,由 `patchRate` 决定(见 onCreate):
-     * 单通道模式下 `patchRate = null`,于是 Schema 只作为服务端自省
-     * 与调试出口,不产生任何下行流量。 */
+     *
+     * 是否把它的变更下发到网络,由 patch **定时器**决定(见 onCreate):
+     * 单通道模式下已调 `setPatchRate(null)` 把定时器清掉,于是 Schema 只作为
+     * 服务端自省与调试出口,不产生任何下行流量。
+     * ⚠️ task-76 订正:此处原写「由 `patchRate` 决定」并据此认为赋值即可 ——
+     *   实测 `broadcastPatch()` **不读** `patchRate`(见 onCreate 的长注释),
+     *   真正决定「有没有定时器」的是 `_patchInterval`。
+     *   ⇒ 措辞按**机制**写,不按字段名写。 */
     this.schema().syncFrom(this.lastBroadcastState);
 
     const violations = this.runtime.drainViolations();
@@ -248,15 +337,23 @@ export class NetPersistRoom extends Room<RoomSchema> {
 }
 
 /**
- * 注册到 Colyseus 的服务端入口辅助(由 `server/src/index.ts` 调用 ——
- * ⚠️ 该文件**当前不存在**,见 `NetPersistRoomOptions.host` 的说明)。
+ * 注册到 Colyseus 的服务端入口辅助(**全仓无调用方**)。
+ *
+ * ⚠️ task-76 订正:原文写「由 `server/src/index.ts` 调用 —— 该文件**当前不存在**」。
+ * 两句**都已过期**:`index.ts` 已由 task-57 补出;而它**并不调用本函数**
+ * (它直接 `new RoomRuntime(...)`,即 A 路)。⇒ 本函数仍无调用方,
+ * 但原因从「没人写调用者」变成了「**有两条路,而选中的是另一条**」。
  *
  * ⚠️ `deps` 在这里**无法转交给房间**:`server.define` 只登记构造器,
  * 实例化时由 Colyseus 调 `onCreate`,没有任何地方能把 `deps` 递给它。
  * 原实现因此写了 `void deps`(**丢弃**)。保留这个参数是给将来
- * `index.ts` 一个统一注入点,但**它现在确实什么都没做** ——
+ * 一个统一注入点,但**它现在确实什么都没做** ——
  * 不写 `void deps` 会让读者以为它被用上了。
  * 真正的注入路径是 `room.withDeps(deps)`(见那里的注释)。
+ *
+ * ⚠️ 而 `withDeps` 本身也**无调用方** ⇒ 两条路合起来说明:
+ *    **host 在 B 路恒为 null 的根因是「整条 B 路无人装配」**,
+ *    不是「少了一行转发」。详见 `docs/TASK47-*` 与 `NetPersistRoomOptions.host`。
  */
 export function gameServerConfig(deps: NetPersistRoomOptions): {
   initializeGameServer: (server: { define: (name: string, handler: unknown) => void }) => void;

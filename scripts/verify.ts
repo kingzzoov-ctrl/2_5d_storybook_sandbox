@@ -3180,9 +3180,38 @@ const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([
              onCreate 里 `host: this.deps?.host ?? null`(通了但传 null);
              gameServerConfig 改成回传 deps;
              **build-wiring 已补出 server/src/index.ts**(createHost / assemble / createServer)
-             ⇒ 生产装配路径**已存在**,host **不再是恒 null**。
+             ⇒ ★ **A 路**的生产装配路径已存在,host 不再是恒 null。
        ```
-       ⇒ 所以本段旧结论「生产里 worldSaveHost 恒为 null」**已不成立**。task-57 已交付。
+
+       ⚠️ **[2026-11-14 task-76 二次修订] 上面那行「已存在」**只对 A 路成立** ——
+       本仓有**两条**装配路径,把它们写成一句会**过度声称**:
+       ```
+       A 路 server/src/index.ts 的 assemble()
+            ⇒ new RoomRuntime(rtOpts, db)   rtOpts 里 `host: host`  ★ 真接上 ✓
+       B 路 server/src/net/room.colyseus.ts 的 onCreate()
+            ⇒ new RoomRuntime(rtOpts, …)   rtOpts 里 `host: this.deps?.host ?? null`
+            ⇒ 而 deps 只由 `withDeps(deps)` 注入,**全仓调用点 0 处**
+              (git grep withDeps ⇒ 只有 :129 的定义与 :272 的注释)
+            ⇒ ★ 真服务端入口链上 host **仍然恒为 null** —— 未交付
+       ```
+       ⇒ 正确陈述是**分口径**的:`生产装配路径已存在` 这句话必须带上「哪条路」。
+         台面上不可简化成一句 —— 因为两条路的结论**相反**。
+
+       ⚠️ 而 task-76 顺带实测出一处**更早、更隐蔽**的问题(它与接线无关,现在就在发生):
+       ```
+       room.colyseus.ts 的 onCreate 里,关 patch 的写法是 `this.patchRate = null`
+       —— 注释称其为「官方开关」。实测**不成立**:
+         @colyseus/core build/Room.js
+           constructor L84   this.setPatchRate(this.patchRate)  ⇒ 建 50ms 定时器
+           setPatchRate L179 if (this._patchInterval) clearInterval(...)   ← 真正关掉处
+           broadcastPatch L267  **不读** this.patchRate
+         ⇒ 直赋属性绕过 setPatchRate ⇒ 定时器**没被清**,照旧周期调 broadcastPatch
+       运行期证据(探针 _t76_timer.ts,覆写 broadcastPatch 计数,窗口 260ms/周期 50ms):
+         直接赋 patchRate=null  ⇒ 被调 4 次   ★ 没关掉
+         setPatchRate(null)     ⇒ 被调 0 次   ✓ 真关掉
+         完全不碰(默认)        ⇒ 被调 4 次   ← 与第一组同值 ⇒ 两态不可区分
+       ```
+       ⇒ 已改为 `this.setPatchRate(null)`。**这条与 host 接线无关**,不随路 A/B 的裁决而变。
 
        ⚠️ **但「已装配」不等于「游戏能跑」** —— net-persist 另实测出一处**并列**缺口:
        `room.ts` 的 `applyMove` 只写 `state.players[].x/y/z`(L723-728),

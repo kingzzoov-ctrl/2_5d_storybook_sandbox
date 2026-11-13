@@ -6,7 +6,7 @@
  */
 
 import { eq, near, ok, report, test, includes } from '../shared/testing/harness.ts';
-import { packTile, unpackTile, setWire, WireColor } from '../shared/types/tile.ts';
+import { packTile, unpackTile, setWire, WireColor, Elevation } from '../shared/types/tile.ts';
 import { ITEM_BY_ID, itemName } from '../shared/constants/items.ts';
 import { ROOM_RECIPES } from '../shared/constants/bosses.ts';
 
@@ -1103,6 +1103,14 @@ test('WT-03-60 [接线] 蓝图接力队列在生产路径上被消费并真正�
   const before = countObjIn(sim, 351);
   eq(before, 0, '前置条件:接力开始前世界里没有 351');
 
+  /* 先把 (0,0)..(2,2) 铺成正常地面,作为「接力不得改变地面高度」的基线。
+     task-80 前提:`tickRelay` 会把任务里的 elev 写回世界
+     (`world_sim.ts` 里 `this.setCell(x, y, { ..., elev: t.elev, ... })`)。 */
+  const elevBefore = new Map<string, number>();
+  for (let y = 0; y < 3; y += 1) {
+    for (let x = 0; x < 3; x += 1) elevBefore.set(`${x},${y}`, sim.grid.elevAt(x, y));
+  }
+
   /* 推进足量帧让全部任务飞完。
      实测标定:80 帧只落 8/9(最后一个任务的飞行时长跨过了第 80 帧),
      120 帧落满 9 格且队列自动关闭 ⇒ 用 120 留出余量。
@@ -1113,6 +1121,47 @@ test('WT-03-60 [接线] 蓝图接力队列在生产路径上被消费并真正�
   eq(countObjIn(sim, 351), 9, '接力跑完后 9 格墙必须真的落进世界(不是只改队列状态)');
   eq(sim.relayPlacedCount, 9, '落位计数应等于蓝图格数');
   eq(sim.relayActive(), false, '全部落位后队列应自动关闭');
+
+  /* ★ task-80:接力不得改动地面高度。
+     缺陷形态(实测):建造层的「空格」曾是 `elev=0`(DEEP 深沟),
+     而世界层的是 `elev=1`(GROUND 地面)。`captureBlueprint` 从建造层
+     网格描图时,越界/未写格拿到 elev=0 并写进蓝图;`tickRelay` 再把它
+     写回世界 ⇒ **一张空蓝图会把整片地挖成 Z-1 深沟**,
+     世界格从 `elev=1`(groundZ 0)变成 `elev=0`(groundZ −1)。
+     这里用「地面高度在接力前后必须一致」钉住它 —— 外部事实,不依赖常量。 */
+  const elevDrift: string[] = [];
+  for (let y = 0; y < 3; y += 1) {
+    for (let x = 0; x < 3; x += 1) {
+      const now = sim.grid.elevAt(x, y);
+      const was = elevBefore.get(`${x},${y}`)!;
+      if (now !== was) elevDrift.push(`(${x},${y}) ${was}→${now}`);
+    }
+  }
+  eq(elevDrift, [], '接力落格不得改动地面高度(elev 漂移会把地面挖成深沟)');
+
+  /* ★ task-80 核心:走**真实链路**的两个「空」必须同高。
+     上一段用手写 blueprint(`elev: 1`)测的是「接力是否忠于蓝图」;
+     这一段测的是「建造层描出来的空,与世界层的空是不是同一个高度」——
+     那才是缺陷的实际发生点。用生产函数 `captureBlueprint` 从一张
+     **全未写**的建造层 `TileGrid` 描图,读它写下的 elev。
+     两层不一致(0 vs 1)或统一到错误值(都 0)都会在这里红。 */
+  const emptySrcGrid = new TileGrid(3, 3);
+  const bpFromEmpty = captureBlueprint(emptySrcGrid, 0, 0);
+  eq(
+    bpFromEmpty.cells[0]!.elev,
+    Elevation.GROUND,
+    '建造层描出的空格 elev 必须是 GROUND —— 否则空蓝图会把世界挖成深沟',
+  );
+  eq(
+    bpFromEmpty.cells[BLUEPRINT_CELLS - 1]!.elev,
+    Elevation.GROUND,
+    '越界格(右下角)的 elev 同样必须是 GROUND,不是 DEEP',
+  );
+  eq(
+    new Set(bpFromEmpty.cells.map((c) => c.elev)),
+    new Set([Elevation.GROUND]),
+    '一张全空蓝图里不得出现第二种海拔',
+  );
 
   /* 负对照:没启动接力的世界,同样的帧数不应凭空出现墙 */
   const sim2 = new WorldSim({ sizeCells: 32, mobs: false, wiring: false });

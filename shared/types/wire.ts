@@ -219,13 +219,41 @@ export interface WildlifeState {
 }
 
 /**
- * `boss.telegraphShape`(u8)的取值。
+ * `boss.telegraphShape`(u8)的取值 —— **线上格式**(wire)。
  *
- * ⚠️⚠️ 这是本项目**最危险的一处同名不同物**:
- * `client/src/ui/boss_hud.ts` 的 `TelegraphShape` 是
- * `{CIRCLE:0, ANNULUS:1, CONE:2, LINE:3, CROSS:4}` —— **5 个下标全部与这里不同**。
- * 服务端 `0=NONE` 在客户端同下标被解成 `CIRCLE`。
- * ⇒ 接线时必须让客户端只认这一份(本文件),否则预警圈会画成错的形状。
+ * ## ⚠️ 与 `client/src/ui/boss_hud.ts` 的同名符号的关系(task-79 实测订正)
+ *
+ * 那一个 `TelegraphShape` 的成员是 **字符串**:
+ * `{CIRCLE:'CIRCLE', ANNULUS:'ANNULUS', CONE:'CONE', LINE:'LINE', CROSS:'CROSS'}`
+ * —— 即「渲染用的五种几何」,**不是下标表**。
+ *
+ * ⇒ **二者类型不相交(number vs string),不存在「下标冲突」**。
+ *   旧注释写「它是 `{CIRCLE:0, ANNULUS:1, ...}` —— 5 个下标全部与这里不同」
+ *   **是错的、且从未成立**:`git log -S "ANNULUS: 1"` 全仓历史 0 命中,
+ *   `boss_hud.ts` 自首个提交 `d10a59f` 起就是字符串。
+ *
+ * ⇒ 实测的**真实**关系:
+ *   · 生产代码里把本文件的数字赋给 `boss_hud` 的 `shape` 字段的位置:**0 处**
+ *     (而 string/number 不相交,真去赋值会被类型检查挡住)
+ *   · 客户端读 `telegraphShape` 的位置:**0 处**(客户端预警圈由
+ *     `boot.ts` 的本地常量驱动,`shape: 'ANNULUS'` 硬编码)
+ *   · 对 `TELEGRAPH_SHAPES` 做数字下标的位置:**0 处**
+ *
+ * ## 但**协议缺口是真的**(不是下标冲突,是**词表覆盖不到**)
+ *
+ * 两侧不是「同一概念的两套编号」,而是**两套不同的形状词汇**:
+ *   · 仅 wire  : NONE / SECTOR / RECT / RING
+ *   · 仅 client: ANNULUS / CONE / LINE / CROSS
+ *   · 两侧同名: CIRCLE —— 语义也相同(都是「实心圆」),这是唯一真同义的一对
+ *
+ * ⇒ SECTOR 对 CONE、RECT 对 LINE、RING 对 ANNULUS 是**语义对应但拼写不同**,
+ *   中间**缺一层显式映射**。这才是接线时要补的东西 —— 一个
+ *   `wire 数字 → 客户端 shape 字符串` 的转换函数,而不是「统一编号」。
+ *
+ * ## 何时必须补
+ *
+ * 当客户端开始**从协议读** `boss.telegraphShape` 时。此前不补是安全的,
+ * 因为客户端目前完全不听这个字段(见上「0 处」)。
  */
 export const TelegraphShape = {
   NONE: 0,

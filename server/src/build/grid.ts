@@ -2,15 +2,41 @@
  * WS-03 共享网格容器(本工作流自研,冻结层之外):承放 32-Bit 单元格的世界视图。
  *
  * 设计要点:
- *  - 只依赖 `node:*` 与冻结层的 `shared/types/tile.ts`;
+ *  - 依赖 `node:*`、冻结层的 `shared/types/tile.ts`,以及 WS-01 的
+ *    `world/chunk.ts`(**仅为 `EMPTY_TILE` 这一份唯一事实源** —— 见下方长注释);
  *  - 禁止 `enum` / 参数属性 / `namespace`,相对导入必须带 `.ts` 后缀;
  *  - 越界读取返回 `EMPTY_TILE`,越界写入静默丢弃 —— 调用方无需到处写边界分支;
  *  - 底层 `Uint32Array` 一维连续,512×512 世界 = 1 MB。
  */
 
 import { OBJ_MASK, packTile, unpackTile } from '../../../shared/types/tile.ts';
-/** 空单元格:六字段全 0(elev=0 深沟、obj=0 无物体、wire=0 无暗线)。 */
-export const EMPTY_TILE = packTile({ elev: 0, base: 0, floor: 0, wire: 0, obj: 0, meta: 0 });
+/*
+ * 空格默认值:**唯一事实源在 WS-01**,本层只消费、不再定义第二次。
+ *
+ * ## 为什么必须从这里 import,而不是在本文件里写一遍字面量
+ *
+ * 此前本文件有自己的 `EMPTY_TILE = packTile({ elev: 0, ... })`,`world/chunk.ts`
+ * 另有一份 `packTile({ elev: Elevation.GROUND, ... })` —— **同名、同语义
+ * (都是「越界读的返回值」)、不同值**,且 elev 差 1 不是纯表示问题:
+ * `physics/world.ts` 的地面高度是 `groundZ = elev - 1`,所以 elev 0 是
+ * **Z-1 深沟**、elev 1 才是 **Z0 地面**。同一个「空」在两层意味着不同高度。
+ *
+ * 实测过的后果(改前):`captureBlueprint` 收本层 `TileGrid`,越界格拿到
+ * elev=0 并写进蓝图;`WorldSim.startRelay` → `tickRelay`(`world_sim.ts:1098`)
+ * 把任务里的 elev 写回世界 ⇒ 一个**完全空的 16×16 蓝图**把 256 格全挖成深沟,
+ * 世界格 (3,3) 从 `elev=1`(groundZ 0)变成 `elev=0`(groundZ −1)。
+ *
+ * 权威归属:WS-01 拥有地形与「虚空默认格」(`docs/WS-01-terrain.md:337`),
+ * `Chunk` 构造默认填充、`FLAT_TERRAIN.elevAt: () => 1`、`verify.ts` 建演示世界用
+ * `elev: 1`、以及 `digToDeep` 要**显式**写 DEEP —— 四条独立旁证都指向
+ * 「没有数据 = 正常地面,深沟只能由显式动作产生」。
+ *
+ * 同一份 SSoT 原则在本目录已有先例:`blueprint.ts` 为 `floorIdOfSlot`
+ * 从 `../world/chunk.ts` 引入(注释:「不得在本地重写偏移」)。
+ */
+import { EMPTY_TILE } from '../world/chunk.ts';
+
+export { EMPTY_TILE };
 
 /** 方位常量:0=北(−y) 1=东(+x) 2=南(+y) 3=西(−x),与 `faceDir()` 高 2 位取值一致。 */
 export const Dir = { NORTH: 0, EAST: 1, SOUTH: 2, WEST: 3 } as const;
@@ -33,6 +59,13 @@ export class TileGrid {
     this.width = Math.max(0, width | 0);
     this.height = Math.max(0, height | 0);
     this.data = new Uint32Array(this.width * this.height);
+    /*
+     * `fillValue === 0` 时跳过 `fill` 只是省一次遍历 —— `Uint32Array` 本来就
+     * 全 0。**但不能把这个短路条件当成「EMPTY_TILE 等于 0」的假设**:
+     * 早期版本隐式依赖了这一点(当时 `EMPTY_TILE` 恰好是 0,于是默认填充
+     * 与「不 fill」等价)。现在 `EMPTY_TILE` 的 SSoT 在 `world/chunk.ts`
+     * 且值为 1,那个巧合已不成立,故此处显式按值填充。
+     */
     if (fillValue !== 0) this.data.fill(fillValue >>> 0);
   }
 
