@@ -514,3 +514,165 @@ node tests/WS-10.test.ts          # 43/43 通过
    是否允许 ×4(或取最大值而非连乘)未定。
 9. **`MAX_REACH_TOLERANCE = 1.5` 容差**:为吸收网络抖动所设。
    若 WS-02 改用客户端预测 + 服务端回滚校验,该容差可收紧至 0.5,需联合实测。
+
+---
+
+## 11. task-70:W1 钳制与 `maxHp` 逐玩家派生(契约 §2.1 / §2.4 / §2.4.1)
+
+> 契约唯一依据:`docs/US2-GATEWAY-CONTRACT.md`。本节只记录**落实与实测**,口径以契约为准。
+
+### 11.1 修的是什么
+
+```
+W1  hp > maxHp      —— 复活/读档后血量超过上限
+W2  hp = NaN        —— revive(id, NaN) ⇒ **所有后续比较恒 false**(比负血更危险)
+W3  maxHp 被共享    —— VitalsSystem.maxHp 是**构造器参数**,所有玩家同一个值
+                       ⇒ 「按等级各自派生」装不进去
+```
+
+修前实测(`VitalsSystem` 裸实例):
+```
+revive('p1', 535) ⇒ hp=535  而 maxHp=100    ★ W1 本体
+revive('p1', -5)  ⇒ hp=-5                  ★ 负血
+revive('p1', NaN) ⇒ hp=NaN                 ★ W2
+register('p1') / register('p2') ⇒ 两者 maxHp **同值**  ★ W3
+```
+
+### 11.2 两处实现(全在 `server/src/combat/vitals.ts`)
+
+**① `revive()` —— W1 钳制,契约指定的唯一选址**
+```ts
+const want = hp ?? v.maxHp;
+const safe = Number.isFinite(want) ? want : v.maxHp;
+v.hp = Math.min(v.maxHp, Math.max(0, safe));
+```
+★ **两个独立机制,不可合并**:
+```
+甲  Number.isFinite(want) ? want : v.maxHp   →  堵 NaN(W2)
+乙  Math.max(0, safe)                        →  管负值落点
+```
+合并成 `Math.max(0, hp ?? v.maxHp)` 会让 NaN **原样穿过**(`Math.max` 遇 NaN 传播)。
+真不变量是 `0 ≤ hp ≤ maxHp`。
+
+**② 新增 `syncMaxHp(id, derivedMaxHp): boolean` —— W3 的正解**
+```
+· 是**唯一**写 v.maxHp 的入口,逐玩家生效(不碰构造器常量)
+· hp 取舍策略 **C:只改上限,hp 绝对值不变**,且**收在函数内部**(不散到调用方)
+  ⇒ 理由:C 是唯一**不给玩家凭空回血**的选项
+  ⇒ 日后裁决改为 A(补满差额)/B(同比例)只需动这一处
+· **必须钳 hp**:`if (v.hp > next) v.hp = next`
+  ⇒ 否则**降级**会再造出 hp>maxHp,即 W1 的镜像,而且由本函数亲手制造
+· **不 import progression**:派生值由**调用方**传入
+  ⇒ 若这里自己查 `statsAtLevel`,vitals 就成了**第二个等级权威**,与契约 §1 冲突
+· 拒绝不可信派生值:`!Number.isFinite(derivedMaxHp) ⇒ return false`(不写入)
+  ⇒ NaN 上限会让 `hp <= maxHp` 恒 false,比不更新更糟
+· 上限地板取 **1**(与 hp 的 0 不同):`maxHp=0` 会让任何 hp 都 `> maxHp`,
+  且 `stepTimers` 的 `hp < maxHp` 恒 false ⇒ **回血永久失效**
+  ★ 此条**已实测**(不再是推理;手法:内存里把 `syncMaxHp` 地板改成 0 造出 `maxHp=0`):
+  ```
+  【地板 1】maxHp=1, hp=0(受伤状态)→ 推进 200 帧 ⇒ hp 0 → 1   回血 ✓
+  【地板 0】maxHp=0, hp=0(受伤状态)→ 推进 200 帧 ⇒ hp 0 → 0   回血 ✗ 永久失效
+  治疗侧:地板 1 heal(50) ⇒ 0→1(返回 1);地板 0 heal(50) ⇒ 0→0(返回 0)
+  ```
+  ⚠️ 对照时**必须把 hp 置为低于上限**,否则「满血不回血/满血治疗返回 0」是正常行为,
+  会得出「两种地板一样」的错误结论(我第一版对照就这么错了)。
+```
+
+### 11.3 ★ 下界为什么是 **0** 而不是 1(契约 §2.4.1 的订正)
+
+契约初版写 `Math.max(1, ...)`,理由是「复活后 hp=0 会立刻再次 downed,是死循环入口」。
+**那条理由机制错**,三条实测:
+
+```
+① revive(0) 后 hp=0 downed=false;推进 400 帧后 hp 被 regen 抬到 **20** ⇒ 不自动倒
+   真正置 downed 的只有「**被**打到 0」那一处(vitals.ts 的 applyHit);
+   revive() 自己置 downed=false 且**不检查 hp** ⇒ 走不到那个分支
+② hp=0 起手 → 一拳: applied=6 hp=0 downed=true
+   hp=1 起手 → 一拳: applied=6 hp=0 downed=true    ← **逐字段完全相同**
+   ⇒ 下界 1 达成不了它声明的目的(一级生物一拳 6 点,1 血和 0 血都是一拳倒)
+③ REVIVE_HP_RATIO = 0.5 ⇒ 复活路径传进来的 hpAfter 最小值是 **50**
+   ⇒ 下界在复活语义下**从未被触发过**
+```
+⇒ 下界 1 的唯一真实效果是**改掉读档语义**:`importVitals`(`world_sim.ts`)把 hp 钳到
+`[0, maxHp]` 后交给 `revive`,于是存档里的 0 HP 被悄悄改成 1
+⇒ 实测打破 `WS-FND-02` C22「0 HP 保留」。
+⇒ 故取 **0**:与读档语义一致,且不伤任何东西。
+
+★ 由此**撤销了 Y 方案**(给 `revive` 加 `floor` 参数):
+Y 的前提是「复活与读档两种语义都落到地板」,但实测复活路径落不到 ⇒ 参数多余。
+
+### 11.4 行为变更登记(契约要求显式登记)
+
+```
+revive(id, 0)   旧: 0(未钳制)   新: 0(与读档一致;初版曾拟为 1,已订正回 0)
+revive(id, -5)  旧: -5          新: 0
+revive(id, NaN) 旧: NaN         新: maxHp          ★ 这是真正的修复
+revive(id, 535) 旧: 535         新: maxHp          ★ W1 本体
+revive(id)      旧: 满血         新: 满血(对照:0 是**下界**,不是**默认值**)
+```
+
+### 11.5 验收实测(`node tests/WS-10.test.ts` ⇒ 102/102)
+
+| 契约 §9 | 断言 | 实测 |
+| :--- | :--- | :--- |
+| 1 | `task70-1` 升 Lv.30 ⇒ `maxHp == 535` | 100 → 535,hp 不变(策略 C) |
+| 2 | `task70-2` 降级 ⇒ hp 被钳 | 535 → 100,`hp <= maxHp` |
+| 3 | `task70-3` ★★ 同实例两个等级各自正确 | p1=535 且 p2=100,且**两者不同** |
+| 7 | `task70-7` `revive(535) ⇒ 100` | ✓ |
+| 8 | `task70-8` `revive(NaN) ⇒ maxHp` | ✓ 有限值 |
+| 9 | `task70-9/10` `revive(-5) ⇒ 0` | ✓ |
+| 10 | `task70-9/10` `revive(0) ⇒ 0` | ✓ 与读档一致 |
+| 10b | `task70-10b` 读档 0 HP 忠实保留 | ✓(同址复验 WS-FND-02 C22) |
+| — | `task70-附` `syncMaxHp` 拒绝/幂等/上限地板 | ✓ 见 §11.2 |
+
+★ **§9-3 是本组最容易被漏掉的一条**:不写「同一实例两个不同等级玩家」这个反例,
+等于**没测到根因** —— 只测单玩家时,「共享常量」与「逐玩家派生」表现**完全相同**。
+
+★ **§9-10b 的作用**:下界改回 1 时 `WS-FND-02` C22 会红,但那个套件不在 WS-10 里。
+在此**同址复验**,让「改回 1」在 WS-10 里也立刻可见 —— 防的是本仓
+「写对了但没人引用的规则」那一类缺陷。
+
+### 11.6 故障注入验证有牙(8 个突变,全部被抓到)
+
+判据:**把断言声称守护的实现改回错误行为 ⇒ 断言必须红**。绿 = 覆盖证据的赝品。
+
+| 突变 | 结果 |
+| :--- | :--- |
+| M1 下界 0 → 1 | `task70-9/10` + `task70-10b` 红 ✓ |
+| M2 去掉 `Number.isFinite` | `task70-8` 红 ✓ |
+| M3 去掉全部钳制 | `task70-7` 红 ✓ |
+| M4 `syncMaxHp` 不钳 hp | `task70-2` 红 ✓ |
+| M5 `syncMaxHp` 写成共享 | `task70-3` 红 ✓ |
+| M6 不校验派生值 | `task70-附` 红 ✓ |
+| M7 恒返回 true | `task70-附` 红 ✓ |
+| M8 上限地板 1 → 0 | `task70-附` 红 ✓ |
+每个突变只改一处、SHA-256 逐字节还原后恢复 102/102。
+
+### 11.7 跑法
+
+```
+node tests/WS-10.test.ts            # 102/102
+node tests/WS-FND-02.test.ts        # 65/65(下界 0 的既有契约,订正后恢复)
+node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert
+```
+
+### 11.8 未决(交契约维护者,本节不裁定)
+
+```
+1 策略 A/B/C:A/B 均未实现,仅 C。若玩法裁决为「升级回血」,改 syncMaxHp 一处即可
+2 ★★ 接入链**已存在但是断的**(实测,非推断):
+   room.ts:1517 syncMaxHpOf() → host.syncMaxHp(playerId, derivedMaxHp)
+   而 host 运行时是 `WorldSim`,**WorldSim 上没有 syncMaxHp 方法**
+   ⇒ room.ts:1521 的 `typeof host.syncMaxHp !== 'function'` ⇒ **直接 return,静默 no-op**
+   实测:`w.syncMaxHp` = undefined;`w.vitals.syncMaxHp` = function
+        `host.syncMaxHp('p1', 535)` ⇒ p1.maxHp 仍为 100(未同步)
+        直调 `w.vitals.syncMaxHp('p1', 535)` ⇒ 535(功能本身好的,只差一层转发)
+   ⇒ 修法需要在 `WorldSim` 上加一个转发方法(或让 room.ts 经世界源取 vitals)。
+     **`world_sim.ts` 不在本 doc 的写域**(task-70 写域只有 vitals/revive/progression/
+     WS-10 测试/本文档)⇒ 已上报 Lead,由该文件的所有者落实。
+   ⇒ ⚠️ 且这是**本仓反复出现的「静默 no-op」形态**:`typeof !== 'function'` 的守卫
+     让「方法没接上」与「已同步但值没变」在外部**不可区分**(两者都不抛、都无日志)。
+3 上一条意味着 syncMaxHp 的**有效**生产调用当前为 0(房间侧调用打在 undefined 上)。
+  接上后应补一条「网关真的每帧/变更时调用它」的断言 —— 否则修复本身又无名
+4 上限地板为何是 1(而非 0):见 §11.2;若日后允许「maxHp=0 的合法状态」需重裁
+```

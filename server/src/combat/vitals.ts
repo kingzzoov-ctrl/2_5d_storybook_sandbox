@@ -356,15 +356,128 @@ export class VitalsSystem {
    * ⇒ 所以修法是**把复活的无敌写进活的那一套**(本参数),而不是给死的那套加递减。
    *
    * 默认 `0` = 保持原语义(重连/读档导入 HP 时不该给无敌帧)。
+   *
+   * ## W1 钳制(契约 `US2-GATEWAY-CONTRACT.md` §2.4 —— **唯一选址在此**)
+   *
+   * **此前这里是 `v.hp = hp ?? v.maxHp`,完全不钳制。** 实测三个反例:
+   * ```
+   * revive('p1', 535)  ⇒ hp=535,而 maxHp=100   ⇒ hp > maxHp   ★ W1 本体
+   * revive('p1', -5)   ⇒ hp=-5                 ⇒ 负血
+   * revive('p1', NaN)  ⇒ hp=NaN                ⇒ **所有后续比较恒 false**
+   * ```
+   * 第三条最危险:与 `checkMove` 的 6.0 值域门同族 —— `NaN` 会静默穿过
+   * 每一个 `hp > 0` / `hp < maxHp` 判断,玩家既不死也回不了血。
+   *
+   * ## ★ 契约给的表达式有一个洞,这里补上(不改契约,只落实它的要求)
+   *
+   * 契约原文 `Math.min(v.maxHp, Math.max(1, hp ?? v.maxHp))` ——
+   * **`Math.max(1, NaN)` 返回 `NaN`**(`Math.max` 遇 `NaN` 传播)。
+   * ⇒ 若照抄,`revive(id, NaN)` 仍然是 `NaN`,洞没补上。
+   * 故 `Number.isFinite` 这一步**不是可选的**。
+   *
+   * ## ★★ 下界是 **0** 而非 1(契约 §2.4.1 订正后的结论)
+   *
+   * 契约初版写 `Math.max(1, ...)`,理由是「复活后 hp=0 会立刻再次 downed,是个死循环入口」。
+   * **那条理由机制错**,三条实测:
+   * ```
+   * ① revive(0) 后 hp=0 downed=false;推进 400 帧 hp 被 regen 抬到 20 ⇒ 不自动倒
+   *    (真正置 downed 的只有本文件被打到 0 的那一处,`revive` 自己置 false 且不检查 hp)
+   * ② hp=0 起手 → 一拳: applied=6 hp=0 downed=true
+   *    hp=1 起手 → 一拳: applied=6 hp=0 downed=true   ← **逐字段完全相同**
+   *    ⇒ 下界 1 达成不了它声明的目的(一级生物一拳 6 点,1 血和 0 血都是一拳倒)
+   * ③ REVIVE_HP_RATIO=0.5 ⇒ 复活路径传进来的 hpAfter 最小值是 **50**
+   *    ⇒ 下界在复活语义下**从未被触发过**
+   * ```
+   * ⇒ 下界 1 的唯一真实效果是**改掉读档语义**:`importVitals`(world_sim.ts:2462)
+   *   把 hp 钳到 `[0, maxHp]` 后交给本函数,于是存档里的 0 HP 被悄悄改成 1
+   *   ⇒ 实测打破 `WS-FND-02` C22「0 HP 保留」。
+   * ⇒ 故取 **0**:与读档语义一致,且不伤任何东西(复活路径落不到地板)。
+   *
+   * ## ★ 两个**独立**机制,不要混成一个
+   *
+   * ```
+   * 甲  Number.isFinite(want) ? want : v.maxHp   →  堵 NaN
+   * 乙  Math.max(0, safe)                        →  管负值落点
+   * ```
+   * W1 的两个病根(`hp > maxHp`、`NaN`)floor=0 一样治得住 ——
+   * 因为 NaN 由甲兜底,与乙无关。真不变量是 `0 ≤ hp ≤ maxHp`。
+   *
+   * ## 为什么钳制**只**在这里(不在 `revive.ts`)
+   *
+   * `revive.ts` 只负责算期望值 `hpAfter` 并传入。两侧都钳 = **两份实现**,
+   * 日后改上限口径必然漂移(本仓陷阱 31/41 已踩过多次)。
    */
   revive(id: string, hp?: number, invulnSec = 0): boolean {
     const v = this.players.get(id);
     if (!v) return false;
-    v.hp = hp ?? v.maxHp;
+    /* ★ 两步分开,不可合并成 `Math.max(0, hp ?? v.maxHp)`:
+     *   `Math.max` 遇 NaN 传播 ⇒ 合并后 NaN 会原样穿过。 */
+    const want = hp ?? v.maxHp;
+    const safe = Number.isFinite(want) ? want : v.maxHp;
+    v.hp = Math.min(v.maxHp, Math.max(0, safe));
     v.downed = false;
     v.iframeSec = Math.max(0, invulnSec);
     v.sinceHurtSec = PLAYER_REGEN_DELAY_SEC;
     return true;
+  }
+
+  /**
+   * 把某个玩家的生命上限同步到**派生值**(契约 `US2-GATEWAY-CONTRACT.md` §2.1)。
+   *
+   * ## ★ 为什么必须是「逐玩家」而不是构造器参数
+   *
+   * `VitalsSystem.maxHp` 是**构造器参数,被所有玩家共享**(实测:同一实例里
+   * `register('p1')` 与 `register('p2')` 拿到同一个 `maxHp`)。
+   * ⇒ 「按等级各自派生」**装不进**构造器 —— 那只能表达一个等级。
+   * ⇒ 唯一正确形态是逐玩家改 `v.maxHp`(`get()` 返回同一引用,可直接改字段)。
+   *
+   * ## 职责边界(契约 §1)
+   *
+   * 本方法**不查表、不 import progression**。派生值 `derivedMaxHp` 由**调用方**
+   * 传入。理由:若这里 `import { statsAtLevel } from './progression.ts'` 去自己算,
+   * `vitals` 就成了**第二个等级权威** —— 与 `progression` 冲突,
+   * 正是契约 §1 「`VitalsSystem` 不负责等级派生」要防的。
+   *
+   * ## ★ hp 的取舍策略:**C(只抬/降上限,hp 绝对值不变)**,且**收在函数内部**
+   *
+   * ```
+   * A 补满差额  ⇒ 升级即回满血
+   * B 按同比例  ⇒ hp *= derived/old
+   * C 只改上限  ⇒ hp 绝对值不变        ← 契约取此
+   * ```
+   * 取 C 的**唯一**理由:它是三个里**唯一不给玩家凭空回血**的。
+   * A 会与「温泉 +30% 生命上限」叠加出「升级顺带回血」的玩法后果,
+   * 而那是**玩法裁决**,不是接线能定的(契约 §10 未决 1)。
+   *
+   * ⚠️ 策略**必须收在这里**,不得散到调用方 —— 日后裁决改成 A/B 时只需动这一处。
+   * 故下面**只有** `Math.min` 钳制,**没有**任何按比例/补差的分支。
+   *
+   * ## ⚠️ 必须钳 `hp`(否则降级再造一个 W1)
+   *
+   * ```
+   * 降到 Lv.1:derived=100,而 hp 可能是 535
+   * ⇒ 不钳 ⇒ hp(535) > maxHp(100) ⇒ **W1 的镜像**,由本函数亲手制造
+   * ```
+   *
+   * @param id 玩家
+   * @param derivedMaxHp 由 `progression.statsAtLevel(level).maxHp` 得到的派生上限
+   * @returns 是否发生了变更(便于调用方避免同帧重复投影)
+   */
+  syncMaxHp(id: string, derivedMaxHp: number): boolean {
+    const v = this.players.get(id);
+    if (!v) return false;
+    /* 派生值本身不可信时**拒绝写入** —— 与 revive 同族:NaN 上限会让
+     * `hp <= maxHp` 恒 false,比不更新更糟。 */
+    if (!Number.isFinite(derivedMaxHp)) return false;
+    /* 上限地板取 1(与 hp 的 0 不同):`maxHp = 0` 会让任何 hp 都 `> maxHp`,
+     * 且 `stepTimers` 的 `hp < maxHp` 恒 false ⇒ 回血永久失效。
+     * 上限为 0 是「无意义的活人」,不是合法状态。 */
+    const next = Math.max(1, derivedMaxHp);
+    const changed = next !== v.maxHp || v.hp > next;
+    v.maxHp = next;
+    /* 策略 C:只钳,不补、不按比例。唯一写 hp 的动机是「不许超过上限」。 */
+    if (v.hp > next) v.hp = next;
+    return changed;
   }
 
   /**

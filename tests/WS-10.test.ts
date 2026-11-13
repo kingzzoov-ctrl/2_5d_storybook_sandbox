@@ -58,6 +58,9 @@ import { MOB_BY_ID } from '../shared/constants/mobs.ts';
 import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
 import { maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
 import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT, SIM_SLOW_DT } from '../server/src/sim/world_sim.ts';
+/* task-70:`VitalsSystem` 直接 import —— §9 验收 3 必须用**裸实例**,
+ * 不能经 `WorldSim`(那会引入 addPlayer/等级同步等旁路,测不到「构造器共享常量」这个根因)。 */
+import { VitalsSystem } from '../server/src/combat/vitals.ts';
 import { mobCombatProfile, MOB_DEF_BASE, MOB_DEF_PER_LEVEL, MOB_ELEMENT_BY_ID } from '../server/src/combat/damage.ts';
 
 const rng = mulberry32(0x5eed10);
@@ -3148,6 +3151,185 @@ test('T59-6 ★ 端到端:推进让**生物 AI 看得见**玩家移动', () => {
   t.applyPlayerMove('p1', 30, 10);
   eq(t.mobPlayers.find((m) => m.id === 'p1')?.x, 10,
     '负向对照:移动后**不推进** ⇒ mobPlayers 不动 ⇒ 推进是必需的');
+});
+
+/* ═══════════ task-70:契约 §9 验收 1/2/3/7/8/9/10 + §2.4 W1 钳制与 §2.1 maxHp 派生 ═══════════
+ *
+ * 契约:`docs/US2-GATEWAY-CONTRACT.md` §2.1 / §2.4 / §2.4.1 / §9
+ *
+ * ## 这一组断言在守什么(先说清,否则不知道它们在防什么)
+ *
+ * ```
+ * W1  重启/读档后 hp > maxHp —— 血量超过上限
+ * W2  revive(id, NaN) ⇒ hp=NaN —— **所有后续比较恒 false**(比负血更危险)
+ * W3  VitalsSystem.maxHp 是**构造器参数、被所有玩家共享**
+ *     ⇒ 「按等级各自派生」装不进去 ⇒ 必须逐玩家改 v.maxHp
+ * ```
+ * W3 是本组最容易被漏掉的一条:不写「同一实例两个不同等级玩家」这个反例,
+ * 等于没测到根因(只测单玩家时,共享常量与逐玩家派生**表现完全相同**)。
+ */
+
+test('task70-1:裁决1 —— 升到 Lv.30 ⇒ v.maxHp == 535(statsAtLevel 派生值,不是构造器常量)', () => {
+  const v = new VitalsSystem();
+  v.register('p1');
+
+  const lv1 = statsAtLevel(1).maxHp;
+  const lv30 = statsAtLevel(30).maxHp;
+  eq(lv1, 100, '冻结层 statsAtLevel(1).maxHp = 100(实测基准)');
+  eq(lv30, 535, '冻结层 statsAtLevel(30).maxHp = 535 —— 100 + 15×(30−1)(实测基准)');
+  eq(v.get('p1')!.maxHp, 100, '前置:新建即 Lv.1 上限 100');
+
+  const changed = v.syncMaxHp('p1', lv30);
+  eq(changed, true, 'syncMaxHp 返回「发生了变更」');
+  eq(v.get('p1')!.maxHp, 535, '★ 升到 Lv.30 后 VitalsSystem 里的 maxHp == 535');
+  eq(v.get('p1')!.hp, 100, '策略 C:只抬上限,hp 绝对值不变(不凭空回血)');
+});
+
+test('task70-2:裁决1 —— 降级 ⇒ hp 被钳到新上限(不得出现 hp > maxHp,即 W1 的镜像)', () => {
+  const v = new VitalsSystem();
+  v.register('p1');
+  v.syncMaxHp('p1', statsAtLevel(30).maxHp);
+  v.get('p1')!.hp = 535;
+  eq(v.get('p1')!.hp, 535, '前置:造出满血 535 的 Lv.30 玩家');
+
+  const changed = v.syncMaxHp('p1', statsAtLevel(1).maxHp);
+  eq(changed, true, '降级也是变更');
+  const g = v.get('p1')!;
+  eq(g.maxHp, 100, '上限降到 100');
+  /* ★ 核心:不钳的话这里是 535,即「本函数亲手制造 W1」 */
+  ok(g.hp <= g.maxHp, `★ 降级后 hp(${g.hp}) 必须 <= maxHp(${g.maxHp})——不得再造出 hp>maxHp`);
+  eq(g.hp, 100, '实测落在新上限 100');
+});
+
+test('task70-3:裁决1 ★★ 同一 VitalsSystem 实例里两个不同等级玩家各自正确(构造器共享常量的直接反例)', () => {
+  /* 本条的**唯一**目的:证伪「给构造器传等级就能实现逐玩家派生」。
+     若 maxHp 真是共享常量,下面 p1/p2 必然同值 —— 那正是不写这条就看不见的缺陷。 */
+  const v = new VitalsSystem();
+  const a = v.register('p1');
+  const b = v.register('p2');
+  eq(a.maxHp, b.maxHp, '前置:未同步前两者同为构造器常量(这正是要打破的状态)');
+
+  v.syncMaxHp('p1', statsAtLevel(30).maxHp);
+  v.syncMaxHp('p2', statsAtLevel(1).maxHp);
+
+  eq(v.get('p1')!.maxHp, 535, '★ 同一实例里 p1(Lv.30) == 535');
+  eq(v.get('p2')!.maxHp, 100, '★ 同一实例里 p2(Lv.1) == 100');
+  ok(v.get('p1')!.maxHp !== v.get('p2')!.maxHp,
+    '★ 两者必须**不同** —— 相同即说明它们仍在共享构造器常量(W3 未修)');
+
+  /* 再反向同步一次,证明是逐玩家而非「最后一次写入赢」 */
+  v.syncMaxHp('p1', statsAtLevel(1).maxHp);
+  eq(v.get('p1')!.maxHp, 100, 'p1 降回 Lv.1 ⇒ 100');
+  eq(v.get('p2')!.maxHp, 100, 'p2 不受影响,仍 100');
+  v.syncMaxHp('p2', statsAtLevel(30).maxHp);
+  eq(v.get('p1')!.maxHp, 100, '★ p1 不被 p2 的同步带偏(不是「最后写赢」)');
+  eq(v.get('p2')!.maxHp, 535, '★ p2 独立涨到 535');
+});
+
+test('task70-7:裁决4 —— revive(535) ⇒ hp == 100(不超上限;修前 hp=535 即 W1 本体)', () => {
+  const v = new VitalsSystem();
+  v.register('p1');
+  eq(v.get('p1')!.maxHp, 100, '前置:上限 100');
+
+  v.revive('p1', 535);
+  const g = v.get('p1')!;
+  eq(g.hp, 100, '★ 传入 535 ⇒ 被钳到上限 100');
+  ok(g.hp <= g.maxHp, `★ hp(${g.hp}) <= maxHp(${g.maxHp})——W1 不变量`);
+  eq(g.downed, false, 'revive 顺带清 downed');
+});
+
+test('task70-8:裁决4 —— revive(NaN) ⇒ hp == maxHp(不是 NaN;NaN 会让所有比较恒 false)', () => {
+  const v = new VitalsSystem();
+  v.register('p1');
+  v.revive('p1', 42);
+
+  v.revive('p1', Number.NaN);
+  const g = v.get('p1')!;
+  ok(Number.isFinite(g.hp), `★ revive(NaN) 后 hp 必须有限,实际 ${g.hp}`);
+  eq(g.hp, g.maxHp, '不可信值回退到满血 maxHp');
+  /* ★ 负向对照:证明「NaN 会毒化」是真实危险,不是纸面担心 */
+  ok(!(g.hp > 0) === false, 'hp=100 ⇒ hp>0 为真(对照:若 hp 是 NaN,此式恒 false)');
+});
+
+test('task70-9/10:裁决4 —— revive(-5) ⇒ 0 且 revive(0) ⇒ 0(下界为 0,与读档语义一致)', () => {
+  /* ★ 契约 §2.4.1 订正:初版写「下界 1」,理由是「hp=0 会立刻再次 downed」——
+     该理由机制错(revive 自己置 downed=false;唯一 downed 入口是**被打**到 0)。
+     实测下界 1 的唯一效果是改掉读档语义,破坏 WS-FND-02 C22。
+     ⇒ 下界取 0。以下两条即契约 §9 订正后的 9/10。 */
+  const v = new VitalsSystem();
+  v.register('p1');
+
+  v.revive('p1', -5);
+  eq(v.get('p1')!.hp, 0, '★ revive(-5) ⇒ 0(负数钳到下界 0,不是 1)');
+
+  v.revive('p1', 0);
+  eq(v.get('p1')!.hp, 0, '★ revive(0) ⇒ 0(与读档语义一致:0 HP 忠实保留)');
+
+  /* 反向对照:0 是**下界**不是**默认值** —— 省略参数仍应满血 */
+  v.revive('p1');
+  eq(v.get('p1')!.hp, 100, '对照:省略 hp ⇒ 满血 maxHp(0 只是下界,不是默认)');
+});
+
+test('task70-10b:裁决4 —— 读档路径的 0 HP 必须忠实保留(WS-FND-02 C22 是「下界 0」的既有契约)', () => {
+  /* ★ 这条是本组断言里**唯一**覆盖 `importVitals` 的。
+     它是 §2.4.1 订正的**验收依据**:若有人把下界改回 1,WS-FND-02 C22 会红,
+     但那个套件不在 WS-10 里 —— 本仓已有多个「写对了但没人引用的规则」(陷阱 85),
+     故在此**同址复验**,让改回 1 在 WS-10 里也立刻可见。 */
+  const s = new WorldSim({ sizeCells: 32 });
+  s.addPlayer('p1', 10, 10);
+  const maxHp = s.vitals.get('p1')!.maxHp;
+
+  eq(s.importVitals({ p1: { hp: 99999 } }), 1, '超上限仍算生效');
+  eq(s.vitals.get('p1')!.hp, maxHp, '超上限钳到 maxHp');
+
+  s.importVitals({ p1: { hp: -5 } });
+  eq(s.vitals.get('p1')!.hp, 0, '★ 负数钳到 0(下界 0;若为 1 则此处红)');
+
+  s.importVitals({ p1: { hp: 0 } });
+  eq(s.vitals.get('p1')!.hp, 0, '★ 存档里的 0 HP 忠实保留(读档不「顺手加血」)');
+  eq(s.vitals.get('p1')!.downed, false, 'downed 被清掉,不会「上线即倒地」');
+
+  /* 不可信值仍被拒(与 revive 的 NaN 兜底同族,但拒绝语义不同:importVitals 是**跳过**) */
+  eq(s.importVitals({ p1: { hp: Number.NaN } }), 0, 'NaN 被拒,不计入生效数');
+  eq(s.vitals.get('p1')!.hp, 0, '被拒时不改动现值');
+});
+
+test('task70-附:syncMaxHp 的拒绝语义与幂等(不可信派生值不得写入)', () => {
+  const v = new VitalsSystem();
+  v.register('p1');
+  const before = v.get('p1')!.maxHp;
+
+  eq(v.syncMaxHp('p1', Number.NaN), false, '★ 派生值 NaN ⇒ 拒绝写入,返回 false');
+  eq(v.get('p1')!.maxHp, before, '被拒后上限不变(NaN 上限会让 hp<=maxHp 恒 false)');
+  eq(v.syncMaxHp('p1', Number.POSITIVE_INFINITY), false, 'Infinity 同样被拒');
+
+  eq(v.syncMaxHp('p_ghost', 500), false, '未登记玩家返回 false,不抛异常');
+  eq(v.get('p_ghost'), null, '不为未登记玩家凭空建条目');
+
+  v.syncMaxHp('p1', 500);
+  eq(v.syncMaxHp('p1', 500), false, '★ 同值重复提交返回 false(便于调用方避免同帧重复投影)');
+  eq(v.get('p1')!.maxHp, 500, '值仍正确');
+
+  /* 上限地板取 1(与 hp 的 0 不同):maxHp=0 会让任何 hp 都 > maxHp,且回血恒失效 */
+  v.get('p1')!.hp = 500;
+  v.syncMaxHp('p1', 0);
+  eq(v.get('p1')!.maxHp, 1, '★ 派生上限 0 ⇒ 钳到 1(上限为 0 是「无意义的活人」)');
+  eq(v.get('p1')!.hp, 1, 'hp 随之被钳,不得 hp>maxHp');
+
+  /* ★ 上限地板为何不能是 0 —— 断言其**后果**,不只断言那个数字。
+     若地板改成 0:maxHp=0 且 hp=0 ⇒ `hp < maxHp` 恒 false ⇒ 回血与治疗永久失效。 */
+  const w = new VitalsSystem();
+  w.register('k');
+  w.syncMaxHp('k', 0);
+  const kw = w.get('k')!;
+  kw.hp = 0;                    /* 受伤状态(必须低于上限,否则满血不回血是正常的) */
+  kw.sinceHurtSec = 999;        /* 早已越过回血延迟 */
+  for (let i = 0; i < 200; i += 1) w.stepTimers(0.05);
+  ok(w.get('k')!.hp > 0,
+    `★ 上限被钳到 1 后,受伤玩家仍能自然回血(实测 ${kw.hp} → ${w.get('k')!.hp});`
+    + '若上限地板为 0 ⇒ hp<maxHp 恒 false ⇒ 回血永久失效');
+  w.get('k')!.hp = 0;
+  ok(w.heal('k', 50) > 0, '★ 治疗同样不被上限地板挡住(地板 0 时 heal 恒返回 0)');
 });
 
 /* ───────────────────────── 收尾 ───────────────────────── */
