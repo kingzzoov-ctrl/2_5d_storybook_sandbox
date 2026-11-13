@@ -2187,6 +2187,63 @@ function checkReachability(): void {
   /* 入口构成行**无条件打印**:它说的是「这个数字覆盖谁」,
      在通过时同样需要 —— 甚至更需要(绿灯时读者不会去追问口径)。 */
   if (entryNote !== '') console.log(`  i ${entryNote}`);
+
+  /* ────────── ★ 分桶算术自洽(陷阱 93 的可门禁化部分)──────────
+   *
+   * ## 为什么这条值得进闸门
+   *
+   * 本会话实测出一类反复复发的失误:**结论含数字,而数字没被反推过**。
+   * 其中「算术对不上」是唯一能在**不看代码**的情况下自动发现的形式
+   * (陷阱 93),而被漏掉的恰恰是**最便宜**的那一步。
+   *
+   * ## 它是**不变量**,不是"再算一遍"
+   *
+   * 分桶的实现保证了:每个白名单条目**恰好**进一个桶(非欠账先分流,其余
+   * 六桶各自 `continue`)。所以下面这条等式**恒应成立**:
+   *
+   *     Σ(各桶) + nonDebt  ===  UNREACHABLE_EXEMPT.size
+   *
+   * ⚠️ 它与 `checkDocs` 里那条「README 欠账构成与实测一致」**不是重复**:
+   *   · checkDocs 查的是「**文档**里抄的数字 vs 门禁算的数字」⇒ 防**抄错**;
+   *   · 本条查的是「门禁**自己**的桶之和 vs 表大小」⇒ 防**分桶实现漏条目**
+   *     (新增桶/改 `continue` 顺序时最容易漏)。两者防的是不同的错。
+   *
+   * ## 反例(为什么真需要它)
+   *
+   * 实测过同类缺陷:`data-conformance` 的分部/总量曾报「自相矛盾而全绿」
+   * (陷阱 66/67)。分桶这类**多路 if + continue** 结构是同一个坑:
+   * 加一个新正则却没接上 `continue`,条目就会**既不计数也不报错**。
+   */
+  {
+    const bucketSum = wl.clientShell + wl.wiring + wl.mechanism
+      + wl.clientMech + wl.dependency + wl.decision + wl.other + wl.nonDebt;
+    if (bucketSum !== UNREACHABLE_EXEMPT.size) {
+      fail(
+        '欠账分桶算术不自治(分桶实现可能漏了条目):'
+        + `各桶之和 ${bucketSum} ≠ 白名单 ${UNREACHABLE_EXEMPT.size}`
+        + `(客户入口 ${wl.clientShell} + 编排接线 ${wl.wiring} + 服务端机制 ${wl.mechanism}`
+        + ` + 客户端机制 ${wl.clientMech} + 外部依赖 ${wl.dependency}`
+        + ` + 等裁决 ${wl.decision} + 未归类 ${wl.other} + 非欠账 ${wl.nonDebt})`,
+      );
+    }
+    /* 第二条不变量:不可达数必须 = 白名单 + 未登记。
+       ⚠️ 这条与上面那条**方向不同**:上面查"表内是否都归了桶",
+          这条查"表**外**是否还有没登记的不可达"。 */
+    if (reachableProd + unreachableCount !== prodAll.length) {
+      fail(
+        '可达性计数不自治:'
+        + `可达 ${reachableProd} + 不可达 ${unreachableCount} ≠ 总数 ${prodAll.length}`,
+      );
+    }
+    if (unreachableCount !== UNREACHABLE_EXEMPT.size + unlisted.length) {
+      fail(
+        '不可达数与白名单/未登记不自治:'
+        + `不可达 ${unreachableCount} ≠ 白名单 ${UNREACHABLE_EXEMPT.size}`
+        + ` + 未登记 ${unlisted.length}`,
+      );
+    }
+    /* 全部成立时**不打印** —— 否则会给绿灯加噪声,而噪声会让真信号被忽略。 */
+  }
 }
 
 /* ───────────── 2.5 同义反复候选检查(S11)───────────── */
