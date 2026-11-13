@@ -16,6 +16,7 @@
     "verify:integration": "node scripts/verify.ts --integration",
     "verify:selfcheck": "node scripts/gate-selfcheck.ts",
     "count-audit": "node scripts/count-audit.ts",
+    "ts-paths": "node scripts/ts-paths.ts",
     "seed-sampling": "node scripts/seed-sampling.ts",
     "selftest-exit-audit": "node scripts/selftest-exit-audit.ts",
     "backlog": "node scripts/backlog.ts",
