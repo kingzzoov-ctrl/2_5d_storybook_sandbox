@@ -1225,13 +1225,44 @@ test('W4-52 性能:200 只怪 30 只唤醒时每 20Hz 帧 CPU 估算(休眠 170 
 /* ═══════════ task-38:taming.ts 的归属判定与前置条件 ═══════════ */
 
 /* 读生产源码文本 —— 宿主的**存在性**无法用 import 断言。 */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const wildSimSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
 const behavSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'mobs', 'behaviors.ts'), 'utf8');
+
+/**
+ * ★ task-73 新增:全仓生产源扫描器。
+ *
+ * 为什么需要它 —— 本套件下面几条断言**各只覆盖 1~4 个文件**,而它们的结论句
+ * 曾写成「全仓」范围。范围一旦不一致,读的人会拿单例当全称用(陷阱 95)。
+ * ⇒ 把「全仓事实」**单独测一遍**,范围偷换就变成**机械可核对**的东西。
+ *
+ * ⚠️ 判据用**原始文本**(不剥注释) ⇒ 注释里提到该标识符也会计入。
+ *    这是**保守**方向:多报会让断言变红,而红可以被看见;少报才会静默。
+ */
+const SRC_ROOTS = ['server/src', 'client/src', 'shared'];
+function collectProdTs(): { rel: string; src: string }[] {
+  const out: { rel: string; src: string }[] = [];
+  const walkDir = (dir: string): void => {
+    for (const e of readdirSync(join(ROOT_DIR, dir), { withFileTypes: true })) {
+      const rel = `${dir}/${e.name}`;
+      if (e.isDirectory()) walkDir(rel);
+      else if (e.name.endsWith('.ts')) out.push({ rel, src: readFileSync(join(ROOT_DIR, rel), 'utf8') });
+    }
+  };
+  for (const r of SRC_ROOTS) walkDir(r);
+  return out;
+}
+/** 原始文本里出现该标识符的行(用于「调用点」这类需要排除定义行的判据)。 */
+function linesMatching(src: string, re: RegExp): number[] {
+  const hits: number[] = [];
+  const ls = src.split('\n');
+  for (let i = 0; i < ls.length; i += 1) if (re.test(ls[i] as string)) hits.push(i + 1);
+  return hits;
+}
 
 test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不是缺接线动作)', () => {
   /* 判定:它不是「有人该 import 它却忘了」,而是**两个宿主都不存在**:
@@ -1243,13 +1274,16 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
 
   /* ① 宠物容器不存在:world_sim 完全不碰 taming 的任何核心类型。 */
   ok(!/PetRecord|TameStage|feedPet|deployPet|sendToRanch/.test(wildSimSrc),
-    'world_sim 不碰 PetRecord/TameStage/feedPet ⇒ 宠物容器不存在');
+    'world_sim.ts 不碰 PetRecord/TameStage/feedPet/deployPet/sendToRanch(★ 范围仅此一文件)');
 
   /* ② 驯服交互不存在:behaviors.ts 里没有 TameableAi,也没有 tameItem 分支。 */
   ok(!/class TameableAi|TameableAi extends/.test(behavSrc),
-    'behaviors.ts 没有 TameableAi ⇒ 没有生物实现驯服交互');
+    'behaviors.ts 没有 TameableAi(★ 范围仅此一文件)');
+  /* ⚠️ task-73 修:原结论句为「⇒ 7 种可驯服生物的 tameItem 字段无人消费」——
+   *    断言体只测 behaviors.ts(实测 0 次,为真),而结论句把范围写成「该字段」= 全仓
+   *    ⇒ **为假**:实测有 3 个文件在读它。全仓事实现由下方 5a 单独钉住(陷阱 95)。 */
   ok(!/tameItem/.test(behavSrc),
-    'behaviors.ts 不读 tameItem ⇒ 7 种可驯服生物的 tameItem 字段无人消费');
+    'behaviors.ts 不读 tameItem(★ 范围仅此一文件;全仓事实见下方 5a)');
 
   /* ③ 反向证据:注册表登记了可驯服名单,却**零引用** ——
    *    这是「登记了但从未被用」的典型信号(比「没登记」更可疑)。 */
@@ -1261,7 +1295,48 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
     wildSimSrc,
   ].reduce((n, s) => n + (s.match(/TAMEABLE_AI_IDS/g) ?? []).length, 0);
   eq(tameRefs, 1,
-    'TAMEABLE_AI_IDS 全仓只出现 1 次(它自己的定义处)⇒ 名单登记了但从未被消费');
+    '这 4 个文件里 TAMEABLE_AI_IDS 只出现 1 次(★ 范围 = 上面这 4 个文件,不是全仓;全仓见下方 5c)');
+
+  /* ═══════════════════════════════════════════════════════════════════════
+   * ★★★ 5 ★ task-73 新增:把「全仓事实」**单独立测**,使范围不再被偷换。
+   *
+   * 背景(陷阱 95):上面第 2 条原先的结论句是
+   *     'behaviors.ts 不读 tameItem ⇒ 7 种可驯服生物的 tameItem 字段无人消费'
+   *   · 断言体只覆盖 behaviors.ts —— 实测 0 次 ⇒ **为真**,断言**绿**
+   *   · 结论句说的是「该字段」= 全仓 —— 实测 3 个文件在读它 ⇒ **为假**
+   *   ⇒ 而这句错话被抄进 `scripts/verify.ts` 的白名单理由,当作「有出处的已核实事实」。
+   *
+   * 修法(**不是删断言**):范围改准确(见上方各处 ★ 标注)+ 另加全仓判据。
+   * ⇒ 范围一旦分开写,「单例冒充全称」就从**文本修辞**变成**机械可核对**的东西。
+   * ═══════════════════════════════════════════════════════════════════════ */
+  const prod = collectProdTs();
+  ok(prod.length > 50,
+    `自证:生产源码扫到 ${prod.length} 个 .ts(期望 > 50 —— 否则扫描器坏了会**静默恒过**)`);
+
+  /* 5a 全仓**读** `.tameItem` 的文件 —— 实测 3 个。
+   *    这条正是「tameItem 字段无人消费」的**反证**。 */
+  const tameReaderFiles = prod.filter((p) => /\.tameItem/.test(p.src)).map((p) => p.rel).sort();
+  eq(tameReaderFiles,
+    ['server/src/content/registry.ts', 'server/src/mobs/taming.ts', 'shared/constants/mobs.ts'],
+    `全仓读 .tameItem 的文件共 ${tameReaderFiles.length} 个 ⇒ tameItem **有**消费者(「无人消费」不成立)`);
+
+  /* 5b 真正无人消费的是 `feedPet` 这个**函数**:生产侧调用点 0(只 1 处定义)。 */
+  let feedPetCalls = 0;
+  for (const p of prod) {
+    const ls = p.src.split('\n');
+    for (const ln of linesMatching(p.src, /feedPet/)) {
+      if (!/export function feedPet/.test(ls[ln - 1] as string)) feedPetCalls += 1;
+    }
+  }
+  eq(feedPetCalls, 0,
+    'feedPet 生产调用点 0(1 处定义 + 0 调用)⇒ 无人消费的是**函数**,不是 tameItem 字段');
+
+  /* 5c 全仓**生产侧**该名单只出现 1 次(仅定义处)⇒「从未被生产消费」成立。
+   *    ⚠️ 与上方第 3 条范围不同:3 只数 4 个文件;本条数**全部生产文件**。
+   *       两者实测**恰好同值 1**,但范围不同,故分开写、分别注明。 */
+  const idsProd = prod.reduce((n, p) => n + (p.src.match(/TAMEABLE_AI_IDS/g) ?? []).length, 0);
+  eq(idsProd, 1,
+    `生产侧(${prod.length} 个文件)TAMEABLE_AI_IDS 只出现 1 次 ⇒ 仅定义处、零生产消费`);
 
   /* ④ 而 taming.ts 自身是**完整**的(27 个导出、测试全绿)——
    *    所以它是「实现存在 + 宿主缺失」,不是「实现有坑」。 */
