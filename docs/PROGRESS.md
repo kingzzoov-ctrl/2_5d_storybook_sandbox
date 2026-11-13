@@ -3787,11 +3787,15 @@ node scripts/backlog.ts           → 133 条 / 109 未关闭 / 0 阻塞 / 24 �
       契约 §2.3 的 8    = **投影字段**数(level/hp/maxHp/x/y/z/weaponId/inventory)
       `SimReadView` 4   = **逐帧读口**数(levelOf/vitalsOf/poseOf/weaponOf)
       `READ_PORTS` 7    = **运行时存在性断言**覆盖的读口数(含 3 个非投影读口)
-      `WorldSaveHost` 9 = 可选成员总数(**含** addPlayer/removePlayer/advance 等写/驱动口)
+      `WorldSaveHost` 9 = **可选**成员数(必选另有 2 ⇒ 总数 **11**;含 addPlayer/removePlayer/advance 等写/驱动口)
     ⇒ **四个数,量纲全不同。** 拿任意两个互比 ⇒ **必然假阳性**。
     ⇒ ★ 本次**双方各犯一次**:Lead 拿字段数(8)比接口成员数(4)⇒ 报"不一致";
       net-persist 把读口数写成 8 ⇒ 进了文档。**同源**。
     ⇒ 判据(Lead 本次新记,两人已共同复核):**比对两个数之前,先确认它们量纲相同。**
+    ⇒ ★★ 且**本条自己也犯过同族的错**:本行初稿写「9 = 可选成员总数」——
+      把「可选 9」与「总数 11」混成一个说法(**量纲仍未分清**,只换了措辞)。
+      2026-11-13 复核实测:`WorldSaveHost` 成员 **11** 个 = 必选 2 + 可选 9。
+      ⇒ ⇒ 故**第五个量纲**是:同一接口的「成员总数」与「可选成员数」也是两个数。
     ```
     ### ★★ 五、处置
 
