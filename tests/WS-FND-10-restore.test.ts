@@ -72,8 +72,12 @@ function boot(db: MemoryDb) {
 function seedAndSnapshot(
   host: ReturnType<typeof boot>['host'],
   rt: ReturnType<typeof boot>['runtime'],
+  weaponId?: number,
 ): Uint8Array {
-  const applied = host.restoreFromProfile?.('p1', { level: 30, hp: 535, x: 7, y: 9, z: 0 });
+  const applied = host.restoreFromProfile?.('p1', {
+    level: 30, hp: 535, x: 7, y: 9, z: 0,
+    ...(weaponId === undefined ? {} : { weaponId }),
+  });
   ok(applied !== undefined && applied >= 1, 'seed:restoreFromProfile 生效(夹具走生产通路)');
   rt.step();
   return encodeFull(rt.state, rt.state.meta.tick).bytes;
@@ -260,6 +264,70 @@ test('T9 落地:loadReconnectSnapshot 从 import-only 变成有生产消费者',
   /* 而它原来只在 L1830 被 re-export */
   const reExport = /export \{[^}]*loadReconnectSnapshot[^}]*\}/.test(roomSrc);
   ok(reExport, 're-export 仍在(向后兼容),但**不再**只有它');
+});
+
+/* ══════════ ★ 以下两条是**负向验证抓出来的覆盖缺口**(2026-11-13)══════════
+ *
+ * 我第一版的 11 条测试在 9 条注入中**放过 2 条**:
+ * ```
+ * I3 去掉 room 侧的 `addPlayer`,测试仍绿  ⇒ 因为 restoreFromProfile **自己**也登记
+ *    ⇒ 即:「room 侧 addPlayer 先于读档」这条**当时没有任何断言**。
+ * I9 sim:武器写进 heldItem(而非 wearing),测试仍绿
+ *    ⇒ 即:武器往返这条**完全没测**(契约 §2.1 的 weaponId 字段形同虚设)。
+ * ```
+ * ⇒ 两条都是**真实缺口**,补如下。
+ * ★ 教训:11/11 通过不代表覆盖了 11 件事。
+ *   判据不是"测试有多少条",而是"**打坏被测的东西,它会不会红**"。
+ */
+
+test('T10 ★ 武器往返:blob 的 weaponId ⇒ wearing ⇒ weaponOf 投影(补 I9 缺口)', () => {
+  const db = freshDb();
+  const { host, runtime } = boot(db);
+  runtime.join({ userId: 'p1', asGuest: false });
+  /* 711 是实测存在的轻剑(`weapons.ts:246`)。 */
+  const WID = 711;
+  const blob = seedAndSnapshot(host, runtime, WID);
+
+  /* 权威侧:weaponOf 必须读得到 —— 它按「wearing 里不在 ARMOR_BY_ID 的第一个 id」判 */
+  eq(host.weaponOf?.('p1'), WID, '★ 权威 weaponOf = 711(⇒ 写进了 wearing,不是 heldItem)');
+  const p = runtime.state.players.find((x) => x.id === 'p1')!;
+  eq(p.weaponId, WID, '★ 投影 weaponId = 711');
+
+  /* blob 里也带上了它 ⇒ 冷启动能恢复 */
+  const pkt = decodePacket(blob);
+  const row = pkt.upserts.find((u) => u.kind === EntityKind.PLAYER && u.id === 'p1');
+  eq(row?.fields.weaponId, WID, '★ blob 里 weaponId = 711(可持久化)');
+
+  /* 冷启动:新运行时读同一份存档 */
+  saveReconnectSnapshot(db, 'room_a', 'p1', blob, T0);
+  const { host: h2, runtime: rt2 } = boot(db);
+  rt2.join({ userId: 'p1', asGuest: false });
+  eq(h2.weaponOf?.('p1'), WID, '★★ 冷启动后权威 weaponOf = 711(端到端往返)');
+  eq(rt2.state.players.find((x) => x.id === 'p1')?.weaponId, WID, '★★ 冷启动后投影 weaponId = 711');
+});
+
+test('T11 ★ room 侧确实先登记再读档(补 I3 缺口)', () => {
+  /* ## 为什么要有这条
+   * `restoreFromProfile` 内部**也**会 `addPlayer`(为了让它对未登记玩家也生效)。
+   * ⇒ 于是「room 侧有没有先登记」**在行为上观察不到** —— 去掉它测试照样绿。
+   * ⇒ 但两者**不是**冗余:
+   * ```
+   * room 侧 addPlayer 用**房间出生点**播种刚体与反作弊
+   * sim 侧 addPlayer 用**档案坐标**
+   * ⇒ 少了 room 侧那次,ac 的播种坐标来自 body(.x/.y),
+   *   而 body 是房间算的出生点 —— 恢复后 ac 与刚体**不同源**
+   * ⇒ 第一次移动被判瞬移(契约 §4.1.2 记的 13.649 格)
+   * ```
+   * ⇒ 判据:结构性地检查**顺序**(源码文本),而不是靠行为(行为查不出)。
+   *   ⚠️ 这正是「行为断言查不出的事,只能用结构断言兜」的场合;
+   *      代价是它测的是**源码形态**而非运行结果 —— 明知而取,故写明。 */
+  const src = readFileSync(new URL('../server/src/net/room.ts', import.meta.url), 'utf8');
+  const addIdx = src.indexOf('host.addPlayer(input.userId, body?.x ?? 0, body?.y ?? 0)');
+  const restoreIdx = src.indexOf('restoreFromSnapshot(host, input.userId)');
+  ok(addIdx > 0, 'room.ts 里有 `host.addPlayer(input.userId, body?.x ...)` 的调用');
+  ok(restoreIdx > 0, 'room.ts 里有 `restoreFromSnapshot(host, input.userId)` 的调用');
+  ok(addIdx < restoreIdx,
+    `★ 登记(${addIdx})必须先于读档(${restoreIdx})—— 顺序反了会让 ac 与刚体不同源`);
 });
 
 report('WS-FND-10-restore');
