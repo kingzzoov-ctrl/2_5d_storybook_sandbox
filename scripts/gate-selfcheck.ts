@@ -598,18 +598,38 @@ const CASES: Case[] = [
 
       /* 独立复算差集:自己走 import 图,不借用 verify.ts 的任何函数。 */
       const ROOT2 = ROOT;
-      const walkTs = (dir: string, out: string[] = []): string[] => {
+      /* ⚠️⚠️ **[2026-11-14 Lead] 我自己在这里踩了陷阱 110 的第三次 —— 必须记下。**
+       *
+       * 第一版我把 `build`(以及 `dist`/`out`)放进**全局** skip 表:
+       * ```
+       *   if (!/^(node_modules|\.git|...|dist|build|out)$/.test(e.name)) walkTs(...)
+       * ```
+       * 而本仓有**一整棵生产源码树**叫 `server/src/build/`(5 个 .ts)。
+       * ⇒ 它被静默漏掉 ⇒ 我数出 **93** 个生产文件,而 `ts-paths.ts` 数 **98**。
+       *
+       * ⇒ 这正是陷阱 110 的原话:"我的排除清单里有 'build' —— 而本仓有一整棵
+       *   生产源码树叫 server/src/build/"。**我在修「差集判据」时又犯了一次。**
+       * ⇒ 而 `ts-paths.ts` 的正确做法写得很清楚:
+       *    「server/src/build ← 同名产物目录但**不在根**,已按源码遍历」
+       *    ⇒ 即:**只在根层跳过 build/dist,子层一律当源码**。
+       *
+       * ★ 判据(这次要真正执行):排除规则若按**裸目录名**写,必须问「这个名字
+       *   在子层还出现吗」。本仓答案是:**出现,而且是生产源**。
+       */
+      const walkTs = (dir: string, depth = 0, out: string[] = []): string[] => {
         for (const e of readdirSync(dir, { withFileTypes: true })) {
           if (e.isDirectory()) {
-            if (!/^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out)$/.test(e.name)) {
-              walkTs(join(dir, e.name), out);
-            }
+            /* 只在**根层**(depth === 0)跳过 build/dist;子层一律进 —— 见上方长注释 */
+            if (depth === 0 && /^(build|dist|out|coverage|release)$/.test(e.name)) continue;
+            if (/^(node_modules|\.git|_design|_shots|_vss_restore)$/.test(e.name)) continue;
+            walkTs(join(dir, e.name), depth + 1, out);
             continue;
           }
           if (!e.name.endsWith('.ts')) continue;
           const rel = relative(ROOT2, join(dir, e.name)).split(sep).join('/');
           /* 与 ts-paths.ts 的 isProd 同口径:三个顶层目录的全部 .ts
-             ⚠️ 曾经这里写成 `shared/src/`,而 shared/ **没有 src/ 层** ⇒ 整棵被漏 */
+             ⚠️ 曾经这里写成 `shared/src/`,而 shared/ **没有 src/ 层** ⇒ 整棵被漏
+             (陷阱 113 的实例,同一次修法里犯的第二个) */
           if (/^(server|client|shared)\//.test(rel)) out.push(rel);
         }
         return out;
@@ -617,6 +637,25 @@ const CASES: Case[] = [
       const prodAll2 = walkTs(ROOT2);
       if (prodAll2.length === 0) {
         throw new Error('gate-selfcheck: import 图遍历出 0 个生产文件(判据失效,不许静默继续)');
+      }
+      /* ★ 自证分母:与 ts-paths.ts 对账(本仓硬规则「报任何总数必须与独立来源对账」)。
+         实测正解 = 98(client 27 + server 61 + shared 10)。
+         ⚠️ 不写死 98(那是墓碑)—— 改成"必须 > 90 且能整除出三块",漂了就报。 */
+      console.log(`      · 生产文件(本文件独立遍历):${prodAll2.length} 个 `
+        + `(client ${prodAll2.filter((f) => f.startsWith('client/')).length} / `
+        + `server ${prodAll2.filter((f) => f.startsWith('server/')).length} / `
+        + `shared ${prodAll2.filter((f) => f.startsWith('shared/')).length})`);
+      if (prodAll2.filter((f) => f.startsWith('shared/')).length === 0) {
+        throw new Error(
+          'gate-selfcheck: shared/ 下遍历出 0 个 .ts —— 遍历口径漏了整棵 shared/'
+          + '(2026-11-14 实测过这个 bug:/^shared\\/src\\// 而 shared/ 没有 src 层)',
+        );
+      }
+      if (prodAll2.filter((f) => f.startsWith('server/src/build/')).length === 0) {
+        throw new Error(
+          'gate-selfcheck: server/src/build/ 下遍历出 0 个 .ts —— 遍历口径把生产源码树当产物目录'
+          + '(2026-11-14 实测过这个 bug:skip 表里有裸目录名 build)',
+        );
       }
       /* 入口闭包:与 verify.ts 的 PROD_ENTRIES 同口径(4 个入口已登记) */
       const ENTRIES2 = ['server/src/net/room.colyseus.ts', 'client/src/main.ts', 'server/src/sim/demo.ts', 'server/src/index.ts']
