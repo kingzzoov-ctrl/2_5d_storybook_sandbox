@@ -137,6 +137,7 @@ import {
 import {
   KillLedger,
   createProgress,
+  setLevel,
   settleMobExp,
   applyShareResult,
   isTalentUnlocked,
@@ -2628,6 +2629,93 @@ export class WorldSim {
       const hp = Math.max(0, Math.min(v.maxHp, row.hp));
       this.vitals.revive(id, hp);
       applied += 1;
+    }
+    return applied;
+  }
+
+  /**
+   * **读档恢复的权威入口**(task-70 / 契约 `TASK47-LAYER-WIRING-CONTRACT.md` §2.1)。
+   *
+   * 把一份玩家档案(来自 `room_players.snapshot_blob` 解码后**该玩家自己那一行**)
+   * 按**固定顺序**写进权威层:`progresses`(等级)与 `vitals`(生命)。
+   *
+   * ## ★ 为什么需要这个口(而不是让房间自己写 state)
+   *
+   * 实测:`level` 的**唯一持久化处**就是 `snapshot_blob`(它是 `encodeFull(state)`
+   * 的投影值);而 `users` 表虽然**有** `level`/`max_hp` 列,
+   * `saveVitalsToUsers` 只写 `hp`(`repo.ts:773`),且 `hp` 被
+   * `cur.max_hp`(=建号 100)钳住 —— 故 **DB 路装不下 535 血**。
+   * ⇒ 读档必须走 blob;而 blob 里是**投影值**,不是权威。
+   * ⇒ 若房间直接把 blob 的值塞进 `state.players[]`,那是**直写投影**(违反 §4.3):
+   *   下一帧 `projectPlayer` 会用权威的旧值把它覆盖回去,表现为「恢复了又弹回」。
+   * ⇒ 故必须有一个**权威侧**的口来接收这份档案。
+   *
+   * ## ★★ 顺序是硬约束,理由都是实测出来的
+   *
+   * ```
+   * 1 addPlayer            —— 未登记则 vitals/physics 都不知道此人,
+   *                          后续 importVitals 会因 `this.vitals.get(id)` 为
+   *                          undefined 而**静默跳过**(importVitals 的既有取舍)
+   * 2 applyPlayerMove      —— 位置先落位,免得后续投影读到旧坐标
+   * 3 ★ syncMaxHp(**必须**在 importVitals 之前)
+   *      `importVitals` 内部把 hp 钳到 `v.maxHp`(见其 :2628)。
+   *      若此时 maxHp 还是构造默认值 100,30 级玩家的 535 血会被**钳成 100**。
+   *      ⇒ 先按 level 把上限抬到派生值,再灌 hp。
+   * 4 importVitals         —— hp 落位(走 revive,顺带清 downed/iframe)
+   * 5 setProfile           —— 装备等档案字段
+   * ```
+   * ⚠️ 第 3 步与第 4 步**换序会静默给出错值** —— 不是报错,是钳制。
+   *    这正是 US2 §4 记下的同一条纪律(`先 syncMaxHp 再投影`)。
+   *
+   * ## ⚠️ 本方法**不新增**派生公式
+   *
+   * `maxHp` 由 `maxHpForLevel`(纯转发 `progression.statsAtLevel`)算,
+   * 落盘走 `vitals.syncMaxHp`。这里不写 `100 + 15*(lv-1)` ——
+   * 写了就是第二份实现(正是 W1 的成因)。
+   * ⇒ 故 `profile` **刻意不含 `maxHp`**:它是 level 的派生值,由本层算。
+   *
+   * @returns 实际生效的玩家数(0 = 没登记过 ⇒ 什么都没做)
+   */
+  restoreFromProfile(playerId: string, profile: {
+    level: number; hp: number; x: number; y: number; z: number; weaponId?: number;
+  }): number {
+    /* 1 登记:未登记时 applyPlayerMove/importVitals 都会静默 no-op。 */
+    if (!this.playerIds.has(playerId)) this.addPlayer(playerId, profile.x, profile.y);
+
+    /* 2 位置(刚体) —— 已获准的写入,与 `applyPlayerMove` 同一语义。 */
+    this.applyPlayerMove(playerId, profile.x, profile.y);
+
+    /* 3 ★ 先抬上限:必须在灌 hp 之前,否则 535 会被旧上限 100 钳住。 */
+    const level = Number.isFinite(profile.level) ? profile.level : 1;
+    const derived = this.maxHpForLevel(playerId, level);
+    if (derived !== null) this.syncMaxHp(playerId, derived);
+
+    /* 3.5 等级档案。`setLevel` 是纯函数(返回新对象)⇒ 必须回写 Map,
+        否则 `levelOf` 仍读到旧等级(而 vitals 上限已经是新等级的值 ⇒ 不一致)。 */
+    const cur = this.progresses.get(playerId) ?? createProgress(playerId);
+    this.progresses.set(playerId, setLevel(cur, level));
+
+    /* 4 hp 落位(revive ⇒ 清 downed/iframe)。 */
+    let applied = 0;
+    if (Number.isFinite(profile.hp)) {
+      applied = this.importVitals({ [playerId]: { hp: profile.hp } });
+    }
+
+    /* 5 档案字段(武器)。
+       ⚠️ 必须写进 `wearing`,**不是** `heldItem` ——
+       `weaponOf` 的既有规则是「`wearing` 里**不在 `ARMOR_BY_ID`** 的第一个 id」
+       (见其 docblock:复用该规则而不另写一套)。
+       我第一版写成 `heldItem: profile.weaponId`,那样 `weaponOf` **永远读不到它**
+       ⇒ 表现为「存档里有武器,恢复后投影出 undefined ⇒ 武器凭空消失」,
+       而**不会有任何东西报错**(setProfile 照常成功)。
+       ⇒ 与陷阱 89 同族:写进去了,但走的是另一条路。
+
+       ⚠️ 这里**只写武器那一个 id** —— 因为 blob 里只有 `weaponId` 这一个
+       装备字段(`PlayerState` 没有整份 `wearing`)。
+       ⇒ 故打包成只含武器的 `wearing`。护甲不在本任务范围(存档里本来就没有它);
+         若将来 blob 扩出 `wearing`,这里应改;记在契约 §10 未决。 */
+    if (profile.weaponId !== undefined && Number.isFinite(profile.weaponId)) {
+      this.setProfile(playerId, { wearing: [profile.weaponId] });
     }
     return applied;
   }

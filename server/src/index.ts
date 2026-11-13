@@ -99,6 +99,14 @@ export interface Assembled {
  * 哪天丢了 `saveToDb` / `attackMobAuthorized` / `levelOf` 中任何一个,
  * **本文件编译期就会报错**,而不是等到运行期在房间的 `if (host === null)` 里静默跳过。
  * ⇒ 让「契约被满足」成为编译期事实,而不是注释里的承诺。
+ *
+ * ⚠️ 但这条纪律的**代价**在 task-70 实测到了,值得写在这里:
+ * `WorldSaveHost` 里**可选**(`?`)的成员,若 `WorldSim` 有而接口没声明,
+ * 就会被**结构化裁掉** —— 即 `const h: WorldSaveHost = sim` 之后
+ * `h.<该方法>` 在类型上**不存在**,而运行期它在。
+ * ⇒ 本仓形态:「**能力存在而通路缺失**」(与陷阱 89 同族)。
+ * ⇒ 故新增任何 `WorldSim` 能力并打算让房间用时,**必须同时**在
+ *    `WorldSaveHost` 里声明,否则这行 `return sim` 会把它悄悄藏起来。
  */
 export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
   /* ⚠️ `WorldSimOptions` 只有 `sizeCells` / `fluidBudget` / `wiring` / `mobs` /

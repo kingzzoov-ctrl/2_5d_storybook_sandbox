@@ -19,8 +19,10 @@
 import {
   encodeDelta,
   encodeFull,
+  decodePacket,
   PROTOCOL_VERSION,
 } from '../../../shared/net/delta.ts';
+import { EntityKind } from '../../../shared/types/wire.ts';
 import {
   AntiCheatRoom,
   type Clock,
@@ -242,6 +244,21 @@ export interface MemberSession {
   joinedAtMs: number;
   lastSeenMs: number;
   seq: number;
+  /**
+   * 本次 join 从存档恢复出的**权威坐标**;未恢复(首次进入/无存档)时为 `null`。
+   *
+   * ## 为什么要记它(task-70)
+   *
+   * 契约 §9 验收 1 要求「读档恢复有真调用点」,而**光有调用点不够** ——
+   * 「调用了但恢复无效」与「没有存档」在外部表现上**完全一样**(陷阱 89)。
+   * 记下恢复结果,断言才能区分这两件事:
+   * ```
+   * 有存档且恢复成功 ⇒ restoredFrom ≠ null
+   * 有存档但恢复失败 ⇒ restoredFrom === null 而 restoreError ≠ null  ← ★ 缺陷
+   * 没有存档         ⇒ restoredFrom === null 且 restoreError === null
+   * ```
+   */
+  restoredFrom?: { x: number; y: number } | null;
 }
 
 export interface JoinResult {
@@ -453,6 +470,54 @@ export interface WorldSaveHost {
    * 可选:世界源不实现它时,`step()` 整段跳过 —— 与 `saveToDb` 同一 null 契约。
    */
   advance?(frames: number): number;
+
+  /**
+   * **读档恢复的权威入口**(task-70 / 契约 §2.1)。
+   *
+   * 把一份**已解码的**玩家档案按固定顺序写进权威层(`progresses` / `vitals`)。
+   * 顺序的内部实现在 `WorldSim.restoreFromProfile`,此处只声明契约。
+   *
+   * ## 为什么它必须存在(而不是房间解析 blob 后直写 `state.players[]`)
+   *
+   * ```
+   * 实测:level 的**唯一**持久化处 = room_players.snapshot_blob
+   *       (它是 encodeFull(state) 的**投影值**,不是权威)
+   * 而 users 表虽然**有** level/max_hp 列:
+   *       saveVitalsToUsers 只写 hp(repo.ts:773),且 hp 被 cur.max_hp(=100)钳住
+   *       ⇒ **DB 路装不下 535 血**(实测 hp 恒 100)
+   * ⇒ 读档只能走 blob;而 blob 是投影值 ⇒ 必须由**权威侧**接收它,
+   *   否则 §4.3 的「唯一写者是 projectPlayer」被绕过:
+   *   房间直写 state ⇒ 下一帧 projectPlayer 用权威旧值覆盖 ⇒
+   *   表现为「恢复了又弹回」(一帧的错,但可观测)
+   * ```
+   *
+   * ## ⚠️ `profile` **刻意不含 `maxHp`**
+   *
+   * `maxHp` 是 `level` 的**派生值**(`statsAtLevel`),由模拟层算。
+   * 若让房间传 maxHp,就出现了第二份派生实现 —— 那正是 W1 的成因。
+   *
+   * ## ⚠️ 返回值的含义
+   *
+   * 实际生效的**玩家数**(0 通常表示「玩家未登记」⇒ 本方法内部会先 `addPlayer`,
+   * 故正常路径应返回 1)。调用方应断言它,而不是忽略 ——
+   * 忽略它会让「恢复静默无效」与「恢复成功」不可区分(陷阱 89)。
+   */
+  restoreFromProfile?(playerId: string, profile: {
+    level: number;
+    hp: number;
+    x: number;
+    y: number;
+    z: number;
+    /**
+     * 装备的武器 id(U16)。
+     *
+     * ⚠️ 模拟层会把它写进 `wearing`(`weaponOf` 的既有规则:
+     *    「`wearing` 里不在 `ARMOR_BY_ID` 的第一个 id 即武器」),
+     *    **不是** `heldItem` —— 写错那个字段 `weaponOf` 读不到,
+     *    而不会有任何东西报错。
+     */
+    weaponId?: number;
+  }): number;
 
   /* ══════════ US2 裁决 3:投影所需的**只读**读口(契约 §3.1)══════════
    *
@@ -699,6 +764,21 @@ export class RoomRuntime {
     hpSkipped: number;
     memRow: number;
   } | null = null;
+  /**
+   * 上一次读档恢复:`restoreFromProfile` 返回的**生效玩家数**;null = 从未尝试。
+   *
+   * 与 `lastSaveReport` 同一处置:把「做了没有、生效几条」**显式暴露**,
+   * 而不是让调用方以为「已经恢复过了」。
+   */
+  lastRestoreApplied: number | null = null;
+  /**
+   * 上一次读档失败的**原因**;null = 无失败。
+   *
+   * ⚠️ 只记**真失败**(存档存在但解不开 —— 协议版本变了 / 字节截断),
+   * **不记**「没有存档」(那是常态,不是错误)。
+   * ⇒ 这个区分是刻意的:两类混在一起会让「读坏了」看起来像「首次进入」。
+   */
+  lastRestoreError: string | null = null;
   /** 每 tick 累计的违规,由外层写 room_events。 */
   private pendingViolations: Violation[] = [];
   private tokenSeq = 0;
@@ -721,7 +801,49 @@ export class RoomRuntime {
        缺省仍为 null,但**装配层现在有地方可传** —— 此前只能事后赋值,
        而生产里那个赋值一处都不存在。 */
     this.worldSaveHost = opts.host ?? null;
-    if (db) {
+    /* ══════════ ★ 房间落库必须是**幂等**的(task-70 实测抓到)══════════
+     *
+     * ## 为什么原来的 `createRoom` 无条件调用是错的
+     *
+     * `createRoom` 对已存在的 id **抛异常**(`repo.ts:328`)。
+     * 而本构造器在**每次**装配时都调它 ⇒
+     * ```
+     * 服务重启(DB 里已有 room_a)
+     * ⇒ assemble() ⇒ new RoomRuntime(...) ⇒ createRoom 抛「房间已存在」
+     * ⇒ **装配失败** ⇒ 根本走不到读档恢复那一步
+     * ```
+     * ⇒ 「冷启动读档」在**架构上**不可达 —— 本任务是 task-70,
+     *   而它的名字就是冷启动。实测:
+     * ```
+     * new RoomRuntime(opts, db) 第一次 ⇒ OK
+     * new RoomRuntime(opts, db) 第二次 ⇒ ★ 抛「房间已存在:room_a」
+     * assemble({db}) 第二次           ⇒ ★ 同上
+     * ```
+     *
+     * ## 判据:构造器的职责是「**确保**房间存在」,不是「**创建**房间」
+     *
+     * 与 `migrate` 同一语义:能重复执行。故**先查**:
+     * ```
+     * 已存在 ⇒ 什么都不做(保留库里的 name/accessMode 等 ——
+     *                  那些可能在别处被改过,不该被本次装配的默认值盖回)
+     * 不存在 ⇒ 按原逻辑创建
+     * ```
+     *
+     * ## ⚠️ 为什么不改 `createRoom` 成 upsert
+     *
+     * 它那条守卫是**故意的**:能抓到「同一个房间被建两次」这类真错
+     * (实测 `tests/WS-07` 有断言依赖它抛)。把守卫改成静默 upsert
+     * 会让那个错误消失 —— 而错误消失不等于问题消失。
+     * ⇒ 收敛在**调用点**修,不动被依赖的守卫。
+     *
+     * ## 幂等后仍可变的部分(刻意不覆盖)
+     *
+     * `ownerId` / `name` / `maxPlayers` / `worldSeed` / 密码
+     * —— 库里的现值**优先**。理由:它们是**可运行时变更**的
+     * (`setPartyMode`/`setRoomStatus` 已在做同类变更),
+     * 而本次装配的参多数是 `?? 默认值`,用它覆盖会把用户的改动静默抹掉。
+     */
+    if (db && getRoom(db, opts.roomId) === undefined) {
       createRoom(db, {
         id: opts.roomId,
         ownerId: opts.ownerId,
@@ -835,9 +957,8 @@ export class RoomRuntime {
     }
     /* 反作弊状态以**实际出生坐标**播种,否则会把出生点位移误判成瞬移。 */
     const body = this.state.players.find((p) => p.id === input.userId);
-    this.ac.join(input.userId, this.state.meta.tick, body?.x ?? 0, body?.y ?? 0, body?.z ?? 0);
 
-    /* ★ 同时把玩家登记进**世界**(task-58):`sim.addPlayer` 此前生产调用者为 0,
+    /* ★ 把玩家登记进**世界**(task-58):`sim.addPlayer` 此前生产调用者为 0,
        于是模拟层不知道有这个玩家 ⇒ `applyPlayerMove` 静默无效,
        距离开闸读刚体 ⇒ 永久 `OUT_OF_AOI`。
        ⚠️ 用**同一个** `body.x/y` 播种,保证反作弊与刚体**同源** ——
@@ -847,6 +968,66 @@ export class RoomRuntime {
     if (host !== null && typeof host.addPlayer === 'function') {
       host.addPlayer(input.userId, body?.x ?? 0, body?.y ?? 0);
     }
+
+    /* ★★ 读档恢复(task-70 / 契约 §4.1)。**必须在 `ac.join` 之前** ——
+     * 反作弊要用**恢复后**的实际坐标播种。
+     *
+     * ## 顺序:**登记 → 读档 → 反作弊播种 → 落库**
+     *
+     * `addPlayer` 必须在读档**之前**:`restoreFromProfile` 内部要
+     * `applyPlayerMove` 与 `importVitals`,两者对未登记的玩家都是静默 no-op。
+     * (与契约 §4.1.1 同一条,理由不同:blob 路要的是「刚体/生命已存在」。)
+     *
+     * ## 为什么失败时**不报错、只不恢复**
+     *
+     * 与 `saveToDb`/`levelOf` 同一 null 契约:没有 db、没有存档
+     * 都是**正常**情况(首次进入),不是错误。
+     * ⚠️ 但**不静默**:返回值与错误分别记在 `restoreApplied` / `restoreError`,
+     * 测试可读 ⇒ 让「恢复无效」与「没有存档」可区分(陷阱 89)。
+     */
+    let restoredPose: { x: number; y: number } | null = null;
+    if (host !== null && typeof host.restoreFromProfile === 'function' && this.db) {
+      restoredPose = this.restoreFromSnapshot(host, input.userId);
+      if (restoredPose !== null) session.restoredFrom = restoredPose;
+    }
+
+    /* 反作弊播种:优先用**恢复后**的实际权威坐标;没有存档则用出生点。
+       ⚠️ 不用 blob 里的坐标 —— 刚体可能因碰撞被推开,
+          两者不同会被判瞬移(实测差 13.649 格)。 */
+    this.ac.join(
+      input.userId,
+      this.state.meta.tick,
+      restoredPose?.x ?? body?.x ?? 0,
+      restoredPose?.y ?? body?.y ?? 0,
+      body?.z ?? 0,
+    );
+
+    /* ★★ 恢复后**立刻投影一次**(task-70 实测抓到的一环)。
+     *
+     * ## 为什么不能等到下一帧的 `step()`
+     *
+     * `step()` 里的 `projectAllPlayers()` 是常规投影点,但它最早也要**50ms 后**
+     * 才跑。而本方法下面那行 `encodeFull(this.state, ...)` 会把
+     * **当前**投影编成 join 的初始快照**发给客户端**:
+     * ```
+     * 不立刻投影 ⇒ 客户端收到的首帧是 level=1 / hp=100 / maxHp=100
+     *            ⇒ HUD 先显示 1 级 100 血,50ms 后才跳成 30 级 535 血
+     * ```
+     * ⇒ 实测确认:`join` 后、`step` 前读 `state.players[].maxHp` 得 **100**,
+     *   `step` 后得 535 —— 中间那一帧的错**真的存在**。
+     *
+     * ## 为什么这不是"第二处投影"(不违反 §4.3 单一写者)
+     *
+     * 调的**就是** `projectAllPlayers()`,同一个唯一写者,没有第二份实现。
+     * ⇒ 「唯一写者」约束的是**谁写 state**,不是**何时写**。
+     *   在这里调只是把**本该在下一帧发生的同一次投影**提前到发快照之前。
+     *
+     * ⚠️ 必须先于 `ac.join` 吗?**不必** —— 反作弊读的是刚体(`playerPosition`),
+     *   而投影只写 `state`。两件事互不依赖,故顺序无关;
+     *   放在 `ac.join` 之后是为了让「反作弊播种」与「读档」贴在一起更好读。
+     */
+    if (restoredPose !== null) this.projectAllPlayers();
+
     this.touch(now);
 
     const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
@@ -1708,6 +1889,91 @@ export class RoomRuntime {
   /** 供断言:把快照解码回来对照。 */
   cloneState(): RoomState {
     return cloneRoomState(this.state);
+  }
+
+  /**
+   * **读档恢复**(task-70 / 契约 §4.1)。返回恢复后该玩家的**实际权威坐标**,
+   * 或 `null`(无存档 / 存档里没有这个人 ⇒ 走正常出生流程)。
+   *
+   * ## 为什么读 blob 而不是 `users` 表
+   *
+   * 实测(契约 §2.2.1):
+   * ```
+   * level 的唯一持久化处 = room_players.snapshot_blob
+   * users 表虽**有** level/max_hp 列,但 saveVitalsToUsers 只写 hp(repo.ts:773),
+   * 且 hp 被 cur.max_hp(=建号 100)钳住 ⇒ 实测写 535 读回 100
+   * ```
+   * ⇒ **只有 blob 装得下** level 与 535 血。
+   *
+   * ## 只取「自己那一行」
+   *
+   * blob 是 `encodeFull(state)`(整房快照)⇒ 含所有玩家的行。
+   * 本方法**只提取 `userId` 自己**的那行 ——
+   * 若把整房都写回权威,那是**用旧快照覆盖别人当前的状态**,
+   * 表现为「一个人重连,全房回档」。
+   *
+   * ## 失败一律返回 `null`,不抛
+   *
+   * 存档可能:① 不存在(首次进入) ② 协议版本变了(`decodePacket` 会抛)
+   * ③ 字节被截断。三者都是**正常的**「没有可用存档」,不该让 join 失败。
+   * ⚠️ 但 ② ③ 与 ① 的处置**不同**:前者是**缺陷**,后者是常态。
+   *    故 ② ③ 走 `restoreError` 记下来(测试可断言),而不是彻底静默 ——
+   *    否则「存档读坏了」与「没有存档」不可区分(陷阱 89)。
+   */
+  restoreFromSnapshot(
+    host: WorldSaveHost,
+    userId: string,
+  ): { x: number; y: number } | null {
+    if (!this.db) return null;
+    const restorer = host.restoreFromProfile;
+    if (typeof restorer !== 'function') return null;
+
+    const blob = loadReconnectSnapshot(this.db, this.id, userId);
+    if (blob === undefined) return null;
+
+    let row: PlayerProjection | null = null;
+    try {
+      const pkt = decodePacket(blob);
+      for (const up of pkt.upserts) {
+        if (up.kind !== EntityKind.PLAYER || up.id !== userId) continue;
+        const f = up.fields;
+        row = {
+          level: typeof f.level === 'number' ? f.level : 1,
+          hp: typeof f.hp === 'number' ? f.hp : 0,
+          maxHp: typeof f.maxHp === 'number' ? f.maxHp : 0,
+          x: typeof f.x === 'number' ? f.x : 0,
+          y: typeof f.y === 'number' ? f.y : 0,
+          z: typeof f.z === 'number' ? f.z : 0,
+          weaponId: typeof f.weaponId === 'number' ? f.weaponId : 0,
+        };
+        break;
+      }
+    } catch (e) {
+      /* 存档存在但读不回来 ⇒ 这是**缺陷**,与「没有存档」不同。记下来供断言。 */
+      this.lastRestoreError = `快照解码失败(${userId}):${(e as Error).message.slice(0, 80)}`;
+      return null;
+    }
+    if (row === null) return null;
+
+    /* ⚠️ 先落到**权威**(唯一入口),**不碰** `state.players[]` —— §4.3。
+       投影由下一帧的 `syncLevelProjections` 统一做(它已在每帧被调用)。 */
+    const applied = restorer.call(host, userId, {
+      level: row.level,
+      hp: row.hp,
+      x: row.x,
+      y: row.y,
+      z: row.z,
+      weaponId: row.weaponId,
+    });
+    this.lastRestoreApplied = applied;
+
+    /* 返回**恢复后的实际**坐标(不是 blob 里的):刚体可能因碰撞被推开,
+       用 blob 坐标播种反作弊会把第一次移动判成瞬移(实测差 13.649 格)。 */
+    if (typeof host.playerPosition === 'function') {
+      const p = host.playerPosition(userId);
+      if (p !== null) return { x: p.x, y: p.y };
+    }
+    return { x: row.x, y: row.y };
   }
 
   onlineCount(): number {
