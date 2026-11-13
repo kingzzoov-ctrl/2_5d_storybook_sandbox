@@ -527,6 +527,57 @@ async function checkGateSelfcheck(): Promise<void> {
 }
 
 
+/**
+ * ★ task-79:BOM 守卫(**硬门禁**,不是告警)。
+ *
+ * ## 为什么它是硬门禁,而不是像 gate-selfcheck 那样默认只告警
+ *
+ * ```
+ * 判据:**该缺陷会让门禁给出错误的通过**吗?
+ *   · gate-selfcheck 未跑 ⇒ 本道门禁的结论**不完整**(少测了 29 件事)
+ *     ⇒ 但已经测的部分是真的 ⇒ 可接受"告警 + 汇总行披露"
+ *   · BOM ⇒ `JSON.parse` 抛错 ⇒ 模块**加载不了** ⇒ 下游全线红
+ *     ⇒ 这是"门禁本身坏了",不是"门禁少测了"
+ *     ⇒ 必须硬拦:一旦放过,门禁的红会出现在**与修改点无关的地方**
+ *       (实测:改 package.json 加一行 script,红在 tests/WS-07.test.ts 上)
+ * ```
+ *
+ * ## 只报"本轮新增"(实测,不是保守)
+ *
+ * ```
+ * HEAD 里本来就有 4 个带 BOM 的历史文件:
+ *   docs/WS-05-boss-raid.md / server/src/mobs/{aoi,geometry,taming}.ts
+ * ⇒ 报它们等于制造一次无授权的批量改动(陷阱 91)
+ * ⇒ 故与 `git cat-file blob HEAD:<path>` 逐文件比对,只报 HEAD 里没有的
+ * ```
+ *
+ * ★ 这条守卫的由来本身是个教训(陷阱 106):
+ *   我在写下"Set-Content -Encoding UTF8 会写 BOM"之后,**又用同一把工具犯了一次**
+ *   ⇒ 证明"记住纪律"不够 —— 被判据约束的必须是**工具**,不是记忆。
+ *   故把纪律做成这道门禁。
+ */
+function checkBomGuard(): void {
+  console.log('\n[BOM 守卫]');
+  const script = join(ROOT, 'scripts', 'bom-guard.ts');
+  if (!existsSync(script)) {
+    fail('scripts/bom-guard.ts 不存在 —— BOM 这道防线整体缺失');
+    return;
+  }
+  const r = spawnSync(process.execPath, [script], { cwd: ROOT, encoding: 'utf8', timeout: 120_000 });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  if (r.status === 0) {
+    const m = /本轮新增 BOM:(\d+)/.exec(out);
+    pass(`无本轮新增 BOM(扫描 ${(/扫描 (\d+) 个文件/.exec(out) ?? [])[1] ?? '?'} 个文件)`);
+    void m;
+    return;
+  }
+  const bad = out.split('\n').filter((l) => l.includes('★')).slice(0, 8);
+  fail(`发现本轮新增的 BOM(它会让 JSON.parse 抛错 ⇒ 门禁会红在无关处):\n`
+    + `      ${bad.join('\n      ')}\n`
+    + '      修法:按全名精确剥除(不要写"扫全仓剥 BOM"的脚本)');
+}
+
+
 /* ───────────────────── 1. 冻结层不变量 ───────────────────── */
 
 async function checkFrozen(): Promise<void> {
@@ -5323,6 +5374,18 @@ if (allFlag && (only || frozenOnly || docsOnly || integrationOnly || contentOnly
   console.error('  ✗ --all 不能与 --only/--frozen/--docs/--content/--integration 同时使用(口径歧义)');
   process.exitCode = 1;
 } else {
+/* ★ task-79:BOM 守卫 —— **必须排在最前**。
+ *
+ * 实测教训:我先把它放在末尾,注入 BOM 后门禁红了,而**第一个红的是
+ * `tests/WS-07.test.ts`(Unexpected token '')** —— 与"我给 package.json 加了
+ * 一行 script"毫无字面关系。⇒ 报错位置与出错位置分离,人会被引去查 WS-07。
+ *
+ * ⇒ 修法不是"把失败信息写清楚"(那是补救),而是**让它先跑**:
+ *   它是 O(打开 248 个文件读 3 字节)的检查,放在最前面零成本;
+ *   而 BOM 一旦存在,**后面几乎所有依赖模块加载的检查都会以各种奇怪的形态红**。
+ * ⇒ ⇒ 判据:**一个"会让别的检查报出误导性错误"的前置条件,必须最先检查。**
+ *   检测它的成本越低,就越没有理由把它排在后面。 */
+if (!frozenOnly && !only) checkBomGuard();
 if (!docsOnly && !only && !integrationOnly && !contentOnly) await checkFrozen();
 /* ⚠️ `runTests()` 必须排在 `checkDocs()` **之前**:
    `checkDocs()` 要用各套件的实测断言数校验 README 表格,
