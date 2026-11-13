@@ -335,4 +335,61 @@ test('FND11-12 不回退:room.ts 的 setAfk 内确实调用了推送(源码判�
     '推送处应写成 typeof 判函数(与 removePlayer 同一纪律),而不是 if (host.x)');
 });
 
+/* ═══════════ 6. ★ 墓碑防护:断言「生产触发源仍为 0」这个事实 ═══════════ */
+
+test('FND11-13 ★ 墓碑防护:生产里仍无人调 setAfk(补上触发源时本断言必须红)', () => {
+  /* ## 这条断言存在的唯一理由
+   *
+   * 本任务修的是**通路**,不是**触发源** —— 实测生产里没有任何东西
+   * 会把 `afk` 变成 `true`(见文件头「本套件不断言什么」一节)。
+   * ⇒ 若只写「注入 AFK ⇒ aoi 不含它」当验收,那么接线做完就绿,
+   *   而**生产行为一字未变**(afk 仍恒 false)
+   * ⇒ 那条断言就成了一口**墓碑**(陷阱 71):把缺陷状态编码成期望值,自己永远绿。
+   *
+   * ⇒ 故必须**同时**钉住「触发源仍为 0」这个**事实**。
+   *   它的价值不在「现在绿」,而在**将来红**:
+   *   一旦有人补上客户端打盹通道 / 服务端超时推断,
+   *   本断言会红 ⇒ 强制他去更新文档与「未做项」标注
+   *   ⇒ 那时「通路已通」才第一次等于「功能可用」。
+   *
+   * ⚠️ 这条**是故意**把「当前缺陷状态」写成期望值的 —— 与陷阱 71 的区别在于:
+   *   陷阱 71 的墓碑**没有出路**(它假装缺陷是正确行为);
+   *   本断言**自带出路**(它明说「补上就该红,并去改文档」)。
+   */
+  /* 1 生产侧 `setAfk` 的调用点仍为 0(只算生产目录,不算测试)。 */
+  const prodFiles = [
+    'server/src/net/room.ts',
+    'server/src/net/room.colyseus.ts',
+    'server/src/index.ts',
+    'server/src/sim/world_sim.ts',
+    'server/src/sim/demo.ts',
+  ];
+  let prodCalls = 0;
+  for (const f of prodFiles) {
+    const code = readCode(f);
+    /* 排除定义本身(`setAfk(userId: string, afk: boolean) {`),只数调用。 */
+    const calls = [...code.matchAll(/setAfk\s*\(/g)].length;
+    const defs = [...code.matchAll(/setAfk\s*\(userId:\s*string/g)].length;
+    prodCalls += calls - defs;
+  }
+  eq(prodCalls, 0,
+    '★ 生产里 `setAfk` 的调用点应仍为 0(实测已知:无人触发打盹)。'
+    + '若你刚补上了触发源 —— 恭喜,请同步更新本测试与 docs/ARCH-GAPS.md 的「未做项」');
+
+  /* 2 客户端侧仍无「切后台」信号 —— 那是触发源最可能的落点。 */
+  const clientCodes = readCode('client/src/net/session.ts');
+  ok(!/visibilitychange|document\.hidden/.test(clientCodes),
+    '★ 客户端仍无切后台信号(补上后本断言必须红,并去摘未做项)');
+
+  /* 3 消息通道仍无 afk 通道(room.colyseus.ts 的 onMessage 全部通道名)。 */
+  const rcCode = readCode('server/src/net/room.colyseus.ts');
+  const channels = [...rcCode.matchAll(/onMessage\(\s*'([^']+)'/g)].map((m) => m[1]);
+  ok(channels.length > 0, '应能解析出 onMessage 通道名(否则本判据失效,需改为别的形态)');
+  ok(!channels.includes('afk') && !channels.includes('background'),
+    `★ 消息面应仍无 afk/background 通道(实测 ${channels.join('/')})`);
+  /* 反向对照:证明解析真的读到了东西(不是空集恒真)。 */
+  ok(channels.includes('move') && channels.includes('attack'),
+    '对照:应解析出已知的 move/attack 通道,证明上一条不是空集假绿');
+});
+
 report('WS-FND-11');
