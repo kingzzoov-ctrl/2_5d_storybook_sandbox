@@ -13,6 +13,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_BYTES, CHUNK_CELLS, packTile, unpackTile } from '../shared/types/tile.ts';
 import { BASE_MOVE_SPEED, DT, TICK_HZ, BodyState } from '../shared/types/physics.ts';
+/* task-71:投影的 level 上界。从**冻结层**取 —— 与 `room.ts` 同一个来源,
+   不在此处再写一个字面量(那会是第二份实现,对不上时没人会发现)。 */
+import { MAX_LEVEL } from '../shared/types/entities.ts';
 /* CR-24:`SC` 走 schema.ts(重导出面),`SH` 走 shared 本体。
    引用相等断言在文件末尾 —— 它是「只有一份实现」的机器判据。 */
 import * as SC from '../server/src/net/schema.ts';
@@ -143,6 +146,11 @@ import {
   RoomRuntime,
   can,
   bootstrap,
+  /* task-71:裁决 2+3 的投影面(契约 §2.3 / §3.1)。 */
+  projectPlayer,
+  projectInventoryTotal,
+  type PlayerProjection,
+  type SimReadView,
 } from '../server/src/net/room.ts';
 /* task-57:生产装配入口 —— K5/K5b 用**生产路径**(而非手动赋值)证明接线。
    ⚠️ 只依赖 `index.ts`(它刻意不 import colyseus 壳),故本套件仍可在 Node 下加载。 */
@@ -164,7 +172,8 @@ import {
   checkMove,
   createAcState,
   fixedClock,
-  maxDisplacementPerTick,
+  /* task-71:CR-27 的限值合并器(直接单测,而不只经构造器间接测)。 */
+  mergeLimits,  maxDisplacementPerTick,
   type FixedClock,
 } from '../server/src/net/anticheat.ts';
 
@@ -4875,5 +4884,531 @@ test('CR-24:上移的 27 个符号在 schema.ts 与 wire.ts 是同一引用(只�
 });
 
 /* ═══════════════ 收尾 ═══════════════ */
+
+/* ═══════════════ CR-27:反作弊 limits 校验(契约 §10 未决 5) ═══════════════ */
+
+/**
+ * ## CR-27 是什么
+ *
+ * `AntiCheatRoom` 的构造参数此前**原样赋值**(`this.limits = limits`)。
+ * 于是任何非对象 / 缺字段 / 非有限值都会让检查**静默失效**:
+ * ```
+ * maxMoveCatchupTicks = undefined
+ *   ⇒ claimedTick = Math.min(intent.tick, lastMoveTick + undefined, lastTick + undefined)
+ *                 = NaN
+ *   ⇒ dtTicks   = Math.max(0, NaN) = NaN
+ *   ⇒ allowed   = 0.36 * NaN = NaN
+ *   ⇒ dist > NaN + 1e-9   **恒 false** ⇒ 全部放行
+ * ```
+ * ⇒ 这不是「限值被调松」,是「检查**根本没执行**」。
+ *
+ * ## 为什么本组看**三条路径**而不是一条
+ *
+ * 我第一版探针只测「瞬移放行」(move 路径),结果 `baseAttackIntervalS = -1`
+ * 这个坏值**测不出来** —— 而它会让最小攻击间隔变成 `-20` 帧 ⇒ 同帧无限连发。
+ * ⇒ **注入物落在哪条路径,就得在哪条路径上观测**(否则测的是另一件事)。
+ *
+ * ## 为什么还要求「不抛错」
+ *
+ * 守卫若写成 fail-**fast**(对原始值直接 `in` ⇒ TypeError),房间会在
+ * **某一帧崩掉** —— 而崩掉的房间**一条检查也不做**。
+ * ⇒ 契约要的是 fail-**closed**(逐字段兜回默认值),不是 fail-fast。
+ * ⇒ 故 `throw` 与 `fail-open` **都算失败**。
+ */
+
+/** 静音 `console.error` 跑一段代码(构造期的回退说明是**预期**输出)。 */
+function quietlyV07<T>(f: () => T): T {
+  const prev = console.error;
+  console.error = () => {};
+  try { return f(); } finally { console.error = prev; }
+}
+
+test('CR27-1 坏 limits 既不放行也不抛错(三条路径同时观测)', () => {
+  const BAD: readonly (readonly [string, unknown])[] = [
+    ["字符串 'not-an-object'", 'not-an-object'],
+    ['数字 42', 42],
+    ['null', null],
+    ['空对象 {}', {}],
+    ['只有 1 个字段的对象', { speedWindowTicks: 20 }],
+    ['字段 = NaN', { ...DEFAULT_LIMITS, maxMoveCatchupTicks: Number.NaN }],
+    ['字段 = undefined', { ...DEFAULT_LIMITS, maxMoveCatchupTicks: undefined }],
+    ['字段 = -1(移动追赶)', { ...DEFAULT_LIMITS, maxMoveCatchupTicks: -1 }],
+    ['字段 = -1(攻击间隔)', { ...DEFAULT_LIMITS, baseAttackIntervalS: -1 }],
+    ['字段 = -1(物品增量)', { ...DEFAULT_LIMITS, maxItemDeltaPerTick: -1 }],
+    ['字段 = Infinity', { ...DEFAULT_LIMITS, teleportSlack: Number.POSITIVE_INFINITY }],
+    ['数组 []', []],
+  ];
+  const openNames: string[] = [];
+  const throwNames: string[] = [];
+  for (const [name, lim] of BAD) {
+    try {
+      const room = quietlyV07(() => {
+        const r = new AntiCheatRoom(lim as never);
+        r.join('p', 0, 0, 0, 0);
+        return r;
+      });
+      /* ── 观测 1:移动路径 —— 瞬移 10 万格必须拒 ── */
+      if (room.move({ playerId: 'p', tick: 1e9, x: 1e5, y: 0, z: 0 }).allowed) {
+        openNames.push(`${name} ⇒ move 放行`);
+      }
+      /* ── 观测 2:攻击路径 —— 同帧 10 连发最多放行 1 次 ── */
+      let atk = 0;
+      for (let i = 0; i < 10; i += 1) if (room.attack('p', 1, 0).allowed) atk += 1;
+      if (atk > 1) openNames.push(`${name} ⇒ attack 放行 ${atk}/10`);
+      /* ── 观测 3:物品路径 —— 单帧 +1000 件必须拒 ── */
+      const iv = room.inventory('p', {
+        tick: 1,
+        ops: [{ itemId: 1, delta: 1000, source: 'ok' }],
+        allowedSources: new Set(['ok']),
+        beforeTotal: 0,
+        capacity: 1e9,
+      });
+      if (iv.allowed) openNames.push(`${name} ⇒ inventory 放行`);
+    } catch (e) {
+      throwNames.push(`${name} ⇒ 抛 ${(e as Error).constructor.name}`);
+    }
+  }
+  eq(openNames, [], `坏 limits 无一放行(实测 ${BAD.length} 类输入 × 3 条路径)`);
+  eq(throwNames, [], '坏 limits 无一抛错(要 fail-closed,不是 fail-fast)');
+});
+
+test('CR27-2 合法 limits 不被误伤(阈值一个都不许动)', () => {
+  /* ⚠️ 这条是 CR27-1 的**反面**。若守卫写成「一律回退默认」,
+     CR27-1 会全绿 —— 但它会把调用方**明确指定**的合法值也扔掉。
+     ⇒ 只断言 CR27-1 等于只测了半个契约。 */
+  const custom = {
+    ...DEFAULT_LIMITS,
+    speedWindowTicks: 33,
+    teleportSlack: 2.5,
+    maxMoveCatchupTicks: 7,
+  };
+  const { room, issues } = quietlyV07(() => {
+    const r = new AntiCheatRoom(custom);
+    return { room: r, issues: r.limitsIssues };
+  });
+  eq(issues, [], '合法 limits ⇒ 零条诊断(不误报)');
+  eq(room.limits.speedWindowTicks, 33, '调用方指定值被**保留**,不是被默认值顶掉');
+  eq(room.limits.teleportSlack, 2.5, '同上(teleportSlack)');
+  eq(room.limits.maxMoveCatchupTicks, 7, '同上(maxMoveCatchupTicks)');
+  eq(room.limits.speedWindowTolerance, DEFAULT_LIMITS.speedWindowTolerance,
+    '未指定字段 = 默认(并集语义)');
+  /* ★ 自定义值必须**真的在生效**,不是只存着不用。 */
+  room.join('q', 0, 0, 0, 0);
+  room.tick(0);
+  ok(!room.move({ playerId: 'q', tick: 100, x: 10, y: 0, z: 0 }).allowed,
+    '自定义 maxMoveCatchupTicks=7 真的在生效(7 帧额度拒掉单帧 10 格)');
+});
+
+test('CR27-3 回退必须**可观测**,不许静默', () => {
+  /* ## 为什么这条单独存在
+   *
+   * CR27-1/2 只约束**行为**(放行与否)。
+   * 而「静默回退」与「可见回退」在行为上**完全相同** ——
+   * 唯一的差别是**有没有人被告知**。
+   * ⇒ 若没有本断言,`limitsIssues` 与那行 `console.error` 就是
+   *   **写了没人引用的装饰**(一段代码是不是载荷,要看有没有断言
+   *   引用它的**效果**)。
+   *
+   * ## 条数矩阵为什么是这个形状
+   *
+   * | 输入 | issues | 说明 |
+   * | :--- | ---: | :--- |
+   * | 原始值 / null / 数组 | 1 | 整体不合法 ⇒ 一句话说清 |
+   * | `{}` | 8 | 八字段全缺 ⇒ **逐字段**各一条 |
+   * | 只给 1 个字段 | 7 | 同上 |
+   * | 1 个字段非法 | 1 | 只有那一个被顶掉 |
+   * | 合法 | 0 | 不误报 |
+   *
+   * ⇒ `{}` = 8 而「只给 1 个字段」= 7,这个**差值本身就是证据**:
+   *    证明回退是**逐字段**跑的,不是「整体不合法就整体换掉」。
+   *
+   * ⚠️ `undefined` 是**唯一**不给诊断的坏输入:它命中默认参数
+   *    (`constructor(limits = DEFAULT_LIMITS)`)⇒ 走的是「没传参」路径。
+   *    那是 JS 语义,不是缺陷 —— 本断言把这条**如实登记**,
+   *    免得后来者以为漏了一格。 */
+  const errLines: string[] = [];
+  const count = (lim: unknown): number => {
+    const prev = console.error;
+    console.error = (m?: unknown) => { errLines.push(String(m)); };
+    try { return new AntiCheatRoom(lim as never).limitsIssues.length; }
+    finally { console.error = prev; }
+  };
+  const MATRIX: readonly (readonly [string, unknown, number])[] = [
+    ["'str'", 'not-an-object', 1],
+    ['42', 42, 1],
+    ['null', null, 1],
+    ['[]', [], 1],
+    ['{}', {}, 8],
+    ['{speedWindowTicks:20}', { speedWindowTicks: 20 }, 7],
+    ['{...D, maxMoveCatchupTicks:NaN}', { ...DEFAULT_LIMITS, maxMoveCatchupTicks: Number.NaN }, 1],
+    ['{...D, maxMoveCatchupTicks:-1}', { ...DEFAULT_LIMITS, maxMoveCatchupTicks: -1 }, 1],
+    ['DEFAULT(合法)', DEFAULT_LIMITS, 0],
+  ];
+  for (const [name, lim, want] of MATRIX) {
+    eq(count(lim), want, `诊断条数:${name} ⇒ ${want}`);
+  }
+  /* ★ 差值是「逐字段」的机器判据(不是靠注释声明)。 */
+  eq(count({}), 8, '全缺 ⇒ 8 条(八字段各一条)');
+  eq(count({ speedWindowTicks: 20 }), 7, '缺 7 个 ⇒ 7 条');
+  /* ★ 真的打到了 stderr,不是只存在数组里。 */
+  ok(errLines.length >= 9, `console.error 被调用 ${errLines.length} 次(坏输入必须有人被告知)`);
+  ok(errLines.some((l) => /maxMoveCatchupTicks|speedWindowTicks/.test(l)),
+    '报错内容**点名**是哪个字段(不是「配置错误」这种无法定位的话)');
+  ok(errLines.some((l) => /回退默认/.test(l)),
+    '报错内容说明了**回退到什么值**(可据以复现)');
+});
+
+test('CR27-4 ★ 未修版本确实会 fail-open(它们是「有牙的断言」)', () => {
+  /* ## 为什么必须写这条
+   *
+   * 「有守卫」与「守卫是载荷」是两件事。若 CR27-1/2/3 在**没有守卫**的
+   * 实现上也能全绿,那它们什么都没测。
+   * ⇒ 本断言**手算**未修版本(naked 直赋)的行为,证明 CR-27 的成因
+   *   是**可复现的算术**,不是事后叙述。
+   *
+   * ⚠️ 这里**不改盘、不注入**:直接拿坏值走裸算术,与
+   *    `this.limits = limits` 之后的代码路径**逐字相同**。
+   *    (对照实现放在断言里,而不是靠改源文件 —— 那会污染队友的工作树。) */
+  const naked = { ...DEFAULT_LIMITS, maxMoveCatchupTicks: Number.NaN };
+  const lastMoveTick = 0;
+  const lastTick = 1;
+  const claimedNaked = Math.min(1e9,
+    lastMoveTick + naked.maxMoveCatchupTicks,
+    lastTick + naked.maxMoveCatchupTicks);
+  ok(Number.isNaN(claimedNaked), '裸路径:claimedTick = NaN(这就是 fail-open 的成因)');
+  const allowedNaked = 0.36 * Math.max(0, claimedNaked - lastMoveTick);
+  ok(Number.isNaN(allowedNaked), '裸路径:allowed = NaN');
+  ok(!(1e5 > allowedNaked + 1e-9),
+    '裸路径:NaN 比较**恒 false** ⇒ 10 万格瞬移被判为合法(★ CR-27 本体)');
+  /* 已修:同一个坏值经守卫 ⇒ 换成默认 1 ⇒ 判据恢复成 true。 */
+  const merged = mergeLimits({ ...DEFAULT_LIMITS, maxMoveCatchupTicks: Number.NaN });
+  eq(merged.limits.maxMoveCatchupTicks, DEFAULT_LIMITS.maxMoveCatchupTicks,
+    '已修:坏值被换成默认 1');
+  ok(merged.issues.length > 0, '已修:并且留下诊断');
+  const claimedFixed = Math.min(1e9,
+    lastMoveTick + merged.limits.maxMoveCatchupTicks,
+    lastTick + merged.limits.maxMoveCatchupTicks);
+  ok(Number.isFinite(claimedFixed), '已修:claimedTick 回到有限值');
+  ok(1e5 > 0.36 * Math.max(0, claimedFixed - lastMoveTick) + 1e-9,
+    '已修:同一个瞬移现在**被拒**(判据恢复成 true)');
+  /* ★ 并且 —— 已修版本真的会让生产房间拒掉它(不是只有纯函数对)。 */
+  const room = quietlyV07(() => new AntiCheatRoom(
+    { ...DEFAULT_LIMITS, maxMoveCatchupTicks: Number.NaN } as never));
+  room.join('p', 0, 0, 0, 0);
+  ok(!room.move({ playerId: 'p', tick: 1e9, x: 1e5, y: 0, z: 0 }).allowed,
+    '★ 同一个坏 limits 造出的房间也真的拒了(守卫接在构造里,不是旁路)');
+});
+
+/* ═══════════════ 裁决 2 + 3:8 字段单向投影 ═══════════════ */
+
+/**
+ * ## 契约依据
+ *
+ * `docs/US2-GATEWAY-CONTRACT.md` §2.3(8 字段交集)/ §3.1(读口)/
+ * §4(顺序)/ §9(验收 4/5/6)。
+ *
+ * ## 为什么「单向」必须有**反向注入**才成立
+ *
+ * 正向(改 SSOT ⇒ state 变)只能证明「有人在写 state」。
+ * 它**不能**排除「也有人从 state 抄回 SSOT」—— 那种实现正向一样通过,
+ * 但两处会互为依据(`CR-14 U1` 的病根形态:判据自指)。
+ * ⇒ 唯一可证伪的判据是:改 `state.hp` **且不驱动** SSOT,
+ *   下一帧它**必须被覆盖回去**。若它留下来了,说明 state 是**另一个权威**。
+ */
+
+/** 假读口:全部返回「没有权威」,逐条断言按需覆写。 */
+function fakeViewV07(): SimReadView {
+  return {
+    levelOf: () => 1,
+    vitalsOf: () => null,
+    poseOf: () => null,
+    weaponOf: () => undefined,
+  };
+}
+
+/** 空的投影出口。 */
+function blankProjV07(): PlayerProjection {
+  return { level: 1, hp: 100, maxHp: 100, x: 0, y: 0, z: 0, weaponId: 0 };
+}
+
+test('PROJ-1 8 字段单向:正向(改 SSOT ⇒ state 跟上)', () => {
+  const view = fakeViewV07();
+  view.levelOf = () => 12;
+  view.vitalsOf = () => ({ hp: 340, maxHp: 535, downed: false });
+  view.poseOf = () => ({ x: 42.5, y: -7.25, z: 2.5 });
+  view.weaponOf = () => 7001;
+  const out = blankProjV07();
+  ok(projectPlayer(view, 'p1', out), '七个字段变了 ⇒ 返回 true(有变更)');
+  eq(out.level, 12, 'level 投影自 progresses');
+  eq(out.hp, 340, 'hp 投影自 vitals');
+  eq(out.maxHp, 535, 'maxHp 投影自 vitals(已是派生值)');
+  eq(out.x, 42.5, 'x 投影自 physics');
+  eq(out.y, -7.25, 'y 投影自 physics');
+  eq(out.z, 2.5, 'z 投影自 physics(旧 applyMove 只写 x/y)');
+  eq(out.weaponId, 7001, 'weaponId 投影自装备权威');
+});
+
+test('PROJ-2 ★★ 反向注入:改 state 的值、不驱动 SSOT ⇒ 下一帧被覆盖', () => {
+  const view = fakeViewV07();
+  view.vitalsOf = () => ({ hp: 100, maxHp: 100, downed: false });
+  const out = blankProjV07();
+  /* 先正常投一次,建立基线。 */
+  projectPlayer(view, 'p1', out);
+  /* ── 注入:直接把 state 侧的值改掉(模拟「有人回抄」或作弊客户端) ── */
+  out.hp = 99999;
+  out.maxHp = 88888;
+  out.level = 29;
+  eq(out.hp, 99999, '注入已生效(未投影前确实是脏值)');
+  /* ── 不驱动 SSOT,只再投一次 ── */
+  ok(projectPlayer(view, 'p1', out), '第二帧报告「有变更」—— 它知道这些值是脏的');
+  eq(out.hp, 100, '★ hp 被 SSOT 覆盖回 100(不是 99999 ⇒ 单向成立)');
+  eq(out.maxHp, 100, '★ maxHp 被覆盖回 100');
+  eq(out.level, 1, '★ level 被覆盖回 1');
+  /* ★ 连投 5 帧都不该让脏值「存活」。 */
+  for (let i = 0; i < 5; i += 1) { out.hp = 99999; projectPlayer(view, 'p1', out); }
+  eq(out.hp, 100, '反复注入也不存活(每帧都被覆盖)');
+});
+
+test('PROJ-3 读口返回「没有权威」时**不投影**(而不是写 0)', () => {
+  /* ⚠️ 这是最容易写错的一格:把 `null` 当成 0 写进去,会让
+     「世界不认识这个玩家」表现为「血量归零 / 坐标原点」。
+     ⇒ 两者是**不同**的事,必须不写。 */
+  const view = fakeViewV07();
+  /* ⚠️ `levelOf` 在假读口里**恒有权威**(返回 1)—— 它不是「可能采不到」的字段。
+     为把本断言聚焦在「null/undefined 不被写成 0」上,出口初值的 level 也对齐成 1,
+     于是「零变更」才真的等价于「除 level 外全无权威」。
+     (我第一版把 level 写成 5 ⇒ level 5→1 是一次真变更 ⇒ 断言与注释自相矛盾。) */
+  const out: PlayerProjection = { level: 1, hp: 77, maxHp: 88, x: 3, y: 4, z: 5, weaponId: 9 };
+  ok(!projectPlayer(view, 'ghost', out), '除 level 外全无权威 ⇒ 零变更');
+  eq(out.level, 1, 'level 照投(它从来不返回 null ⇒ 不属于「可能采不到」的字段)');
+  eq(out.hp, 77, 'hp 保留旧值(没被写成 0)');
+  eq(out.maxHp, 88, 'maxHp 保留旧值');
+  eq(out.x, 3, 'x 保留旧值(没被写成 0)');
+  eq(out.y, 4, 'y 保留旧值');
+  eq(out.z, 5, 'z 保留旧值');
+  eq(out.weaponId, 9, 'weaponId 保留旧值(undefined = 采不到,≠「空手 0」)');
+  eq(out.level, 1, 'level 单独有权威(levelOf 从不返回 null)⇒ 它照投');
+});
+
+test('PROJ-4 level 夹上界,hp/maxHp **不夹**(那会变成第二份实现)', () => {
+  /* ## 为什么 level 夹而 hp 不夹
+   *
+   * `level` 的消费者 `carryCapacityOf` 直接 `8 + (lv-1)` 而**不钳** ⇒
+   * 越界会让它与 `progression.statsAtLevel` 的口径分歧 ⇒ 必须夹。
+   * `hp`/`maxHp` 的钳制**唯一**选址在 `vitals.ts` 的 `syncMaxHp` /
+   * `revive`(契约 §2.4 W1)⇒ 若投影这里再夹一次,就出现**第二份实现**,
+   * 两处口径一旦不同就会互相顶着。
+   * ⇒ 故投影对 hp「原样搬运」,哪怕值是越界的。 */
+  const view = fakeViewV07();
+  view.levelOf = () => 1e9;
+  view.vitalsOf = () => ({ hp: 9_999_999, maxHp: 1e9, downed: false });
+  const out = blankProjV07();
+  projectPlayer(view, 'p1', out);
+  eq(out.level, MAX_LEVEL, `level=1e9 ⇒ 夹到 MAX_LEVEL=${MAX_LEVEL}`);
+  eq(out.hp, 9_999_999, 'hp **不夹**(钳制选址在 vitals,不在这里)');
+  eq(out.maxHp, 1e9, 'maxHp **不夹**');
+  /* NaN 等级 ⇒ 不写(而不是把 NaN 写进 wire 的数值字段)。 */
+  view.levelOf = () => Number.NaN;
+  const out2: PlayerProjection = { level: 7, hp: 1, maxHp: 1, x: 0, y: 0, z: 0, weaponId: 0 };
+  projectPlayer(view, 'p1', out2);
+  eq(out2.level, 7, 'level=NaN ⇒ 保留旧值(不把 NaN 写进 wire)');
+  /* 下界也夹:level=0 / -5 ⇒ 至少 1。 */
+  view.levelOf = () => -5;
+  const out3 = blankProjV07();
+  projectPlayer(view, 'p1', out3);
+  eq(out3.level, 1, 'level=-5 ⇒ 夹到下界 1(不是 0 或负数)');
+});
+
+test('PROJ-5 W5:总量 = 明细的**纯重算**,不是累加', () => {
+  /* ## 为什么必须是重算
+   *
+   * ```
+   * 累加:total += delta   ⇒ 漏一帧 ⇒ **永久**偏差(且越跑越偏)
+   * 重算:total = f(明细)  ⇒ 每帧只依赖当时的明细 ⇒ 自愈
+   * ```
+   * ⇒ 故这里拿同一份明细**重复**算:必须**恒等**(累加式会翻倍)。 */
+  const detail = [{ quantity: 3 }, { quantity: 4 }, { quantity: 0 }];
+  eq(projectInventoryTotal(detail), 7, '明细合计 = 7');
+  eq(projectInventoryTotal(detail), 7, '★ 再算一次仍是 7(累加式会变 14)');
+  eq(projectInventoryTotal(detail), 7, '★ 第三次仍是 7');
+  eq(projectInventoryTotal([{ quantity: 1 }]), 1, '换新明细 ⇒ 1(不残留上一轮合计)');
+  /* 非数组 ⇒ 0,而**不是** NaN/undefined。 */
+  eq(projectInventoryTotal(null), 0, 'null ⇒ 0(不是 NaN)');
+  eq(projectInventoryTotal([]), 0, '空明细 ⇒ 0');
+  eq(projectInventoryTotal('nope'), 0, '非数组 ⇒ 0');
+  /* 单项坏值不污染整串。 */
+  eq(projectInventoryTotal([{ quantity: Number.NaN }, { quantity: 5 }]), 5,
+    '一项 NaN 不把合计毁成 NaN');
+  eq(projectInventoryTotal([{}]), 0, '缺 quantity 的项计 0');
+  eq(projectInventoryTotal([{ quantity: -3 }]), 0, '负数项不计(总量不会为负)');
+});
+
+test('PROJ-6 装配位:生产路径真的把字段接上了(不是只在测试里)', () => {
+  /* ## 为什么这条必须有
+   *
+   * `projectPlayer` 是纯函数 ⇒ 上面 5 条**全绿也可能一行都没接**。
+   * ⇒ 必须走**生产装配**(`assemble()` + `rt.step()`),证明
+   *   「权威改了 ⇒ 网络态跟着改」是**真的在跑**。 */
+  const asm = assemble({});
+  const host = asm.host as unknown as Record<string, unknown>;
+  const rt = asm.runtime;
+  /* ── 读口存在性(缺一个就是没接)── */
+  /* ⚠️ 清单必须**从 `WorldSaveHost` 的读口定义里枚举**,不能凭记忆列
+     —— 我第一版漏了后两个,而它们同样可选 ⇒ 漏掉即等于允许**静默降级**。
+     `inventoryDetailOf` 是第 8 项的
+     明细来源(当前如实返回 null,但**方法必须在**)。 */
+  const READ_PORTS = [
+    'levelOf', 'vitalsOf', 'poseOf', 'weaponOf',
+    'inventoryDetailOf',
+    'maxHpForLevel', 'syncMaxHp',
+  ] as const;
+  for (const n of READ_PORTS) {
+    eq(typeof host[n], 'function', `世界源提供 ${n}()`);
+  }
+  rt.join({ userId: 'p1' });
+  rt.heartbeat('p1');
+  const find = (): SH.PlayerState => {
+    const p = rt.state.players.find((x) => x.id === 'p1');
+    ok(p !== undefined, 'state 里能找到 p1');
+    return p!;
+  };
+  const sim = asm.host as unknown as {
+    progresses: Map<string, { level: number }>;
+    physics: { bodies: Map<string, { x: number; y: number; z: number }> };
+    setProfile(id: string, patch: { wearing?: readonly number[] }): void;
+  };
+  sim.progresses.set('p1', { level: 1 } as never);
+  rt.step(null);
+  eq(find().level, 1, '基线 level=1');
+  /* ── 正向:改权威 ⇒ 跑一帧 ⇒ 网络态跟上 ── */
+  sim.progresses.get('p1')!.level = 30;
+  rt.step(null);
+  eq(find().level, 30, '★ 权威升到 30 ⇒ 网络态 level=30');
+  eq(find().maxHp, 535, '★ 派生上限 **535** 也投到了(progression 口径 100+15*29)');
+  const b = sim.physics.bodies.get('p1');
+  ok(b !== undefined, '物理体存在');
+  b!.x = 42.5;
+  b!.z = 2.5;
+  rt.step(null);
+  near(find().x, 42.5, 1e-9, '★ 权威 x=42.5 ⇒ 网络态 x=42.5');
+  near(find().z, 2.5, 1e-9, '★ 权威 z=2.5 ⇒ 网络态 z=2.5(z 也是单向来的)');
+  sim.setProfile('p1', { wearing: [7001] });
+  rt.step(null);
+  eq(find().weaponId, 7001, '★ 装备权威 [7001] ⇒ 网络态 weaponId=7001');
+  /* ── ★★ 反向:注入网络态,不驱动 sim ⇒ 下一帧被覆盖 ── */
+  find().hp = 99999;
+  find().level = 29;
+  rt.step(null);
+  ok(find().hp !== 99999, `★ 注入的 hp=99999 没能存活(现值 ${find().hp})`);
+  eq(find().level, 30, '★ 注入的 level=29 被覆盖回权威值 30');
+});
+
+test('PROJ-7 §9-3 同一实例里两个玩家各自正确(共享常量那个坑的反例)', () => {
+  /* 若 `maxHp` 被算成**实例级常量**(而非 per-player),两个不同等级的
+     玩家会拿到同一个上限。⇒ 必须两人同时在场才测得出。 */
+  const asm = assemble({});
+  const rt = asm.runtime;
+  const sim = asm.host as unknown as { progresses: Map<string, { level: number }> };
+  for (const id of ['a', 'b']) { rt.join({ userId: id }); rt.heartbeat(id); }
+  sim.progresses.set('a', { level: 30 } as never);
+  sim.progresses.set('b', { level: 10 } as never);
+  rt.step(null);
+  const get = (id: string): SH.PlayerState => {
+    const p = rt.state.players.find((x) => x.id === id);
+    ok(p !== undefined, `能找到 ${id}`);
+    return p!;
+  };
+  eq(get('a').maxHp, 535, 'a(Lv.30) ⇒ 535');
+  eq(get('b').maxHp, 235, 'b(Lv.10) ⇒ 235(100+15*9)');
+  ok(get('a').maxHp !== get('b').maxHp,
+    '★ 两人上限**不同** ⇒ 不存在「实例级共享常量」那个坑');
+});
+
+test('PROJ-8 §9-2 降级 ⇒ hp 被钳到新上限(hp <= maxHp 不变量)', () => {
+  /* W1 的**不变量**:任何时刻 `hp <= maxHp`。
+     升级不会破它,**降级**会 ⇒ 故测降级路径。 */
+  const asm = assemble({});
+  const rt = asm.runtime;
+  const host = asm.host as unknown as {
+    progresses: Map<string, { level: number }>;
+    vitals: { get(id: string): { hp: number; maxHp: number } | null };
+  };
+  rt.join({ userId: 'p1' });
+  rt.heartbeat('p1');
+  host.progresses.set('p1', { level: 30 } as never);
+  rt.step(null);
+  const v30 = host.vitals.get('p1');
+  ok(v30 !== null, '有生命记录');
+  eq(v30!.maxHp, 535, '升到 30 级 ⇒ maxHp=535');
+  /* 把血顶满再降级 —— 若不钳,hp 会留在 535 而 maxHp 掉回 100。 */
+  v30!.hp = 535;
+  host.progresses.get('p1')!.level = 1;
+  rt.step(null);
+  const v1 = host.vitals.get('p1')!;
+  ok(v1.hp <= v1.maxHp, `降级后 hp(${v1.hp}) <= maxHp(${v1.maxHp}) —— 不变量成立`);
+  eq(v1.maxHp, 100, '降级 ⇒ maxHp 回到 100');
+  const p = rt.state.players.find((x) => x.id === 'p1')!;
+  ok(p.hp <= p.maxHp, `网络态同样满足不变量(hp=${p.hp} maxHp=${p.maxHp})`);
+});
+
+test('PROJ-10 世界源侧:采不到权威必须返回 null,不得返回零值', () => {
+  /* ## 为什么这条单独存在
+   *
+   * PROJ-3 断言的是**投影侧**:拿到 null 时不许写 0。
+   * 但若**世界源侧**自己不返回 null 而返回 `{hp:0,maxHp:0}`,
+   * 投影侧永远看不到 null ⇒ PROJ-3 恒绿,**而线上表现为
+   * 「世界不认识这个玩家 ⇒ 他被显示成 0 血」**。
+   * ⇒ 这条是被 J11 注入揭出来的真缺口:两半缺一不可。
+   *
+   * ⚠️ 判据用 `null` 而**不是** falsy:`{hp:0}` 是**真值**,
+   *    所以 `ok(!x)` 这种写法辨不出这两种情况 —— 必须 `eq(x, null)`。 */
+  const asm = assemble({});
+  const host = asm.host as unknown as {
+    vitalsOf(id: string): { hp: number; maxHp: number; downed: boolean } | null;
+    poseOf(id: string): { x: number; y: number; z: number } | null;
+    weaponOf(id: string): number | undefined;
+  };
+  const GHOST = 'never-joined-player';
+  /* 先确认这个 id 真的不存在(否则本断言又在测别的事)。 */
+  const rt = asm.runtime;
+  ok(!rt.state.players.some((x) => x.id === GHOST), '前置:该玩家确实从未加入');
+  eq(host.vitalsOf(GHOST), null, 'vitalsOf(未知) ⇒ null(不是 {hp:0,maxHp:0})');
+  eq(host.poseOf(GHOST), null, 'poseOf(未知) ⇒ null(不是原点 {0,0,0})');
+  eq(host.weaponOf(GHOST), undefined, 'weaponOf(未知) ⇒ undefined(不是 0=空手)');
+  /* ★ 反面:把上面的 null 换成零值对象,`eq(null)` 会红 —— 这就是断言有牙的原因。 */
+  ok(host.vitalsOf(GHOST) !== undefined,
+    '判据区分 null 与 undefined:两者都表示「采不到」,但值与缺失是两件事');
+  /* 投影侧因此**不写**任何字段(与 PROJ-3 合成完整链路)。 */
+  const view: SimReadView = {
+    levelOf: () => 1,
+    vitalsOf: (id) => host.vitalsOf(id),
+    poseOf: (id) => host.poseOf(id),
+    weaponOf: (id) => host.weaponOf(id),
+  };
+  const out: PlayerProjection = { level: 1, hp: 77, maxHp: 88, x: 3, y: 4, z: 5, weaponId: 9 };
+  ok(!projectPlayer(view, GHOST, out), '未知玩家 ⇒ 相对基线零变更');
+  eq(out.hp, 77, 'hp 未被写成 0(端到端:世界源 null ⇒ 投影不写)');
+  eq(out.x, 3, 'x 未被写成 0');
+  eq(out.weaponId, 9, 'weaponId 未被写成 0');
+});
+test('PROJ-9 第 8 项走「变更时」路径,且总量以**明细重算**为准', () => {
+  /* 契约 §2.3 带宽裁定:总量是标量,逐帧投 20 次 × N 人无意义
+     ⇒ 只在 `applyInventory` 变更时投一次。
+     ⚠️ 但「重算而非累加」与频率**无关** —— 低频 + 累加式照样漂,
+        而且更晚发现。故这里同时验「只在变更时」与「是重算」。 */
+  const asm = assemble({});
+  const rt = asm.runtime;
+  const r = rt as unknown as {
+    inventoryTotals: Map<string, number>;
+    projectInventoryTotalFor(userId: string): boolean;
+  };
+  rt.join({ userId: 'p1' });
+  rt.heartbeat('p1');
+  /* 世界源**不持有**背包明细(如实返回 null)⇒ 本方法应报「无变更」,
+     而不是把总量错写成 0。 */
+  const before = r.inventoryTotals.get('p1');
+  eq(r.projectInventoryTotalFor('p1'), false, '世界源无明细 ⇒ 不报变更(不误写)');
+  eq(r.inventoryTotals.get('p1'), before, '总量**未被改动**(没被写成 0)');
+});
 
 report('WS-07');

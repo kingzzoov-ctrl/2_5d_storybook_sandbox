@@ -411,6 +411,105 @@ function sanitizeMul(declared: unknown, fallback: number, max: number): number {
 }
 
 /**
+ * 校验并**合并**外部传入的限值。
+ *
+ * ## ★★★ 为什么必须有这一步(CR-27:契约缺守卫 ⇒ fail-open)
+ *
+ * 构造器此前是 `this.limits = limits`,**对传入值不做任何检查**。
+ * 于是传入非对象或**部分对象**时:
+ * ```
+ * limits.maxMoveCatchupTicks == undefined
+ * ⇒ claimedTick = min(intent.tick, lastMoveTick + undefined, lastTick + undefined) = **NaN**
+ * ⇒ dtTicks = Math.max(0, NaN) = NaN
+ * ⇒ allowed = 0.36 * NaN = **NaN**
+ * ⇒ `dist > NaN + 1e-9` **恒 false**  ⇒ **全部放行**
+ * ```
+ *
+ * ## 实测(本仓复现,攻击 = `{tick:1e9, x:1e5}` 瞬移 10 万格)
+ * ```
+ * new AntiCheatRoom()                       ⇒ 拒绝 ✓
+ * new AntiCheatRoom(DEFAULT_LIMITS)         ⇒ 拒绝 ✓
+ * new AntiCheatRoom('not-an-object')        ⇒ ★ allowed=true  fail-open
+ * new AntiCheatRoom({speedWindowTicks:20})  ⇒ ★ allowed=true  fail-open
+ * new AntiCheatRoom(null)                   ⇒ 抛 TypeError(崩溃,非放行)
+ * new AntiCheatRoom(42) / ({}) / 字段=undefined / 字段=NaN ⇒ ★ 全部 fail-open
+ * ```
+ *
+ * ## ★ 比 Lead 描述的**更广**:不是单个字段,是**整个类型缺值域门**
+ *
+ * 逐字段注入 `NaN` 后,**8 个字段全部**让它负责的那道检查静默失效:
+ * ```
+ * maxMoveCatchupTicks  ⇒ claimedTick = NaN        ⇒ 瞬移放行
+ * teleportSlack        ⇒ allowed = NaN            ⇒ 瞬移放行
+ * maxSpeedBonusMul     ⇒ cap = NaN                ⇒ 瞬移放行
+ * speedWindowTicks     ⇒ cutoff = NaN             ⇒ 窗口检查失效
+ * speedWindowTolerance ⇒ cap = NaN                ⇒ 窗口检查失效
+ * baseAttackIntervalS  ⇒ minInterval = NaN        ⇒ 同帧 10 连发全放行
+ * maxAttackSpeedBonus  ⇒ bonus = NaN              ⇒ 同上
+ * maxItemDeltaPerTick  ⇒ Math.abs(net) > NaN = false ⇒ 单帧刷 1000 件放行
+ * ```
+ * ⚠️ 测 `speedWindow*` 时我第一版探针**自己踩了坑**:攻击构造被 **TELEPORT
+ *    抢先拦下**,窗口检查根本没走到 ⇒ 误判成"仍安全"。修正构造(走 1.3 倍速、
+ *    声明 mul=1,恰好通过单帧而上窗口)后同样 fail-open。
+ *    ⇒ 这正是本仓那条纪律:**注入物必须是缺陷本体**,打在"被别的检查抢先
+ *      命中的一侧"测不出来。
+ *
+ * ## 定性:契约缺守卫,**不是当前可利用缺陷**
+ * ```
+ * 生产调用点只有 room.ts 的 `new AntiCheatRoom()`(不传参)⇒ 当前不可达。
+ * 与 `mobHitDamage` 同类(ARCH-GAPS 第五层):缺守卫,非当前可利用。
+ * ```
+ * ⇒ 但仍要修:**一个只在"将来有人传参"时才显形的洞,永远不会被自己发现**。
+ *
+ * ## 取值策略:**逐字段 fail-closed 到默认值**(不是 fail-fast 抛错)
+ *
+ * ```
+ * fail-fast(抛错)的理由:坏配置是**开发者错误**,应尽早暴露。
+ * fail-closed(兜默认)的理由:反作弊在**每帧热路径**上,抛错会
+ *   把「一个字段写错」升级成「房间整帧崩掉」—— 而崩溃的房间
+ *   **不检查任何东西**,比"用默认限值继续检查"更不安全。
+ * ⇒ 取 **fail-closed**,但**不静默**:见下面的 `limitsReported`。
+ * ```
+ * ⚠️ 为什么必须"不静默":兜默认若无声,就成了**又一处静默降级** ——
+ *    传错字段的人永远不知道自己传错了,而限值悄悄变回默认。
+ *    ⇒ 故合并结果**可读回**(`AntiCheatRoom.limits` 是合并后的值),
+ *      且非法字段被记进 `limitsIssues` 供断言与诊断。
+ *
+ * ## 什么算非法
+ * ```
+ * · 整个 limits 不是对象(null / 字符串 / 数字)⇒ **整体**回退 DEFAULT_LIMITS
+ * · 单字段 非 number / NaN / ±Infinity / 负数 ⇒ **该字段**回退默认
+ *   (⚠️ 0 是**合法**值:它表达"零容忍",是一个真实的策略选择,不是坏值)
+ * · 未知字段 ⇒ 忽略(不报错:结构化传入允许多余键)
+ * ```
+ */
+export function mergeLimits(limits: unknown): { limits: AntiCheatLimits; issues: string[] } {
+  const issues: string[] = [];
+  /* 整体不是对象 ⇒ 全部回退。`null` 此前会抛 TypeError,这里一并收下。 */
+  if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) {
+    const shown = limits === null ? 'null' : `${typeof limits} ${String(limits).slice(0, 24)}`;
+    issues.push(`limits 不是对象(${shown})⇒ 全部回退 DEFAULT_LIMITS`);
+    return { limits: { ...DEFAULT_LIMITS }, issues };
+  }
+  const src = limits as Record<string, unknown>;
+  const out = { ...DEFAULT_LIMITS };
+  for (const key of Object.keys(DEFAULT_LIMITS) as (keyof AntiCheatLimits)[]) {
+    if (!(key in src)) {
+      issues.push(`${key} 缺失 ⇒ 回退默认 ${DEFAULT_LIMITS[key]}`);
+      continue;
+    }
+    const v = src[key];
+    /* ⚠️ 只接受**有限非负数**。`0` 合法(见上文);`NaN`/`±Infinity`/负数/非 number 全拒。 */
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+      issues.push(`${key}=${String(v)} 非法(需有限非负数)⇒ 回退默认 ${DEFAULT_LIMITS[key]}`);
+      continue;
+    }
+    out[key] = v;
+  }
+  return { limits: out, issues };
+}
+
+/**
  * 单帧允许的最大位移。
  * 位移上界 = maxSpeed(声明倍率) × DT,再乘 `teleportSlack` 补偿时钟抖动。
  *
@@ -755,12 +854,38 @@ function rejectInv(
 /* ═══════════════════════════ 6. 房间级汇总 ═══════════════════════════ */
 
 export class AntiCheatRoom {
+  /**
+   * **合并后**的实际限值。⚠️ 构造器传入坏值时它**不是**你传进去的那个对象 ——
+   * 而是逐字段回退过的安全副本(见 `mergeLimits`)。
+   * 这正是「可读回」的用义:传参的人能立刻看出自己的字段没生效。
+   */
   readonly limits: AntiCheatLimits;
+  /**
+   * 构造时发现的限值问题(空数组 = 传参完全合法)。
+   *
+   * ⚠️ 存在的理由:`mergeLimits` 取 fail-closed(兜默认而非抛错),
+   * 那就必须**让降级可观测** —— 否则它只是又一处静默降级。
+   */
+  readonly limitsIssues: readonly string[];
   private states = new Map<string, PlayerAntiCheatState>();
   private log: Violation[] = [];
 
-  constructor(limits: AntiCheatLimits = DEFAULT_LIMITS) {
-    this.limits = limits;
+  constructor(limits: AntiCheatLimits | unknown = DEFAULT_LIMITS) {
+    /* ★ CR-27 修复点:此前是 `this.limits = limits`(不做任何检查)
+       ⇒ 部分对象/非对象会让 `maxMoveCatchupTicks` 变 `undefined`
+       ⇒ `claimedTick` 变 `NaN` ⇒ `dist > NaN` 恒 false ⇒ **全部放行**。
+       详见 `mergeLimits` 的实测表。 */
+    const merged = mergeLimits(limits);
+    this.limits = merged.limits;
+    this.limitsIssues = merged.issues;
+    if (merged.issues.length > 0) {
+      /* 打到 stderr:配置错误属**开发者可见**的一类,不该被 20Hz 的日志淹掉。
+         (与 WS-13 的 `LOAD_FAIL::` 同一取舍:失败要让门禁能看见。) */
+      console.error(
+        `[anticheat] 限值非法,已逐字段回退默认值(${merged.issues.length} 项):\n`
+        + merged.issues.map((s) => `  · ${s}`).join('\n'),
+      );
+    }
   }
 
   join(id: string, tick = 0, x = 0, y = 0, z = 0): PlayerAntiCheatState {

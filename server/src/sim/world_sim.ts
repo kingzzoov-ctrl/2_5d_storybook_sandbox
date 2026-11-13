@@ -144,6 +144,7 @@ import {
   type PlayerProgress,
   type ShareResult,
 } from '../combat/progression.ts';
+import { statsAtLevel } from '../../../shared/types/entities.ts';
 import {
   createDowned,
   tickGhostBubble,
@@ -2259,6 +2260,171 @@ export class WorldSim {
     this.forgeUnlockedIds.delete(id);
     this.syncPlayers();
     return had;
+  }
+
+
+  /* ═══════════ US2 裁决 3:投影读口(契约 §3.1)═══════════ */
+
+  /**
+   * 生命值权威(`VitalsSystem`)。
+   *
+   * ## 为什么返回**展开的基本类型**而不是 `PlayerVitals`
+   *
+   * `room.ts` 是**结构化**依赖:它不 import 模拟层类型。
+   * 返回一个 `{hp, maxHp, downed}` 字面量就把依赖面收到最小
+   * (与 `levelOf` 同一个理由 —— 见它上面那段)。
+   *
+   * ⚠️ 只展开投影需要的三个字段,**不返回整个对象**:
+   *    返回整个 `PlayerVitals` 会让投影侧能读到 `totalTaken` 等
+   *    它**不该**碰的字段 —— 接口面越窄,回抄越难写。
+   *
+   * @returns `null` = 该玩家没有生命记录(未 register)⇒ 调用方**不投影**
+   *          (而不是投 0:那会让「世界不认识这个玩家」表现成「血量归零」)
+   */
+  vitalsOf(canonicalPlayerId: string): { hp: number; maxHp: number; downed: boolean } | null {
+    const v = this.vitals.get(canonicalPlayerId);
+    if (v === null) return null;
+    return { hp: v.hp, maxHp: v.maxHp, downed: v.downed };
+  }
+
+  /**
+   * 位置权威(含 `z`)。
+   *
+   * ## 与已有的 `playerPosition()` 的关系:不是重复
+   *
+   * ```
+   * playerPosition(id)  → { x, y }        ← task-58 为「移动写回」而加
+   * poseOf(id)          → { x, y, z } | null  ← 本方法,为「8 字段投影」而加
+   * ```
+   * 两份**读的是同一个 `physics.bodies`**,所以不存在「两份实现互相顶着」
+   * —— 但存在「两个读口」这件事本身需要说明,否则下一个人会问为什么有两个。
+   *
+   * ## 为什么不把 `playerPosition` 改成带 z、只留一个
+   *
+   * `playerPosition` 的消费方是 `applyMove`,它**只要 x/y**
+   * (z 在那条路径上由报文声明)。改成带 z 会让 `applyMove` 拿到一个
+   * 它不该信的 z,从而**扩大**那条路径的信任面。
+   * ⇒ 保留两个读口,各自面窄。名字也不同(`playerPosition` vs `poseOf`),
+   *   避免「同名不同物」(本仓 W7 那个 `Clock` 就是反例)。
+   *
+   * ⚠️ `z` 的语义:`DynamicBody.z` 是高度。玩家投影 z 从权威读,
+   *    而不是抄报文声明值(旧 `applyMove` 是抄的)。
+   */
+  poseOf(playerId: string): { x: number; y: number; z: number } | null {
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return null;
+    return { x: b.x, y: b.y, z: b.z };
+  }
+
+  /**
+   * 装备权威:当前手持武器 id(U16 语义;`0` = 空手)。
+   *
+   * ## ⚠️ 类型是 `number`,**不是**契约 §3.1 写的 `string`
+   *
+   * ```
+   * 契约 §3.1  : weaponOf(): string | undefined
+   * 实现真相    : PlayerState.weaponId 是 FieldType.U16(FIELD_TABLE 实测)
+   *              WorldSim 侧武器 id 是 number(ARMOR_BY_ID / weaponById 的键)
+   * ⇒ 按契约返回 string 会让投影把一个**字符串写进 U16 字段** ——
+   *   编码器要么抛,要么写出垃圾。
+   * ⇒ 取 number;契约文字应改(已在实现处记 CR)。
+   * ```
+   *
+   * ## 武器是从 `wearing` 里**推**出来的,不是独立字段
+   *
+   * `PlayerProfile` 只有 `wearing: number[]` 与 `heldItem: number`
+   * ⇒ 「什么是武器」由 `equipmentSnapshotOf` 的既有规则决定:
+   *   **不在 `ARMOR_BY_ID` 里的第一个 id** 就是武器。
+   * ⚠️ 这里**复用**那条规则而不另写一套 —— 另写会让「武器是什么」
+   *    出现两份判据(零爆装冻结与投影会对同一份 wearing 给出不同武器)。
+   *
+   * @returns `undefined` = 没装备武器 ⇒ 调用方**不投影**
+   *          (不写 0:`0` 是「空手」这个**真实状态**,与「采不到权威」两件事)
+   */
+  weaponOf(playerId: string): number | undefined {
+    const wearing = this.profiles.get(playerId)?.wearing;
+    if (wearing === undefined || wearing.length === 0) return undefined;
+    for (const id of wearing) {
+      if (!ARMOR_BY_ID.has(id)) return id;
+    }
+    return undefined;
+  }
+
+  /**
+   * 等级 → **派生上限**的权威算子(契约 §2.1)。
+   *
+   * ## 为什么归 `WorldSim` 提供,而不是让 `room.ts` 自己调 `progression`
+   *
+   * `net → combat` 是**禁止**的依赖方向(契约 §8;`WS-07 K6` 钉住
+   * `room.ts` 的代码态不得出现模拟层符号)。而「等级 → 属性」的算子是
+   * `progression.statsAtLevel` —— 若让房间直接调它,那条禁止就被绕过了。
+   * ⇒ 由世界源(它**合法地**同时知道 progression 与 vitals)转发一层。
+   *
+   * ## ⚠️ 这里**不新增**等级→属性的公式
+   *
+   * `progression` 是唯一算子(契约 §1)。本方法只**转发**它的结果。
+   * 若在这里写 `100 + 15*(lv-1)`,就出现了第二份公式 ——
+   * 而那正是 W1(两个 maxHp 来源)的成因。
+   *
+   * @returns `null` = 该玩家没有档案/玩家不存在 ⇒ 调用方不更新上限
+   */
+  maxHpForLevel(playerId: string, level: number): number | null {
+    /* ★★★ 实测抓到的错:我第一版这里先查 `progresses.get(playerId)`,
+     * 没有档案就返回 null。后果:
+     * ```
+     * 玩家 join 后**没有** progression 档案(levelOf 也不建档案,见它的注释)
+     * ⇒ maxHpForLevel 返回 null ⇒ 房间不更新上限 ⇒ maxHp 永远停在
+     *   VitalsSystem 构造默认值 100
+     * ⇒ 30 级玩家 maxHp 仍是 100(而 progression 口径是 535)
+     * ⇒ ⇒ **W1 那个缺口原样还在**,只是换了个地方表达
+     * ```
+     * ⇒ 修:本方法是「等级 → 属性」的**纯算子**转发,等级是**参数**给的,
+     *   不需要玩家有档案。加档案检查等于凭空引入一个与等级无关的前提。
+     * ⚠️ 而 `playerId` 参数因此**没有用到** —— 保留它是为了两件事:
+     *   1 与投影读口的其它方法签名一致(调用方不必记特例)
+     *   2 将来看需要按玩家算(如装备加成)时不必改签名
+     *   ⇒ 用 `void` 显式表态「这个参数当前不参与运算」,而不是删掉它。
+     *
+     * ⚠️ `progression` 是唯一算子(契约 §1):这里**只转发**
+     *    `statsAtLevel` 的结果,不写 `100 + 15*(lv-1)` ——
+     *    写出那条公式就是第二份实现(正是 W1 的成因)。 */
+    void playerId;
+    const stats = statsAtLevel(level);
+    return Number.isFinite(stats.maxHp) ? stats.maxHp : null;
+  }
+
+  /**
+   * 把派生上限落到 `vitals`(契约 §2.1 的**唯一**写入口是 `vitals.syncMaxHp`)。
+   *
+   * ⚠️ 本方法是**纯转发**:策略 C(只抬上限、钳 hp、不补血)的实现在
+   *    `vitals.syncMaxHp` 内部,不在这里复述 —— 复述就是两份实现。
+   *
+   * @returns 是否发生了变更
+   */
+  syncMaxHp(playerId: string, derivedMaxHp: number): boolean {
+    return this.vitals.syncMaxHp(playerId, derivedMaxHp);
+  }
+
+  /**
+   * 背包**明细**(契约 §2.3 第 8 项的权威来源)。
+   *
+   * ## ⚠️ 世界源这里返回 `null` 是**正确的当前状态**,不是缺陷
+   *
+   * 契约 §2.3 说第 8 项的权威是 `users.inventory_json` —— 那是**数据库**侧,
+   * 不在 `WorldSim` 里(`WorldSim` 不持有 db,实测它的构造参数里没有)。
+   * ```
+   * room.ts 侧已有权威总量:`authoritativeItemTotal()`(读 db 的 totalItemsOf)
+   * WorldSim 侧:没有背包明细
+   * ⇒ 故本方法默认返回 null ⇒ 投影侧走「没有明细」退路
+   * ```
+   * ⇒ 这是**如实**表达「模拟层不持有背包明细」,而不是假装有。
+   *   若日后背包搬进模拟层,实现本方法即可,投影侧一行不用改。
+   *
+   * ⚠️ 返回 `readonly { quantity?: unknown }[]` 而不是模拟层的物品类型:
+   *    仍然是为了让 `room.ts` 不依赖模拟层类型(结构化)。
+   */
+  inventoryDetailOf(_playerId: string): readonly { quantity?: unknown }[] | null {
+    return null;
   }
 
   /** 治疗玩家(料理 / 药水 / 队友技能)。返回实际回复量。 */

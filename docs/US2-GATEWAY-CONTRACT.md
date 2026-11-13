@@ -180,14 +180,30 @@ v.hp = Math.min(v.maxHp, Math.max(0, safe));      // ★ 下界 0,不是 1
 ### 3.1 网关骨架(`RoomRuntime` ↔ `WorldSim`)
 
 ```ts
-/** 投影所需的**只读**读口 —— 网关只经此取数,不直接摸 WorldSim 内部 Map。 */
+/** 投影所需的**只读**读口 —— 网关只经此取数,不直接摸 WorldSim 内部 Map。
+ *
+ * ⚠️ **逐帧投影只走 4 个读口**;下面「逐帧 4 口 ⇒ 7 字段」外加第 8 项
+ *    `inventory`(走**变更时投影**的另一条路,见 §2.3 带宽裁定)。
+ */
 interface SimReadView {
-  levelOf(playerId: string): number;      // progresses
+  levelOf(playerId: string): number;      // progresses  ⇒ 字段 1: level
   vitalsOf(playerId: string): { hp: number; maxHp: number; downed: boolean } | null;
+                                          //              ⇒ 字段 2,3: hp / maxHp
   poseOf(playerId: string): { x: number; y: number; z: number } | null;
-  weaponOf(playerId: string): string | undefined;
-  inventoryTotalOf(playerId: string): { used: number; cap: number } | null;
+                                          //              ⇒ 字段 4,5,6: x / y / z
+  weaponOf(playerId: string): number | undefined;
+                                          //              ⇒ 字段 7: weaponId
 }
+```
+**⚠️ 本节曾有两处与实现不符,已订正(2026-11-13)**:
+```
+1 `weaponOf` 原写作 `string | undefined` —— 错。`PlayerState.weaponId` 是
+  **U16 数字**(FIELD_TABLE 的语义),实现为 `number | undefined`。
+  写成 string 会让假实现与真实现分叉,而「假实现不忠实」会渗进**夹具**
+  (陷阱 74)。⇒ 改为 `number | undefined`。
+2 原列了 `inventoryTotalOf(...)` —— 已**删**(该声明三无:零实现/零消费者/零断言,
+  且它给的是**总量**,与 W5 裁定「总量必须由**明细重算**、不得当输入」方向相反)。
+  ⇒ 真实通路是 `projectInventoryTotalFor → inventoryDetailOf → projectInventoryTotal`。
 ```
 **★ 为什么抽 `SimReadView` 而不是直接读 WorldSim**:
 ```

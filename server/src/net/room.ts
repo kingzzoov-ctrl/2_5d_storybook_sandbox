@@ -453,6 +453,216 @@ export interface WorldSaveHost {
    * 可选:世界源不实现它时,`step()` 整段跳过 —— 与 `saveToDb` 同一 null 契约。
    */
   advance?(frames: number): number;
+
+  /* ══════════ US2 裁决 3:投影所需的**只读**读口(契约 §3.1)══════════
+   *
+   * ## 为什么读口单独一组、且**全部可选**
+   *
+   * 与 `levelOf` / `applyPlayerMove` 同一 null 契约:老的世界源不实现就用
+   * 「没有权威」的退路,不报错也不假装同步过。实测老源只实现了前 7 个。
+   *
+   * ## ★★ 为什么抽这一组而不是让房间直接读 `WorldSim` 内部 Map
+   *
+   * 契约 §3.1 给了两条理由,第二条是关键的:
+   * ```
+   * 1 投影**可单测** —— 一个假实现即可,不必起整个 WorldSim
+   * 2 ★★ 它把「投影读了哪些字段」变成**显式**的 ——
+   *   若将来有人在投影里读 `room.state.players[].hp` 当权威,
+   *   那是**回抄**,而有了这个接口就能用「假实现不提供该字段」
+   *   来**结构性挡掉**
+   * ```
+   * ⇒ 本接口**只暴露 SSOT 侧的值**。任何从 `state` 取数的投影都拿不到输入,
+   *   因为本接口的方法签名里**根本没有** `state`。这是结构性的,不是约定。
+   *
+   * ## ⚠️ 与契约 §3.1 的三处**实测不符**(按实现真相取值,已记 CR)
+   *
+   * | 契约写法 | 实现真相 | 本接口取值 |
+   * | :--- | :--- | :--- |
+   * | `weaponOf(): string \| undefined` | `PlayerState.weaponId` 是 **U16 数字**(FIELD_TABLE 实测) | `number` |
+   * | `poseOf(): {x,y,z} \| null` | `DynamicBody` **有** z,但 `applyMove` 只接 x/y | `{x,y,z}`(z 读回权威) |
+   * | `inventoryTotalOf(): {used,cap}` | 三无(零实现/零消费者/零断言),且与 W5 方向相反 | **删声明**(见下) |
+   * ```
+   * ⚠️ 第一条不是笔误可以忽略的:若按契约返回 `string`,投影写进
+   *    `PlayerState.weaponId`(U16,`FIELD_TABLE` 会按 2 字节编码)会得到一个
+   *    **字符串进数值字段** —— 编码器要么抛,要么写出垃圾。
+   *    ⇒ 按实现真相取 `number`。契约文字应改(已在文档里记 CR)。
+   */
+  /** 生命值权威(`VitalsSystem`)。不存在该玩家 ⇒ `null`。 */
+  vitalsOf?(playerId: string): { hp: number; maxHp: number; downed: boolean } | null;
+  /** 位置权威(`physics.bodies`,含 z —— 与 `playerPosition` 的 x/y 版并存)。 */
+  poseOf?(playerId: string): { x: number; y: number; z: number } | null;
+  /**
+   * 装备权威武器 id。`undefined` = 该玩家没有武器/没有装备数据。
+   *
+   * ⚠️ 类型是 `number`(U16),**不是**契约里写的 `string` —— 见上表。
+   */
+  weaponOf?(playerId: string): number | undefined;
+  /* ⚠️ 此处**刻意没有** `inventoryTotalOf(): {used, cap}` —— 契约 §3.1 列了它,
+     但实测它在本仓是**三无**:零实现(WorldSim 没有)、零消费者(step/applyInventory
+     都不读)、零断言引用。而它给的又是**总量**,与 W5 的裁定
+     「总量必须由**明细重算**,不得当输入」**方向相反** ——
+     留着它会鼓励将来有人「读总量再赋给 state」,那正是 W5 要挡的形态。
+     ⇒ 第 8 项的真实通路是:
+       `projectInventoryTotalFor` → `host.inventoryDetailOf` → `projectInventoryTotal`
+     ⇒ 故删声明而不补实现(已在 docs/WS-07-net-persist.md §9.1 记 CR)。 */
+}
+
+/** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */
+export interface PlayerProjection {
+  level: number;
+  hp: number;
+  maxHp: number;
+  x: number;
+  y: number;
+  z: number;
+  weaponId: number;
+}
+
+/**
+ * 投影所需的**只读**读口(契约 §3.1)。
+ *
+ * ## 为什么它与 `WorldSaveHost` 的读口分开定义
+ *
+ * `WorldSaveHost` 是「房间对世界的完整契约」(写口 + 读口 + 驱动口),
+ * 而本接口是**投影函数唯一被允许的输入面**。
+ * ⇒ 分开之后,`projectPlayer` 的签名**结构上**只能拿到 SSOT 侧的值:
+ *   它没有任何参数能触及 `room.state`,所以「回抄」不是「不该做」,
+ *   而是**做不到**(契约 §3.1 理由 2 的兑现)。
+ *
+ * ## ⚠️ 全部方法返回 `null`/`undefined` 的语义
+ * ```
+ * null  = 「权威说这个玩家不存在」⇒ 该字段**不投影**(保留旧值,不写 0)
+ * ⇒ ★ 不能把 null 当 0 写:那会让「世界不认识这个玩家」表现为
+ *   「玩家血量归零 / 位置瞬移到原点」——两个都像真的故障。
+ * ```
+ */
+export interface SimReadView {
+  levelOf(playerId: string): number;
+  vitalsOf(playerId: string): { hp: number; maxHp: number; downed: boolean } | null;
+  poseOf(playerId: string): { x: number; y: number; z: number } | null;
+  weaponOf(playerId: string): number | undefined;
+}
+
+/**
+ * 把 SSOT 投影到只读网络视图(契约 §3.2)。
+ *
+ * ## 纯函数语义
+ *
+ * ```
+ * 同样输入 ⇒ 同样输出,且**不读 `out` 自身**。
+ * ```
+ * ⚠️ 注意「不读 out 自身」是**性质**,不是风格:一旦读 `out.hp` 去算新值
+ *    (例如 `out.hp -= dmg`),就又把投影变成第二个权威了。
+ * 本函数的实现里只出现 `view.*` 与字面常量 —— 没有 `out.` 的读。
+ *
+ * ## 返回「是否发生变更」而不是「是否有权威值」
+ *
+ * 契约 §3.2 要求返回 `boolean` 供 20Hz 差分编码复用 —— 但含义必须是
+ * **「有字段真的变了」**,不是「读到了权威」。理由:
+ * ```
+ * 若返回「读到了」⇒ 每帧恒 true ⇒ 差分编码退化成全量下发
+ * (带宽浪费,且掩盖"其实没变"这个事实)
+ * ```
+ *
+ * ## ⚠️ 为什么 `level` 要夹上界,而 `hp`/`maxHp` 不夹
+ *
+ * `level` 夹一次(与既有 `syncLevelProjections` 同口径),理由是本字段的
+ * **消费者不夹**:`carryCapacityOf` 直接 `8 + (lv - 1)`。若投影越界,
+ * 房间容量口径与 `progression.statsAtLevel`(已钳)就分歧了。
+ * 而 `hp`/`maxHp` 的钳制**已经在 `VitalsSystem` 内**(`syncMaxHp` 策略 C),
+ * ⇒ 在这里再钳一次就是**第二份实现**(本仓明确的缺陷形态)。
+ * ⇒ 分工:上界统一一处(`vitals` 管生命、`progression` 管等级),
+ *   投影只**搬运**。
+ *
+ * ## ⚠️ `z` 从权威读,不从报文
+ *
+ * `poseOf` 返回的 z 来自 `DynamicBody.z`。此前 `applyMove` 写的是
+ * `p.z = intent.z`(客户端声明值)—— 那是任务 58 之前的旧路径。
+ * 现在权威有 z(高度/跳跃/流体浮沉都会改它),投影必须读权威,
+ * 否则「玩家在水里被抬起」这类变化对客户端不可见。
+ */
+export function projectPlayer(view: SimReadView, playerId: string, out: PlayerProjection): boolean {
+  let changed = false;
+
+  /* ── 1 level(权威 = progresses;夹上界,理由见 docblock)── */
+  const lv = view.levelOf(playerId);
+  if (Number.isFinite(lv)) {
+    const clamped = Math.max(1, Math.min(MAX_LEVEL, Math.trunc(lv)));
+    if (out.level !== clamped) { out.level = clamped; changed = true; }
+  }
+
+  /* ── 2 hp / 3 maxHp(权威 = vitals;**不夹**,钳制在 vitals 内)── */
+  const v = view.vitalsOf(playerId);
+  if (v !== null) {
+    if (Number.isFinite(v.hp) && out.hp !== v.hp) { out.hp = v.hp; changed = true; }
+    if (Number.isFinite(v.maxHp) && out.maxHp !== v.maxHp) { out.maxHp = v.maxHp; changed = true; }
+  }
+
+  /* ── 4/5/6 x,y,z(权威 = physics)──
+     ⚠️ `null` ⇒ 不投影(保留旧值)。把 null 当 0 写会让「世界不认识这个玩家」
+        表现成「瞬移到原点」——那看起来像真故障,会把排障引偏。 */
+  const pose = view.poseOf(playerId);
+  if (pose !== null) {
+    if (Number.isFinite(pose.x) && out.x !== pose.x) { out.x = pose.x; changed = true; }
+    if (Number.isFinite(pose.y) && out.y !== pose.y) { out.y = pose.y; changed = true; }
+    if (Number.isFinite(pose.z) && out.z !== pose.z) { out.z = pose.z; changed = true; }
+  }
+
+  /* ── 7 weaponId(权威 = 装备)──
+     ⚠️ `undefined` = 「没有装备数据」⇒ 不投影。不得写成 0:
+        `0` 在 FIELD_TABLE 里的语义是「空手」,那是一个**真实的手持状态**,
+        与「采不到权威」是两件事(本仓 CR-14 U1 的同族区分)。 */
+  const w = view.weaponOf(playerId);
+  if (w !== undefined && Number.isFinite(w) && out.weaponId !== w) {
+    out.weaponId = w;
+    changed = true;
+  }
+
+  return changed;
+}
+
+/**
+ * 背包**总量** = 由明细**重算**的纯函数(契约 §2.3 的 W5 裁定)。
+ *
+ * ## ★★ 为什么必须是纯函数,不得累加式更新
+ *
+ * ```
+ * 累加式:total += delta   ⇒ **漏一帧就永久偏差**(误差不可自愈)
+ * 重算式:total = f(items) ⇒ 任何一帧的结果都只依赖当时的明细
+ * ```
+ * 契约 §2.3 明写这一条。实测同族先例:本仓 `repo.ts` 的 `totalItemsOf`
+ * 就是**对明细求和**,不是读一个累加计数器 —— 两者结果应一致,
+ * 而那正是本函数可以**交叉验证**的对象。
+ *
+ * ## ⚠️ 与 `room.inventoryTotals` 的关系(这才是 W5 的实质)
+ *
+ * ```
+ * users.inventory_json(明细)  →  权威
+ * room.inventoryTotals(总量)  →  **派生缓存**(纯内存模式下的退路)
+ * ⇒ 方向 = 明细 → 总量(单向)
+ * ⇒ 故本函数**只接受明细数组**,不接受任何"当前总量"参数 ——
+ *   那会让它又变成「以总量为输入」(= 双向的第一步)。
+ * ```
+ * ⚠️ 若传入的明细**不是数组**(库返回 `{}` / `null`),回退 `0` 而不是 `NaN`:
+ *    `NaN` 会让 `after > capacity`、`after < 0` 全部恒 false ⇒ 容量守恒失效
+ *    (与 CR-27 同族)。
+ *
+ * @param items 明细(每项至少要有 `quantity`)
+ * @returns 总件数(非负整数);输入非法时 `0`
+ */
+export function projectInventoryTotal(
+  items: readonly { quantity?: unknown }[] | null | undefined,
+): number {
+  if (!Array.isArray(items)) return 0;
+  let sum = 0;
+  for (const it of items) {
+    const q = it?.quantity;
+    /* ⚠️ 逐项 `isFinite` 而不是整段求和后判断:一项 `NaN` 会毒化整个和,
+       而逐项挡掉能让「其余合法项仍然计入」—— 与 `checkInventory` 的
+       `FRACTIONAL` 逐项判同一取向。 */
+    if (typeof q === 'number' && Number.isFinite(q)) sum += q;
+  }
+  return sum < 0 ? 0 : sum;
 }
 
 /**
@@ -984,6 +1194,12 @@ export class RoomRuntime {
     /* 通过的合法操作要落到总量记账上,否则下一次 beforeTotal 仍是旧值 ——
        那会让「总量守恒」这层在连续操作间隔里失真。 */
     if (r.allowed) this.applyItemTotalDelta(userId, input.ops);
+    /* 第 8 项:通过后立刻把**总量**按明细重算一次(契约 §2.3「变更时投影」)。
+       ⚠️ 必须在 applyItemTotalDelta **之后** —— 否则重算读的是变更前的明细。
+       ⚠️ 这条与 applyItemTotalDelta 不是重复:后者是纯内存模式的**退路缓存**,
+          前者是**权威重算**(走明细)。host 提供明细时以**重算**为准
+          (见 projectInventoryTotalFor 与 projectInventoryTotal 的 docblock)。 */
+    this.projectInventoryTotalFor(userId);
     return r;
   }
 
@@ -1150,12 +1366,19 @@ export class RoomRuntime {
     /* ⚠️ 必须在 `if (this.db)` **之外** —— 等级投影与有没有数据库无关。
        (放进去的话,纯内存模式 `db === null` 就永远不同步等级,
        而那正是测试最常用的形态。) */
-    this.syncLevelProjections();
+    this.projectAllPlayers();
     return prevSnapshot ? encodeDelta(prevSnapshot, this.state).bytes : new Uint8Array(0);
   }
 
   /**
-   * 把**权威等级**投影到 `state.players[].level`(W2「level 双写者」的裁决)。
+   * 把 SSOT 的 **8 个交集字段**单向投影到 `state.players[]`(契约 §2.3;裁决 2 + 3)。
+   *
+   * ## 本方法此前叫 `syncLevelProjections`,只投 `level`
+   *
+   * 改名不是重命名:`level` 此前是**唯一**被投影的字段(W2 的修法),
+   * 而契约 §2.3 把交集面扩到 8 个。保留旧名会让人以为「这里只管等级」,
+   * 从而在别处再加一条投影路径 —— 那正是「两份实现」的起点。
+   * ⇒ 单一出口:`step()` 只调本方法,本方法只调 `projectPlayer`。
    *
    * ## 两份等级的关系(这是 US2 必须显式处理的那一条)
    *
@@ -1180,24 +1403,157 @@ export class RoomRuntime {
    * 挂在攻击上会漏掉其余路径。放在每帧推进里,「权威一变,投影随即一致」,
    * 且与 `saveToDb` 的 20 帧节流**同一个 tick 编号**,落盘与下发不会错位。
    *
-   * ## 上界
+   * ## ★ 8 字段的权威来源与投影规则(契约 §2.3 表)
    *
-   * 这里**夹一次**上界。理由不是「模拟层可能溢出」(`combatantStats`
+   * | # | 字段 | 权威 | 本方法做什么 |
+   * | :--- | :--- | :--- | :--- |
+   * | 1 | `level` | `progresses` | 夹 `[1, MAX_LEVEL]` 后直传 |
+   * | 2 | `hp` | `vitals` | 直传(**不夹** —— 钳制在 vitals 内) |
+   * | 3 | `maxHp` | `vitals`(已是派生值) | 先 `syncMaxHp` 再直传 |
+   * | 4/5/6 | `x`/`y`/`z` | `physics.bodies` | 直传 |
+   * | 7 | `weaponId` | 装备权威 | 直传(`undefined` = 不投) |
+   * | 8 | `inventory` | `users.inventory_json`(明细) | ⚠️ **只投总量**,走变更时路径 |
+   *
+   * ⚠️ 第 8 项**不在这里逐帧投** —— 它是标量,20Hz × N 人无意义(带宽裁定),
+   *    由 `projectInventoryTotalFor` 在 `applyInventory` 变更时调一次。
+   *
+   * ## ⚠️ 顺序:先 `syncMaxHp` 再 `projectPlayer`(不可换)
+   *
+   * 契约 §4 第 4 步:先按等级同步派生上限,再投影。
+   * 换过来的话,升级那一帧投影到的是**旧上限** —— 一帧的错,
+   * 且在等级跳变边界上会表现为「血量上限落后一帧」。
+   *
+   * ## 上界(`level` 夹一次)
+   *
+   * 理由不是「模拟层可能溢出」(`combatantStats`
    * 内部已钳到 `MAX_LEVEL`),而是**本字段的消费者不钳**:
    * `carryCapacityOf` 直接 `8 + (lv - 1)`,而 `progression.statsAtLevel` 的口径
    * 是 `8 + (L-1)` 且 `L` 已被钳 ⇒ 投影越界会让两处口径分歧。
    * 该上界此前是**惰性**的(level 恒 1),接线后即时生效 ——
    * 由 `WS-07 E18` 两侧扫描钉住(level=30 ⇒ 37;level=31 ⇒ 仍 37)。
    */
-  private syncLevelProjections(): void {
+  private projectAllPlayers(): void {
     const host = this.worldSaveHost;
-    if (host === null || typeof host.levelOf !== 'function') return;
+    if (host === null) return;
+    const view = this.simReadView();
+    if (view === null) return;
+    /* 逐玩家投影 8 个交集字段(契约 §2.3)。
+       ⚠️ 这里**不改 state 以外的任何东西** —— 投影是只读视图的写入,
+          不是领域变更。领域变更只在 `WorldSim.tick` 里发生(契约 §4)。
+       ⚠️ 顺序:先 syncMaxHp 再 projectPlayer —— 与契约 §4 第 4 步一致。
+          maxHp 是派生值,必须先落到 vitals,投影才能读到**本帧**的正确上限
+          (反过来的话,升级那一帧投影到的是旧上限 —— 一帧的错)。 */
     for (const p of this.state.players) {
-      const lv = host.levelOf(p.id);
-      if (!Number.isFinite(lv)) continue;
-      const clamped = Math.max(1, Math.min(MAX_LEVEL, Math.trunc(lv)));
-      if (p.level !== clamped) p.level = clamped;
+      const lv = view.levelOf(p.id);
+      if (Number.isFinite(lv)) {
+        const clamped = Math.max(1, Math.min(MAX_LEVEL, Math.trunc(lv)));
+        /* 裁决 1:maxHp 由 progression 派生,经 vitals.syncMaxHp 落到权威。
+           ⚠️ 这里**不算** maxHp 公式 —— 那会是第二份实现(公式在 progression)。
+              本方法只做「等级 → 问一次派生值 → 交给 vitals」的搬运。
+           ⚠️ 为什么逐帧调而不是只在等级变化时调:
+              syncMaxHp 自己返回 bool 且内部判 changed ⇒ 重复调**无副作用**
+              实测:`maxHp` 相同且 `hp <= maxHp` 时 changed=false、不写。
+              用「这里先判等级变了没」来省调用,会引入**第二处变化检测**,
+              而那正是两份实现互相顶着的地方。 */
+        const derived = this.derivedMaxHp(p.id, clamped);
+        if (derived !== null) this.syncMaxHpOf(p.id, derived);
+      }
+      projectPlayer(view, p.id, p);
     }
+  }
+
+  /**
+   * 构造投影读口(契约 §3.1)。
+   *
+   * ## 为什么在**这里**构造,而不是让 projectPlayer 自己摸 worldSaveHost
+   *
+   * `projectPlayer` 只接受 `SimReadView` ⇒ 它**结构上**拿不到 `room.state`。
+   * 把所有 `host` 的存在性判断收在这一处,投影函数就变成**纯函数**
+   * —— 那正是它能被假实现单测的前提。
+   *
+   * ## ⚠️ 老世界源(只实现了部分读口)怎么办:逐口降级
+   *
+   * 缺哪个读口,该读口返回「没有权威」:vitalsOf/poseOf 给 null、
+   * weaponOf 给 undefined ⇒ 对应字段不投影(保留旧值)。
+   * ⇒ 而不是整段跳过:那样「接了 3 个读口」与「一个都没接」表现相同,
+   *   断言分不出进度。逐口降级让**接了哪些**成为可观测的。
+   *
+   * ⚠️ 第 8 项不在这里 —— 走「变更时投影」的单独路径(且**只有明细一条通路**)
+   * (契约 §2.3 带宽裁定),读口存在性由 `projectInventoryTotalFor` 自己判。
+   */
+  private simReadView(): SimReadView | null {
+    const host = this.worldSaveHost;
+    if (host === null) return null;
+    return {
+      levelOf: (id) => (typeof host.levelOf === 'function' ? host.levelOf(id) : 1),
+      vitalsOf: (id) => (typeof host.vitalsOf === 'function' ? host.vitalsOf(id) : null),
+      poseOf: (id) => (typeof host.poseOf === 'function' ? host.poseOf(id) : null),
+      weaponOf: (id) => (typeof host.weaponOf === 'function' ? host.weaponOf(id) : undefined),
+
+    };
+  }
+
+  /**
+   * 派生上限注入点。默认走 `progression.statsAtLevel` —— 但它住在
+   * `server/src/combat/`,而 `net → combat` 是**禁止**的依赖方向
+   * (契约 §8;`WS-07 K6` 钉住本文件的代码态不得出现模拟层符号)。
+   *
+   * ⇒ 故派生值必须**由世界源提供**:它同时知道 progression 与 vitals,
+   *   是唯一能合法连接两侧的地方(契约 §8「派生值由**调用方**传入,
+   *   不让 vitals 自己按 level 查表」)。
+   * ⇒ 世界源没提供时返回 null ⇒ 不改 maxHp(保留 vitals 的既有值),
+   *   而**不是**拿一个猜的公式兜底 —— 那会是第二份实现。
+   */
+  private derivedMaxHp(playerId: string, level: number): number | null {
+    const host = this.worldSaveHost as
+      | (WorldSaveHost & { maxHpForLevel?(id: string, lv: number): number | null })
+      | null;
+    if (host === null || typeof host.maxHpForLevel !== 'function') return null;
+    const v = host.maxHpForLevel(playerId, level);
+    return v !== null && Number.isFinite(v) ? v : null;
+  }
+
+  /** 把派生上限交给 vitals(经世界源;`net` 不认识 `VitalsSystem`)。 */
+  private syncMaxHpOf(playerId: string, derivedMaxHp: number): void {
+    const host = this.worldSaveHost as
+      | (WorldSaveHost & { syncMaxHp?(id: string, hp: number): boolean })
+      | null;
+    if (host === null || typeof host.syncMaxHp !== 'function') return;
+    host.syncMaxHp(playerId, derivedMaxHp);
+  }
+
+  /**
+   * 第 8 项 `inventory`:总量投影(契约 §2.3 的 W5 裁定)。
+   *
+   * ## ★★ 方向 = 明细 → 总量,且**重算**而非累加
+   *
+   * 累加式(`total += delta`)漏一帧就**永久偏差**;
+   * 重算式(`total = f(明细)`)任何一帧只依赖当时的明细。
+   * ⇒ 故这里**读明细**(经 `inventoryDetailOf`),不读 `inventoryTotals`。
+   *   `inventoryTotals` 是纯内存模式下的**退路缓存**,不是本投影的输入。
+   *
+   * ## 为什么是「变更时」而不是逐帧(契约 §2.3 带宽裁定)
+   *
+   * 总量是标量,逐帧投 20 次 × N 人无意义。⇒ 调用方只在
+   * `applyInventory` 通过后调一次。
+   * ⚠️ 但**重算**这一点与频率无关:低频 + 累加式照样会漂(而且更晚发现)。
+   *
+   * @returns 是否发生变更(供调用方决定要不要下发)
+   */
+  projectInventoryTotalFor(userId: string): boolean {
+    const host = this.worldSaveHost as
+      | (WorldSaveHost & {
+        inventoryDetailOf?(id: string): readonly { quantity?: unknown }[] | null;
+      })
+      | null;
+    if (host === null || typeof host.inventoryDetailOf !== 'function') return false;
+    const detail = host.inventoryDetailOf(userId);
+    if (detail === null) return false;
+    const total = projectInventoryTotal(detail);
+    const prev = this.inventoryTotals.get(userId);
+    if (prev === total) return false;
+    this.inventoryTotals.set(userId, total);
+    return true;
   }
 
   /**
