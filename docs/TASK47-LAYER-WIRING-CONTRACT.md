@@ -119,22 +119,103 @@ interface WorldSaveHost {
 }
 ```
 
+### ★★★ 2.1.2 **再次订正(2026-11-13,`net-persist` 实测反驳,Lead 复算后采纳)**——本节推翻 2.1.1 的结论
+
 ```
-★★ 为什么改成这个形态(而不是 `restoreFromProfile(playerId, profile)`)
-  1 既不重复 **也不越权**:`profile` 那个形态要求房间**先解析出** level/hp ——
-    而权威的派生规则(等级→maxHp、maxHp 钳制)全在模拟层;
-    房间一旦自己算 ⇒ **第二份派生实现**(陷阱 80 的形态)。
-  2 「谁该被还原」由模拟层定:`loadVitalsFromUsers` 只读**显式给出的** ID,
-    其 docblock 明写「把全表读进来会让"谁该被还原"取决于 DB 里恰好有谁
-    ⇒ **那正是幽灵玩家的来源**」。房间不该参与这个决定。
-  3 `loadFromDb` 内部**已经**用了 `syncMaxHp` 的等价顺序保障 ——
-    它走 `importVitals → vitals.revive`,而 revive 的上界取自**当帧** maxHp。
-    ⚠️ 但**顺序仍需订正**:若驱逐玩家的 maxHp 尚未按 level 同步过,
-      revive 会按旧上限(100)钳住 ⇒ 故 §4.1 增加一步。
+★★ 我在 2.1.1 把缺口判成「只需暴露 loadFromDb」⇒ **错了。**
+   `net-persist` 停手没写一行,先跑了四条实测反驳我。**它是对的**,我逐条复算:
+
+  ── 证据 A(源码,我复核 ✓)──
+  `saveVitalsToUsers` 只写 hp:repo.ts:773
+      savePlayerState(db, id, { hp: row.hp }, nowMs)
+  ⇒ `exportVitals()` 返回的 {hp,maxHp,downed} 里 **maxHp 一读出即丢弃**;
+     `progresses`(level/exp)在 `saveToDb` **完全不出场**。
+  ⇒ ★ Lead 全仓实测:把 level 写进 DB 的调用点 = **0**(唯一 `update('users')` 在 repo.ts:261,
+     而它的 `next` 来自 `savePlayerState` 的 patch ⇒ 没人传过 level)。
+
+  ── 证据 B(源码,我复核 ✓)──
+  repo.ts:255-259:`const maxHp = (next.max_hp) ?? cur.max_hp; next.hp = clampIntQuiet(hp,0,maxHp)`
+  ⇒ 建号 max_hp=100 ⇒ `savePlayerState({hp:535})` 被钳成 **100**。
+     `saveVitalsToUsers` 又**从不传** max_hp ⇒ 连抬上限的机会都没有。
+  ⇒ ⇒ **存档层自己就把 hp 封在 100。**
+
+  ── 证据 C(推论,我认可)──
+  冷启动走 loadFromDb ⇒ 顶多得到 100/100 ⇒ **验收 2 的 535 达不到**。
+
+  ── 证据 D(源码,我复核 ✓)──
+  room.ts `snapshotFor()` = `encodeFull(this.state, tick).bytes`
+  ⇒ 它 encode 的是 **`this.state.players[]`(= 投影值)⇒ 含 level**。
+  ⇒ ★ 而 `level` 的**唯一**持久化处**就是** `room_players.snapshot_blob`(repo.ts:429)。
+
+  ── 全仓调用点(我实测)──
+  `loadReconnectSnapshot` 在 `server/src` 里:**定义在 repo.ts:434,room.ts:1830 仅 re-export,
+     真调用点 = 0**(其余 2 处在 tests/WS-07.test.ts:2683/2693)。
+  ⇒ ★ 而 `WorldSim.loadFromDb` 走的是 `loadVitalsFromUsers` + `loadRoomMobMem`,
+     **完全不经过 room.ts** ⇒ 它**不可能**让验收 1 变绿。
+```
+
+**⇒ 三条结论(采纳 `net-persist` 的判断)**
+
+```
+1 验收 2(注入 level=30/hp=535 ⇒ 两侧 535)**只能走 blob** ——
+  因为 level 的唯一持久化处就是 snapshot_blob。
+2 验收 1(`loadReconnectSnapshot` 有真调用)⇒ **`loadFromDb` 根本不碰它** ⇒ 照样红。
+3 ⇒ `loadFromDb` 消的是**另一条欠账**(HP + 生物 mem 回世界),**不能替代**读档恢复。
+  ⇒ ⇒ **两条 seam 是并列关系,不是替换关系。** 本任务需要**两条都做**。
+     (或:若只做一条,必须是 blob 那条 —— 它才同时过验收 1 与 2。)
+```
+
+**⇒ 我 2.1.1 两条理由的重新裁定(它逐条驳,其中一条我认错)**
+
+```
+理由 1 ✗ **我错了**:我写「profile 形态会让房间**先解析出** level/hp ⇒ 第二份派生实现」。
+   · 但**我自己设计的 profile 形参里没有 maxHp** —— 房间只传 level 与 hp,
+     maxHp 由模拟层 `syncMaxHp` 内部派生。
+   · ⇒ 房间**没有算任何派生值** ⇒ 不构成第二份实现。它的反驳**成立**。
+   · ⇒ 且它补了实证:`importVitals({hp:535})` 在 maxHp=100 时确实钳成 100
+     ⇒ **钳制只有一处实现,没有分叉**。
+理由 2 ✓ 成立(它认这条):让 `vitals.ids()` 决定「谁该还原」更对。
+   · 但它指出:**这条管的是 DB 的 users 路径**;
+     而 blob 路径的作用域是 `(roomId, userId)` ——
+     「谁被还原」由**正在 join 的那个人**决定,比 `vitals.ids()` **更窄**,
+     ⇒ **不存在幽灵玩家**问题。
+   · ⇒ 故理由 2 **不能用来否定 blob 路径**(它作用在不同路径上)。
+```
+
+**★ 最终形态(两条并列,均需 `restoreFromProfile` + `loadFromDb`)**
+
+```ts
+interface WorldSaveHost {
+  /** 读档恢复(blob 路径)—— 验收 1/2/3 靠它。 */
+  restoreFromProfile?(playerId: string, profile: {
+    level: number; hp: number; x: number; y: number; z: number; weaponId?: number;
+  }): boolean;   /* ⚠️ 不含 maxHp —— level 派生值,由模拟层算 */
+
+  /** HP + 生物 mem 从 DB 回世界(users 路径)—— 与上面并列,另一条欠账。 */
+  loadFromDb?(db: DbLike, roomId: string): {
+    hpApplied: number; memApplied: number; memSkipped: number;
+  };
+}
+```
+
+```
+⇒ ★ 而 2.1.1 的 §4.1.1「登记必须先于读档」**仍然成立**(blob 路径同样要先 addPlayer):
+   因为它要 `applyPlayerMove` 到实际坐标、且 `projectPlayer` 需要 state 行存在。
 ```
 
 
-### 2.2 复用而非新增的部分(★ 经 §2.1.1 订正后)
+```
+★ 2.1.1 曾用上面三条理由否定 blob 形态 ⇒ ★★ **经 2.1.2 复核,理由 1 与 3 不成立**:
+  1 ✗ **错**:房间只传 level/hp,**不传 maxHp** ⇒ 派生仍全在模拟层 ⇒ 无第二份实现。
+  2 ✓ 成立,但它管的是 **users 路径**;blob 路径按 `(roomId,userId)` 作用域,**更窄**,
+     不存在幽灵玩家 ⇒ 不能用来否定 blob 路径。
+  3 ✗ **与结论无关**:它说的是 users 路径的顺序,而 blob 路径的 hp 不走 revive,
+     它走 `restoreFromProfile → syncMaxHp → importVitals`;
+     ⇒ 顺序约束**仍要**(见 §4.1),但**不构成"因此该选 loadFromDb"的理由**。
+```
+
+
+### 2.2 复用而非新增的部分(★ 经 §2.1.1 / §2.1.2 **两次**订正后)
 
 ```
 已存在、**不需新增**的权威口(实测):
@@ -145,16 +226,35 @@ interface WorldSaveHost {
     WorldSim.syncMaxHp(id, maxHp)    —— US2 已落地的派生上限
     WorldSim.addPlayer(id,x,y)       —— 登记刚体
     progression.setLevel(progress,L) —— 等级(纯函数,返回新对象,需回写 Map)
-  读侧(★ 本节订正新增,**此前漏了**):
-    WorldSim.loadFromDb(db, roomId)  —— **整个权威恢复已实现**(world_sim.ts:2673)
-    repo.loadVitalsFromUsers(db,ids) —— 只读显式 ID(防幽灵玩家),repo.ts:786
-    repo.loadRoomMobMem(db, roomId)  —— repo.ts:833
+  读侧(★ 两条并列,消**不同**欠账 —— 不可互相替代):
+    A `repo.loadReconnectSnapshot(db,roomId,userId)` —— blob(含 level/maxHp),repo.ts:434
+        ⇒ **验收 1/2 只靠它**;目前 `server/src` 真调用点 **0**(仅 room.ts:1830 re-export)
+    B `WorldSim.loadFromDb(db,roomId)`               —— users.hp + 生物 mem,world_sim.ts:2673
+        ⇒ 独立欠账;**不能替代 A**:它不碰 snapshot_blob,也不写 level
 
-★ 结论(订正后):**恢复不需要新增任何权威写口,也不需要新增读口逻辑** ——
-  `WorldSim.loadFromDb` **已经是完整的恢复**;
-  缺的只是**把它暴露进 `WorldSaveHost`** 并在房间路径上调用。
-  ⇒ ⇒ 本任务的实质从「造一条恢复路径」降级为「**暴露一条既有路径并接线**」。
-  ⇒ ★ 这是**好消息**:工作量小得多,且风险低(既有逻辑已被 WS-FND-02 覆盖)。
+★ 结论(**两次**订正后):本任务**有两条 seam,不是一条**。
+  · A =「读档恢复」(blob 路径)⇒ 过验收 1/2/3
+  · B =「DB 状态回世界」(users 路径)⇒ 过验收 4 的一部分
+  ⇒ ⇒ 我(Lead)在 2.1.1 判「只需 B」是**错的**(见 §2.1.2)。
+  ⇒ ★ `net-persist` 的处置**值得作为范例**:**方向分歧时先停手、先实测、再让 Lead 裁**,
+     而不是"按 Lead 说的先写完"。这一步省下的是整轮返工。
+```
+
+### ★★ 2.2.1 一条**结构性**发现(`net-persist` 报出,Lead 复核):`users` 装不下血上限
+
+```
+repo.ts:255-259
+  const maxHp = (next.max_hp as number) ?? cur.max_hp;
+  next.hp = clampIntQuiet(next.hp as number, 0, maxHp);
+⇒ `saveVitalsToUsers` 只传 `{ hp }`(repo.ts:773)⇒ `next.max_hp` 恒 undefined
+  ⇒ `maxHp` 恒取 `cur.max_hp`(建号 = **100**)
+  ⇒ 而 `users.max_hp` **从来没人写**(Lead 实测:全仓把 level 写进 DB 的调用点 = 0)
+⇒ ⇒ **存档层自身把 hp 封在 100。** Lv.30 的 535 血**存不下**。
+
+★ 这不是"接线漏了",是**数据模型层面的缺口** ⇒ 属「等裁决」或「等服务端机制」,
+  而非「等编排层接线」。
+⚠️ 判据:若某条欠账的理由写「待接入」而实际是**数据模型缺字段**,
+  那理由是**误导性的** —— 与 `scoring.ts` 那条同族(见 mob-boss-ai 的发现)。
 ```
 
 
@@ -217,19 +317,23 @@ export function assemble(deps: AssembleDeps = {}): Assembled;
        而 `vitals.ids()` **只含已登记玩家** ⇒ 未登记则**读不回来**。
        (实测依据:repo.ts:782 docblock「只读**显式给出的** ID」
         + world_sim.ts:2677 传的正是 `this.vitals.ids()`)
-3 ★ **读档(权威)**:`host.loadFromDb(db, roomId)`
-    ⇒ 内部 = `importVitals(loadVitalsFromUsers(...))` + `importMobMem(loadRoomMobMem(...))`
-    ⇒ ⚠️ hp 走 `vitals.revive` ⇒ **上界取自当帧 maxHp**
-       ⇒ 故 **第 3.5 步不可省**(见下)
-3.5 ★ **先按等级同步 maxHp** 再让 hp 落位:
+3 ★ **读档(选路,见 §2.2 两条 seam)**:
+    ★ **主路 A(blob)**:`loadReconnectSnapshot(db, roomId, userId)` ⇒ blob | undefined
+       ⇒ decodePacket(blob) → 取**自己那一行** ⇒ 得到 { level, hp, maxHp, x, y, z, weaponId }
+       ⇒ 这正是**唯一含 level** 的持久化处(§2.2.1:`users` 装不下 level/maxHp)
+    ○ 副路 B(users):`host.loadFromDb(db, roomId)` —— 独立欠账,**不替代 A**
+       (它只回 hp + 生物 mem;而 hp 在 blob 路里已有更全的副本)
+3.5 ★ **先按等级同步 maxHp** 再让 hp 落位(**两条路都要**):
     `projectPlayer` 里 level 先投影 ⇒ `syncMaxHpOf` 用派生值刷新 vitals.maxHp
-    ⇒ 若驱逐玩家的 maxHp 仍是 100(旧上限),revive 会把 535 的存档血钳到 100。
+    ⇒ 若驱逐玩家的 maxHp 仍是 100(旧上限),`importVitals` 会把 535 的存档血钳到 100。
     ⚠️ 实现上最稳的顺序(与 US2 §4 同源):
        先 `syncMaxHpOf(id)`(让上限=当前 level 的派生值)
-       → 再 `loadFromDb`
+       → 再到 hp:`restoreFromProfile` 内部顺序
+         `addPlayer → applyPlayerMove → syncMaxHp → importVitals → setProfile`
        → 再 `projectPlayer`
-4 位置:room 快照里的 x/y/z 是**投影值** ⇒
-    ⚠️ 只作为**兜底**(世界里没有该刚体时用);有权威则用 `playerPosition(id)` 读回
+4 位置:blob 里的 x/y/z 是**投影值**(encode 时刚从 state 读出)⇒
+    ⚠️ **不要**直接采信:刚体可能因碰撞被推开 ⇒ 用 `applyPlayerMove(blob.x, blob.y)`
+       **并**最后用 `playerPosition(id)` 的实际值给 `ac.join`
 5 ★ **再投影**:`projectPlayer(view, id, state.players[i])`(US2 唯一写者)
 6 播种反作弊:`ac.join(id, tick, x, y, z)` 用**恢复后**的实际坐标
     ⇒ 不用存档里的坐标:刚体可能因碰撞被推开,两者不同会被判瞬移(实测差 13.649 格)
@@ -248,6 +352,26 @@ export function assemble(deps: AssembleDeps = {}): Assembled;
     未登记 ⇒ 不在 ids ⇒ 读回 0 条 ⇒ **恢复静默无效**
     (而外部表现与"没有存档"完全一样 —— 又一次陷阱 89 的形态!)
 ⇒ 判据:**任何"读回"接口,先查它的 id 来源是"我传的"还是"它自己扫的"。**
+
+★ 而 **blob 路径同样要先登记**(理由不同,结论相同):
+  它要 `applyPlayerMove` 到实际坐标、且后续 `projectPlayer` 需要 `state.players[]`
+  里**已有该行** ⇒ 否则移动被丢弃、投影无处可写(静默,不报错)。
+```
+
+### 4.1.2 ★ 一条**只有实测才发现**的形态:`users` 路径**永远过不了**验收 2
+
+```
+net-persist 实测(Lead 复核源码后采纳):
+  · `saveVitalsToUsers` 只传 `{ hp }` ⇒ `users.max_hp` **从不被写**
+  · `savePlayerState` 的钳制:`next.hp = clampInt(hp, 0, cur.max_hp)`(repo.ts:259)
+  · 建号 `max_hp = 100` ⇒ **535 存进去读出来是 100**
+⇒ ⇒ 于是「冷启动走 loadFromDb ⇒ 断言 535/535」这条验收**在数据模型层面不可能通过**,
+     与接线做没做**无关**。
+⇒ ★ 这一条的价值:**它把一个"接线任务"重新分类成"数据模型缺口"**。
+   若不实测,执行者会以为是接线没做,反复接线却永远不绿 ——
+   而**每次失败的形态都像"还差一点"**。
+⇒ ★★ 判据(可迁移):**当一条验收"怎么接都不绿"时,先怀疑它在数据模型层面不可满足,
+   而不是继续接线。**
 ```
 
 
