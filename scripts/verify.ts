@@ -1324,13 +1324,17 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
     '内容基线锁;gate-only(被 content-lock / extension-drill / verify 真消费),非欠账'],
   /* ② 比 baseline 更孤立:**连 gate-only 都不是** ——
      门禁侧真 import = 0,`scripts/**` 里的每次出现都只是**登记**。
-     实测三条阻塞全成立 ⇒ 改写成「等什么」:
-       · room.ts 的 join() 无 contentClaim 参数(0 次命中)
-       · DEFAULT_CONTENT_POLICY = STRICT ⇒ 拒所有无指纹客户端
-       · 客户端 24 个 .ts 里含网络能力的是 0 个
-     ⇒ 它等的是**不存在的客户端网络层**。 */
+     ⚠️ 第三条阻塞「客户端 24 个 .ts 里含网络能力的是 0 个」**已于 2026-11-13 订正**:
+      实测 `client/src` 现有 **27** 个 .ts,其中 `net/session.ts` 真有 `new WebSocket`×1
+      (task-69 那轮之后出现的)⇒ 该条**不再成立**。
+     ★ 但前两条仍成立,故本条**仍不可达**:客户端能连了,却**不会发内容指纹**——
+      实测 `session.ts` 顶层 import 只有 2 条(`shared/net/delta.ts`、`./state_store.ts`),
+      **不含** handshake;`contentClaim` 是硬编码 `null`。
+     ⇒ 它等的是**「客户端能自算内容指纹」**(需 `registry.ts` 上移 `shared/`)+ join 签名扩展。 */
   ['server/src/content/handshake.ts',
-    '内容握手;等客户端网络层 + join 签名扩展(三条阻塞已实测成立),非「待接入」'],
+    '内容握手;等客户端能自算内容指纹 + join 签名扩展'
+    + '(三条阻塞中**第三条已过期**:客户端现有 27 个 .ts 且 session.ts 真有 WebSocket),'
+    + '非「待接入」'],
   /* ③ 有生产引用(2 处),**但两个引用者都不可达** ⇒ 属差集 `DIFF_REF`。
      它是「对不可达模块的引用」,不是「已接」。
      ⚠️ 「有生产引用」与「生产可达」是**两个判据**;本条目满足前者、不满足后者。
@@ -1344,7 +1348,18 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2)'],
   ['server/src/db/driver.sqlite.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
   ['server/src/db/memory_db.ts', '驱动按 DbLike 结构化类型注入,生产入口尚未注入'],
-  ['server/src/mobs/taming.ts', 'WS-04 牧场驯服,等宠物容器 + 驯服交互(tameItem 无人消费)'],
+  /* ⚠️ 本条的措辞在 2026-11-13 被订正 —— 原文写「(tameItem 无人消费)」,**事实不成立**:
+     `taming.ts:81`(tameableDefs 过滤)、`:124`/`:127`(feedPet 校验物品)都在读该字段;
+     `shared/constants/mobs.ts` 里 7 处赋值也说明它有生产者。
+     ⇒ 真正**零生产调用**的是 `feedPet` 这个**函数**(实测 18 处出现里 15 处在 tests/)。
+     ★ 差别要紧:「字段没人读」与「整个入口没人调」是**两种缺陷、两种修法**。
+     ★ 错话从哪来:`tests/WS-04.test.ts:1251` 的断言只测**一个文件**——
+         `ok(!/tameItem/.test(behavSrc))`,结论句却写「⇒ 7 种可驯服生物的
+         tameItem 字段无人消费」,把**单文件范围偷换成全仓范围**。
+         该断言**是绿的**,于是错结论被当已核实事实抄进本表(陷阱 95)。 */
+  ['server/src/mobs/taming.ts',
+    'WS-04 牧场驯服,等宠物容器 + 驯服交互(feedPet 零生产调用;'
+    + 'tameItem 字段**有**消费者,旧措辞「无人消费」已订正)'],
   /* `net/prediction.ts` 已于 2026-11-12 **搬迁**到 `client/src/net/`,
      不是接线 —— 它本就是客户端模块,放在 `server/src/` 下是放错位置。
      理由改写成「等客户端网络层」而非「待接线」:
