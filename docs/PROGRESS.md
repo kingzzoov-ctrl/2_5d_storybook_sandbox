@@ -4617,5 +4617,32 @@ D room.ts `snapshotFor()` = `encodeFull(this.state, tick).bytes`
         (本轮**未查**,如实标注:这是未验证项,不是"已确认没问题")
     ```
 
+    ### ★★ 六、那个未决项 **已销**(当天查完,并且又抓到我一次同型错)
+
+    ```
+    ① 非 utf8 读取点 = **0**  ⇒ GBK 类风险**不会**传染给仓内脚本
+       (`readFileSync(f,'utf8')` 是字节精确解码,无代码页概念)
+    ② 按 `\r` 切行的点 = 2,都在 `scripts/judgement_audit.ts`(**故意的**:
+       它是行尾归一器 + 一个 `withEol(src, 'lf'|'crlf'|'cr'|'mixed')` 测试辅助)
+    ③ 「split('\n') 但不归一 CRLF 且用行号」= **0**
+    ④ 抽检发现 `scripts/entry_load_exempt.ts` / `tests/WS-07.test.ts` 工作区含 CRLF
+    ```
+
+    ```
+    ★★ 而 ④ 我**第一版判成了"新引入 CRLF,需修"** —— 又一次同型错(本日第三次):
+      我比的是 `git show HEAD:file`(经 git **文本归一化** ⇒ 返 LF)
+      与工作区(真 CRLF)⇒ **两层不是同一层,不该比**。
+    ★ 实测根因:`core.autocrlf = true`(无 .gitattributes)
+       ⇒ 仓库里存 LF,检出时转 CRLF ⇒ **工作区 CRLF 是正常行为**。
+    ★ 铁证:`git status` 里这两个文件**干净**;`git diff --ignore-cr-at-eol` **无实质差异**。
+    ⇒ 判据:**判"某文件的行尾被改了"必须同层比** ——
+       ① 看 `git status`(git 自己认不认它脏) ② 用 `--ignore-cr-at-eol` 看实质差异;
+       不要拿"HEAD 归一化后的文本"与"工作区原始字节"作对照。
+    ⇒ ⇒ 这条与陷阱 97 是**同一根因的第三次出现**:论据与结论不同域。
+       ★ 而它在同一天内出现三次(96 存在性未验 / 97 论据跨域 / 98 比较跨层)
+         ⇒ 可见这类错**不是偶发**,而是**默认思维方式的缺陷** ——
+         我在"我看到了 A"到"所以 B"之间,习惯性省略了"**A 与 B 是否同一口径**"。
+    ```
+
 
 
