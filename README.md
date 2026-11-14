@@ -276,9 +276,42 @@ node scripts/content-lock.ts --capacity  # 内容容量账本(ID / 位域剩余�
 node scripts/content-lock.ts --audit     # 引用闭合审计
 node scripts/content-lock.ts --update    # 刷新内容基线(有意扩展后,需登记 CR)
 node scripts/typecheck.ts              # 类型检查(未装 tsc 时优雅跳过并退出 0)
+node scripts/typecheck-baseline-audit.ts           # 类型检查**基线锁**(已被 verify.ts --all 调用)
+node scripts/typecheck-baseline-audit.ts --update  # 修掉类型错误后刷新基线
 ```
 
 **零依赖**:全部测试与实现只用 Node 内置模块 + Node 24 的原生 `.ts` 类型擦除直跑,不需要 `npm install`、不需要构建。
+
+### 类型检查基线锁(2026-11-14 接入)
+
+```
+node scripts/typecheck.ts ⇒ exit 2 / **267 条**错误(三次连跑 267/267/267 ⇒ 确定)
+   按目录:tests/ **209(78%)** / server 27 / scripts 18 / client 10 / shared 3
+   缺 @types 只有 2(three)+1(better-sqlite3)⇒「装几个 @types 就好」不成立
+```
+
+`verify.ts:2972` 早已写明「tsc 恒红 ⇒ 拿它当门禁 = 一个永远红的门 ⇒ 没人会看它」——
+**那个取舍是对的**。但它漏掉第三条路:**267 稳定 ⇒ 它可以是基线**。
+判据因此从「零错误」变成「**不增加**」,与本仓既有的 `content-lock` 同一思路。
+
+```
+错误数 > 基线      ⇒ **红**(引入了新类型错误)
+出现基线没有的指纹 ⇒ **红**(哪怕总数没涨)
+错误数 < 基线      ⇒ **告警不红**(变好了;基线该刷新)
+typescript 未装    ⇒ **跳过并说明**(本仓默认零依赖,不是缺陷)
+```
+
+★ **为什么比「指纹多重集」而不是只比总数** —— 这是实测,不是推理:
+```
+修掉 1 条 + 新引入 1 条 ⇒ 总数不变
+  只比总数    : 2 → 2          ⇒ ★ **绿**(放过了!)
+  比指纹多重集: 新增 1 / 消失 0 ⇒ ✓ 红(抓住了)
+```
+指纹 = `文件 | 错误码 | 归一化消息`,**不含行号**
+(含行号则"上方插一行"会让其后所有错误行号 +1 ⇒ 表现为全部消失+全部新增 ⇒ 天天误报)。
+
+★ **它不替代 `vite build`**:后者查语法与模块解析(实测输出里 `error TS` 命中 **0** 次,确实不查类型),
+本锁查类型,两者互补。
 
 ---
 
