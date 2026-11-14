@@ -48,6 +48,11 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep, dirname, resolve } from 'node:path';
+/* ★ 扫描范围的**唯一事实源**。不要在本文件另写一份跳过列表 ——
+ * 起因实测:7 个判据里只有 1 个的跳过列表含 `_probe_sandbox/`,
+ * 其余 6 个会走进队友的整仓副本,把 HEAD 的问题报成"本轮新增"(BOM 假红 3 个)。
+ * ⇒ 判据:凡**仓库的副本**,对它的结论**不是关于本仓的结论**。 */
+import { shouldSkipDir } from './scan-scope.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const STRICT = process.argv.includes('--strict');
@@ -155,7 +160,11 @@ function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name);
     if (statSync(p).isDirectory()) {
-      if (name === 'node_modules' || name.startsWith('.')) continue;
+      /* ★ 范围判定**只走 scan-scope.ts**(唯一事实源)。
+       * 本行原为手写的 `name === 'node_modules' || name.startsWith('.')` ——
+       * 那份手写副本不含 `_probe_sandbox/`,会走进队友的整仓副本。
+       * ⚠️ `shouldSkipDir` 已含 `startsWith('.')`,故行为是**超集**且更正确。 */
+      if (shouldSkipDir(name)) continue;
       walk(p, out);
     } else if (name.endsWith('.ts')) out.push(p);
   }

@@ -51,6 +51,10 @@ function countEntries(file: string, declName: string): number | null {
 }
 
 const TRUTH: Record<string, number> = {};
+/* ★ 每个「正解」都必须解析成功 —— 见文件末尾的断言 #2。
+ * 这张表**必须**列出全部应有键:漏一个键 ⇒ 该键永远 undefined ⇒
+ * 引用它的自称被判 '?'(既不 ✓ 也不 ★)⇒ **改个声明名就能让它静默恒绿**。 */
+const EXPECTED_TRUTH_KEYS = ['可达性白名单', 'orphan', '同义反复白名单'] as const;
 {
   const wl = countEntries(join(ROOT, 'scripts/verify.ts'), 'UNREACHABLE_EXEMPT');
   const orphan = countEntries(join(ROOT, 'scripts/orphan-audit.ts'), 'ORPHAN_KNOWN');
@@ -191,6 +195,66 @@ console.log(`
    ⇒ 故本脚本的定位:**辅助清单工具,不是门禁**。
      要门禁化,只能把范围缩到上面三类(那是一份可自动核对的清单)。
 `);
+
+/* ══════════════════ 进链所需的**两组断言** ══════════════════
+ *
+ * ## 为什么必须是**两组**(task-84 任务A,注入验证过)
+ *
+ * 让本脚本进退出码,只加"陈旧 ⇒ 非零"是**不够的**。反例实测:
+ *
+ * ```
+ * 把 verify.ts 里被计数的 `TAUT_SUSPECT_EXEMPT` **改名**:
+ *   ⇒ countEntries() 返回 null ⇒ TRUTH['同义反复白名单'] 不存在
+ *   ⇒ 引用它的自称被判 '?'(truth === undefined)
+ *   ⇒ '?' 既不 ✓ 也不 ★ ⇒ stale 恒为 0
+ *   ⇒ **改个声明名就让它静默恒绿,而且永远绿**
+ *   实测(注入验证):改名前后 exit **都是 0**,而 TRUTH 表少了一个键。
+ * ```
+ * ⇒ 这是**最难发现的一类腐烂**:不报错、不告警、不减分,
+ *   而它同时**关掉了**这个检测器唯一的价值(比对)。
+ *   ⇒ 故必须同时断言:**每个应有的 TRUTH 键都解析成功**。
+ *
+ * ## 两组分别是
+ * ```
+ * #1  stale > 0        ⇒ 非零   (过时条目必须报错)
+ * #2  每个 TRUTH 键解析成功 ⇒ 非零 (否则"拆掉真值来源"即可恒绿)
+ * ```
+ * ★ 施加顺序无所谓(两者各自独立置位),但**验证顺序必须**:
+ *   先证明"改前是绿的",再证明"改后是红的" ——
+ *   否则无法区分"我修好了"与"它本来就会红"。
+ *   (已按此顺序注入验证:`_t84ca.ts`)
+ *
+ * ## 与 `--selftest` 的关系
+ * 本节**独立于** `--selftest` 之外:selftest 验的是"检测能力"(_anchor 等),
+ * 本节验的是"**输入是否完整**"。二者任一失败都应非零。
+ */
+let assertFailed = false;
+{
+  /* #2 先报 —— 它失败时下面的 stale 数字不可信 */
+  const unresolved = EXPECTED_TRUTH_KEYS.filter((k) => TRUTH[k] === undefined);
+  if (unresolved.length > 0) {
+    console.log(`\n   ★ 正解缺失:${unresolved.length} 个应有的 TRUTH 键解析失败`);
+    for (const k of unresolved) {
+      console.log(`      · ${k} —— 被计数的声明找不到(改名/删除/形态变了?)`);
+    }
+    console.log('      ⇒ 引用它的自称会被判 \'?\'(既不 ✓ 也不 ★)⇒ **本检测器静默失效**');
+    console.log('      ⇒ 不是"没有陈旧",是**没有比对** —— 两者必须可区分');
+    assertFailed = true;
+  }
+  /* #1 */
+  if (stale > 0) {
+    console.log(`\n   ★ 陈旧 ${stale} 处(见上面 ★ 陈旧 行)`);
+    console.log('      ⇒ 文档里的数与代码算出的正解不一致,应更新文档或代码');
+    assertFailed = true;
+  }
+}
+
+/* 退出码策略(与 --selftest 的分工):
+ *   默认运行 = **报告 + 断言**。加这两个断言后,默认运行已经**可进链**:
+ *   它不再只是"打印 N 处陈旧",而是"陈旧/真值缺失 ⇒ 非零"。
+ *   ⚠️ 定位变化必须写下来 —— 本文件原来的 docblock 说"不是门禁",
+ *      那是**加断言之前**的事实;加完之后那句就不再成立(陷阱 125:说明会过期)。 */
+if (assertFailed) process.exitCode = 1;
 
 /* ─────── selftest ───────
  *
