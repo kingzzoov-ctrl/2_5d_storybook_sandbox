@@ -83,16 +83,16 @@ export function steer45(
   const left = test(-AVOID_ANGLE_DEG);
   const right = test(+AVOID_ANGLE_DEG);
 
-  if (!forward) return { dir: u, turn: 0, reads: 3, blocked: { forward, left, right } };
+  if (!forward) return { dir: u, turn: 0, reads: PROBE_READS_PER_STEP, blocked: { forward, left, right } };
 
   const pick = (deg: number): Vec2 => {
     const a = rad + deg * (Math.PI / 180);
     return { x: Math.cos(a), y: Math.sin(a) };
   };
-  if (!left) return { dir: pick(-AVOID_ANGLE_DEG), turn: -1, reads: 3, blocked: { forward, left, right } };
-  if (!right) return { dir: pick(+AVOID_ANGLE_DEG), turn: 1, reads: 3, blocked: { forward, left, right } };
+  if (!left) return { dir: pick(-AVOID_ANGLE_DEG), turn: -1, reads: PROBE_READS_PER_STEP, blocked: { forward, left, right } };
+  if (!right) return { dir: pick(+AVOID_ANGLE_DEG), turn: 1, reads: PROBE_READS_PER_STEP, blocked: { forward, left, right } };
   /* 全堵:原路折返,同样只读 3 次。 */
-  return { dir: { x: -u.x, y: -u.y }, turn: 0, reads: 3, blocked: { forward, left, right } };
+  return { dir: { x: -u.x, y: -u.y }, turn: 0, reads: PROBE_READS_PER_STEP, blocked: { forward, left, right } };
 }
 
 /* ─────────────── FSM ─────────────── */
