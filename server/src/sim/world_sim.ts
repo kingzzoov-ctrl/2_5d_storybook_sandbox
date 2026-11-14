@@ -91,6 +91,24 @@ import {
  * `submitDelivery` / `bridgeCapture` / `crownPickup` 的生产非自身调用点为 **0**,
  * 全仓也没有 `applyAction` / `dispatchAction`。**⇒ 不得表述为「WS-11 可用」。**
  *
+ * ## ⚠️★ 「import 了」不等于「接线了」—— 我在这次提交里就犯了
+ *
+ * 本块的**第一版**只 import 了 `createRushOrderSession` / `startRushOrder` /
+ * `tickRushOrder` 三个符号,却**一个都没调用**。后果是三绿一空:
+ * ```
+ *   可达性门禁  绿 —— import 就是一条边(verify.ts:805 的判据就是 import 形态)
+ *   文本判据    绿 —— 符号确实出现在本文件里
+ *   测试套件    绿 —— 没有一条断言问「急单每帧真推进了吗」
+ *   实际行为    空 —— 这一帧什么都没发生
+ * ```
+ * ⇒ 这正是我在 task-84 报告里反复引用的「**引用 ≠ 执行**」,
+ *   而我恰在**声称完成接线的那次提交**里犯了它。
+ * ★ 它比 `wiring_view.ts` 那种「挂 tick 也被丢弃」更隐蔽:那种至少有一次真调用,
+ *   这种**连调用点都没有**,所以任何「有没有 import」的判据都抓不到。
+ * ⇒ 修法不是「补一行调用」就完,而是**给可观测量**(`rushTicked` / `rushRunningSec`),
+ *   让「没接」与「接了但这帧无事」在外部**看得出区别**。
+ * ⇒ 判据纪律:**证明接线的是「调用会发生」,不是「符号被引用」。**
+ *
  * ## 方向:sim → party,单向
  *
  * `docs/WS-11-coop-prank-party.md:745` 的「禁用耦合」明确不许 WS-11 模块
@@ -639,6 +657,32 @@ export class WorldSim {
   lastPartyTick: { partyTicked: number; afkTicked: number; afkDew: number; events: string[] } = {
     partyTicked: 0, afkTicked: 0, afkDew: 0, events: [],
   };
+
+  /**
+   * 急单会话(WS-11 的 `RushOrderSession`)。**`null` = 本房间没开急单。**
+   *
+   * ## ⚠️ 这个字段是我第一版**漏掉的**,而且漏得很隐蔽
+   *
+   * 第一版我只 import 了 `tickRushOrder` / `createRushOrderSession` / `startRushOrder`
+   * 三个符号却**一个都不调用**。后果:
+   * ```
+   * · 可达性门禁:绿 —— import 就是一条边,闭包照样 +1(verify.ts:805 的判据是 import 形态)
+   * · 任何「有没有接」的文本判据:绿 —— 符号确实出现在文件里
+   * · 实际行为:**这一帧什么都没有推进**
+   * ```
+   * ⇒ 这正是我自己在报告里反复引用的「**引用 ≠ 执行**」,
+   *   而我恰恰在**声称接线的那次提交**里犯了它。
+   * ★ 它比 `wiring_view.ts` 那种「挂了 tick 也被丢弃」更难看:
+   *   那种至少还有一次真调用可以被人发现,这种连调用点都没有。
+   *
+   * ⇒ 教训:**「import 了」与「调用了」是两个判据,只有后者能证明接线。**
+   *   本文件的 `lastPartyTick.rushTicked` 就是为此加的 ——
+   *   它让「没接」和「接了但这帧结算了」在外部**看得出区别**。
+   */
+  private rushRun: RushOrderSession | null = null;
+
+  /** 最近一次慢帧有没有真正推进急单(1 = 调了 `tickRushOrder`,0 = 没开急单)。 */
+  rushTicked = 0;
 
   /* ═══════════ task-44:击杀结算 / 幽灵泡泡 / 装备词条的生产接线 ═══════════ */
 
@@ -3465,6 +3509,48 @@ export class WorldSim {
     this.partyRun = null;
   }
 
+  /**
+   * 开一场急单(WS-11 §6 的 `RushOrderSession`)。
+   *
+   * `rng` 必须由调用方注入 —— 本类**刻意不**用自己的 `this.rng`,
+   * 因为 `tests/WS-01` 有确定性快照钉住 `tick()` 里的 RNG 调用顺序;
+   * 从这里偷偷抽数会让那份快照漂移,而漂移的原因**极难定位**
+   * (表现是「某个不相干的确定性测试红了」)。
+   * `createRushOrderSession` 会把 `rng` 存在会话里,故只在开局时取一次。
+   */
+  startRushRun(roomLevel: number, rng: () => number, stock: Record<number, number> = {}): boolean {
+    if (!Number.isFinite(roomLevel) || roomLevel < 1) return false;
+    const s = createRushOrderSession({ clock: this.partyClock, roomLevel, rng, stock });
+    startRushOrder(s);
+    this.rushRun = s;
+    return true;
+  }
+
+  /** 结束并清空急单。 */
+  clearRushRun(): void {
+    this.rushRun = null;
+  }
+
+  /** 急单当前状态(诊断与断言用)。未开局返回 `'IDLE'`。 */
+  rushState(): string {
+    return this.rushRun === null ? 'IDLE' : this.rushRun.state;
+  }
+
+  /**
+   * 急单三个工位的累计运转秒数之和(诊断用)。
+   *
+   * ★ 用它而**不是**用 `state === RUNNING` 做判据:状态是**枚举**,
+   *   只要 `startStation` 被调过就恒为 RUNNING —— 那只能证明「开局了」,
+   *   不能证明「每帧在算」。`runningSec` 是**每帧累加**的连续量,
+   *   它会随时间真的增长 ⇒ 才区分得开「已接线」与「只调了一次」。
+   * ⚠️ 我第一版写的 `station.heat` **不存在**于 `StationRuntime`
+   *   (`rush_order.ts:349-364`),TS 类型擦除不报错,运行时会得到 NaN。
+   */
+  rushRunningSec(): number {
+    if (this.rushRun === null) return 0;
+    return this.rushRun.stations.reduce((a, st) => a + st.runningSec, 0);
+  }
+
   /** 当前对局相位(诊断与断言用)。未开局返回 `'IDLE'`。 */
   partyPhase(): string {
     return this.partyRun === null ? 'IDLE' : this.partyRun.phase;
@@ -3549,6 +3635,15 @@ export class WorldSim {
     let partyTicked = 0;
     let afkTicked = 0;
     let afkDew = 0;
+
+    /* 急单(WS-11 §6)。★ 这一行是我**补上**的 —— 第一版漏了它,
+       只 import 不调用 ⇒ 门禁全绿而什么都没推进。详见 `rushRun` 的注释。 */
+    if (this.rushRun !== null) {
+      events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT));
+      this.rushTicked = 1;
+    } else {
+      this.rushTicked = 0;
+    }
 
     if (this.partyRun !== null) {
       events.push(...tickPartyMode(this.partyRun));

@@ -2683,19 +2683,14 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
      (fluid.ts:620 相变产物直取该常量),已改为字面量 110,故条目已移出。
      行为覆盖由 :679/:680 的字面量 110 守住,无缺口。 */
   /* ── WS-03 ── */
-  ['WS-03::BLUEPRINT_SIZE', '已知:断言右侧取自 blueprint.ts,待换字面量'],
+  /* 2026-11-14 task-89:`WS-03::BLUEPRINT_SIZE` 已修 ⇒ 摘除。
+     修法**双向锚定**(与 WS-10 同一修法):
+       :657  eq(BLUEPRINT_SIZE, 16, …)      ← 锚定常量本身,字面量取自手册 §5.3 参数表
+       :649  期望值写字面量 16 + 长注释说明来源 ⇒ 不再引 `BLUEPRINT_SIZE` 作期望值
+     ⇒ 手册那两个来源(`docs/WS-03-build.md` §2.3 L101 / §5.3 参数表)是**独立来源**,
+       故新断言能证伪 —— 改 `blueprint.ts` 的 16 会红。 */
   /* ── WS-04 ── */
-  ['WS-04::BEETLE_FRONT_DR', '已知:断言右侧取自 behaviors.ts,待换字面量'],
-  ['WS-04::BOAR_WINDUP_SEC', '已知:断言右侧取自 behaviors.ts,待换字面量'],
-  ['WS-04::CAPYBARA_REFLECT_HEARTS', '已知:断言右侧取自 behaviors.ts,待换字面量'],
-  ['WS-04::GINGER_ESCAPE_SEC', '已知:断言右侧取自 behaviors.ts,待换字面量'],
-  ['WS-04::KNIGHT_FRONT_DR', '已知:断言右侧取自 behaviors.ts,待换字面量'],
-  ['WS-04::PROBE_READS_PER_STEP', '已知:测试把常量作为输入透传,待换字面量'],
   /* ── WS-05 ── */
-  ['WS-05::FOX_CLONE_COUNT', '已知:断言右侧取自 phases.ts,待换字面量'],
-  ['WS-05::SUMMON_ITEM_MAX', '已知:断言右侧取自 raid.ts,待换字面量'],
-  ['WS-05::SUMMON_ITEM_MIN', '已知:断言右侧取自 raid.ts,待换字面量'],
-  ['WS-05::TIME_SHIELD_SEC', '已知:断言右侧取自 phases.ts,待换字面量'],
   /* ── WS-06 ──
      本套件此前**对门禁完全不可见**(导入经 alchemy/index.ts 转发文件),
      修好键解析后才浮现。
@@ -3972,6 +3967,31 @@ function checkOrphanList(): void {
   }
   if (orphan.size === 0) {
     fail('ORPHAN_KNOWN 解析出 0 条 —— 正则与表格形态不符,本门禁不可信');
+    return;
+  }
+  /* ═══ ★ 2026-11-14(task-84 复盘):解析条数必须等于**真值条数** ═══
+   *
+   * 原实现只自检「解析出 0 条」,而那**不足以**发现静默丢条目。
+   * 实测(build-wiring 在 task-84 里撞见):把一条写成
+   *     ['path',
+   *      '段一' + '段二'],
+   * (path 与理由**不在同一行**)⇒ 上面的正则要求 `\s*\]` 紧随其后 ⇒ **不匹配**,
+   * 而表里真 7 条、解析出 5 条 ⇒ **`orphan ⊆ 白名单` 这条不变量只在那 5 条上生效**。
+   * ★ 最危险之处:门禁**全绿**、`orphan-audit` 也**全绿**(它自己解析)。没有任何判据会报 5 vs 7。
+   * 这是第 4 类缺陷(判据表述对不上它声称要防的东西)的新实例:
+   * 它**看起来在检查"7 条都在白名单里"**,实际只检查了 5 条。
+   *
+   * ⇒ 根治:用一条**独立于正则**的真值来对账 —— 数表格里以 `[` 开头的条目行数。
+   *   (理由文本里不会出现行首 `[`,故这是可靠的口径。)
+   * 这与 PROGRESS「报任何总数必须与独立来源对账」是同一条纪律;
+   * 也修掉了 build-wiring 已报告的那条盲区(他写了建议 (a),见其 task-84 报告 §F)。 */
+  const entryLines = src.slice(a, b).split('\n').filter((l) => /^\s*\[/.test(l)).length;
+  if (orphan.size !== entryLines) {
+    fail(
+      `ORPHAN_KNOWN 解析条数(${orphan.size})≠ 真值条数(${entryLines})` +
+      ` —— 有 ${entryLines - orphan.size} 条被正则**静默丢弃** ⇒ 它们不受本门禁保护。` +
+      ` 修法:每条写成**一行** \`['路径', '理由'],\`(多行 \`+\` 拼接形态不被解析)`
+    );
     return;
   }
 

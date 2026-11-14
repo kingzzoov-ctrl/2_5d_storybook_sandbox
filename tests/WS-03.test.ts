@@ -646,8 +646,15 @@ function makeBlueprintScene(): TileGrid {
 test('WT-03-36 框选 16×16 生成蓝图:尺寸与格数正确', () => {
   const g = makeBlueprintScene();
   const bp = captureBlueprint(g, 0, 0);
-  eq(bp.w, BLUEPRINT_SIZE, '宽 16');
-  eq(bp.h, BLUEPRINT_SIZE, '高 16');
+  /* 期望值写字面量 16,不引 `BLUEPRINT_SIZE`。
+     `captureBlueprint` 的 w/h 形参**默认值就是 `BLUEPRINT_SIZE`**(blueprint.ts:166-167),
+     故引用它会让两边同步移动 —— 把常量改成任何值这条都恒真。
+     16 取自手册 `docs/WS-03-build.md` §2.3(L101 `export const BLUEPRINT_SIZE = 16;`)
+     与 §5.3 参数表(「BLUEPRINT_SIZE | 16 | 边长(格)」),是**独立来源**。
+     下方另用 `eq(BLUEPRINT_SIZE, 16)` 锚定常量本身(双向锚定,与 WS-10 同一修法)。 */
+  eq(bp.w, 16, '宽 16(手册 §2.3 / §5.3)');
+  eq(bp.h, 16, '高 16(手册 §2.3 / §5.3)');
+  eq(BLUEPRINT_SIZE, 16, 'BLUEPRINT_SIZE 本身 = 16(手册 §5.3 参数表)');
   eq(bp.cells.length, BLUEPRINT_CELLS, '共 256 格');
   const solid = blueprintSolidCells(bp);
   ok(solid.length > 20, `非空格应超过 20,实际 ${solid.length}`);

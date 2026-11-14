@@ -15,7 +15,7 @@ import {
   type AoiPlayer,
 } from '../server/src/mobs/aoi.ts';
 import {
-  MobFsm, MobFsmState, steer45, PROBE_READS_PER_STEP, GRAZE_RADIUS,
+  MobFsm, MobFsmState, steer45, GRAZE_RADIUS,
   TELEGRAPH_SEC_MIN, TELEGRAPH_SEC_MAX, estimateFsmCostUs, resolveTelegraphHit,
 } from '../server/src/mobs/fsm.ts';
 import {
@@ -23,9 +23,12 @@ import {
   insideWarn3D, pointerAngleDeg, GEOM_EPS, unit, WARN_SHAPES,
 } from '../server/src/mobs/geometry.ts';
 import {
-  BOAR_CHARGE_TILES, BOAR_SELF_STUN_SEC, BOAR_WINDUP_SEC,
-  BAT_FALL_SEC, BEETLE_FRONT_DR, CAPYBARA_REFLECT_HEARTS, CHOCO_MELT_FLOOR,
-  GINGER_ESCAPE_SEC, KNIGHT_FRONT_DR, KNIGHT_PARALYZE_SEC, SAMURAI_FRONT_ARC_DEG,
+/* task-86:本块摘掉了 4 个**因换字面量而失去全部正文引用**的名字
+   (`BOAR_WINDUP_SEC` / `BEETLE_FRONT_DR` / `CAPYBARA_REFLECT_HEARTS` / `KNIGHT_FRONT_DR`)。
+   ⚠️ `GINGER_ESCAPE_SEC` **保留** —— 它在 :595 仍有一处正文使用(不是同义反复站点). */
+  BOAR_CHARGE_TILES, BOAR_SELF_STUN_SEC,
+  BAT_FALL_SEC, CHOCO_MELT_FLOOR,
+  GINGER_ESCAPE_SEC, KNIGHT_PARALYZE_SEC, SAMURAI_FRONT_ARC_DEG,
   TANUKI_REVEAL_DISTANCE, ITEM, DamageKind, THUNDER_HELM_STACK_MAX,
   HARPY_GUST_FORCE,
   createMobAi, isHostile,
@@ -244,7 +247,11 @@ test('W4-09 45° 避障:直行优先,且恒为 3 次数组读取', () => {
   const noWall = () => false;
   const r = steer45(1, 0, 0, 0, noWall);
   eq(r.turn, 0, '无障碍直行');
-  eq(r.reads, PROBE_READS_PER_STEP, '读取次数 = 3');
+  /* task-86:右侧原本是 `PROBE_READS_PER_STEP`(被测模块的导出)⇒ 恒绿.
+   * 3 来自手册 §5 参数配表「`PROBE_READS_PER_STEP` | 3 | 次 | 零寻路证明的硬上界」.
+   * ⚠️ 附加发现:该常量在 `fsm.ts` 里**零使用**(`reads: 3` 全是硬编码字面量)
+   * ⇒ 它此前没有守着任何东西;换成字面量后,这条才真的约束 `steer45` 的返回值. */
+  eq(r.reads, 3, '读取次数 = 3(手册 §5 硬上界)');
   near(r.dir.x, 1, 1e-12, '方向正确');
 });
 
@@ -426,7 +433,9 @@ test('W4-23 野猪:蓄力 1s → 直线冲锋 6 格 → 撞墙自晕 3s', () => 
   /* 蓄力阶段:原地不动,计时 1 秒 */
   ai.tick(rt, world, DT);
   eq(rt.mem.phase, 1, '进入刨蹄蓄力');
-  eq(rt.mem.windup, BOAR_WINDUP_SEC, '蓄力 = 1.0s');
+/* task-86:1.0 来自手册 §5「`BOAR_WINDUP_SEC` | 1.0 | 秒 | 生物配表野猪 note 原文」;
+   * note 原文见 `shared/constants/mobs.ts:32`「原地刨蹄蓄力 1 秒」. */
+  eq(rt.mem.windup, 1.0, '蓄力 = 1.0s(手册 §5)');
   const x0 = rt.x;
   for (let i = 0; i < 19; i += 1) ai.tick(rt, world, DT);
   near(rt.x, x0, 1e-9, '蓄力期间原地不动');
@@ -458,7 +467,8 @@ test('W4-24 卡皮巴拉:攻击反弹爱心、永不掉血', () => {
   const ai = createMobAi(rt.def);
   const r = ai.onDamage(rt, world, 9999, DamageKind.PHYSICAL, 0);
   eq(r.hpLoss, 0, '零损血');
-  eq(r.reflectHearts, CAPYBARA_REFLECT_HEARTS, '反弹 1 颗爱心');
+/* task-86:1 来自手册 §5「`CAPYBARA_REFLECT_HEARTS` | 1 | 颗 | 同上「反弹爱心」」. */
+  eq(r.reflectHearts, 1, '反弹 1 颗爱心(手册 §5)');
   eq(rt.hp, rt.def.hp, 'HP 保持满值');
   eq(rt.alive, true, '不可击杀');
   ok(world.events.includes('capybara_heart_reflect'), '发射反弹爱心事件');
@@ -550,7 +560,8 @@ test('W4-28 紫晶甲虫:正面减伤 80%、爆破镐碎壳、掀翻露肚皮', 
   const rt = makeRuntime('mob_beetle_crystal', { facingDeg: 0, hp: 10000 });
   const ai = createMobAi(rt.def);
   ai.tick(rt, world, DT);
-  eq(rt.mem.frontDr, BEETLE_FRONT_DR, '正面减伤 80%');
+/* task-86:0.80 来自手册 §5「`BEETLE_FRONT_DR` | 0.80 | — | 同上「免疫 80%」」. */
+  eq(rt.mem.frontDr, 0.80, '正面减伤 80%(手册 §5)');
 
   const front = ai.onDamage(rt, world, 100, DamageKind.PHYSICAL, 0);
   near(front.hpLoss, 20, 1e-9, '正面 100 伤害只吃 20');
@@ -585,7 +596,8 @@ test('W4-29 姜饼小人:10 秒逃逸计时 + 飞索钩回', () => {
   /* 计时器语义:第 1 个 tick 建立 10 秒计时并扣掉该帧 dt。 */
   ai.tick(rt, world, DT);
   near(rt.mem.escapeTimer, GINGER_ESCAPE_SEC - DT, 1e-12, '首帧后剩 9.95s');
-  eq(rt.mem.escapeTimer + DT, GINGER_ESCAPE_SEC, '起始严格为 10.00s,未多扣');
+/* task-86:10.0 来自手册 §5「`GINGER_ESCAPE_SEC` | 10.0 | 秒 | 同上「10 秒逃逸」」. */
+  eq(rt.mem.escapeTimer + DT, 10.0, '起始严格为 10.00s,未多扣(手册 §5)');
 
   /* 逃逸必须发生在恰好第 200 个 20Hz tick(= 10.00s)。 */
   let escapeTick = -1;
@@ -702,7 +714,8 @@ test('W4-33 发条重骑:背后钥匙被钩爪拔下后瘫痪 8 秒', () => {
   const rt = makeRuntime('mob_clock_knight', { facingDeg: 0, hp: 10000, x: 0, y: 0 });
   const ai = createMobAi(rt.def);
   ai.tick(rt, world, DT);
-  eq(rt.mem.frontDr, KNIGHT_FRONT_DR, '正面减伤 90%');
+/* task-86:0.90 来自手册 §5「`KNIGHT_FRONT_DR` | 0.90 | — | 同上「正面极难击败」」. */
+  eq(rt.mem.frontDr, 0.90, '正面减伤 90%(手册 §5)');
   const front = ai.onDamage(rt, world, 100, DamageKind.PHYSICAL, 0);
   near(front.hpLoss, 10, 1e-9, '正面 100 只吃 10');
 

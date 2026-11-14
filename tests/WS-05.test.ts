@@ -23,8 +23,10 @@ import {
 } from '../server/src/bosses/raid.ts';
 import {
   createBossState, phaseIndexFor, skillWarnGeoms, tickBoss, applyBreak, damageBoss,
-  spawnFoxClones, BREAK_STUN_SEC, BREAK_CRIT_BONUS, TIME_SHIELD_SEC, TIME_SHIELD_HEAL_RATIO,
-  FOX_CLONE_COUNT, JELLY_SPLIT_COUNT,
+/* task-86:`FOX_CLONE_COUNT` / `TIME_SHIELD_SEC` 因换字面量而失去全部正文引用,已摘。
+   `SUMMON_ITEM_MIN` / `SUMMON_ITEM_MAX` **保留** —— 它们在 :979 仍有一处正文使用. */
+  spawnFoxClones, BREAK_STUN_SEC, BREAK_CRIT_BONUS, TIME_SHIELD_HEAL_RATIO,
+  JELLY_SPLIT_COUNT,
   type BossState,
 } from '../server/src/bosses/phases.ts';
 import {
@@ -47,8 +49,11 @@ test('W5-01 消费冻结层:8 个 Boss、8 个祭品 734-741 一一映射', () =
   const cov = summonItemCoverage();
   eq(cov.complete, true, '祭品 ID 恰好覆盖 734..741 无重无缺');
   eq(cov.ids.length, 8, '8 个祭品');
-  eq(cov.ids[0], SUMMON_ITEM_MIN, '最小祭品 734');
-  eq(cov.ids[cov.ids.length - 1], SUMMON_ITEM_MAX, '最大祭品 741');
+/* task-86:734 / 741 来自手册 §5 参数配表
+   * 「`SUMMON_ITEM_MIN/MAX` | 734 / 741 | ID | 手册 §3.10 祭品段」,
+   * 与冻结表 `shared/constants/bosses.ts` 的 8 个祭品一一对应. */
+  eq(cov.ids[0], 734, '最小祭品 734(手册 §5)');
+  eq(cov.ids[cov.ids.length - 1], 741, '最大祭品 741(手册 §5)');
   /* 每个 Boss 的召唤物与冻结表逐条一致 */
   for (const b of BOSS_LIST) {
     eq(SUMMON_ITEM_BY_BOSS.get(b.id), b.summonItem, `${b.id} 祭品 ID`);
@@ -290,9 +295,11 @@ test('W5-12 妖狐 P1 三道 30° 风刃 / P2 四分身', () => {
 
   s.hp = s.maxHp * 0.6; tickBoss(s, 0.05, { target: { x: 10, y: 0 }, t: 0 });
   const p2 = skillWarnGeoms(s, { x: 10, y: 0 }, 0);
-  eq(p2.length, FOX_CLONE_COUNT, '4 个分身蓄力圈');
+  /* task-86:4 来自手册 §5「`FOX_CLONE_COUNT` | 4 | 个 | 冻结 Boss 表妖狐 P2 原文「4 个分身」」. */
+  eq(p2.length, 4, '4 个分身蓄力圈(手册 §5)');
   eq(p2.every((g) => g.radius === 2), true, '半径 2');
-  eq(s.clones.length, FOX_CLONE_COUNT, '状态里也生成 4 个分身');
+  /* task-86:同上,4 来自手册 §5. */
+  eq(s.clones.length, 4, '状态里也生成 4 个分身(手册 §5)');
   eq(fakeCloneCount(s.clones), 3, '3 个假分身');
   eq(survivorsAfterFoxBreak(s.clones).length, 1, '破幻后只剩 1 个真身');
 });
@@ -367,7 +374,9 @@ test('W5-16 克洛诺斯 P1 旋转指针 / P2 四角四色环 / P3 全场改写'
   eq(p2.length, CHRONOS_CIRCUIT_COUNT + 1, '四角指示环 + 中央脉冲塔');
   eq(p2.filter((g) => g.kind === 'RING').length, 4, '四个环');
   eq(p2.filter((g) => g.kind === 'CIRCLE').length, 1, '中央一个圆');
-  eq(s.shieldSec, TIME_SHIELD_SEC, 'P2 开启 8 秒时间护盾');
+    /* task-86:8.0 来自手册 §5
+   * 「`TIME_SHIELD_SEC` | 8.0 | 秒 | 冻结 Boss 表克洛诺斯 P2 原文「8 秒内未切断供能则回血」」. */
+  eq(s.shieldSec, 8.0, 'P2 开启 8 秒时间护盾(手册 §5)');
 
   s.hp = s.maxHp * 0.3; tickBoss(s, 0.05, { target: { x: 10, y: 0 }, t: 0 });
   const p3 = skillWarnGeoms(s, { x: 10, y: 0 }, 0);
@@ -395,7 +404,7 @@ test('W5-18 时间护盾:8 秒内未破则回血,破防则回血取消', () => {
   s.hp = Math.round(s.maxHp * 0.64);
   tickBoss(s, 0.05, { target: { x: 0, y: 0 }, t: 0 });
   eq(s.phaseIndex, 1, '进入 P2');
-  eq(s.shieldSec, TIME_SHIELD_SEC, '护盾窗口 8s');
+    eq(s.shieldSec, 8.0, '护盾窗口 8s(手册 §5)');
   const hpAfterSwitch = s.hp;
   /* 推进 8 秒未破防 → 回血 */
   for (let i = 0; i < 161; i += 1) tickBoss(s, 0.05, { target: { x: 0, y: 0 }, t: 0 });
@@ -652,7 +661,7 @@ test('W5-31 破防成功 → 眩晕窗口 → 全队暴击:端到端串联(以�
   s.hp = Math.round(s.maxHp * 0.64);
   tickBoss(s, 0.05, { target: { x: 0, y: 0 }, t: 0 });
   eq(s.phaseIndex, 1, '进入 P2 并开盾');
-  eq(s.shieldSec, TIME_SHIELD_SEC, '时间护盾已开启');
+    eq(s.shieldSec, 8.0, '时间护盾已开启(手册 §5)');
 
   const input = { circuitsOn: [true, true, true, false], platesPressed: [true, true, true, true], towerPowered: true, shieldActive: true };
   eq(evaluateBreak('boss_chronos_colossus', input).ok, false, '三缺一 → 不破');
