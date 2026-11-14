@@ -2750,10 +2750,32 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
 
 ]);
 
-/** 收集生产模块(server/src + client/src)的数值型导出常量:`<文件>::<名>` → 表达式。 */
+/**
+ * 收集生产模块的数值型导出常量:`<文件>::<名>` → 表达式。
+ *
+ * ★★★ 2026-11-14 加入 `shared/` —— 此前只扫 `server/src` + `client/src`,
+ * 于是**定义在 `shared/` 的常量的同义反复候选一个都看不到**。
+ *
+ * 实测漏面(本轮 team 发现,我用独立脚本复核):
+ * ```
+ * shared/ 数值型 export const = **55 个**,门禁候选集**一个都看不到**。
+ * 其中被真实引用为断言期望的,已确认两例:
+ *   shared/types/entities.ts:210  export const REVIVE_TIME   = 1.0;
+ *   shared/types/entities.ts:214  export const FEATHER_INVULN = 3.0;
+ * ⇒ tests/WS-10.test.ts 里 `eq(REVIVE_TIME, 1.0, ...)` 这类断言
+ *   **不进入同义反复判定**(因为 `REVIVE_TIME` 不在键集里)。
+ * ```
+ * ★ 为什么这是**真缺口**而不是"设计如此":同一条判据的语义是
+ *   「断言两侧是否取自同一来源」—— 这个语义与常量**定义在哪个目录**无关。
+ *   把它限制在 server/client 两目录,是**实现的历史范围**,不是判据的边界。
+ * ★ 为什么现在才加:`prodDirs`(可达性口径)与这里(候选集口径)是**两个不同的集合**,
+ *   前者刻意不含 `shared/`(shared 是被依赖方,不是入口),后者**应该**含。
+ *   两个 `for (const d of [...])` 分散在不同函数里,于是"顺手照抄一下"就漏了。
+ *   ⇒ 与本轮 `scan-scope.ts` 那条同族:**同一概念的范围写在多处 ⇒ 迟早不一致。**
+ */
 function collectNumericExports(): Map<string, string> {
   const out = new Map<string, string>();
-  for (const d of ['server/src', 'client/src']) {
+  for (const d of ['server/src', 'client/src', 'shared']) {
     for (const f of walk(join(ROOT, d), ['.ts'])) {
       const rel = relative(ROOT, f).split(sep).join('/');
       const code = stripCommentsAndStrings(readFileSync(f, 'utf8'));
@@ -2782,11 +2804,17 @@ function collectNumericExports(): Map<string, string> {
  * **必须用代码态扫描**(U12):旧版跑 `stripCommentsOnly` + 正则,于是
  * 字符串里的 `export { X } from './y.ts'` 会被当成真转发边,
  * 把 X 解析到错误模块 ⇒ 候选**静默消失**(实测 32 → 31)。
+ *
+ * ★★★ 2026-11-14 同样加入 `shared/`:与 `collectNumericExports` **同一个概念**
+ * (哪些目录属于"生产侧候选集"),但写在**两个函数里**。
+ * ⇒ 我改前一处时,这里**差点漏掉** —— 实测发现时它仍只含两个目录。
+ *   ★ 这正是本函数上方那条注释警告的形态,只是这次漏的不是"注释态 vs 代码态",
+ *     而是"**同一范围写在两处,改一处**"。
  */
 function buildReexportMap(): Map<string, string> {
   const out = new Map<string, string>();
   const edges: { from: string; names: [string, string][]; to: string }[] = [];
-  for (const d of ['server/src', 'client/src']) {
+  for (const d of ['server/src', 'client/src', 'shared']) {
     for (const f of walk(join(ROOT, d), ['.ts'])) {
       const rel = relative(ROOT, f).split(sep).join('/');
       const dir = rel.slice(0, rel.lastIndexOf('/'));
