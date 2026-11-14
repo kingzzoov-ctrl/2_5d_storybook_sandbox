@@ -1384,7 +1384,31 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
    * 不抛异常、只是时间凭空快 10 倍。这类量纲错配不会自我暴露。
    *
    * 且 Boss 不是生物:8 个 Boss 全不在 `MOB_BY_ID`,挂 `tickMobs` 等于挂在空集合上。 */
-  ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图,待客户端接线'],
+  /* ⚠️ 2026-11-14 订正(task-81 实测,两处原措辞都不准):
+   *
+   * (1) 套件号错:原写「WS-08」,而**实现测试在 WS-03**。
+   *     实测:全仓真 import 本文件的只有 `tests/WS-03.test.ts`(4 次调用 buildWireView),
+   *     而 `tests/WS-08.test.ts` 含 'wiring_view' = **false**(它测的是信号推进那半)。
+   *     ⇒ ★ 这个错**从写下那天就不影响任何数字**,所以没人发现 ——
+   *       「理由文本里的错误不会红」,故理由本身也是要审计的对象。
+   *
+   * (2) 「待客户端接线」把两件**方向相反**的事压成一件:
+   *     · 服务端侧不是「等接」,是**不该接**(纯视图计算、非世界状态;
+   *       挂 tick 就是每帧丢弃的假可达)。
+   *     · 客户端侧不是「缺一个调用点」,是**宿主不存在**,且缺两样:
+   *       ① WireView 下发报文(协议层)——
+   *          实测 `wire.ts` 里 tiles / Tile / grid **各 0 次**(`chunk` 有命中但那是 chunkVersions)
+   *       ② 铺线 UI 面板(UI 层)
+   *     ★ 且客户端**无法**直接 import 本文件:跨层守卫(本文件 checkCrossLayerImports)
+   *       禁止 client 相对说明符落到 server 之下 —— 已由 task-81 注入真越层文件实测确认能拦。
+   *     ⇒ 客户端那份 tile 网格(three/boot.ts 拼的 4x4 chunk)**wire 位全 0**
+   *       (demo_world.ts 的 packTile 实参 `wire: 0`)⇒ 硬接上渲染出来也是空白,无法验收。 */
+  ['server/src/build/wiring_view.ts',
+    '四色电路暗线视图(**实现测试在 WS-03,非 WS-08**)。两半定性相反,必须分开:'
+    + '服务端侧**根本不该接**(纯视图计算,非世界状态;挂 tick = 每帧丢弃的假可达);'
+    + '客户端侧**客户端宿主不存在**,缺两样 —— ① WireView 下发报文(协议,归 shared/types/wire.ts + net)'
+    + '② 铺线 UI 面板(归 UI 层)。'
+    + '⚠️ 客户端**无法**直接 import 本文件:跨层守卫禁止 client 说明符落到 server 之下。'],
   /* ══════════════════════════════════════════════════════════════════════
    * ⚠️ 为什么本表有 **14** 条,而 `orphan-audit.ts` 只有 **9** 条?(差 5 条)
    *
@@ -1487,11 +1511,32 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
     + 'tameItem 字段**有**消费者,旧措辞「无人消费」已订正)'],
   /* `net/prediction.ts` 已于 2026-11-12 **搬迁**到 `client/src/net/`,
      不是接线 —— 它本就是客户端模块,放在 `server/src/` 下是放错位置。
-     理由改写成「等客户端网络层」而非「待接线」:
      服务端侧**根本不该接**它(`reconcile` 要的是服务端权威快照,
-     服务端自己是权威,接进去等于「预测自己已经权威的东西」)。
-     卡点是**客户端还没有网络层**(24 个文件里 0 个有 WebSocket/colyseus/fetch)。 */
-  ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块)—— 等客户端网络层消费快照'],
+     服务端自己是权威,接进去等于「预测自己已经权威的东西」)——
+     这一半仍然成立。
+     ⚠️ 但「卡点是客户端还没有网络层」这一半**已过期**(task-82 实测订正):
+     ```
+       原措辞:「24 个文件里 0 个有 WebSocket/colyseus/fetch」
+       实测:client/src 下 **27** 个 .ts,其中 **2** 个命中:
+             net/session.ts:249  `new WebSocket(u)`   ← 真有构造点
+             net/state_store.ts:9 只是注释里提到「不碰 WebSocket」
+             net/session.ts:337    `send(bytes)` 已有实现(带 readyState 检查)
+             main.ts:78            `createSession` 已装配
+       ⇒ 网络层**在岗**,快照链路**已通**(session → store.apply → decodePacket → RoomState)
+     ```
+     ★ 所以真实卡点**不在**「等网络层」,而在**输入端**:
+       prediction.ts 要的输出(快照/Interpolator)确实已到,但它要的**输入**(InputCmd)
+       没有生产者 —— 客户端 WASD 现在驱动的是**相机平移**(three/boot.ts:1053 `pan.x += ...`),
+       且生产侧 `session.send` 调用点 **0**,协议里 `ackedSeq`/`inputSeq` **各 0 次**
+       ⇒ `predictStep`/`reconcile`/`resimulate`/`pruneCmds` 四族无从建立。
+     ★ 判据:**「等 X」这类理由必须写明 X 的**当前**状态** ——
+       它过期时的表现是「没人再读它」,而门禁不查理由与事实是否相符。 */
+  ['client/src/net/prediction.ts',
+    'WS-07 客户端预测(**网络层在岗、快照链路已通**,故不再是「等客户端网络层」)。'
+    + '真卡点在**输入端**:预测器要 InputCmd,而客户端无输入生产者'
+    + '(WASD 现在驱动**相机平移**,client/src/three/boot.ts:1053)、生产侧 session.send 调用 0、'
+    + '协议无 ackedSeq ⇒ predictStep/reconcile/resimulate/pruneCmds 四族无从建立;'
+    + '且「WASD 是镜头还是角色」是**产品裁决**(见 docs/TASK-83-wasd-three-options.md)'],
   ['server/src/party/modes.ts',
     'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时);'
     + '注意 data-conformance.ts 只 import 它的**常量**(CROWN_WIN_SEC 等)与手册比对,'
@@ -1576,9 +1621,29 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
 const WL_BLOCK_CLIENT_SHELL = /本仓无装配入口|客户端子系统/;
 /* 「等客户端**机制**」与「等客户端**入口**」不是一回事:
    入口 = 文件不在;机制 = 文件在、上游能力不在。
-   窄词是「客户端」+「机制类名词」(网络层/运行时/装配层)—— 不写宽词「客户端」,
-   否则又会把服务端那批「待客户端接线」先抓走(见上方实测 19/22/9/0 vs 16/25/9/0)。 */
-const WL_BLOCK_CLIENT_MECH = /客户端网络层|客户端运行时|客户端装配层/;
+   窄词是「客户端」+「机制类名词」(网络层/运行时/装配层/宿主)—— 不写宽词「客户端」,
+   否则又会把服务端那批「待客户端接线」先抓走(见上方实测 19/22/9/0 vs 16/25/9/0)。
+
+   ★ 2026-11-14 补词「客户端宿主」(task-81 实测的欠账,而非推断):
+   ```
+     wiring_view.ts 的客户端侧卡点是「宿主不存在 —— 缺 WireView 下发报文 + 铺线 UI 面板」
+     ⇒ 语义上**正是本桶的定义**(「入口已有,但缺该模块要消费的东西」),
+       但旧词表只列了 网络层/运行时/装配层 三种 ⇒ 它落不进任何桶。
+   ```
+   ⚠️ **实测补词的影响面**(不靠推理):对全部 14 条逐一比对
+     `OLD = /客户端网络层|客户端运行时|客户端装配层/`
+     `NEW = OLD + 客户端宿主`
+   ⇒ 新增命中 **0** 条 —— 即**纯词表补全,不移动任何现有条目的桶**。
+     ★ 这条实测是必须做的:本仓纪律「修规则时要问它还会误伤谁」(陷阱 113)。
+       若我不测,就无法区分"补词只影响该条"与"补词顺带改判了别条"。
+
+   ★★ 为什么这次必须补词而不能只留「未归类」:
+     门禁自己会红(`✗ 欠账构成里有 1 条未归类 —— 未归类项不参与 README 校验,
+     会成为静默口袋`)。⇒ 即"未归类"不是中性状态,它让那一条**逃出 README 校验**。
+     ★ 判据:分类器出现"未归类"时,**不要为了让门禁变绿而把措辞改回去** ——
+       要先问「旧分类对不对」。本例实测旧分类(「待客户端接线」)**是错的**,
+       所以正确修法是**补词表**,不是恢复旧措辞。 */
+const WL_BLOCK_CLIENT_MECH = /客户端网络层|客户端运行时|客户端装配层|客户端宿主/;
 const WL_BLOCK_DEPENDENCY = /three|依赖未安装|相容层/;
 /* ══════════════════════════════════════════════════════════════════════════
    **非欠账**两桶(task-43 实测新增,2026-11-12)
