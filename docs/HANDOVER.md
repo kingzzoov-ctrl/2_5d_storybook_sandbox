@@ -1,7 +1,10 @@
 # 项目移交包 —— 2.5D 绘本风多人沙盒
 
 > **本文是移交给下一位负责人/下一个会话的入口文档。**
-> 生成时间:2026-11-14 · 基线提交 `bb481e4` · 移交时 HEAD `8678abf`(分支 `main`)
+> 生成时间:2026-11-14 · 基线提交 `bb481e4` · **移交时** HEAD `8678abf`(分支 `main`)
+> ⚠️ 上面那个 HEAD 是**移交当时的快照**,不是"现在"(本文件此后又更新过多轮)——
+>    要现在的:`git rev-parse HEAD`。**本文件的其余数字都已按最新实测更新,且其中
+>    可机检的那些已接入 `verify.ts::verifyHandoverNumbers`(改坏就红)。**
 > ★ **2026-11-14 同日「接手者第一轮」的改动尚未提交** —— 清单见本文 **§十一**
 > **本文所有数字都是本次**从磁盘/工具**实测**的,不是从别的文档抄的。
 > 抄来的数字会过期;实测的不会。凡本文与旧文档冲突,**以本文为准**,并去修旧文档。
@@ -20,8 +23,8 @@
 | 运行时依赖 | **0 个**(`dependencies = {}`) |
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
-| 层 | 服务端 `server/src` **61** `.ts` · 客户端 `client/src` **27** · 共享 `shared` **10** ⇒ **生产 .ts 合计 98** |
-| 测试 | `tests/*.test.ts` **28** 个套件 |
+| 层 | 服务端 `server/src` **61** `.ts` · 客户端 `client/src` **29** · 共享 `shared` **10** ⇒ **生产 .ts 合计 100** |
+| 测试 | `tests/*.test.ts` **32** 个套件 |
 | 工具 | `scripts/*.ts` **31** 个 |
 | 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
 | 门禁 | `scripts/verify.ts`(6230 行) |
@@ -33,8 +36,9 @@
 ✗ 相对导入不写 `.ts` 后缀(node 原生 ESM 要求显式扩展名)
 ✓ 只允许「可擦除语法(type-erasure only)」
 ⇒ 门禁有一节专门查这个(「可擦除语法」),全绿
-⇒ ⚠️ 唯一例外:`server/src/net/schema.colyseus.ts` 用了 **44 个装饰器**,
-  已在门禁登记为**唯一例外**(`README 装饰器例外条数与实测一致(1)`)
+⇒ ✅ **零例外**(2026-11-14 达成):`schema.colyseus.ts` 的 44 处 `@type` 已全部改成
+  官方 `defineTypes`,门禁的装饰器例外白名单**已清空**(`DECORATOR_EXEMPT` = ∅)
+  ⇒ 装饰器例外 **0** 处。
 ```
 
 ---
@@ -383,7 +387,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-ad6eeea7d93c  README.md
+77027b4bf0e9  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
@@ -611,8 +615,8 @@ docs/PROGRESS.md                   陷阱 143 / 144
 
 ```
 AC1  全量门禁不退化                ✓(exit 0 / 行首 ✗ 0)
-AC2  用例数净增                    ✓ 1545 > 1526
 AC2  用例数净增                    ✓ 1555 > 1526
+AC3  可达性分母变化已解释          ✓ 共 100(本轮新增 2 个 client 模块);不可达 9 条全部登记
 AC4  自检区分力                    ✓ gate-selfcheck **30/30** 全过(--strict-selfcheck 已纳入退出码)
 AC5  倒地不可移动                  ✓ 注入即红
 AC6  倒地不可攻击                  ✓ 注入即红

@@ -330,6 +330,15 @@ function verifyReadmeNumbers(): void {
     actual: decoratorExemptCount,
   });
 
+  /* ── 10 首段「N 份文档结构」 ──
+     ★ 与 HANDOVER §一 同一教训:README **首段**也在自称,而它此前没人比过 ——
+       实测它漂成过 `12`(真值 `14`)。 */
+  check({
+    label: '首段文档结构份数',
+    re: /冻结不变量 \+ (\d+) 份文档结构/,
+    actual: docStructCount,
+  });
+
 /* ── 6 入口执行层:N 个已登记 / M 个成功路径为空 ──
    README:`入口执行层      1 个 ✅(**成功路径为空 0 个**)`
    ⚠️ 两个数**互相约束**(登记数 ≥ 空路径数),故一次全验 —— 与上面非欠账条数同一手法。
@@ -559,6 +568,27 @@ function verifyHandoverNumbers(): void {
     re: /^\| PROGRESS 陷阱 \| \*\*([^*]+)\*\* \| ([^|]+) \|/m,
     actual: progressActual,
     wanted: (m) => `${(m[1] ?? '').trim()} | ${(m[2] ?? '').trim()}`,
+  });
+
+  /* ── 10 §一「这个项目是什么」表:生产 .ts 合计 / 套件数 / 装饰器例外 ──
+     ★ 2026-11-14(外部审计第二轮):§三 接进门禁之后,§一 那几行**仍然是手写的**,
+       于是同一轮里一起漂了:生产 .ts `98 → 100`、套件 `28 → 32`、
+       装饰器例外「1 处」→ `0`。
+     ⇒ 教训与 §三 那次**完全相同**:只给一张表接门禁,等于把"没人管"的标签留给了别的表。 */
+  check({
+    label: '生产 .ts 合计',
+    re: /⇒ \*\*生产 \.ts 合计 (\d+)\*\*/m,
+    actual: reachProdTotal < 0 ? null : reachProdTotal,
+  });
+  check({
+    label: '测试套件数',
+    re: /^\| 测试 \| `tests\/\*\.test\.ts` \*\*(\d+)\*\* 个套件/m,
+    actual: suiteSummary === null ? null : suiteSummary.suites,
+  });
+  check({
+    label: '装饰器例外条数',
+    re: /装饰器例外 \*\*(\d+)\*\* 处/m,
+    actual: decoratorExemptCount,
   });
 }
 
