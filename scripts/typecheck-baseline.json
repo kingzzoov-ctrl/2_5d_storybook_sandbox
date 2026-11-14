@@ -1,7 +1,7 @@
 {
   "_readme": "类型检查基线:指纹 | 错误码 | 归一化消息(**不含行号**)。判据见 scripts/typecheck-baseline-audit.ts 顶部注释。更新方式:node scripts/typecheck-baseline-audit.ts --update",
   "generated": "2026-11-14",
-  "total": 267,
+  "total": 265,
   "fingerprints": {
     "client/src/audio.ts|TS2564|Property 'level' has no initializer and is not definitely assigned in the constructor.": 1,
     "client/src/net/session.ts|TS2367|This comparison appears to be unintentional because the types '<N>' and '<N>' have no overlap.": 1,
@@ -19,7 +19,6 @@
     "scripts/perf-bounds.ts|TS2353|Object literal may only specify known properties, and 'x' does not exist in type 'Partial<BossState>'.": 1,
     "scripts/verify.ts|TS18047|'__diffProdAll' is possibly 'null'.": 1,
     "scripts/verify.ts|TS2554|Expected <N> arguments, but got <N>.": 1,
-    "scripts/verify.ts|TS2304|Cannot find name 'reachHint'.": 2,
     "scripts/verify.ts|TS2367|This comparison appears to be unintentional because the types '<N>' and '<N>' have no overlap.": 1,
     "scripts/verify.ts|TS2345|Argument of type 'unknown' is not assignable to parameter of type 'EventPayload | undefined'.": 1,
     "scripts/verify.ts|TS2339|Property 'ELECTRIC' does not exist on type '{ readonly PHYSICAL: \"PHYSICAL\"; readonly FIRE: \"FIRE\"; readonly EXPLOSION: \"EXPLOSION\"; readonly WATER: \"WATER\"; readonly SOUND: \"SOUND\"; readonly HOOK: \"HOOK\"; readonly HEAVY: \"HEAVY\"; readonly SLIP: \"SLIP\"; }'.": 1,

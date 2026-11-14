@@ -22,7 +22,12 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
-const SKIP = /^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out|release|coverage)$/;
+/* ★★★ 2026-11-14:跳过名从**唯一事实源**取,不再各写一份。
+   起因:仓库根多了 `_probe_sandbox/`(队友的整仓副本),而本文件的局部列表没有它。
+   实测当时 7 个判据各写一份,只有 1 个含它(6/7 缺)⇒ 扫副本 ⇒ 把 HEAD 的既有问题
+   报成"本轮新增"(假红)。详见 scripts/scan-scope.ts 文件头。 */
+import { shouldSkipDir } from './scan-scope.ts';
+const SKIP = { test: (n: string): boolean => shouldSkipDir(n) };
 
 /** 收集全部生产 `.ts`(server/ · client/ · shared/,与 `scripts/ts-paths.ts` 的 `isProd` 同口径) */
 const walkProd = (dir: string, out: string[] = []): string[] => {

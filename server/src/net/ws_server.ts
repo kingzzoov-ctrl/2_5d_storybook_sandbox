@@ -83,6 +83,23 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
 import type { Socket } from 'node:net';
+/* ★ 2026-11-14(task-85 分片 2):上行二进制**真解析**。
+ *
+ * ## 为什么**必须** import 而不是在这里自己写一份
+ *
+ * 本仓 WS-13 §5 的标题就是「★★ CR-20:**不造第二份口径**」。
+ * 若我在运输层里手写一个解包器,那就是**第二份协议实现** ——
+ * 两份必须永远一致,而它们会漂移(这正是 CR-20 要防的形态)。
+ * ⇒ 用 `shared/net/delta.ts` 的 `decodePacket`:协议**只有一份实现**。
+ *
+ * ## ⚠️ 这与 L721 那条「刻意不 import delta.ts」的关系(必须先说清)
+ *
+ * L721 说的是 **`PROTOCOL_VERSION` 那个常量**:它在本文件里**仍然**是本地的。
+ * 理由没变:常量重复的代价是"两个数要一致",而这一点由 WS-13 §6-1 的
+ * `welcome.protocolVersion` 断言**钉住**;而**解析器**不能重复 ——
+ * 它的代价是"两份实现要永远等价",没有断言能钉住那个(见上)。
+ * ⇒ 常量可复制(有钉)、**逻辑不可复制**(无钉)。这不是自相矛盾,是判据不同。 */
+import { decodePacket, type DecodedPacket } from '../../../shared/net/delta.ts';
 
 /* ═══════════════════════════ 1. 帧编解码 ═══════════════════════════ */
 
@@ -367,6 +384,31 @@ export type WsServerHandle = {
   /** 最近收到的上行载荷(**已剥 tag**)—— 供断言证明剥对了。 */
   lastUplink(): Uint8Array | null;
   /**
+   * ★ 2026-11-14(分片 2)上行**真解析**的累计计数。
+   *
+   * ## 为什么必须给**计数**而不是只给"最近一次的结果"
+   *
+   * 本仓 build-wiring 那次缺陷的形态是「引用 ≠ 执行」:
+   * 符号被 import 了、**一次都没调用**,而门禁/文本/测试**三处全绿**。
+   * 只暴露 `lastUplinkDecoded()`(最近一次)会被**一次**调用伪造 ——
+   * 与「帧数 > 0」可以被一次推进伪造**同形**。
+   *
+   * ⇒ 计数是**单调累加**的,故可以断言「随上行次数增长」:
+   * ```
+   *   发 1 个合法包 ⇒ parsed 从 0 变 1
+   *   再发 1 个        ⇒ 变 2          ← 只断言 `> 0` 抓不到"只解了第一个"
+   * ```
+   * 两个计数**分开**,才能分别断言"该接的接住了"与"该拦的拦住了"
+   * (本仓纪律:「不抛错」与「不放行」是两个判据)。
+   */
+  uplinkParsed(): number;
+  /** 解析**失败**的累计次数(与 `uplinkParsed` 分开计,不合并)。 */
+  uplinkRejected(): number;
+  /** 最近一次成功解析出的报文(**未解析成功时为 null**)。 */
+  lastParsedPacket(): DecodedPacket | null;
+  /** 最近一次解析失败的原因原文(null = 没失败过)。 */
+  lastParseError(): string | null;
+  /**
    * 供测试:**模拟异常掉线** —— 直接 destroy 所有底层 TCP,不发 close 帧。
    *
    * ## 为什么需要它(而不是让测试用 `ws.close()`)
@@ -446,6 +488,11 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let lastFrameBytes = 0;
   /** 最近一次收到的**剥离 tag 后**的上行载荷(供断言:证明剥对了)。 */
   let lastUplink: Uint8Array | null = null;
+  /* ★ 2026-11-14(分片 2)上行解析的**累计**计数 —— 分开计,不合并。 */
+  let uplinkParsed = 0;
+  let uplinkRejected = 0;
+  let lastParsedPacket: DecodedPacket | null = null;
+  let lastParseError: string | null = null;
   let nextConnSeq = 1;
 
   const write = (c: WsConn, bytes: Uint8Array): void => {
@@ -585,11 +632,63 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
         onHello(c, hello);
         return;
       }
-      /* ★ 二进制 ⇒ 载荷已剥掉 tag(契约 §12.1:上行有 tag、下行没有)。
-         本服务端是**运输层** ⇒ 只记录,不解析协议语义
-         (移动/攻击在 room 层;真接生产时在这里把 body 交给 decodePacket)。 */
-      log(`上行协议包 payload=${u.payload.byteLength}B`);
+      /* ★★★ 2026-11-14(task-85 分片 2):上行二进制 ⇒ **真解析**(原为"只记录不解析")
+       *
+       * ## 改前是什么
+       * ```
+       * log(`上行协议包 payload=${u.payload.byteLength}B`);
+       * lastUplink = u.payload;
+       * ```
+       * ⇒ 字节收下了、**没人看内容** ⇒ 客户端发来一个**完全损坏**的包,
+       *   服务端照样记一笔日志、`lastUplink()` 照样非空、**不报任何错**。
+       *
+       * ## 判据(两个,分开)
+       * ```
+       *   1 解析**成功** ⇒ uplinkParsed 累加,并留下 lastParsedPacket
+       *   2 解析**失败** ⇒ uplinkRejected 累加 + 记下原因 + 打日志 ⇒ **不静默**
+       * ```
+       * ★ 「不抛错」与「不放行」是两个判据 ⇒ 两个计数**分开**,
+       *   不能合并成一个 `handled`(合并后无法断言"该拦的拦住了")。
+       *
+       * ## ⚠️ 一个真实陷阱:「没抛」≠「解析对了」(我实测到的)
+       * ```
+       * new Uint8Array(70000) 首字节置 1 ⇒ decodePacket **不抛**,
+       *   返回 { op:0, tick:0, removed:0, upserts:0, bytesConsumed:10 }
+       * ⇒ 69990 字节是**尾部垃圾**,而它被算成"解析成功"。
+       * ```
+       * ⇒ 故本实现要求**恰好消耗完**才算成功:
+       *   `bytesConsumed === byteLength`。有剩余 ⇒ 记为失败(理由写明剩余字节数)。
+       * ⇒ 这样"成功计数"不会被垃圾包灌水 ——
+       *   否则我自己的 `uplinkParsed` 就是又一个"能变绿的假判据"。 */
+      /* ⚠️ `lastUplink` 仍然无条件记录 —— 它的语义是"最近收到的、已剥 tag 的原始载荷",
+         与"能不能解析"**无关**。WS-13 §6-5 用 70000 字节的**非协议**载荷测它
+         (那条断言的前提正是"大帧能整到达",不是"大帧能被解析")
+         ⇒ 若把它的赋值挪进"解析成功"分支,那条断言会因**无关的改动**而红。 */
       lastUplink = u.payload;
+      try {
+        const pkt = decodePacket(u.payload);
+        if (pkt.bytesConsumed !== u.payload.byteLength) {
+          uplinkRejected += 1;
+          lastParseError = `报文尾部有 ${u.payload.byteLength - pkt.bytesConsumed} 字节未消耗`
+            + `(解出 ${pkt.bytesConsumed}/${u.payload.byteLength}B)`;
+          log(`上行协议包解析失败:${lastParseError}`);
+          return;
+        }
+        uplinkParsed += 1;
+        lastParsedPacket = pkt;
+        lastParseError = null;
+        log(`上行协议包已解析 op=${pkt.op} tick=${pkt.tick}`
+          + ` removed=${pkt.removed.length} upserts=${pkt.upserts.length}`
+          + ` ${pkt.bytesConsumed}B`);
+      } catch (e) {
+        /* ★ 解析失败**不静默**,也**不断连**:
+         *   运输层对畸形载荷的纪律与其它路径一致(本文件多处用「宽容」catch)——
+         *   一个坏包只该丢它自己,不该杀掉连接。
+         *   ⚠️ 但"宽容"不等于"假装没发生" ⇒ 计数 + 原因 + 日志三样都要留。 */
+        uplinkRejected += 1;
+        lastParseError = e instanceof Error ? e.message : String(e);
+        log(`上行协议包解析失败:${lastParseError}`);
+      }
       return;
     }
     /* 未识别的 opcode(如 continuation 0x0):不静默丢 —— 记为一条日志。
@@ -697,6 +796,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     framesSent: (): number => framesSent,
     lastFrameBytes: (): number => lastFrameBytes,
     lastUplink: (): Uint8Array | null => lastUplink,
+    /* ★ 2026-11-14(分片 2)上行解析的累计计数 + 最近结果。
+       两个计数**分开** ⇒ 可分别断言"该接的接住了 / 该拦的拦住了"。 */
+    uplinkParsed: (): number => uplinkParsed,
+    uplinkRejected: (): number => uplinkRejected,
+    lastParsedPacket: (): DecodedPacket | null => lastParsedPacket,
+    lastParseError: (): string | null => lastParseError,
     /* ★ 模拟异常掉线:destroy 底层 socket(**不发 close 帧**)。
        服务端侧看到的与"客户端掉网"完全一致 ⇒ 走 `disconnect` 分支。 */
     dropConnectionsForTest: async (): Promise<void> => {
@@ -719,6 +824,11 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
 }
 
 /** 协议版本 —— 与 shared/net/delta.ts 的 PROTOCOL_VERSION 同值。
- *  ⚠️ 刻意**不 import** delta.ts:本服务端是运输层,不该依赖协议内容。
- *  (两者一致性由 WS-13 §6-1 的 `welcome.protocolVersion` 断言钉住。) */
+ *  ⚠️ 这个**常量**刻意不 import delta.ts:常量重复的代价是"两个数要一致",
+ *     而它由 WS-13 §6-1 的 `welcome.protocolVersion` 断言钉住。
+ *  ★ 2026-11-14(分片 2)订正:上一句原写「本服务端是运输层,不该依赖协议内容」——
+ *     那个理由**只对常量成立,对解析器不成立**。运输层现在**确实** import 了
+ *     `decodePacket`(见文件头 import 处的长注释):
+ *     常量可复制(有断言钉住一致性),**解析逻辑不可复制**(没有任何断言能钉住
+ *     "两份实现永远等价")。WS-13 §5「不造第二份口径」正是这条纪律的出处。 */
 export const PROTOCOL_VERSION = 1;

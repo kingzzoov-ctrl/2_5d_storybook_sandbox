@@ -31,7 +31,9 @@ import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
 const STRICT = process.argv.includes('--strict');
-const SKIP = /^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out|release|coverage)$/;
+/* ★★★ 2026-11-14:跳过名从**唯一事实源**取,不再各写一份(详见 scan-scope.ts 文件头)。 */
+import { shouldSkipDir } from './scan-scope.ts';
+const SKIP = { test: (n: string): boolean => shouldSkipDir(n) };
 
 const pureLf: string[] = [];
 const pureCrlf: string[] = [];

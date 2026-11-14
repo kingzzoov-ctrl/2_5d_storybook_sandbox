@@ -24,9 +24,29 @@
  * ## 用法
  *
  * ```
- * node scripts/clean-temp.ts            # 列出并删除(仓库根 + 扫描根内)
- * node scripts/clean-temp.ts --dry-run  # 只列不删
+ * node scripts/clean-temp.ts                 # 列出并删除(仓库根 + 扫描根内)
+ * node scripts/clean-temp.ts --dry-run       # 只列不删
+ * node scripts/clean-temp.ts --keep=_t84     # ★ 保留某前缀(可重复);删除其余
+ * node scripts/clean-temp.ts --force         # ★ 超过安全阈值时才可删
  * ```
+ *
+ * ## ★★★ 2026-11-14 加两道保险(起因是一次实测的**危险**)
+ *
+ * 实测:8 人并行作业时,裸跑本器件会一次删掉 **342 个**根级残留,
+ * 其中 **205 个不是跑它的人的** —— 别人的探针里有些是**刻意保留的实物证据**
+ * (如"两版有缺陷的探针",用来记录"探针自己会坏")。
+ * ⇒ 本器件的匹配规则写着「按名字匹配就永远会命中不该命中的东西」(见下 `_vss_restore` 那段),
+ *   而它此前只有**跳过目录**这一种表达"不该删"的能力,**没有表达"这个文件要留"的能力**。
+ * ⇒ 补两道:
+ *   1 `--keep=<前缀>`(可重复)⇒ 显式保留。**这是"不该删"的正确表达方式**
+ *      (跳过目录表达的是"这里没有残留",保留前缀表达的是"这是有意的产物")。
+ *   2 **安全阈值**:一次要删 > 40 个时**必须显式 `--force`**,否则拒绝执行并说明原因。
+ *      理由:单次作业的正常残留量是个位数到十几个;
+ *      一次 300+ 意味着"这不是残留,是整个车队的产物" ⇒ 该由人决定。
+ *
+ * ⚠️ 为什么阈值不用"字节数"而用"文件个数":实测 342 个只占 2501.5 KB
+ *    (`_vss_restore` 的 44.3 MB 才是大头,而它已被跳过)
+ *    ⇒ **按字节设阈值会漏掉这种"很多小文件"的危险**,而它恰恰是并行作业的典型形态。
  *
  * ⚠️ **匹配规则是刻意保守的**:文件名以 `_` 开头 + 常见文本扩展名。
  * 不动 `_design/` `_shots/` `_cdp_profile/`(它们是**目录**,不是残留)。
@@ -45,9 +65,14 @@ import { join } from 'node:path';
 
 const ROOT = process.cwd();
 const DRY = process.argv.includes('--dry-run');
+const FORCE = process.argv.includes('--force');
+/** ★ 显式保留前缀,`--keep=_t84 --keep=_tp91`。可重复。 */
+const KEEP = process.argv.filter((a) => a.startsWith('--keep=')).map((a) => a.slice('--keep='.length));
+/** ★ 安全阈值:单次删除超过这个数就必须 `--force`(理由见文件头)。 */
+const MAX_SILENT = 40;
 /** 与 verify.ts 的 checkTempResidue 保持**同一份规则** —— 改一处要改两处(CR-20 的形态)。 */
 const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
-const SKIP_DIR = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|\.git)$/;
+const SKIP_DIR = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|_probe_sandbox|\.git)$/;
 const TEMP_NAME = /^_.*\.(ts|js|mjs|txt|md|log|json)$/;
 
 interface Hit { rel: string; abs: string; size: number; inAuditRoot: boolean; head: string }
@@ -63,6 +88,8 @@ const walk = (dir: string, rel: string): void => {
     try { st = statSync(abs); } catch { continue; }
     if (st.isDirectory()) { walk(abs, r); continue; }
     if (!TEMP_NAME.test(n)) continue;
+    /* ★ 显式保留:`--keep=<前缀>` 命中 ⇒ **既不列也不删**(它是有意产物,不是残留) */
+    if (KEEP.some((p) => p.length > 0 && n.startsWith(p))) continue;
     let head = '';
     try { head = readFileSync(abs, 'utf8').split('\n').find((l) => l.trim())?.slice(0, 66) ?? ''; } catch { /* 二进制 */ }
     hits.push({ rel: r, abs, size: st.size, inAuditRoot: SCAN_ROOTS.some((x) => r.startsWith(`${x}/`)), head });
@@ -71,9 +98,24 @@ const walk = (dir: string, rel: string): void => {
 walk(ROOT, '');
 
 console.log(`\n[临时残留清理]${DRY ? ' (--dry-run,不删)' : ''}`);
+if (KEEP.length > 0) console.log(`  保留前缀:${KEEP.join(', ')}(这些**不列不删**)`);
 if (hits.length === 0) {
   console.log('  ✓ 无残留');
   process.exit(0);
+}
+
+/* ★★ 安全阈值:一次删太多 ⇒ 拒绝,除非 --force。
+   理由:正常单次作业的残留量是个位数到十几个;一次 300+ 意味着
+   "这不是残留,是整个车队的产物" ⇒ 该由人决定,不该由工具静默决定。 */
+if (!DRY && !FORCE && hits.length > MAX_SILENT) {
+  console.error('');
+  console.error(`  ✗✗ 拒绝执行:本次将删除 **${hits.length}** 个,超过安全阈值 ${MAX_SILENT}。`);
+  console.error('     这通常意味着"这不是你的残留,是其他人的在途产物" —— 实测一次 342 个里 205 个不是本次作业者的。');
+  console.error('     ⇒ 若确实要删,请二选一:');
+  console.error('        · 只删你自己的:  node scripts/clean-temp.ts --keep=<别人的前缀> …');
+  console.error('        · 确认要全删:    node scripts/clean-temp.ts --force');
+  console.error('     (先用 --dry-run 看清清单。**本器件此前没有这道闸,一次能清掉全车队**。)');
+  process.exit(2);
 }
 
 const bytes = hits.reduce((a, h) => a + h.size, 0);

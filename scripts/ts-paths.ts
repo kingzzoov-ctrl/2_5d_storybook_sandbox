@@ -37,7 +37,9 @@ export const ROOT = process.cwd();
 const ROOT_ONLY_ARTIFACTS = new Set(['build', 'out', 'release', 'coverage']);
 
 /** 任何深度都排除的目录(确定不含源码)。 */
-const ALWAYS_EXCLUDE = new Set(['node_modules', '.git', '_design', '_shots', '_vss_restore']);
+/* ★★★ 2026-11-14:跳过名从**唯一事实源**取,不再各写一份(详见 scan-scope.ts 文件头)。 */
+import { shouldSkipDir } from './scan-scope.ts';
+const ALWAYS_EXCLUDE = { has: (n: string): boolean => shouldSkipDir(n) };
 
 export interface WalkResult {
   /** 全部 .ts 文件(绝对路径) */

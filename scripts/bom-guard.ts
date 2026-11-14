@@ -20,9 +20,14 @@
 import { execSync } from 'node:child_process';
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+/* ★★★ 2026-11-14:跳过规则改为从**唯一事实源**取 —— 不要在本文件里再写一份。
+   起因:仓库根多了 `_probe_sandbox/`(队友的整仓副本),而本文件的局部 SKIP_DIRS
+   **没有**它 ⇒ 把副本里 HEAD 本来就有的 3 个 BOM 报成「本轮新增」⇒ **假红**。
+   实测当时 7 个判据各写一份跳过规则,只有 1 个含 `_probe_sandbox`(6/7 缺)。
+   ⇒ 详见 scripts/scan-scope.ts 的文件头。 */
+import { SKIP_DIRS } from './scan-scope.ts';
 
 const ROOT = process.cwd();
-const SKIP_DIRS = new Set(['node_modules', '.git', '_design', '_shots', '_vss_restore', 'dist', 'build']);
 const EXTS = ['.ts', '.json', '.md', '.mjs', '.cjs', '.js'];
 
 const hasBom = (p: string): boolean => {
