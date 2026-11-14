@@ -14,6 +14,16 @@ import {
       引用相等由 WS-07 的断言钉住)⇒ 本文件不需要直接认识 wire.ts。 */
 import { tableFor, EntityKind } from '../server/src/net/schema.ts';
 
+/* ── task-84:缺口 A(对局运行时)的**行为判据**需要真造一个世界并跑帧 ──
+ *
+ * ⚠️ 为什么必须从这里 import 而不是复用上面的纯函数:
+ * 本文件此前对 WS-11 的断言**全是纯函数调用**(`tickStation` / `tickRushOrder` 直接喂参),
+ * 从没有一处**驱动过世界**。而「接线」这件事的本质恰恰是
+ * 「世界每帧会调它」—— 纯函数调用**结构上测不到这件事**
+ * (调用者存在与否,与函数本身是否正确无关)。
+ * ⇒ 故必须 `new WorldSim()` 并真的 `tick()`,这是本组唯一能证伪接线的形态。 */
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
+
 import {
   createManualClock,
   createRushOrderSession,
@@ -1622,12 +1632,99 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
    *   `tableFor` 从 `schema.ts` 取(重导出),所以这条仍走 schema.ts 的对外面。 */
   const roomFields = tableFor(EntityKind.ROOM).map((f) => f.key);
   ok(roomFields.includes('scoreA'), '协议的房间字段表含 scoreA(行为判据,不依赖声明位置)');
-  const wildSim = readFileSync(join(ROOT, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
-  ok(!wildSim.includes('partyMode'), 'world_sim 不含 partyMode ⇒ 计分字段无人驱动');
 
-  /* afk.ts:等的是「房间 tick + 切后台事件」,两者都没有。 */
-  ok(!wildSim.includes('tickAfk'), 'world_sim 不调 tickAfk');
-  ok(!room.includes('tickAfk'), 'room.ts 也不调 tickAfk');
+  /* ── task-84:缺口 A(对局运行时)已接 —— 本组由「钉未接线」改为「钉接对了」 ──
+   *
+   * ⚠️⚠️ **改这一组的理由,不是「接线后它变红了」。** 逐条说清:
+   *
+   * (a) `!wildSim.includes('partyMode')`(:1626)—— ★ 它**至今仍是绿的**。
+   *     实测:`'tickPartyMode'.includes('partyMode') === false`(大写 P)。
+   *     ⇒ 这条的**理由**说「计分字段无人驱动」,而**判据**是「文本含小写子串」——
+   *       两者只在「持有字段恰好叫 partyMode」时才对得上。
+   *       它是一条**判据与结论错位**的断言,且**看起来在设防**。
+   *     ⇒ 故必须重写:让判据与要判的事对齐。**这不是因为它红了。**
+   *
+   * (b) `!wildSim.includes('tickAfk')`(:1629)—— 这条**确实变红了**(接线所致)。
+   *
+   * (c) 两条**新**断言必须是**行为判据**,不能只是「调用点存在」:
+   *     `includes(sim, 'tickAfk')` 在「函数定义了但从不调用」时**照样绿** ——
+   *     那是 task-81 的原缺陷形态(引用 ≠ 执行)。故这里跑真帧数。
+   *
+   * ## 口径(报数必须带,否则不可复核)
+   *   频次:慢帧 2Hz,`dt = SIM_SLOW_DT`;1 慢帧 = `FAST_PER_SLOW`(=10)次 `tick()`
+   *   ⇒ 「跑 40 慢帧」= 调用 `tick()` **400** 次。★ 我第一版按 40 次算,读数是 0 帧推进,
+   *     差点判成「驱动器没生效」—— 实际是我算错了频次,不是代码错。
+   */
+  const wildSim = readFileSync(join(ROOT, 'server', 'src', 'sim', 'world_sim.ts'), 'utf8');
+  /* (i) 驱动点**唯一**。比原来的「某个文件没有它」更强:禁的是任何第二处。
+         两处驱动会让时钟双倍前进,而**不报错**。 */
+  {
+    const drivers = ['server/src/sim/world_sim.ts', 'server/src/net/room.ts']
+      .filter((p) => readFileSync(join(ROOT, p), 'utf8').includes('tickAfk'));
+    eq(drivers.length, 1,
+      `tickAfk 的驱动点必须恰好 1 处(实测:${drivers.join(', ') || '无'})——`
+      + `两处会让逻辑时钟双倍前进且不报错`);
+  }
+  /* (ii) ★ 真守卫:对局**相位真的推进**。
+         这一条不依赖任何命名,故将来谁重写驱动器都不会被它误伤。 */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    eq(sim.partyPhase(), 'IDLE', '未开局时相位 IDLE');
+    ok(sim.startPartyRun('BRIDGE_CTF', 'p1'), 'startPartyRun 接受合法 key 与裁判');
+    eq(sim.partyPhase(), 'BUILD', '开局后进入 BUILD(BRIDGE_CTF 的 buildSec > 0)');
+    /* BRIDGE_CTF: buildSec = 15 ⇒ 30 慢帧跨过边界 */
+    for (let i = 0; i < 30 * FAST_PER_SLOW; i += 1) sim.tick();
+    eq(sim.partyPhase(), 'RACE',
+      '跑 30 慢帧(=15s)后相位从 BUILD 进到 RACE ⇒ tickPartyMode 真的被每帧驱动');
+    eq(sim.lastPartyTick.partyTicked, 1, '可观测量记录到本慢帧推进了对局');
+  }
+  /* (iii) ★ 反向:没有 startPartyRun 时**必须不推进**。
+         没有这一条,(ii) 的「相位变了」可能只是构造函数写死了初值。 */
+  {
+    const idle = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    for (let i = 0; i < 30 * FAST_PER_SLOW; i += 1) idle.tick();
+    eq(idle.partyPhase(), 'IDLE', '未开局的房间跑 30 慢帧仍 IDLE');
+    eq(idle.lastPartyTick.partyTicked, 0, '未开局时可观测量为 0(驱动存在 ≠ 对局在跑)');
+  }
+  /* (iv) ★ 驱动**不得**被电路开关连坐。
+         `new WorldSim({ wiring: false })` 是合法构造参数;若调用点写在
+         `if (this.wiringOn) {}` 内,那类房间的对局会静默冻结。 */
+  {
+    const noWire = new WorldSim({ sizeCells: 8, wiring: false, rng: () => 0.5, combatRng: () => 0.5 });
+    noWire.startPartyRun('BRIDGE_CTF', 'p1');
+    for (let i = 0; i < 30 * FAST_PER_SLOW; i += 1) noWire.tick();
+    eq(noWire.partyPhase(), 'RACE',
+      'wiring:false 的房间同样推进对局 ⇒ 驱动点不在 if (wiringOn) 块内');
+  }
+  /* (v) 坏参数必须**拒绝**,不许静默取默认值 —— 否则会造出「模式在跑但裁判是错的」。 */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    eq(sim.startPartyRun('NOPE', 'p1'), false, '未知 mode key 被拒绝');
+    eq(sim.startPartyRun('BRIDGE_CTF', ''), false, '空 refereeId 被拒绝');
+    eq(sim.partyPhase(), 'IDLE', '两次拒绝后仍未开局');
+  }
+
+  /* room.ts 侧:`.includes(absent)` 这 4 条**至今全绿**(room 一行未改)。
+     保留它们是有意的:它们钉的是 §8「禁用耦合」那条**架构约束**
+     (WS-11 模块/对局运行时都不得渗进 net 层),接线后这条约束**不变**。 */
+  for (const absent of ['tickPartyMode', 'RoomMode', 'MatchState', 'createPartyMode']) {
+    ok(!room.includes(absent),
+      `room.ts 不含 ${absent} ⇒ 对局运行时住在 sim 层,未渗入 net(WS-11 §8 禁用耦合)`);
+  }
+
+  /* afk.ts:驱动已接(见上 (i)(ii));露水的**行为**判据在此,
+     与 `tests/WS-FND-11-afk.test.ts` 的连接态判据分工不同。 */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    sim.setPlayerDozing('p1', 0);
+    /* 4 慢帧 = 2s < DOZE_AFTER_SEC(=5)⇒ 还不该产露 */
+    for (let i = 0; i < 4 * FAST_PER_SLOW; i += 1) sim.tick();
+    eq(sim.dewOf('p1'), 0, `2 秒仍在打盹阈值(${DOZE_AFTER_SEC}s)内 ⇒ 不产露`);
+    /* +96 慢帧 = +48s ⇒ 共 50s,打盹约 45s,按 DEW_SEC_PER_UNIT 应得 1 滴 */
+    for (let i = 0; i < 96 * FAST_PER_SLOW; i += 1) sim.tick();
+    eq(sim.dewOf('p1'), Math.floor((50 - DOZE_AFTER_SEC) / DEW_SEC_PER_UNIT),
+      '跑过阈值后露水按 tickAfk 的速率真的累积 ⇒ 挂机玩法被每帧驱动');
+  }
 
   /* immunity.ts:施加整蛊的宿主不存在。 */
   ok(!wildSim.includes('resolveShield'), 'world_sim 不调 resolveShield');

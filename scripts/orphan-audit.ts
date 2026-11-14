@@ -76,8 +76,32 @@ export const ORPHAN_KNOWN = new Map<string, string>([
      **裸 import**(`import '../wiring/components.ts';`)引用,因此**可达**。
      我的初版扫描器用正则找 `from '…'`,漏掉裸 import,把它误报成 orphan。
      详见 `extractRelativeImports` 的注释与「词法自检」一节。 */
-  ['server/src/party/modes.ts', 'WS-11 派对模式;待编排层按房间模式分发'],
-  ['server/src/social/afk.ts', 'WS-11 挂机检测;待房间 tick 调用'],
+  /* ── 2026-11-14 task-84(WS-11 缺口 A:对局运行时)接线 2 条 ⇒ 摘除 ──
+   *
+   * 接线方式 = `WorldSim` 慢帧 `tickPartyStep()`(2Hz,`dt = SIM_SLOW_DT`),
+   * 由 `world_sim.ts` 的 `tick()` 在 `isSlow` 块内调用(刻意放在
+   * `if (this.wiringOn)` **之外** —— 否则 `wiring:false` 的房间会静默冻结对局)。
+   *
+   * ★ **本次只摘 2 条,不是 4 条 —— 这个数是算出来的,不是数出来的:**
+   *   `coop/rush_order.ts` 与 `party/scoring.ts` **从来不在本表**。
+   *   它们有非零引用(modes/scoring/afk 的仅类型或内部导入),
+   *   按本表的「零引用」口径从来不成立。
+   *   只有 modes / afk 原为 **0 引用**,被 `world_sim` **直接 import** 后
+   *   引用者 0 → 1,才从 orphan 转可达。
+   *   ⇒ 「可达性白名单摘 4 条 + 本表摘 2 条」**不矛盾**,是两个不同的集合。
+   *   ⚠️ 若照「摘几条减几条」去改本表,会多减 2 条;而报错形态是
+   *      `verify.ts` 的 `orphan ⊆ 可达性白名单` 不变量 ——
+   *      **它看起来像可达性算错了,不像本表改错了**。
+   *
+   * ⚠️ 本表**不变量**:orphan ⊆ 可达性白名单(`verify.ts` 的那条自检)。
+   *   摘可达性白名单时**必须同步摘本表**,否则报「两套判据矛盾」。
+   *   本次实测正是如此:`orphan-audit` 报 modes/afk「已可达,应移出」,
+   *   而白名单已摘 ⇒ 两套判据互相矛盾。
+   *   ⇒ 故理由必须写到「**谁接的、接在哪**」。旧文案是
+   *     「待编排层按房间模式分发」/「待房间 tick 调用」—— 这类**目录级、
+   *     笼统的理由在事实变化后会继续豁免**,不会自己失效;
+   *     与 `UNREACHABLE_EXEMPT` 的「理由过时」是同一个病。
+   */
   ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫;待接 applyPrank'],
   ['server/src/build/wiring_view.ts', 'WS-08 电路可视视图;待客户端接线'],
   ['server/src/mobs/taming.ts', 'WS-04 驯服;待交互系统调用'],

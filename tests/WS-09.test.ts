@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   AZIMUTH_DEG,
+  COS_AZ,
   COS_PITCH,
   createCamera,
   followCamera,
@@ -289,19 +290,25 @@ import {
   atlasFrameIndex,
   atlasUvForFacing,
   billboardScale,
+  cellFloor,
   cameraForwardVector,
   cameraOffsetDirection,
   cameraPosition,
   dyeUniformPayload,
   dyeUploadCount,
   gridToVec3Tuple,
+  groundZAt,
   hexToRgb01,
   isTextureUniform,
   lodMergeSize,
   orthoHalfExtents,
+  PLAYER_MARKER_NAME,
+  playerMarkerPlacement,
+  playerMarkerScale,
   quadIndexBuffer,
   screenToNdc,
   shaderMaterialFlags,
+  SPRITE_CELL_WORLD,
   uniformTypeKind,
 } from '../client/src/stage/assembly_math.ts';
 import {
@@ -2971,6 +2978,91 @@ test('装配纯数学:立牌图集环绕、缩放与染色 uniform 负载', () =
   eq(dyeUploadCount([]), 0, '空表 = 0');
   eq(dyeUploadCount([1]), 1, '1 条 = 1');
   eq(dyeUploadCount([1, 2, 3, 4]), 1, '4 条仍只上传 1 个可见表面(单槽位)');
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * 玩家立牌(task-83)—— 断言的是「**屏幕上的东西变了**」,不是「函数被调用过」
+   *
+   * 口径:先算出立牌**在屏幕上的落点**(用渲染器同一个 `projectGridToScreen`),
+   * 再改**权威状态里玩家所在的格**,断言落点按投影规律**移动了预期的像素数**。
+   * ⇒ 若立牌摆错格、忘了 +0.5、或 `center === null` 时退回原点,这几条都会红。
+   * ════════════════════════════════════════════════════════════════════════ */
+
+  /* 高程表:两个高度不同的格子,用来验证「脚踩在面上」而不是浮在 0 */
+  const zAt = new Map<string, number>([
+    ['5,5', 2],      /* 玩家起始格:高程 2 */
+    ['9,5', 2],      /* 只改 x:同高程 */
+    ['5,9', 0],      /* 只改 y:高程 0 ⇒ 落点 z 必须跟着变 */
+  ]);
+
+  /* ── 1 权威未知 ⇒ 不可见,且**不是**摆到原点 ── */
+  eq(playerMarkerPlacement(null, zAt), { gx: 0, gy: 0, gz: 0, visible: false },
+    'center 为 null ⇒ visible:false(不能静默摆到原点)');
+
+  /* ── 2 摆到格心:玩家在格 (5,5) ⇒ 立牌在 (5.5, 5.5) ── */
+  const at55 = playerMarkerPlacement({ cx: 5, cy: 5 }, zAt);
+  eq(at55, { gx: 5.5, gy: 5.5, gz: 2, visible: true }, '格 (5,5) ⇒ 格心 (5.5,5.5),高程取表里的 2');
+  /* +0.5 一旦拿掉,这条立刻红 —— 它同时钉住了「格心」与「高程来自表」 */
+  eq(at55.gx - 5, 0.5, '格心偏移 = +0.5(踩在格子正中,不在角上)');
+
+  /* ── 3 屏幕内容真的变了:x 5→9 时落点必须按投影移动 ── */
+  const camM = createCamera(1280, 800, 16);
+  const p55 = projectGridToScreen(at55.gx, at55.gy, at55.gz, camM);
+
+  const at95 = playerMarkerPlacement({ cx: 9, cy: 5 }, zAt);
+  const p95 = projectGridToScreen(at95.gx, at95.gy, at95.gz, camM);
+
+  ok(p95.x !== p55.x || p95.y !== p55.y,
+    `玩家 x 5→9 后,立牌屏幕落点必须改变(实测 (${p55.x},${p55.y}) → (${p95.x},${p95.y}))`);
+
+  /*
+   * 独立算一遍期望像素:等轴投影下 dx=+4 格 ⇒ 屏幕 Δx = 4*COS_AZ*k、Δy = 4*GROUND_Y_PER_CELL*k。
+   * 期望值是**手推**的,不是从被测代码里读的。
+   */
+  const k = pixelScale(camM);
+  near(p95.x - p55.x, 4 * COS_AZ * k, 1e-9, 'x 位移 4 格 ⇒ 屏幕 Δx = 4·COS_AZ·像素比例');
+  near(p95.y - p55.y, 4 * GROUND_Y_PER_CELL * k, 1e-9, 'x 位移 4 格 ⇒ 屏幕 Δy = 4·SIN_AZ·SIN_PITCH·像素比例');
+
+  /* ── 4 只改 y 时高程跟着表走(脚踩在面上,不浮在 0) ── */
+  const at59 = playerMarkerPlacement({ cx: 5, cy: 9 }, zAt);
+  eq(at59.gz, 0, '格 (5,9) 表里高程 0 ⇒ 落点 z = 0');
+  eq(at55.gz, 2, '格 (5,5) 表里高程 2 ⇒ 落点 z = 2(不被硬编码成 0)');
+  ok(at55.gz !== at59.gz, '不同高程的格子,立牌高度必须不同(否则是浮在半空)');
+
+  /* 表里没有的格 ⇒ 兜底 0,而不是 NaN(NaN 会让精灵整个消失,更难查) */
+  eq(groundZAt(zAt, 12345, 67890), 0, '查不到高程 ⇒ 兜底 0');
+  ok(Number.isFinite(groundZAt(zAt, 12345, 67890)), '兜底值必须是有限数,不能是 NaN');
+
+  eq(cellFloor(5.5), 5, '格心 5.5 取整回格 5(表键是整数格)');
+
+  /* ── 5 尺寸:立牌一格宽,与其他立牌同一常量(曾经算错放大 16 倍) ── */
+  const sc = playerMarkerScale(SPRITE_CELL_WORLD);
+  near(sc.x, SPRITE_CELL_WORLD, 1e-12, '立牌宽 = 一格世界单位');
+  near(sc.x, 64 / 41, 1e-12, '一格 = ATLAS_CELL / ATLAS_PX_PER_CELL = 64/41 ≈ 1.5609');
+  eq(sc.x, sc.y, '立牌等比,不拉扁');
+
+  /* ── 6 装配侧:场景图里**真的有**这块精灵(静态检查,见报告里的强度说明) ──
+   *
+   * 过 `stripComments`:否则**把代码注释掉**也能让这几条通过(注释里的字
+   * 仍然匹配正则)⇒ 那样的断言没有牙。`stripComments` 是函数声明,已提升。
+   */
+  eq(PLAYER_MARKER_NAME, 'player_marker', '立牌名是常量,测试靠它从场景图里找回');
+  const bootSrc = stripComments(readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '..', 'client/src/three/boot.ts'),
+    'utf8',
+  ));
+  ok(/new THREE\.Sprite\(/.test(bootSrc), 'boot.ts 里构造了 Sprite');
+  ok(/playerMarker\.name = PLAYER_MARKER_NAME/.test(bootSrc), '立牌被赋名(否则测试找不回来)');
+  ok(/scene\.add\(playerMarker\)/.test(bootSrc), '立牌被加进场景(只 new 不加 = 屏上什么都没有)');
+  ok(/playerMarkerPlacement\(center, zAt\)/.test(bootSrc), '每帧用**权威状态**的 center 摆立牌');
+  ok(/playerMarker\.position\.set\(cell\.gx, cell\.gy, cell\.gz\)/.test(bootSrc), '每帧写入立牌位置');
+  ok(/playerMarker\.visible = cell\.visible/.test(bootSrc), '可见性由 pure 层裁决,不在装配层另判一次');
+  /*
+   * 反向护栏:这几条断言必须**真的在检查 boot.ts**。
+   * 若路径写错,`readFileSync` 会抛错 ⇒ 本块红,而不是静默变成「空字符串里
+   * 找不到模式」—— 后者会红得莫名其妙,前者会指名道姓。
+   */
+  ok(bootSrc.length > 10000, `读到的 boot.ts 非空且成规模(实测 ${bootSrc.length} 字符)`);
+  ok(/scene\.add\(/.test(bootSrc), 'boot.ts 确实有 scene.add 调用族(口径自检)');
 });
 
 test('染色辅助:可染判定、染料消耗、调色盘网格', () => {

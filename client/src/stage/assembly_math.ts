@@ -575,3 +575,92 @@ export function spritePositionForAnchor(
   void centerY;
   return { x: gx, y: gy, z: gz };
 }
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 玩家立牌 —— 「当局者在哪」的可视化(task-83)
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * 玩家立牌的名字.
+ *
+ * 测试与自检脚本靠它从**场景图**里把这块精灵找回来(而不是靠「函数被调用过」),
+ * 故必须是常量而不是散落两处的字面量 —— 否则改名时测试会静默失灵.
+ */
+export const PLAYER_MARKER_NAME = 'player_marker';
+
+/**
+ * 玩家立牌的摆放参数(世界单位「格」).
+ *
+ * `gx/gy` 是格坐标(与 `chunk_geometry` 的 `x = cellX, y = cellY` 恒等映射同系);
+ * `gz` 是**地形那一格的高程**,不是估的 ⇒ 脚必然踩在面上.
+ */
+export interface PlayerMarkerPlacement {
+  gx: number;
+  gy: number;
+  gz: number;
+  /** 是否应当可见. 权威未知(`center` 为 null)时为 false,**不是**摆到 (0,0). */
+  visible: boolean;
+}
+
+/** 取整到格(地形高程表的键是整数格)。 */
+export function cellFloor(v: number): number {
+  return Math.floor(v);
+}
+
+/**
+ * 从「世界格坐标 → 高程」查表取地面高度.
+ *
+ * 与 `three/boot.ts` 建表时用的是**同一个键格式**(`gx,gy` 逗号分隔),
+ * 故这里只做查表与兜底,不重复实现 tile 解包.
+ *
+ * 查不到时返回 `0`(地表基准). 这比 `NaN` 安全 —— `NaN` 会让精灵整个消失,
+ * 而那不是「没画」,是「画了一个看不见的东西」,更难查.
+ */
+export function groundZAt(zAt: ReadonlyMap<string, number>, gx: number, gy: number): number {
+  const z = zAt.get(`${gx},${gy}`);
+  return z === undefined ? 0 : z;
+}
+
+/**
+ * 由「权威圆心」与「地形高程表」算出立牌摆放.
+ *
+ * ## 为什么 `center` 为 null 时返回 `visible: false`,而不是摆到原点
+ *
+ * 与 `net/telegraph_center.ts` 的同一条理由:**世界原点是一个看起来合法的错误位置**.
+ * 摆过去会让玩家在左上一闪,而**没有任何东西会报错**. ⇒ 「不知道」必须与
+ * 「位置是 (0,0)」分开,由调用方显式决定.
+ *
+ * ## 为什么格坐标要 +0.5
+ *
+ * `telegraphCenterOf` 返回的是**玩家所在格**(来自 `PlayerState.x/y`,解码时已
+ * 反量化为「格」). 地形顶面覆盖 `[gx, gx+1] × [gy, gy+1]`
+ * ⇒ 要让脚**踩在格子中央**必须 +0.5(与 `three/boot.ts` 立牌落点同一做法).
+ *
+ * ## 位置只有一个来源
+ *
+ * ```
+ * telegraphCenterOf(RoomState, localPlayerId)  →  { cx, cy } | null   ← 已有, 可达
+ * playerMarkerPlacement(center, zAt)          →  { gx, gy, gz, visible }  ← 本函数
+ * ```
+ * 本函数**只把那个位置翻译成 three 的摆放参数**,不重新解释坐标 ——
+ * 刻意如此:`three/boot.ts` 的立牌注释记着一次实测事故,立牌用错缩放常量
+ * 导致精灵放大 16 倍盖住半张地图,根因就是**两处各算一份口径**.
+ */
+export function playerMarkerPlacement(
+  center: { cx: number; cy: number } | null,
+  zAt: ReadonlyMap<string, number>,
+): PlayerMarkerPlacement {
+  if (center === null) return { gx: 0, gy: 0, gz: 0, visible: false };
+  const gx = center.cx + 0.5;
+  const gy = center.cy + 0.5;
+  const gz = groundZAt(zAt, cellFloor(gx), cellFloor(gy));
+  /* 走既有的 `spritePositionForAnchor`(它此前**零调用方**)—— 立牌和别的立牌
+   * 用同一条落点规则,不另写一遍「position 放哪」。 */
+  const pos = spritePositionForAnchor(gx, gy, gz, spriteWorldHeight(1));
+  return { gx: pos.x, gy: pos.y, gz: pos.z, visible: true };
+}
+
+/** 立牌在世界单位下的尺寸(一格宽 × 一格高). */
+export function playerMarkerScale(cellWorld = SPRITE_CELL_WORLD): { x: number; y: number } {
+  return { x: cellWorld, y: spriteWorldHeight(1) };
+}

@@ -81,6 +81,43 @@ import {
   type SorterState,
   type Stack,
 } from '../wiring/logistics.ts';
+/* ── task-84:WS-11 对局运行时的每帧驱动(缺口 A)──
+ *
+ * ## 这是「入口可跑性」那一层,不是「WS-11 可用」
+ *
+ * 接上之后 `RushOrderSession` / `PartyModeRuntime` / `AfkPlayer` 会真的逐帧推进
+ * (实测 `tickRushOrder` 在空 `opts` 下仍驱动 `tickStation`/`tickBeaver`/链条超时/结算,
+ *  见 `coop/rush_order.ts:924-964`)。但**玩家仍然无法**交单 / 夺旗 / 拾冠 ——
+ * `submitDelivery` / `bridgeCapture` / `crownPickup` 的生产非自身调用点为 **0**,
+ * 全仓也没有 `applyAction` / `dispatchAction`。**⇒ 不得表述为「WS-11 可用」。**
+ *
+ * ## 方向:sim → party,单向
+ *
+ * `docs/WS-11-coop-prank-party.md:745` 的「禁用耦合」明确不许 WS-11 模块
+ * import `net/**`、`physics/**`、`combat/**`。故驱动**只能**住在上游、
+ * 向下调它们;这些 import 之后,party/coop/social 里**一个 net 字样都不出现**。
+ *
+ * ## 为什么是 import 具名符号而不是副作用 import
+ *
+ * `tickLogisticsStep` 那种先例用的是具名导入(它真要调 `tickLogistics`)。
+ * 只有 `components.ts` 那种「只要注册副作用」的才写裸 import。
+ * 这里每个符号都真的被调用,故按具名写。
+ */
+import {
+  createManualClock,
+  createRushOrderSession,
+  startRushOrder,
+  tickRushOrder,
+  type RushOrderSession,
+} from '../coop/rush_order.ts';
+import {
+  createPartyMode,
+  startPartyMode,
+  tickPartyMode,
+  PARTY_MODE_KEY,
+  type PartyModeRuntime,
+} from '../party/modes.ts';
+import { createAfkPlayer, tickAfk, type AfkPlayer } from '../social/afk.ts';
 /* ── 副作用 import:必须保留 ──
  *
  * `components.ts` **没有任何导出被本文件调用**,它的作用是**模块加载时**
@@ -553,6 +590,55 @@ export class WorldSim {
    * 重建成本 O(件数),LOGISTICS_* 件典型数量在个位数到几十。
    */
   private readonly logisticsBelts = new Map<string, ConveyorState>();
+
+  /* ═══════════ task-84:WS-11 对局运行时(缺口 A — 每帧驱动)═══════════ */
+
+  /**
+   * 对局模式运行时。**`null` = 本房间没开派对模式**,不是「还没接线」。
+   *
+   * ## 为什么不在这里 `new` 一个
+   *
+   * `createPartyMode` 需要 `refereeId`(436 哨台归属者)与 `PartyModeKey` ——
+   * 两者都是**玩家/房间级决策**,不是世界模拟层能自己定的。
+   * 模拟层替它选一个默认值,就是**替上层做决定**,而那个决定永远不会被质疑:
+   * 模式照样推进、播报照样发,只是裁判是错的。
+   *
+   * ⇒ 故本字段只由 `startPartyRun()` 写入,没开就是 `null`,tick 里直接跳过。
+   * 这与 `afkPlayers` 的纪律一致(「只存房间推过来的事实,单写入」)。
+   */
+  private partyRun: PartyModeRuntime | null = null;
+
+  /**
+   * 逻辑时钟。**与 `frameCount` 分离**,理由见 `tickPartyStep` 的注释。
+   *
+   * `createManualClock` 来自 `coop/rush_order.ts` —— 它是全仓**唯一**已实现的
+   * `Clock`,且 `party/modes.ts:21` 的 `Clock` 类型就是从那里 import 的。
+   * ⇒ 用它可以让 `PartyModeRuntime` 与将来的 `RushOrderSession` **共用同一个时钟**,
+   *   否则两份秒数会各自漂移(ARCH-GAPS 的 W7:「两个同名 Clock 接口」)。
+   */
+  private readonly partyClock = createManualClock(0);
+
+  /**
+   * 挂机(打盹攒露水)玩家表。按键 = `playerId`。
+   *
+   * ⚠️ **与 `afkPlayers` 不是同一件事,不要合并** —— 见 `afkPlayers` 的 docblock:
+   * 那个是**连接态**(断线回收),本表是**玩法态**(切后台 5 秒后打盹、攒露水)。
+   * 同名异义,故本字段刻意不叫 `afkPlayers`。
+   */
+  private readonly afkRuns = new Map<string, AfkPlayer>();
+
+  /**
+   * 最近一次慢帧对局推进的可观测量。
+   *
+   * 与 `lastMobTicks` / `lastLogisticsTick` / `lastBossTick` 同一模式:
+   * 把「这一帧推进了什么」暴露成**可观测量**。
+   * 没有它,「驱动没接」与「接了但这帧恰好无事发生」从外面**看不出区别** ——
+   * `tickPartyMode` 在 IDLE 相位返回空数组,而 `tickAfk` 在非后台时恒返回 0,
+   * 两者都与「根本没调用」长得一模一样。
+   */
+  lastPartyTick: { partyTicked: number; afkTicked: number; afkDew: number; events: string[] } = {
+    partyTicked: 0, afkTicked: 0, afkDew: 0, events: [],
+  };
 
   /* ═══════════ task-44:击杀结算 / 幽灵泡泡 / 装备词条的生产接线 ═══════════ */
 
@@ -3347,6 +3433,141 @@ export class WorldSim {
     }
   }
 
+  /* ═══════════════ task-84:WS-11 对局运行时的每帧驱动 ═══════════════ */
+
+  /**
+   * 开一局派对模式。**这是 `createPartyMode` 在全仓的第一个生产调用点。**
+   *
+   * ## 为什么由模拟层提供这个入口,而不是让房间直接 new
+   *
+   * 驱动必须与 `tick()` 同源(否则「谁先谁后」取决于两个调用方),
+   * 而 `tick()` 在 `WorldSim` 里 ⇒ 持有者也只能在这里。
+   * 房间侧只需要调这一行,不必认识 `PartyModeRuntime` 的结构。
+   *
+   * ## 参数全部**必填**,不给默认值
+   *
+   * `refereeId` / `key` 是**玩家与房间级决策**,模拟层替它猜一个默认值
+   * 就会造出「模式在跑但裁判是错的」——而那种错误**不报错、不影响推进**,
+   * 只是结算归属错人。故宁可让调用方必须显式给。
+   */
+  startPartyRun(key: string, refereeId: string): boolean {
+    const known = Object.values(PARTY_MODE_KEY) as string[];
+    if (!known.includes(key)) return false;
+    if (refereeId === '') return false;
+    const m = createPartyMode({ key: key as (typeof PARTY_MODE_KEY)[keyof typeof PARTY_MODE_KEY], clock: this.partyClock, refereeId });
+    startPartyMode(m);
+    this.partyRun = m;
+    return true;
+  }
+
+  /** 结束并清空对局(房间关局 / 重开时调)。不含结算 —— 结算归上层。 */
+  clearPartyRun(): void {
+    this.partyRun = null;
+  }
+
+  /** 当前对局相位(诊断与断言用)。未开局返回 `'IDLE'`。 */
+  partyPhase(): string {
+    return this.partyRun === null ? 'IDLE' : this.partyRun.phase;
+  }
+
+  /**
+   * 登记/注销一个挂机玩家的**玩法态**(打盹攒露水)。
+   *
+   * ⚠️ 与 `setPlayerAfk`(连接态)**不是同一件事**:后者由房间推「谁断线了」,
+   * 本方法建的是「谁在打盹攒露水」。两者可以同时为真,也可以一真一假 ——
+   * 断线的人未必在打盹,打盹的人也未必断线。
+   *
+   * `atSec` 传入即视为「此刻切到后台」;传 `null` 表示回到前台。
+   */
+  setPlayerDozing(playerId: string, atSec: number | null): boolean {
+    if (playerId === '') return false;
+    if (atSec === null) {
+      /* 回前台:保留已攒的露水,只清打盹态(`goForeground` 的语义)。 */
+      const p = this.afkRuns.get(playerId);
+      if (p === undefined) return false;
+      p.backgroundedAtSec = null;
+      p.dozedSec = 0;
+      p.dewAcc = 0;
+      return true;
+    }
+    let p = this.afkRuns.get(playerId);
+    if (p === undefined) {
+      p = createAfkPlayer(playerId);
+      this.afkRuns.set(playerId, p);
+    }
+    p.backgroundedAtSec = atSec;
+    return true;
+  }
+
+  /** 某玩家已攒的露水(诊断与断言用)。未登记返回 0。 */
+  dewOf(playerId: string): number {
+    return this.afkRuns.get(playerId)?.dew ?? 0;
+  }
+
+  /** 已登记的打盹玩法态玩家数(诊断用)。 */
+  dozingCount(): number {
+    return this.afkRuns.size;
+  }
+
+  /**
+   * 推进一次 WS-11 对局运行时(慢帧 2Hz)。
+   *
+   * ## 频次:慢帧,`dt = SIM_SLOW_DT`
+   *
+   * 三个入口的推荐帧率**都不高于慢帧**,逐个有依据:
+   * ```
+   * tickAfk      afk.ts:115 原文「单步推进打盹:推荐 dt = 0.5s(低频帧)」
+   *              0.5 === SIM_SLOW_DT(2Hz) ⇒ 与模块自己的建议**逐值吻合**
+   * tickPartyMode 签名无 dt,内部靠 clock.now() 算 elapsed
+   *              ⇒ 正确性只依赖时钟,与帧率无关
+   * tickRushOrder  §6.1 每帧开销 < 0.001ms,工位/河狸是秒级状态机
+   * ```
+   * ★ **我的第一版把 `tickAfk` 放快帧(理由:露水是小数累加器,怕折算错)**,
+   *   复核模块注释后**否掉了自己**:`dewAcc += rate * dt` 对 dt **线性**,
+   *   只要 dt 与调用频次一致(0.5s × 2Hz),每秒产露量就与快帧等价;
+   *   而放快帧反而**违背模块自己写明的推荐值**,且让每秒执行 20 次无用功。
+   *   ⇒ 教训:先读模块的推荐帧率,再谈「我觉得该多快」。
+   *
+   * ## 时钟:本方法自管逻辑秒,不读帧计数
+   *
+   * `partyClock.advance(SIM_SLOW_DT)` 每慢帧推进一次 ⇒ 逻辑秒与**慢帧数**
+   * 严格成比例。刻意**不**用 `frameCount / TICK_HZ`:后者含快帧,
+   * 两者差 `FAST_PER_SLOW`(=10)倍 —— 写成那样 `tickAfk` 的
+   * `nowSec - backgroundedAtSec` 会 10 倍速越过 `DOZE_AFTER_SEC`,
+   * 表现成「切后台不到 5 秒就进打盹」,而**不报错**。
+   *
+   * ## 顺序:`先 party 后 afk`,互不依赖
+   *
+   * 两者共享的只有本方法的 `nowSec`,读的都是**各自的**私有状态
+   * (`partyRun` vs `afkRuns`),没有先后依赖。
+   * 取这个次序是为了让 `events` 的顺序稳定可断言。
+   */
+  private tickPartyStep(): void {
+    this.partyClock.advance(SIM_SLOW_DT);
+    const nowSec = this.partyClock.now();
+    const events: string[] = [];
+    let partyTicked = 0;
+    let afkTicked = 0;
+    let afkDew = 0;
+
+    if (this.partyRun !== null) {
+      events.push(...tickPartyMode(this.partyRun));
+      partyTicked = 1;
+    }
+
+    for (const p of this.afkRuns.values()) {
+      const whole = tickAfk(p, nowSec, SIM_SLOW_DT);
+      afkTicked += 1;
+      afkDew += whole;
+    }
+
+    this.lastPartyTick = { partyTicked, afkTicked, afkDew, events };
+    /* 事件并入世界总线。**必须与 `bus.drain()` 同帧语义**:总线每快帧末尾排空,
+       而本方法在慢帧内被调,故这里 emit 的事件会在**本帧末尾**被投递 ——
+       与 mobHost 的 emit 行为一致(同一慢帧内产生、同帧末尾 drain)。 */
+    for (const ev of events) this.bus.emit('party_event', { kind: ev });
+  }
+
   /** 按 (x,y,kind) 反查件 ID。物流节点只带坐标,回写 state 时需要 ID。 */
   private componentIdOf(x: number, y: number, kind: string): string {
     for (const c of this.wiring.components.values()) {
@@ -3685,6 +3906,22 @@ export class WorldSim {
            `componentsEvaluated` 与 `running` 都正常 —— 单看这些指标看不出问题。 */
         this.tickLogisticsStep();
       }
+
+      /* ── 慢帧 2Hz:WS-11 对局运行时(task-84,缺口 A)──
+       *
+       * ★ **刻意放在 `if (this.wiringOn)` 块之外。**
+       * 我第一版顺手写在 `tickLogisticsStep()` 后面(即块内 L3686 之后),
+       * 那会让「派对模式能不能推进」取决于**电路开关** ——
+       * `new WorldSim({ wiring: false })` 时整个对局静默冻结,
+       * 而 `wiring:false` 是**合法的构造参数**(world_sim.ts:718
+       * `this.wiringOn = opts.wiring !== false`),测试与无电路存档都会用到。
+       * ⇒ 表现是「没通电的房间开不了派对」,不报错、只是不推进。
+       *
+       * 顺序放在物流之后:本步骤读 `afkRuns` / `partyRun`,两者都是
+       * **房间推过来的事实**(`setPlayerDozing` / `startPartyRun`),
+       * 不读本帧的电路或地形,故与前面各步无依赖。
+       * 放这里只为「玩家状态推进同处一地」便于阅读。 */
+      this.tickPartyStep();
 
       /* ── 慢帧 2Hz:建造 / 房间识别 / 蓝图接力(task-36)──
          放在地形与物流之后:本帧的地形写入(含接力落位)应在本帧就被看见,

@@ -29,6 +29,7 @@ import {
   SPRITE_CELL_WORLD, SPRITE_CENTER_X, SPRITE_CENTER_Y,
   ATLAS_CELL, ATLAS_IMAGE_W, ATLAS_IMAGE_H, ATLAS_PX_PER_CELL,
   cellIndexFromId, offsetRepeatOfCell,
+  playerMarkerPlacement, playerMarkerScale, PLAYER_MARKER_NAME,
 } from '../stage/assembly_math.ts';
 
 /* ── 以下 8 个模块此前**从未被浏览器加载**(有测试、零 DOM 依赖,但无装配入口)──
@@ -95,6 +96,8 @@ import { createAudio, type AudioHandle } from './audio_out.ts';
    这两个模块都**纯**(零三方、零 DOM)⇒ 可被 WS-12 直接 import 断言。 */
 import { ClientStateStore } from '../net/state_store.ts';
 import { telegraphCenterOf } from '../net/telegraph_center.ts';
+/* task-83:玩家可见物。位置来源**唯一** —— 权威状态经 `telegraphCenterOf`,
+   本文件只把那个位置翻译成 three 的摆放参数(纯逻辑在 `stage/assembly_math.ts`)。 */
 
 /** 帧率统计窗口(毫秒) */
 const FPS_WINDOW_MS = 500;
@@ -391,6 +394,47 @@ export function boot(container: HTMLElement): BootHandle {
     atlasOk = sprites.length > 0;
   });
 
+  /* ══════════════ task-83:玩家可见物(playermarker) ══════════════
+   *
+   * ## 为什么要有它
+   *
+   * 接线前客户端**完全不画玩家**:本文件里 `players` 出现 **0 次**(
+   * `git grep -c players client/src/three/boot.ts` ⇒ 空).
+   * 玩家位置早就拿到了(`telegraphCenterOf` → `playerGx/playerGy`,task-67 S2),
+   * 但只喂给了「屋顶淡出」与「预警圈圆心」—— **没有一个是看得见的实体**.
+   *
+   * ## 形态:照现有立牌写法(不新造一套)
+   *
+   * `boot.ts:376` 那处的图集立牌是现成范本,并且已经解决了两件容易写错的事:
+   *   1. 缩放用**世界单位**常量,不是 `SPRITE_SCALE`(用错会放大 16 倍盖住地图);
+   *   2. 锚点 `center.y` 要 0.15 不是 0.85(写反会让立牌整体陷进地里).
+   * ⇒ 这里沿用同一组常量,不自己算第二份口径.
+   *
+   * ## 自己玩家 vs 别人
+   *
+   * 本任务只画**本地玩家**(与服务端下发的 `localPlayerId` 对齐),
+   * 因为验收内容是「快照动了 ⇒ 屏幕上的东西动了」,一个 marker 就够证明.
+   * ⚠️ **不**做「随便挑一个玩家画上去」—— `telegraph_center.ts:50-52` 记着
+   *    那条教训:悄悄挑 `players[0]` 会在多人房里把圆心钉到别人头上,且不报错.
+   */
+  const playerMarker = new THREE.Sprite(new THREE.SpriteMaterial({
+    color: 0xffd166,
+    transparent: true,
+    opacity: 0.95,
+    depthTest: true,
+  }));
+  playerMarker.name = PLAYER_MARKER_NAME;
+  {
+    const s = playerMarkerScale(SPRITE_CELL_WORLD);
+    playerMarker.scale.set(s.x, s.y, 1);
+  }
+  /* 与图集立牌同一锚点约定(距底 15%)—— 否则脚会陷进地里或浮空 */
+  playerMarker.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
+  /* 初始不可见:权威第一帧还没到. `telegraphCenterOf` 的 `null` 语义是
+     「不知道」,不是「位置是 (0,0)」—— 见 `stage/assembly_math.ts` 的说明. */
+  playerMarker.visible = false;
+  scene.add(playerMarker);
+
   /**
    * 自检钩子:切换立牌可见性。
    *
@@ -416,6 +460,23 @@ export function boot(container: HTMLElement): BootHandle {
       return sprites[i]?.name ?? null;
     },
     ids: () => ATLAS_SAMPLE_IDS.slice(),
+    /* task-83:玩家立牌的开关与读数 —— 供**截图差分**用(关掉再拍一张,两张相减,
+     * 差集就是玩家占的像素,不依赖颜色阈值).
+     *
+     * ⚠️ 刻意**不**并进 `setVisible`/`only`:那两个只遍历 `sprites`(图集立牌),
+     *    把玩家立牌混进去会让「逐个测量第 i 个立牌」的下标错位.
+     */
+    playerMarker: () => ({
+      name: playerMarker.name,
+      visible: playerMarker.visible,
+      x: playerMarker.position.x,
+      y: playerMarker.position.y,
+      z: playerMarker.position.z,
+    }),
+    setPlayerMarkerVisible: (v: boolean): boolean => {
+      playerMarker.visible = v;
+      return playerMarker.visible;
+    },
   };
 
   /**
@@ -1072,6 +1133,22 @@ export function boot(container: HTMLElement): BootHandle {
       playerGy = center.cy;
       authoritySeen = true;
     }
+    /* ── task-83:把玩家画出来,并让它跟着 20Hz 快照动 ──
+     *
+     * 这一行就是「快照 ⇒ 屏幕」的**唯一接口**. 位置**不重新算** ——
+     * `center` 已经由权威状态给出(上面那几行),这里只做「翻译成摆放参数」.
+     *
+     * 高程取**地形那一格**的实际高度(与 `boot.ts` 建 `zAt` 表同源),
+     * 这样玩家会跟着地形起伏,而不是悬在一个固定的平面上.
+     *
+     * `visible` 由 `playerMarkerPlacement` 决定:`center === null` ⇒ 不可见.
+     * ⇒ 权威没到时**不画**,而不是画到世界原点(那会是一个看起来合法的错误位置).
+     */
+    {
+      const cell = playerMarkerPlacement(center, zAt);
+      playerMarker.position.set(cell.gx, cell.gy, cell.gz);
+      playerMarker.visible = cell.visible;
+    }
     updateRoof(dt / 1000);
     /* 把算出来的 alpha 真的喂给材质 —— 否则「淡出」只是内存里的一个数 */
     (roofMesh.material as THREE.MeshLambertMaterial).opacity = roofOpacity();
@@ -1132,6 +1209,23 @@ export function boot(container: HTMLElement): BootHandle {
       authoritativeCenter: telegraphCenterOf(authority.state, authority.localPlayerId),
       authorityDecodeErrors: authority.decodeErrors,
       authorityEmptyFrames: authority.emptyFrames,
+      /* ── task-83 玩家可见物自检口径 ──
+       *
+       * 这三个字段的作用与上面 `authoritySeen` 那一组**不同**:
+       * 那一组证明「权威位置到了」,这一组证明「权威位置**被画出来了**」——
+       * 两者是两件事,本仓此前只有前者(所以才会出现「位置拿到了但没画」).
+       *
+       * `playerMarkerVisible` 与 `playerMarkerPos` 一起读才有意义:
+       *   visible=false 且 pos 是 (0,0,0) ⇒ 权威还没到(正常)
+       *   visible=true  且 pos ≠ 权威位置 ⇒ **接线断了**(这是要抓的那类缺陷)
+       */
+      playerMarkerName: playerMarker.name,
+      playerMarkerVisible: playerMarker.visible,
+      playerMarkerPos: {
+        x: playerMarker.position.x,
+        y: playerMarker.position.y,
+        z: playerMarker.position.z,
+      },
       /* ── 图集自检口径:截图脚本靠这几个字段判断「真图 vs 占位」── */
       atlasOk,
       atlasErr,

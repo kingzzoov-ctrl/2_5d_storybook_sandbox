@@ -52,6 +52,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assemble, createHost } from '../server/src/index.ts';
+/* task-84:上面那条「连接态 vs 玩法」的判据已改为**行为判据**,
+   需要一个真世界来跑「只开玩法态、看连接态是否被点亮」。 */
+import { WorldSim } from '../server/src/sim/world_sim.ts';
 import { RoomRuntime, type WorldSaveHost } from '../server/src/net/room.ts';
 import { AccessMode } from '../server/src/db/repo.ts';
 
@@ -304,8 +307,35 @@ test('FND11-10 本通路与 social/afk.ts 的 tickAfk 是两件事(不合并)', 
         正是靠「该文件不含那些标识符」来断「玩法模块仍未接线」。 */
   const simSrc = readCode('server/src/sim/world_sim.ts');
   const roomSrc = readCode('server/src/net/room.ts');
-  ok(!/social\/afk\.ts/.test(simSrc), 'world_sim.ts 不应 import social/afk.ts(代码,不含注释)');
-  ok(!/social\/afk\.ts/.test(roomSrc), 'room.ts 不应 import social/afk.ts(代码,不含注释)');
+  /* ── task-84:缺口 A 接线后,本组的判据从「有没有 import」改为「两件事有没有合并」 ──
+   *
+   * ⚠️ 原文是 `ok(!/social\/afk\.ts/.test(simSrc), 'world_sim.ts 不应 import …')`。
+   * 接线后 `world_sim.ts` **确实** import 了它(玩法要每帧驱动打盹攒露水),
+   * ⇒ 那句 `!` 变红。**但本组的命题不是「永不许 import」**,而是
+   * 「**连接态与玩法不得合并**」(见本 test 的标题与上面第 291-295 行)。
+   * ⇒ 原判据只是当年**用来表达**那个命题的**代理指标**;
+   *   现在真正的命题可以直接判了,故换成**行为判据**。
+   *
+   * 为什么不能只把 `!` 删掉:删掉等于「连接态与玩法不合并」这件事**失去守卫** ——
+   * 而那正是 Lead 记的「避开检测器 ≠ 补上覆盖」。 */
+  ok(/social\/afk\.ts/.test(simSrc),
+    'world_sim.ts 现在 import social/afk.ts(缺口 A:玩法由模拟层每帧驱动)');
+  /* ★ 真守卫(行为):两条通路**各自独立**。
+     若将来有人把「连接态」与「玩法态」合并(例如让 setPlayerAfk 顺手记打盹、
+     或让连线态从露水状态派生),下面三条里必然有一条红。 */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    /* 只开**玩法态**(打盹),不碰连接态。 */
+    sim.setPlayerDozing('p1', 0);
+    eq(sim.dozingCount(), 1, '打盹玩法态已登记 p1');
+    /* 反向:连接态**不该**因此被点亮 —— 这正是「两件事」的判据。 */
+    eq(sim.afkPlayerCount, 0, '★ 打盹**不**让连接态计数变化 ⇒ 两条通路独立,未合并');
+    eq(sim.isPlayerAfk('p1'), false, '★ 打盹**不**使 isPlayerAfk 为真 ⇒ 未合并');
+  }
+  /* room.ts 那条**保持**:它钉的是「net 层不得依赖玩法模块」这个架构约束。 */
+  ok(!/social\/afk\.ts/.test(roomSrc),
+    'room.ts 仍不 import social/afk.ts —— 驱动在 sim 层(WS-11 §8 禁用耦合:'
+    + '方向必须 net/sim → 玩法;此处若需要 import,说明方向反了)');
   /* 反向:那条通路确实存在,且确实有打盹玩法常量 —— 证明「两件事」成立。 */
   const afkSrc = readFileSync(join(ROOT, 'server/src/social/afk.ts'), 'utf8');
   ok(/export const DOZE_AFTER_SEC/.test(afkSrc), 'social/afk.ts 应有玩法常量 DOZE_AFTER_SEC');

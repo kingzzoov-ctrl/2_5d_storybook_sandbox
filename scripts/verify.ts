@@ -1485,8 +1485,53 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      于是被 `/差集/` 字面正则漏判成**欠账**,让欠账分母虚高。
      ⇒ 分类现已改为**计算式**(见 `isDiffSet()`),此处补面包屑只为让**人**读得出来。
      ⚠️ 判据是计算式,不是这两个字 —— 两个字只是可读性。 */
-  ['server/src/coop/rush_order.ts', 'WS-11 抢单协作,等对局层 + 玩家动作输入管线(深于 US2);'
-    + '生产引用者 modes/scoring/afk **全部不可达** ⇒ 差集条目'],
+  /* ═══ ★ 2026-11-14 task-84:WS-11 缺口 A(对局运行时)接线 ⇒ 整块摘除 4 条 ═══
+   *
+   * 摘除的 4 条:`coop/rush_order.ts` · `party/modes.ts` · `party/scoring.ts` · `social/afk.ts`
+   *
+   * 接线方式(不是「import 一下」):`WorldSim` 慢帧新增 `tickPartyStep()`,
+   * 位置在 L3686 `this.tickLogisticsStep()` 之后 —— **照抄 `wiring/logistics.ts`
+   * 这个已成功摘出白名单的先例**。方向是 **sim → party 单向**:
+   * `docs/WS-11-coop-prank-party.md:745` 的「禁用耦合」不许 WS-11 模块 import `net/**`,
+   * 故驱动只能住在上游。
+   *
+   * ★★ 为什么这不是「假可达」(与 `wiring_view.ts` 那条的**关键区别**):
+   * ```
+   *   tickRushOrder(s, dt, opts = {}) 的三个 opts 字段**全部可选**(`?:`),
+   *   且函数体(L924-964,41 行)里 opts 只出现 3 次,**全是"默认值"不是"门控"**:
+   *     L929  const tended   = (opts.tended   ?? []).includes(st.kind);   ← 默认值
+   *     L930  const spraying = (opts.spraying ?? []).includes(st.kind);   ← 默认值
+   *     L934  if (opts.spawnBeaver !== false) { ... }                     ← 默认**开**
+   *   ⇒ 空 opts 下**仍被执行**的:L931 tickStation、L935-944 海狸计时与生成、
+   *     L947 tickBeaver、L949-955 链条超时、L957-960 结算。
+   *   ⇒ 即**真的逐帧推进**(残差:玩家输入那一路仍无来源)。
+   *     对照 wiring_view:`挂 tick = 每帧丢弃的假可达` —— 那条**不该**接,这条该接。
+   * ```
+   *
+   * ⚠️ **但它只是 ARCH-GAPS 三层里的第一层(入口可跑性)**:
+   * ```
+   *   `submitDelivery` / `bridgeCapture` / `crownPickup` 的生产非自身调用点 = **0**,
+   *   全仓也没有 `applyAction` / `dispatchAction`(实测)
+   *   ⇒ 接线后 session 内部真的推进,但**玩家无法**交单 / 夺旗 / 拾冠
+   *   ⇒ **不得表述为「WS-11 可用」** —— 动作执行层仍缺。
+   * ```
+   *
+   * ★ 还有两项"驱动了但没东西喂它",如实留档:
+   * ```
+   *   `tended` / `spraying` / `roomLevel` / `stock` 四项在**生产侧来源 = 0**
+   *   (独立复核:tended/spraying/roomLevel 各 0;`stock` 的生产侧 3 处命中是
+   *    **同名异义** —— `client/src/ui/recipe_tree.ts` 的配方库存,与本模块无关)
+   * ```
+   *
+   * ★ 由本次接线带出的**测试同批改动(17 站点)**:见 `tests/WS-11.test.ts` 与
+   *   `tests/WS-FND-11-afk.test.ts` 的注释。其中最有价值的一条是
+   *   `:1626 !wildSim.includes('partyMode')` —— 实测
+   *   `'tickPartyMode'.includes('partyMode')` = **false**(大写 P),
+   *   即该断言的**判据(文本小写子串)**与它**声称要防的事(计分字段无人驱动)不对齐**,
+   *   而它**永远绿**。⇒ 本仓第 4 类系统性缺陷的新形态:
+   *   「**判据措辞对不上它要防的东西**」—— 比恒绿更隐蔽,因为它**看起来在设防**。
+   */
+  /* `server/src/party/scoring.ts` 随之可达(被现已可达的 modes/afk 引用)⇒ 一并摘除。 */
   /* ⚠️ 本行原为 `driver.sqlite.ts` 的欠账登记,**2026-11-13 task-70 已消**:
      生产入口 `index.ts` 现在 import 了 `openNodeSqlite`(`AssembleDeps.dbPath` 路径),
      ⇒ 实测可达数 83 → **84**,本条移出白名单。
@@ -1537,19 +1582,19 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
     + '(WASD 现在驱动**相机平移**,client/src/three/boot.ts:1053)、生产侧 session.send 调用 0、'
     + '协议无 ackedSeq ⇒ predictStep/reconcile/resimulate/pruneCmds 四族无从建立;'
     + '且「WASD 是镜头还是角色」是**产品裁决**(见 docs/TASK-83-wasd-three-options.md)'],
-  ['server/src/party/modes.ts',
-    'WS-11 竞技模式,等对局运行时(有枚举与计分字段,无运行时);'
-    + '注意 data-conformance.ts 只 import 它的**常量**(CROWN_WIN_SEC 等)与手册比对,'
-    + '不代表 738 行**逻辑**被接线 —— 引用 ≠ 执行'],
-  /* ★ 2026-11-14 Lead 补措辞:生产引用者 modes / afk **全部不可达** ⇒ 差集条目。 */
-  ['server/src/party/scoring.ts', 'WS-11 计分,待接入;生产引用者 modes/afk **全部不可达** ⇒ 差集条目'],
   ['server/src/prank/immunity.ts',
     'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个);'
     + 'data-conformance.ts 只读它的常量,逻辑未接'],
   /* ★ 2026-11-14 Lead 补措辞:生产引用者 immunity 本身不可达 ⇒ 差集条目。 */
   ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个);'
     + '生产引用者 immunity **不可达** ⇒ 差集条目'],
-  ['server/src/social/afk.ts', 'WS-11 挂机攒露水,等房间每帧驱动(与 room 的 AFK 同名异义)'],
+  /* `social/afk.ts` 已随 task-84(WS-11 缺口 A)接线 ⇒ 从本表摘除。
+     见上方 task-84 的整块说明。
+     ⚠️ 它曾被记为「等房间每帧驱动(与 room 的 AFK **同名异义**)」——
+        那后半句仍然成立:`room.ts` 有自己的一套 AFK(afkSinceMs/AFK_TIMEOUT_MS),
+        与 `social/afk.ts` 的挂机攒露水**是两件事**。接线消掉的是"无驱动",
+        **没有**消掉同名异义 —— 后者仍在 `tests/WS-11.test.ts` 有守卫。 */
+  /* `server/src/party/modes.ts` 与 `server/src/party/scoring.ts` 亦随 task-84 摘除。 */
   /* `wiring/logistics.ts` 已于 2026-11-12 接线(传送带/分拣/机械臂的逐步推进),
      经 `WorldSim` 的慢帧 `tickLogisticsStep` 驱动。已从本表摘除。 */
 
