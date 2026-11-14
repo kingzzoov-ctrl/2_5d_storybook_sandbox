@@ -2747,12 +2747,7 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
     '★ 待修(2026-11-14 新揭出):旧判据 `[^,]+` 遇逗号即停 ⇒ `near(Math.hypot(pos.x, pos.y, pos.z), ORTHO_DISTANCE, …)` 这种**第 1 实参带嵌套调用**的写法,旧正则**一个名字都读不到** ⇒ 静默漏报。已与 HEAD 逐行比对确认是**既有**缺陷,非本轮引入。'],
   ['WS-09::TRANSPARENT_INDEX',
     '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(e.get(0, 0), TRANSPARENT_INDEX)` 第 1 实参含调用 ⇒ 旧正则读不到)。HEAD 已存在。'],
-  ['WS-10::MAX_CRIT_DMG',
-    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(combatantStats(30, [718, 730], {critDmg: 5.0}).critDmg, MAX_CRIT_DMG, …)`)。HEAD 已存在。'],
-  ['WS-10::MAX_CRIT_RATE',
-    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(combatantStats(30, [], {critRate: 1e9}).critRate, MAX_CRIT_RATE, …)`)。HEAD 已存在。'],
-  ['WS-10::MAX_DODGE_RATE',
-    '★ 待修(2026-11-14 新揭出):同族假阴性 —— 旧正则在这行读到的名字是内层变量 `dodgy`,而不是真正的第 2 顶层实参 `MAX_DODGE_RATE`。⚠️ terrain-physicist 另报:该文件 `:1201-1205` 有注释称「原断言是空断言,已修」,故这一处**可能是第二处未改干净**的,归 combat-progress 核。HEAD 已存在。'],
+
 ]);
 
 /** 收集生产模块(server/src + client/src)的数值型导出常量:`<文件>::<名>` → 表达式。 */

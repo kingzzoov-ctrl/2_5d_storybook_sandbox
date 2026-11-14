@@ -405,7 +405,8 @@ WS-07 用例数 133 → 137。
 | 7b | `wiring/components.ts` 不可达 | 40 项电路件 | AND/NOT、继电器、分流器全部不可达 | 见「未决」 |
 | 7c | `combat/damage.ts` 不可达 | 约 2300 行 | 八步伤害公式被 `vitals.ts` 简化路径取代 | 见「未决」 |
 
-**第 6 例的发现最尖锐**:`assertSchemaReady()` 在生产被调用(`room.colyseus.ts:73`)
+**第 6 例的发现最尖锐**:`assertSchemaReady()` 在生产被调用(`room.colyseus.ts` 的 `onCreate` 内;
+2026-11-14 订正:原写作 `:73`,该锚点已漂,现为 **:144**)
 但**零测试驱动**。补上文本对账后,当场抓到**两个方向相反的生产级缺陷**:
 
 * `PlayerSchema.name` 漏写 `@type` → 昵称**永远同步不到客户端**,且静默无报错。

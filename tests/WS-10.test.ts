@@ -2731,11 +2731,24 @@ test('task51-5:comboMul 是唯一无上界乘数 —— 其余六个各有界(�
      —— 实测 0.13,根本没触到钳制点,那条断言测的不是钳制。 */
   eq(combatantStats(30, [724, 730]).dodgeRate, 0.13, '前置:单套 724+730 的闪避率是 0.13(未触上限)');
   const dodgy = Array.from({ length: 20 }, () => 724);
-  eq(combatantStats(30, dodgy).dodgeRate, MAX_DODGE_RATE,
-    `重复堆 20 件 724 才触到上限,被钳到 ${MAX_DODGE_RATE}`);
-  eq(combatantStats(30, [718, 730], { critDmg: 5.0 }).critDmg, MAX_CRIT_DMG,
-    `爆伤钳到 MAX_CRIT_DMG=${MAX_CRIT_DMG}(即便声明 5.0)`);
-  eq(combatantStats(30, [], { critRate: 1e9 }).critRate, MAX_CRIT_RATE, '暴击率钳到 1.0');
+  /* task-88 续:以下三行右侧原为 `MAX_DODGE_RATE` / `MAX_CRIT_DMG` / `MAX_CRIT_RATE`
+     (均取自 weapons.ts)⇒ 两侧同源,数学上恒真。各自改为**手册字面量**:
+       · 0.75 / 3.0 —— `docs/WS-10-combat-progress.md` §5.4 L341
+         「| `MAX_DODGE_RATE` / `MAX_CRIT_DMG` | 0.75 / 3.0 | 上限封顶 |」;
+         另见 L400「闪避率超过 0.75」、L121「dodgeRate, // ≤ MAX_DODGE_RATE 0.75」。
+       · 1.0 —— 同上手册 L401「| 暴击率 / 爆伤溢出 | 分别封顶 1.0 / 3.0 |」。
+     ⚠ 实测(注入 ⇒ 套件 exit):3.0→9.9 变红(99/102)、0.75→0.99 变红(100/102)、
+       **1.0→9.9 仍 102/102 全绿** —— 即 `MAX_CRIT_RATE` 此前**无任何守卫**,
+       本行是它唯一的独立锚点(见该行下方注)。 */
+  eq(combatantStats(30, dodgy).dodgeRate, 0.75,
+    '重复堆 20 件 724 才触到上限,被钳到 0.75(手册 §5.4)');
+  eq(combatantStats(30, [718, 730], { critDmg: 5.0 }).critDmg, 3.0,
+    '爆伤钳到 3.0(即便声明 5.0;手册 §5.4)');
+  /* ★ 本行是 `MAX_CRIT_RATE` 的**唯一**守卫:注入 1.0→9.9 时,
+     本行改前是 `eq(x, MAX_CRIT_RATE)` 形态 ⇒ 跟着一起漂,套件 102/102 全绿。
+     改为字面量 1.0 后,该注入必然让本行变红。 */
+  eq(combatantStats(30, [], { critRate: 1e9 }).critRate, 1.0,
+    '暴击率钳到 1.0(手册 L401「分别封顶 1.0 / 3.0」)');
 
   /* 而 comboMul 修复前**没有任何** MAX_* 可钳 —— 现在有了,且是同一个量纲。 */
   ok(MAX_COMBO_MUL > 1, '上界大于 1(连段是加成而非削减)');

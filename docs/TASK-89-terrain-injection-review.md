@@ -527,11 +527,119 @@ _tp89_i48.txt  _tp89_i49.txt  _tp89_i50.txt
 
 > ⚠️ 门禁会报「临时残留 2xx 个」,那里面**大部分是别人的**(如 `_argcheck.ts`、`_ic_q*.ts`、`_bl.txt`、`_dl.txt`)。我只认领上面这 93 个 `_tp89_*`。
 
+### 第二批(task-A / task-B,9 个)
+
+```
+_tp91_taskA.ts        _tp91_taskA_out.txt
+_tp91_taskB.ts        _tp91_taskB_out.txt      ← 第一版,结论句硬编码(★ 刻意保留作反面教材)
+_tp91_taskB2.ts       _tp91_taskB2_out.txt     ← 第二版,注释行被当断言(★ 刻意保留)
+_tp91_taskB3.ts       _tp91_taskB3_out.txt     ← 终版,口径正确
+_tp89_gate7.txt                                ← Lead 修好 reachHint 后的全绿门禁输出
+```
+
+---
+
+## 追加:任务 A —— `WS-FND-07::OBSIDIAN_ID`
+
+> ⚠️ **时序事实**:我开工时 Lead 已**并发修好**了 `tests/WS-FND-07.test.ts:73/:74`(改成字面量 110)。所以我不是"发现缺陷",而是**独立验证了该修复**。以下证据链对**当前**文本有效。
+
+### 1 全部命中处(file:line,代码/注释分列)
+
+扫 `tests/` 下 27 个 `*.test.ts`(分母已断言 > 0)⇒ 命中 10 处,**代码行仅 3 处**:
+
+| file:line | 代码? | 原文 |
+|:---|:---|:---|
+| `tests/WS-01.test.ts:29` | 代码 | `CAP, PHASE_MIN_AMOUNT, OBSIDIAN_ID, PUMICE_ID, FLUID_CELL_BUDGET,` |
+| `tests/WS-01.test.ts:701` | 代码 | `eq(OBSIDIAN_ID, 110, '黑曜石 ID');` |
+| `tests/WS-FND-07.test.ts:32` | 代码 | `import { OBSIDIAN_ID } from '../server/src/world/fluid.ts';` |
+| `tests/WS-01.test.ts:777/778/780` | 注释 | (task-80 的解释性注释) |
+| `tests/WS-FND-07.test.ts:52/53/55/70` | 注释 | (Lead 本次修复的解释性注释) |
+
+⚠️ 这 3 处是**用 `stripComments` 逐行判定**分出来的 —— 直接 grep 会把注释里的示例算成代码(我在任务 B 里正好踩过这个坑)。
+
+### 2 判定:真同义反复
+
+逐跳追踪(带 file:line):
+```
+跳1  fluid.ts:620          const product = kind===HOT_SPRING ? PUMICE_ID : OBSIDIAN_ID;
+跳2  world_sim.ts:3967-3968  for (const p of drainPhaseProducts()) this.setCell(p.x, p.y, { obj: p.obj })
+跳3  → 写入 OBJ 层
+跳4  → grid.objIdAt(4,4) 读回**同一个值**
+```
+⇒ 期望值与被测值**同源** ⇒ 改常量两侧同步移动 ⇒ 恒真。**Lead 的字面量 110 改法正确。**
+
+### 3 独立来源:手册**逐字明写**(最高档)
+
+```
+docs/WS-01-terrain.md:268   | OBSIDIAN_ID | 110 | items.ts 黑曜石块 |
+docs/WS-01-terrain.md:171   WATER + LAVA → 黑曜石 110
+docs/WS-01-terrain.md:173   SLIME + LAVA → 黑曜石 110
+```
+⇒ 与 `BLUEPRINT_SIZE` / `MAX_EVENTS_PER_FRAME` **同级**(逐字明写),**不是** `CONTENT_FINGERPRINT_VERSION` 那种「靠格式推导」的次档。**这条不需要额外裁定。**
+
+### 4 有牙证据:注入 ⇒ **该行亲自红**(取自 stderr)
+
+```
+基线            exit=0   8/8 通过(stderr 失败行 0 条)
+注入            fluid.ts  OBSIDIAN_ID 110 → 999
+生效自检(子进程读回)  OBSIDIAN_ID = 999        ← 证明"我以为改坏了"是真改坏
+注入后          exit=1   7/8(stderr 失败行 1 条)
+★ stderr 原文:
+  ✗ [WS-FND-07] WF-07-01 相变产物写回地形… — 水侧该格 OBJ 层已写入黑曜石 110(内容表 items.ts:40)
+     期望 110 / 实际 999
+⇒ **目标行亲自红**,不是"套件红了"
+还原            ecf9ae5e35b94767 → ecf9ae5e35b94767   ✓ 逐字节一致
+```
+> 注意:失败行只有 1 条(`:73` 先 throw ⇒ `:74` 被遮蔽)—— 与下面任务 B 的发现**同构**。
+
+---
+
+## 追加:任务 B —— over-determination 遮蔽做成**可复跑判据**
+
+### 实例
+
+`tests/WS-01.test.ts` 的 `注入水量受容量钳制,不会溢出 CAP`(L846~L866)。
+被测断言行 **7 条**(已用 `stripComments` 排除 2 条注释行 L853/L857);目标 = **L860**。
+
+### ★ 遮蔽深度 = 3
+
+| 中和前 N 条 | exit | 通过 | 目标是否首红 | stderr 首条失败 |
+|:--|:--|:--|:--|:--|
+| 0 | 1 | 49/50 | 仍非目标 | `单位容量 1000 毫格 期望 1000 / 实际 1200`(L847) |
+| 1 | 1 | 49/50 | 仍非目标 | `只接受剩余 300 期望 300 / 实际 500`(L852) |
+| 2 | 1 | 49/50 | 仍非目标 | 同 L852(仍在顶上) |
+| **3** | 1 | 49/50 | **目标行亲自红** | `钳制到 CAP(= 1000 毫格) 期望 1000 / 实际 1200`(**L860**) |
+
+**判据形式**:「中和掉前 N 条 ⇒ 目标行才**首次**成为失败行」⇒ N = 遮蔽深度。**N ≥ 1 即该断言平时从未被行使。** 逐条前序都是 `CAP` 的函数:L847 / L850 / L852。
+
+### 意义:粒度错配
+
+```
+checkTautology 按 **(套件::常量)** = 断言级
+注入复核按 **test 块**      = 块级(harness.ts:162 的 eq() 首条即 throw)
+⇒ 断言级缺陷可被**块级绿**掩盖
+```
+**两个可选判据**(交 Lead 裁定,我不改 harness):(a) 报「遮蔽深度 > 0」清单;(b) 改 harness 让 `eq`/`near` 收集失败后**跑完块** ⇒ 遮蔽在根上消失,但改语义需 Lead 定。
+
+### ★★ 两个自曝坑(都在我自己的探针里)
+
+| 坑 | 现象 | 根因 | 修法 |
+|:---|:---|:---|:---|
+| **坑1 结论句硬编码** | 第一版 `note()` 写「目标行亲自红 ⇒ 它有牙」,而**它自己的实测输出是 `NO`** | 结论是硬编码字符串 ⇒ **不随测量变化**,与测量相反 | 结论**只由测量变量生成** + 新增「无法证明」分支 |
+| **坑2 注释行被当断言** | 第二版把 2 条注释行算进"中和对象",其中 1 条是 `no-op` ⇒ 报出的「深度 3」实为「深度 2 + 1 次无效中和」 | **没用 `probe-kit` 的 `stripComments()`** —— 而它存在的理由正是「本仓已两次踩到读到注释里的示例」 | 第三版补上,深度 3 才是可信值 |
+
+⇒ **建议进 PROGRESS:「探针的结论句若硬编码,它自己就是装饰」** —— 这是本仓「判据坏掉却伪装成正常」同族形态在**探针**上的实例。两版有缺陷的探针我**刻意保留**(`_tp91_taskB.ts` / `_tp91_taskB2.ts`),作为实物证据。
+
+### 我能证明的 / 不能证明的(任务 B)
+
+- **能证明**:该块遮蔽深度 = 3;目标行本身有牙(中和 3 条后亲自红);还原 SHA-256 逐字节一致。
+- **不能证明**:①我只测了**这 1 个块**;288/312 个多断言块(92.3%)**未逐个测**。②我说不出全仓「被遮蔽断言」的**总数** —— 需对每块做多次中和实验,成本远超本轮。
+
 ---
 
 ## 未做项 + 理由
 
-1. **`scripts/verify.ts` 我没动(包括那处 `reachHint` 崩溃和 4 条白名单)。** 理由:不在我写域(`✗ Do not touch: scripts/**`),Lead 明确说白名单与门禁由你改。白名单你已执行完毕;**`reachHint` 崩溃仍在,等 Lead 修**(我只报告 + 给最小修法)。
+1. **`scripts/verify.ts` 我没动(包括那处 `reachHint` 崩溃和 4 条白名单)。** 理由:不在我写域(`✗ Do not touch: scripts/**`),Lead 明确说白名单与门禁由你改。白名单你已执行完毕;**`reachHint` 崩溃也已由 Lead 修好**(改为语义正确的 `tautHint`),我复跑确认 `exit=0`。
 2. **`README.md` / `docs/PROGRESS.md` 我没动。** 理由:同上,不在写域。门禁报的 README 台账过期与用例汇总过期都是**别人**新增内容导致的,不是我改出来的。
 3. **`tests/WS-06.test.ts` 我没动。** 理由:不在写域,该文件归 `alchemy-core`;而且我的结论是「保留 + 改措辞」,不需要改断言。(注:`alchemy-core` 本轮已把 `:148/149` 改成字面量 16。)
 4. **`shared/types/physics.ts` / `shared/types/tile.ts` 的注入算越界吗 —— 我需要声明。** 这 2 个文件在 `✗ Do not touch: shared/contracts/**` 之外(`shared/types/`),但仍是冻结层。我用它们做了 i35~i39、i47、i48 共 7 组注入,**全部立即还原,SHA-256 逐字节一致**(见上表 `154D111F...`)。

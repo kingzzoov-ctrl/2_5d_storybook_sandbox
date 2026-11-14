@@ -326,6 +326,105 @@ function referencedBy(target: string, froms: string[], self: string): string[] {
   console.log(`  ✓ 导入扫描器词法自检通过(${cases.length} 形态 + 1 阳性对照)`);
 }
 
+/* ══════════════════ 登记表完整性自检 ══════════════════
+ *
+ * ## 为什么这一节存在(task-84 任务A)
+ *
+ * task-84 实测出一个真缺陷:`verify.ts` 用**单行正则**解析 ORPHAN_KNOWN,
+ * 而多行形态
+ *
+ *     ['path',
+ *       '段一'
+ *       + '段二'],
+ *
+ * **不匹配**那个正则(它要求路径与理由同一行、理由不含引号)
+ * ⇒ 该条被**静默丢弃**(真 7 条 → 解析出 5 条),而门禁**全绿**、
+ * 本文件也**全绿**(它不解析文本,不受影响)。
+ * ⇒ 教训:**「登记形态」本身也是审计对象。**
+ *   「你在文档里写了一句纪律」≠「判据在防它」。
+ *
+ * ## 本文件与之同族的两处风险,逐条设防
+ *
+ * 本文件**不做文本解析**(ORPHAN_KNOWN 是**真 Map**,多行 `+` 由 JS 自己拼好),
+ * 故 verify.ts 那种「单行正则丢条目」**在本文件结构上不可能发生**。
+ * 但同族(「静默丢弃一条登记」)的风险这里**确实有两条**:
+ *
+ * ### (1) 重复键塌缩
+ * `new Map([...])` 对同一 key 只留**最后一条**。若有人把同一路径登记两次
+ * (改注释、抄条目时最容易发生),**前一条静默消失**。
+ * 判据 =「**字面条目数**」vs「**运行时 Map.size**」:
+ * ```
+ *   字面条目数  来自源码文本(独立真值)
+ *   Map.size    来自运行时
+ * 两者不等 ⇒ 有键被塌缩 ⇒ 报红
+ * ```
+ * ★ 实测该判据**能抓到**:造 3 条含 1 个重复键 ⇒ Map.size=2 ≠ 字面 3 ⇒ 报出。
+ *
+ * ### (2) `/^export /m` 门禁的漏判面
+ * 下面收集 `found` 时要求文件匹配 `/^export /m`。以下形态会被**静默跳过**
+ * (连「它是不是 orphan」都不问):
+ * ```
+ *   export{A};          ← 无空格(合法 JS)
+ *     缩进的 export 声明  ← 行首有空白
+ *   只出现在注释里的 export  ← 文件真正的导出为零
+ * ```
+ * 判据 = 统计「含 `export` 但不匹配门禁」的生产文件,**> 0 即报**。
+ * ⚠️ 当前实测 = **0** ⇒ 本判据**现在不报**。它的价值在**将来**某人写出
+ * `export{X}` 时**当场报出**,而不是又静默少查一个文件。
+ * ⇒ 「现在不报」正是它该有的样子:它不是为今天的缺陷而加,
+ *   是为**同一类缺陷的下一次**而加 —— 与本节上面那条重复键判据同一用意。
+ *
+ * ★ 与本文件既有的词法自检同一条纪律:
+ *   **判据自己坏掉,必须能自己报出来。** 否则它就是下一个
+ *   「对『坏掉』与『报红』不可区分」的判据(见 PROGRESS 陷阱 126)。
+ */
+{
+  const bad: string[] = [];
+
+  /* ── (1) 重复键塌缩:字面条目数 vs Map.size ── */
+  const selfSrc = readFileSync(join(ROOT, 'scripts', 'orphan-audit.ts'), 'utf8');
+  const tblStart = selfSrc.indexOf('export const ORPHAN_KNOWN');
+  const tblEnd = selfSrc.indexOf(']);', tblStart);
+  if (tblStart < 0 || tblEnd < 0) {
+    bad.push('无法定位 ORPHAN_KNOWN 字面量表 ⇒ 自检锚点失效,本节等于不存在');
+  } else {
+    const seg = selfSrc.slice(tblStart, tblEnd);
+    /* 独立真值:首字符(跳过空白)为 `[` 且紧跟带引号路径的行 = 一条登记。
+       ⚠️ 用「行首」而非「任意位置」匹配 —— 否则注释里举的 `['a.ts', 'b']` 例子
+          会被算成条目,把这条判据变成**恒真**。 */
+    const declared = seg.split('\n').filter((l) => /^\s*\[\s*'/.test(l)).length;
+    if (declared === 0) {
+      bad.push('字面条目数解析为 0 —— 锚点或形态不符,本判据不可信(不是「表是空的」)');
+    } else if (declared !== ORPHAN_KNOWN.size) {
+      bad.push(`字面条目 ${declared} 条 ≠ ORPHAN_KNOWN.size ${ORPHAN_KNOWN.size} 条`
+        + ' ⇒ 有**重复键被 Map 静默塌缩**(同一路径登记两次,前一条消失)');
+    }
+  }
+
+  /* ── (2) `/^export /m` 门禁的漏判面 ── */
+  const gateMiss: string[] = [];
+  for (const f of prodFiles) {
+    const r = relOf(f);
+    const s = text.get(r) ?? readFileSync(f, 'utf8');
+    if (!/\bexport\b/.test(s)) continue;
+    if (!/^export /m.test(s)) gateMiss.push(r);
+  }
+  if (gateMiss.length > 0) {
+    bad.push(`有 ${gateMiss.length} 个生产文件含 \`export\` 但不匹配 /^export /m`
+      + ` ⇒ 它们**永远不会被检查是不是 orphan**(静默跳过):`
+      + `${gateMiss.slice(0, 4).join(', ')}${gateMiss.length > 4 ? ' …' : ''}`);
+  }
+
+  if (bad.length > 0) {
+    console.log(`\n  ✗ 登记表完整性自检未通过(${bad.length} 处):`);
+    for (const b of bad) console.log(`      ${b}`);
+    console.log('  ⇒ 登记形态本身出错 ⇒ 本审计的**条数与全部数字都不可信**');
+    process.exit(1);
+  }
+  console.log(`  ✓ 登记表完整性自检通过(字面 ${ORPHAN_KNOWN.size} 条 == Map.size;`
+    + `export 门禁漏判 0 个)`);
+}
+
 /* ── 找出所有 L2 orphan ── */
 const found: { file: string; tests: string[]; lines: number }[] = [];
 for (const f of prodFiles) {
