@@ -44,7 +44,7 @@
 | 不做的事 | 归属 | 原因 |
 | :--- | :--- | :--- |
 | 任何子系统的内部逻辑 | 各自的 WS | 编排层只负责**顺序与节奏**,不重复实现 |
-| 网络同步与差量编码 | WS-07 | `RoomRuntime` 负责;两者可组合但互不依赖 |
+| 网络同步与差量编码 | WS-07 | `RoomRuntime` 负责;两者可组合 ⚠️ **但见 US2 —— 「互不依赖」这个措辞已陈旧(2026-11-14 订正)** |
 | 生物 FSM 的具体行为 | WS-04 `behaviors.ts` | 它需要 `MobRuntime` 宿主,由调用方注入 |
 | 存档 | WS-07 `db/` | — |
 | 改冻结层 | — | `shared/**` 一行不动 |
@@ -333,7 +333,7 @@ node server/src/sim/demo.ts 10         # 可运行冒烟演示(默认 10 秒)
 | # | 问题 | 现状 | 建议 | 需谁裁决 |
 | :--- | :--- | :--- | :--- | :--- |
 | US1 | ~~**生物行为未接入**~~ **已解决(CR-6)** | 已构造 `MobHost` 并每慢帧 `tickMobs([...aoi.activeMobs])`,25 个 AI 的 `tick` 在生产可达(实测 100 帧推进 100 次;8 只生物产出预警) | 移动权威已由 **CR-9 方案 D** 一并解决(FSM 基础移动 + AI 专属动作,位置恒同步;此前 22/24 生物永远站着) | 已解决 |
-| US2 | **网关联动未接** | `RoomRuntime` 与 `WorldSim` 互不依赖 | 两者可组合:`RoomRuntime.step()` 里调 `WorldSim.tick()`,把快照喂给 `encodeDelta`。当前刻意解耦,便于分别测试 | Lead + WS-07 |
+| US2 | ⚠️ ~~**网关联动未接**~~ **已接线 —— 本行措辞已陈旧(2026-11-14 订正)** | `RoomRuntime` **已经**每帧驱动世界:`room.ts:1547` 的 `host.advance(1)`(task-59 接的)。**端到端实测**(net-persist `docs/TASK-85-us2-wiring-plan.md`):真起 `startWsServer` + 真 WS 客户端 ⇒ 世界帧 **0→39**、`welcome` 收到、帧可 `decodePacket` ⇒ 真 `WorldSim` 在跑 | ★ 原措辞「`RoomRuntime` 与 `WorldSim` **互不依赖**」只对**字面**成立:两者确实互不 `import`,但依赖经 **`WorldSaveHost` 结构化接口**成立 ——**「不认识这个名字」≠「不能驱动它」**。⚠️ 本行此前误导了 backlog 探针:它用**名字口径** `/WorldSim\|world_sim/` 判断,而 `room.ts` 里该名字**只出现在注释**(去注释后 0 命中)⇒ 探针**永远 dormant**,使「已通」长期显示为「未开」。**已裁决改行为口径** `/host\s*\.\s*advance\s*\(/`(`scripts/backlog.ts`) | Lead + WS-07 |7 |
 | US3 | ~~**战斗与炼金未进循环**~~ **伤害部分已解决(CR-7)** | 伤害管线已进慢帧循环:`resolveMobStrikes()` 消费预警通道 + 事件通道,`vitals.applyHit` 结算。**炼金(WS-06)与 Boss 阶段(WS-05)仍未进循环** | 剩余:炼金是**交互驱动**(玩家主动合成)而非每帧推进,不需要进循环;WS-05 的 Boss 阶段需接入 `tickMobs` | 部分解决 |
 | US4 | ~~**流体预算在大世界偏低**~~ **已修正诊断,见下** | 原判断为「1024 格/慢帧不够,建议提高预算或按玩家距离加权」 | **实测推翻**:512×512 每步仅 0.99ms,占 500ms 慢帧预算的 **0.2%** —— CPU 不是瓶颈。真瓶颈是**覆盖延迟**:纯游标轮询下一格被访问的间隔 = `n/budget` 慢帧,实测 128×128 让水铺 25 行需 **2268 秒**(64×64 只需 39 秒)。已改为「活跃格优先 + 游标兜底」,四数量级世界耗时一致(约 32 秒)。详见 [FLUID-BUDGET.md](FLUID-BUDGET.md) | 已解决 |
 | US5 | ~~**`WorldGrid` 与 `FluidField` 的双份状态**~~ **已解决(真缺陷,详见 §10.1)** | **本文档原描述偏轻**:不是「靠 `setCell` 显式同步」,而是**只同步了 `elev`、漏了 `obj→solid`**。`WorldGrid.isSolidAt` 判 351~371 为墙,`FluidField.solid` 却仍是 0 → **水直接穿墙**。实测:左高右低 + x=8 竖一道 351 墙,800 帧后墙右侧积水 **5844 毫格**;补投影后为 **0**。已在 `setCell` 里同步 `solid` | 原建议「让 `FluidField` 读 `WorldGrid`」**不采纳**:`base`/`amount` 是流体独有状态,`WorldGrid` 里没有对应字段,读不到。改为「唯一入口 `setCell` 同时投影 `elev` 与 `solid`,并以 `grid.isSolidAt` 为唯一判据」 | 已解决 |

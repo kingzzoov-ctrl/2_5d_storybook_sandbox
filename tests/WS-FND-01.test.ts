@@ -202,7 +202,15 @@ test('A12 四个分区指纹互不相同(items/mobs/bosses/modes)', () => {
 
 test('A13 overall 由四分区与算法版本合成,可独立复现', () => {
   const f = contentFingerprints();
-  eq(f.version, CONTENT_FINGERPRINT_VERSION);
+  /* 期望值写字面量 1,不引 `CONTENT_FINGERPRINT_VERSION`。
+     `contentFingerprints()` 返回的 `version` **就是**该常量(registry.ts:276
+     `return { version: CONTENT_FINGERPRINT_VERSION, ... }`),故引用它恒真。
+     1 的**独立来源**:手册/审计档记录总体指纹串为 `v1-eaefa38b`
+     (`docs/DATA-CONFORMANCE.md:265「指纹 v1-eaefa38b」`、
+     `docs/COMPLETION-CRITERIA.md:49`),而指纹串格式是 `v{version}-{8hex}`
+     ⇒ 首段 `v1` 即 version = 1。下方 `eq(CONTENT_FINGERPRINT_VERSION, 1)`
+     继续锚定常量本身(双向锚定,与 WS-10 同一修法)。 */
+  eq(f.version, 1, '算法版本 = 1(手册指纹串形如 v1-eaefa38b)');
   eq(CONTENT_FINGERPRINT_VERSION, 1);
   /* 手工按实现公式重算,确认 overall 可复现 —— 而不是「某个神秘数字」。 */
   const expect = fnv1a32(`${f.version}|${f.items}|${f.mobs}|${f.bosses}|${f.modes}`);

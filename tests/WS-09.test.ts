@@ -801,8 +801,15 @@ test('淡入淡出曲线:平滑、两端精确、单调', () => {
   near(smoothstep01(2), 1, 1e-15, '越界夹紧为 1');
   near(smoothstep01(0.5), 0.5, 1e-15, '中点 0.5');
   near(roofAlpha(0, true), 1, 1e-15, '进入前全不透明');
-  near(roofAlpha(1, true), ROOF_MIN_ALPHA, 1e-15, '进入后淡到最低透明度');
-  near(roofAlpha(0, false), ROOF_MIN_ALPHA, 1e-15, '离开前是最低透明度');
+  /* 字面量 0.15 的来源:手册 docs/WS-09-client-render.md §5.3 参数表
+     「ROOF_MIN_ALPHA | 0.15」,§3 正文另有
+     「ROOF_MIN_ALPHA = 0.15 保留一点屋顶轮廓」。
+     原写法右侧是 ROOF_MIN_ALPHA,而 roof_transparency.ts:140
+     「return 1 - (1 - ROOF_MIN_ALPHA) * smoothstep01(fade);」
+     与被测函数同源 ⇒ 改常量时两侧同向动 ⇒ 恒绿。
+     换成手册字面量后,常量一旦漂移这几条必红。 */
+  near(roofAlpha(1, true), 0.15, 1e-15, '进入后淡到最低透明度(手册 5.3 = 0.15)');
+  near(roofAlpha(0, false), 0.15, 1e-15, '离开前是最低透明度(手册 5.3 = 0.15)');
   near(roofAlpha(1, false), 1, 1e-15, '离开后恢复不透明');
   eq(ROOF_MIN_ALPHA, 0.15, '最低不透明度 0.15');
 
@@ -840,13 +847,13 @@ test('屋顶管理器:跨片切换、α 数组、幂等与脏标记', () => {
   eq(mgr.activeComponent, 0, '激活 0 号片');
   ok(!mgr.setPlayerCell(1, 2), '仍在同一片 → 无变化(幂等)');
   for (let i = 0; i < 60; i += 1) mgr.update(0.05);
-  near(mgr.alphaOf(0), ROOF_MIN_ALPHA, 1e-6, '第一片淡到 0.15');
+  near(mgr.alphaOf(0), 0.15, 1e-6, '第一片淡到 0.15(手册 5.3)');
   near(mgr.alphaOf(1), 1, 1e-6, '第二片保持不透明');
 
   mgr.setPlayerCell(6, 5);
   eq(mgr.activeComponent, 1, '切到第二片');
   mgr.update(ROOF_FADE_SEC);
-  near(mgr.alphaOf(1), ROOF_MIN_ALPHA, 1e-6, '第二片淡出');
+  near(mgr.alphaOf(1), 0.15, 1e-6, '第二片淡出(手册 5.3)');
   near(mgr.alphaOf(0), 1, 1e-6, '第一片恢复');
   ok(mgr.isIdle(), '过渡结束进入空闲');
 
@@ -863,7 +870,7 @@ test('屋顶管理器:跨片切换、α 数组、幂等与脏标记', () => {
   /* 便捷函数 */
   const quick = computeRoofAlpha(tiles, w, h, 1.5, 1.5);
   eq(quick.active, 0, '便捷函数命中第一片');
-  eq(quick.alphas[0], ROOF_MIN_ALPHA, '激活片给最低透明度');
+  eq(quick.alphas[0], 0.15, '激活片给最低透明度(手册 5.3)');
   eq(quick.alphas[1], 1, '非激活片不透明');
 });
 
@@ -1323,9 +1330,15 @@ test('染色通道:32 色、材质 id 与颜色无关、幂等喷色', () => {
   near(e?.maskRect.x ?? -1, 0.5, 1e-12, '换色后矩形重置');
   near(e?.strength ?? -1, 0.8, 1e-12, '强度记录');
 
-  /* 非法索引 → 视为未染色 */
+  /* 非法索引 → 视为未染色。
+     字面量 -1 的来源:手册 docs/WS-09-client-render.md §2.4
+     「export const NO_DYE = -1;」。
+     原写法右侧是 NO_DYE,而 dye_overlay.ts:197
+     「const tint = t >= 0 && t < DYE_PALETTE_SIZE ? t : NO_DYE;」
+     正是把越界索引赋成该常量 ⇒ 两侧同源 ⇒ 恒绿。
+     换成手册字面量后,常量一旦漂移这条必红。 */
   ch.spray(key, 999, rect, 1, 102);
-  eq(ch.get(key)?.tintIndex, NO_DYE, '越界色索引视为擦除');
+  eq(ch.get(key)?.tintIndex, -1, '越界色索引视为擦除(手册 2.4 的 NO_DYE = -1)');
 
   /* 洗色 */
   ch.spray(key, 7, rect, 1, 103);
@@ -2757,8 +2770,13 @@ test('与 WS-06 炼金契约同构:16×16 像素矩阵直接可用', () => {
   };
   const bundle = buildWeaponTexture(style);
   eq(bundle.rgba.length, ICON_RGBA_BYTES, 'AG 契约:RGBA 1024 字节');
-  eq(bundle.width, ICON_SIZE, '16 列');
-  eq(bundle.height, ICON_SIZE, '16 行');
+  /* 字面量 16 的来源:手册 docs/WS-09-client-render.md 第 5.3 节参数表
+     「ICON_SIZE / ICON_PIXELS / ICON_RGBA_BYTES | 16 / 256 / 1024」。
+     原写法右侧是 ICON_SIZE,而 entity_sprites.ts:450-451 正是
+     「width: ICON_SIZE, height: ICON_SIZE」⇒ 改常量时两侧同向变化 ⇒ 恒绿。
+     换成手册字面量后,常量一旦漂移这两条必红。 */
+  eq(bundle.width, 16, '16 列(手册 5.3)');
+  eq(bundle.height, 16, '16 行(手册 5.3)');
   eq(auraAnchors(style.particle_aura).length, 1, 'MUSIC_NOTES 挂点');
   eq(bundle.hasOutline, true, 'GIZMO 图案有描边');
   inRange(bundle.coverage, 0, 1, '覆盖率');

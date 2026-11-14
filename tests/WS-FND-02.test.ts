@@ -244,12 +244,16 @@ test('A11 自我 emit 不炸栈,被重入上限拦住', () => {
 test('A12 每帧事件数超上限时丢弃并记账,不静默吞掉', () => {
   const b = new EventBus();
   b.on('*', () => {});
-  /* 发超过上限的数量。上限 4096,发 4200。 */
-  const N = MAX_EVENTS_PER_FRAME + 104;
+  /* 发超过上限的数量。上限 4096,发 4200。
+     期望值写字面量 4096,不引 `MAX_EVENTS_PER_FRAME` —— 报文的 delivered
+     **由该常量兜底**(bus.ts:262 `if (processed >= MAX_EVENTS_PER_FRAME)`),
+     故引用它恒真。4096 的独立来源:手册 `docs/EVENT-BUS.md` §1.2 上限行
+     「每帧 4096 事件 / 每事件 512 处理器 / 重入深度 8」。 */
+  const N = 4096 + 104;
   for (let i = 0; i < N; i += 1) b.emit('bulk');
   const st = b.drain();
   eq(st.dropped, 104, '丢弃 104 个');
-  eq(st.delivered, MAX_EVENTS_PER_FRAME, '投递 4096 个');
+  eq(st.delivered, 4096, '投递 4096 个(手册 EVENT-BUS.md §1.2)');
   eq(b.totals.dropped, 104, '累计丢弃记账');
   /* 日志里应有一条 overflow 标记,使「丢了东西」这件事可查 */
   const overflow = b.history().filter((r) => r.event.kind === '<overflow>');
@@ -326,16 +330,20 @@ test('A16 snapshot() 反映帧序/待投递/订阅数/累计', () => {
   eq(s1.totals.delivered, 1);
 });
 
-test('A17 日志环形缓冲:超容量后只保留最近 HISTORY_CAPACITY 条', () => {
+test('A17 日志环形缓冲:超容量后只保留最近 512 条', () => {
   const b = new EventBus();
   b.on('*', () => {});
-  const N = HISTORY_CAPACITY + 50;
+  /* 期望值写字面量 512,不引 `HISTORY_CAPACITY` —— 保留条数**由该常量决定**
+     (bus.ts:348/351 的环形入队与取模都用它),故引用它恒真。
+     512 的独立来源:手册 `docs/EVENT-BUS.md` §1.2 上限行与 §1.3 观测段
+     「bus.history() // 最近 512 条投递记录(含错误与丢弃)」。 */
+  const N = 512 + 50;
   for (let i = 0; i < N; i += 1) {
     b.emit(`e${i}`);
     b.drain();
   }
   const h = b.history();
-  eq(h.length, HISTORY_CAPACITY, '保留满容量');
+  eq(h.length, 512, '保留满容量(手册 EVENT-BUS.md §1.3 写 512)');
   /* 最早的应是第 50 条(e50),最新的应是 eN-1 */
   eq(h[0].event.kind, 'e50', '环形覆盖最旧的');
   eq(h[h.length - 1].event.kind, `e${N - 1}`, '最新在末尾');

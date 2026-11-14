@@ -343,7 +343,9 @@ test('C1 河狸 4 秒偷走 3 块木板,库存同步扣减', () => {
   for (let i = 0; i < 8; i += 1) ev.push(...tickBeaver(b, 0.5, stock));
 
   includes(ev, EVT_BEAVER_STOLE, '偷料事件已广播');
-  eq(b.stolenQty, BEAVER_RECLAIM_QTY, '抱走 3 块');
+  /* task-88:右侧原为 `BEAVER_RECLAIM_QTY`(取自 rush_order.ts)⇒ 恒真。
+     改为手册 §5.3 L532「`BEAVER_RECLAIM_QTY` | 3」的字面量。 */
+  eq(b.stolenQty, 3, '抱走 3 块(手册 §5.3 = 3)');
   eq(stock[BEAVER_TARGET_ITEM_ID], 7, '库存 10 → 7');
   eq(b.state, BEAVER_STATE.FLEEING, '转入逃跑');
 });
@@ -445,7 +447,9 @@ test('D3 越序触发 ⇒ 链中断 + 40 分惩罚', () => {
   ok(!r.ok, '越序应失败');
   eq(r.reason, 'OUT_OF_ORDER', '中断原因越序');
   eq(c.state, CHAIN_STATE.BROKEN, '链中断');
-  eq(c.penalty, CHAIN_BREAK_PENALTY, '罚 40 分');
+  /* task-88:右侧原为 `CHAIN_BREAK_PENALTY`(取自 rush_order.ts)⇒ 恒真。
+     改为手册 §5.4 L551「`CHAIN_BREAK_PENALTY` | 40」的字面量。 */
+  eq(c.penalty, 40, '罚 40 分(手册 §5.4 = 40)');
   eq(BREAK_PENALTY_CHECK(), 40, '惩罚常量 = 40');
 });
 function BREAK_PENALTY_CHECK(): number { return CHAIN_BREAK_PENALTY; }
@@ -508,10 +512,12 @@ test('D7 会话级链接入:得分与罚分同步到急单总分', () => {
   const bad = addRelayChain(ses, 'bad');
   advanceRelayChain(ses, bad, 'CHOP', { atSec: 0 });
   advanceRelayChain(ses, bad, 'PAT', { atSec: 1 });     // 越序
-  eq(ses.penalty, CHAIN_BREAK_PENALTY, '罚分入账');
+  /* task-88:右侧原为 `CHAIN_BREAK_PENALTY`(取自 rush_order.ts)⇒ 恒真。
+     改为手册 §5.4 L551「`CHAIN_BREAK_PENALTY` | 40 | 任一环中断」的字面量。 */
+  eq(ses.penalty, 40, '罚分入账(手册 §5.4 = 40)');
 
   const st = settleSession(ses);
-  eq(st.penalty, CHAIN_BREAK_PENALTY, '结算带出罚分');
+  eq(st.penalty, 40, '结算带出罚分(手册 §5.4 = 40)');
   eq(st.sessionScore >= 0, true, '总分被地板到 0 以上');
 });
 
@@ -533,7 +539,9 @@ test('E1 叠罗汉高度按冻结层 CARRY_Z_STEP 阶梯递增', () => {
 test('E2 Z=2 果实采集:2 / 3 人够不到,满 4 人梯才够得到', () => {
   eq(STACK_REACH_Z, 0.3, '伸手抓取高度 0.30 格');
   eq(Z2_REACH_TARGET, 2.3, 'Z=2 有效抓取高度 2.30(平台面 2.0 + 到手 0.30)');
-  eq(Z2_FRUIT_HEIGHT, Z2_REACH_TARGET, '果实判定复用同一目标高度');
+  /* task-88:右侧原为 `Z2_REACH_TARGET`(取自 rush_order.ts,且 Z2_FRUIT_HEIGHT 就是它的别名)⇒ 恒真。
+     改为手册 §5.5 L564「`Z2_FRUIT_HEIGHT` | = `Z2_REACH_TARGET`(2.30)」的字面量。 */
+  eq(Z2_FRUIT_HEIGHT, 2.30, '果实判定复用同一目标高度(手册 §5.5 = 2.30)');
 
   /* 逐档验算 E_k.z = k × 0.85 */
   near(stackTopZ(1) + STACK_REACH_Z, 0.30, 1e-9, '1 人梯可达 0.30');
@@ -699,12 +707,16 @@ test('F8 雪球冰冻 3 秒;冰雕可被大锤当保龄球推出', () => {
   ok(m.slidOnHammer, '怪物冰雕可被敲出当保龄球');
   const p = resolveSnowball(false);
   eq(p.frozenSec, 3, '队友同样冰冻 3 秒(和平盾可免疫)');
-  eq(toyOf(233).morphSec, SNOWBALL_FREEZE_SEC, '玩具表 morphSec = 3');
+  /* task-88:右侧原为 `SNOWBALL_FREEZE_SEC`(取自 toys.ts)⇒ 恒真。
+     改为手册 §5.6 L579 玩具表 233 行「变形/持续 = 3」的字面量。 */
+  eq(toyOf(233).morphSec, 3, '玩具表 morphSec = 3(手册 §5.6 233 行 = 3)');
 });
 
 test('F9 炸弹果 3 秒引信 / 药水倍率 / 蜂蜜减速', () => {
   eq(BOMB_FUSE_SEC, 3);
-  eq(toyOf(228).morphSec, BOMB_FUSE_SEC, '引信时长与表一致');
+  /* task-88:右侧原为 `BOMB_FUSE_SEC`(取自 toys.ts)⇒ 恒真。
+     改为手册 §5.6 L576 玩具表 228 行「变形/持续 = 3」的字面量。 */
+  eq(toyOf(228).morphSec, 3, '引信时长与表一致(手册 §5.6 228 行 = 3)');
   near(SHRINK_SCALE, 0.3, 1e-9);
   near(GIANT_SCALE, 2.0, 1e-9);
   near(HONEY_SLOW_RATIO, 0.7, 1e-9);
@@ -823,7 +835,9 @@ test('G9 【U10】243 自伤不受和平盾影响:戴 218 + 戴 243 被自己的
   /* ① 自伤保留,不被和平盾挡掉 */
   ok(hit.dealt > 0, `自伤真实生效,扣了 ${hit.dealt} HP`);
   eq(hit.shielded, false, '自伤标记为未被和平盾拦截');
-  eq(hit.paralyzedSec, HELMET_SELF_PARALYZE_SEC, '感电麻痹 1.5 秒');
+  /* task-88:右侧原为 `HELMET_SELF_PARALYZE_SEC`(取自 toys.ts)⇒ 恒真。
+     改为手册 §5.6b L590「`HELMET_SELF_PARALYZE_SEC` | 1.5」的字面量。 */
+  eq(hit.paralyzedSec, 1.5, '感电麻痹 1.5 秒(手册 §5.6b = 1.5)');
   eq(HELMET_SELF_PARALYZE_SEC, 1.5, '麻痹常量 = 1.5 秒');
   eq(HELMET_SELF_DAMAGE, 45, '自伤数值 45');
   near(hit.hp, before - HELMET_SELF_DAMAGE, 1e-9, 'HP = 200 − 45 = 155');
@@ -1015,7 +1029,9 @@ test('H4 掉冠 5 秒冷却防止抖冠刷分', () => {
   for (let i = 0; i < 20; i += 1) { clock.advance(0.5); tickCrown(r, 0.5); }  // 10s
   ok(crownDrop(r), '被撞飞掉冠');
   eq(r.holder, null, '皇冠落地');
-  eq(r.cooldownSec, CROWN_PICKUP_COOLDOWN_SEC, '进入 5 秒冷却');
+  /* task-88:右侧原为 `CROWN_PICKUP_COOLDOWN_SEC`(取自 modes.ts)⇒ 恒真。
+     改为手册 §5.7 L608「`CROWN_PICKUP_COOLDOWN_SEC` | 5」的字面量。 */
+  eq(r.cooldownSec, 5, '进入 5 秒冷却(手册 §5.7 = 5)');
   ok(!crownPickup(r, 'bob'), '冷却期内无法拾取');
 
   /* 以 0.5s 步长累计推进满 5 秒冷却 */
@@ -1323,7 +1339,9 @@ test('I7 534 留言信箱:容量上限、点赞徽章、过期清理', () => {
       likes: 0, sticker: i % 12, gifts: { 130: 1 }, text: `贴纸贺卡 ${i}`,
     });
   }
-  eq(mb.items.length, MAILBOX_CAPACITY, '容量封顶 50');
+  /* task-88:右侧原为 `MAILBOX_CAPACITY`(取自 social/afk.ts)⇒ 恒真。
+     改为手册 §5.8 L626「`MAILBOX_CAPACITY` | 50」的字面量。 */
+  eq(mb.items.length, 50, '容量封顶 50(手册 §5.8 = 50)');
   eq(mb.dropped, 5, '溢出丢弃 5 条');
   eq(mb.items[0].id, 'm5', 'FIFO:最旧的被丢掉');
 

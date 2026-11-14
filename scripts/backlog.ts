@@ -308,10 +308,45 @@ const STALE_PROBES: { doc: string; id: string; claim: RegExp; file: string; prob
   {
     doc: 'SIM-orchestration.md',
     id: 'US2',
+    /* ★ 2026-11-14 裁决:探针从**名字口径**改为**行为口径**(Lead)。
+     *
+     * ## 为什么必须改(实测)
+     *
+     * 原 probe 是 `/WorldSim|world_sim/`。它的方向是**反的**:
+     * ```
+     * K6(WS-07 / WS-FND-07) : room.ts **不得**提及 WorldSim   ← 促成好设计
+     * US2 探针              : room.ts **必须**提及 WorldSim才算已开 ← 期待坏设计
+     * ⇒ 二者**不可能同时满足**。
+     * ```
+     * 我实测(`server/src/net/room.ts`):
+     * ```
+     * 名字口径:原样**命中**(18 处)但**全部是注释**;
+     *           去注释后(`stripComments`,即本验证器的真实口径)**0 命中**
+     *           ⇒ 探针**永远 dormant** ⇒ "已通"长期显示为"未开"
+     * 行为口径:`host.advance(1)` @ :1547 **命中**(代码态,非注释)
+     * ```
+     * ⇒ 而**功能其实早就通了**:依赖是经 `WorldSaveHost` **结构化接口**成立的
+     *   ——「不认识这个名字」≠「不能驱动它」。
+     *   net-persist 的端到端实测(`docs/TASK-85-us2-wiring-plan.md`):
+     *   真起 `startWsServer` + 真 WS 客户端 ⇒ 世界帧 0→39、`welcome` 收到、
+     *   帧可 `decodePacket` ⇒ **真 WorldSim 在跑**。
+     *
+     * ## 判据纪律(与陷阱 125 同族)
+     *
+     * **判据要读本体,不能读本体的代理。**
+     * 名字是"依赖关系"的**代理**;`host.advance(` 才是本体事实。
+     * 而且名字口径**奖励坏设计** —— 它逼你把实现细节写进装配层。
+     *
+     * ⚠️ 口径:本 probe 跑在**去注释**的文本上(见本文件 `stripComments` 的 docblock),
+     * 故 `advance` 出现在注释里**不算**。 */
     claim: /互不依赖/,
     file: 'server/src/net/room.ts',
-    probe: /WorldSim|world_sim/,
-    why: '网关联动接入后 RoomRuntime 会引用 WorldSim;当前 room.ts 完全不含该符号',
+    probe: /host\s*\.\s*advance\s*\(/,
+    why: '网关联动接入后 room.ts 会在代码态驱动世界(host.advance(frames))。'
+      + '原 probe 是 /WorldSim|world_sim/ —— 那是**名字口径**,而依赖经 WorldSaveHost '
+      + '结构化接口成立、名字永远不出现 ⇒ 探针永远 dormant(实测:去注释后 0 命中)。'
+      + '★ 已实测真实接线:`room.ts:1547 host.advance(1)`(task-59)⇒ 本项应判**已落地**,'
+      + '文档 `SIM-orchestration.md` 的「互不依赖」那句**已陈旧**,待改。',
   },
   {
     doc: 'SIM-orchestration.md',

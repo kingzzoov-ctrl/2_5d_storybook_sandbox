@@ -850,7 +850,14 @@ test('注入水量受容量钳制,不会溢出 CAP', () => {
   eq(put1, 700, '第一次注入 700');
   const put2 = f.addWater(0, 0, 700);
   eq(put2, 300, '只接受剩余 300');
-  eq(f.amountAt(0, 0), CAP, '钳制到 CAP');
+  /* ★ task-89:原为 `eq(f.amountAt(0, 0), CAP, '钳制到 CAP')` —— 右侧取自被测模块,
+     而实现里 `addWater` 正是 `Math.min(..., CAP)` ⇒ 两侧同源,对任意常量值恒真
+     (改 CAP 时钳制点也跟着动)。门禁 checkTautology 已把它列为未登记候选
+     (`WS-01::CAP`)。改为字面量 1000,独立来源 = 手册 §1「一格 = 1000 毫格」
+     与上方 :847 `eq(CAP, 1000)` 的锚定。
+     注:本 test 内 :847 会先 throw(over-determined),故本条主要价值是
+     **不把被测常量当期望值** —— 门禁口径要的正是这个。 */
+  eq(f.amountAt(0, 0), 1000, '钳制到 CAP(= 1000 毫格)');
   const put3 = f.addWater(0, 0, 100);
   eq(put3, 0, '已满则注入 0');
   eq(f.totalTiles(), 1, '1000 毫格 = 1 整格');

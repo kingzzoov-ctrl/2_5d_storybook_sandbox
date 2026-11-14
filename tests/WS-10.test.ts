@@ -296,7 +296,10 @@ test('生产接线8(第7步 反伤):反伤数值与作用半径在生产路径�
   /* 与独立入口 reflectFrom 双向一致(两处口径必须同源)。 */
   const indep = reflectFrom(1.5, r.finalDamage);
   near(indep.reflectDamage, r.reflectDamage, 1e-6, 'reflectFrom 与 computeDamage 第 7 步同值');
-  eq(indep.radius, REFLECT_RADIUS, '反伤半径取自实现');
+  /* task-88:右侧原为 `REFLECT_RADIUS`(取自 damage.ts)⇒ 恒真。
+     改为字面量 3,来源:`docs/WS-10-combat-progress.md` L193(管线第 7 步
+     「作用半径 3 格」)+ L306(728 反伤甲行「反伤半径 3 格」)。 */
+  eq(indep.radius, 3, '反伤半径取自实现');
   eq(REFLECT_RADIUS, 3, 'REFLECT_RADIUS = 3 格(设计基线,非取自实现)');
   eq(r.steps[6]!.step, '7 反伤', '第 7 步在 steps 链的第 7 位(顺序固定)');
 
@@ -329,7 +332,11 @@ test('生产接线9(第8步 击退):击退冲量在生产路径上真的参与',
   /* 反例:222 充气大锤除击退外,对队友是 0 伤害 + 固定冲量。 */
   const prank = allyPrankHit(light);
   eq(prank.finalDamage, 0, '整蛊命中对队友 0 伤害');
-  eq(prank.knockbackImpulse, PRANK_HAMMER_KNOCKBACK, `整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK} 格/秒(与武器无关)`);
+  /* task-88:右侧原为 `PRANK_HAMMER_KNOCKBACK`(取自 weapons.ts)⇒ 数学上恒真。
+     改为字面量 8.0,来源有两处**独立于实现**的手册记载:
+       · `docs/WS-10-combat-progress.md` L444「| 3 | 204 与 222 常数 | 破盾 4.0、击退 8.0 |」
+       · `docs/WS-11-coop-prank-party.md` §5.6 L572 玩具表 222 行「冲量 8」 */
+  eq(prank.knockbackImpulse, 8.0, `整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK} 格/秒(与武器无关)`);
   ok(prank.knockbackImpulse !== rLight.knockbackImpulse, '整蛊冲量与普通攻击不同(反例锚点)');
 
   /* 派生质量:生物质量默认 1(与 physics.spawn 默认一致)。 */
@@ -610,7 +617,9 @@ test('生产接线14:八步逐步在生产路径上被驱动(并标明哪几步�
   /* 反例:222 充气大锤打队友 = 0 伤害 + 固定冲量(击退与伤害解耦)。 */
   const prank = allyPrankHit(createTarget({ id: 'ally', name: '队友', hp: 999, maxHp: 999 }));
   eq(prank.finalDamage, 0, '反例:整蛊对队友 0 伤害');
-  eq(prank.knockbackImpulse, PRANK_HAMMER_KNOCKBACK, `反例:整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK}(与武器无关)`);
+  /* task-88:同上,右侧改字面量 8.0(原取自 weapons.ts,恒真)。
+     来源同 L334:`WS-10` 手册 L444「击退 8.0」+ `WS-11` 手册 §5.6 L572「冲量 8」。 */
+  eq(prank.knockbackImpulse, 8.0, `反例:整蛊固定击退 ${PRANK_HAMMER_KNOCKBACK}(与武器无关)`);
 
   /* ── 短路分支同样在生产路径上 ── */
   const sFar = attackWorld('mob_sheep', { at: [4, 4], mobAt: [40, 40] });
@@ -1657,10 +1666,13 @@ test('幽灵泡泡:期间完全免伤且不能移动/攻击/被治疗', () => {
   const d = createDowned(p, EQUIP, 0, 0);
   eq(ghostDamageMul(d), 0, '幽灵泡泡免伤乘区为 0');
   const ctl = ghostControl(d);
-  /* 【task-23 定性结论:保留,不改为字面量】同 `BASE_CRIT_DMG` ——
-   * 注入 GHOST_MOVE_MUL 0→0.5 ⇒ 变红(相邻 `eq(ctl.moveMul, 0)` 抓住),故常量有守卫。
-   * 属 verify.ts 白名单已登记候选,非缺陷;改字面量需同步 verify.ts,不在写域。 */
-  eq(ctl.moveMul, GHOST_MOVE_MUL, '位移乘数 0(不能自主移动)');
+  /* 【task-23 原判「保留,不改为字面量」;task-88 已改】
+   *   task-23 的顾虑是「改字面量需同步 verify.ts,不在当时写域」——
+   *   task-88 的写域已包含本文件,且 Lead 同步摘除了 `WS-10::GHOST_MOVE_MUL` 白名单条目。
+   *   牙口实测:注入 GHOST_MOVE_MUL 0→0.6 ⇒ 本行自红(期望 0 / 实际 0.6),源还原逐字节一致。 */
+  /* task-88:右侧原为 `GHOST_MOVE_MUL`(取自 revive.ts)⇒ 恒真。
+     改为手册 §4.4 L245「期间: takenMul = 0(免伤)、moveMul = 0」的字面量 0。 */
+  eq(ctl.moveMul, 0, '位移乘数 0(不能自主移动)(手册 §4.4 moveMul = 0)');
   eq(ctl.moveMul, 0, '位移被完全限制');
   eq(ctl.canAttack, false, '不能攻击');
   eq(ctl.canBeHealed, false, '不能被治疗');
@@ -1735,10 +1747,14 @@ test('227 泡泡水枪:连中 3 发把人装进大泡泡,并可直接灭高炉�
   eq(s3.trapped, true, '第 3 发成功困人');
   eq(s3.downed.state, BodyState.BUBBLED, '状态变为 BUBBLED');
   eq(s3.downed.bubbleStacks, 0, '层数清零');
-  /* 【task-23 定性结论:保留,不改为字面量】同 `BASE_CRIT_DMG` ——
-   * 注入 BUBBLE_TRAP_SEC 5.0→9.0 ⇒ 变红(相邻字面量断言抓住),故常量有守卫。
-   * 属 verify.ts 白名单已登记候选,非缺陷;改字面量需同步 verify.ts,不在写域。 */
-  eq(s3.downed.invulnSec, BUBBLE_TRAP_SEC, '困人计时 = 5 秒');
+  /* 【task-23 原判「保留,不改为字面量」;task-88 已改】
+   *   task-23 的顾虑是「改字面量需同步 verify.ts,不在当时写域」——
+   *   task-88 的写域已包含本文件,且 Lead 同步摘除了 `WS-10::BUBBLE_TRAP_SEC` 白名单条目。
+   *   牙口实测:注入 BUBBLE_TRAP_SEC 5.0→2.5 ⇒ 本行自红(期望 5 / 实际 2.5),源还原逐字节一致。 */
+  /* task-88:右侧原为 `BUBBLE_TRAP_SEC`(取自 revive.ts)⇒ 恒真。
+     改为字面量 5.0,来源:`docs/WS-10-combat-progress.md` §5.4 L338
+     「| `BUBBLE_GUN_SHOTS` / `BUBBLE_TRAP_SEC` | 3 发 / 5.0s | 227 泡泡水枪 |」。 */
+  eq(s3.downed.invulnSec, 5.0, '困人计时 = 5 秒(手册 §5.4 = 5.0s)');
 
   /* 227 水枪灭火:3 格内火格强度归零 */
   const cells = [

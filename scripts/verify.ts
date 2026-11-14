@@ -2698,41 +2698,63 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
      而 prompt.ts 直取该常量)是真同义反复,**已改为字面量 16 + 锚定**;
      111/112(比 SILHOUETTE_ART 字面量美术的有牙齿断言)**保留**,故此项仍在候选集里。
      注入 16→8 实测:552 变红、111/112 变红 ⇒ 两条路径都有效。 */
-  ['WS-06::ICON_SIZE', '已知:552/553 已改字面量;111/112 比 SILHOUETTE_ART 有牙齿,保留'],
+  /* ★ 2026-11-14 `WS-06::ICON_SIZE` 摘除。
+     原理由文本写「111/112 比 SILHOUETTE_ART 有牙齿,保留」—— 那是**当时**的读数。
+     task-90 已把它改成**双重锚定**形态(`tests/WS-06.test.ts:593` 字面量 16 +
+     `:595` `eq(ICON_SIZE, 16,…)`),我独立复核:
+       · 剥注释后 `eq(x, ICON_SIZE)` 形态 **0 命中**(HEAD 里有 2 处)
+       · `eq(ICON_SIZE, 16)` 字面量锚定仍在 ⇒ **是改不是删**
+       · 有牙实测:注入 `ICON_SIZE 16→8` ⇒ 运行期读回 8(生效自检)+
+         **`[WS-06] 51/64`(13 条红)** ⇒ 确实有牙;还原后 SHA-256 逐字节一致
+     ⇒ 「保留」这个判断本身没错,错的是**它已经过期而白名单没有到期机制**。 */
+
+
   /* ── WS-07 ── */
   /* PROTOCOL_VERSION 已于本批修复(WS-07:861 改为字面量 1)—— 已移出白名单 */
   /* ── WS-09 ── */
   ['WS-09::A4_MIDI', '已知:断言右侧取自 audio.ts,待换字面量'],
-  ['WS-09::ICON_SIZE', '已知:断言右侧取自 entity_sprites.ts,待换字面量'],
-  ['WS-09::NO_DYE', '已知:断言右侧取自 dye_overlay.ts,待换字面量'],
   ['WS-09::PITCH_COUNT', '已知:断言右侧取自 audio.ts,待换字面量'],
-  ['WS-09::ROOF_MIN_ALPHA', '已知:断言右侧取自 roof_transparency.ts,待换字面量'],
-  ['WS-09::SLOTS_PER_ROW', '已知:断言右侧取自 inventory.ts,待换字面量'],
   /* ── WS-10 ── */
   ['WS-10::BASE_CRIT_DMG', '已知:断言右侧取自 weapons.ts,待换字面量'],
-  ['WS-10::PRANK_HAMMER_KNOCKBACK',
-    '已双重锚定:同伴字面量断言 eq(PRANK_HAMMER_KNOCKBACK, 8.0) 使改常量必红,'
-    + '故本条无区分力缺口 —— 与 REFLECT_RADIUS 同一修法'],
-  ['WS-10::REFLECT_RADIUS',
-    '已双重锚定:同伴字面量断言 eq(REFLECT_RADIUS, 3) 使改常量必红'],
-  ['WS-10::BUBBLE_TRAP_SEC', '已知:断言右侧取自 revive.ts,待换字面量'],
-  ['WS-10::GHOST_MOVE_MUL', '已知:断言右侧取自 revive.ts,待换字面量'],
+  /* ★ 2026-11-14:以下 2 条**已移出**(原为多行 `+` 拼接形态)。
+     它们的理由文本自己写着「已双重锚定…故本条无区分力缺口」——
+     即作者当时已判定"不是缺口而保留作记录"。但本表的语义是**抑制命中**,
+     已不再命中的条目留在表里 = 让「白名单条数」这个数字**名不副实**,
+     且会掩盖真实的漂移(门禁每次都报「失真 N 处」,久了没人看)。
+     ⇒ 「这是已知且正当的」应当写在**被观察对象附近**(测试文件里),
+       不是写在**抑制表**里。
+     ⚠️ 且它们用的是多行 `+` 拼接形态 —— 正是 `ORPHAN_KNOWN` 解析器
+        曾经**静默丢弃**的那种写法(PROGRESS 已记录)。本表因用 `startsWith` 逐行判
+        而侥幸读到,但**同一族风险**真实存在:登记形态本身也是审计对象。 */
   /* `WS-10::REFLECT_RADIUS` 已移出:Lead 改成字面量 3 + `eq(REFLECT_RADIUS, 3)` 双重锚定。
      实证注入 3.0→6.0 ⇒ 44/44 变 43/44(修复前是 44/44 全绿)。 */
   /* ── WS-11 ── */
-  ['WS-11::BEAVER_RECLAIM_QTY', '已知:断言右侧取自 rush_order.ts,待换字面量'],
-  ['WS-11::BOMB_FUSE_SEC', '已知:测试把常量作为输入透传,待换字面量'],
-  ['WS-11::CHAIN_BREAK_PENALTY', '已知:断言右侧取自 rush_order.ts,待换字面量'],
-  ['WS-11::CROWN_PICKUP_COOLDOWN_SEC', '已知:断言右侧取自 modes.ts,待换字面量'],
-  ['WS-11::HELMET_SELF_PARALYZE_SEC', '已知:断言右侧取自 toys.ts,待换字面量'],
-  ['WS-11::MAILBOX_CAPACITY', '已知:断言右侧取自 afk.ts,待换字面量'],
-  ['WS-11::SNOWBALL_FREEZE_SEC', '已知:断言右侧取自 toys.ts,待换字面量'],
-  ['WS-11::Z2_REACH_TARGET', '已知:断言右侧取自 rush_order.ts,待换字面量'],
   /* ── WS-FND-01 ── */
-  ['WS-FND-01::CONTENT_FINGERPRINT_VERSION', '已知:断言右侧取自 registry.ts,待换字面量'],
   /* ── WS-FND-02 ── */
-  ['WS-FND-02::HISTORY_CAPACITY', '已知:断言右侧取自 bus.ts,待换字面量'],
-  ['WS-FND-02::MAX_EVENTS_PER_FRAME', '已知:断言右侧取自 bus.ts,待换字面量'],
+
+  /* ─────────── ★ 2026-11-14 新揭出的 6 条(旧判据假阴性)───────────
+   * 来源:我修 `checkTautology` 的第 2 顶层实参解析后,这 6 条**首次**被报出来。
+   * 为什么旧判据会漏:`/eq|near\(\s*[^,]+,…/` 的 `[^,]+` 遇**第一个**逗号即停,
+   * 于是「第 1 实参本身含调用」的写法下,它读到的要么是**内层实参名**
+   * (如 `dodgy`),要么**一个都读不到** ⇒ 真命中被静默丢弃。
+   * ★ 所以旧判据的错**不只是"多报 74 处"**,还有这一侧:
+   *   「把真命中替换成内层变量名,然后过滤掉」= **静默漏报**。
+   * ⚠️ 这 6 条**尚未修**,故理由写「待修」而非「已知正当」——
+   *    白名单的语义是「已知且已解释」,拿它盖住未处理的欠账就是掩盖。
+   * 归口:WS-09 ×2 → client-stage;WS-10 ×3 → combat-progress;
+   *       WS-FND-07 ×1 → (见该条目内注)。 */
+  ['WS-09::ORTHO_DISTANCE',
+    '★ 待修(2026-11-14 新揭出):旧判据 `[^,]+` 遇逗号即停 ⇒ `near(Math.hypot(pos.x, pos.y, pos.z), ORTHO_DISTANCE, …)` 这种**第 1 实参带嵌套调用**的写法,旧正则**一个名字都读不到** ⇒ 静默漏报。已与 HEAD 逐行比对确认是**既有**缺陷,非本轮引入。'],
+  ['WS-09::TRANSPARENT_INDEX',
+    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(e.get(0, 0), TRANSPARENT_INDEX)` 第 1 实参含调用 ⇒ 旧正则读不到)。HEAD 已存在。'],
+  ['WS-10::MAX_CRIT_DMG',
+    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(combatantStats(30, [718, 730], {critDmg: 5.0}).critDmg, MAX_CRIT_DMG, …)`)。HEAD 已存在。'],
+  ['WS-10::MAX_CRIT_RATE',
+    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(combatantStats(30, [], {critRate: 1e9}).critRate, MAX_CRIT_RATE, …)`)。HEAD 已存在。'],
+  ['WS-10::MAX_DODGE_RATE',
+    '★ 待修(2026-11-14 新揭出):同族假阴性 —— 旧正则在这行读到的名字是内层变量 `dodgy`,而不是真正的第 2 顶层实参 `MAX_DODGE_RATE`。⚠️ terrain-physicist 另报:该文件 `:1201-1205` 有注释称「原断言是空断言,已修」,故这一处**可能是第二处未改干净**的,归 combat-progress 核。HEAD 已存在。'],
+  ['WS-FND-07::OBSIDIAN_ID',
+    '★ 待修(2026-11-14 新揭出):同族假阴性。HEAD 已存在。'],
 ]);
 
 /** 收集生产模块(server/src + client/src)的数值型导出常量:`<文件>::<名>` → 表达式。 */
@@ -3412,10 +3434,101 @@ function checkTautology(): void {
       for (const m of l.matchAll(/\b([A-Za-z_]\w*)\b/g)) if (nameToMod.has(m[1])) bodyRefs.add(m[1]);
     });
 
+    /* ★ 2026-11-14 根治(client-stage task-87 报告 + Lead 独立复核):
+       原判据是 `/eq|near\(\s*[^,]+,\s*([A-Za-z_]\w*)\s*[,)]/` ——
+       `[^,]+` **遇到第一个逗号就停** ⇒ 它求的不是「第 2 个**顶层**实参」,
+       而是「**第一个逗号之后紧跟的那个标识符**」。这两者在**有嵌套调用**时不同:
+
+       ```
+       eq(computeSlotLayout(320, SLOTS_PER_ROW, INVENTORY_SPARE_ROWS).rows, 21, '…')
+          ↑ 正则以为第 2 参 = SLOTS_PER_ROW
+          ↑ 实则第 2 参 = 字面量 21(SLOTS_PER_ROW 是内层调用的第 2 个实参)
+       ```
+
+       ## 实测影响(我独立复算,不采信报告)
+
+       ```
+       门禁总命中 1041 处 / 假阳性 74 处 ⇒ **7.1%**
+       按套件:WS-09 20 · WS-03 10 · WS-11 8 · WS-07 7 · WS-08 6 · WS-FND-06 6
+               WS-06 5 · WS-02 4 · WS-10 3 · WS-04 2 · WS-05 2 · WS-13 1
+       ★ 且它**实际造成过噪声**:白名单里 `WS-09::SLOTS_PER_ROW` 这一条,
+         命中的 4 处(L1692-1695)**全部**是假阳性 ⇒
+         该条目**仅为假阳性而存在**(移出后门禁转绿 —— 见该条目处的说明)。
+       ```
+
+       ## 为什么必须修根因而非加白名单
+
+       假阳性是**多报**。多报的直接后果不是"报错",而是
+       **把一个本来不含同义反复的常量推进白名单** ⇒
+       此后该常量**将来**真的出现同义反复时,门禁**不会报** ——
+       闸门被一条错误条目**永久占位**。
+       ⇒ 与本仓形态 4「判据表述对不上它要声称防的东西」同族:
+         「第 2 个参数」这个**表述**对不上它实际在读的东西。
+
+       ## 修法:顶层实参切分(括号/中括号/大括号/字符串感知)
+
+       只认**深度 0** 的逗号 ⇒ 拿到的才是真正的第 2 个顶层实参。
+
+       ⚠️ **我自己在这处犯过同一个错,而且是被门禁读数抓出来的**
+       (本仓陷阱 124b:「读数离谱时,第一嫌疑是自己的测量口径」):
+
+       我的第一版函数名叫 `secondTopArg`,但循环体在遇到**第一个**深度 0 的逗号时
+       就 `return cur.trim()` ⇒ 它返回的是**第 1 个**实参,不是第 2 个。
+       实测后果:门禁命中从 **4 暴涨到 173**,而 `WS-10::BASE_CRIT_DMG`
+       从"命中"翻成"stale"(因为 `eq(edgeLow.critMul, BASE_CRIT_DMG)`
+       被读成第 1 参 `edgeLow.critMul` —— 不是裸标识符 ⇒ 被过滤掉)。
+
+       ★ 我是用**已知答案的真值表**定位到它的(7 个用例,期望值手写):
+
+       | 用例 | 期望第 2 参 | 我的错版 | 正确版 |
+       | :--- | :--- | :--- | :--- |
+       | `eq(a, b)` | `b` | `a` ✗ | `b` ✓ |
+       | `eq(REFLECT_RADIUS, 3)` | `3` | `REFLECT_RADIUS` ✗ | `3` ✓ |
+       | `eq(edgeLow.critMul, BASE_CRIT_DMG, …)` | `BASE_CRIT_DMG` | `edgeLow.critMul` ✗ | `BASE_CRIT_DMG` ✓ |
+
+       ⇒ 错版 **7/7 全错**,正确版 **7/7 全对**。错误率 100% 这个读数本身
+         就是"这不是边界情况、是整体偏移"的信号 —— 与"7.1%"完全不同性质。
+       ⇒ **教训**:凡是"取第 N 个 X"的函数,写之前先列**含嵌套/含字符串逗号**的真值表。 */
+    const topArgAt = (s: string, openIdx: number, n: number): string | null => {
+      let depth = 0;
+      let argIdx = 0;
+      let cur = '';
+      let inStr: string | null = null;
+      for (let i = openIdx + 1; i < s.length; i++) {
+        const c = s[i]!;
+        const p = s[i - 1];
+        if (inStr !== null) {
+          if (c === inStr && p !== '\\') { inStr = null; continue; }
+          cur += c;
+          continue;
+        }
+        if (c === "'" || c === '"' || c === '`') { inStr = c; cur += c; continue; }
+        if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
+        if (c === ')' || c === ']' || c === '}') {
+          if (depth === 0 && c === ')') return argIdx === n ? cur.trim() : null;
+          depth--;
+          cur += c;
+          continue;
+        }
+        if (c === ',' && depth === 0) {
+          if (argIdx === n) return cur.trim();
+          argIdx++;
+          cur = '';
+          continue;
+        }
+        cur += c;
+      }
+      return null;
+    };
+
     lines.forEach((l, i) => {
       if (importLines.has(i)) return;
-      for (const m of l.matchAll(/\b(?:eq|near)\s*\(\s*[^,]+,\s*([A-Za-z_]\w*)\s*[,)]/g)) {
-        const cn = m[1];
+      for (const m of l.matchAll(/\b(?:eq|near)\s*\(/g)) {
+        const openIdx = (m.index ?? 0) + m[0].length - 1;
+        const arg2 = topArgAt(l, openIdx, 1);   /* ★ 0-based ⇒ 1 = 第 2 个 */
+        if (arg2 === null) continue;
+        if (!/^[A-Za-z_]\w*$/.test(arg2)) continue;   /* ★ 顶层第 2 参必须是裸标识符 */
+        const cn = arg2;
         if (!bodyRefs.has(cn)) continue;
         const mod = nameToMod.get(cn)!;
         if (!numExports.has(`${mod}::${cn}`)) continue;
@@ -3445,6 +3558,42 @@ function checkTautology(): void {
 
   const unlisted = [...found.keys()].filter((k) => !TAUT_SUSPECT_EXEMPT.has(k)).sort();
 
+  /* ★★★ 2026-11-14 修**崩溃级**缺陷:`ReferenceError: reachHint is not defined`
+
+     原代码在本节引用了 `reachHint`,而它声明在 `checkReachability`(L2291)的
+     **函数作用域内**(L2404)⇒ `checkTautology` 引不到它 ⇒ **必崩**。
+
+     ## ⚠️ 这条**不是我引入的** —— A/B 实测证明
+
+     ```
+     变体 1  HEAD 原样               ⇒ unlisted=0,该分支不执行,不崩
+     变体 2  HEAD + 清空白名单        ⇒ ★★ **同样崩**
+             (强制 unlisted>0)         ReferenceError: reachHint is not defined
+     ```
+     ⇒ 触发条件恰好是 `unlisted.length > 0`(**有未登记候选**),
+       而 HEAD 时白名单数与命中数恰好对齐 ⇒ 该分支**从未执行过** ⇒ 潜伏至今。
+     (terrain-physicist 独立发现同一条,给了我行号对照;我做了上面的 A/B 归因。)
+
+     ## 为什么这条比"普通红"严重
+
+     ```
+     崩溃点在 `[同义反复候选]` 节 ⇒ **它之后的所有检查节一条都不执行**,
+     而退出码仍是 1 ⇒ 表现成「门禁正常报红」,实际是**门禁没跑完**。
+     ⇒ 且触发条件正是「有未登记候选」= **越需要它报的场合越崩**。
+     ⇒ 形态 4「判据表述对不上它要声称防的东西」的极端形态:
+       **判据在最该干活的时候自己坏掉,并伪装成"正常报红"。**
+     ```
+
+     ## 修法:给了**语义正确**的新常量,而不是把旧常量提为共用
+
+     `reachHint` 的内容讲的是**可达性**那个数会一起变。改同义反复白名单
+     **不会**让可达性数字变 ⇒ 原写法是**串味的复制粘贴**。
+     本节该指的是 README 里**它自己那一行**(`README.md:169`「同义反复候选 34 条」)。
+     ⇒ 若只是"把旧常量提到模块级"能消掉崩溃,但会**把错误的指路留下**。 */
+  const tautHint = '★ 同时注意:README「同义反复候选」那一行(约 `README.md:169`)'
+    + '也要同步改 —— 它记的是命中数与白名单数,与本节是**同一根因的两个投影**;'
+    + '否则下一次运行还会再红一次。';
+
   if (stale.length > 0) {
     fail(`同义反复白名单失真(${stale.length} 处,应修正):${stale.join('; ')}`);
   } else if (unlisted.length > 0) {
@@ -3452,7 +3601,7 @@ function checkTautology(): void {
       fail(
         `新增未登记的同义反复候选 ${unlisted.length} 个(--strict-taut):`
         + `${unlisted.slice(0, 4).join(', ')}${unlisted.length > 4 ? ' ...' : ''}`
-        + `\n      ${reachHint}`,
+        + `\n      ${tautHint}`,
       );
     } else {
       advise(
@@ -3464,7 +3613,7 @@ function checkTautology(): void {
         console.warn(`      · ${s}  ${n}`);
       }
       if (unlisted.length > 12) console.warn(`      ... 另有 ${unlisted.length - 12} 个`);
-      console.warn(`      ${reachHint}`);
+      console.warn(`      ${tautHint}`);
     }
   }
 

@@ -766,6 +766,20 @@ test('极端速度也不产生 NaN(子步与钳制生效)', () => {
   pw.step();
   ok(Number.isFinite(b.x) && Number.isFinite(b.y) && Number.isFinite(b.z), '坐标仍有限');
   ok(Number.isFinite(b.vx) && Number.isFinite(b.vy) && Number.isFinite(b.vz), '速度仍有限');
+  /* ★ task-89:原断言 `ok(pw.lastReport.substeps <= MAX_SUBSTEPS)` 是**空断言** ——
+     substeps 的**上界就是 `MAX_SUBSTEPS` 本身**(world.ts:329-333
+     `clampInt(Math.ceil((vmax*dt)/0.25), 1, MAX_SUBSTEPS)`),
+     故该不等式对**任意**常量值恒真。实测注入 4→5 时 WS-02 仍 43/43 全绿,
+     且该场景的 substeps 已被**钳到上界**(实测 = 4,不是 1)⇒ 断言确实被行使过却仍无牙。
+     修法(与 WS-10 `MAX_DODGE_RATE` 同一修法):
+       1 断言**被钳到的具体值** 4(字面量)⇒ 钳制逻辑漂移就红;
+       2 断言常量本身 = 4(字面量)⇒ 常量漂移就红。
+     4 的独立来源:手册 `docs/WS-02-physics.md` §5 参数表(L356
+     「MAX_SUBSTEPS | 4 | 见 §4.1 推导」),以及 §4.1 伪码(L156
+     「substeps = clamp(ceil(vmax·dt / 0.25), 1, 4)」)与 L164 的推导
+     (「上限 4 步(对应 80 格/秒)」)。 */
+  eq(pw.lastReport.substeps, 4, '1e6 速度下 substeps 被钳到上界 4(手册 §4.1 L156)');
+  eq(MAX_SUBSTEPS, 4, 'MAX_SUBSTEPS 本身 = 4(手册 §5 参数表 L356)');
   ok(pw.lastReport.substeps <= MAX_SUBSTEPS, `子步数被钳制在 ${MAX_SUBSTEPS}`);
   /* 注入 NaN 也能被兜底 */
   const c = pw.spawn('nan', { x: 10, y: 10, z: 0 });

@@ -125,9 +125,28 @@ test('A3 九个剪影的规范美术全部合法(16×16 且字符在盘内)', ()
   const r = selfCheckArt();
   ok(r.ok, `剪影美术自检失败:${r.errors.join(' / ')}`);
   eq(Object.keys(SILHOUETTE_ART).length, 9, '九种剪影');
+  /* 期望值写「字面量 16」,不引 `ICON_SIZE`。
+   *
+   * 16 的独立来源(不是从被测源码抄的):
+   *   手册 §5.5「16×16 像素立牌」,本仓落点 `docs/WS-06-alchemy.md:477`
+   *   (参数表原文 `ICON_SIZE | 16 | 手册 §5.5 16×16`),同一文档 `:369`
+   *   给出 schema 规格 `minItems:16, maxItems:16` —— 两处独立于
+   *   `pixel_icon.ts`。
+   *
+   * 为什么不引 `ICON_SIZE` —— 实测给出两条理由(都不是推理):
+   *   1 本 test 上面 :126 的 `ok(r.ok, ...)` 会 throw,而 `selfCheckArt()`
+   *     内部已用 `validatePixelMatrix` 比过 `matrix.length` / `row.length`
+   *     与 `ICON_SIZE`。故「行数/行宽与常量不符」在 :126 就被拦下,
+   *     下面两条在**只改常量**的场景里根本执行不到
+   *     (实测:注入 16→8,报错出自 :126,不是这两行)。
+   *     ⇒ 引 `ICON_SIZE` 时它们对「常量被改」无区分力(被遮蔽)。
+   *   2 写字面量 16 后,它们才在「常量与美术**一起**被改成 8」这种
+   *     :126 抓不到的场景里变红 —— 那正是它们**唯一**独立于 :126 的价值。
+   *   ※ :127 的「九种剪影」计数不在本条范围内,它由形状枚举独立守着。
+   */
   for (const [name, art] of Object.entries(SILHOUETTE_ART)) {
-    eq(art.length, ICON_SIZE, `${name} 行数`);
-    for (const row of art) eq(row.length, ICON_SIZE, `${name} 行宽`);
+    eq(art.length, 16, `${name} 行数`);
+    for (const row of art) eq(row.length, 16, `${name} 行宽`);
   }
 });
 
