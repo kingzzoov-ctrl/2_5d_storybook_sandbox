@@ -142,6 +142,75 @@ function pickServerReason(src: string): string {
   return '';
 }
 
+/**
+ * ★★ 换行无关的锚点匹配 —— 修一个「锚点写对了却报 0 命中」的假失败。
+ *
+ * ## 症状
+ *
+ * T37 第 2 条用例(`把**已修好的** attack 重新塞回登记`)长期报
+ * 「探针无效:锚点命中 0 次」,而它注入的是 `scripts/verify.ts`。
+ * 但**锚点文本确实在文件里** —— 这是最误导的部分:报错说"找不到"。
+ *
+ * ## 根因(实测)
+ *
+ * ```
+ * scripts/verify.ts              CRLF=6120  bareLF=0    ← 磁盘上是 CRLF
+ * scripts/gate-selfcheck.ts      CRLF=0     bareLF=1130 ← 本文件是 LF
+ * git config core.autocrlf = true          ← 这就是两者不同的原因
+ * ```
+ * 用例里 anchor 写作字面量 `'...([\n'`(源码里的 `\n` = 一个 LF 字符),
+ * 而目标文件里那一行**结尾是 `\r\n`** ⇒ `split(anchor)` 恒为 0。
+ *
+ * 实测对照:
+ * ```
+ * anchor 带 bare LF  ⇒ 命中 0
+ * anchor 带 CRLF     ⇒ 命中 1
+ * ⇒ 是**换行不一致**,不是锚点不存在。
+ * ```
+ *
+ * ## 为什么这个 bug 特别值得记
+ *
+ * 它把一个**"环境不一致"**伪装成了**"锚点过期"**,而本文件为"锚点过期"
+ * 专门写了大量注释与自取锚点机制(见 `from` 的接口注释)。
+ * ⇒ 于是**诊断系统把注意力引向了错误的方向**:我按"锚点又过期了"的思路
+ *   查了半天,真相是 `core.autocrlf=true` 与 LF 字面量的交互。
+ * ⇒ 与陷阱 132(冻结基线把崩溃冻成预期状态)同族:
+ *   **错误的诊断标签会让修的人修错地方。**
+ *
+ * ## 修法
+ *
+ * 先按**原样**匹配(精确优先,不改既有语义);
+ * 0 命中时,把两侧的 `\r\n` 都归一成 `\n` 再试 —— 并在命中后从
+ * 归一化文本里**定位切回原文本**,保证替换的是原文。
+ * 这样:CRLF 文件、LF 文件、以及将来混行的文件,都能正确命中。
+ */
+function findAnchor(src: string, anchor: string): { at: number; len: number } | null {
+  const at = src.indexOf(anchor);
+  if (at >= 0) return { at, len: anchor.length };
+  /* 归一化重试:两侧同法归一,故下标可直接映射回原文本 */
+  const nSrc = src.replace(/\r\n/g, '\n');
+  const nAnchor = anchor.replace(/\r\n/g, '\n');
+  const nAt = nSrc.indexOf(nAnchor);
+  if (nAt < 0) return null;
+  /* 把归一化下标映射回原下标:统计 nAt 之前的 \r\n 个数 */
+  const before = nSrc.slice(0, nAt);
+  const crlfBefore = (before.match(/\n/g) ?? []).length;
+  const realAt = nAt + crlfBefore;
+  /* 原文本里对应的长度 = 归一化长度 + 该段内的 \r 个数 */
+  const nSeg = nSrc.slice(nAt, nAt + nAnchor.length);
+  const segCrlf = (nSeg.match(/\n/g) ?? []).length;
+  return { at: realAt, len: nAnchor.length + segCrlf };
+}
+
+/** 计数 = 精确匹配数;为 0 时用归一化计数(供报错文本区分两种成因)。 */
+function countAnchor(src: string, anchor: string): { n: number; normalized: boolean } {
+  const exact = src.split(anchor).length - 1;
+  if (exact !== 0) return { n: exact, normalized: false };
+  const nSrc = src.replace(/\r\n/g, '\n');
+  const nAnchor = anchor.replace(/\r\n/g, '\n');
+  return { n: nSrc.split(nAnchor).length - 1, normalized: true };
+}
+
 const CASES: Case[] = [
   /* ═══ T37:新增的「入口执行层」门禁必须能检测漂移 ═══
    *
@@ -1079,12 +1148,31 @@ for (const c of CASES) {
     failures += 1; dropLab(); continue;
   }
   if (fromText !== '') {
-    const n = src.split(fromText).length - 1;
+    const { n, normalized } = countAnchor(src, fromText);
     if (n !== 1) {
-      console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:锚点命中 ${n} 次(需恰好 1 次)`);
+      /* 区分两种成因 —— 这是本脚本存在的理由(「探针失效」不等于「门禁失职」)。
+         0 命中时明说"是不是换行不一致",否则读者会按"锚点过期"去修错地方。 */
+      const diag = n === 0
+        ? (normalized
+          ? '\n    ⚠ 归一化换行后仍命中 0 ⇒ 锚点**真的**不在了(不是 CRLF 问题)'
+          : '\n    ⚠ 但归一化换行后命中 >0 ⇒ 这是**换行不一致**(core.autocrlf=true),不是锚点过期')
+        : '';
+      console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:锚点命中 ${n} 次(需恰好 1 次)${diag}`);
       failures += 1; dropLab(); continue;
     }
-    writeFileSync(p, src.replace(fromText, c.to), 'utf8');
+    /* ★ 用 findAnchor 定位后按**下标**替换 —— 不再用 src.replace(fromText, ...),
+       因为锚点在 CRLF 文件里可能是归一化后才命中的,那时 replace 会找不到。 */
+    const hit = findAnchor(src, fromText);
+    if (!hit) {
+      console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:定位到锚点但无法切回原文本(换行映射错)`);
+      failures += 1; dropLab(); continue;
+    }
+    /* ★ 注入文本也要**跟随目标文件的换行风格** —— 否则往 CRLF 文件里塞一段 LF,
+       副本就成了混行文件。副本随后要跑真门禁,混行会让 `\n` 锚点类检查
+       时灵时不灵(正是本函数要修的那个坑的同族)。 */
+    const crlfFile = (src.match(/\r\n/g) ?? []).length > (src.match(/(?<!\r)\n/g) ?? []).length;
+    const toText = crlfFile ? c.to.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n') : c.to.replace(/\r\n/g, '\n');
+    writeFileSync(p, src.slice(0, hit.at) + toText + src.slice(hit.at + hit.len), 'utf8');
     /* 自证:读回确认内容真的变了 —— 防「空操作探针」假证据 */
     if (readFileSync(p, 'utf8') === src) probeOk = false;
   }
