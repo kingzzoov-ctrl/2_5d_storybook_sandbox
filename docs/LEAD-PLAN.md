@@ -181,6 +181,88 @@ node scripts/verify.ts --all
 
 ---
 
+## 七之二、当前进度快照(2026-11-14)
+
+> ★ 本节是**时点快照**,不是冻结契约。冻结层的数字见 `README.md`「已冻结的核心数字」,
+> 那一节受门禁校验;本节只做导航,过期不报红。**口径以 `node scripts/verify.ts --all` 的实际输出为准。**
+
+### 7.2.1 门禁状态
+
+```
+verify --all --strict-reach --strict-taut --strict-inert  ⇒ **exit 0**(~17s)
+用例 **1511 条 / 26 套件**(WS 1011 / 14 套件 · 基座 FND 500 / 12 套件)
+跨 WS 集成 38/38 · 冻结层不变量 17 · 可擦除语法全绿
+生产可达性 **88/98**(不可达 10 条已全部登记理由;白名单 10 条)
+  欠账构成:等客户端入口 0 / 等编排层接线 1 / 等服务端机制 3 / 等客户端机制 2 / 等裁决 0
+  ⇒ 10 条中 6 条欠账 + 4 条非欠账(gate-only 2 + 差集 2)
+未决台账 133 条(109 未关闭 / **0 阻塞** / 24 已关闭)
+```
+
+### 7.2.2 门禁器件清单(除 `verify.ts` 外的独立审计器)
+
+```
+scripts/typecheck-baseline-audit.ts   类型检查**基线锁**(2026-11-14 新增,见陷阱 123/124)
+scripts/gate-selfcheck.ts             门禁自检(独立复算生产文件数与非欠账分解)
+scripts/judgement_audit.ts            判据形态审计(F 类:跑了子进程但没看退出码)
+scripts/orphan-audit.ts               生产零引用清单
+scripts/doc-line-audit.ts             文档行号引用审计
+scripts/dup-export-audit.ts           同名导出审计(找「同名两处不同内容」)
+scripts/count-audit.ts                计数对账
+scripts/eol-audit.ts / bom-guard.ts   换行风格 / BOM 守卫
+scripts/ts-paths.ts                   路径口径
+scripts/selftest-exit-audit.ts        自测退出码
+scripts/clean-temp.ts                 临时残留
+scripts/content-lock.ts               内容基线锁(--capacity / --audit / --update)
+```
+
+### 7.2.3 尚未闭合的**架构级**缺口(全部有实测证据)
+
+| 缺口 | 一句话 | 证据位置 | 状态 |
+| :--- | :--- | :--- | :--- |
+| **US2 网关联动** | `RoomRuntime` 与 `WorldSim` 互不依赖 ⇒ **真服务端跑不起世界** | `docs/ARCH-GAPS.md` 六层空缺 | **task-85 调查中** |
+| **动作执行层** | `RoomAction` 22 个动作,`action` 报文**成功分支为空** ⇒ 玩家发指令服务端回 `allowed` 然后**什么都没发生**(无错误、无回执、连 `else` 都没有) | `docs/ARCH-GAPS.md` 第二层 | 待立项 |
+| **生产入口可跑性** | `room.colyseus.ts` 是可达性**根**却**自己无法被 import**(装饰器 + CJS 命名导入双阻塞)⇒ 那 4 条 handler **零测试可覆盖** | `docs/ARCH-GAPS.md` 第三层 | 待立项 |
+| **客户端联机层** | client 25 文件 9705 行,**网络痕迹全 0** ⇒ 是纯离线渲染器 | `docs/CLIENT-NET-GAP.md` | 部分(task-67/83) |
+
+★ 三条缺口**互相咬合**:动作执行层没接,所以网关联动了也"玩家按了没反应";
+而入口不可加载,所以动作执行层**结构上查不到**。立项时应一起做。
+
+### 7.2.4 已完成的接线批次(可达性 69 → 88 的构成)
+
+```
+2026-11-12  WS-06 炼金 7 条 → WorldSim.forgeAlchemy()
+            WS-05 Boss 3 条 → WorldSim 慢帧 bossRaid.tickBosses()
+            WS-08 物流 1 条 → WorldSim 慢帧 tickLogisticsStep()
+            客户端 8 模块   → three/ui_binding.ts + ui/panel_layout.ts
+            客户端入口补齐  → client/index.html + main.ts
+2026-11-13  driver.sqlite  → index.ts 注入 openNodeSqlite
+2026-11-14  WS-11 缺口 A 4 条 → WorldSim 慢帧 tickPartyStep()(task-84)
+            ★ 玩家立牌渲染(客户端首次真正画出玩家)(task-83)
+```
+
+### 7.2.5 判据纪律(踩过的坑,新增时请先读)
+
+`docs/PROGRESS.md` 已积累 **124 条陷阱**。最新 6 条与本轮直接相关:
+
+```
+119  我把「当前状态」写成「期望值」 ⇒ 墓碑(断言把缺陷态当正确值钉住)
+120  第三次踩陷阱 110(walkTs 的 build 跳过表漏掉整棵 server/src/build/)
+121  队友标了「推论,不是实测」而我差点当结论写进决策文件
+122  **改了一句理由文本,静默改掉一个被门禁校验的数字**(桶由理由文本的正则决定)
+123  本仓有**能跑、结果确定、能抓真错误**的类型检查器,**而它不在任何门禁里**
+124  **净额掩盖出现在判据设计自身**:只比总数的基线锁会被「修 1 条 + 引 1 条」骗过
+```
+
+★ 四条操作性判据(**每次派活都适用**):
+```
+A 把断言声称要守的东西**改坏** ⇒ 仍然绿 = 装饰
+B 接线类改动需要一条**被切断路径**的对照
+C 一条注入没红有**两种**解释:断言没牙 / 代码里有第二份实现顶着 —— 必须查清是哪种
+D 还原必须 **SHA-256 逐字节一致**
+```
+
+---
+
 ## 八、未决问题(留待 Lead 终审)
 
 1. **WS-06 双词条化学反应突变**的具体概率表由写手自拟,Lead 需复核是否与「Q 分档」产生数值叠加失控。
