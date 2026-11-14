@@ -4042,19 +4042,26 @@ const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([
              ⇒ ★ **A 路**的生产装配路径已存在,host 不再是恒 null。
        ```
 
-       ⚠️ **[2026-11-14 task-76 二次修订] 上面那行「已存在」**只对 A 路成立** ——
-       本仓有**两条**装配路径,把它们写成一句会**过度声称**:
-       ```
-       A 路 server/src/index.ts 的 assemble()
-            ⇒ new RoomRuntime(rtOpts, db)   rtOpts 里 `host: host`  ★ 真接上 ✓
-       B 路 server/src/net/room.colyseus.ts 的 onCreate()
-            ⇒ new RoomRuntime(rtOpts, …)   rtOpts 里 `host: this.deps?.host ?? null`
-            ⇒ 而 deps 只由 `withDeps(deps)` 注入,**全仓调用点 0 处**
-              (git grep withDeps ⇒ 只有 :129 的定义与 :272 的注释)
-            ⇒ ★ 真服务端入口链上 host **仍然恒为 null** —— 未交付
-       ```
-       ⇒ 正确陈述是**分口径**的:`生产装配路径已存在` 这句话必须带上「哪条路」。
-         台面上不可简化成一句 —— 因为两条路的结论**相反**。
+      ⚠️ **[2026-11-14 task-76 二次修订] 上面那行「已存在」**只对 A 路成立** ——
+      本仓有**两条**装配路径,把它们写成一句会**过度声称**:
+      ```
+      A 路 server/src/index.ts 的 assemble()
+           ⇒ new RoomRuntime(rtOpts, db)   rtOpts 里 `host: host`  ★ 真接上 ✓
+      B 路 server/src/net/room.colyseus.ts 的 onCreate()
+           ⇒ new RoomRuntime(rtOpts, ...)   rtOpts 里 `host: resolveRoomHost(this.deps)`
+           ⇒ 无 deps / 无 host 键 ⇒ createHost();显式 `host: null` ⇒ 保持 null
+           ⇒ ★ 真服务端入口链上 host **不再恒为 null**(2026-11-14 接上)
+      ```
+      ⇒ **但「分口径」这条纪律没有失效**:两条路**仍然是两条**(各自构造一份
+        `RoomRuntime`),台面上仍不可简化成「一条路」。变的只是两条路的结论
+        **不再相反**。`tests/WS-FND-12-wiring-paths.test.ts` 把这两件事
+        (谁接上了 / 仍是两条)都钉成了断言。
+
+      ★ 这段的三次修订本身就是教训 —— 每次只修一层:
+        一次(2026-11-12):把「index.ts **不存在**」修成「已存在」—— **论据**过期;
+        二次(2026-11-14):发现结论**分口径** —— **结论**过期(A 对 B 错);
+        三次(同日):把 B 路真的接上 —— 这时才轮到最后一层:
+                     两条路**没有合并**,所以仍不能写成一句。
 
        ⚠️ 而 task-76 顺带实测出一处**更早、更隐蔽**的问题(它与接线无关,现在就在发生):
        ```

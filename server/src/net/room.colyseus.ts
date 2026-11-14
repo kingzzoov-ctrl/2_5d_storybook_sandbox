@@ -28,6 +28,7 @@ import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions, type WorldSaveHost 
 import { DT } from '../../../shared/types/physics.ts';
 import { AccessMode } from '../db/repo.ts';
 import type { DbLike } from '../db/repo.ts';
+import { createHost } from '../index.ts';
 
 /**
  * `Room` 的**运行时值**只能从默认导出上取(`colyseus` 是 CommonJS,根入口没有命名导出):
@@ -117,32 +118,78 @@ export interface NetPersistRoomOptions {
    * `import './room.ts'`。若改成 import `WorldSim` 类型,就等于在装配层
    * 硬绑模拟层,并把 `scripts/backlog.ts` 的 US2 探针**误报为已开**。
    *
-   * ## ⚠️ 目前**没有生产调用方构造它**(task-76 订正:此段此前说错了)
+   * ## ★ 2026-11-14:B 路**已经有 host 了**(此段原结论「依然保持 null」已过期)
    *
-   * 此段原文写「`server/src/index.ts` **不存在**」—— **那句早已过期**:
-   * `index.ts` 已由 task-57 补出(`createHost` / `assemble` / `createServer`)。
-   * 但**结论仍然成立**,而且理由变了 —— 这是本条最值得记住的地方:
-   *
+   * 原结论的论据链是:
    * ```
    * task-57 之前:index.ts 不存在 ⇒ 没有任何东西能构造 host
    * task-57 之后:index.ts 存在,但它**不经过本文件** ——
-   *              它自己 `new RoomRuntime(rtOpts, db)`(index.ts:181),
-   *              与本文件是**两条平行的装配路径**
+   *              它自己 new RoomRuntime(rtOpts, db),与本文件是两条平行装配路径
+   * ⇒ 本参数在生产里依然是 undefined ⇒ host 依然保持 null
    * ```
+   * 前三行**都还对**,只有**最后一行**错了 —— 它默认了「没有注入者 ⇒ 只能是 null」。
+   * 而 `createHost()` 就在 `index.ts` 里、且**不依赖本文件**(index.ts 刻意只装到
+   * `RoomRuntime` 这一层,不碰 Colyseus)⇒ 本文件可以**单向** import 它。
+   * ⇒ 现在走 `resolveRoomHost(this.deps)`:没注入就自己构造。这就是本条的修法。
    *
-   * ⇒ 故本参数在生产里**依然**是 `undefined` ⇒ `host` 依然保持 null。
-   *   本文件的 `deps` 只由 `withDeps(deps)` 注入,而全仓 `withDeps`
-   *   的调用点 **0 处**(唯一疑似是 L272 的注释)。
+   * ⚠️ **仍不要把两句合成一句**:
+   *   · 「两条装配路径并存」**没变** —— A 路与 B 路各自 `new RoomRuntime`;
+   *   · 变的只是「两条路现在都有世界」。
+   *   `WS-FND-12` 为此保留了一整套断言,把「谁接上了、怎么接的、哪一态仍是 null」
+   *   逐条钉住;把它简化成一句会立刻红。
+   *
+   * ⚠️ 也**不要**因此以为 `withDeps` 可以删:它是**注入**通道(测试与部署层要指定
+   *   自己的 host)。它仍无调用点,但那**不再等于**「B 路无世界」——
+   *   见 `WS-FND-12` 的 FND12-4(它继续钉住「谁在注入」这个事实)。
    *
    * ⇒ ★ 教训:一句「因为 X 所以 Y」里,**X 会过期而 Y 未必过期**。
-   *   只删过期的 X 而不复核 Y,会把一条仍然正确的警告连带删掉。
-   *   正确做法是**换掉论据并保留结论**(如上)。
-   *
-   * ## 这**不算**「接线完成」:契约已正确 + 有装配位,**但没人构造 host**。
-   * 补法是在部署层调 `room.withDeps({ ...deps, host })`,
-   * 或让本文件改为复用 `index.ts` 的 `assemble()`(见 `docs/TASK47-*` 的 CR 待裁)。
+   *   而这一条更刁:过期的既不是 X 也不是 Y,是**从 X 到 Y 的那一步推理**
+   *   (「没有注入者 ⇒ 只能是 null」)—— 那种过期**换论据也修不掉**,
+   *   只能等有人真的去把能力接上。
    */
   host?: WorldSaveHost | null;
+}
+
+/**
+ * 解析 B 路的 `rtOpts.host` —— **B 路唯一的 host 判断点**。
+ *
+ * ## 为什么必须是这个函数,而不是留在 `onCreate` 的字面量里
+ *
+ * 原实现写 `host: this.deps?.host ?? null`。那一行**没法被断言**:它只存在于
+ * 一个生命周期回调内部,而回调用 Colyseus 的服务器上下文才跑得到。
+ * 于是「B 路 host 恒为 null」这件事**活过了整整一轮**,只以注释 + 一条
+ * 「源码态正则」断言(`WS-FND-12` 的 FND12-3)的形式存在。
+ * ⇒ 抽成纯函数 ⇒ 可以直接调用、直接断言(见 `WS-FND-12` 的 FND12-3b)。
+ *
+ * ## 默认值为什么是 `createHost()` 而不是 `null`
+ *
+ * `HANDOVER` §7.3 的第一层缺口写的是「B 路仍无世界」。而
+ * `server/src/index.ts` 早就有 `createHost()`:它返回**显式标注为**
+ * `WorldSaveHost` 的实现 —— 少了 `saveToDb` / `attackMobAuthorized` / `levelOf`
+ * 任何一个都会**编译期**报错。缺的从来不是能力,是**没人构造**。
+ *
+ * ## 依赖方向是单向的(这一点决定了它可行)
+ *
+ * `index.ts` 的 docblock 记载「本文件一旦 import `room.colyseus.ts`,本文件立刻
+ * 不可加载」—— 那说的是**反方向**。这里是 `room.colyseus.ts → index.ts`,
+ * 而 `index.ts` **不依赖 Colyseus**(它刻意只装到 `RoomRuntime` 这一层)。
+ * 实测:改完两条入口仍各自 `LOADED`(由门禁的「入口可加载」逐条验)。
+ *
+ * ## 三态,不是两态
+ *
+ * ```
+ * 没有 deps / deps 里没有 host 键 ⇒ createHost()      ← 生产默认
+ * deps.host === null(键在、值为 null) ⇒ null         ← **显式关闭**
+ * deps.host 有值                      ⇒ 用它          ← 注入
+ * ```
+ * 中间那一态是**负对照的入口**:`tests/WS-07.test.ts` 的 K1 用 `host: null`
+ * 证明「没有 host 时 `saveToDb`/`levelOf`/`attackMobAuthorized` 三处整段跳过」。
+ * 把它一起"修好",那条负对照就再也构造不出缺陷了。
+ */
+export function resolveRoomHost(deps?: NetPersistRoomOptions): WorldSaveHost | null {
+  if (deps === undefined) return createHost();
+  if ('host' in deps) return deps.host ?? null;
+  return createHost();
 }
 
 export type RoomCreateOptions = {
@@ -215,13 +262,14 @@ export class NetPersistRoom extends Room<RoomSchema> {
       maxPlayers: this.maxClients,
       worldSeed: options.worldSeed,
       /* US2 装配位:世界源经构造参传入。
-         ⚠️ `this.deps?.host ?? null` —— `deps` 全仓**无人注入**
-         (grep withDeps ⇒ 调用点 0),故生产里此处**恒为 null**。
-         (task-76 订正:原注释把原因写成「index.ts 不存在」,该文件已存在;
-          但结论成立,因为 index.ts 走的是**另一条**装配路径,不经本文件。)
-         不谎报:null 时 `saveToDb`/`levelOf`/`attackMobAuthorized` 三处
-         整段跳过(由 `tests/WS-07.test.ts` 的 K1 断言钉住)。 */
-      host: this.deps?.host ?? null,
+         ★ 2026-11-14:`?? null` 已换成 `resolveRoomHost(this.deps)` ——
+         B 路**不再是「恒为 null」**。三态语义见那个函数的注释:
+           没有 deps / 没有 host 键 ⇒ 生产默认 `createHost()`
+           `host: null`(键在、值为 null)⇒ 显式关闭(负对照入口,别"修"它)
+         ⚠️ 仍**不是**「两条路合并」:A 路(`index.ts` 的 `assemble()`)与
+         B 路(本文件)各自构造一份 `RoomRuntime`,这一条没变、也不该顺手变。
+         变的只是:**两条路现在都有世界**。 */
+      host: resolveRoomHost(this.deps),
     };
     this.runtime = new RoomRuntime(rtOpts, this.deps?.db ?? null);
 
@@ -415,9 +463,10 @@ export class NetPersistRoom extends Room<RoomSchema> {
  * 不写 `void deps` 会让读者以为它被用上了。
  * 真正的注入路径是 `room.withDeps(deps)`(见那里的注释)。
  *
- * ⚠️ 而 `withDeps` 本身也**无调用方** ⇒ 两条路合起来说明:
- *    **host 在 B 路恒为 null 的根因是「整条 B 路无人装配」**,
- *    不是「少了一行转发」。详见 `docs/TASK47-*` 与 `NetPersistRoomOptions.host`。
+ * ⚠️ 2026-11-14 订正:上一句**前一半仍准确**("整条 B 路无人装配"曾是真因),
+ *    但**结论已改** —— B 路现在通过 `resolveRoomHost(this.deps)` 自己构造 host,
+ *    **不再恒为 null**。`withDeps` 仍无调用方,那只是「注入通道没人用」,
+ *    不再是缺口。详见 `resolveRoomHost` 的注释与 `WS-FND-12`。
  */
 export function gameServerConfig(deps: NetPersistRoomOptions): {
   initializeGameServer: (server: { define: (name: string, handler: unknown) => void }) => void;

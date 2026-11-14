@@ -49,23 +49,29 @@
  * ## ⚠️ 但「本文件能装」≠「生产链装上了」——本仓有**两条**装配路径(task-76)
  *
  * 本文件是 **A 路**;另一条是 **B 路**:`./net/room.colyseus.ts` 的 `onCreate`。
- * 两者各写一份 `rtOpts`、各自 `new RoomRuntime(...)`,而**只有 A 路真接上 host**:
+ * 两者各写一份 `rtOpts`、各自 `new RoomRuntime(...)` —— **「两条路」这一点没变**。
  *
  * ```
- * A 路 本文件 assemble()             rtOpts.host = host         ★ 已接上 ✓
- * B 路 room.colyseus.ts:onCreate()   rtOpts.host = this.deps?.host ?? null
- *      而 deps 只由 room.withDeps(deps) 注入
- *      ⇒ `git grep withDeps` 调用点 **0 处** ⇒ B 路 host **恒为 null** ★ 未交付
+ * A 路 本文件 assemble()             rtOpts.host = host          ★ 已接上
+ * B 路 room.colyseus.ts:onCreate()   rtOpts.host = resolveRoomHost(this.deps)
+ *                                    无 deps / 无 host 键 ⇒ createHost()
+ *                                    显式 `host: null`   ⇒ 保持 null(负对照入口)
  * ```
  *
- * ⚠️ 所以「生产装配路径已存在 / host 不再是恒 null」这句话**必须带口径** ——
- *   它对 A 路成立,对 B 路不成立;台面上写成一句就是**过度声称**。
+ * ★ 2026-11-14:**B 路也接上了**。此前那行是 `this.deps?.host ?? null`,而 `deps`
+ *   只由 `withDeps()` 注入、调用点 0 处 ⇒ 「B 路 host 恒为 null」成立。
+ *   但**解法原本想错了**:缺的不是注入者,是**没人构造** ——
+ *   而 `createHost()` 就在本文件里,且本文件不依赖 Colyseus
+ *   ⇒ `room.colyseus.ts` 可以**单向** import 本文件。这就是本轮的修法。
  *
- * ⚠️ 而「把 B 路接上」**不是加一行转发**:本文件一旦 import 本行的
- *   `./net/room.colyseus.ts`(**任何**形式,哪怕只为复用装配),本文件立刻
- *   变成**不可加载**(实测,见下节第 2 条),而它是 `PROD_ENTRIES` 成员
- *   ⇒ 门禁的「入口可加载性」当场红。
- *   ⇒ 故 B 路的接法与「在 A 路里复用」互斥;这正是它仍挂着 CR 的原因。
+ * ⚠️ 所以「生产装配路径已存在 / host 不再是恒 null」这句现在对**两条路都成立**,
+ *   但**仍必须带口径**:它们是**两条**路径,不是一条(各自构造一份 `RoomRuntime`)。
+ *   `tests/WS-FND-12-wiring-paths.test.ts` 把这一点变成断言 —— 想合成一句就会红。
+ *
+ * ⚠️ 而**反方向**仍然不许:本文件一旦 import `./net/room.colyseus.ts`
+ *   (**任何**形式,哪怕只为复用装配),本文件立刻变成**不可加载**(实测,见下节第 2 条),
+ *   而它是 `PROD_ENTRIES` 成员 ⇒ 门禁的「入口可加载性」当场红。
+ *   ⇒ 可行方向**只有** `room.colyseus.ts → 本文件` 这一条;那正是本轮用的方向。
  *
  * ## 为什么不直接 import `./net/room.colyseus.ts`
  *
@@ -235,7 +241,9 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
     worldSeed: deps.worldSeed,
     /* ★ 本行就是第 9 例的修复点:host **在此被真正赋给**运行时契约字段。
        此前全仓 `server/src/**` 里没有任何地方做这件事。
-       房间侧对应行是 `host: this.deps?.host ?? null` —— 同一个 seam。 */
+       房间侧对应行是 `host: resolveRoomHost(this.deps)` —— 同一个 seam,
+       而它**也已接上**(2026-11-14),所以这块不再是「两条路分叉」,
+       只剩「两条路各写一份」这个结构性事实(见 `WS-FND-12`)。 */
     host,
   };
 

@@ -7,18 +7,21 @@
  *
  * ```
  * A 路  server/src/index.ts 的 assemble()
- *         rtOpts.host = host                      ← ★ 真接上
+ *         rtOpts.host = host                        ← ★ 真接上(2026-11-14 之前就通)
  * B 路  server/src/net/room.colyseus.ts 的 onCreate()
- *         rtOpts.host = this.deps?.host ?? null
- *         而 deps 只由 room.withDeps(deps) 注入,全仓调用点 0 处
- *         ⇒ B 路 host **恒为 null**
+ *         rtOpts.host = resolveRoomHost(this.deps)  ← ★ 2026-11-14 接上
+ *         无 deps / deps 无 host 键 ⇒ createHost()   (生产默认)
+ *         显式 host: null          ⇒ 保持 null      (负对照入口)
  * ```
  *
- * 而仓里曾有一句话把它写成**一句**:
+ * ⚠️ **历史(它说明了本套件为什么存在)**:B 路曾写
+ * `rtOpts.host = this.deps?.host ?? null`,而 `deps` 只由 `withDeps()` 注入、
+ * 全仓调用点 0 处 ⇒ **B 路 host 恒为 null**。当时仓里有一句话把它写成一句:
  * > 「生产装配路径**已存在**,host **不再是恒 null**」(`scripts/verify.ts` 旧文本)
+ * 那句话**只对 A 路成立** —— 于是本套件把「分口径」变成断言。
  *
- * 那句话**只对 A 路成立**。本套件把「分口径」这件事变成断言,
- * 使「将来任何人想把它简化成一句」时**立刻红**。
+ * ⇒ 现在两条路都有世界,但**仍是两条路**(各自 `new RoomRuntime`,没有合并)。
+ *   本套件继续钉住这一点:任何人想把它简化成一句时**立刻红**。
  *
  * ## 本套件的取证手段(2026-11-14 task-95 后已更新)
  *
@@ -49,12 +52,27 @@ import { fileURLToPath } from 'node:url';
 
 import { assemble } from '../server/src/index.ts';
 import { RoomRuntime, RoomRegistry } from '../server/src/net/room.ts';
-import { NetPersistRoom } from '../server/src/net/room.colyseus.ts';
+import { NetPersistRoom, resolveRoomHost } from '../server/src/net/room.colyseus.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
 const readSrc = (rel: string): string =>
   readFileSync(join(ROOT, rel), 'utf8').replace(/\r\n/g, '\n');
+
+/**
+ * 去掉注释后的源码 —— **判据必须看代码态**。
+ *
+ * ⚠️ 本仓踩过这一类假绿:把旧写法抄进注释,「源码态正则」照样命中。
+ * 而这里更险:被检文件与本文件的注释里**都**引着 `this.deps?.host ?? null`
+ * (那是这段历史本身)⇒ 不剥注释,`不出现`那半条断言永远红、`出现`那半条永远绿。
+ *
+ * ⚠️ 块注释用**等长空格**替换(保留换行)⇒ 行号不漂,报错信息里的 `file:line` 仍可信。
+ * `//` 分支保留 `://`(`protocol` 之类会被误伤 —— 既有写法)。
+ */
+const readCode = (rel: string): string =>
+  readSrc(rel)
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
 
 /** 固定时钟 —— 消除时间不确定性。 */
 const fixedClock = (t = 1_700_000_000_000): { nowMs: () => number } => ({ nowMs: () => t });
@@ -77,30 +95,52 @@ test('FND12-2 A 路的 host 是可用的(有 saveToDb / levelOf / attackMobAutho
   eq(typeof a.host.attackMobAuthorized, 'function', 'host.attackMobAuthorized 应是函数');
 });
 
-/* ═══════════ 2. B 路:host 恒为 null(源码态 + 无注入者)═══════════ */
+/* ═══════════ 2. B 路:host **由 `resolveRoomHost` 决定**(源码态 + 行为态) ═══════════ */
 
-test('FND12-3 B 路的 rtOpts.host 是 `this.deps?.host ?? null`(源码态)', () => {
-  /* 变红条件:有人把 B 路的 host 改成别的来源(例如真的接上了)——
-     **那条改动就该同时改本断言**,否则本套件会一直替旧事实作证。 */
-  const src = readSrc('server/src/net/room.colyseus.ts');
-  ok(/host:\s*this\.deps\?\.host\s*\?\?\s*null/.test(src),
-    'B 路 rtOpts.host 应仍为 `this.deps?.host ?? null`(若已接线,请同步本断言)');
+test('FND12-3 B 路的 host **不再是 `?? null`** —— 由 `resolveRoomHost` 决定(代码态)', () => {
+  /* 变红条件:有人把 `host: resolveRoomHost(this.deps)` 改回任何直连 null 的形态。
+     ⚠️ 判据必须查**代码态**:本文件与被检文件的注释里都还引着旧写法
+        `this.deps?.host ?? null`(那是这段历史本身)⇒ 查原文会**假绿**。 */
+  const code = readCode('server/src/net/room.colyseus.ts');
+  ok(/host:\s*resolveRoomHost\(this\.deps\)/.test(code),
+    'B 路 rtOpts.host 应走 `resolveRoomHost(this.deps)`');
+  ok(!/this\.deps\?\.host\s*\?\?\s*null/.test(code),
+    'B 路**代码态**不应再出现 `this.deps?.host ?? null`(那会把 B 路退回「恒为 null」)');
 });
 
-test('FND12-4 `withDeps` 在全仓**零调用点** ⇒ B 路的 deps 无人注入', () => {
-  /* 变红条件:有人真的调了 withDeps(那就该更新本断言,并宣布 B 路已接上)。
-     ⚠️ 判据必须**排除定义处与注释**:git grep 实测只有 :定义 与 :注释 两处。
-     这里逐行分类,而不是「出现次数 > 1 就算有调用」——
-     那种口径会把注释也算成调用(本仓已犯过「提取口径比事实宽」的错)。 */
+test('FND12-3b B 路无注入时**构造出** host;而显式 `host: null` 仍为 null(三态)', () => {
+  /* 变红条件:
+       1 `resolveRoomHost` 退化成恒 null(B 路又没世界了);
+       2 把「显式关闭」那一态也"顺手修好" —— 那会让 WS-07 的 K1 负对照
+         再也构造不出缺陷(负对照必须能**主动**造出缺陷)。 */
+  const noDeps = resolveRoomHost(undefined);
+  ok(noDeps !== null, '没有 deps 时应构造出 host(不再是 null)');
+  const h1 = noDeps as NonNullable<typeof noDeps>;
+  eq(typeof h1.saveToDb, 'function', '构造出的 host.saveToDb 应是函数');
+  eq(typeof h1.levelOf, 'function', '构造出的 host.levelOf 应是函数');
+  eq(typeof h1.attackMobAuthorized, 'function', '构造出的 host.attackMobAuthorized 应是函数');
+
+  const noHostKey = resolveRoomHost({ clock: fixedClock(), db: null, ownerId: 'o' });
+  ok(noHostKey !== null, 'deps 里没有 host 键时也应构造 host(**键缺席 ≠ 显式关闭**)');
+
+  const explicit = resolveRoomHost({ clock: fixedClock(), db: null, ownerId: 'o', host: null });
+  eq(explicit, null, '★ 显式 `host: null` 必须**保持** null —— 它是负对照的唯一入口');
+});
+
+test('FND12-4 `withDeps` 仍零调用点 —— 但**这已不再是缺口**(它只是注入通道之一)', () => {
+  /* 变红条件:有人真的调了 withDeps(该更新本断言,并说明注入来源)。
+     ⚠️ 2026-11-14 之前本断言的含义是「⇒ B 路 host 恒为 null」。那句结论
+        **已不成立**:现在 `resolveRoomHost` 在无注入时自己构造 host(见 FND12-3b)。
+        本断言留着,是因为「谁在注入 deps」这个事实仍值得被看见 ——
+        但**不许**再拿它当「B 路无世界」的证据。
+     ⚠️ 判据必须排除定义处与注释:这里逐行分类,而不是「出现次数 > 1 就算有调用」——
+        那种口径会把注释也算成调用(本仓已犯过「提取口径比事实宽」的错)。 */
   const files = ['server/src/net/room.colyseus.ts', 'server/src/index.ts'];
   const callSites: string[] = [];
   for (const f of files) {
-    const code = readSrc(f)
-      .replace(/\/\*[\s\S]*?\*\//g, ' ')      // 块注释
-      .replace(/(^|[^:])\/\/[^\n]*/g, '$1');  // 行注释(保护 `://`)
-    code.split('\n').forEach((l, i) => {
+    readCode(f).split('\n').forEach((l, i) => {
       if (!/withDeps/.test(l)) return;
-      /* 定义处:withDeps(deps: …): this {  —— 它含 `): this` 或 `{` 收尾 */
+      /* 定义处:withDeps(deps: ...): this { —— 它含 `): this` 或 `{` 收尾 */
       if (/withDeps\s*\([^)]*\)\s*:\s*this\s*\{/.test(l)) return;
       callSites.push(`${f}:${i + 1}: ${l.trim()}`);
     });
