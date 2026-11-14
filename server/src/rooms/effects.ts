@@ -38,6 +38,51 @@ export const ONSEN_MAX_HP_MUL = 1.3;
  */
 export const ONSEN_BUFF_SEC = 1200;
 
+/**
+ * 手册 §3.8 的 **9 种动态房间 —— 每一种都必须在这里有一条决定**。
+ *
+ * ## 为什么需要这张表(而不是「实现了 3 种就算数」)
+ *
+ * `shared/constants/bosses.ts` 的 `ROOM_RECIPES` 有 **9** 条(冻结层,不可改)。
+ * 而本文件此前只处理了其中 **3** 条的数值效果(温泉 / 卧室 / 锻造房),
+ * 另外 6 条**没有任何读者** —— 玩家盖出【欢聚大锅食堂】站进去,说明书承诺的
+ * 「Boss 战前全团 +40% 大餐」不会发生,而**门禁全绿、也不报错**。
+ *
+ * ⇒ 这张表把「另外 6 条怎么办」从**沉默**变成**决定**:
+ *   · `PLAYER_NUMERIC` —— 有可观测数值,本文件实现它;
+ *   · `SYSTEM_UNLOCK`  —— 它的 bonus 是**解锁一个系统**(商店/物流/炼金/饲养),
+ *     而那个系统在仓库里**还不存在** ⇒ 明确写出来,不假装已实现;
+ *   · `DISPLAY_ONLY`   —— 它本来就不产生玩家数值(画廊展示)。
+ *
+ * ⚠️ 判据是**覆盖性**,且对着**冻结层**核:`tests/WS-FND-17` 断言
+ *    `ROOM_RECIPES` 的每个 key 都在这张表里。⇒ 将来手册加了第 10 种房间,
+ *    这里会**当场红**,而不是悄悄多一条没人处理的 key。
+ */
+export const ROOM_EFFECT_DECISION: Readonly<Record<string, {
+  kind: 'PLAYER_NUMERIC' | 'SYSTEM_UNLOCK' | 'DISPLAY_ONLY';
+  /** 该房间的增益内容 + (若非 PLAYER_NUMERIC)缺什么。 */
+  purpose: string;
+}>> = Object.freeze({
+  FORGE_MASTER: { kind: 'PLAYER_NUMERIC', purpose: '解锁中高级武器护甲与魔能电路锻造(`forgeUnlocked`)' },
+  COZY_CANTEEN: { kind: 'PLAYER_NUMERIC', purpose: '大餐:站内**且带着料理 buff** 时攻击 / 生命上限 ×1.4(见 `CANTEEN_MEAL_MUL`)' },
+  COZY_BEDROOM: { kind: 'PLAYER_NUMERIC', purpose: '每秒回 15 HP(`BEDROOM_HEAL_PER_SEC`)+ 打盹状态(`napping`)' },
+  SAKURA_ONSEN: { kind: 'PLAYER_NUMERIC', purpose: '泡澡获 20 分钟生命上限 ×1.3(`ONSEN_MAX_HP_MUL` / `ONSEN_BUFF_SEC`)' },
+  ECO_RANCH: { kind: 'SYSTEM_UNLOCK', purpose: '圈养动物自动进食 + 每日产出毛团/温泉橘 —— **需饲养与产出的日结系统**,仓库里没有 ⇒ 未实装' },
+  ART_GALLERY: { kind: 'DISPLAY_ONLY', purpose: '像素画作与自定义纹章**展示** —— 按手册不产生玩家数值' },
+  ALCHEMY_LAB: { kind: 'SYSTEM_UNLOCK', purpose: '大模型自由炼金 + 全服首创冠名陈列 —— **需 LLM 与陈列系统** ⇒ 未实装' },
+  AUTO_GREENHOUSE: { kind: 'SYSTEM_UNLOCK', purpose: '全天候透光 + 自动洒水与分拣物流 —— **需物流系统** ⇒ 未实装' },
+  CLOUD_DEPOT: { kind: 'SYSTEM_UNLOCK', purpose: '上架稀有材料与奇物供购买 —— **需商店/交易系统** ⇒ 未实装' },
+});
+
+/**
+ * 【欢聚大锅食堂】的大餐倍率(手册:「Boss 战前全团 +40% 攻击/生命上限大餐」)。
+ *
+ * ⚠️ 触发条件是**站里 + 带着料理 buff**,不是"站里就给":手册说的是**大餐**
+ *    —— 而大餐是 `cooking.ts` 的产物。这条区分很重要:否则玩家空手站在食堂里
+ *    就能白拿 +40%,而那是另一条规则。
+ */
+export const CANTEEN_MEAL_MUL = 1.4;
+
 /** 一个玩家的房间效果状态(由 `WorldSim` 按玩家持有)。 */
 export interface RoomEffectState {
   /** 温泉剩余秒数(>0 时 maxHp 按 `ONSEN_MAX_HP_MUL` 放大) */
@@ -47,11 +92,16 @@ export interface RoomEffectState {
   /** 本帧是否站在卧室里 */
   inBedroom: boolean;
   /** 本帧是否站在锻造房里 */
+  /** 本帧是否站在锻造房里 */
   inForge: boolean;
+  /** 本帧是否站在食堂里(【欢聚大锅食堂】) */
+  inCanteen: boolean;
 }
 
 export function createRoomEffectState(): RoomEffectState {
-  return { onsenSec: 0, inOnsen: false, inBedroom: false, inForge: false };
+  return {
+    onsenSec: 0, inOnsen: false, inBedroom: false, inForge: false, inCanteen: false,
+  };
 }
 
 /** 一帧的输入:玩家在哪、所站格属于哪个房间。 */
@@ -60,6 +110,13 @@ export interface RoomEffectInput {
   roomKey: string | null;
   /** 本帧时长(秒)。 */
   dt: number;
+  /**
+   * 玩家**当前是否带着料理 buff**(由调用方从他身上的 `FoodBuff` 列表算)。
+   *
+   * 可选:不传 = 没有(而不是"报错")。理由:它是**加成的触发条件**,
+   * 而"没有 buff"是完全正常的状态 —— 让每个调用方都传 `false` 不产生任何信息。
+   */
+  hasMealBuff?: boolean;
 }
 
 /** 一帧的输出:本帧应施加的效果 + 新的状态。 */
@@ -69,6 +126,10 @@ export interface RoomEffectResult {
   healHp: number;
   /** 生命上限倍率(1.0 表示无加成) */
   maxHpMul: number;
+  /** 本帧是否打盹(卧室。手册:「每秒恢复 15 HP **并进入打盹状态**」) */
+  napping: boolean;
+  /** 大餐乘区(食堂 **且** 带着料理 buff);1.0 = 无 */
+  mealMul: number;
   /** 是否解锁中高级锻造 */
   forgeUnlocked: boolean;
 }
@@ -104,6 +165,7 @@ export function stepRoomEffects(st: RoomEffectState, input: RoomEffectInput): Ro
   const inOnsen = key === 'SAKURA_ONSEN';
   const inBedroom = key === 'COZY_BEDROOM';
   const inForge = key === 'FORGE_MASTER';
+  const inCanteen = key === 'COZY_CANTEEN';
 
   /*
    * 温泉计时:站在水里时**重置**为满时长(手册:泡澡获 20 分钟);
@@ -118,11 +180,16 @@ export function stepRoomEffects(st: RoomEffectState, input: RoomEffectInput): Ro
   }
 
   return {
-    state: { onsenSec, inOnsen, inBedroom, inForge },
+    state: { onsenSec, inOnsen, inBedroom, inForge, inCanteen },
     /* 卧室回血:按 dt 折算,帧率无关。 */
     healHp: inBedroom ? BEDROOM_HEAL_PER_SEC * dt : 0,
+    /* 打盹:与回血**同源** —— 手册把两者写在同一句里,不拆成两个判据。 */
+    napping: inBedroom,
     /* 生命上限倍率:站在温泉里 **或** 泡澡增益未过期都生效。 */
-    maxHpMul: maxHpMulOf({ onsenSec, inOnsen, inBedroom, inForge }),
+    maxHpMul: maxHpMulOf({ onsenSec, inOnsen, inBedroom, inForge, inCanteen }),
+    /* 大餐乘区:食堂 **且** 带着料理 buff —— 手册说的是「大餐」,
+       而大餐是 `cooking.ts` 的产物 ⇒ 空手站在食堂里**不该**拿到 +40%。 */
+    mealMul: inCanteen && input.hasMealBuff === true ? CANTEEN_MEAL_MUL : 1.0,
     forgeUnlocked: inForge,
   };
 }

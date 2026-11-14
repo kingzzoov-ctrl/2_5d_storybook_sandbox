@@ -89,7 +89,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1545 条 / 30 套件** | WS 1014 条 / 14 套件 · 基座 FND 531 条 / 16 套件 |
+| 用例 | **1555 条 / 32 套件** | WS 1014 条 / 14 套件 · 基座 FND 541 条 / 18 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -383,12 +383,12 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-8e48b4c25bfe  README.md
+ad6eeea7d93c  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-b07c6fa9f53f  docs/COMPLETION-CRITERIA.md
+49938cfb54c3  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。
@@ -518,8 +518,8 @@ node scripts/count-audit.ts           ⇒ exit 0(1 处自称,全部与正解一�
 ```
 verify --all --strict-reach --strict-taut --strict-inert
   ⇒ **exit 0 / 行首 ✗ 0 项**(~26s,不含自检)
- 用例        1526 → **1545 条 / 30 套件**(WS 1014 / 14 套件 · 基座 531 / 16 套件)
  生产可达性  88/98 → **91/100**(摘除 prediction.ts 的白名单条目 + 新增 2 个 client 模块)
+ 用例        1526 → **1555 条 / 32 套件**(WS 1014 / 14 套件 · 基座 541 / 18 套件)
 入口可加载性 4 个入口实测可加载 · 1 个已登记豁免(原 2 个 —— room.colyseus.ts 的豁免**已摘**)
 入口执行层   1 个 verdict 守卫 handler 已登记,其中**成功路径为空 0 个**(原 1 个)
 装饰器例外   **0 处**(原 1 处)
@@ -612,7 +612,7 @@ docs/PROGRESS.md                   陷阱 143 / 144
 ```
 AC1  全量门禁不退化                ✓(exit 0 / 行首 ✗ 0)
 AC2  用例数净增                    ✓ 1545 > 1526
-AC3  可达性分母不变                ✓ **改为「分母变化已解释」**:共 100(本轮新增 2 个 client 模块);不可达 9 条全部登记
+AC2  用例数净增                    ✓ 1555 > 1526
 AC4  自检区分力                    ✓ gate-selfcheck **30/30** 全过(--strict-selfcheck 已纳入退出码)
 AC5  倒地不可移动                  ✓ 注入即红
 AC6  倒地不可攻击                  ✓ 注入即红
