@@ -3031,6 +3031,86 @@ function checkClientBuild(): void {
 }
 
 /**
+ * **类型检查基线锁**(2026-11-14 新增,用户裁定「冻结基线接进门禁」)。
+ *
+ * ## 为什么是「基线」而不是「零错误」
+ *
+ * 实测(`scripts/typecheck.ts` 能跑且结果确定):
+ * ```
+ *   node scripts/typecheck.ts ⇒ exit 2 / **267 条**错误(三次连跑 267/267/267 ⇒ 确定)
+ *   按目录:tests/ **209(78%)** / server 27 / scripts 18 / client 10 / shared 3
+ *   缺 @types 只有 2(three)+1(better-sqlite3)⇒「装几个 @types 就好」不成立
+ * ```
+ * ⇒ 前面 `checkClientBuild` 的小标题已写明取舍:「tsc 恒红 ⇒ 拿它当门禁 =
+ *   一个永远红的门 ⇒ 没人会看它」——**那个取舍是对的**。
+ * ★ 但它漏掉了第三条路:**267 稳定 ⇒ 它可以是基线**。
+ *   判据从「零错误」变成「**不增加**」,与本仓既有的 `content-lock` 同一思路。
+ *
+ * ## ★★★ 为什么比**指纹多重集**而不是只比总数
+ *
+ * 若只比总数:**修掉 1 条 + 新引入 1 条 ⇒ 总数不变 ⇒ 静默通过**。
+ * 这不是推理,是**实测**(隔离最小工程,两条 TS2322 互换):
+ * ```
+ *   改动前 2 条 → 改动后 2 条
+ *   只比总数    : 2 → 2          ⇒ ★ **绿**(放过了!)
+ *   比指纹多重集: 新增 1 / 消失 0 ⇒ ✓ 红(抓住了)
+ * ```
+ * ⇒ 所以本锁的判据是**多重集**(指纹 → 重数),判据实现在
+ *   `scripts/typecheck-baseline-audit.ts`,此处只负责调用与透传。
+ *
+ * ## 为什么指纹里**不含行号**(实测的必要性)
+ *
+ * 含行号会让基线**极脆**:在一个旧错误上方插一行 ⇒ 其后所有错误行号 +1
+ * ⇒ 表现为「全部消失 + 全部新增」⇒ 天天误报。
+ * 实测:末尾插一行 ⇒ **绿**(本锁);这是设计取舍,不是巧合。
+ *
+ * ## 边界(如实)
+ * - `typescript` 未安装 ⇒ **跳过并说明**(本仓默认零依赖,"没装可选开发依赖"不是缺陷);
+ * - 我**没有**试图修那 267 条 —— 我未读它们的具体位置,不知道哪些是真漂移、
+ *   哪些是 tsconfig 太严 ⇒ **"能烧掉"是我不能证明的**;
+ * - 它**不替代** `vite build`:后者查语法与模块解析,本锁查类型,两者互补。
+ */
+function checkTypecheckBaseline(): void {
+  console.log('\n[类型检查基线锁]');
+  const audit = join(ROOT, 'scripts', 'typecheck-baseline-audit.ts');
+  if (!existsSync(audit)) {
+    /* 缺失 ⇒ 报红而非静默跳过:否则删掉这个文件就等于关掉了本判据。 */
+    fail('类型检查基线锁:scripts/typecheck-baseline-audit.ts 不存在 ⇒ 判据失效(不许静默跳过)');
+    return;
+  }
+  if (!existsSync(join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'))) {
+    console.log('      · 未装 typescript(本仓默认零依赖)⇒ 类型检查基线锁跳过');
+    return;
+  }
+  const r = spawnSync(process.execPath, [audit], {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 67108864, timeout: 300000,
+  });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  /* ⚠️ 必须读 status —— 本仓踩过「跑了子进程但没看退出码 ⇒ 门禁恒绿」
+     (judgement_audit 的 F 类检测器)。 */
+  if (r.status === 1) {
+    const body = out.split('\n').filter((l) => /新增|增多|✗|\+\d+/.test(l)).slice(0, 14).join('\n      ');
+    fail(`类型错误**比基线增加**了(基线锁:只准减不准增):\n      ${body}`);
+    return;
+  }
+  if (r.status !== 0) {
+    fail(`类型检查基线锁异常退出(码 ${r.status})—— 无法区分"通过"与"没跑成":\n      ${out.split('\n').filter((l) => l.trim() !== '').slice(-6).join('\n      ')}`);
+    return;
+  }
+  const line = out.split('\n').find((l) => /基线 \d+ 条 \/ 实测 \d+ 条/.test(l)) ?? '';
+  const warnLine = out.split('\n').find((l) => /已修掉/.test(l));
+  if (/✓ 类型错误未增加/.test(out)) {
+    pass(`类型错误未增加(${line.trim().replace(/^·\s*/, '').slice(0, 90)})`);
+    /* ★ 变好时**告警而不红** —— 修错不该算失败;但要说出来,否则基线会永远停在高位。 */
+    if (warnLine !== undefined) {
+      console.log(`      ⚠ ${warnLine.trim().slice(0, 140)}`);
+    }
+    return;
+  }
+  fail(`类型检查基线锁输出形态无法识别(既无"未增加"也无"增加")⇒ 不许当通过:\n      ${out.split('\n').filter((l) => l.trim() !== '').slice(0, 8).join('\n      ')}`);
+}
+
+/**
  * 检查**反作弊汇点**的入参来源。
  *
  * ## 为什么查汇点而不查转发点(实测教训)
@@ -5750,6 +5830,14 @@ checkClientTrust();
    ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件"，
       在这里跑全量客户端构建会让它变得比全量还慢。 */
 if (!frozenOnly && !docsOnly && !contentOnly && !integrationOnly && !only) checkClientBuild();
+/* ★ 类型检查基线锁(2026-11-14,用户裁定「冻结基线接进门禁」)。
+   ⚠️ 与 checkClientBuild 同样的运行条件:它要跑一次全量 tsc(~10s),属慢操作,
+      故 --frozen / --docs / --content / --only 都不跑。
+   ⚠️ 但**必须**与 checkClientBuild 一样在"全量"下跑 —— 否则它就成了
+      "没人开就不查"的摆设(那条理由见 checkClientBuild 的小标题)。
+   ★ 它补的是 checkClientBuild **明确写出的边界**:vite 不做类型检查。
+     实测证据:vite build 输出里 `error TS` 命中 **0** 次。 */
+if (!frozenOnly && !docsOnly && !contentOnly && !integrationOnly && !only) checkTypecheckBaseline();
 if (!frozenOnly && !only && !contentOnly) checkDocs();
 if (!frozenOnly && !docsOnly && !integrationOnly) await checkContent();
 if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
