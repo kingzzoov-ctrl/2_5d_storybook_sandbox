@@ -19,6 +19,7 @@ import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep, basename, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { FluidField } from '../server/src/world/fluid.ts';
 import { collectOpenItems, detectStale } from './backlog.ts';
 import { ENTRY_LOAD_EXEMPT } from './entry_load_exempt.ts';
@@ -170,6 +171,13 @@ let contentFreeCount: number | null = null;
 let strippableDirCount: number | null = null;
 /** 可擦除语法:装饰器例外条数(README `装饰器例外 N 处`)。`null` = 未跑。 */
 let decoratorExemptCount: number | null = null;
+
+/** 入口执行层:已登记的 verdict 守卫 handler 数。`null` = 未跑。 */
+let inertRegisteredCount: number | null = null;
+/** 入口执行层:其中「成功路径为空」的数量。`null` = 未跑。 */
+let inertEmptySuccessCount: number | null = null;
+/** 信任边界:实测「安全判据取自客户端输入」的处数。`null` = 未跑。 */
+let trustFromClientCount: number | null = null;
 /** 用例汇总(README `测试执行 A/A ... 共 M 个用例` + 两行小计)。`null` = 未跑。 */
 let suiteSummary: {
   total: number;
@@ -293,7 +301,30 @@ function verifyReadmeNumbers(): void {
     actual: decoratorExemptCount,
   });
 
-  /* ── 6 非欠账条数 ──
+/* ── 6 入口执行层:N 个已登记 / M 个成功路径为空 ──
+   README:`入口执行层      1 个 ✅(**成功路径为空 0 个**)`
+   ⚠️ 两个数**互相约束**(登记数 ≥ 空路径数),故一次全验 —— 与上面非欠账条数同一手法。
+   ★ 2026-11-14 接入:这两个数此前是手写、无人比对的,已陈旧过。 */
+check({
+  label: '入口执行层登记数',
+  re: /入口执行层\s+(\d+)\s*个[\s\S]{0,24}?成功路径为空\s*(\d+)\s*个/,
+  actual: inertRegisteredCount === null || inertEmptySuccessCount === null
+    ? null
+    : `${inertRegisteredCount}/${inertEmptySuccessCount}`,
+  wanted: (m) => `${m[1]}/${m[2]}`,
+});
+
+/* ── 7 信任边界:实测「取自客户端」的处数 ──
+   README:`信任边界        **取自客户端 0 处** ✅(受管字段 3 个 / 汇点 1 个 ...)`
+   ⚠️ 锚的是「取自客户端 N 处」而**不是**「受管字段 N 个」——
+      这两个量曾被混用,而那正是 README 长期陈旧的原因。 */
+check({
+  label: '信任边界取自客户端处数',
+  re: /信任边界[^\n]*?取自客户端\s*(\d+)\s*处/,
+  actual: trustFromClientCount,
+});
+
+  /* ── 8 非欠账条数 ──
      README:`**15 条中 12 条是欠账**(...),另 **3 条非欠账**。`
      ⚠️ 三个数**互相约束**:15 - 12 = 3。故一次全验,而不是只验"3"。 */
   if (nonDebtCount === null) {
@@ -317,7 +348,7 @@ function verifyReadmeNumbers(): void {
     }
   }
 
-  /* ── 7 用例汇总(四项:总条数 / 总套件 / WS 小计 / 基座小计) ──
+  /* ── 9 用例汇总(四项:总条数 / 总套件 / WS 小计 / 基座小计) ──
      README:
        测试执行        21/21 ✅  共 1382 个用例
          ├─ WS 编号套件          922 条 / 12 套件
@@ -364,6 +395,100 @@ function verifyReadmeNumbers(): void {
     fail(`README 用例汇总过期:${bad.join(';')} —— 应更新 README`);
   } else {
     pass(`README 用例汇总与实测一致(${s.total} 个用例 / ${s.suites} 套件;WS ${s.mainTotal} 条 / 基座 ${s.fndTotal} 条)`);
+  }
+}
+
+/**
+ * 校验 `docs/HANDOVER.md` §九「查验本文是否被篡改」那张 sha256 表的**自洽性**。
+ *
+ * 为什么需要:那张表的用途是让接手者判断「文档是否被人改过」——
+ * 而它自己有 **7 个手写哈希,一个都没被任何脚本比过**(实测:全仓 `sha256 前 12`
+ * 只出现在 HANDOVER 自己,没有第二个消费者)。
+ * ⇒ 一张不校验的校验表**比没有这张表更坏**:它把「没查」伪装成「查过了」,
+ *   而且**必然**会随着每一次文档改动而腐烂 —— 腐烂后照它查验,
+ *   得到的结论恰恰是它要防的那个(「文档已被篡改」)。
+ *
+ * 口径(实测确认,不是猜的):**LF 归一后的字节 sha256 前 12 位**
+ *  = 索引 blob 的字节(本仓无 `.gitattributes`,且 `core.autocrlf=true` ⇒ 索引恒为 LF)。
+ *  ⚠️ **不要**改回「工作区原始字节」:实测本机工作区是「3 个 CRLF + 4 个 LF」的**混合**状态,
+ *     而 `core.autocrlf=true` 会让**新克隆把全部文件检出成 CRLF** ⇒ 照原始字节记录的值
+ *     在新克隆上对 4 个文件**全部误报**(这张表原本就是这么烂的:7 个值里有 3 个
+ *     只在本机工作区成立)。归一化之后,记录值与检出设置无关。
+ *     ★ 实测依据:6 个未改动文件的「LF 归一」哈希与 `git cat-file blob HEAD:<path>`
+ *       **逐位相同**(7 个里第 7 个是 README,只因它本轮被改过而不同)。
+ *  ⚠️ `HANDOVER.md` **不进表**(它自己在表下注释里写明了原因:自己是校验对象)。
+ *     本检查据此断言它**不在**表里,防止有人"顺手补全"造出一个自指的表。
+ */
+function verifyHandoverHashes(): void {
+  const text = readFileSync(join(ROOT, 'docs', 'HANDOVER.md'), 'utf8');
+
+  /* 表行形态(实测:该文件里只有这 7 行符合,零误匹配 —— 故可直接全文件扫):
+       `cd57ee031c19  README.md`
+       `0e30dd7be087  docs/PROGRESS.md`  */
+  /* ★ 哈希算在「LF 归一」后的字节上 —— 口径及其实测理由见上面函数注释。 */
+  const normHash = (p: string): string =>
+    createHash('sha256')
+      .update(Buffer.from(readFileSync(p, 'utf8').replace(/\r\n/g, '\n'), 'utf8'))
+      .digest('hex')
+      .slice(0, 12);
+
+  const rows = [...text.matchAll(/^([0-9a-f]{12})[ \t]+(\S+\.md)[ \t]*$/gm)]
+    .map((m) => ({ hash: m[1]!, file: m[2]! }));
+
+  if (rows.length === 0) {
+    fail('docs/HANDOVER.md 里找不到 sha256 表 —— 表被删了?(本检查锚「12 位十六进制 + .md」的行)');
+    return;
+  }
+
+  /* ★ 期望集合**写死在这里**,而不是「表里有什么就查什么」。
+     否则删掉一行 = 少查一个文件 = **静默通过**(本仓「删断言式作弊」的老坑)。 */
+  const EXPECTED = [
+    'README.md',
+    'docs/PROGRESS.md',
+    'docs/LEAD-PLAN.md',
+    'docs/ARCH-GAPS.md',
+    'docs/CHANGE_REQUESTS.md',
+    'docs/COMPLETION-CRITERIA.md',
+    'docs/TASK-83-wasd-three-options.md',
+  ];
+
+  const structural: string[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    if (seen.has(r.file)) structural.push(`表里出现重复行:${r.file}`);
+    seen.add(r.file);
+  }
+  for (const f of EXPECTED) {
+    if (!seen.has(f)) structural.push(`表里缺行:${f}(删行就能让本检查变绿 ⇒ 必须显式补齐)`);
+  }
+  for (const f of seen) {
+    if (!EXPECTED.includes(f)) structural.push(`表里有未预期行:${f}(加文件要同步改本检查的 EXPECTED)`);
+  }
+  if (seen.has('docs/HANDOVER.md')) {
+    structural.push('HANDOVER.md 自己进了哈希表 —— 自校验不可能(表下注释已写明)');
+  }
+
+  const mismatched: string[] = [];
+  for (const r of rows) {
+    const p = join(ROOT, r.file);
+    if (!existsSync(p)) {
+      mismatched.push(`${r.file} 不存在`);
+      continue;
+    }
+    const actual = normHash(p);
+    if (actual !== r.hash) mismatched.push(`${r.file}:表 ${r.hash} / 实测 ${actual}`);
+  }
+
+  if (structural.length === 0 && mismatched.length === 0) {
+    pass(`docs/HANDOVER.md sha256 表自洽(${rows.length} 个文件,LF 归一 = 索引 blob 口径)`);
+    return;
+  }
+  if (structural.length > 0) fail(`docs/HANDOVER.md sha256 表结构异常:${structural.join(';')}`);
+  if (mismatched.length > 0) {
+    fail(
+      `docs/HANDOVER.md sha256 表与实测不符:${mismatched.join(';')}`
+      + ' —— 照这张表查验会误判「文档已被篡改」;应重算并更新(LF 归一 sha256 前 12 位)'
+    );
   }
 }
 
@@ -3352,6 +3477,11 @@ function checkClientTrust(): void {
     + `受管字段 ${Object.values(SERVER_OWNED_INPUTS).flat().length} 个 / `
     + `实测取自客户端 ${found.length} 处(已登记 ${TRUST_EXEMPT.length} 处)`;
 
+  /* ★ 2026-11-14:暴露给 README 校验 —— `信任边界` 那一节的数此前无人比对。
+     实测它把「受管字段 3 个」误读成「取自客户端 3 处」而长期陈旧,
+     而门禁一直在打**正确的 0 处** ⇒ 正确值与错误值共存,没有东西比对它们。 */
+  if (fullRun) trustFromClientCount = found.length;
+
   /* ── D2:契约表自检 —— 与另外三张白名单同款「失真即报错」──
      本表被清空 / 拼错 / 删条 / 字段名写错,判据来源就静默失效,
      而门禁仍会打印「已检查」。这些都必须 fail,不允许「数字变了但不红」。 */
@@ -4171,6 +4301,14 @@ function checkInertHandlers(): void {
     else advise('入口执行层', msg);
   }
   const gaps = [...VERDICT_HANDLER_KNOWN.values()].filter((v) => v.successPath.includes("**无**")).length;
+  /* ★ 2026-11-14:把这两个数**暴露给 README 校验**。
+     它们此前是「手写、无人比对」的数,实测已陈旧过 ——
+     README 写「3 个 / 2 个成功路径为空」,真值早已是 **1 个 / 0 个**。
+     ⚠️ 只在**全量**模式赋值:`--only` 的口径与 README(全量)不是同一个。 */
+  if (fullRun) {
+    inertRegisteredCount = VERDICT_HANDLER_KNOWN.size;
+    inertEmptySuccessCount = gaps;
+  }
   pass(
     `入口执行层登记自洽(${VERDICT_HANDLER_KNOWN.size} 个 verdict 守卫 handler 已登记;`
     + `其中 ${gaps} 个成功路径为空(真缺口,见 docs/ARCH-GAPS.md);`
@@ -6211,6 +6349,13 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
    ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件",
       而 README 的数字都是**全量**口径 ⇒ 比了必然假红。 */
 if (!frozenOnly && !only) verifyReadmeNumbers();
+
+/* ★ 2026-11-14(接手者):HANDOVER §九 的 sha256 表接链。与上面两道同性质 ——
+   「文档里手写的、看起来像校验的」数字 vs 「脚本能算出的正解」。
+   同样只在 `!frozenOnly && !only` 时跑(它比的是**全量**口径的文档,局部口径里报它会误导)。
+   ⚠️ 这里**不排除 `--docs`**:`--docs` 的语义是「只检查文档」,
+      而这张表正是文档的一部分 —— 排除它等于让 `--docs` 漏掉一个必红的项。 */
+if (!frozenOnly && !only) verifyHandoverHashes();
 
 /* ★ 2026-11-14(接手者):计数对账接链。位置与守卫**都与 `verifyReadmeNumbers()` 对齐** ——
    两者是同一性质(「文档/注释里的自称」vs「代码算出的正解」),故:
