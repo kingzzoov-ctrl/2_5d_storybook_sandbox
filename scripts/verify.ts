@@ -1877,12 +1877,14 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
        ⇒ `predictStep`/`reconcile`/`resimulate`/`pruneCmds` 四族无从建立。
      ★ 判据:**「等 X」这类理由必须写明 X 的**当前**状态** ——
        它过期时的表现是「没人再读它」,而门禁不查理由与事实是否相符。 */
-  ['client/src/net/prediction.ts',
-    'WS-07 客户端预测(**网络层在岗、快照链路已通**,故不再是「等客户端网络层」)。'
-    + '真卡点在**输入端**:预测器要 InputCmd,而客户端无输入生产者'
-    + '(WASD 现在驱动**相机平移**,client/src/three/boot.ts:1053)、生产侧 session.send 调用 0、'
-    + '协议无 ackedSeq ⇒ predictStep/reconcile/resimulate/pruneCmds 四族无从建立;'
-    + '且「WASD 是镜头还是角色」是**产品裁决**(见 docs/TASK-83-wasd-three-options.md)'],
+  /* ★ 2026-11-14(task-83 选乙):`client/src/net/prediction.ts` **已从本表摘除**。
+     它此前登记的理由是「真卡点在**输入端**:预测器要 `InputCmd`,而客户端无输入生产者
+     (WASD 当时驱动的是**相机平移**)、生产侧 `session.send` 调用 0、协议无 `ackedSeq`」。
+     ⇒ 那个理由现在**不成立**:`net/input.ts` 就是输入生产者,`net/predictor.ts`
+       是真调用方,`main.ts` 装配了它们、并经 `session.sendMove` 上行。
+     实测:可达性闭包经 `client/src/main.ts → net/predictor.ts → net/prediction.ts` 命中。
+     ⚠️ 摘除动作**必须写在这里**:否则下一个人会以为它还在等接线 ——
+        而「没人再读那条理由」正是这类登记腐烂的方式(与 `social/afk.ts` 摘除同形)。 */
   ['server/src/prank/immunity.ts',
     'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个);'
     + 'data-conformance.ts 只读它的常量,逻辑未接'],

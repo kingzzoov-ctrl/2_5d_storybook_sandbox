@@ -137,7 +137,12 @@ export const ORPHAN_KNOWN = new Map<string, string>([
      旧文案「待交互系统调用」方向对但太笼统。实测卡点是**两样都不存在** ——
      宠物容器 + 驯服交互;而 `tameItem` 字段**有**消费者(旧措辞「无人消费」已订正)。 */
   ['server/src/mobs/taming.ts', 'WS-04 牧场驯服;等**宠物容器 + 驯服交互**(feedPet 零生产调用;tameItem 字段**有**消费者,旧措辞「无人消费」已订正)'],
-  ['client/src/net/prediction.ts', 'WS-07 客户端预测(客户端模块);等客户端网络层 —— 服务端侧不该接'],
+  /* ★ 2026-11-14(task-83 选乙):`client/src/net/prediction.ts` **已从本表摘除**。
+     旧理由写的是「等客户端网络层 —— 服务端侧不该接」。前半句早就不成立
+     (网络层在岗,卡的是**输入端**),而输入端已补:见 `net/input.ts` +
+     `net/predictor.ts`,由 `client/src/main.ts` 装配。
+     ⚠️ 摘除必须留痕:否则"它还在等接线"这个印象会一直留着,
+        而**没人再读的那条理由**正是这张表腐烂的方式。 */
   ['server/src/db/memory_db.ts', 'WS-07 内存库;生产走 sqlite 驱动,仅测试用'],
   ['server/src/content/handshake.ts', '内容握手;待房间 join 时校验'],
   ['server/src/content/baseline.ts', '内容基线锁;仅门禁与测试使用'],

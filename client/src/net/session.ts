@@ -120,6 +120,14 @@ export interface SessionHandle {
   readonly lastDropReason: string | null;
   /** 发一帧上行(原始字节,由调用方用 `delta.ts` 编码)。未连接时返回 false。 */
   send(bytes: Uint8Array): boolean;
+  /**
+   * 上行一条**移动意图**(WASD 驱角色的产物)。
+   *
+   * ★ 2026-11-14(task-83 选乙)新增:此前生产侧 `send` 调用点 **0 处**,
+   * 于是「客户端命令序号」这条链路在协议上根本不存在。
+   * 未连接时返回 `false`(与 `send` 同一纪律:不抛、不静默假装成功)。
+   */
+  sendMove(intent: MoveIntent): boolean;
   close(): void;
 }
 
@@ -186,6 +194,41 @@ export function encodeClientFrame(payload: Uint8Array, isText: boolean): Uint8Ar
   out[0] = isText ? FRAME_TEXT : FRAME_BINARY;
   out.set(payload, 1);
   return out;
+}
+
+/**
+ * 上行**移动意图** —— WASD 驱角色的产物(2026-11-14 task-83 选乙)。
+ *
+ * ## 坐标口径(必须与两处一致,否则会出现「服务端认为你在瞬移」)
+ *
+ * ```
+ * 发的是**绝对位置**(tick + x/y/z),不是方向向量。
+ * 理由:`server/src/net/anticheat.ts` 的 `checkMove` 判的是
+ *       「dist(新旧坐标) / tick 差」与窗口速率 —— 方向向量喂给它没有意义。
+ * 字段名与服务端 `room.colyseus.ts` 的 `onMessage('move')` 入参逐字相同。
+ * ```
+ */
+export interface MoveIntent {
+  /** 客户端 tick(用于 ac 的速率窗口)。 */
+  tick: number;
+  x: number;
+  y: number;
+  z: number;
+  /** 速度倍率(装备 / 料理 / 叠罗汉)。省略时服务端按 1 处理。 */
+  speedMul?: number;
+}
+
+/**
+ * 把移动意图编成**上行文本帧**。纯函数 ⇒ 帧形态可被断言。
+ *
+ * ⚠️ 走**文本**而不是二进制:文本分支在 `ws_server.ts` 里被解析成 JSON,
+ * 而二进制分支走的是 `decodePacket`(那是**下行**包格式)。
+ * 用错分支的表现是「帧发出去了、服务端解析失败或当别的东西处理」——
+ * 不报错、也不断连,只是什么都不会发生。
+ */
+export function encodeMoveUplink(intent: MoveIntent): Uint8Array {
+  const json = JSON.stringify({ t: 'move', ...intent });
+  return encodeClientFrame(new TextEncoder().encode(json), true);
 }
 
 /**
@@ -368,6 +411,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
     send(bytes: Uint8Array): boolean {
       if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
       socket.send(encodeClientFrame(bytes, false));
+      return true;
+    },
+    sendMove(intent: MoveIntent): boolean {
+      if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
+      socket.send(encodeMoveUplink(intent));
       return true;
     },
     close(): void {

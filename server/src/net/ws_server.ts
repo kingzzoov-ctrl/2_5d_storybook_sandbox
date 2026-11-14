@@ -357,6 +357,50 @@ export type WsServerOptions = {
  * 本服务端需要的**最小房间接口** —— 结构化类型,不 import `room.ts`。
  * ⚠️ 刻意**不**出现模拟层类型名(US2 探针的同款纪律)。
  */
+/** `parseMoveIntent` 的结果 —— 判别联合,而不是 `null` + 原因字符串。 */
+export type MoveIntentParse =
+  | { ok: true; intent: { tick: number; x: number; y: number; z: number; speedMul?: number } }
+  | { ok: false; reason: string };
+
+/**
+ * 校验并构造一条**移动意图**(2026-11-14,task-83 选乙)。
+ *
+ * 为什么必须单独抽成纯函数:它是这条上行里**唯一有分支**的部分,而 `onMove`
+ * 本身要一个真连接才跑得到 ⇒ 不抽出来的话,「坏值被拦住」这件事**一条断言都没有**
+ * (只会剩下注释在说它被拦了 —— 本仓把那种东西叫「一条不能变红的说明」)。
+ *
+ * 判据必须**显式**排 `NaN` / `Infinity`:
+ *   typeof NaN === 'number'  → true(只查类型拦不住)
+ *   NaN > 上限               → false(范围检查也放它过去)
+ * ⇒ `Number.isFinite` 是这里**唯一**能拦住它的写法。下游 `checkMove` 的 6.0
+ * 值域门是第二道;运输层先拦一道,两道不冲突(也不互相替代)。
+ *
+ * `speedMul` 是可选:给了但非法(字符串 / NaN)⇒ **当作没给**,而不是整条拒绝。
+ * 理由:它是乘数,不是坐标 —— 一个坏乘数不该让整次移动消失。
+ */
+export function parseMoveIntent(msg: {
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;
+}): MoveIntentParse {
+  const fields: Array<[string, unknown]> = [
+    ['tick', msg.tick], ['x', msg.x], ['y', msg.y], ['z', msg.z],
+  ];
+  for (const [name, v] of fields) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      return { ok: false, reason: `${name}=${String(v)}(要求有限数)` };
+    }
+  }
+  const intent: { tick: number; x: number; y: number; z: number; speedMul?: number } = {
+    tick: msg.tick as number,
+    x: msg.x as number,
+    y: msg.y as number,
+    z: msg.z as number,
+  };
+  if (typeof msg.speedMul === 'number' && Number.isFinite(msg.speedMul)) {
+    intent.speedMul = msg.speedMul;
+  }
+  return { ok: true, intent };
+}
+
 export type WsRoomLike = {
   readonly id: string;
   step(prevSnapshot: unknown): Uint8Array;
@@ -368,6 +412,20 @@ export type WsRoomLike = {
   };
   leave(userId: string): boolean;
   disconnect(userId: string): boolean;
+  /**
+   * 应用一条移动意图。**可选** —— 它只对「真驱动一个模拟层」的房间有意义。
+   *
+   * ⚠️ 刻意**可选**:`WsRoomLike` 是本文件的**结构化最小接口**,
+   * 单机演示房间(与部分测试桩)没有世界可变 —— 逼它们实现一个空方法
+   * 就等于把「什么都没做」写成契约。
+   * 而"没实现"这条路径在上行里是**出声**的(见 `onMove`),不是静默。
+   *
+   * 形状与 `RoomRuntime.applyMove(userId, intent)` 一致 ⇒
+   * `RoomRuntime` **结构性满足**它,本文件不需要 import `room.ts`。
+   */
+  applyMove?(userId: string, intent: {
+    tick: number; x: number; y: number; z: number; speedMul?: number;
+  }): unknown;
   cloneState(): unknown;
 };
 
@@ -622,14 +680,22 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
         return;
       }
       if (u.kind === 'text') {
-        let hello: HelloFrame;
-        try { hello = JSON.parse(new TextDecoder().decode(u.payload)) as HelloFrame; }
+        let parsed: HelloFrame & { t?: string };
+        try { parsed = JSON.parse(new TextDecoder().decode(u.payload)) as HelloFrame & { t?: string }; }
         catch {
           write(c, encodeClose(1003, '文本上行不是合法 JSON'));
           c.closed = true;
           return;
         }
-        onHello(c, hello);
+        /* ★ 2026-11-14:文本上行**不再一律当 hello** —— 新增移动意图(`t:'move'`)。
+           ⚠️ 判据只看 `t`,其余(含 `t` 缺席)**仍按 hello** ——
+              客户端的 hello 帧历史上不带 `t` 也能工作,不能因为加了一条新分支
+              就把它判死(那是"顺手放宽/收紧"的另一半)。 */
+        if (parsed.t === 'move') {
+          onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown });
+          return;
+        }
+        onHello(c, parsed);
         return;
       }
       /* ★★★ 2026-11-14(task-85 分片 2):上行二进制 ⇒ **真解析**(原为"只记录不解析")
@@ -737,6 +803,59 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1) */
     sendBinary(c, opts.room.snapshotFor(userId));
   }
+
+/**
+ * 应用一条**移动意图**(2026-11-14)。WASD 驱角色的服务端落点。
+ *
+ * ## 为什么放在这里而不是"再开一条下行通道"
+ *
+ * 移动意图是**上行**,与 `hello` 同一条文本分支 —— 分流靠 `t` 字段。
+ * 复用的是同一套「剥 tag → 分类 → 解析」的运输层纪律,不新增帧种类。
+ *
+ * ## 三个判据都**必须出声**(本仓纪律:静默丢弃比报错更坏)
+ *
+ * ```
+ * 1 还没 hello 就发 move ⇒ 丢弃 + log
+ *   (没有 userId 就没法应用;而"没 userId 也照收"会让越权路径看不出痕迹)
+ * 2 房间没实现 applyMove ⇒ 丢弃 + log
+ *   (`WsRoomLike` 是**结构化最小接口**,单机演示房间没有这个方法。
+ *    若这里静默 return,「客户端在发、服务端没接」会表现得像网络丢包)
+ * 3 数值不合法(NaN / Infinity / 缺字段)⇒ 丢弃 + log
+ *   ⚠️ 这一条尤其重要:`NaN` 的比较恒为 false ⇒ 它会**穿过**绝大多数范围检查,
+ *      而下游 `checkMove` 的 6.0 值域门正是为它设的。运输层先拦一道,不冲突。
+ * ```
+ *
+ * ⚠️ `applyMove` 抛错时也**不断连**(与畸形载荷同纪律:一个坏动作只该丢它自己),
+ * 但必须计数 + 记原因。
+ */
+function onMove(c: WsConn, msg: {
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;
+}): void {
+  /* ⚠️ 两个条件都要查,而不是只查 `helloDone`:类型上 `c.userId` 是 `string | null`,
+     而 `applyMove` 要 `string`。只查前者会让类型检查多一条 TS2345
+     (本轮实测:基线锁当场抓到 +1)—— 这不是洁癖:若哪天真有连接在
+     `helloDone` 之后被清掉 userId,`applyMove(null, …)` 会去查一个不存在的玩家。 */
+  if (!c.helloDone || c.userId === null) {
+    log('移动意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    return;
+  }
+  const apply = opts.room.applyMove;
+  if (typeof apply !== 'function') {
+    log('本房间没有 applyMove ⇒ 移动意图无处应用(丢弃,不是丢包)');
+    return;
+  }
+  const parsed = parseMoveIntent(msg);
+  if (!parsed.ok) {
+    log(`移动意图被拒(${parsed.reason})⇒ 丢弃`);
+    return;
+  }
+  const intent = parsed.intent;
+  try {
+    apply.call(opts.room, c.userId, intent);
+  } catch (e) {
+    log(`applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+  }
+}
 
   /* ── 20Hz 广播循环 ── */
   const timer = setInterval(() => {

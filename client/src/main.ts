@@ -20,6 +20,10 @@
 
 import { boot, type BootHandle } from './three/boot.ts';
 import { createSession, type SessionHandle } from './net/session.ts';
+import { InputSource, attachKeyboard } from './net/input.ts';
+import { LocalPredictor } from './net/predictor.ts';
+import { telegraphCenterOf } from './net/telegraph_center.ts';
+import { DT } from '../../shared/types/physics.ts';
 
 declare global {
   interface Window {
@@ -73,6 +77,9 @@ function main(): void {
   /* ── 联机:只在给了 `?server=` 时才连 ──
      不给就完全是单机模式,与接线前行为一致(截图自检依赖这一点)。 */
   let session: SessionHandle | null = null;
+  /* 自己的 playerId —— 只在 `welcome` 里拿得到。预测器要用它去 store 里
+     取**权威**位置(`telegraphCenterOf` 的第二个参数)。 */
+  let playerId: string | null = null;
   const url = serverUrlFromLocation();
   if (url !== null) {
     session = createSession({
@@ -87,19 +94,60 @@ function main(): void {
           if (s === 'failed') console.warn('[session] 失败:', detail);
         },
         onWelcome: (w) => {
+          playerId = w.playerId;
           console.info(`[session] 已加入房间 ${w.roomId}(玩家 ${w.playerId})`);
         },
       },
     });
   }
 
+  /* WASD → InputCmd → 本地预测 → 上行(2026-11-14,task-83 选乙)。
+     固定 20Hz:`predictStep` 的位移是 `v_max * DT`,而 DT 是服务端权威常数 ——
+     跟着渲染帧走会让 60Hz 与 30Hz 的机器角色速度不同,且不报错。
+     ⚠️ 相机仍是临时态:WASD **同时**在平移相机(`three/boot.ts` 的 `pan`),
+     于是角色不会走出画面 —— 但那是**巧合**成立的,不是「相机跟随」。
+     让相机跟随权威位置要动渲染路径,其验收只能靠看 ⇒ 单独一件,不在本轮。 */
+  const input = new InputSource();
+  const detachInput = attachKeyboard(window, input);
+  const predictor = new LocalPredictor();
+  let localTick = 0;
+  let seeded = false;
+  const inputLoop: ReturnType<typeof setInterval> = setInterval(() => {
+    const cmd = input.nextCmd();
+    const p = predictor.step(cmd);
+    localTick += 1;
+    /* 权威姿态喂回预测器。第一次先**播种** —— 预测器必须从权威值起步,
+       否则它从 (0,0) 出发一路追,表现是「角色从世界原点滑过来」。 */
+    const pose = playerId === null ? null : telegraphCenterOf(handle.store.state, playerId);
+    if (pose !== null) {
+      if (!seeded) {
+        predictor.reset({ x: pose.cx, y: pose.cy, z: 0 });
+        seeded = true;
+      } else {
+        predictor.onAuthoritative({ x: pose.cx, y: pose.cy, z: 0 });
+      }
+    }
+    predictor.absorbVisual(DT);
+    if (session !== null) {
+      session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z });
+    }
+  }, DT * 1000);
+
   window.__stageReady = () => ({
     ...handle.summary(),
     /* 联机状态也进自检口径 —— 否则「连没连上」只能靠看控制台 */
     sessionState: session?.state ?? 'offline',
     serverContentClaim: session?.serverContentClaim ?? null,
+    /* ★ 2026-11-14(task-83 选乙):预测链路也进自检口径 —— */
+    /* 否则「输入有没有真的产生命令」只能靠看控制台,而那正是它静默一整轮的原因。 */
+    inputKeys: input.pressedCount,
+    predictedPos: predictor.pos,
+    pendingCmds: predictor.pendingCount,
+    lastReconcileAction: predictor.lastReconcile?.action ?? null,
   });
   window.addEventListener('beforeunload', () => {
+    detachInput();
+    clearInterval(inputLoop);
     session?.close();
     handle.dispose();
   });
