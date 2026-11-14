@@ -1704,6 +1704,65 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
     eq(sim.partyPhase(), 'IDLE', '两次拒绝后仍未开局');
   }
 
+  /* (vi) ★★ **引用 ≠ 执行**:急单确实每帧在算,不只是「符号被 import」。
+   *
+   * 这一条是**我自己踩过之后补的** —— 我第一版 `world_sim.ts` 只 import 了
+   * `createRushOrderSession` / `startRushOrder` / `tickRushOrder` 却**一个都没调用**,
+   * 而当时三处全绿:
+   * ```
+   *   可达性门禁 绿(import 就是一条边)
+   *   文本判据   绿(符号确实在文件里)
+   *   测试套件   绿(没有一条断言问「急单每帧推进了吗」)
+   *   实际行为   空
+   * ```
+   * ⇒ 故本条的判据**必须**是「跑了会变」的量,不能是「存在性」。
+   *   `rushRunningSec` 是 `StationRuntime.runningSec`(每帧累加)之和。
+   */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    eq(sim.rushState(), 'IDLE', '未开局急单时为 IDLE');
+    ok(sim.startRushRun(1, () => 0.5), 'startRushRun 接受合法房间等级');
+    eq(sim.rushState(), 'RUNNING', '开局后急单进入 RUNNING');
+    const before = sim.rushRunningSec();
+    for (let i = 0; i < 10 * FAST_PER_SLOW; i += 1) sim.tick();
+    const after = sim.rushRunningSec();
+    ok(after > before,
+      `急单工位累计运转秒数必须**随时间增长**(前 ${before.toFixed(2)} → 后 ${after.toFixed(2)})`
+      + `—— 这一条防的正是「只 import 不调用」:那种情况下它恒为 0`);
+    eq(sim.rushTicked, 1, '可观测量记录到本慢帧真的推进了急单');
+  }
+  /* (vii) 急单的**内部**结算链真的跑到了:河狸偷料那一段。
+          `tickStation` 只证明工位在算;河狸在 `tickRushOrder` 的另一段,
+          两条都跑到才算整个函数真的被执行。 */
+  {
+    const sim = new WorldSim({ sizeCells: 8, rng: () => 0.5, combatRng: () => 0.5 });
+    const seen: string[] = [];
+    sim.bus.on('party_event', (e: { payload: { kind?: string } }) => {
+      seen.push(String(e.payload?.kind ?? '?'));
+    });
+    sim.startRushRun(1, () => 0.5);
+    for (let i = 0; i < 60 * FAST_PER_SLOW; i += 1) sim.tick();   /* 30s */
+    ok(seen.includes('BEAVER_SPAWN'),
+      '跑 30 秒后必须出现过 BEAVER_SPAWN ⇒ `tickRushOrder` 的河狸计时分支真的执行');
+    ok(seen.length > 0, `急单事件必须到达世界总线(实测 ${seen.length} 条)`);
+  }
+  /* (viii) 急单**不得**污染 `this.rng` 的调用序列 —— `tests/WS-01` 有确定性快照。 */
+  {
+    const count = (withRush: boolean): number => {
+      let n = 0;
+      const sim = new WorldSim({ sizeCells: 8, rng: () => { n += 1; return 0.5; }, combatRng: () => 0.5 });
+      if (withRush) sim.startRushRun(1, () => 0.5);   /* 独立 rng,不碰 this.rng */
+      for (let i = 0; i < 20 * FAST_PER_SLOW; i += 1) sim.tick();
+      return n;
+    };
+    const a = count(false);
+    const b = count(true);
+    eq(a, b,
+      `开急单前后 tick() 对注入 rng 的调用次数必须相同(${a} vs ${b})`
+      + `—— 否则 tests/WS-01 的确定性快照会漂移,且漂移原因极难定位`);
+    ok(a > 0, `该断言的分母必须 > 0(实测 ${a})`);
+  }
+
   /* room.ts 侧:`.includes(absent)` 这 4 条**至今全绿**(room 一行未改)。
      保留它们是有意的:它们钉的是 §8「禁用耦合」那条**架构约束**
      (WS-11 模块/对局运行时都不得渗进 net 层),接线后这条约束**不变**。 */
