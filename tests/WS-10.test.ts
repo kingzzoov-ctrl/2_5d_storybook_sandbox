@@ -392,7 +392,8 @@ test('生产接线12:204 爆破镐经 attackMob 真的能一击敲碎晶甲(EXPL
   /* ## 这条守的是一个我自己在接线时引入的缺陷
    *
    * 手册与 `WeaponDef` 都写着 204「对晶甲类护盾拥有 4.0 破盾倍率」,
-   * 而 `BeetleAi.onDamage`(`behaviors.ts:720`)的碎壳分支判据是
+   * 而 `BeetleAi.onDamage`(`server/src/mobs/behaviors.ts`,方法起点 L716;
+   * 行号以实际代码为准)的碎壳分支判据是
    * `kind === DamageKind.EXPLOSION`。
    *
    * 我第一版 `damageKindOf` **按元素映射**,而 `BREACH_PICK.element` 是 `NONE`
@@ -430,7 +431,8 @@ test('生产接线12:204 爆破镐经 attackMob 真的能一击敲碎晶甲(EXPL
 test('生产接线13:火灵遇水经 attackMob 真的固化为黑曜石(WATER 可达)', () => {
   /* ## 这条守的通道,以及一个「差点写出来的死代码」
    *
-   * 火灵的固化分支判 `kind === DamageKind.WATER`(`behaviors.ts:1224`)。
+   * 火灵的固化分支判 `kind === DamageKind.WATER`
+   * (`LavaElemAi.onDamage`,起点 L1223;行号以实际代码为准)。
    * 我第一版 `damageKindOf` 里写了 `case Element.ICE: return WATER` ——
    * 语义上合理,但**实测武器表里没有任何 ICE 武器**(13 把武器的元素只有
    * NONE/FIRE/LIGHT/SLIME/LIGHTNING),那段就是**永不执行的代码**。
@@ -723,7 +725,8 @@ test('生产接线16:攻击已死生物时 hpLoss 归零(不虚报掉血)', () =
   /* ## 这条守的是 `hpLoss` 的真实语义
    *
    * `damageMob` 自述契约是「**`hpLoss` 才是真正的掉血**,因为可能被格挡」。
-   * 但 `BaseMobAi.onDamage`(`behaviors.ts:175`)算的是:
+   * 但 `BaseMobAi.onDamage`(`server/src/mobs/behaviors.ts`,方法起点 L174;
+   * 行号以实际代码为准)算的是:
    * ```ts
    * const hpLoss = Math.max(0, amount);
    * rt.hp = Math.max(0, rt.hp - hpLoss);   // 尸体上 rt.hp 恒被钳在 0
@@ -2367,7 +2370,7 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
 
   const gv = g.vitals.get('p1')!;
   /* ⚠️ 期望值写**字面量 0.5**(设计基线),不写 `MANUAL_REVIVE_INVULN` ——
-     后者正是被 `revive.ts:222` 写进 `DownedState` 的那个常量,
+     后者正是被 `revive.ts` 的 `touchRevive`(写入点 L222)写进 `DownedState` 的那个常量,
      用它当期望值就是**同义反复**(常量改成任何值两边同步移动,断言无法失败)。
      实测:门禁 `--strict-taut` 抓到本条为「新增未登记的同义反复候选」。
      与本文件 task44-7 既有写法(`eq(s.lastRevive!.invulnSec, 0.5, ...)`)一致。 */
@@ -2988,11 +2991,11 @@ test('T58-4 ★ 世界侧**没有第二道反作弊**(用「撤销第一道」�
 test('T58-5 边界残余(如实记录):世界侧不钳制,钳制由物理在 tick 时做', () => {
   /* ## 这条记录一个**已知残余**,不是「修好了」
      `applyPlayerMove` 只管「写在哪」,**不做边界钳制** —— 因为边界归物理层
-     (`world.ts:670` 在 `tick` 时把刚体钳回 `bounds`)。若这里也钳一次,
-     就是**第二份边界实现**(与「反作弊只在一处」同一条纪律)。
+     (`PhysicsWorld.clampBounds` 在 `tick` 时把刚体钳回 `bounds`)。
+     若这里也钳一次,就是**第二份边界实现**(与「反作弊只在一处」同一条纪律)。
      实测残余:
        · 写入 `maxX + 5` ⇒ 权威立刻读到 `maxX + 5`
-       · 推 1 帧 ⇒ 被 `world.ts:670` 钳回 `maxX`
+       · 推 1 帧 ⇒ 被 `clampBounds` 钳回 `maxX`
        · 再推 2 帧 ⇒ **稳定停在边界**(不会持续增长)
      性质:**一次性收敛**,非持续。非越权:反作弊限单帧 ≤ 0.36 格,
      而窗口速率(5.63 格/秒)限住了总量 ⇒ 走不到世界外。 */
@@ -3003,7 +3006,7 @@ test('T58-5 边界残余(如实记录):世界侧不钳制,钳制由物理在 tic
   eq(s.playerPosition('p1')!.x, over, '权威立刻 = 越界值(世界侧无钳制)');
 
   s.tick();
-  eq(s.playerPosition('p1')!.x, maxX, '★ 推 1 帧 ⇒ 被**物理层**钳回边界(`world.ts:670`)');
+  eq(s.playerPosition('p1')!.x, maxX, '★ 推 1 帧 ⇒ 被**物理层**钳回边界(`PhysicsWorld.clampBounds`)');
   s.tick();
   s.tick();
   eq(s.playerPosition('p1')!.x, maxX, '★ 再推 2 帧 ⇒ 稳定停在边界 ⇒ 残余**一次性收敛**');
@@ -3134,7 +3137,7 @@ test('T59-5 `advance` 真的让**子系统**跑起来(不只是计数器)', () =
 
      ⚠️ **不要**用「生物的 `physics.bodies` 位移」当判据 —— 我第一版就是这样,
      结果假红(`x=14.000` 没动)。原因是 **task-58 实测过的既有事实**:
-     生物移动走的是 `MobRuntime`(`host.ts:449` 的 `rt.x = fsm.x`),
+     生物移动走的是 `MobRuntime`(`MobHost.advanceFsmBase` 里的 `rt.x = fsm.x`),
      **不写 `physics.bodies`** ⇒ 刚体本来就不动。那是既有设计,不是缺陷。
      ⇒ 改用 `mobPlayers` 的**刷新**当判据(它才是 `tick()` 的直接产物)。 */
   const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
