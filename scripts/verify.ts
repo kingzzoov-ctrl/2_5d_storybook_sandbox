@@ -2753,8 +2753,6 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
     '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(combatantStats(30, [], {critRate: 1e9}).critRate, MAX_CRIT_RATE, …)`)。HEAD 已存在。'],
   ['WS-10::MAX_DODGE_RATE',
     '★ 待修(2026-11-14 新揭出):同族假阴性 —— 旧正则在这行读到的名字是内层变量 `dodgy`,而不是真正的第 2 顶层实参 `MAX_DODGE_RATE`。⚠️ terrain-physicist 另报:该文件 `:1201-1205` 有注释称「原断言是空断言,已修」,故这一处**可能是第二处未改干净**的,归 combat-progress 核。HEAD 已存在。'],
-  ['WS-FND-07::OBSIDIAN_ID',
-    '★ 待修(2026-11-14 新揭出):同族假阴性。HEAD 已存在。'],
 ]);
 
 /** 收集生产模块(server/src + client/src)的数值型导出常量:`<文件>::<名>` → 表达式。 */

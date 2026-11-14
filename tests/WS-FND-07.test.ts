@@ -49,8 +49,29 @@ test('WF-07-01 相变产物写回地形:水邻熔岩若干帧后该格真的变�
 
   /* 断言**地形**,不是断言 `pendingObj.length` —— 后者在缺陷状态下也会增长,
      它会「通过」却什么都没修好。这正是本条断言的价值所在。 */
-  eq(sim.grid.objIdAt(4, 4), OBSIDIAN_ID, '水侧该格 OBJ 层已写入黑曜石 110');
-  eq(sim.grid.objIdAt(5, 4), OBSIDIAN_ID, '熔岩侧该格 OBJ 层已写入黑曜石 110');
+  /* ★ 2026-11-14(Lead):期望值改写**字面量 110**,不引 `OBSIDIAN_ID`。
+     原写法 `eq(objIdAt(4,4), OBSIDIAN_ID)` 是**同义反复**:
+     `fluid.ts:620` 的相变产物**直接取自该常量**
+     (`const product = kind === FluidKind.HOT_SPRING ? PUMICE_ID : OBSIDIAN_ID;`)
+     ⇒ 两侧同向移动 ⇒ 把常量改成任何值这两条都恒真。
+
+     ## 110 的来源是**独立的**(不是从 fluid.ts 抄的)
+
+     `shared/constants/items.ts:40`:
+     ```
+     { id: 110, name: '黑曜石块', category: N, tags: ['石材','抗爆','锋利'], … }
+     ```
+     ⇒ 那是**冻结内容表**(`shared/constants/**`,由内容基线锁 `v1-eaefa38b` 看住),
+       而 `fluid.ts:35` 的 docblock 自己写着「取自 `shared/constants/items.ts` 原文」。
+     ⇒ 所以 `110` 这个值的**权威在内容表**,不在 fluid.ts —— 改 fluid.ts 会红。
+
+     ## 双向锚定(与 WS-01 `:701` 同一修法)
+
+     `tests/WS-01.test.ts:701` 已有 `eq(OBSIDIAN_ID, 110, '黑曜石 ID')` 锚定常量本身。
+     两处合起来:常量改了 ⇒ :701 红;内容表改了而常量没跟 ⇒ 本条红。
+     ⇒ 避免「常量与内容表**一起**漂走」这种两个引用同时移动的静默。 */
+  eq(sim.grid.objIdAt(4, 4), 110, '水侧该格 OBJ 层已写入黑曜石 110(内容表 items.ts:40)');
+  eq(sim.grid.objIdAt(5, 4), 110, '熔岩侧该格 OBJ 层已写入黑曜石 110(内容表 items.ts:40)');
 
   const products = r.reports.reduce((n, x) => n + x.phaseProducts, 0);
   eq(products, 2, '报告里的相变产物计数为 2(两格)');
