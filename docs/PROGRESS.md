@@ -6545,3 +6545,113 @@ NEW = OLD + 客户端宿主
   这是本轮第二次犯「第一嫌疑是自己刚写的那份」这条判据(上次是 gate-selfcheck 的 e[0]/e[1])。
 ⇒ 修法:探针**不要平行重写判据**;要复算就先实现全部前置(这里前置是"差集得用计算式")。
 ```
+
+## 四十二、陷阱 123:**本仓有一个能跑的、确定的、能抓真错误的类型检查器 —— 而它不在任何门禁里**
+
+### 起因:一个未决项(`Clock` 有两个接口)逼我测到底
+```
+全仓有两个 `Clock`:
+  server/src/coop/rush_order.ts:40   interface Clock { now(): number }    ← 单位**秒**
+  server/src/net/anticheat.ts:203    interface Clock { nowMs(): number }  ← 单位**毫秒**
+⇒ 先前把它记为"同名异义,待裁"。而我这次要问的是**它会不会真出事**。
+```
+
+### 第一层:结构类型上互不可赋值 ⇒ TypeScript **会**拦
+```
+两者方法名不同(now vs nowMs)⇒ 不是"看起来像",是**真正不同的类型**。
+⇒ 我**真注入**了一个故意的混用:
+     import type { Clock as SecClock } from './coop/rush_order.ts';
+     import type { Clock as MsClock } from './net/anticheat.ts';
+     export function wantsMs(c: MsClock): number { return c.nowMs(); }
+     export const secClock: SecClock = { now: () => 0 };
+     export const mixed = wantsMs(secClock);          ← 应报错
+```
+
+### 第二层:门禁**没**拦它
+```
+跑 `verify.ts --all` ⇒ exit=1,但唯一的红是:
+  ✗ README 声称「生产可达性 84/98」,实测 84/99
+⇒ 它只发现"多了一个文件",**完全没提类型不匹配**。
+★ 即:那个故意的类型错误**静默通过**了整套门禁。
+```
+
+### ★★★ 第三层:我原以为"本仓没有类型检查" —— **错了**
+```
+实测:package.json 里有 `"typecheck": "node scripts/typecheck.ts"`,而
+      node_modules/typescript **已安装**、tsc **可执行**。
+真跑 `node scripts/typecheck.ts` ⇒ **exit 2**,367 行输出,**267 条错误**。
+⇒ ★ 我先前那句"本仓以类型擦除运行 ⇒ 没有类型检查"**是错的** ——
+   检查器在,而且**能抓我那个注入**(实测 TS2345 Argument of type ... is not assignable)。
+   ⇒ ⇒ 缺口不是"没有检查",是「**检查存在、能跑、能抓真错误,但没有任何门禁调用它**」。
+```
+
+### 第四层:267 条错误可复现、可分类,不是噪声
+```
+三次连跑:267 / 267 / 267 ⇒ **确定**(不是随机/时序导致)
+按错误码(前五):
+   64  TS2339  Property 'x0' does not exist on type 'never'
+   62  TS18048  'spec' is possibly 'undefined'
+   48  TS2345  Argument of type '{ elev: number; base: ... }'
+   16  TS2322  Type 'number | bigint' is not assignable to type 'number'
+   12  TS18047  '__diffProdAll' is possibly 'null'
+按目录:
+  209  tests/      ← ★ 占 78%
+   27  server/
+   18  scripts/
+   10  client/
+    3  shared/
+单一根因候选(同一条消息重复 ≥3 次,合计 ~150 条):
+   17 'Argument of type string is not assignable to parameter of'
+   17 'obj' is possibly 'undefined'
+   10 'Property "instance" does not exist on type ForgeResult'
+   ...
+缺 @types:只有 **2** 条(three)+ 1 条(better-sqlite3)
+  ⇒ ★ 即"装几个 @types 就好了"这个解释**不成立** —— 真实错误是散的类型漂移。
+```
+
+### 为什么它没接进门禁:源码里写了理由,而那理由**是对的**
+```
+`verify.ts:2972` 的小标题:「## 为什么用 vite build 而不是 tsc」
+```
+原文实测摘录:
+```
+node scripts/typecheck.ts ⇒ exit 2,既有错误一片:
+  ⇒ tsc **本来就红** ⇒ 拿它当门禁 = 一个永远红的门 ⇒ 没人会看它。
+vite build 实测 exit 0 / 1.2s / 31 modules transformed
+  ⇒ 它能回答唯一需要回答的那个问题:「这份客户端代码能不能被打包」
+  ⚠️ 它**不做类型检查**(esbuild 转译即走)—— 所以它覆盖的是语法与模块解析,不是类型。
+```
+⇒ ★ 这个取舍**不是疏忽**:作者明确知道 tsc 恒红,并明确写出了 vite 的边界。
+   ⇒ 所以这不是"某人忘了接线",而是一个**已被权衡过的现状**。
+
+### 那我为什么还要记它:三条实测出来的**新**信息
+```
+1 267 这个数**稳定**(3/3 同),不是"一片"这种模糊描述 ⇒ 它可以做**基线**
+   ⇒ 于是"接进门禁"有一条**不需要先烧掉全部**的路径:
+     **冻结基线**:断言「错误数不超过 267」+「不出现新的错误码」。
+     ★ 这与本仓既有的 `content-lock` 基线锁是**同一个思路**。
+2 `vite build` **不查类型**这条边界,与"两个 Clock 混用**静默通过**"是同一件事的两面
+   ⇒ 后者是前者的**实例**:一个真类型错误走完全套门禁而无人知。
+3 209/267(78%)在 `tests/` ⇒ 接基线锁的**收益面**主要在测试代码
+   ⇒ 而测试代码的类型漂移会**掩盖**真实的契约漂移(本仓已两次实测到
+     「两份实现互相顶着」:task-47 wearingOf/syncPlayers、task-50 陷阱 31/41)。
+```
+
+### 我自己实测了 `vite build`(不引用注释里的旧值)
+```
+node node_modules/vite/bin/vite.js build ⇒ **exit 0**,「✓ 38 modules transformed · built in 135ms」
+   产出:dist/client/index.html 1.37 kB · assets/index-*.js 146.53 kB · assets/three-*.js 479.66 kB
+★ 而它的输出里 `error TS` 命中 **0** 次 ⇒ **实测证实:vite build 完全不做类型检查**。
+⚠️ 源码注释写的是「31 modules」,我实测 **38** ⇒ 注释里的数**又过期了**
+   (与陷阱 119「注释里的路径也会过期」、陷阱 122「理由文本会漂」同族:
+    凡写进文件的**快照型数字**都会漂,而没有任何门禁查它们)。
+```
+
+### 我没有做的事(如实)
+```
+· **没有**把 typecheck 接进门禁 —— 这要改 verify.ts 的判据集合,
+  且"冻结基线"本身要先定"哪些错误码允许存在",属设计裁决 ⇒ 应开卡而非顺手做。
+· **没有**试图修那 267 条 —— 我没读过它们的具体位置,不知道哪些是
+  "真类型漂移"哪些是"tsconfig 太严"。**断言"能烧掉"是我不能证明的**。
+· `vite build` 的 exit 0 与「不查类型」**已实测**(见上),不再引用注释值。
+```
