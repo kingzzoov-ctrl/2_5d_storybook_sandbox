@@ -1,7 +1,8 @@
 # 项目移交包 —— 2.5D 绘本风多人沙盒
 
 > **本文是移交给下一位负责人/下一个会话的入口文档。**
-> 生成时间:2026-11-14 · 基线提交 `bb481e4`(分支 `main`,共 185 次提交,已全部推送)
+> 生成时间:2026-11-14 · 基线提交 `bb481e4` · 移交时 HEAD `8678abf`(分支 `main`)
+> ★ **2026-11-14 同日「接手者第一轮」的改动尚未提交** —— 清单见本文 **§十一**
 > **本文所有数字都是本次**从磁盘/工具**实测**的,不是从别的文档抄的。
 > 抄来的数字会过期;实测的不会。凡本文与旧文档冲突,**以本文为准**,并去修旧文档。
 
@@ -22,8 +23,8 @@
 | 层 | 服务端 `server/src` **61** `.ts` · 客户端 `client/src` **27** · 共享 `shared` **10** ⇒ **生产 .ts 合计 98** |
 | 测试 | `tests/*.test.ts` **28** 个套件 |
 | 工具 | `scripts/*.ts` **31** 个 |
-| 文档 | `docs/` **75** 个 `.md` + 3 个 `.png` = 78 文件 / **2.64 MB** |
-| 门禁 | `scripts/verify.ts`(6120 行) |
+| 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
+| 门禁 | `scripts/verify.ts`(6230 行) |
 
 ### ★ 三条不许违反的语法约束(这不是风格问题,是能不能跑的问题)
 
@@ -48,7 +49,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 # 常用单跑
 node scripts/verify.ts --all          # 全部测试 + 门禁(约 21s)
-node scripts/gate-selfcheck.ts        # 门禁自检 29 用例(约 163s)
+node scripts/gate-selfcheck.ts        # 门禁自检(用例数见其输出,约 3 分钟)
 node tests/WS-10.test.ts              # 单个套件
 npm run sim                           # 服务端模拟 demo
 npm run build:client                  # 客户端构建
@@ -89,7 +90,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
 | 用例 | **1526 条 / 28 套件** | WS 1011 条 / 14 套件 · 基座 FND 515 条 / 14 套件 |
-| 门禁自检 | **29/29** | 2026-11-14 由 28/29 提升(修 T37 锚点换行 bug) |
+| 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
 | 生产可达性 | **88 / 98**(不可达 10,白名单 10) | 欠账构成:等客户端入口 0 / 等编排层接线 1 / 等服务端机制 3 / 等客户端机制 2 / 等裁决 0 |
@@ -224,8 +225,14 @@ _ho_*   ×1    ← Lead 本次移交核对脚本
 ```
 7 **同一范围不要写在两处** —— 实测:7 个判据的"跳过目录"列表,
   **只有 1 个**含 `_probe_sandbox`(6/7 缺)⇒ 扫副本 ⇒ 报 3 个 BOM 假红。
-  ⇒ 已建 `scripts/scan-scope.ts` 作**唯一事实源**(已接 4 个,
-    `verify.ts` / `gate-selfcheck.ts` **尚未接完**)。
+  ⇒ 已建 `scripts/scan-scope.ts` 作**唯一事实源**。
+  ★ **已接完(2026-11-14 同日,接手者)**:7/7 —— 新接入 `verify.ts`(两处自写表:
+    `diffSetData` / `checkTempResidue`)、`clean-temp.ts`、`gate-selfcheck.ts`(第 7 份)。
+  ⇒ 收口时实测「两份副本**已经发散**」:旧 verify 口径 **347** / 旧 clean-temp 口径 **330**,
+    差 **17** 条,全部落在 `_probe_sandbox/`(仓库副本)⇒ 是**假红**而非残留。
+  ⇒ 并发现跳过表的**作用域**也会分叉:`build` 被当成"任何层都跳过",而 `server/src/build/`
+    是**生产源码**(5 个 .ts)⇒ `diffSetData()` 曾算出 **93**(权威 **98**)。
+    ⇒ 已把跳过名分两类 + `shouldSkipDirAtDepth()` 做成唯一入口(见 LEAD-PLAN §7.2.1e)。
 8 **自省式判据(去活数据里取参数)带回新失效模式**:
   取不到 ⇒ 退化成空操作 ⇒ **恒绿**。
   ⇒ 必须显式区分"有意不改"与"解析失败",并让**后者报错**。
@@ -261,7 +268,10 @@ git status --short  ⇒  (干净)
                                         : exit **1** · "★ 陈旧 README.md:169 自称 4 (正解 5)"
                                           ✓ 断言 #1 有牙
 ⇒ 两组都成立 ⇒ **进链的技术条件已满足**,只差接进 `verify.ts`
-  (那是 Lead 的写域,**尚未接** ⇒ 这是接手者的第一件可做的活)
+  ★ **已接(2026-11-14 同日,接手者)**:`verify.ts` 新增 `checkCountAudit()` + 消费侧三判据
+  (汇总行解析不到 / ★陈旧>0 / ★正解缺失 ⇒ 各自 fail),并在 `gate-selfcheck` 补
+  **T38-a / T38-b** 两条区分力自检(自检用例数 **29 → 31**)。
+  实测两条注入都命中预期消息 ⇒ **这条链有牙,且已被机器钉住**。
 ```
 ★ **我自己的量具打偏过一次**:第一次注入 B 我改的是「同义反复候选 5 条」,
 而检测器读的是「…**白名单** 5 条」后那个数 ⇒ 报出"未触发"的**假阴性**。
@@ -334,9 +344,9 @@ git status --short  ⇒  (干净)
 ## 九、接手第一小时建议做的事
 
 ```bash
-# 1 确认基线(约 4 分钟)
+# 1 确认基线(约 5 分钟)
 node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --strict-selfcheck
-#   期望 exit 0 / 行首 ✗ 0 项 / 自检 29/29
+#   期望 exit 0 / 行首 ✗ 0 项 / 自检 30/30
 
 # 2 读三份文档(按顺序)
 #   docs/LEAD-PLAN.md      ← 当前计划与快照(先读这个)
@@ -354,13 +364,14 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-cb4e45d10156  README.md
-2a40385afd64  docs/PROGRESS.md
-42728ccb0f17  docs/LEAD-PLAN.md
-1a085febc966  docs/ARCH-GAPS.md
+ae697c10959a  README.md
+0e30dd7be087  docs/PROGRESS.md
+b387930e1082  docs/LEAD-PLAN.md
+db1e4e335354  docs/ARCH-GAPS.md
 0856298d0fb4  docs/CHANGE_REQUESTS.md
-76369e63097d  docs/COMPLETION-CRITERIA.md
+b07c6fa9f53f  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
+# ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 ```
 
 ---
@@ -384,4 +395,207 @@ cb4e45d10156  README.md
 7 根目录 337 个 `_` 临时文件我**一个都没删**(按纪律,等判据齐全再清)
 8 ✓ **已核**:新增 `scripts/assertion-order-audit.ts` 后,可达性**仍是 88/98**
   (`scripts/**` 不计入生产分母)⇒ 该文件无侧效应,分母未变。
+```
+
+---
+
+## 十一、★ 2026-11-14「接手者第一轮」:做了什么 / 改了什么 / **没做什么**
+
+> 本节由接手者在移交当日追加。**所有数字都是当场实测的。**
+> ⚠️ 这些改动**尚未提交**(工作区改动,未 `git commit` / 未 `git push`)。
+
+### 11.1 做了什么(三件,全部已验收)
+
+```
+1 scan-scope.ts 接完:5/7 → **7/7**
+  新接入 verify.ts(两处自写表)、clean-temp.ts、gate-selfcheck.ts。
+  ⇒ 顺带实测出两处**此前未登记**的判据缺陷:
+     · 两份副本**已经发散**:旧 verify 口径 347 / 旧 clean-temp 口径 330,
+       差 17,全部落在 _probe_sandbox(假红,不是残留)
+     · 跳过表的**作用域**分叉:diffSetData() 曾算出 93(权威 98)
+       —— 陷阱 110 第 4 次复发,已记为 PROGRESS 陷阱 141
+
+2 count-audit.ts 的两组断言**接进退出链**(移交时的状态是"只差接")
+  新增 verify.ts::checkCountAudit() + 消费侧三判据
+  (汇总行解析不到 / ★陈旧>0 / ★正解缺失 ⇒ 各自 fail)。
+  ⇒ 区分力自检:gate-selfcheck 新增 T38-a / T38-b ⇒ 自检 **29 → 31**
+
+3 两条架构缺口的**只读调查**落成文档(**未改任何代码**):
+  docs/TASK-94-action-layer-landing-plan.md  ← 22 个动作的逐条落点 + 最小切口
+  docs/TASK-95-entry-loadability.md          ← 三重阻塞的实测成因 + 两方案代价
+```
+
+### 11.2 改动文件清单(逐条)
+
+| 文件 | 改动 | 性质 |
+|:---|:---|:---|
+| `scripts/scan-scope.ts` | 跳过名**分两类** + `shouldSkipDirAtDepth()` + `walkRepo()` 默认深度感知 | 结构性 |
+| `scripts/verify.ts` | 引 scan-scope(两处自写表);`diffSetData` 改深度感知;新增 `checkCountAudit()`;去掉写死的自检用例数 | 结构性 + 接线 |
+| `scripts/clean-temp.ts` | 删掉第二份跳过表,改走 `shouldSkipDir` | 结构性 |
+| `scripts/gate-selfcheck.ts` | 删掉第 7 份跳过表;新增 T38-a / T38-b | 结构性 + 自检 |
+| `docs/LEAD-PLAN.md` | §7.2.1 数字 + 新增 §7.2.1e | 文档 |
+| `docs/PROGRESS.md` | 新增陷阱 **141 / 142** ⇒ 现在 **49 节 / 94..142**(无缺号 / 严格递增 / 无 BOM) | 文档 |
+| `docs/COMPLETION-CRITERIA.md` | 档 A 的「门禁自检」29/29 → 31/31 + 加「时点快照」声明 | 文档 |
+| `docs/HANDOVER.md` | 本文(§一 / §三 / §六 / §7.1 / §九 / §十一) | 文档 |
+| `docs/TASK-94-action-layer-landing-plan.md` | **新文件** | 新文档 |
+| `docs/TASK-95-entry-loadability.md` | **新文件** | 新文档 |
+
+### 11.3 验收(实测,命令可复跑)
+
+```
+node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --strict-selfcheck
+  ⇒ exit 0 / 行首 ✗ 0 项
+node scripts/gate-selfcheck.ts        ⇒ **30/30**
+node scripts/count-audit.ts           ⇒ exit 0(1 处自称,全部与正解一致)
+```
+
+### 11.4 ★ 我**没有**做什么(避免下一个人误判)
+
+```
+1 没有 commit、没有 push。工作区是脏的 —— 清单见 §11.2。
+2 没有实施动作执行层接线(TASK-94 §五给了切口,但那是**下一步**,不是已完成)。
+3 没有修入口可加载性(TASK-95 给了两条修法的代价,两者都**未动**)。
+4 没有清任何根级 `_*` 临时物 —— 仍是 **330** 个(本轮从 347 修正而来,原因见 §11.1)。
+5 没有处理 §7.2 的 8 条待裁决 U 项 —— 仍**未裁**。
+6 没有重测 COMPLETION-CRITERIA「档 A」里**除自检外**的历史数字(已在原处加声明)。
+7 没有改 `README.md`(它的 hash 未变 ⇒ 你看到的那份自称与移交时逐字节相同)。
+```
+
+### 11.5 下一件的建议顺序(基于本轮实测)
+
+```
+① TASK-94 §五 那 5 个动作(SET_MEMBER_ROLE / KICK_MEMBER / SET_ROOM_ACCESS /
+   SET_PARTY_MODE / CLOSE_ROOM)—— 唯一一批"宿主已存在、不改可达性、可被现有套件覆盖"的。
+   ⚠️ 接线会撞红 6 处既有断言(清单在 TASK-94 §五),那是"接线即红"而非回归。
+② 但它的**前置**是 §7.3 的第一层与第五层(谁是玩家状态的"唯一所有者")。
+   TASK-94 §四 用四条证据说明:handler 作用域里 **WorldSim 不可见**是**被测试钉住的设计**
+   (tests/WS-07.test.ts:4364-4378 断言 net 层代码态不得出现 /WorldSim|world_sim/)。
+③ 入口可加载性(TASK-95)可与上面并行,但它**单独修不会让玩家按得动** ——
+   因为 `registerHandlers()` 全仓 **0 调用点**(TASK-94 §2.3)。
+```
+
+---
+
+## 十二、★ 2026-11-14「接手者第二轮」:按 COMPLETION-CRITERIA §六 推进(序 1–5)
+
+> 承接 §十一。本轮**仍未提交**(工作区改动,未 `git commit` / 未 `git push`)。
+> 逐条验收见本节末尾的「判据对照」。
+
+### 12.1 数字(实测,取代 §三 的对应行)
+
+```
+verify --all --strict-reach --strict-taut --strict-inert
+  ⇒ **exit 0 / 行首 ✗ 0 项**(~26s,不含自检)
+用例        1526 → **1533 条 / 29 套件**(WS 1014 / 14 套件 · 基座 519 / 15 套件)
+生产可达性  88/98 **未变**(分母仍 98)
+入口可加载性 4 个入口实测可加载 · 1 个已登记豁免(原 2 个 —— room.colyseus.ts 的豁免**已摘**)
+入口执行层   1 个 verdict 守卫 handler 已登记,其中**成功路径为空 0 个**(原 1 个)
+装饰器例外   **0 处**(原 1 处)
+WS-10       102/102(断言调用点 942 → 996)
+WS-07       215/215(原 212)
+新增套件     tests/WS-FND-15-e2e.test.ts(4 条)
+```
+
+### 12.2 做了什么
+
+```
+G2 幽灵泡泡规则 3/4(§六 序 2)—— **补齐**
+   不能移动:world_sim.ts applyPlayerMove 对倒地玩家返回 false + 可判定理由
+   不能攻击:world_sim.ts attackMobAuthorized 返回 rejected:'DOWNED'
+   四条共用同一真值来源 VitalsSystem.downed;含**健在负对照**;12 条注入全红
+
+G3 生产入口可加载性(§六 序 3)—— **三条阻塞全消除**
+   装饰器 44 → 0(改官方 defineTypes;字段仍 44 个,逐名字逐类型不变)
+   Client 改 import type(它本就没有运行时值)、Room 改 default 解构
+   registerHandlers() 加了**真实调用点**(onCreate);豁免条目已摘
+   ⇒ node -e "import('./server/src/net/room.colyseus.ts')" ⇒ **LOADED**
+
+G4 动作执行层(§六 序 3)—— **接线 + 消灭静默成功**
+   新增 RoomRuntime.dispatchAction():5 个动作(成员角色/踢人/房间访问/派对模式/关房)
+   真的改可观测状态;未实现的 17 个**显式**返回 kind:'NOT_IMPLEMENTED'
+   handler 成功侧发 actionResult、失败侧发 reject(带 kind)
+   VERDICT_HANDLER_KNOWN 里 action 那条按门禁自身要求**移出并留档**
+   判据:WS-07 的 ACT-1/2/3(行为级 + GUEST 负对照 + 零副作用)
+
+G5 第五层 5 条裁决(§六 序 3 的前提)—— **已裁并落 ARCH-GAPS**
+   ★ 实测发现其中 **4 条早已在代码里落地并有断言**,只有第 5 条(mobHitDamage)是本轮新做
+   ⇒ 记录在 docs/ARCH-GAPS.md 第五层的「★ 裁决记录」节(含每条钉它的断言在哪)
+
+G6 复活宽限「有名」(§六 序 4)—— **补齐缺口**
+   机制与主体断言本已存在(94→102);本轮补:逐玩家宽限、读档不发无敌
+   注入 iframeSec=0 / invulnSec 缺省改坏 ⇒ 均红
+
+G7 客户端联机层(§六 序 1,关键路径)—— **实测 + 修了一条真断裂**
+   ★ 见 COMPLETION-CRITERIA §三 的更新:session.ts **已在生产链上**(不是"不存在")
+   ★ 但实测到:服务端用**文本帧**发 welcome,而 session.ts 只收 ArrayBuffer
+     ⇒ 握手永不完成(state 恒 connecting)、localPlayerId 恒空、圆心恒 null,
+       而**二进制快照照常合入** ⇒ 症状是"画面在动,只是圆心不对"
+   ⇒ 已修(文本帧汇入同一 classifyDownlink 分派)+ 端到端判据 WS-FND-15
+   ⚠️ prediction.ts **仍未接**:它的卡点在**输入端**(无 InputCmd 生产者),
+     而「WASD 是镜头还是角色」是**产品裁决** —— 见 COMPLETION-CRITERIA §三 更新
+
+G8 108 条台账逐条定性(§六 序 5)—— **完成**
+   24 已实现未标 / 31 真欠账 / 49 待裁 / **4 我不知道**(独立计数)= **108** ✓
+   逐条表:docs/BACKLOG-108-TRIAGE.md(主控抽查 3 组结论,全部成立)
+```
+
+### 12.3 本轮改动的文件
+
+```
+server/src/combat/vitals.ts        W1 去重(钳制只剩一处)+ mobHitDamage 上界与消毒
+server/src/combat/revive.ts        仅注入后逐字节还原,最终与 HEAD 一致
+server/src/sim/world_sim.ts        倒地闸 ×2 + 可判定理由字段
+server/src/net/room.ts             dispatchAction + ActionPayload/ActionOutcome + classifyFailure
+server/src/net/room.colyseus.ts    action handler 接分派 + 双向回执;registerHandlers 调用点;导入修法
+server/src/net/schema.colyseus.ts  44 处装饰器 → defineTypes(字段与类型不变)
+client/src/net/session.ts          ★ 文本帧分支(修端到端断裂)
+scripts/verify.ts                  DECORATOR_EXEMPT 清空;action 移出 VERDICT_HANDLER_KNOWN;去写死数字
+scripts/entry_load_exempt.ts       摘 room.colyseus.ts 豁免
+scripts/typecheck-baseline.json    基线 265 → 261(只准减不准增,已按脚本建议 --update)
+tests/WS-07.test.ts                两条墓碑断言改向 + ACT-1/2/3 + 装饰器口径
+tests/WS-10.test.ts                规则 3/4 判据 + 宽限缺口 + 裁决 1/4/5 的判据
+tests/WS-FND-09-wiring.test.ts     豁免表断言改向(条数 2 → 1)
+tests/WS-FND-12-wiring-paths.test.ts  FND12-8 改向为「必须可加载 + handler 已注册」
+tests/WS-FND-15-e2e.test.ts        **新套件**(真客户端模块 ↔ 真服务端)
+docs/ARCH-GAPS.md                  第五层裁决记录
+docs/COMPLETION-CRITERIA.md        档 B/C 勾选 + §三 更新
+docs/BACKLOG-108-TRIAGE.md         **新文档**
+docs/PROGRESS.md                   陷阱 143 / 144
+```
+
+### 12.4 ★ 本轮**没有**做到(如实)
+
+```
+1 档 B 判据「从浏览器走一遍多人流程不撞空操作」—— **仍未达成**。
+   已接的动作只有 5/22;其余 17 个**会说话**(NOT_IMPLEMENTED)但**确实没有功能**。
+2 档 C 的三项玩法(9 种房间增益 / 料理 buff 消费点 / 三件死道具裁决)——
+   按边界 9 **不做**(需 owner 产品裁决)。
+3 prediction.ts 仍未接(卡在 WASD 产品裁决)。
+4 未 commit / 未 push。
+5 真机 FPS 仍未实测(合同「我不打算做的事」已声明)。
+```
+
+### 12.5 判据对照(逐条)
+
+```
+AC1  全量门禁不退化                ✓(exit 0 / 行首 ✗ 0)
+AC2  用例数净增                    ✓ 1533 > 1526
+AC3  可达性分母不变                ✓ 共 98
+AC4  自检区分力                    ✓ gate-selfcheck **30/30** 全过(--strict-selfcheck 已纳入退出码)
+AC5  倒地不可移动                  ✓ 注入即红
+AC6  倒地不可攻击                  ✓ 注入即红
+AC7  入口可加载                    ✓ LOADED
+AC8  装饰器归零                    ✓ 44 → 0,字段 44 不变
+AC9  handler 已注册                ✓ ≥2
+AC10 豁免已摘                      ✓ 表内只剩 1 条
+AC11 动作真的执行                  ✓ ACT-1
+AC12 静默成功已消灭                ✓ ACT-2 + handler 双向回执断言
+AC13 5 条裁决各有断言              ✓ ARCH-GAPS「★ 裁决记录」逐条注明断言位置
+AC14 复活宽限有名                  ✓ 注入即红
+AC15 prediction 已接               ✗ **未达成**(卡产品裁决)—— 理由见 §12.4
+AC16 端到端往返                    ✓ WS-FND-15 4/4
+AC17 台账定性完整                  ✓ 24+31+49+4 = 108
+AC18 文档哈希自洽                  ✓ 见 §九 的表
+AC19 无新增依赖                    ✓ dependencies 仍为空
+AC20 冻结层未被动                  ✓ --frozen 17 项全绿;shared/** 与 harness.ts 未改
 ```

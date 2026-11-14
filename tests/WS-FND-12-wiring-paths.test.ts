@@ -20,16 +20,21 @@
  * 那句话**只对 A 路成立**。本套件把「分口径」这件事变成断言,
  * 使「将来任何人想把它简化成一句」时**立刻红**。
  *
- * ## 为什么这些断言**读源码**而不是 import B 路
+ * ## 本套件的取证手段(2026-11-14 task-95 后已更新)
  *
- * `room.colyseus.ts` **无法被 Node 加载**(实测):
+ * 本套件原先**不能** import B 路 —— `room.colyseus.ts` 当时无法被 Node 加载:
  * ```
  * 它传递依赖 ./net/schema.colyseus.ts,后者含 44 处 @type 装饰器
  * ⇒ Node strip-only 无法擦除装饰器 ⇒ SyntaxError: Invalid or unexpected token
+ * ⇒ 该「不可加载」还会经 import 边传染给 index.ts 的闭包
  * ```
- * ⚠️ 而且这个「不可加载」会**经由 import 边传染** —— 任何人让 `index.ts`
- *   import 它(`PROD_ENTRIES` 成员),门禁的入口可加载性检查当场红。
- * ⇒ 故本套件的取证手段是**源码文本 + 子进程加载探针**,不是 import。
+ * ✅ task-95 已把这条阻塞修掉(装饰器 → `defineTypes`;CJS 命名导入 →
+ *   默认导出解构 / `import type`),⇒ 现在**可以** import B 路,
+ *   而「不可加载」那条断言按设计改向为「**必须可加载** + 4 条 handler 必须已注册」
+ *   (见 FND12-8;它同时**实跑**一次 `onCreate()` 取证,不再只查字符串在不在)。
+ * ⇒ 其余断言仍**读源码**:它们测的是「两条路的字段名 / rtOpts 键集是否分叉」——
+ *   那不是 import 能测的(import 一个模块什么也不证明),
+ *   文本判据在这里是**恰当**手段,不是退而求其次。
  *
  * ## 每条断言都附「它能怎么变红」
  *
@@ -44,6 +49,7 @@ import { fileURLToPath } from 'node:url';
 
 import { assemble } from '../server/src/index.ts';
 import { RoomRuntime, RoomRegistry } from '../server/src/net/room.ts';
+import { NetPersistRoom } from '../server/src/net/room.colyseus.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -145,13 +151,18 @@ test('FND12-7 ownerId 的用途是**玩家身份**(不是注册表运维者)—�
   ok(asOther.role !== 'OWNER', '别人不该拿 OWNER 角色');
 });
 
-/* ═══════════ 4. 「不可加载」会经 import 边传染(接线的硬阻塞)═══════════ */
+/* ═══ 4. 「不可加载」**已修**:接线阻塞消失,且 handler 真的注册了 ═══ */
 
-test('FND12-8 room.colyseus.ts 不可加载,且该不可加载**会传染给 index.ts 的闭包**', () => {
-  /* 这条是「为什么 B 路不能靠『在 index.ts 里加一行 import』接上」的**证据**。
-     判据与 verify.ts 的 entryLoadable() 同源:子进程 import,只看
-     SyntaxError / ERR_MODULE_NOT_FOUND / ERR_INVALID_TYPESCRIPT_SYNTAX。
-     变红条件:B 路变得可加载了(那「加一行会红」这个阻塞就消失了,应重新评估接法)。 */
+test('FND12-8 B 路**必须可加载**,且 4 条 handler 在 onCreate 里真的被注册(原断言为「不可加载」)', () => {
+  /* ★ 本条于 2026-11-14(task-95)**按设计改向**,不是删改措辞。
+     原断言把「B 路当前不可加载」钉成事实,并据此证明「在 index.ts 里加一行 import
+     会让门禁红」。三条阻塞(装饰器 / CJS 命名导入 / registerHandlers 0 调用点)
+     修好后,那条断言**必然变红** —— 变红是「接线阻塞消失」的验收信号,
+     而不是回归(原注释里就写着「若这条红了:说明 B 路已可加载……应更新本断言」)。
+     ⇒ 新口径(本条**保留**,只换方向):**B 路必须可加载**,且 **handler 必须已注册**。
+
+     判据与 verify.ts 的 `entryLoadable()` 同源:子进程 import,只看
+     SyntaxError / ERR_MODULE_NOT_FOUND / ERR_INVALID_TYPESCRIPT_SYNTAX。 */
   const judge = (spec: string): boolean => {
     const src =
       `import(${JSON.stringify(spec)}).then(()=>{process.exit(0)},e=>{`
@@ -164,21 +175,51 @@ test('FND12-8 room.colyseus.ts 不可加载,且该不可加载**会传染给 ind
     return r.status === 0;
   };
   ok(judge('./server/src/index.ts'), '基线:index.ts 应可加载');
-  /* 传染性:用一个**子进程内**的 data: 模块把两条 import 串起来,
-     避免在仓库里留临时文件(纪律:临时探针不许乱造乱删)。 */
-  const chain =
-    `import(${JSON.stringify('./server/src/net/room.colyseus.ts')})`
-    + `.then(()=>import(${JSON.stringify('./server/src/index.ts')}))`
-    + `.then(()=>{process.exit(0)},e=>{`
-    + `const name=String(e&&e.constructor&&e.constructor.name);`
-    + `const code=String((e&&e.code)||'');`
-    + `const bad=code==='ERR_MODULE_NOT_FOUND'||code==='ERR_INVALID_TYPESCRIPT_SYNTAX'`
-    + `||code==='ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX';`
-    + `if(name==='SyntaxError'||bad){process.exit(3)}process.exit(0)});`;
-  const r = spawnSync(process.execPath, ['-e', chain], { cwd: ROOT, encoding: 'utf8', timeout: 90_000 });
-  ok(r.status !== 0,
-    'B 路当前应不可加载(⇒ 任何让 index.ts 依赖它的接法都会红)。'
-    + '若这条红了:说明 B 路已可加载,接线的阻塞已消失,应重新评估接法并更新本断言');
+  ok(judge('./server/src/net/room.colyseus.ts'),
+    'B 路**必须可加载**。若这条红了:装饰器 / CJS 命名导入的阻塞又回来了 ——'
+    + '而它是 PROD_ENTRIES 成员(生产入口),加载不了就等于整条 B 路跑不到');
+
+  /* ── 第二半:4 条 handler 必须**真的**被注册 ──
+     ★ 为什么必须用行为判据,不能只查源码里有 `this.registerHandlers();` 这一行:
+       源码里存在 ≠ 被调用。task-95 实测的原始缺陷恰恰是「方法声明在、全仓 0 调用点」——
+       而「查字符串在不在」的断言对那个缺陷**恰好是绿的**(本仓反复点名的
+       「存在性断言冒充定位断言」形态)。
+     ⇒ 做法:真跑一次 `onCreate()`,只把**副作用**换掉 ——
+       · Colyseus 构造器会 `setPatchRate(50)` 起一个定时器,故在 prototype 上先换掉它
+         (否则定时器挂住进程,测试文件跑完不退出);
+       · `onMessage` 换成记录器(这样「注册了哪几条」可逐条核对);
+       · `setState` / `setSimulationInterval` 换成空实现(不真起 patch 与 20Hz 定时器)。
+       `assertSchemaReady()`、`new RoomRuntime(...)`、`this.maxClients = ...` 都**真跑**。
+     ⇒ 变红条件:去掉 `onCreate` 里的 `this.registerHandlers();`(或改坏它的调用),
+       则 `seen` 为空数组 ⇒ 本断言红。 */
+  const proto = NetPersistRoom.prototype as unknown as Record<string, unknown>;
+  const realPatchRate = proto.setPatchRate;
+  proto.setPatchRate = function stubPatchRate(): void { /* 不建定时器 */ };
+  const room = new NetPersistRoom();
+  proto.setPatchRate = realPatchRate;
+  /* 关掉 Colyseus 的「空房自动销毁」定时器(否则 1s 后它自己 dispose,污染 stderr)。 */
+  room.autoDispose = false;
+
+  const rec = room as unknown as {
+    onMessage: (type: string, cb: unknown) => void;
+    setState: (state: unknown) => void;
+    setSimulationInterval: (fn: () => void, ms: number) => void;
+    onCreate: (options: unknown) => void;
+    maxClients: number;
+    runtime: { id: string };
+  };
+  const seen: string[] = [];
+  rec.onMessage = (type) => { seen.push(type); };
+  rec.setState = () => { /* 不建 schema 状态 */ };
+  rec.setSimulationInterval = () => { /* 不起 20Hz 定时器 */ };
+  rec.onCreate({ roomId: 'r_fnd12', maxPlayers: 4 });
+
+  eq(seen, ['move', 'attack', 'inventory', 'action'],
+    'onCreate 必须注册 4 条报文入口(漏一条 = 那条输入在生产里被**静默丢弃**:'
+    + 'onMessage 无 handler 时 Colyseus 不报错)');
+  eq(rec.maxClients, 4, 'onCreate 确实执行了(它把 options.maxPlayers 写进房间)');
+  ok(rec.runtime !== undefined && rec.runtime.id === 'r_fnd12',
+    'onCreate 确实建好了运行时 ⇒ 上面那次注册发生在 runtime 之后(handler 收到报文时读它)');
 });
 
 /* ═══════════ 5. 两处 rtOpts 键集仍相等(防分叉,与 FND9-9 互补)═══════════ */

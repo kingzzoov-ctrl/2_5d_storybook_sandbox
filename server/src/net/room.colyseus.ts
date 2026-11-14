@@ -1,14 +1,19 @@
 /**
  * WS-07 · Colyseus Room 薄装配层。
  *
- * **不被任何测试 import。** 它把 Colyseus 的生命周期回调原样转发给
+ * **业务逻辑不在这里。** 它把 Colyseus 的生命周期回调原样转发给
  * `RoomRuntime`(`./room.ts`,零依赖),因此所有业务逻辑都能在无 colyseus
  * 环境下被单测覆盖。这里的代码量刻意压到最小:
  *
- *   onCreate  → new RoomRuntime(...)  + RoomSchema
+ *   onCreate  → new RoomRuntime(...)  + RoomSchema + **registerHandlers()**
  *   onJoin    → runtime.join()        → 回发全量/断线快照
  *   onLeave   → runtime.disconnect() / runtime.leave()
  *   setSimulationInterval(50ms) → runtime.step() → schema.syncFrom()
+ *
+ * ✅ 本文件自 2026-11-14(task-95)起**可被 Node 直接加载**
+ *   (装饰器 → `defineTypes`、CJS 命名导入 → 默认导出/`import type`),
+ *   并由 `tests/WS-FND-12-wiring-paths.test.ts` 的 FND12-8 实测 import + 断言
+ *   4 条 handler 在 `onCreate` 里真的被注册。此前它**谁也没法 import**。
  *
  * 关键:**20Hz 差量由我们自己的 delta.ts 负责**,Colyseus 的自动 patch 只当
  * 兜底(通过 `schema.syncFrom` 写值,由 Colyseus 决定是否下发)。
@@ -16,12 +21,27 @@
  * 而 Colyseus 的 patch 支持其 WebSocket 层的可靠有序通道。
  */
 
-import { Room, Client } from 'colyseus';
+import colyseusPkg from 'colyseus';
+import type { Client, Room as ColyseusRoom } from 'colyseus';
 import { RoomSchema, BossSchema, PlayerSchema, WildlifeSchema, assertSchemaReady } from './schema.colyseus.ts';
 import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions, type WorldSaveHost } from './room.ts';
 import { DT } from '../../../shared/types/physics.ts';
 import { AccessMode } from '../db/repo.ts';
 import type { DbLike } from '../db/repo.ts';
+
+/**
+ * `Room` 的**运行时值**只能从默认导出上取(`colyseus` 是 CommonJS,根入口没有命名导出):
+ * ```
+ * import { Room, Client } from 'colyseus'   ✗ SyntaxError: Named export 'Room' not found
+ * import * as ns from 'colyseus'            ✗ 实测只有 4 个键,ns.Room === undefined
+ * import pkg from 'colyseus'                ✓ 实测 47 个键,typeof pkg.Room === 'function'
+ * ```
+ * 而 `Client` **连默认导出上都没有运行时值**(实测 `pkg.Client === undefined`;
+ * `@colyseus/core/build/index.d.ts` 只有 `export { type Client, ... }`)
+ * ⇒ 它只能是 `import type`(运行时擦除),**不能**改写成解构。
+ * ⇒ 两者写法不同不是风格问题,是「该符号有没有运行时值」的差别。
+ */
+const Room: typeof ColyseusRoom = colyseusPkg.Room;
 
 /**
  * **单通道开关(默认关闭 Colyseus patch 同步)。**
@@ -205,6 +225,23 @@ export class NetPersistRoom extends Room<RoomSchema> {
     };
     this.runtime = new RoomRuntime(rtOpts, this.deps?.db ?? null);
 
+    /* ★ 报文入口的**唯一**注册点(task-95 补)。
+     *
+     * 位置的理由(两句话都是硬条件,不是风格):
+     *  1 必须在 `this.runtime` 建好**之后** —— 4 条 handler 的第一句都是
+     *    `this.runtime.<fn>(...)`,注册时虽不读它,但**收到报文时**必读;
+     *  2 必须在**第一次可能收到报文之前** —— Colyseus 只在该房 `onCreate`
+     *    返回之后才会把客户端交给它(先是 `onJoin`,再是任意 `onMessage`)。
+     *    放在这里 ⇒ 早于 `onJoin`、早于任何报文;若挪到 `onJoin` 里,
+     *    重连/并发入场时先到的那条报文会被**静默丢弃**(onMessage 无 handler
+     *    时 Colyseus 不报错)。
+     *
+     * ⚠️ 为什么值得专门写这段:实测本方法此前**全仓 0 调用点**(仅 :316 的声明)
+     *    ⇒ 4 条 handler 从未注册 ⇒ 玩家按得动、客户端也发得出去,
+     *    但服务端**永远收不到** move / attack / inventory / action。
+     *    而「不可加载」掩盖了这件事 —— 文件加载不了,讨论 handler 注册无从谈起。 */
+    this.registerHandlers();
+
     /* 20Hz 权威帧。 */
     this.setSimulationInterval(() => this.stepTick(), DT * 1000);
   }
@@ -325,9 +362,36 @@ export class NetPersistRoom extends Room<RoomSchema> {
       const r = this.runtime.applyInventory(client.sessionId, { ops: msg.ops });
       if (!r.allowed) client.send('reject', { kind: 'INVENTORY' });
     });
-    this.onMessage('action', (client, msg: { action: Parameters<RoomRuntime['authorize']>[1] }) => {
-      const gate = this.runtime.authorize(client.sessionId, msg.action);
-      if (!gate.allowed) client.send('reject', { kind: 'PERMISSION', reason: gate.reason });
+    /* ── action:授权 → 执行 → **回执**(2026-11-14 接线)──
+     *
+     * ## 此前形态(实测)
+     * ```
+     * authorize(...) ⇒ !allowed ⇒ send('reject')
+     * ⇒ allowed === true 时**零执行、零回执、零日志**(成功分支为空)
+     * ```
+     * ⇒ 22 个 `RoomAction` 长期「授权存在、执行不存在」;玩家按了没反应,
+     *   而且**没有任何一处**能看出原因 —— 连 `else` 都没有。
+     *
+     * ## 现在
+     * 执行落到 `RoomRuntime.dispatchAction()`(它负责把宿主方法的返回值
+     * 翻译成 `ActionOutcome`,并对未实现的动作用 `NOT_IMPLEMENTED` **显式**拒绝)。
+     * 本 handler 只做一件事:**把结果变成回执**。
+     *
+     * ★ 成功**也**发回执(`actionResult { ok: true, effect }`)。
+     *   这不是冗余流量,而是消灭「静默成功」的唯一办法:
+     *   没有回执时,「执行了」与「什么都没发生」在客户端**不可区分**。
+     * ★ 失败带 `kind` —— 否则「无权」与「这个动作还没实现」在客户端又混成一件事,
+     *   而那正是本次修复要消灭的那类混淆。 */
+    this.onMessage('action', (client, msg: {
+      action: Parameters<RoomRuntime['authorize']>[1];
+      payload?: Parameters<RoomRuntime['dispatchAction']>[2];
+    }) => {
+      const out = this.runtime.dispatchAction(client.sessionId, msg.action, msg.payload ?? {});
+      if (out.ok) {
+        client.send('actionResult', { ok: true, action: msg.action, effect: out.effect ?? null });
+        return;
+      }
+      client.send('reject', { kind: out.kind, action: msg.action, reason: out.reason ?? null });
     });
   }
 

@@ -19,6 +19,7 @@
  * 3. **基线对照**:干净副本必须先绿。若基线就红,一切结论作废。
  * 4. 退出码非 0 表示「有检查没牙齿」或「探针失效」。
  *
+ *
  * 用法:
  *   node scripts/gate-selfcheck.ts              # 全部用例
  *   node scripts/gate-selfcheck.ts --only D1    # 只跑某组
@@ -28,6 +29,11 @@
 import { readFileSync, writeFileSync, existsSync, mkdtempSync, cpSync, rmSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, relative, sep, dirname, resolve } from 'node:path';
+/* ★ 2026-11-14(接手者):跳过规则走唯一事实源(`scripts/scan-scope.ts`)。
+   ⚠️ 这与本文件「独立复算」的原则**不冲突**:独立性要求的是**算法**独立
+      (自己走 import 图、不借 verify.ts 的函数),而不是「目录黑名单各写一份」——
+      后者不是独立复算,是**同一份事实的第七份副本**,而且它实测已经缺了 `_probe_sandbox`。 */
+import { shouldSkipDirAtDepth } from './scan-scope.ts';
 
 /**
  * ★ **本文件自带**的相对导入提取 —— 有意**不**从 `verify.ts` import。
@@ -222,17 +228,26 @@ const CASES: Case[] = [
    * 这两条 handler 一旦被修好,写死的锚点就会过期,而过期的表现是
    * 「锚点命中 0 次」—— 看起来像「门禁没问题」,实际是**用例没测到**。
    */
-  {
-    group: 'T37',
-    name: 'action handler 加上成功执行 ⇒ 登记应报「不再是该形态」',
-    file: 'server/src/net/room.colyseus.ts',
-    from: '',
-    to: '',
-    expect: 'red',
-    wantMsg: /不再是该形态/,
-    args: ['--frozen'],
-    mark: 'inert-action',
-  } as Case,
+  /* ⛔ **本用例已于 2026-11-14 移除 —— 它的主体不存在了**。
+   *
+   * 原用例:「给 `action` handler 加上成功执行 ⇒ 登记应报『不再是该形态』」。
+   * 它靠 `mark: 'inert-action'` 从活文件里自取「`action` 的拒绝守卫行」(`!x.allowed`),
+   * 再往它后面插一条执行语句来构造注入。
+   *
+   * 2026-11-14 动作执行层接线之后:
+   * ```
+   * · action handler 改成 `dispatchAction()` + **双向回执**(成功 actionResult /
+   *   失败 reject),里面**不再有** `!x.allowed` 那一行;
+   * · 于是锚点自取抛出「action 的拒绝守卫行未找到」(实测:gate-selfcheck 直接崩);
+   * · 而 verify.ts 的 VERDICT_HANDLER_KNOWN 里 action 那条**已被移出** ⇒
+   *   本用例即便能注入,也**永远不可能变红**(它要测的门禁已不再检查该主体)。
+   * ```
+   * ⇒ 按 T37 第二条用例(attack 换向)的同一处置原则:**用例自己过期了**,
+   *   而不是「门禁失效」。留着它会让 gate-selfcheck 崩溃 —— 那是**更坏的**
+   *   状态:一个连跑都跑不起来自检。故移除,并在此留档。
+   * ⇒ 仍保留的是 `inert-attack`:attack 不在登记表里,
+   *   把一条「已修好」的登记项塞回去必须报「不再是该形态」—— 那条还成立。
+   */
   {
     group: 'T37',
     name: '把**已修好的** attack 重新塞回登记 ⇒ 应报「不再是该形态」',
@@ -688,9 +703,12 @@ const CASES: Case[] = [
       const walkTs = (dir: string, depth = 0, out: string[] = []): string[] => {
         for (const e of readdirSync(dir, { withFileTypes: true })) {
           if (e.isDirectory()) {
-            /* 只在**根层**(depth === 0)跳过 build/dist;子层一律进 —— 见上方长注释 */
-            if (depth === 0 && /^(build|dist|out|coverage|release)$/.test(e.name)) continue;
-            if (/^(node_modules|\.git|_design|_shots|_vss_restore)$/.test(e.name)) continue;
+            /* ★ 2026-11-14(接手者):两条规则**合并为唯一事实源的一次调用** ——
+               此前这里是**第 7 份**跳过清单(而且它自己也缺 `_probe_sandbox`)。
+               语义逐条等价:`depth 0` = 构建产物类 + 非本仓类;`depth > 0` = 只有非本仓类
+               ⇒ 上面那段长注释写的纪律(「只在根层跳过 build/dist」)从此由**类型**保证,
+                 不再靠"下一个写判据的人会读到这段注释"。 */
+            if (shouldSkipDirAtDepth(e.name, depth)) continue;
             walkTs(join(dir, e.name), depth + 1, out);
             continue;
           }
@@ -795,6 +813,46 @@ const CASES: Case[] = [
     expect: 'any',
     wantMsg: /分类顺序.*结果/,
     args: ['--frozen'],
+  },
+
+  /* ═══ T38:新增的「计数对账」接链必须能失败 ═══
+   *
+   * 2026-11-14(接手者)把 `scripts/count-audit.ts` 的**两组断言**接进了 verify.ts 的退出链。
+   * 本仓的纪律是「**接线时必须自带区分力自检**」——
+   * 一个"永远绿"的消费侧和没接线没有区别(见 `checkJudgementAudit` 处那条长注释)。
+   *
+   * 两条用例各打**一条不同的**分支 —— 合起来才是"接线真的在消费它的退出码":
+   * ```
+   * T38-a  README 里的自称改坏        ⇒ 走「★ 陈旧」分支
+   * T38-b  真值来源被拆(多要一个键) ⇒ 走「★ 正解缺失」分支
+   * ```
+   * ⚠️ `wantMsg` 用的是**只有本道会打的**那句(`文档自称与代码正解不一致` /
+   *    `TRUTH 键解析失败`)—— 不能用 `/计数对账/` 之类宽串:
+   *    宽串会**同时匹配"节标题"**,于是即使失败来自别的检查、用例也照样"通过"。
+   *    这正是本仓那条判据:**断言必须锚在只有目标路径才会产出的字符串上**。
+   *
+   * ⚠️ 两条都用 `--docs`(局部口径,约 4.6s):本道的守卫是 `!frozenOnly && !only`,
+   *    `--docs` 属于会跑到它的口径 ⇒ 用例既快又真的经过那条路径。
+   */
+  {
+    group: 'T38',
+    name: '把 README 的「同义反复白名单 5 条」改坏 ⇒ 计数对账必须红(T38-a)',
+    file: 'README.md',
+    from: '✅(白名单 5 条',
+    to: '✅(白名单 4 条',
+    expect: 'red',
+    wantMsg: /文档自称与代码正解不一致/,
+    args: ['--docs'],
+  },
+  {
+    group: 'T38',
+    name: '把 TRUTH 表多要一个不存在的键 ⇒ 计数对账必须报「真值缺失」(T38-b)',
+    file: 'scripts/count-audit.ts',
+    from: "const EXPECTED_TRUTH_KEYS = ['可达性白名单', 'orphan', '同义反复白名单'] as const;",
+    to: "const EXPECTED_TRUTH_KEYS = ['可达性白名单', 'orphan', '同义反复白名单', '本用例注入的假键'] as const;",
+    expect: 'red',
+    wantMsg: /TRUTH 键解析失败/,
+    args: ['--docs'],
   },
 ];
 

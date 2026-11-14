@@ -765,6 +765,39 @@ export function projectInventoryTotal(
 }
 
 /**
+ * `action` 报文里除动作名之外能带的参数(**可选**;缺则按 `INVALID` 拒绝)。
+ *
+ * 为什么不把参数并进 `RoomAction` 常量本身:动作名是**协议常量**,
+ * 而要带的参数随动作而变(16 个动作里只有 4 个需要参数)。
+ * 分开之后,「动作清单」这一份事实仍然只有一处(`RoomAction`)。
+ */
+export interface ActionPayload {
+  /** `SET_MEMBER_ROLE` / `KICK_MEMBER`:目标成员。 */
+  targetId?: string;
+  /** `SET_MEMBER_ROLE`:新角色。 */
+  role?: RoomRole;
+  /** `SET_ROOM_ACCESS`:访问模式。 */
+  mode?: AccessMode;
+  /** `SET_ROOM_ACCESS`:密码房的口令 hash(`null` = 无密码)。 */
+  passwordHash?: string | null;
+  /** `SET_PARTY_MODE`:派对模式。 */
+  partyMode?: PartyMode;
+}
+
+/**
+ * 一次动作分派的**结果 + 回执**。`effect` 只放可序列化的少量字段 ——
+ * 回执要能直接进报文,不许把内部对象漏出去。
+ */
+export interface ActionOutcome {
+  ok: boolean;
+  /** 结果类别。**必须显式**(含 `NOT_IMPLEMENTED`)= 消灭"静默成功"的载体。 */
+  kind: 'OK' | 'PERMISSION' | 'INVALID' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
+  /** 失败原因;`ok === true` 时不存在。 */
+  reason?: string;
+  /** 成功时的后果摘要(回执用)。 */
+  effect?: Record<string, string | number | boolean>;
+}
+/**
  * 单个房间的运行时。**不 import colyseus** —— colyseus 的 Room 只是薄装配层
  * (`room.colyseus.ts`),把它的 onTick/onJoin 转发到这里的方法。
  */
@@ -1232,6 +1265,116 @@ export class RoomRuntime {
     this.touch(this.clock.nowMs());
     if (this.db) setPartyMode(this.db, this.id, mode, this.clock.nowMs());
     return { ok: true };
+  }
+
+  /* ── 4.4 动作分派(RoomAction 的**执行层**)── */
+
+  /**
+   * 把 `authorize()` 的「许可」变成「执行 + 回执」。
+   *
+   * ## 此前的问题(实测,2026-11-14)
+   *
+   * `room.colyseus.ts` 的 `action` 报文 handler 只有一句:
+   * ```
+   * authorize(...) ⇒ !allowed ⇒ client.send('reject', ...)
+   * ```
+   * ⇒ `allowed === true` 时**零执行、零回执、零日志**(成功分支为空)。
+   * 于是 22 个 `RoomAction` 长期处于「授权存在、执行不存在」的状态,
+   * 而**失败是静默的** —— 玩家按了没反应,没有任何一处能看出原因。
+   *
+   * ## 为什么本方法**不**自己判权限(这是刻意的分工)
+   *
+   * 下面 4 个动作的宿主方法(`setMemberRole` / `kick` / `setAccess` /
+   * `setPartyModeBy`)**各自第一行就是 `this.authorize(...)`**。
+   * 本方法若再判一次,就长出**第二份权限实现** —— 本仓 1 号病根
+   * (陷阱 31/41;同族的最近一例是 `vitals.ts:405-408` 记的「两侧都钳 = 两份实现」)。
+   * ⇒ 故:**宿主方法自带闸的,直接调用它,再把它的返回值翻译成本方法的返回类型。**
+   *
+   * ⚠️ 唯一的例外是 `CLOSE_ROOM`:`close()` 是**生命周期方法**,
+   *   还被 `onDispose` 与 `reapEvictions` 调用 ⇒ 它**不能**自带权限闸,
+   *   闸必须在这里。这个不对称是**刻意的**,不是遗漏。
+   *
+   * ## 未实现的动作**显式**返回 `NOT_IMPLEMENTED`
+   *
+   * 静默成功正是本次要消灭的东西。若这里对未实现的动作返回 `ok: true`,
+   * 客户端会以为动作生效了,**而门禁一条都红不了**(它只查「成功分支是否为空」)。
+   * ⇒ 返回 `ok: false` + `kind: 'NOT_IMPLEMENTED'` ⇒ 它**可被断言**:
+   *   「发 `PLACE_BLOCK` ⇒ 回执必须是 NOT_IMPLEMENTED」。
+   *   将来谁把它接上,那条断言会**按设计变红**,提醒同时更新
+   *   `verify.ts` 的 `VERDICT_HANDLER_KNOWN` 登记。
+   *   ★ 这与本仓既有手法一致:**把"未做项"钉成一条会红的断言**,而不是留一句注释。
+   */
+  dispatchAction(actorId: string, action: RoomAction, payload: ActionPayload = {}): ActionOutcome {
+    switch (action) {
+      case RoomAction.SET_MEMBER_ROLE: {
+        const targetId = payload.targetId;
+        const role = payload.role;
+        if (typeof targetId !== 'string' || role === undefined) {
+          return { ok: false, kind: 'INVALID', reason: '需要 targetId 与 role' };
+        }
+        const r = this.setMemberRole(actorId, targetId, role);
+        return r.ok
+          ? { ok: true, kind: 'OK', effect: { targetId, role: String(role) } }
+          : this.classifyFailure(actorId, action, r.reason);
+      }
+      case RoomAction.KICK_MEMBER: {
+        const targetId = payload.targetId;
+        if (typeof targetId !== 'string') {
+          return { ok: false, kind: 'INVALID', reason: '需要 targetId' };
+        }
+        const r = this.kick(actorId, targetId);
+        return r.ok
+          ? { ok: true, kind: 'OK', effect: { targetId } }
+          : this.classifyFailure(actorId, action, r.reason);
+      }
+      case RoomAction.SET_ROOM_ACCESS: {
+        const mode = payload.mode;
+        if (mode === undefined) return { ok: false, kind: 'INVALID', reason: '需要 mode' };
+        const r = this.setAccess(actorId, mode, payload.passwordHash ?? null);
+        return r.ok
+          ? { ok: true, kind: 'OK', effect: { mode: String(mode) } }
+          : this.classifyFailure(actorId, action, r.reason);
+      }
+      case RoomAction.SET_PARTY_MODE: {
+        const mode = payload.partyMode;
+        if (mode === undefined) return { ok: false, kind: 'INVALID', reason: '需要 partyMode' };
+        const r = this.setPartyModeBy(actorId, mode);
+        return r.ok
+          ? { ok: true, kind: 'OK', effect: { partyMode: String(mode) } }
+          : this.classifyFailure(actorId, action, r.reason);
+      }
+      case RoomAction.CLOSE_ROOM: {
+        /* ★ 例外:`close()` 不自带闸(见上方长注释)⇒ 闸在这里。 */
+        const gate = this.authorize(actorId, RoomAction.CLOSE_ROOM);
+        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
+        const done = this.close();
+        if (!done) return { ok: false, kind: 'ROOM_CLOSED', reason: '房间已不是 OPEN' };
+        return { ok: true, kind: 'OK', effect: { status: String(this.status) } };
+      }
+      default:
+        return {
+          ok: false,
+          kind: 'NOT_IMPLEMENTED',
+          reason: `动作 ${action} 尚无执行层(授权存在、执行不存在 —— 见 docs/TASK-94)`,
+        };
+    }
+  }
+
+  /**
+   * 失败**分类** —— 只在失败路径上问一次 `authorize()`,拿它的**结构化结果**分类。
+   *
+   * ⚠️ 这里**不许**改成"看 `reason` 字符串里有没有『无权』":
+   *   那是本仓反复点名的形态 —— **判据取不到它该判的东西时就会退化成读文本**
+   *   (`whitelistBreakdown` 的教训)。`authorize()` 本来就返回布尔,
+   *   读它比读它生成的散文可靠。
+   *
+   * ⚠️ 也**不是**第二份权限实现:判定仍由宿主方法内的那次 `authorize()` 做,
+   *   本方法只在它**已经拒绝之后**再问一次,用于分流 PERMISSION 与 INVALID。
+   *   `authorize()` 的契约写明"越权返回 false 且**不产生副作用**"⇒ 重问是安全的。
+   */
+  private classifyFailure(actorId: string, action: RoomAction, reason: string | undefined): ActionOutcome {
+    const gate = this.authorize(actorId, action);
+    return { ok: false, kind: gate.allowed ? 'INVALID' : 'PERMISSION', reason };
   }
 
   /* ── 4.3 反作弊转发 ── */

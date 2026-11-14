@@ -34,16 +34,53 @@
  */
 
 import type { WarnGeom } from '../mobs/geometry.ts';
+/* ★ 等级上界必须**从冻结层内容派生**(裁决 5),不许在本文件里手写数字。
+   import 的是**内容表**本身,不是"抄一个数过来" —— 见 `CONTENT_MAX_MOB_LEVEL`。 */
+import { MOB_LIST } from '../../../shared/constants/mobs.ts';
+import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
 
 /* ═══════════════════════ 1. 常量 ═══════════════════════ */
 
 /**
- * 玩家初始最大生命值。
+ * 玩家最大生命值的**缺省(兜底)**,**不是权威**。
+ *
+ * ## ★ 裁决(ARCH-GAPS「未决」第 1 条,已下):权威只在 `progression`
+ *
+ * ```
+ * 权威      PlayerProgress.maxHp  =  statsAtLevel(level).maxHp   ← 唯一真相源
+ * 落点      VitalsSystem.syncMaxHp(id, derivedMaxHp)             ← 逐玩家写入
+ * 本常量    「还没进入成长系统 / 还没同步过等级」时的初始值        ← 降级为缺省
+ * ```
+ * ⇒ 等级 30 的权威上限**不是**本常量,而是派生值(当前内容 = 535)。
+ * ⇒ 温泉「+30% 生命上限」这类乘区乘在 `v.maxHp`(**已是派生值**)上,
+ *   不乘在本常量上(`world_sim.effectiveMaxHp` 即此口径)。
+ *
+ * ## 为什么仍保留 100
  *
  * 取 100:手册未硬性规定玩家血量(它规定的是伤害公式),而 100 使
  * 「一刀掉多少」与百分比直觉一致。生物伤害量级见 `MOB_HIT_*`。
+ * 它同时是 `new VitalsSystem()` 无参时的值 —— 测试夹具与 `demo` 都靠它。
  */
 export const PLAYER_BASE_HP = 100;
+
+/**
+ * 冻结层内容里**生物等级的上界**(派生值,不是手写常量)。
+ *
+ * ## 为什么派生,而不是直接写 30
+ *
+ * 它是 `mobHitDamage` 的**上界口径**:手写数字的唯一后果是
+ * 「下一个人加了更高级的生物,伤害上界却还是旧值」——
+ * 这种漂移**不报错**,只会在某天悄悄把合法伤害钳掉(或放过荒谬值)。
+ * 派生自 `MOB_LIST` / `BOSS_LIST` 的 `level` 字段 ⇒ 改内容即改上界。
+ *
+ * 实测(当前内容):`MOB_LIST` 24 项 level 1..25、`BOSS_LIST` 8 项 level 5..30
+ * ⇒ 本值 = 30。`tests/WS-10.test.ts` 有一条断言把这个值钉住 ——
+ * 内容改动时它会红,提醒你复核这里的口径(而不是让口径悄悄过期)。
+ */
+export const CONTENT_MAX_MOB_LEVEL = Math.max(
+  ...MOB_LIST.map((m) => m.level),
+  ...BOSS_LIST.map((b) => b.level),
+);
 
 /**
  * 生物一次攻击的基础伤害(按其等级缩放)。
@@ -144,12 +181,79 @@ export interface VitalsFrameStats {
  *
  * **纯函数,不读生物状态**:这样测试可以直接断言数值,不必构造生物。
  * 与手册的 `bossScaledHp` 同一思路 —— 等级是唯一的缩放维度。
+ *
+ * ## ★ 上界(裁决 5):等级被钳进 `[1, CONTENT_MAX_MOB_LEVEL]`
+ *
+ * ### 为什么必须在这里钳
+ *
+ * 本函数是**所有**生物伤害的唯一产出口:`applyHit`(预警几何通道)与
+ * `resolveStrikes`(编排层批量结算)都只从这里取 `raw`。修前的实测
+ * (`docs/ARCH-GAPS.md` 第五层):
+ * ```
+ * mobHitDamage(1e9)  ⇒ 2000000004   ← 荒谬值经 raw 流进三个字段:
+ *   v.totalTaken += raw        (累计统计)
+ *   this.totals.damage += raw  (帧统计)
+ *   base.applied = raw         (★ 对外返回值:网络差量 / 客户端 / 存档)
+ * ```
+ * ⇒ 在这里钳一次,三个字段**同时**有界 —— 这比在三个写入点各钳一次好:
+ * 三份实现日后必然漂移(本仓陷阱 31/41),而这里只有一处口径。
+ *
+ * ### 阈值为什么不写 30
+ *
+ * 上界取 `CONTENT_MAX_MOB_LEVEL`(从 `MOB_LIST` / `BOSS_LIST` 派生)。
+ * 硬编码 30 的失败模式是**静默过期**:内容加了 35 级生物后,合法伤害
+ * 会被悄悄钳掉而不报错。
+ *
+ * ### 三档口径(与 `sanitizeComboMul` 同族:拒绝与夹取必须可区分)
+ *
+ * ```
+ * 合法 1..上界   ⇒ 原样
+ * 有限越界 ≤0    ⇒ 1;  > 上界 ⇒ 上界(夹取)
+ * +Infinity      ⇒ 上界(夹取)
+ * 非数字 / NaN   ⇒ 1(拒绝)
+ * ```
+ * 最后一条是**顺带堵住的一个真洞**:修前 `mobHitDamage({})` = `NaN`
+ * (`Math.max(1, NaN)` 返回 `NaN`),而 `NaN` 经 `raw` 写进 `v.hp` 后
+ * `hp === 0` 恒 false ⇒ 玩家**既不死也回不了血**(与 task-51 修掉的
+ * 「生物 HP 被 NaN 永久污染」同一形态,只是发生在 vitals 侧)。
  */
 export function mobHitDamage(level: number, mul = 1.0): number {
-  const lv = Math.max(1, Math.trunc(level));
+  const lv = clampMobLevel(level);
+  /* ★ 荒谬**乘数**的第二道门:`mul` 是公开入参(任何调用方都能传),
+     与等级同族 —— `mobHitDamage(5, NaN)` 修前返回 `NaN`。
+     口径与 `sanitizeComboMul` 一致:**非有限 ⇒ 拒绝**(退回 1.0),
+     而不是夹取到某个上界 —— 「乘数不可信」时唯一安全的默认是「不加成」。
+     ⇒ 本函数的输出**恒为有限数**(≥1),这是三个外流字段有界的前提。 */
+  const m = Number.isFinite(mul) ? mul : 1.0;
   const base = MOB_HIT_BASE + MOB_HIT_PER_LEVEL * (lv - 1);
-  return Math.max(1, Math.round(base * mul));
+  return Math.max(1, Math.round(base * m));
 }
+
+/**
+ * 把等级收进 `[1, CONTENT_MAX_MOB_LEVEL]`(见 `mobHitDamage` 的三档口径)。
+ *
+ * ⚠️ 单独成函数只为一件事:让「上界从内容派生」这条口径**只有一个实现**。
+ */
+function clampMobLevel(level: number): number {
+  /* `Math.trunc` 对非法值给出判别式:`{}` / `NaN` ⇒ NaN,`Infinity` ⇒ Infinity。
+     故 `Number.isNaN` 这一步**不是可选的** —— `Math.max(1, NaN)` 传播 NaN。 */
+  const trunc = Math.trunc(level);
+  if (Number.isNaN(trunc)) return 1;
+  return Math.min(CONTENT_MAX_MOB_LEVEL, Math.max(1, trunc));
+}
+
+/**
+ * 单次生物攻击伤害的**上界**(= 内容最大等级处的伤害)。
+ *
+ * 它是裁决 5 里「阈值口径」的可断言形态:
+ * ```
+ * MOB_HIT_MAX_DAMAGE === mobHitDamage(CONTENT_MAX_MOB_LEVEL)
+ * ```
+ * 断言它,就能钉住「`raw` 的荒谬值被吸收」这件事 —— 而不是只钉住某次调用的数字。
+ * ⚠️ 事件型攻击(`EVENT_STRIKE_RULES`)可带 `mul > 1`,故它**不是**`raw` 的绝对值上界,
+ * 而是「合法等级上限处的基础伤害」。荒谬**等级**造成的荒谬伤害由它兜住。
+ */
+export const MOB_HIT_MAX_DAMAGE = mobHitDamage(CONTENT_MAX_MOB_LEVEL);
 
 /**
  * 判断一个预警几何是否命中某玩家。
@@ -402,10 +506,20 @@ export class VitalsSystem {
    * W1 的两个病根(`hp > maxHp`、`NaN`)floor=0 一样治得住 ——
    * 因为 NaN 由甲兜底,与乙无关。真不变量是 `0 ≤ hp ≤ maxHp`。
    *
-   * ## 为什么钳制**只**在这里(不在 `revive.ts`)
+   * ## 为什么钳制**只**在这里(不在 `revive.ts`,也不在 `importVitals`)
    *
-   * `revive.ts` 只负责算期望值 `hpAfter` 并传入。两侧都钳 = **两份实现**,
-   * 日后改上限口径必然漂移(本仓陷阱 31/41 已踩过多次)。
+   * 裁决 4(ARCH-GAPS「未决」第 4 条,已下):本函数是**公开入口**
+   * (`world_sim.revivePlayer` / `tickDowned` / `importVitals` 都汇到它),
+   * ⇒ 钳在调用方只能防住**一个**调用方,而 `revive(id, 任意 hp)` 是公开签名。
+   * `revive.ts` 只负责算期望值 `hpAfter` 并传入。
+   *
+   * ```
+   * 修前   world_sim.importVitals 自带一份 `Math.min(v.maxHp, row.hp)`
+   *        ⇒ 同一入口的两条路径口径不同(读档有钳、revive 没有)
+   * 修后   **那份实现已摘除**,读档直接传原始 hp 进来,由本函数统一钳
+   *        ⇒ 真不变量 `0 ≤ hp ≤ maxHp` 只有一处实现
+   * ```
+   * 两侧都钳 = **两份实现**,日后改上限口径必然漂移(本仓陷阱 31/41 已踩过多次)。
    */
   revive(id: string, hp?: number, invulnSec = 0): boolean {
     const v = this.players.get(id);
@@ -531,12 +645,17 @@ export class VitalsSystem {
       return base;
     }
 
-    v.hp = Math.max(0, v.hp - raw);
+    /* ★ 三个字段都有界(裁决 5)——
+       上界由 `mobHitDamage` 的**单一**钳制点保证(等级钳进内容上界、
+       非有限乘数被拒)。这里**故意不再钳一次**:在三个写入点各钳一次 =
+       三份实现,日后必然漂移,且会掩盖上游钳制失效(本仓陷阱 31/41)。
+       实测链条(`tests/WS-10.test.ts` 逐条断言)见 `mobHitDamage` 的注释。 */
+    v.hp = Math.max(0, v.hp - raw);          /* 已钳在 0(HP 侧) */
     v.iframeSec = PLAYER_IFRAME_SEC;
     v.sinceHurtSec = 0;
-    v.totalTaken += raw;
+    v.totalTaken += raw;                     /* ★ 累计统计:有界(修前吸收 2e9) */
     v.hitCount += 1;
-    base.applied = raw;
+    base.applied = raw;                      /* ★ **对外返回值**:有界(修前外流 2e9) */
 
     if (v.hp === 0) {
       v.downed = true;
@@ -544,7 +663,7 @@ export class VitalsSystem {
       this.totals.downed += 1;
     }
     this.totals.hits += 1;
-    this.totals.damage += raw;
+    this.totals.damage += raw;               /* ★ 帧统计:有界 */
     return base;
   }
 

@@ -62,6 +62,7 @@
  */
 import { readdirSync, statSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { shouldSkipDir } from './scan-scope.ts';
 
 const ROOT = process.cwd();
 const DRY = process.argv.includes('--dry-run');
@@ -70,9 +71,13 @@ const FORCE = process.argv.includes('--force');
 const KEEP = process.argv.filter((a) => a.startsWith('--keep=')).map((a) => a.slice('--keep='.length));
 /** ★ 安全阈值:单次删除超过这个数就必须 `--force`(理由见文件头)。 */
 const MAX_SILENT = 40;
-/** 与 verify.ts 的 checkTempResidue 保持**同一份规则** —— 改一处要改两处(CR-20 的形态)。 */
+/* ★ 2026-11-14(接手者):原本这里是**第二份跳过清单**,而注释自己写着
+   「与 verify.ts 的 checkTempResidue 保持同一份规则 —— 改一处要改两处」(CR-20 的形态)。
+   ⇒ 那份副本已删除:跳过规则改由 `scripts/scan-scope.ts` 唯一提供。
+   ⚠️ 本器件是**破坏性工具** ⇒ 变更方向必须**只缩小删除范围**:
+      新集合是旧集合的**超集**(新增的 `dist` / `out` / `coverage` / `release` 在根下实测都不存在,
+      `_probe_sandbox` 旧表本就有)⇒ **不会让任何此前被保留的文件变成待删**。 */
 const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
-const SKIP_DIR = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|_probe_sandbox|\.git)$/;
 const TEMP_NAME = /^_.*\.(ts|js|mjs|txt|md|log|json)$/;
 
 interface Hit { rel: string; abs: string; size: number; inAuditRoot: boolean; head: string }
@@ -83,7 +88,7 @@ const walk = (dir: string, rel: string): void => {
   for (const n of readdirSync(dir)) {
     const abs = join(dir, n);
     const r = rel ? `${rel}/${n}` : n;
-    if (SKIP_DIR.test(n)) continue;
+    if (shouldSkipDir(n)) continue;
     let st;
     try { st = statSync(abs); } catch { continue; }
     if (st.isDirectory()) { walk(abs, r); continue; }
@@ -161,7 +166,7 @@ const walk2 = (dir: string, rel: string): void => {
   for (const n of readdirSync(dir)) {
     const abs = join(dir, n);
     const r = rel ? `${rel}/${n}` : n;
-    if (SKIP_DIR.test(n)) continue;
+    if (shouldSkipDir(n)) continue;
     let st;
     try { st = statSync(abs); } catch { continue; }
     if (st.isDirectory()) { walk2(abs, r); continue; }

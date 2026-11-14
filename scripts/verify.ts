@@ -12,7 +12,7 @@
  *   node scripts/verify.ts --strict-taut   # 把「未登记的同义反复候选」升级为失败
  *   node scripts/verify.ts --strict-inert # 入口执行层:未登记项报错
  *   node scripts/verify.ts --strict-reach  # 把「未登记的不可达模块」升级为失败
- *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(29 用例,约 163s)
+ *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(用例数与耗时见其自身输出)
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
@@ -23,6 +23,7 @@ import { FluidField } from '../server/src/world/fluid.ts';
 import { collectOpenItems, detectStale } from './backlog.ts';
 import { ENTRY_LOAD_EXEMPT } from './entry_load_exempt.ts';
 import { extractRelativeImports } from './imports.ts';
+import { shouldSkipDir, shouldSkipDirAtDepth } from './scan-scope.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 
@@ -404,9 +405,19 @@ async function countBacklog(): Promise<{
  * Node 24 默认不启用,实测 `.ts` 与 `.js` 都抛 `Invalid or unexpected token`,
  * 而 `node --check` 不报错。
  *
- * `schema.colyseus.ts` 是**唯一的例外**:它是 Colyseus 装配层,
- * `@type(...)` 装饰器本来就是构建期转译的产物,该文件不被任何测试 import,
- * 在生产里由 Colyseus 的构建链处理。
+ * ## ★ 2026-11-14:`schema.colyseus.ts` 已被**消除**,白名单因此**清空**
+ *
+ * 此前它是唯一例外:`@type(...)` 装饰器是 Colyseus 的构建期语法,
+ * 而 Node 24 的 strip-only 不支持装饰器 ⇒ 那个文件**不可加载** ⇒ 门禁只能给它开例外。
+ *
+ * 本轮把它改成 `@colyseus/schema` 官方的**无装饰器**写法(`defineTypes`):
+ * 行首 `@type(` 计数 **44 → 0**,字段名与类型标注语义不变,**零新增依赖**、无构建步骤。
+ * 实测:`node -e "import('./server/src/net/room.colyseus.ts')"` ⇒ `LOADED`。
+ * ⇒ 例外存在的**理由**消失了,白名单随之清空。
+ *
+ * ⚠️ 这里**保留空集合而不是删掉这个机制**:下一个人若真需要例外,
+ *   必须走「往这里加一条 → 白名单自检核对它确实含装饰器」这条路,
+ *   而不是悄悄放宽正则。**空集合是一条会说话的注释:现在一条例外都不许有。**
  *
  * ## 为什么白名单要**逐条核对**而不是直接跳过
  *
@@ -415,7 +426,7 @@ async function countBacklog(): Promise<{
  * 白名单里的每个路径**确实存在且确实含装饰器** ——
  * 白名单失真(多出或失效)会当场失败,而不是静默放宽门禁。
  */
-const DECORATOR_EXEMPT = new Set<string>(['server/src/net/schema.colyseus.ts']);
+const DECORATOR_EXEMPT = new Set<string>([]);
 
 const fail = (msg: string): void => {
   failures += 1;
@@ -509,9 +520,9 @@ async function checkGateSelfcheck(): Promise<void> {
   const strict = argv.includes('--strict-selfcheck');
   if (!strict) {
     /* 默认:只确认"它在",并把"未纳入默认口径"这件事说清。
-       ⚠️ 不打印 pass() —— 那会让 29 个用例的数字看起来像"已跑过"。 */
+       ⚠️ 不打印 pass() —— 那会让"它跑过了"看起来像事实。 */
     advise('门禁自检',
-      `scripts/gate-selfcheck.ts(29 用例,约 163s)**未纳入默认口径** —— `
+      'scripts/gate-selfcheck.ts(用例数见其自身输出)**未纳入默认口径** —— '
       + '它的红目前没有代价。加 --strict-selfcheck 才跑它并纳入退出码');
     return;
   }
@@ -534,7 +545,7 @@ async function checkGateSelfcheck(): Promise<void> {
  *
  * ```
  * 判据:**该缺陷会让门禁给出错误的通过**吗?
- *   · gate-selfcheck 未跑 ⇒ 本道门禁的结论**不完整**(少测了 29 件事)
+ *   · gate-selfcheck 未跑 ⇒ 本道门禁的结论**不完整**(少测了一整批变异用例)
  *     ⇒ 但已经测的部分是真的 ⇒ 可接受"告警 + 汇总行披露"
  *   · BOM ⇒ `JSON.parse` 抛错 ⇒ 模块**加载不了** ⇒ 下游全线红
  *     ⇒ 这是"门禁本身坏了",不是"门禁少测了"
@@ -1784,22 +1795,25 @@ let __diffReach: Set<string> | null = null;
 function diffSetData(): { prodAll: string[]; reach: Set<string> } {
   if (__diffProdAll === null) {
     __diffProdAll = [];
-    const walk = (dir: string): void => {
+    const walk = (dir: string, depth: number): void => {
       for (const e of readdirSync(dir, { withFileTypes: true })) {
         if (e.isDirectory()) {
-          if (!/^(node_modules|\.git|_design|_shots|_vss_restore|dist|build|out)$/.test(e.name)) {
-            walk(join(dir, e.name));
+          if (!shouldSkipDirAtDepth(e.name, depth)) { /* ★ 唯一事实源 + 深度感知口径 */
+            walk(join(dir, e.name), depth + 1);
           }
           continue;
         }
         if (!e.name.endsWith('.ts')) continue;
         const rel = relative(ROOT, join(dir, e.name)).split(sep).join('/');
-        /* ⚠️ 与 `ts-paths.ts` 的 `isProd` **同口径**:三个顶层目录的全部 .ts。
-           曾经这里是 `shared/src/`,而 `shared/` **没有 src/ 层** ⇒ 整棵被漏。 */
+        /* ⚠️ 与 `ts-paths.ts` 的 `isProd` **同口径**:三个顶层目录的全部 .ts —— 实测 **98**。
+           ★ 2026-11-14(接手者):此前跳过表在**所有层**都跳 `build` ⇒ `server/src/build/`
+             (5 个 .ts)整棵被静默漏掉 ⇒ 本函数曾算出 **93**。
+             ⇒ 即:上面那句「同口径」在修复前**不成立** —— 注释声称 98,代码给 93。
+             改用 `shouldSkipDirAtDepth()`:构建产物类只在**根层**跳过(陷阱 110 第 4 次复发)。 */
         if (/^(server|client|shared)\//.test(rel)) __diffProdAll.push(rel);
       }
     };
-    walk(ROOT);
+    walk(ROOT, 0);
   }
   if (__diffReach === null) __diffReach = reachableClosure(PROD_ENTRIES);
   return { prodAll: __diffProdAll, reach: __diffReach };
@@ -3771,11 +3785,26 @@ const VERDICT_HANDLER_KNOWN = new Map<string, VerdictHandlerFacts>([
        ⇒ **本门禁判定的是「handler 的成功分支是否为空」(形态层),它在形态上已修好。**
          「它在生产运行期端到端可达吗」是**装配层**的问题(two gaps),不归本门禁。
          两句话必须分开,不能合并成「已修」。 */
-  ['server/src/net/room.colyseus.ts::action', {
-    successPath: '**无** —— authorize 是纯查表函数,授权通过后无执行、无回执',
-    evidence: '实测 authorize 体零状态赋值;且 22 个 RoomAction 无分发器,'
-      + '见 docs/ARCH-GAPS.md 第二层',
-  }],
+  /* ✅ `action` **已于 2026-11-14 移出本表** —— 它不再是「无执行」形态。
+     移出依据(实测,不是采信报告):
+       `room.colyseus.ts` 的 `action` handler 现在把报文交给
+       `RoomRuntime.dispatchAction()`,并按结果**双向回执**:
+         成功 ⇒ client.send('actionResult', { ok: true, action, effect })
+         失败 ⇒ client.send('reject', { kind, action, reason })
+       ⇒ 成功分支**不再为空**;而本门禁的形态判据是「最后一句是 `if (!allowed…)`」
+       ⇒ 形态已变,继续登记会被 `checkInertHandlers` 判为**登记失真**并报错
+         (它自己的报错文案就写着「若已加成功执行,应移出登记并记为已修」)。
+
+     ★ 这里的「执行」是**可断言**的,不是修辞:
+       · 5 个动作(成员角色 / 踢人 / 房间访问 / 派对模式 / 关房)各自导致
+         `RoomRuntime` 的可观测状态变化;
+       · 未接的 17 个动作**显式**返回 `kind: 'NOT_IMPLEMENTED'`
+         —— 「静默成功」这一类已被消灭,而它是本次修复的正题。
+       判据见 `tests/WS-07.test.ts` 的 **ACT 系列**(含 GUEST 负对照与注入验证)。
+
+     ⚠️ **未接的 17 个动作不是「已修」**:它们仍无执行层,只是现在**会说话**了。
+       谁接上某个动作,`ACT-3` 那条「未实现必须显式拒绝」的断言会**按设计变红**,
+       提醒把该动作从 `NOT_IMPLEMENTED` 名单里移出。见 `docs/TASK-94`。 */
 ]);
 
 /** 句法扫描:找「`const v = ...;` 后跟 `if (!v.allowed) ...`」形态的 onMessage handler。
@@ -3940,6 +3969,101 @@ function checkJudgementAudit(): void {
   console.log('    └─ ⚠️ C 类命中带 [C?] 标记者**须人工复核** —— 该检测器覆盖判定已知偏窄');
 }
 
+/* ══════════════════ count-audit 接链(2026-11-14,接手者)══════════════════
+ *
+ * ## 接的是什么(实测,不是推断)
+ *
+ * `scripts/count-audit.ts` 检测「注释 / 文档里写死的、可被代码算出来的数」。
+ * 2026-11-14 由 task-84 任务A 给它加了**两组断言**,并注入验证有牙:
+ * ```
+ * 注入 A  把 `TAUT_SUSPECT_EXEMPT` 改名(5 处)
+ *         ⇒ exit **1** ·「★ 正解缺失:1 个应有的 TRUTH 键解析失败」 ✓ 断言 #2 有牙
+ * 注入 B  README.md:169 自称 白名单 5 → 4
+ *         ⇒ exit **1** ·「★ 陈旧 README.md:169 自称 4 (正解 5)」     ✓ 断言 #1 有牙
+ * ```
+ * ⇒ 两组都成立 ⇒ **技术条件已满足**,只差接进退出码。本函数就是那次接线。
+ *
+ * ## 为什么**不**做成 `--strict-count`
+ *
+ * 本文件既有的三道 `--strict-*`(reach / taut / inert)都是「**新增欠账**默认不拦截」的语义,
+ * 那条设计是对的。但本道查的**不是欠账**,是「声明的数与代码算出的正解不一致」:
+ * ```
+ * 同类既有:`verifyReadmeNumbers()` 对 README 的 14 项自称**直接 fail**,不设开关。
+ * 本道与它同性质(文档自称 vs 代码正解)⇒ 同样直接 fail。
+ * ```
+ * ★ 若给它一个默认关闭的开关,它就会重演本仓反复点名的陷阱 82
+ *   ——「**不拦门禁的自检脚本,它的红没有代价**」。
+ *   那正是 `gate-selfcheck.ts` 到今天还要靠 `--strict-selfcheck` 才生效的原因。
+ * ⇒ 判据:**一个"声明与事实不符"的检测器,不该由记得开开关的人来决定它有没有代价。**
+ *
+ * ## 消费侧必须同时看三件事
+ *
+ * ```
+ * 1 汇总行解析不到            ⇒ 崩溃 / 超时 / 格式变了 ⇒ **不能当绿**
+ * 2 ★ 陈旧 > 0                ⇒ fail(文档里的数 ≠ 代码正解)
+ * 3 ★ 正解缺失                ⇒ fail(真值来源被拆掉 ⇒ 检测器静默失效)
+ * ```
+ * ⚠️ 第 3 条**不能省**,也不是重复:实测「把被计数的声明**改名**」会让所有自称判 `?`
+ *   (既不 ✓ 也不 ★)⇒ 陈旧恒为 0 ⇒ **改个名字就能让它永远绿**。
+ *   上游(count-audit)已断言这条,但**接线侧必须自己再看一次** ——
+ *   否则哪天上游删掉那条断言,本道就静默失去一半意义,而没有任何东西报出来。
+ */
+function checkCountAudit(): void {
+  console.log('\n[计数对账]');
+  const script = join(ROOT, 'scripts', 'count-audit.ts');
+  if (!existsSync(script)) {
+    advise('计数对账', 'count-audit.ts 不存在 ⇒ 「文档自称 vs 代码正解」这道比对未运行');
+    return;
+  }
+  const r = spawnSync(process.execPath, ['scripts/count-audit.ts'], {
+    cwd: ROOT, encoding: 'utf8', timeout: 60_000,
+  });
+  /* ★ 退出码**就地取出** —— 与 `checkJudgementAudit` 同一条纪律:
+     那里的 F 检测器按 20 行窗口找「读了 status 没有」,把 `r.status` 推远就报"未读"。 */
+  const spawnStatus = r.status ?? -1;
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  /* ★ 先判「跑了没有」—— 否则崩溃 / 超时会被读成"没问题"(形态 F 的教训)。 */
+  const m = /自称总数\s*(\d+);与正解一致\s*(\d+);★\s*陈旧\s*(\d+)/.exec(out);
+  if (m === null) {
+    const head = out.split('\n').slice(0, 3).join(' / ').trim();
+    fail(`计数对账未产出可解析汇总(可能崩溃 / 超时 / 输出格式变了):${head.slice(0, 160)}`);
+    return;
+  }
+  const claims = Number(m[1]);
+  const matched = Number(m[2]);
+  const stale = Number(m[3]);
+  /* ★ 第 3 条:真值来源是否还在。 */
+  const missing = /正解缺失:(\d+)\s*个应有的 TRUTH 键解析失败/.exec(out);
+  if (missing !== null) {
+    fail(
+      `计数对账:${missing[1]} 个应有的 TRUTH 键解析失败 ⇒ 引用它的自称会被判 '?'`
+      + `(既不 ✓ 也不 ★)⇒ **本检测器静默失效**。不是"没有陈旧",是"没有比对" —— 两者必须可区分`,
+    );
+    return;
+  }
+  if (stale > 0) {
+    /* 只取**逐条定位行**(形如 `★ 陈旧 README.md:169 自称 4 (正解 5)`)。
+       ⚠️ 不能只按 `★ 陈旧` 过滤:汇总行(`自称总数 ...;★ 陈旧 0`)与
+          结论行(`★ 陈旧 ${stale} 处`)也含这个子串 ⇒ 会把"数量"当"位置"报出来。
+          这正是本仓那条纪律:统计门禁输出要先找**权威计数行**,不要关键词计数。 */
+    const lines = out.split('\n')
+      .filter((l) => /★\s*陈旧\s+\S+:\d+/.test(l))
+      .slice(0, 8)
+      .map((l) => l.trim().slice(0, 140));
+    for (const l of lines) fail(`文档自称与代码正解不一致:${l}`);
+    if (lines.length === 0) fail(`计数对账报 ★ 陈旧 ${stale} 处,但**未列出任何定位行**`);
+    return;
+  }
+  if (spawnStatus !== 0) {
+    fail(`计数对账 exit=${String(spawnStatus)} 但既无陈旧、也无真值缺失 ⇒ 退回码与判据不一致`);
+    return;
+  }
+  pass(
+    `计数对账:${claims} 处自称全部与代码正解一致(${matched}/${claims});`
+    + '三组正解键(可达性白名单 / ORPHAN_KNOWN / 同义反复白名单)均解析成功)',
+  );
+}
+
 /**
  * **临时残留清点**(2026-11-13,Lead 加)。
  *
@@ -3979,17 +4103,20 @@ function checkTempResidue(): void {
   console.log('\n[临时残留]');
   const SCAN_ROOTS = ['scripts', 'tests', 'server', 'client', 'shared'];
   const hits: { rel: string; size: number; inAuditRoot: boolean }[] = [];
-  /* ⚠️ `_vss_restore` 必须跳过 —— 它是 2026-11-13 误删事故后从 VSS 抢救出的
-     **188 个外部文件**(44.3 MB),名字以 `_` 开头、内容是 `.ts/.txt`
-     ⇒ 恰好落进下面的临时残留规则。它与 `scripts/clean-temp.ts` 的 SKIP_DIR
-     **同一份规则的两处副本**(CR-20 的形态)—— 改一处必须改两处。 */
-  const SKIP = /^(node_modules|_design|_shots|_cdp_profile|_vss_restore|\.git)$/;
+  /* ★ 2026-11-14(接手者):跳过规则**改由唯一事实源提供**。
+     此前这里是 `scripts/clean-temp.ts` 里那份 SKIP_DIR 的**第二份副本** ——
+     注释自己也写着「改一处必须改两处」(CR-20 的形态)。
+     ⇒ 第二份副本已不存在:`shouldSkipDir()` 由 `scripts/scan-scope.ts` 唯一提供。
+     ⚠️ 语义**逐条等价**,不是放宽:`_vss_restore` / `_probe_sandbox` / `_design` /
+        `_shots` 本就该跳过;`out` / `_cdp_profile` 已搬进事实源;
+        新增的只有「以 `.` 开头的隐藏目录」—— 实测仓库根只有 `.git` / `.baseline`,
+        而 `.baseline/` 内 `_*` 文件数为 **0** ⇒ 对本道的报数**零影响**。 */
   const walk = (dir: string, rel: string): void => {
     if (!existsSync(dir)) return;
     for (const n of readdirSync(dir)) {
       const full = join(dir, n);
       const r = rel ? `${rel}/${n}` : n;
-      if (SKIP.test(n)) continue;
+      if (shouldSkipDir(n)) continue;
       let st;
       try { st = statSync(full); } catch { continue; }
       if (st.isDirectory()) { walk(full, r); continue; }
@@ -6084,6 +6211,14 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
    ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件",
       而 README 的数字都是**全量**口径 ⇒ 比了必然假红。 */
 if (!frozenOnly && !only) verifyReadmeNumbers();
+
+/* ★ 2026-11-14(接手者):计数对账接链。位置与守卫**都与 `verifyReadmeNumbers()` 对齐** ——
+   两者是同一性质(「文档/注释里的自称」vs「代码算出的正解」),故:
+     · 同样放在**所有 producer 之后**(本道只读文件,不依赖 producer,但保持一致以便阅读)
+     · 同样只在 `!frozenOnly && !only` 时跑:`--only WS-XX` 是**局部口径**,
+       而本道比的是**全量**自称 ⇒ 在局部口径里报它会误导。
+   ⚠️ 函数定义在本文件靠前处(紧跟 `checkJudgementAudit`),调用点在这里。 */
+if (!frozenOnly && !only) checkCountAudit();
 
 /* ★ task-75:门禁自检(见 `checkGateSelfcheck` 的长注释)。
    ⚠️ 位置在 `verifyReadmeNumbers()` **之后**:它默认只 `advise()`,

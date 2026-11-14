@@ -1534,8 +1534,24 @@ export class WorldSim {
    * 「有上界」≠「有权威」。服务端目前**没有连段状态机**,凭空造一个属于
    * 超范围 ⇒ 这里固定按普攻第 1 段(`comboMul` 缺省 1.0)结算。
    *
+   *
+   * ## ★ 幽灵泡泡闸(规则 4:倒地不能攻击 —— 2026-11-14 补,修前此处零命中)
+   *
+   * 真值来源是 **`VitalsSystem.downed`**(见下方闸 0b 的实现处注释:
+   * 为什么不是 `DownedState`)。
+   *
    * @returns `hit === null` 且 `outcome === 'OK'` = 没有这只生物(不静默造伤害);
-   *          `outcome === 'OUT_OF_AOI'` = 目标不在活跃区,未结算。
+   *          `outcome === 'OUT_OF_AOI'` = **未结算**(目标不在活跃区,或被闸拒绝 ——
+   *          是哪种看 `rejected`);
+   *          `rejected` = 显式拒绝的理由(`null` = 未被拒绝)。
+   *
+   *          ⚠️ 为什么不新造一个 `outcome: 'DOWNED'`:该联合类型是**对外契约**
+   *          (`server/src/net/room.ts` 的 `AttackReport.outcome` 与
+   *          `WorldSaveHost.attackMobAuthorized` 的声明),加一个成员会立刻在
+   *          `room.ts` 里产生**新的**类型错误 —— 而本仓的 `typecheck-baseline`
+   *          锁住既有错误数,新增即门禁红。
+   *          ⇒ 机器外契约不动,理由由 `rejected` 字段承载(它同时是**可判定**的:
+   *          `=== 'DOWNED'` 即可,不需要读人类可读的字符串)。
    */
   attackMobAuthorized(
     playerId: string,
@@ -1544,14 +1560,45 @@ export class WorldSim {
   ): {
     outcome: 'OK' | 'OUT_OF_AOI';
     hit: { result: PipelineDamageResult; hpLoss: number; events: string[] } | null;
+    /**
+     * 显式拒绝的理由;`null` = 未被拒绝(走到了结算或缺生物)。
+     *
+     * 为什么要这个字段:`outcome` 只有两个值,装不下「为什么没结算」——
+     * 而「被打成幽灵泡泡 ⇒ 不能攻击」与「目标在 32 格外」是**两件事**,
+     * 混成一个值就是**谎报**(本文件反复强调的取舍)。
+     */
+    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'OUT_OF_AOI' | null;
   } {
     /* 闸 0:`playerId` 必须是**登记过的玩家**,不是生物。
        否则攻击者可用一只生物当「玩家」去打另一只(它同样在
        `physics.bodies` 里,`mobDistance` 能算出距离)。 */
-    if (!this.playerIds.has(playerId)) return { outcome: 'OUT_OF_AOI', hit: null };
+    if (!this.playerIds.has(playerId)) return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'NOT_A_PLAYER' };
+
+    /* 闸 0b:★ **幽灵泡泡规则 4 —— 倒地者不能攻击**(与移动侧对称,见 `applyPlayerMove`)。
+     *
+     * ## 真值来源:`vitals.downed`(**不是** `DownedState`)
+     *
+     * ```
+     * vitals.downed        applyHit 把 HP 打到 0 的**同一帧**置真   ← 本闸读它
+     * DownedState(泡泡)   由 tickDowned 在**慢帧**(2Hz)才建        ← 不读它
+     * ```
+     * 三条理由:
+     * 1. **`DownedState` 是 `downed` 的派生状态机**,不是判据本身 ——
+     *    `tickDowned` 的注释明写「触发条件读 `vitals.downed` 而不是自己判 HP」,
+     *    这里若改读它,等于让动作权限比伤害判定**晚**最多 0.5s(一个慢帧),
+     *    表现是「HP 已归零、泡泡还没建,却还能打出一刀」。
+     * 2. 它由**慢帧**维护 ⇒ 秒级窗口;权限判定不该依赖帧相位。
+     * 3. `DownedState` 还承载 `BUBBLED`(227 泡泡水枪困人)等**别的**语义,
+     *    拿它当「是否倒地」会让两种状态混成一个判据。
+     * ⇒ 免伤(`applyHit` 的 `if (v.downed) return base`)与不能治疗
+     *   (`heal` 的 `if (v.downed) return 0`)读的**也是**这个字段 ——
+     *   四条规则一个真值来源,不新造第二套「是否倒地」。 */
+    if (this.vitals.get(playerId)?.downed === true) {
+      return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'DOWNED' };
+    }
 
     const rt = this.mobHost.runtimeOf(mobId);
-    if (rt === null) return { outcome: 'OK', hit: null };
+    if (rt === null) return { outcome: 'OK', hit: null, rejected: null };
 
     /* 闸 1:AOI —— 判据是「**这个**玩家到它的距离 ≤ AOI 唤醒半径」。
      *
@@ -1567,7 +1614,7 @@ export class WorldSim {
      * ⇒ 客户端无法伪造「我在它旁边」。 */
     const distance = this.mobDistance(playerId, mobId);
     if (!Number.isFinite(distance) || distance > AOI_WAKE_DISTANCE) {
-      return { outcome: 'OUT_OF_AOI', hit: null };
+      return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'OUT_OF_AOI' };
     }
 
     const hit = this.attackMob(playerId, mobId, {
@@ -1576,7 +1623,7 @@ export class WorldSim {
       comboMul: 1.0,
       ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
     });
-    return { outcome: 'OK', hit };
+    return { outcome: 'OK', hit, rejected: null };
   }
 
   /* ── 玩家 → 生物 的伤害入口(task-33 接线)─────────────────────────
@@ -2281,6 +2328,20 @@ export class WorldSim {
   }
 
   /**
+   * 最后一次 `applyPlayerMove` **被拒**的理由;`null` = 未发生拒绝。
+   *
+   * ## 为什么需要它(返回值是 `boolean`,装不下理由)
+   *
+   * 「没写进去」有两种完全不同的原因:身份不对(它不是玩家)、
+   * 或**规则不允许**(幽灵泡泡期间不能移动)。只返回 `false` 时它们
+   * 在断言里**不可区分** —— 而本仓反复记着一条:「不谎报」要求可判定,
+   * 不可判定的失败会被读成成功(`attackMobAuthorized` 的 `rejected` 同取舍)。
+   *
+   * ⚠️ 它**不是**判定本身,只是一份诊断记录:真值来源仍是
+   * `VitalsSystem.downed`(见方法内注释)。
+   */
+  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | null = null;
+  /**
    * **玩家移动的权威写入点**(task-58)。把一次已获准的移动写进 `physics.bodies`。
    *
    * ## 为什么是「位置」而不是「速度」
@@ -2329,14 +2390,47 @@ export class WorldSim {
    *
    * @returns 是否真的写入了(未登记的 id 返回 `false`,不抛错 —— 与
    *          `attackMobAuthorized` 的「不谎报」同取舍)。
+   *          **被拒的理由**见 `lastMoveRejection`(`boolean` 装不下理由)。
+   *
+   * ## ★ 幽灵泡泡闸(规则 3:倒地不能移动 —— 2026-11-14 补)
+   *
+   * 修前实测:`applyPlayerMove('p1', 32, 32)` 在 `vitals.downed === true` 时
+   * 照收 ⇒ 位移 33.9 格(而免伤 / 不能治疗早已生效)。这就是「四条规则只落了两条」。
+   *
+   * **真值来源:`VitalsSystem.downed`**,与该组另外三条规则同一处
+   * (免伤 = `applyHit` 的 `v.downed`;不能治疗 = `heal` 的 `v.downed`)。
+   * 为什么**不是** `DownedState`:见 `attackMobAuthorized` 闸 0b 的注释
+   * (它是慢帧维护的派生状态机,拿它当权限判据会留出最长一个慢帧的窗口)。
+   * ⇒ 不新造第二套「是否倒地」,只查这一个字段。
+   *
+   * 为什么算**规则**而不是反作弊(与上面那一段不冲突):它判的是
+   * 「**这个人当前有没有行动权**」,不是「这次位移合不合法」—— 与
+   * `checkMove` 的量纲无关,故不构成第二份实现。
    */
   applyPlayerMove(playerId: string, x: number, y: number): boolean {
-    if (!this.playerIds.has(playerId)) return false;
+    this.lastMoveRejection = null;
+    if (!this.playerIds.has(playerId)) {
+      this.lastMoveRejection = 'NOT_A_PLAYER';
+      return false;
+    }
     const b = this.physics.bodies.get(playerId);
-    if (b === undefined) return false;
+    if (b === undefined) {
+      this.lastMoveRejection = 'NO_BODY';
+      return false;
+    }
+    /* ★ 幽灵泡泡规则 3 —— 显式拒绝,**不许静默返回 true**。
+       判据只读 `vitals.downed`:它是「HP 归零」这一瞬时的**唯一**判定,
+       由 `applyHit` 写入、`revive` 清除。 */
+    if (this.vitals.get(playerId)?.downed === true) {
+      this.lastMoveRejection = 'DOWNED';
+      return false;
+    }
     /* 非有限值挡在这里:写入 NaN 会让 `mobDistance` 恒 NaN ⇒ 距离闸永久失效,
        而 `NaN` 的比较恒 false 属本仓高发坑(见 `checkMove` §6.0 值域门)。 */
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      this.lastMoveRejection = 'NON_FINITE';
+      return false;
+    }
     b.x = x;
     b.y = y;
     return true;
@@ -2779,6 +2873,16 @@ export class WorldSim {
    * 用 `revive(id, hp)` 而非直接改 `v.hp`:它顺带清掉 `downed` 与 `iframeSec`,
    * 否则「倒下状态」会被一起读回来,玩家一上线就是倒地不起。
    * 未登记的玩家跳过 —— 与 `importMobMem` 同一条理由。
+   *
+   * ## ★ 裁决 4:hp 的钳制**不在本函数**(唯一选址是 `VitalsSystem.revive`)
+   *
+   * 本函数此前自带一份 `Math.min(v.maxHp, row.hp)`。裁决要求「把已有规则提到
+   * 唯一入口」⇒ 那份实现**已摘除**,这里的 `row.hp` 原样传给 `revive`。
+   * 修前的准确缺陷形态不是「读档没钳」,而是「**同一入口两条路径口径不同**」
+   * (读档有钳、`revive` 无钳 ⇒ 可造出 `hp > maxHp`)。
+   *
+   * ⚠️ 由此,调用方的**顺序**成为硬约束:先 `syncMaxHp`(抬到等级派生值)再调本函数。
+   * 否则上限还是构造缺省 `PLAYER_BASE_HP`,30 级玩家的 535 血会被钳成 100。
    */
   importVitals(data: Record<string, { hp: number; maxHp?: number; downed?: boolean }>): number {
     let applied = 0;
@@ -2786,11 +2890,11 @@ export class WorldSim {
       const v = this.vitals.get(id);
       if (!v) continue;
       const row = data[id];
+      /* 不可信行**跳过**(不写):与 `revive` 的 NaN 兜底同族,但拒绝语义不同 ——
+         那里是「回退到满血」,这里是「不计入生效数、不改动现值」。
+         ⚠️ 数值钳制**不在这里**(见方法注释的裁决 4)。 */
       if (!row || typeof row.hp !== 'number' || !Number.isFinite(row.hp)) continue;
-      /* 钳到 [0, maxHp]:满血 100 的玩家不该因为一份脏存档变成 5 位数。
-         `VitalsSystem` 的 maxHp 是构造期常量,不信任存档里的 maxHp 字段。 */
-      const hp = Math.max(0, Math.min(v.maxHp, row.hp));
-      this.vitals.revive(id, hp);
+      this.vitals.revive(id, row.hp);
       applied += 1;
     }
     return applied;
@@ -2821,10 +2925,10 @@ export class WorldSim {
    *                          undefined 而**静默跳过**(importVitals 的既有取舍)
    * 2 applyPlayerMove      —— 位置先落位,免得后续投影读到旧坐标
    * 3 ★ syncMaxHp(**必须**在 importVitals 之前)
-   *      `importVitals` 内部把 hp 钳到 `v.maxHp`(见其 :2628)。
-   *      若此时 maxHp 还是构造默认值 100,30 级玩家的 535 血会被**钳成 100**。
+   *      钳制**唯一**在 `VitalsSystem.revive`(裁决 4;`importVitals` 已摘除自己那份)。
+   *      若此时 maxHp 还是构造缺省值 100,30 级玩家的 535 血会被**钳成 100**。
    *      ⇒ 先按 level 把上限抬到派生值,再灌 hp。
-   * 4 importVitals         —— hp 落位(走 revive,顺带清 downed/iframe)
+   * 4 importVitals         —— hp 落位(原样传值,钳制由 revive 做;顺带清 downed/iframe)
    * 5 setProfile           —— 装备等档案字段
    * ```
    * ⚠️ 第 3 步与第 4 步**换序会静默给出错值** —— 不是报错,是钳制。

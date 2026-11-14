@@ -284,15 +284,18 @@ test('FND9-13 已知不可加载的入口已登记,且豁免数与 PROD_ENTRIES 
   /* 为什么要这条:豁免表若**越积越多**,就会退化成一份「假的绿色清单」——
      本仓对 `UNREACHABLE_EXEMPT` 有过同一教训(理由过时/条目失真)。
      ⇒ 这里钉住三件事:已知的两个真实不可加载入口在表内、本入口不在表内、条数固定。 */
-  ok(isEntryLoadExempt('server/src/net/room.colyseus.ts'),
-    'room.colyseus.ts 应已登记(44 处 @type 装饰器,Node strip-only 不可加载,待 CR 裁决)');
+  ok(!isEntryLoadExempt('server/src/net/room.colyseus.ts'),
+    '★ room.colyseus.ts **不得**再登记为不可加载 —— 2026-11-14 三条阻塞已全部消除'
+    + '(装饰器改 `defineTypes` / `Client` 改 type-only / `registerHandlers` 已有调用点),'
+    + '实测 `node -e "import(...)"` 输出 LOADED。'
+    + '若它重新出现在豁免表里,说明有人把阻塞改回来了。');
   ok(isEntryLoadExempt('client/src/main.ts'),
     'client/src/main.ts 应已登记(浏览器入口,依赖 document/window)');
 
   /* ⚠️ 条数会随 PROD_ENTRIES 增删而变 —— 改了 `PROD_ENTRIES` 就回来核这个数。
      把这条写在这里而不是散落各处,是为了让「表变宽」必须**显式**改一行断言。 */
-  eq(entryLoadExemptCount(), 2,
-    '豁免条数应为 2(改 PROD_ENTRIES 条数或增删豁免时,回来核这个数)');
+  eq(entryLoadExemptCount(), 1,
+    '豁免条数应为 1(2026-11-14 摘除 room.colyseus.ts;改 PROD_ENTRIES 或增删豁免时回来核)');
 });
 
 test('FND9-14 豁免表是**单一事实来源**:verify.ts 必须 import 它,不得持副本', () => {

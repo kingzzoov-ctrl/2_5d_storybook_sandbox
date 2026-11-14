@@ -1,7 +1,7 @@
 {
   "_readme": "类型检查基线:指纹 | 错误码 | 归一化消息(**不含行号**)。判据见 scripts/typecheck-baseline-audit.ts 顶部注释。更新方式:node scripts/typecheck-baseline-audit.ts --update",
   "generated": "2026-11-14",
-  "total": 265,
+  "total": 261,
   "fingerprints": {
     "client/src/audio.ts|TS2564|Property 'level' has no initializer and is not definitely assigned in the constructor.": 1,
     "client/src/net/session.ts|TS2367|This comparison appears to be unintentional because the types '<N>' and '<N>' have no overlap.": 1,
@@ -36,7 +36,6 @@
     "server/src/mobs/fsm.ts|TS2459|Module '\"<PATH>\"' declares 'Vec2' locally, but it is not exported.": 1,
     "server/src/mobs/host.ts|TS2554|Expected <N> arguments, but got <N>.": 1,
     "server/src/net/schema.colyseus.ts|TS2416|Property 'assign' in type 'PlayerSchema' is not assignable to the same property in base type 'Schema'.": 1,
-    "server/src/net/schema.colyseus.ts|TS2345|Argument of type '{ map: typeof PlayerSchema; }' is not assignable to parameter of type 'DefinitionType'.": 1,
     "server/src/net/ws_server.ts|TS2339|Property 'userId' does not exist on type 'HelloFrame'.": 3,
     "server/src/party/modes.ts|TS2367|This comparison appears to be unintentional because the types '\"BUILD\" | \"RACE\" | \"PLAY\"' and '\"SETTLED\"' have no overlap.": 1,
     "server/src/sim/demo.ts|TS2341|Property 'mobPlayers' is private and only accessible within class 'WorldSim'.": 1,
@@ -92,7 +91,6 @@
     "tests/WS-07.test.ts|TS2345|Argument of type 'readonly { key: string; type: string; }[]' is not assignable to parameter of type 'readonly FieldSpec[]'.": 1,
     "tests/WS-07.test.ts|TS2339|Property 'bit' does not exist on type '{ key: string; type: string; }'.": 3,
     "tests/WS-07.test.ts|TS2352|Conversion of type 'boolean | never[] | null | undefined' to type 'number' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.": 1,
-    "tests/WS-07.test.ts|TS2345|Argument of type 'string' is not assignable to parameter of type 'readonly string[]'.": 3,
     "tests/WS-07.test.ts|TS2345|Argument of type 'string' is not assignable to parameter of type 'readonly { quantity?: unknown; }[]'.": 1,
     "tests/WS-08.test.ts|TS2322|Type 'Record<string, unknown>' is not assignable to type 'Record<string, number>'.": 1,
     "tests/WS-08.test.ts|TS2322|Type 'null' is not assignable to type 'number'.": 1,

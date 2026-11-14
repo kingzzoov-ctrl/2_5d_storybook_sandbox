@@ -42,16 +42,37 @@
  * **从不执行一行代码**。于是「这个入口能不能被 `import` 成功」在判据里
  * **结构上不可见** —— 门禁把一个**根本加载不了**的模块列为「生产入口」,而它全绿。
  *
- * 实测(Node 24.13.0,逐个加载):
+ * 实测(Node 24.13.0,逐个加载;**这是 2026-11-12 当时的形态**,不是现状):
  * ```
  * ✓ server/src/index.ts               可加载(装配入口,无装饰器、不含 colyseus)
  * ✓ server/src/sim/demo.ts            可加载(**但有副作用**:加载即跑 200 帧并打印)
- * ✗ server/src/net/room.colyseus.ts   SyntaxError(44 处 @type 装饰器)
+ * ✗ server/src/net/room.colyseus.ts   SyntaxError(44 处 @type 装饰器)  ← 已于 2026-11-14 修复,见下节
  * ✗ client/src/main.ts                ReferenceError(document/浏览器环境)
  * ```
  * ⇒ **4 个入口里 2 个加载不了,而门禁从未察觉。**
  * ⚠️ 这也是为什么判据**必须用子进程**:`demo.ts` 加载即执行,
  * 用 `await import()` 会让门禁真跑一遍模拟(而且它**跑完不抛错**,捕获异常查不出)。
+ *
+ * ## 2026-11-14(task-95):第 3 条豁免**已摘除**
+ *
+ * `server/src/net/room.colyseus.ts` 现在**能被 Node 直接加载**(实测 `LOADED`),
+ * 三条独立阻塞各自有了不破铁律的修法:
+ * ```
+ * ① 44 处 @type 装饰器      ⇒ 改用 @colyseus/schema 官方的 defineTypes(无装饰器 API,
+ *                            内部与装饰器走同一条注册路径 ⇒ 语义不变)
+ * ② import { Room, Client } ⇒ Room 改默认导出解构;Client **没有运行时值**
+ *                            (@colyseus/core 只导出 `type Client`)⇒ 改 import type
+ * ③ registerHandlers() 0 调用点 ⇒ 在 onCreate 里补上调用点(否则 4 条 handler 永不注册)
+ * ```
+ * ⇒ 裁决结果是**方案乙**:不新增 devDependency、不加 npm script、不引入构建步骤,
+ *   也不移除 Colyseus —— 用官方无装饰器 API 把装饰器消掉。
+ *   实测成因与代价清单见 `docs/TASK-95-entry-loadability.md`。
+ *
+ * ⚠️ 摘掉的那条豁免,其**理由与出路**也随之作废,这正是本表设计要求的效果:
+ *   「出路:等 CR 裁决」是一个**可结算**的状态,结算后条目必须消失 ——
+ *   否则它会变成一份自我延续的假绿色清单(与 `UNREACHABLE_EXEMPT` 同一教训)。
+ * ⇒ 本表因此只剩 `client/src/main.ts` 一条(浏览器入口,**设计如此**,不是欠账)。
+ * ⇒ 若将来又有入口加载不了,正确做法是**登记理由 + 出路**,不是往判据里加豁免。
  */
 export const ENTRY_LOAD_EXEMPT: ReadonlyMap<string, string> = new Map<string, string>([
   [
@@ -60,20 +81,6 @@ export const ENTRY_LOAD_EXEMPT: ReadonlyMap<string, string> = new Map<string, st
     + '它的可运行性由 client/index.html 的 <script src> + 浏览器实测(60 FPS)保证,'
     + '不由本判据保证。'
     + '⇒ 出路:无需修复;若将来做 SSR 才需要重新评估。',
-  ],
-  [
-    'server/src/net/room.colyseus.ts',
-    '**待裁决的架构矛盾**:44 处 @type 装饰器(Colyseus 必需;'
-    + '实测行首计数 44、含注释残留 45 —— 口径见 docs/ARCH-GAPS.md:212),'
-    + 'Node 24 strip-only 不支持装饰器 ⇒ 需构建步骤(tsc/esbuild)。'
-    + '而本仓铁律是「零依赖 + 直接跑 .ts」⇒ 两者不可兼得。'
-    + '⇒ 出路:等 CR 裁决三个选项之一 ——'
-    + '(1) 移除 Colyseus 依赖(schema 仅作元数据容器,USE_COLYSEUS_PATCH 已为 false);'
-    + '(2) 为该文件引入构建步骤(破零依赖铁律);'
-    + '(3) 该房间降级为设计文档,从 PROD_ENTRIES 移出。'
-    + '⚠️ 在裁决前,`worldSaveHost` 的生产装配路径**不经过**本文件 ——'
-    + '装配入口是 server/src/index.ts(它零 colyseus 依赖),'
-    + '验收见 tests/WS-FND-09-wiring.test.ts。',
   ],
 ]);
 

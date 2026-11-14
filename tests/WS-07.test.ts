@@ -3006,36 +3006,36 @@ test('G06 端到端:16 人满房 + 1 人被踢 + 1 人重连,计数正确', () =
 /* ═══════════════════════════════════════════════════════════════════════
  * H. Colyseus 装配层字段等价校验(task-13)
  *
- * 背景:`server/src/net/schema.colyseus.ts` 有 **44 个行首** `@type` 装饰器
- * (第 45 处是 `:182` 注释里的残留文本,不生效 —— 两个数都对,口径不同),
- * 装饰器在 Node strip-only 下是**运行时拒绝**(`.ts`/`.js` 都抛
- * `Invalid or unexpected token`)—— 所以**不能 import 该文件来测**。
+ * 背景:`server/src/net/schema.colyseus.ts` 是 Colyseus 装配层。**2026-11-14(task-95)
+ * 之前**它有 **44 个行首** `@type` 装饰器(注释里还有 1 处残留文本 ⇒ 字面计数 45 ——
+ * 两个数都对,口径不同),而装饰器在 Node strip-only 下是**运行时拒绝**
+ * (`.ts`/`.js` 都抛 `Invalid or unexpected token`)⇒ 那时**不能 import 该文件来测**。
  *
- * ⚠️ **本注释在 2026-11-12 修正过两处**(原写「45 个」+「Colyseus 未安装」):
- *   1. 「Colyseus 是 optionalDependency **未安装**」→ 实测 **已装 v0.15.57**
- *      (在 `optionalDependencies` 而非 `dependencies`,后者是 `{}` —— 只看后者会误判)。
- *      ⇒ **「不能 import」的真因只有一个:装饰器**,与包无关。原注释把两条理由并列,
- *        其中一条是错的:后来者装了包、以为能 import,会发现仍不行却不知为何。
- *      (**修法也因此不同**:缺包 `npm i` 即可;装饰器需构建步骤或改用零依赖替身。)
- *   2. 装饰器计数 44(行首,真实生效)vs 45(含 `:182` 注释残留)。
+ * ✅ **现在是 0 处**(见 H02):44 处标注已改写成官方无装饰器 API
+ *   `defineTypes(Cls, { 字段: 类型 })` —— 它内部就是
+ *   `for (field in fields) type(fields[field], options)(target.prototype, field)`,
+ *   与装饰器**走同一条注册路径** ⇒ 语义不变,而「登记了类型的字段数」仍是 44。
  *
- * ⚠️ **第二个独立阻塞点(同日发现,与包无关)**:本文件的依赖
- * `room.colyseus.ts:19` 用的是**命名导入** `import { Room, Client } from 'colyseus'`,
- * 而 `colyseus` 是 **CommonJS**(`type` 未设、`main: ./build/index.js`)——
+ * ⚠️ **第二个独立阻塞点(2026-11-12 发现,2026-11-14 已修)**:`room.colyseus.ts`
+ * 当时用的是**命名导入** `import { Room, Client } from 'colyseus'`,而 `colyseus` 是
+ * **CommonJS**(`type` 未设、`main: ./build/index.js`)——
  * 命名导入会抛 `Named export 'Room' not found`。实测:
- * `import { Room }` ✗ / `import c from 'colyseus'` ✓ / `import * as c` ✓。
- * ⇒ **就算把 44 处装饰器全去掉,该文件依然 import 失败。修法清单是两条,不是一条。**
+ * `import { Room }` ✗ / `import c from 'colyseus'` ✓ /
+ * `import * as c` ✓(**但 `ns.Room` 是 undefined** —— 实测只有 4 个键)。
+ * ⇒ 已改为:默认导出解构 `Room` + `import type { Client }`(**`Client` 没有运行时值**)。
  *
- * 注:`readFileSync` 文本解析的做法**本身仍然正确**(理由见下),只是给后来者的归因错了。
+ * 注:`readFileSync` 文本解析的做法**仍然正确**,理由要说准:
+ * 它测的是**源码事实**(字段名 / 标注值 / 生产调用点),而标注值在 `defineTypes` 表里
+ * 同样**只有文本形态** —— `defineTypes` 不提供任何「回读某字段标注」的反射出口。
  * 而 `assertSchemaReady()` 在生产被 `room.colyseus.ts` 的 `onCreate` 调用
- * (2026-11-14 订正:原写作 `:73`,该锚点已漂,现为 `:144`),却零测试驱动。
+ * (锚点已漂,2026-11-14 订正为 `:164`),且**零测试驱动**。
  *
- * 做法:**文本解析 + 集合比对**,把判据独立复现,不依赖装饰器能否执行。
- * 这不是「退而求其次」—— 它测的是**源码事实**(字段名、注解类型、生产调用点),
- * 恰恰是装饰器版本无法在测试环境里暴露的部分。
+ * 做法:**文本解析(类体抽字段名 + `defineTypes` 表抽类型)+ 集合比对**,
+ * 把判据独立复现。这不是「退而求其次」——
+ * 它测的正是**源码事实**,恰恰是「能执行的那一半」暴露不出来的部分。
  *
  * 本组断言在 2026-11-11 首次运行时**抓到两个真实缺陷**:
- *   1. `PlayerSchema.name` 漏写 `@type` → 昵称永远同步不到客户端(静默);
+ *   1. `PlayerSchema.name` 漏写类型标注 → 昵称永远同步不到客户端(静默);
  *   2. `RoomMetaSchema.tick` 多出字段 → `assertSchemaReady()` 在生产抛错,
  *      服务端起不来。两者都已修复,断言保留为回归守卫。
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -3044,20 +3044,47 @@ test('G06 端到端:16 人满房 + 1 人被踢 + 1 人重连,计数正确', () =
 const COLYSEUS_SCHEMA_PATH = join(ROOT_DIR, 'server', 'src', 'net', 'schema.colyseus.ts');
 const COLYSEUS_ROOM_PATH = join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts');
 
-/** 匹配「恰好 2 空格缩进」的字段声明行:`[@type(...)] name = ...`。
- * 方法体内的赋值缩进更深(4+ 空格),自然被排除。
- * 4 个可选捕获组覆盖 4 种 `@type` 参数形态:
+/** 匹配类体内「恰好 2 空格缩进」的字段声明行:`name = ...`。
+ * 方法体内的赋值缩进更深(4+ 空格),自然被排除。 */
+const COLYSEUS_FIELD_LINE = /^ {2}([A-Za-z_]\w*)\s*=/;
+
+/** 匹配 `defineTypes` 表里的 2 空格缩进条目:`字段: <标注>`。
+ * 4 个可选捕获组覆盖 4 种标注形态(与旧 `@type` 的 4 种**逐字对应**):
  *   1 字符串字面量 `'string'`
  *   2 对象字面量 `{ map: PlayerSchema }`
  *   3 数组字面量 `['string']`
  *   4 构造器引用 `RoomMetaSchema`
- * 全部不匹配时(即无注解)捕获组均为 undefined → type = null。 */
-const COLYSEUS_FIELD_LINE =
-  /^ {2}(?:@type\((?:'([^']*)'|(\{[^}]*\})|(\[\s*'[^']*'\s*\])|([A-Za-z_]\w*))\)\s+)?([A-Za-z_]\w*)\s*=/;
+ * ⚠️ 值**原样保留文本**(不解析成枚举):这样「有人把 `{ map: X }` 写成 `X`」
+ *    会以文本差异暴露,而不是被解析器吞掉。 */
+const COLYSEUS_DEFINE_TYPES_ENTRY =
+  /^ {2}([A-Za-z_]\w*): (?:'([^']*)'|(\{[^}]*\})|(\[\s*'[^']*'\s*\])|([A-Za-z_]\w*)),?$/;
+
+/**
+ * 从 `schema.colyseus.ts` 的 `defineTypes(Cls, {...})` 表里抽出「字段 → 类型标注」。
+ *
+ * ⚠️ 找不到该表 / 找不到收尾 ⇒ **直接抛**。不许「没找到就返回空 Map」——
+ *    那会让 H03~H08 的集合断言两边都空而**假绿**(本仓点名的「空对空」形态)。
+ */
+function parseDefineTypes(source: string, className: string): Map<string, string> {
+  const head = `defineTypes(${className}, {`;
+  const at = source.indexOf(head);
+  ok(at >= 0, `应能在 schema.colyseus.ts 里找到 \`${head}\`(类型标注的唯一来源)`);
+  const start = at + head.length;
+  const end = source.indexOf('\n});', start);
+  ok(end > start, `defineTypes(${className}, ...) 应以 \`});\` 收尾`);
+  const out = new Map<string, string>();
+  for (const line of source.slice(start, end).split('\n')) {
+    const m = COLYSEUS_DEFINE_TYPES_ENTRY.exec(line);
+    if (!m) continue;
+    out.set(m[1]!, (m[2] ?? m[3] ?? m[4] ?? m[5])!);
+  }
+  return out;
+}
 
 /**
  * 从 `schema.colyseus.ts` 里解析出一个 Schema 子类的实例字段。
- * 返回 `type: null` 表示该字段**没有 `@type` 注解**。
+ * **字段名**来自类体(2 空格缩进的 `name = ...`),**类型**来自 `defineTypes` 表。
+ * 返回 `type: null` 表示该字段**没有登记类型**(Colyseus 会静默不同步它)。
  */
 function parseColyseusClass(
   source: string,
@@ -3065,11 +3092,12 @@ function parseColyseusClass(
 ): { name: string; type: string | null }[] {
   const m = new RegExp(`export class ${className} extends Schema \\{([\\s\\S]*?)\\n\\}`).exec(source);
   ok(m !== null, `应能在 schema.colyseus.ts 里找到 export class ${className} extends Schema`);
+  const types = parseDefineTypes(source, className);
   const out: { name: string; type: string | null }[] = [];
   for (const line of m![1].split('\n')) {
     const f = COLYSEUS_FIELD_LINE.exec(line);
     if (!f) continue;
-    out.push({ name: f[5], type: f[1] ?? f[2] ?? f[3] ?? f[4] ?? null });
+    out.push({ name: f[1]!, type: types.get(f[1]!) ?? null });
   }
   return out;
 }
@@ -3099,40 +3127,52 @@ const PARITY_PAIRS: readonly [string, string, () => readonly { key: string; type
   ['RoomMetaSchema', 'RoomMetaSchema', () => ROOM_FIELD_TABLE],
 ];
 
-test('H01 装配层源码存在,且是唯一带装饰器的文件(其余文件禁装饰器)', () => {
+test('H01 装配层源码存在,且**已无装饰器**(全仓禁装饰器)—— 标注走 defineTypes', () => {
   const src = readColyseusSchema();
   ok(src.length > 0, '源码应非空');
-  /* 文件头已声明「本文件不被测试 import」。 */
+  /* 类型标注的唯一来源是 `defineTypes`(官方无装饰器 API,见文件头注释)。 */
   ok(src.includes('assertFieldTableParity'), '应含 assertFieldTableParity');
   ok(src.includes('assertSchemaReady'), '应含 assertSchemaReady');
   /* @colyseus/schema 是唯一外部依赖导入。 */
   ok(src.includes("from '@colyseus/schema'"), '应从 @colyseus/schema 导入');
 });
 
-test('H02 装饰器总数与逐类分布符合实测(5 个类)', () => {
+test('H02 类型标注总数与逐类分布符合实测(5 个类),且装饰器数为 **0**', () => {
   const src = readColyseusSchema();
-  /* 实测:5 个类共 44 个带注解字段;另有 1 处 `@type` 出现在
-   * RoomMetaSchema 的说明注释里,故字面计数为 45。 */
+  /* 实测:5 个类共 44 个**登记了类型**的字段(14 / 9 / 10 / 5 / 6)。
+   * ⚠️ 口径变化(2026-11-14 task-95):这 44 个标注**过去是 `@type(...)` 装饰器**,
+   *    现在是 `defineTypes` 表的条目。「有标注的字段数」这个口径**没变**(仍是 44),
+   *    但「装饰器数」这个口径**变成 0** —— 两者是**两个数**,不要混用一个数。 */
   const counts: Record<string, number> = {};
   for (const cls of ['PlayerSchema', 'WildlifeSchema', 'BossSchema', 'RoomMetaSchema', 'RoomSchema']) {
     const fields = parseColyseusClass(src, cls);
     counts[cls] = fields.filter((f) => f.type !== null).length;
-    eq(fields.length - counts[cls], 0, `${cls} 不应存在无注解字段`);
+    eq(fields.length - counts[cls], 0, `${cls} 不应存在无标注字段`);
   }
   eq(counts.PlayerSchema, 14);
   eq(counts.WildlifeSchema, 9);
   eq(counts.BossSchema, 10);
   eq(counts.RoomMetaSchema, 5);
   eq(counts.RoomSchema, 6);
-  eq(Object.values(counts).reduce((a, b) => a + b, 0), 44, '五类合计 44 个带注解字段');
+  eq(Object.values(counts).reduce((a, b) => a + b, 0), 44,
+    '五类合计 44 个**登记了类型**的字段(装饰器已换成 defineTypes ⇒ 条数不变)');
 
-  /* 字面计数 = 44 个真注解 + 1 处注释提及。用注释提及数反推,
-   * 防止有人在注释里多加 `@type(` 却不动代码,把这里的等式搞成巧合。 */
-  const literal = [...src.matchAll(/@type\(/g)].length;
-  const inComments = src.split('\n')
-    .filter((l) => /^\s*(\/\*|\*|\/\/)/.test(l) && l.includes('@type(')).length;
-  eq(literal, 44 + inComments, `@type 字面计数应等于真注解数(44)+ 注释提及数(${inComments})`);
-  eq(inComments, 1, '注释里的 @type 提及共 1 处');
+  /* ★ 装饰器计数必须为 **0**(task-95 的新口径)。
+   * 判据:**逐行**看「去掉缩进后是否以 `@` 开头」—— 那才是会被 Node 解析的装饰器。
+   * ⚠️ 刻意**不**用「对原文正则计数」的写法:那会把注释里**讨论**旧写法的行也算进去,
+   *    本仓实测踩过同一个坑(同一个 `@type` 被数成 45 / 49,而真值是 44)——
+   *    对「文本出现」判真假、却不管它是不是**代码**,是这里最容易犯的错。 */
+  const decoratorLines = src
+    .split('\n')
+    .filter((line) => line.trimStart().startsWith('@'));
+  eq(decoratorLines.length, 0,
+    `schema.colyseus.ts 不应有行首装饰器(实测 ${decoratorLines.length} 处:`
+    + `${decoratorLines.slice(0, 3).join(' | ')})`);
+  /* 反向守卫:光出现 `defineTypes` 这个词不算数 —— 5 个类**各自**都要有登记表。
+   * (只查关键词会让「只给一个类登记、其余四个静默不同步」这种半成品通过。) */
+  for (const cls of ['PlayerSchema', 'WildlifeSchema', 'BossSchema', 'RoomMetaSchema', 'RoomSchema']) {
+    ok(src.includes(`defineTypes(${cls}, {`), `${cls} 应有自己的 defineTypes 登记表`);
+  }
 });
 
 test('H03 【核心】PlayerSchema 的字段集合与 FIELD_TABLE 完全相等(不多不少)', () => {
@@ -3176,19 +3216,20 @@ test('H06 【核心】RoomMetaSchema 的字段集合与 ROOM_FIELD_TABLE 完全�
   ok(!expected.includes('tick'), 'ROOM_FIELD_TABLE 本就不含 tick');
 });
 
-test('H07 每个字段都有 @type 注解(缺注解 = 静默不同步)', () => {
+test('H07 每个字段都**登记了类型**(未登记 = 静默不同步)', () => {
   const src = readColyseusSchema();
-  /* 这是缺陷 1 的守卫:PlayerSchema.name 原先漏写 @type,
-   * Colyseus 会静默跳过未标注字段 —— 昵称永远到不了客户端。 */
+  /* 这是缺陷 1 的守卫:PlayerSchema.name 原先漏写类型标注,
+   * Colyseus 会静默跳过未登记字段 —— 昵称永远到不了客户端。 */
   for (const [cls] of PARITY_PAIRS) {
     const fields = parseColyseusClass(src, cls);
     for (const f of fields) {
-      ok(f.type !== null, `${cls}.${f.name} 缺少 @type 注解(Colyseus 会静默不同步该字段)`);
+      ok(f.type !== null,
+        `${cls}.${f.name} 未在 defineTypes 表里登记类型(Colyseus 会静默不同步该字段)`);
     }
   }
 });
 
-test('H08 @type 声明的类型与 FIELD_TABLE.type 的映射逐字段一致', () => {
+test('H08 defineTypes 声明的类型与 FIELD_TABLE.type 的映射逐字段一致', () => {
   const src = readColyseusSchema();
   for (const [cls, , tableFn] of PARITY_PAIRS) {
     const declared = parseColyseusClass(src, cls);
@@ -3280,51 +3321,88 @@ test('H14 容器类 RoomSchema 的字段与协议语义一致(5 个容器 + room
   }
   eq(fields.length, 6, 'RoomSchema 应有 6 个字段');
   /* 实体容器用 MapSchema(按 id 去重 + 支持 remove),与手写协议的
-   * removed 列表语义对齐 —— 这是注释里的声称,这里验源码。 */
+   * removed 列表语义对齐 —— 这是注释里的声称,这里**两侧都验源码**:
+   *   ① 类体里真的 `new MapSchema<T>()`;② `defineTypes` 表里真的 `{ map: T }`。
+   * (只验①会让「登记表漏了容器字段」通过 —— 那正是 Colyseus **静默不同步**的形态。) */
   const body = /export class RoomSchema extends Schema \{([\s\S]*?)\n\}/.exec(src)![1];
-  for (const k of ['players', 'wildlife', 'bosses']) {
-    ok(new RegExp(`@type\\(\\{ map: \\w+ \\}\\)\\s+${k}\\s*=\\s*new MapSchema`).test(body),
-      `${k} 应为 MapSchema(@type({ map: ... }))`);
+  const types = parseDefineTypes(src, 'RoomSchema');
+  const wantMap: Record<string, string> = {
+    players: 'PlayerSchema',
+    wildlife: 'WildlifeSchema',
+    bosses: 'BossSchema',
+  };
+  for (const [k, v] of Object.entries(wantMap)) {
+    ok(new RegExp(`${k}\\s*=\\s*new MapSchema<${v}>`).test(body),
+      `${k} 应初始化为 \`new MapSchema<${v}>()\``);
+    eq(types.get(k), `{ map: ${v} }`, `${k} 的 defineTypes 标注应为 \`{ map: ${v} }\``);
   }
-  ok(/dirtyChunkKeys\s*=\s*new ArraySchema/.test(body), 'dirtyChunkKeys 应为 ArraySchema');
+  ok(/dirtyChunkKeys\s*=\s*new ArraySchema<string>/.test(body),
+    'dirtyChunkKeys 应初始化为 `new ArraySchema<string>()`');
+  eq(types.get('dirtyChunkKeys'), "['string']",
+    "dirtyChunkKeys 的 defineTypes 标注应为 `['string']`");
 });
 
-test('H15 【故障注入守卫】字段名/注解的解析对偏移敏感,不会静默通过', () => {
+test('H15 【故障注入守卫】字段名/类型的解析对偏移敏感,不会静默通过', () => {
   /* 本组断言全部依赖 parseColyseusClass 的文本解析。若解析器本身坏了
    * (例如正则不再匹配任何行),所有「集合相等」断言会因为两边都空而**假绿**。
-   * 这里用自造的假源码验证解析器真的在抽取,并对注入的变化敏感。 */
+   * 这里用自造的假源码验证解析器真的在抽取,并对注入的变化敏感。
+   * ⚠️ 假源码必须与 `schema.colyseus.ts` 的**真实形态**同形(类体 + defineTypes 表),
+   *    否则本守卫会退化成「测它自己写的那个形状」的空转。 */
   const fake = [
     'export class ProbeSchema extends Schema {',
-    "  @type('string') alpha = '';",
-    "  @type('uint8') beta = 0;",
+    "  alpha = '';",
+    '  beta = 0;',
     '  gamma = 1;',
     '}',
+    'defineTypes(ProbeSchema, {',
+    "  alpha: 'string',",
+    "  beta: 'uint8',",
+    '});',
   ].join('\n');
   const got = parseColyseusClass(fake, 'ProbeSchema');
   eq(got.length, 3, '解析器应抽出 3 个字段(不能因为解析失败而返回空)');
   eq(got.map((f) => f.name), ['alpha', 'beta', 'gamma']);
   eq(got[0].type, 'string');
   eq(got[1].type, 'uint8');
-  eq(got[2].type, null, 'gamma 无注解 → type 应为 null(而非 undefined)');
+  eq(got[2].type, null, 'gamma 未在 defineTypes 登记 → type 应为 null(而非 undefined)');
 
   /* 方法体里的赋值不应被当成字段。 */
   const withMethod = [
     'export class ProbeSchema extends Schema {',
-    "  @type('string') alpha = '';",
+    "  alpha = '';",
     '  assign(x: { alpha: string }): void {',
     '    this.alpha = x.alpha;',
     '    const tmp = 1;',
     '  }',
     '}',
+    'defineTypes(ProbeSchema, {',
+    "  alpha: 'string',",
+    '});',
   ].join('\n');
   const got2 = parseColyseusClass(withMethod, 'ProbeSchema');
   eq(got2.length, 1, '方法体内的赋值不应被当成字段');
   eq(got2[0].name, 'alpha');
+  eq(got2[0].type, 'string', '类型应取自 defineTypes 表(不是从类体猜的)');
 
-  /* 篡改字段名 → 解析结果跟着变(证明解析器不是在返回缓存/常量)。 */
-  const tampered = withMethod.replace('alpha', 'ALPHA_RENAMED');
+  /* 篡改**类体**里的字段名 → 解析结果跟着变(证明解析器不是在返回缓存/常量)。 */
+  const tampered = withMethod.replace("alpha = ''", "ALPHA_RENAMED = ''");
   const got3 = parseColyseusClass(tampered, 'ProbeSchema');
   eq(got3[0].name, 'ALPHA_RENAMED', '字段名变了,解析结果必须跟着变');
+  eq(got3[0].type, null,
+    '改名后 defineTypes 表里已没有它 ⇒ 必须报「未登记」,不能沿用旧类型');
+
+  /* 篡改**类型表**里的值 → 解析结果跟着变(证明类型不是硬编码在解析器里的)。 */
+  const retyped = withMethod.replace("alpha: 'string'", "alpha: 'uint32'");
+  eq(parseColyseusClass(retyped, 'ProbeSchema')[0].type, 'uint32',
+    '类型标注变了,解析结果必须跟着变');
+
+  /* ★ 登记表**缺失**时必须抛错,而不是返回空 Map ——
+   *   空表会让 H03~H08 的集合断言两边都空 ⇒ **假绿**(本仓点名的「空对空」)。 */
+  let threw = false;
+  try {
+    parseDefineTypes('export class ProbeSchema extends Schema {\n}\n', 'ProbeSchema');
+  } catch { threw = true; }
+  ok(threw, 'defineTypes 表缺失时必须抛错,不许静默返回空 Map');
 });
 
 test('H16 字段表本身的完整性(bit 无冲突、升序、无重复 key)', () => {
@@ -3901,7 +3979,7 @@ test('task-40 判定:prediction 是**客户端**模块,已搬到 client/src/net/
  * 判据不是可达性,而是**「授权数量 vs 执行数量」的落差**。
  * 门禁查不到「声明了 22 个动作、只有 3 个能真的发生」这种形态。 */
 
-test('task-38 【真缺陷】RoomAction 声明 22 个动作,生产只有 3 条通道能改变世界', () => {
+test('task-38 【已改向】RoomAction 声明 22 个动作;4 条报文通道均已接执行层', () => {
   /* ① 动作面:声明了多少 */
   const declared = Object.values(RoomAction);
   eq(declared.length, 22, 'RoomAction 声明 22 个动作');
@@ -3912,34 +3990,37 @@ test('task-38 【真缺陷】RoomAction 声明 22 个动作,生产只有 3 条�
   eq(messages.join(','), 'move,attack,inventory,action',
     '客户端消息面恰好 4 条');
 
-  /* ③ ★ 核心:其中 'action' **只验权限,不执行动作**。
-   *    证明方式:该 handler 的函数体里除 authorize 外**没有第二个 runtime 调用**。 */
+  /* 3 ★★ **已改向(2026-11-14 接线后)**:此前这里断言「`action` handler
+   *    除 `authorize` 外**没有第二个 runtime 调用**」⇒ 授权后没有执行者。
+   *    接线之后那条断言**按设计变红**,它的含义是「缺陷已修」而不是回归
+   *    (本仓「把未做项钉成一条会红的断言」那条手法的预期代价)。
+   *    ⇒ 故改为断言**新方向**:必须有执行入口 + **双向回执**。
+   *    ⚠️ 只断言"源码里有 dispatchAction 这个名字"**仍然不够** ——
+   *       名字可以在而永不被调用(本仓记过 9 例「测试全绿 + 生产零消费」)。
+   *       **行为级**判据在下面的 ACT-1 / ACT-2 / ACT-3 三组里,那才是本组的分量所在。 */
   const actionHandler = /onMessage\('action'[\s\S]*?\n    \}\);/.exec(roomColyseus)![0];
-  includes(actionHandler, 'authorize', "action handler 调 authorize");
-  const otherCalls = [...actionHandler.matchAll(/this\.runtime\.(\w+)\s*\(/g)]
-    .map((m) => m[1]!).filter((n) => n !== 'authorize');
-  eq(otherCalls.length, 0,
-    `action handler 除 authorize 外无其它 runtime 调用 ⇒ 授权后**没有执行者**`
-    + `(若不为 0,实际调用:${otherCalls.join(', ')})`);
-  ok(!/else/.test(actionHandler),
-    'action handler 没有 else 分支 ⇒ allowed=true 时**静默返回**,连回执都没有');
+  const runtimeCalls = [...actionHandler.matchAll(/this\.runtime\.(\w+)\s*\(/g)].map((m) => m[1]!);
+  ok(runtimeCalls.includes('dispatchAction'),
+    `★ action handler 必须有执行入口(实得 runtime 调用:${runtimeCalls.join(', ') || '无'})`);
+  ok(/client\.send\('actionResult'/.test(actionHandler),
+    '★ 成功侧必须有回执 —— 否则「执行了」与「什么都没发生」在客户端不可区分');
+  ok(/client\.send\('reject'/.test(actionHandler), '失败侧必须有回执');
 
-  /* ④ 三条真正生效的通道作对照 —— 证明「通道」这个概念本身是可行的。 */
+  /* 4 **四条**通道都能改变世界 —— 这是「通道」这个概念本身可行的证明。 */
   const performing: string[] = [];
   for (const m of messages) {
-    if (m === 'action') continue;
     const seg = new RegExp(`onMessage\\('${m}'[\\s\\S]*?\\n    \\}\\);`).exec(roomColyseus)![0];
     const call = /this\.runtime\.(\w+)\s*\(/.exec(seg);
     if (call) performing.push(`${m}→${call[1]}`);
   }
-  eq(performing.length, 3,
-    `能改变世界的通道恰好 3 条:${performing.join(', ')}`);
-  for (const want of ['applyMove', 'applyAttack', 'applyInventory']) {
+  eq(performing.length, 4,
+    `能改变世界的通道必须恰好 4 条(实得:${performing.join(', ')})`);
+  for (const want of ['applyMove', 'applyAttack', 'applyInventory', 'dispatchAction']) {
     ok(performing.some((p) => p.endsWith(want)), `${want} 在生效通道里`);
   }
 });
 
-test('task-38 【真缺陷】authorize 是**纯判定**:房主被允许全部 22 个动作,状态却零变化', () => {
+test('task-38 【已改向】authorize 是纯判定;而 action 的**执行层**已接线(回执双向)', () => {
   /* ★ 这是「静默空操作」的运行时实证 —— 不是读代码推断的。
    * 若无此断言,「22 个动作被允许」会被误读成「22 个功能可用」。 */
 
@@ -3964,21 +4045,22 @@ test('task-38 【真缺陷】authorize 是**纯判定**:房主被允许全部 22
   eq(JSON.stringify(rt.cloneState()), before,
     'authorize 无副作用(纯查表)—— 是事实,但**不足以**推出「无执行层」');
 
-  /* 2b ★ 真正的支点:成功分支为空。`if (!gate.allowed) reject;` 之后**再无语句**。
-   *    (我第一版把「2a 的零变化」当结论 —— 那是错的证据链,mob-boss-ai 指出、
-   *     我复核后确认成立:`authorize` 是纯函数,纯函数当然不改状态。
-   *     更糟:若有人给 action 加真执行却仍让 authorize 保持纯,旧断言会**照样绿**。) */
+  /* 2b ★★ **已改向(2026-11-14 接线后)**:此前这里断言「成功分支为空」——
+   *    判据是「`action` handler 的代码行恰好 4 行」。接线之后那条断言
+   *    **按设计变红**,它的含义是「缺陷已修」而**不是**回归(这正是本仓
+   *    「把未做项钉成一条会红的断言」那条手法的预期代价)。
+   *    ⇒ 故改为断言**新形态**:有执行入口、成功侧有回执、失败侧带 `kind`。
+   *    ⚠️ 只断言「行数变多了」是**没有牙**的 —— 加一行注释也能让它变多。 */
   const roomColyseus2 = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
   const actionBody = /onMessage\('action'[\s\S]*?\n    \}\);/.exec(roomColyseus2)![0];
-  const codeLines2 = actionBody.split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^\/[\/*]|^\*/.test(l));
-  /* ⚠️ 期望值是 **4** 不是 3 —— 我第一版写 3 并失败:
-   *    handler 的代码行是「onMessage 头 / authorize / reject / `});` 收尾」。
-   *    断言写错时**先怀疑自己**:实测打印后才定的这个数。 */
-  eq(codeLines2.length, 4,
-    `action handler 只有 4 行代码(onMessage 头 / authorize / reject / 收尾)`
-    + ` ⇒ 成功分支确为空(实际 ${codeLines2.length} 行:${codeLines2.map((l) => l.slice(0, 30)).join(' ‖ ')})`);
+  ok(/this\.runtime\.dispatchAction\(/.test(actionBody),
+    '★ action handler 必须把报文交给 `RoomRuntime.dispatchAction()`(执行层的唯一入口)');
+  ok(/client\.send\('actionResult'/.test(actionBody),
+    '★ 成功侧**必须有回执** —— 没有它,「执行了」与「什么都没发生」在客户端不可区分');
+  ok(/client\.send\('reject'/.test(actionBody),
+    '失败侧必须有回执');
+  ok(/kind:\s*out\.kind/.test(actionBody),
+    '★ 失败回执必须带 `kind` —— 否则「无权」与「动作尚未实现」又混成一件事');
 
   /* ③ 对照组:applyMove 立刻改变状态 —— 证明「(2) 的零变化」是因为
    *    authorize 不执行,而不是因为快照机制不敏感。
@@ -4023,6 +4105,112 @@ test('task-38 【真缺陷】authorize 是**纯判定**:房主被允许全部 22
   eq(metaAfter.scoreB, 0, 'scoreB 仍为 0 ⇒ 从无代码驱动它');
 });
 
+/* ═══════════════ ACT:动作执行层(2026-11-14 接线)═══════════════ */
+
+/**
+ * ## 这组证明什么(以及为什么**不许**用「源码里有 dispatchAction」当判据)
+ *
+ * 旧形态是「授权通过 ⇒ 什么都不做」。那种缺陷**不可能**靠"读源码里有没有某个
+ * 函数名"测出来 —— 名字可以在,却一次都没被调用
+ * (`docs/COMPLETION-CRITERIA.md` §四 已记 9 例「测试全绿 + 生产零消费」)。
+ * ⇒ 故这里断言的是 **`RoomRuntime` 的可观测状态变化**,外加
+ *   「未实现的动作必须**显式**拒绝」。两条合起来才排除「静默成功」。
+ */
+
+/** 三人房夹具:OWNER(o) / MEMBER(m) / GUEST(g)。GUEST 角色**显式**设 —— 不靠 join 的默认值猜。 */
+function actRoom(): RoomRuntime {
+  const c = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: 'act', ownerId: 'o', clock: c.clock });
+  rt.join({ userId: 'o' });
+  rt.join({ userId: 'm' });
+  rt.join({ userId: 'g' });
+  rt.members.get('g')!.role = RoomRole.GUEST;
+  return rt;
+}
+
+test('ACT-1 ★★ 动作**真的执行**:5 个动作各改变可观测状态,且回执带后果摘要', () => {
+  const rt = actRoom();
+
+  /* ① SET_MEMBER_ROLE */
+  const r1 = rt.dispatchAction('o', RoomAction.SET_MEMBER_ROLE, { targetId: 'm', role: RoomRole.ADMIN });
+  eq(r1.ok, true, 'SET_MEMBER_ROLE 应成功');
+  eq(r1.kind, 'OK', '成功必须**显式** kind=OK(不是靠"没抛异常"表示)');
+  eq(r1.effect?.role, String(RoomRole.ADMIN), '★ 回执里带后果摘要(effect)');
+  eq(rt.members.get('m')!.role, RoomRole.ADMIN, '★ 状态真的变了(m: MEMBER → ADMIN)');
+
+  /* ② SET_PARTY_MODE:运行时字段与快照**都**变 */
+  type MetaView = { meta: { partyMode: number } };
+  const idx = Object.values(PartyMode).indexOf(PartyMode.PAINT_WAR);
+  const before = (rt.cloneState() as unknown as MetaView).meta.partyMode;
+  const r2 = rt.dispatchAction('o', RoomAction.SET_PARTY_MODE, { partyMode: PartyMode.PAINT_WAR });
+  eq(r2.ok, true, 'SET_PARTY_MODE 应成功');
+  eq(rt.partyMode, PartyMode.PAINT_WAR, '★ 运行时 partyMode 变了');
+  eq((rt.cloneState() as unknown as MetaView).meta.partyMode, idx,
+    `★ 快照里的 partyMode 也变了(${before} → ${idx})`);
+
+  /* ③ SET_ROOM_ACCESS */
+  const r3 = rt.dispatchAction('o', RoomAction.SET_ROOM_ACCESS, {
+    mode: AccessMode.PASSWORD, passwordHash: 'h',
+  });
+  eq(r3.ok, true, 'SET_ROOM_ACCESS 应成功');
+  eq(rt.accessMode, AccessMode.PASSWORD, '★ accessMode 变了');
+  eq(rt.passwordHash, 'h', '★ passwordHash 也落了');
+
+  /* ④ KICK_MEMBER */
+  const r4 = rt.dispatchAction('o', RoomAction.KICK_MEMBER, { targetId: 'm' });
+  eq(r4.ok, true, 'KICK_MEMBER 应成功');
+  eq(rt.members.has('m'), false, '★ 被踢的人真的不在 members 里了');
+
+  /* ⑤ CLOSE_ROOM 放最后(关了就不能再操作) */
+  const r5 = rt.dispatchAction('o', RoomAction.CLOSE_ROOM);
+  eq(r5.ok, true, 'CLOSE_ROOM 应成功');
+  eq(rt.status, RoomStatus.CLOSED, '★ status 变成 CLOSED');
+});
+
+test('ACT-2 ★★ 消灭「静默成功」:未实现的动作**显式**返回 NOT_IMPLEMENTED', () => {
+  const rt = actRoom();
+  /* 抽 3 个**确定**未实现的动作(见 docs/TASK-94 第三节:全仓无落点)。 */
+  for (const act of [RoomAction.PLACE_BLOCK, RoomAction.OPEN_CHEST, RoomAction.MODIFY_TOWN]) {
+    const r = rt.dispatchAction('o', act);
+    eq(r.ok, false, `★ ${act} 不得返回 ok=true —— 那就是静默成功(旧形态的病根)`);
+    eq(r.kind, 'NOT_IMPLEMENTED', `★ ${act} 必须**显式**报告"尚无执行层"`);
+    ok(typeof r.reason === 'string' && r.reason.length > 0, `${act} 的拒绝必须带原因`);
+  }
+  /* 负对照:已接的动作**不**走 NOT_IMPLEMENTED —— 否则 ACT-2 会被"全都拒绝"骗过。 */
+  const one = rt.dispatchAction('o', RoomAction.SET_PARTY_MODE, { partyMode: PartyMode.NONE });
+  eq(one.kind, 'OK', '已接的动作必须走 OK,不能被一并标成 NOT_IMPLEMENTED');
+});
+
+test('ACT-3 负对照:GUEST 一律 PERMISSION 且**零副作用**;缺参数是 INVALID', () => {
+  const rt = actRoom();
+  const before = JSON.stringify(rt.cloneState());
+  const roleBefore = rt.members.get('m')!.role;
+
+  /* ★ 这条守的是 ACT-1 的**非空洞性**:若权限闸坏了(谁都能过),
+     ACT-1 依然全绿,而这一条会红。 */
+  const guestCalls = [
+    rt.dispatchAction('g', RoomAction.SET_MEMBER_ROLE, { targetId: 'm', role: RoomRole.ADMIN }),
+    rt.dispatchAction('g', RoomAction.KICK_MEMBER, { targetId: 'm' }),
+    rt.dispatchAction('g', RoomAction.SET_ROOM_ACCESS, { mode: AccessMode.PUBLIC, passwordHash: null }),
+    rt.dispatchAction('g', RoomAction.SET_PARTY_MODE, { partyMode: PartyMode.NONE }),
+    rt.dispatchAction('g', RoomAction.CLOSE_ROOM),
+  ];
+  for (const r of guestCalls) {
+    eq(r.ok, false, '★ GUEST 无权执行管理动作');
+    eq(r.kind, 'PERMISSION', '★ 必须是 PERMISSION(不是 INVALID,也不是 NOT_IMPLEMENTED)');
+  }
+  eq(rt.members.get('m')!.role, roleBefore, '★ 被拒后 m 的角色没变');
+  eq(rt.status, RoomStatus.OPEN, '★ 被拒后房间仍是 OPEN');
+  eq(JSON.stringify(rt.cloneState()), before, '★ 快照逐字节不变 ⇒ 越权真的零副作用');
+
+  /* 缺参数:不是"什么都没发生",而是**明确**的 INVALID。
+     ⚠️ 与 PERMISSION 分开是刻意的:两者对客户端的含义不同
+        (无权 = 换个人来做;缺参 = 报文写错了)。 */
+  const r = rt.dispatchAction('o', RoomAction.SET_MEMBER_ROLE, {});
+  eq(r.ok, false, '缺 targetId/role 必须失败');
+  eq(r.kind, 'INVALID', '★ 必须是 INVALID,不能混成 PERMISSION');
+});
+
 test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是执行者', () => {
   /* 这条把 task-38 的「暂不接」判据精确化。
    * 我原先与 mob-boss-ai 都判「等 US2(room 持有 sim)」,
@@ -4063,27 +4251,45 @@ test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是
  * (它是 `npm run sim` 的入口,顶层即副作用)。在测试里 import 它会真的跑一遍模拟。
  * ⇒ 所以这里改为**静态判定「已知阻塞形态」**,与 `schema.colyseus.ts` 那组的做法一致。 */
 
-test('task-38 【真缺陷】生产入口 room.colyseus.ts 无法加载 —— 两个**独立**阻塞点', () => {
+test('task-38 生产入口 room.colyseus.ts 的两个阻塞点**已修** —— 回归守卫(0 装饰器 + CJS 导入的正确写法)', () => {
   const rcSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
 
-  /* 阻塞点 1:依赖链上的 `schema.colyseus.ts` 含装饰器(Node strip-only 不解析)。
-   * ⇒ `room.colyseus.ts` 自己 **0 处装饰器**,是被依赖拖垮的。 */
+  /* 阻塞点 1(2026-11-14 task-95 已修):依赖链上的 `schema.colyseus.ts` 曾含
+   * 44 处 `@type` 装饰器(Node strip-only 不解析)⇒ `room.colyseus.ts` 自己是 0 处,
+   * 却**被依赖拖垮**。现在两侧都必须为 0 —— 任一侧回退,本条先红。 */
   const ownDecos = [...rcSrc.matchAll(/^\s*@(\w+)/gm)].length;
-  eq(ownDecos, 0, 'room.colyseus.ts 自身 **0 处**装饰器 ⇒ 它是被依赖拖垮的');
+  eq(ownDecos, 0, 'room.colyseus.ts 自身 **0 处**装饰器');
 
   const scSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'schema.colyseus.ts'), 'utf8');
   const depDecos = [...scSrc.matchAll(/^\s*@(\w+)/gm)].length;
-  /* ⚠️ 行首计数 = **真实生效**的装饰器数(44)。
-   *    `@type(` 的字面出现数是 45 —— 差 1 处在 `:182` 注释里(残留文本,不生效)。
-   *    两个数都对;断言取**行首**口径,因为它才是「会被解析的」。 */
-  eq(depDecos, 44, 'schema.colyseus.ts 有 44 处**生效**装饰器(行首口径;含注释为 45)');
+  /* ⚠️ 行首口径 = **真实生效**的装饰器数。
+   *    修复前是 44(注释里残留的 `@type(` 文本另算 ⇒ 字面计数 45);
+   *    修复后应为 **0** —— 44 处标注全部搬进了 `defineTypes` 表:
+   *    **条数仍是 44**(见 H02),但那些是普通对象条目,不再是装饰器。 */
+  eq(depDecos, 0, 'schema.colyseus.ts 应有 **0 处**生效装饰器(已改用 defineTypes)');
+  ok(scSrc.includes('defineTypes('),
+    'schema.colyseus.ts 应改用 @colyseus/schema 官方无装饰器 API defineTypes');
   ok(rcSrc.includes('schema.colyseus'),
-    'room.colyseus.ts 确实依赖 schema.colyseus.ts ⇒ 被其装饰器拖垮');
+    'room.colyseus.ts 确实依赖 schema.colyseus.ts ⇒ 后者的语法形态直接决定前者能否加载');
 
-  /* 阻塞点 2(与包无关、与装饰器无关):命名导入 ↔ CommonJS。
-   * ⇒ **就算 44 处装饰器全去掉,该文件依然 import 失败。修法清单是两条。** */
-  includes(rcSrc, "import { Room, Client } from 'colyseus'",
-    '用的是**命名导入**');
+  /* 阻塞点 2(2026-11-14 已修):命名导入 ↔ CommonJS。
+   * ★ 判据**必须对两种写法同时取证**,只查「不含旧写法」会漏:
+   *   把 `Room` 也挪进 `import type` 会让它变成**类型**,
+   *   `extends Room<RoomSchema>` 当场报错 —— 而文本上「没有命名导入」仍然成立。
+   * ⚠️ 且必须比**代码态**:旧写法在文件头的注释里**被引用着**(说明为什么不能那么写),
+   *    直接对原文 `includes` 会把它当成「还在用」⇒ 假红(本仓点名的
+   *    「对文本出现判真假,却不管它是不是代码」形态)。 */
+  const rcCode = rcSrc
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')      /* 块注释 */
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');  /* 行注释(保护 `://`) */
+  ok(!rcCode.includes("import { Room, Client } from 'colyseus'"),
+    '代码态不应再有 CJS 命名导入(实测 SyntaxError: Named export not found)');
+  ok(rcCode.includes("import colyseusPkg from 'colyseus';"),
+    '`Room` 的运行时值应从**默认导出**上取(CJS 的 module.exports)');
+  ok(rcCode.includes("import type { Client, Room as ColyseusRoom } from 'colyseus';"),
+    '`Client` 必须走 `import type`(实测 colyseus 根入口**没有**它的运行时值)');
+  ok(rcCode.includes('const Room: typeof ColyseusRoom = colyseusPkg.Room;'),
+    '两者缺一不可:类型来自 import type,运行时值来自默认导出');
   const cjs = JSON.parse(readFileSync(join(ROOT_DIR, 'node_modules', 'colyseus', 'package.json'), 'utf8'));
   ok(cjs.type === undefined,
     `colyseus 是 CommonJS(\`type\` 未设)—— 命名导入会抛 Named export not found`);
@@ -4112,13 +4318,22 @@ test('task-38 【真缺陷】生产入口 room.colyseus.ts 无法加载 —— �
     `实测 v${cjs.version} 满足清单声明的 ^${declared}(下界)`
     + ` ⇒ **确已安装**,原注释「未安装」已过期`);
 
-  /* 判据固化:凡生产入口,必须能被加载。这里断言「已知不可加载的入口」清单
-   * 与我们实测一致 —— 若将来有人修好了,本条会红,提醒**同步删除本断言**。 */
+  /* 判据固化(2026-11-14 task-95 改向):凡生产入口,必须能被加载 ——
+   * 而**豁免表里不该再有它**(修好了就必须摘掉登记,否则豁免表会退化成假绿清单)。
+   * ⇒ 若将来它又加载不了,`checkEntryLoadable()` 会当场红,而不是被一条旧豁免遮住。 */
   const verifySrc = readFileSync(join(ROOT_DIR, 'scripts', 'verify.ts'), 'utf8');
-  includes(verifySrc, "'server/src/net/room.colyseus.ts'",
+  ok(verifySrc.includes("'server/src/net/room.colyseus.ts'"),
     'room.colyseus.ts 在 PROD_ENTRIES 里(是生产入口)');
+  const exemptSrc = readFileSync(join(ROOT_DIR, 'scripts', 'entry_load_exempt.ts'), 'utf8');
+  ok(!/^\s*'server\/src\/net\/room\.colyseus\.ts',$/m.test(exemptSrc),
+    '它不应再是 ENTRY_LOAD_EXEMPT 的条目(已可加载 ⇒ 按该表的设计必须摘除)');
   ok(rcSrc.includes('onMessage'),
     '它确实承载客户端消息面 ⇒ 「入口跑不到」意味着这些 handler 零测试可覆盖');
+  /* 同一件事的**第三重**证据:注册方法必须真有调用点(否则 4 条 handler 全不生效)。
+   * 变红条件:删掉 `onCreate` 里的 `this.registerHandlers();`
+   *   (那正是 task-95 实测出的原始缺陷形态:方法声明在、全仓 0 调用点)。 */
+  eq([...rcSrc.matchAll(/this\.registerHandlers\(\);/g)].length, 1,
+    'onCreate 里应有**恰好 1 处** `this.registerHandlers();` 调用点');
 });
 
 test('task-38:包与装配层的模块形态 —— 列举式核对(防只读一个字段的全称结论)', () => {

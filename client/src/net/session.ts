@@ -271,10 +271,41 @@ export function createSession(opts: SessionOptions): SessionHandle {
 
     socket.addEventListener('message', ((ev: { data: unknown }) => {
       const raw = ev.data;
-      /* 服务端的下行:0x01 文本(welcome)/ 0x02 二进制(协议包)。
-         若对端**不带**类型头(裸协议包),按二进制处理 —— 兼容两种服务端写法。 */
+      /* 服务端的下行:**两种 WebSocket 帧类型都会出现**(实测,见下)。
+         📌 2026-11-14 修:此前这里只接受 `ArrayBuffer` / 视图,于是
+         **服务端的 welcome 文本帧**落进下面的 `else` ⇒ 被当「载荷形态不对」丢弃
+         ⇒ 握手**永不完成**。实测证据(真 `startWsServer` + 真 `createSession`):
+         ```
+         下行原始形态: string(len=119) | ArrayBuffer(82) | ArrayBuffer(10) | ...
+         createSession ⇒ state = connecting(永不 live)
+                       · store.localPlayerId = ""     ← 没拿到自己的 id
+                       · store.state.players  = 1     ← ★ 二进制快照**照常合入**
+                       · droppedFrames = 1 · lastDropReason = "收到字符串(119 字符)而非二进制帧"
+         ```
+         ⇒ 症状极具误导性:「画面在动、状态在变」,只有圆心恒 `null`。
+         ⇒ 判据:**两端各自的单元测试都过,而它们之间的帧类型约定没人测**
+           (`WS-12` 全用人为造的字节帧 ⇒ 结构上碰不到这条路径)。
+           端到端判据见 `tests/WS-FND-15-e2e.test.ts`(它两条都红过)。
+         ⇒ 修法:文本帧按 UTF-8 编成字节,**汇入同一个 `classifyDownlink` 分派**。
+           ⚠️ 不新开一条「是字符串就当 JSON」的旁路 —— 那会长出**第二份判定**,
+              而两份判定日后必然漂移(陷阱 31/41)。 */
       let bytes: Uint8Array | null = null;
-      if (raw instanceof ArrayBuffer) {
+      if (typeof raw === 'string') {
+        /* ★ 文本帧在协议里**只可能是**握手 JSON(下行唯一的文本)。
+           若它不是以 `{` 开头,那就是**形态不对**,不是"坏协议包" ——
+           两者必须分开计数(`droppedFrames` vs `decodeErrors`),否则会把
+           **形态问题**报成**坏包**,正是本仓记过的「症状名 ≠ 成因名」(陷阱 137)。
+           ⚠️ 若不在此拦下,`classifyDownlink` 会把它归为二进制、喂给解码器
+              ⇒ 它就会以「解码失败」的形态出现,原因指向错方向。 */
+        const asBytes = new TextEncoder().encode(raw);
+        if (asBytes.byteLength === 0 || asBytes[0] !== JSON_PREFIX) {
+          droppedFrames += 1;
+          lastDropReason = `收到文本帧但不是 JSON(前 24 字符:${raw.slice(0, 24)})`;
+          opts.events.onDrop?.(lastDropReason);
+          return;
+        }
+        bytes = asBytes;
+      } else if (raw instanceof ArrayBuffer) {
         bytes = new Uint8Array(raw);
       } else if (ArrayBuffer.isView(raw)) {
         /* 某些实现给 TypedArray / Buffer 视图 —— 也接受(否则又是一次静默丢帧) */

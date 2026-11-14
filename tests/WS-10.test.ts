@@ -60,7 +60,9 @@ import { maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
 import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT, SIM_SLOW_DT } from '../server/src/sim/world_sim.ts';
 /* task-70:`VitalsSystem` 直接 import —— §9 验收 3 必须用**裸实例**,
  * 不能经 `WorldSim`(那会引入 addPlayer/等级同步等旁路,测不到「构造器共享常量」这个根因)。 */
-import { VitalsSystem } from '../server/src/combat/vitals.ts';
+import {
+  VitalsSystem, mobHitDamage, CONTENT_MAX_MOB_LEVEL, MOB_HIT_MAX_DAMAGE,
+} from '../server/src/combat/vitals.ts';
 import { mobCombatProfile, MOB_DEF_BASE, MOB_DEF_PER_LEVEL, MOB_ELEMENT_BY_ID } from '../server/src/combat/damage.ts';
 
 const rng = mulberry32(0x5eed10);
@@ -2182,6 +2184,155 @@ test('task44-5:HP 归零 → 进幽灵泡泡(vitals.downed 是唯一判据)', ()
   eq(d.rescuerId, null, '还没有救援者');
   /* 零掉级 / 零爆装:倒地瞬间冻结的快照必须来自进度档案。 */
   eq(d.levelSnapshot, s.progressSnapshotOf('p1')!.level, '倒地快照的等级 = 进度档案的等级(零掉级的前提)');
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * ★ G2(2026-11-14):幽灵泡泡规则 3 / 4 —— 不能移动 / 不能攻击
+   *
+   * ## 修前实测(「四条规则只落了两条」)
+   * ```
+   * 免伤      vitals.applyHit 的 `if (v.downed) return base`     ✓ 已有
+   * 不能治疗  vitals.heal 的 `if (v.downed) return 0`            ✓ 已有
+   * 不能移动  applyPlayerMove 对倒地玩家 ⇒ **true**,位移 33.9 格   ← 本次补
+   * 不能攻击  attackMobAuthorized 里 `downed`/`downedStates` 零命中 ← 本次补
+   * ```
+   *
+   * ## 真值来源选的是 `vitals.downed`,**不是** `DownedState`
+   *
+   * | 事实 | 谁写 | 何时为真 |
+   * | :--- | :--- | :--- |
+   * | `vitals.downed` | `applyHit` 把 HP 打到 0 的**同一帧** | 瞬时、慢帧无关 ← **本闸读它** |
+   * | `DownedState`(泡泡) | `tickDowned`,**慢帧 2Hz** | 最长晚 0.5s |
+   *
+   * 1. `DownedState` 是 `downed` 的**派生**状态机 —— `tickDowned` 自己的注释写着
+   *    「触发条件读 `vitals.downed` 而不是自己判 HP」⇒ 拿它当权限判据会出现
+   *    「HP 已归零、泡泡还没建,却还能走/还能打」的窗口(权限判定不该依赖帧相位);
+   * 2. 它同时承载 `BUBBLED`(227 泡泡水枪困人)等**别的**语义,混用会让两种状态变一个判据;
+   * 3. 另外两条规则(免伤 / 不能治疗)读的也是 `v.downed` ⇒ 四条规则一个来源。
+   * 下面第一条**就地钉住这个选择**:夹具里玩家刚被打到 0,而 `downedOf()` 仍是
+   * `undefined`(泡泡要等慢帧才建)—— 若实现改读 `DownedState`,它立刻红。
+   *
+   * ## 负对照是必须的
+   * 只测「倒地不能动/不能打」的话,把移动与攻击**整体关掉**也能全绿(假修);
+   * 故同一夹具里先立「健在玩家同一动作仍然允许」,再打空血重测同一动作。
+   *
+   * ⚠️ 本块**不新增 `test()`**(与 task-64 同一规格):`report()` 按 `test()` 计数,
+   *    而 README 的套件表是 Lead 的写域。
+   * ══════════════════════════════════════════════════════════════════════════ */
+  {
+    const g = new WorldSim({ sizeCells: 64, combatRng: () => 0.5 });
+    g.addPlayer('p1', 10, 10);
+    g.addMob('mob_sheep', 'MEADOW', 11, 10);
+    const mobHp0 = g.mobHost.runtimeOf('mob_sheep')!.hp;
+
+    /* ── 负对照先行:健在玩家的**同一动作**仍然允许 ── */
+    eq(g.applyPlayerMove('p1', 12, 10), true,
+      '负对照:健在玩家移动**仍被允许**(没有这一条,「把移动整体关掉」也是绿的)');
+    eq(g.lastMoveRejection, null, '负对照:健在玩家移动没有拒绝理由');
+    eq(g.playerPosition('p1')!.x, 12, '负对照:位置真的写进去了');
+    const aliveHit = g.attackMobAuthorized('p1', 'mob_sheep');
+    eq(aliveHit.outcome, 'OK', '负对照:健在玩家攻击**仍走到结算**');
+    eq(aliveHit.rejected, null, '负对照:健在玩家攻击没有拒绝理由');
+    ok(aliveHit.hit !== null && aliveHit.hit.hpLoss > 0,
+      `负对照:健在玩家的攻击**真的结算了**(掉血 ${aliveHit.hit?.hpLoss ?? 0})`);
+    eq(g.mobHost.runtimeOf('mob_sheep')!.hp < mobHp0, true, '负对照:生物 HP 真的掉了');
+
+    /* ── 把玩家打到 0:走 vitals 的权威入口,不用岩浆的随机时序 ── */
+    g.vitals.get('p1')!.hp = 1;
+    g.vitals.beginFrame();
+    const downing = g.vitals.applyHit('g2_probe', 'p1', 1, 1.0, 0);
+    eq(downing.downed, true, '前置:这次命中把玩家打到 0(唯一判据是 vitals)');
+    eq(g.vitals.get('p1')!.downed, true, '前置:downed 为真');
+    eq(g.downedOf('p1'), undefined,
+      '★★ 前置:此刻**还没有**泡泡状态(DownedState 由慢帧创建)⇒ 动作闸必须读 vitals.downed;'
+      + '若改读 DownedState,这半秒里移动/攻击会被放行(正是本块要防的窗口)');
+
+    /* ── 规则 3:不能移动(显式拒绝 + 可判定理由 + 位置真的没动)── */
+    const posBefore = g.playerPosition('p1')!;
+    eq(g.applyPlayerMove('p1', 32, 32), false,
+      '★ 规则3:倒地玩家 `applyPlayerMove` 必须**显式拒绝**(修前返回 true、位移 33.9 格)');
+    eq(g.lastMoveRejection, 'DOWNED',
+      '★ 规则3:拒绝理由**可判定**(`boolean` 装不下理由 ⇒ 另有 lastMoveRejection)');
+    const posAfter = g.playerPosition('p1')!;
+    eq(posAfter.x, posBefore.x, '★ 规则3:权威 x **没变**(不是「拒了但写进去了」)');
+    eq(posAfter.y, posBefore.y, '★ 规则3:权威 y **没变**');
+
+    /* ── 规则 4:不能攻击 ── */
+    const ghostHit = g.attackMobAuthorized('p1', 'mob_sheep');
+    eq(ghostHit.rejected, 'DOWNED', '★ 规则4:倒地玩家 `attackMobAuthorized` 被显式拒绝');
+    eq(ghostHit.hit, null, '★ 规则4:被拒时**没有**结算结果(修前照常结算)');
+    eq(g.mobHost.runtimeOf('mob_sheep')!.hp, mobHp0 - aliveHit.hit!.hpLoss,
+      '★ 规则4:生物 HP 停在负对照那一刀之后 —— 拒绝真的生效(不是「拒了但打到了」)');
+
+    /* ── 复活后两条规则**同时**解除(否则就是「一倒就永久不能动/不能打」)── */
+    g.revivePlayer('p1', 50);
+    eq(g.vitals.get('p1')!.downed, false, '前置:已复活');
+    eq(g.applyPlayerMove('p1', 12, 10), true, '★ 复活后移动立刻恢复');
+    eq(g.lastMoveRejection, null, '★ 复活后不再有拒绝理由');
+    const back = g.attackMobAuthorized('p1', 'mob_sheep');
+    eq(back.rejected, null, '★ 复活后攻击立刻恢复');
+    ok(back.hit !== null && back.hit.hpLoss > 0, '★ 且真的又结算出一刀(与负对照同形态)');
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * ★ 裁决 5(2026-11-14):`mobHitDamage` 的上界**从冻结层内容派生**,
+   *   并且 `raw` 外流的三个字段**(v.totalTaken / base.applied / totals.damage)**都有界。
+   *
+   * 修前实测(`docs/ARCH-GAPS.md` 第五层):`level 1e9 ⇒ mobHitDamage = 2000000004`,
+   * 这个值经 `raw` 同时流进三个字段 —— 其中 `base.applied` **最要紧**:
+   * 它是**调用方拿到的返回值**,会外流到网络差量 / 客户端 / 存档。
+   *
+   * ⚠️ 阈值**不许硬编码 30**:下面两条先把**派生值**钉住 ——
+   *    内容改了(加一只 35 级生物)它们会红,提醒复核口径,而不是让口径悄悄过期。
+   * ══════════════════════════════════════════════════════════════════════════ */
+  {
+    eq(CONTENT_MAX_MOB_LEVEL, 30,
+      '★ 阈值口径:内容(shared/constants 的 mobs + bosses)里最大生物等级 = 30(**派生**,不是硬编码)');
+    eq(MOB_HIT_MAX_DAMAGE, 64,
+      '★ 阈值口径:上界伤害 = 64(= mobHitDamage(30) = 6 + 2×(30−1))');
+    eq(mobHitDamage(30), 64, '前置:合法上界等级本来就给 64(否则「钳制」可能只是改了公式)');
+    eq(mobHitDamage(1), 6, '前置:1 级基准 6(量级基准,防止把公式改小当成「钳住了」)');
+
+    /* 夹取:有限越界与 +Infinity 一律落到内容上界 */
+    eq(mobHitDamage(31), 64, '等级 31 ⇒ 钳到内容上界 64');
+    eq(mobHitDamage(1e9), 64, '★ 等级 1e9 ⇒ 64(修前 2000000004)');
+    eq(mobHitDamage(Number.POSITIVE_INFINITY), 64,
+      '+Infinity ⇒ 夹取到上界(不是被拒绝成 1 级 —— 与 sanitizeComboMul 同口径)');
+
+    /* 拒绝:非数字 / NaN ⇒ 1 级 */
+    eq(mobHitDamage(Number.NaN), 6, 'NaN 等级 ⇒ **拒绝**为 1 级(6 点)');
+    eq(mobHitDamage({} as never), 6, '非数字 ⇒ 同上(修前这里返回 NaN,顺着 raw 毒化 v.hp)');
+    ok(mobHitDamage(Number.NaN) !== mobHitDamage(1e9),
+      '★ 「拒绝」与「夹取」两种非法语义必须**可区分**(同为非法值却给同一个数就不可判定)');
+
+    /* ── 三个字段:逐个断言(经真实入口 applyHit,不是复述纯函数)── */
+    const v = new VitalsSystem();
+    v.register('p1');
+    v.beginFrame();
+    const big = v.applyHit('claims_lv1e9', 'p1', 1e9, 1.0, 0);
+    eq(big.applied, 64,
+      '★ 字段1/3 `base.applied`(**对外返回值**,会外流到网络/客户端/存档)被钳:64(修前 2000000004)');
+    eq(v.get('p1')!.totalTaken, 64, '★ 字段2/3 `v.totalTaken`(累计统计)被钳:64');
+    eq(v.get('p1')!.hp, 100 - 64, 'HP 侧只掉 64(HP 本就有 Math.max(0,·) 的下钳)');
+    eq(v.snapshot().damage, 64, '★ 字段3/3 `totals.damage`(帧统计,经 snapshot)被钳:64');
+    ok(Number.isFinite(big.applied) && Number.isFinite(v.get('p1')!.totalTaken),
+      '★ 三处都必须**有限**:荒谬值被吸收,而不是变成 NaN 静默穿过所有比较');
+
+    /* ── 荒谬**乘数**同族:`mul` 是公开入参,NaN 曾让 `v.hp` 变 NaN ──
+       后果不是「掉了荒谬的血」,而是「**既不死也回不了血**」:
+       `hp === 0` 恒 false、`hp < maxHp` 恒 false(与 task-51 修掉的
+       「生物 HP 被 NaN 永久污染」同一形态,只是发生在 vitals 侧)。 */
+    const w = new VitalsSystem();
+    w.register('p2');
+    w.beginFrame();
+    const nanMul = w.applyHit('claims_nan_mul', 'p2', 5, Number.NaN, 0);
+    ok(Number.isFinite(w.get('p2')!.hp), `★ NaN 乘数不得毒化 HP(实测 ${w.get('p2')!.hp})`);
+    eq(nanMul.applied, 14, '非有限乘数被**拒绝**为 1.0(5 级 ⇒ 14),不是 NaN');
+    /* ★ 断言**后果**而非法字段:被毒化时回血会永久失效。 */
+    w.get('p2')!.sinceHurtSec = 999;
+    for (let i = 0; i < 50; i += 1) w.stepTimers(0.05);
+    ok(w.get('p2')!.hp > 86,
+      `★ 中毒后仍能自然回血(实测 ${w.get('p2')!.hp} > 86);若 hp 是 NaN ⇒ 「hp < maxHp」恒 false ⇒ 永不回血`);
+  }
 });
 
 test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对照', () => {
@@ -2348,7 +2499,10 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
  *     第 3 参是**数字**不是对象。实测传 `('p1', 20)` ⇒ `playerId=20` ⇒
  *     `players.get(20)` 为 undefined ⇒ 走 `if (!v) return base` 早退 ⇒
  *     `applied=0 blockedByIframe=false`(看起来像"被挡住了",实则是**没打**);
- *     传对象当 level ⇒ `mobHitDamage({})` = NaN ⇒ `applied=NaN`。
+ *     传对象当 level ⇒ 修前 `mobHitDamage({})` = NaN ⇒ `applied=NaN`。
+ *     ⚠️ 2026-11-14(裁决 5)起非法等级被**拒绝**为 1 级 ⇒ 那种错法现在
+ *     得到的是一把**看起来正常**的伤害(6 点),更像真的 —— 故分辨
+ *     「被挡住」与「没打」只能靠 `blockedByIframe`,不能靠 `applied===0`。
  *     **两种错法都会导出假结论。**
  *
  * ⚠️ 帧数**不能写死**:慢帧(2Hz)相位决定归零所需帧数。实测复活后
@@ -2406,6 +2560,24 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
   ok(hit2.applied > 0, `task-64 后果3:宽限到期后正常受击(applied=${hit2.applied} > 0)`);
   eq(hit2.blockedByIframe, false, 'task-64 后果3:到期后不再被 iframe 挡');
   ok(gv.hp < 50, `task-64 后果3:HP 真的下降(${gv.hp} < 50)`);
+
+  /* ── 后果 4:宽限**只属于被救的人**(防「一处写全局 / 写进共享字段」)──
+   *
+   * 失败模式与 W3(`maxHp` 曾是**构造器共享常量**)同族:把「某人的无敌」写进
+   * 实例级/全局状态 ⇒ 一个人复活,全世界无敌 —— 而这条断言此前**没有人守**。
+   * 用**裸实例**测最干净(不经救援时序),且两侧都断言:被救者被挡、另一人照常挨打。 */
+  const bare = new VitalsSystem();
+  bare.register('a');
+  bare.register('b');
+  bare.revive('a', 50, 0.5);
+  eq(bare.get('a')!.iframeSec, 0.5, '★ task-64 后果4:被救者拿到 0.5s 宽限(字面量,不用常量自证)');
+  eq(bare.get('b')!.iframeSec, 0,
+    '★ task-64 后果4:另一个人**没有**宽限 ⇒ 宽限是逐玩家字段,不是共享/全局状态');
+  bare.beginFrame();
+  eq(bare.applyHit('t64_probe_a', 'a', 1, 1.0, 0).applied, 0, '★ task-64 后果4:有宽限的人这一拳不掉血');
+  const bHit = bare.applyHit('t64_probe_b', 'b', 1, 1.0, 0);
+  ok(bHit.applied > 0, `★ task-64 后果4:没宽限的人正常受击(${bHit.applied})⇒ 上面那条「不掉血」不是恒真`);
+  eq(bHit.blockedByIframe, false, '★ task-64 后果4:且**不是**被 iframe 挡 ⇒ 确实没有「顺带的无敌」');
   }
 });
 
@@ -3324,6 +3496,49 @@ test('task70-10b:裁决4 —— 读档路径的 0 HP 必须忠实保留(WS-FND-0
   /* 不可信值仍被拒(与 revive 的 NaN 兜底同族,但拒绝语义不同:importVitals 是**跳过**) */
   eq(s.importVitals({ p1: { hp: Number.NaN } }), 0, 'NaN 被拒,不计入生效数');
   eq(s.vitals.get('p1')!.hp, 0, '被拒时不改动现值');
+
+  /* ★ 反向(裁决 4 的另一半):读档/重连**不该**发无敌 ——
+     `revive(id, hp)` 第三参缺省 0 是刻意的语义(见 `vitals.revive` 的注释)。
+     若有人「顺手修一下复活体验」把缺省改成非 0,这里立刻红:
+     「重连即无敌」是可刷的优势,而它在生产里**没有别的观察点**。 */
+  eq(s.vitals.get('p1')!.iframeSec, 0, '★ 读档后 iframeSec === 0(重连不给宽限;缺省参数是 0)');
+
+  /* ═══ 裁决 1 + 裁决 4:上限权威在 progression;读档与 revive 走**同一份**钳制 ═══
+   *
+   * 修前的准确缺陷形态不是「读档没钳」,而是「**同一入口两条路径口径不同**」:
+   * ```
+   * importVitals:`Math.min(v.maxHp, row.hp)`  ← 自带一份
+   * revive      :`v.hp = hp ?? v.maxHp`       ← 没有
+   * ```
+   * ⇒ 裁决 4 把那份实现**提到唯一入口**(`VitalsSystem.revive`),`importVitals` 已摘除。
+   * 下面用**30 级的权威上限**(progression 派生 535)证明三件事:
+   *   1. 上限的权威是 progression,**不是** vitals 的常量 100(降级为缺省);
+   *   2. 读档路径与 revive 路径给出**同一个数** —— 这就是「只有一份钳制」的可观测形态;
+   *   3. `hp <= maxHp` 恒成立。
+   */
+  const lv30 = new WorldSim({ sizeCells: 32 });
+  lv30.addPlayer('p9', 10, 10);
+  /* ★ 走生产的读档入口:它会**先 syncMaxHp 再 importVitals**(顺序是硬约束) */
+  lv30.restoreFromProfile('p9', { level: 30, hp: 99999, x: 10, y: 10, z: 0 });
+  eq(lv30.progressOf('p9').maxHp, 535,
+    '★ 裁决1:权威上限来自 progression(`PlayerProgress.maxHp` = 535),不是常量 100');
+  eq(lv30.maxHpForLevel('p9', 30), 535, '★ 裁决1:WorldSim 的派生口与 progression 同值(不是第二套口径)');
+  eq(lv30.vitals.get('p9')!.maxHp, 535, '★ 裁决1:派生值落到 `vitals` 的 `v.maxHp`');
+  eq(lv30.vitals.get('p9')!.hp, 535,
+    '★ 裁决4:读档造的 hp=99999 被钳到 **535**(= 该玩家的 maxHp,不是 100 ⇒ 钳的是逐玩家上限)');
+  ok(lv30.vitals.get('p9')!.hp <= lv30.vitals.get('p9')!.maxHp, '★ 真不变量 `hp <= maxHp` 成立');
+
+  /* 同一入口的另一条路径必须给**同一个数** */
+  lv30.revivePlayer('p9', 99999);
+  eq(lv30.vitals.get('p9')!.hp, 535,
+    '★ 裁决4:`revive(99999)` 与读档路径**同一个结果** ⇒ 全仓只有一份钳制');
+
+  /* 负对照:换个等级,同一入口给出**不同**的上界(证明钳的是逐玩家的 maxHp) */
+  lv30.restoreFromProfile('p10', { level: 1, hp: 99999, x: 12, y: 10, z: 0 });
+  eq(lv30.vitals.get('p10')!.maxHp, 100,
+    '负对照:Lv.1 的上限 = 100(常量在这里只是缺省,恰好等于 1 级派生值)');
+  eq(lv30.vitals.get('p10')!.hp, 100,
+    '负对照:同一份钳制对 Lv.1 给 100 ⇒ 上界确实是逐玩家的 maxHp,不是共享常量');
 });
 
 test('task70-附:syncMaxHp 的拒绝语义与幂等(不可信派生值不得写入)', () => {
