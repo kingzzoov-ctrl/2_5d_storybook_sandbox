@@ -143,6 +143,8 @@ export interface AssembleDeps {
   rng?: () => number;
   /** 战斗随机流(与 `rng` 独立,见 `WorldSim` 的 `combatRng` 注释)。 */
   combatRng?: () => number;
+  /** 是否生成野生动物(不传 = `WorldSim` 自己的默认)。 */
+  mobs?: boolean;
   /** 房间名与准入方式,与 `NetPersistRoom.onCreate` 的同名字段一一对应。 */
   name?: string;
   accessMode?: AccessMode;
@@ -209,6 +211,10 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
     sizeCells: deps.sizeCells,
     rng: deps.rng,
     combatRng: deps.combatRng,
+    /* ★ 2026-11-14:`mobs` 透传。此前这里只传 sizeCells/rng/combatRng ⇒
+       `assemble()` 造出来的世界里**没有怪**,而 `applyAttack` 需要 mobId ⇒
+       「能玩」这条路上打怪永远空转。启动器(`scripts/play.ts`)用它把世界填满。 */
+    mobs: deps.mobs,
   } as ConstructorParameters<typeof WorldSim>[0]);
   return sim;
 }

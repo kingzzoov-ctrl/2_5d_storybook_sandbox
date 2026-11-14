@@ -426,6 +426,13 @@ export type WsRoomLike = {
   applyMove?(userId: string, intent: {
     tick: number; x: number; y: number; z: number; speedMul?: number;
   }): unknown;
+  /**
+   * 应用一条攻击意图(`RoomRuntime.applyAttack` 的形状)。
+   * 可选,理由同 `applyMove`。
+   */
+  applyAttack?(userId: string, claimedBonus?: number, mobId?: string): unknown;
+  /** 最近一次攻击结算报告(`RoomRuntime.lastAttackReport`);回给客户端做反馈。 */
+  readonly lastAttackReport?: unknown;
   cloneState(): unknown;
 };
 
@@ -695,6 +702,11 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown });
           return;
         }
+        /* ★ 2026-11-14:`t:'attack'` —— 打怪的落点。判据同 `move`。 */
+        if (parsed.t === 'attack') {
+          onAttack(c, parsed as { mobId?: unknown; bonus?: unknown });
+          return;
+        }
         onHello(c, parsed);
         return;
       }
@@ -828,6 +840,37 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
  * ⚠️ `applyMove` 抛错时也**不断连**(与畸形载荷同纪律:一个坏动作只该丢它自己),
  * 但必须计数 + 记原因。
  */
+/**
+ * 应用一条**攻击意图**(2026-11-14)。打怪的服务端落点。
+ *
+ * 判据与 `onMove` 同规:未 hello / 房间没实现 / 参数非法 ⇒ **丢弃并出声**。
+ * 成功时把 `lastAttackReport` 回给客户端(`t:'attackResult'`)——
+ * 否则「打中了」与「什么都没发生」在客户端**不可区分**(本仓反复记的静默形态)。
+ */
+function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown }): void {
+  if (!c.helloDone || c.userId === null) {
+    log('攻击意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    return;
+  }
+  const apply = opts.room.applyAttack;
+  if (typeof apply !== 'function') {
+    log('本房间没有 applyAttack ⇒ 攻击无处应用(丢弃,不是丢包)');
+    return;
+  }
+  const mobId = typeof msg.mobId === 'string' ? msg.mobId : '';
+  if (mobId === '') {
+    log('攻击意图缺 mobId ⇒ 丢弃(没有目标就没有结算)');
+    return;
+  }
+  const bonus = typeof msg.bonus === 'number' && Number.isFinite(msg.bonus) ? msg.bonus : 0;
+  try {
+    apply.call(opts.room, c.userId, bonus, mobId);
+  } catch (e) {
+    log(`applyAttack 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+    return;
+  }
+  sendJson(c, { t: 'attackResult', report: opts.room.lastAttackReport ?? null, mobId });
+}
 function onMove(c: WsConn, msg: {
   tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;
 }): void {

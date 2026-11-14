@@ -31,6 +31,7 @@
     "content:update": "node scripts/content-lock.ts --update",
     "test": "node scripts/verify.ts --all",
     "sim": "node server/src/sim/demo.ts",
+    "play": "node scripts/play.ts",
     "typecheck": "node scripts/typecheck.ts",
     "dev:client": "vite",
     "build:client": "vite build",

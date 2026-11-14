@@ -128,6 +128,14 @@ export interface SessionHandle {
    * 未连接时返回 `false`(与 `send` 同一纪律:不抛、不静默假装成功)。
    */
   sendMove(intent: MoveIntent): boolean;
+  /**
+   * 上行一条**攻击意图**(2026-11-14)。服务端把它交给
+   * `room.applyAttack(userId, bonus, mobId)`,并把结算报告回成 `t:'attackResult'`。
+   *
+   * ⚠️ 没有这条时「打怪」在客户端**无处可发** —— 世界里有怪、服务端也能结算,
+   *    但中间这一段缺了 ⇒ 表现就是「按了没反应」。
+   */
+  sendAttack(intent: AttackIntent): boolean;
   close(): void;
 }
 
@@ -231,6 +239,20 @@ export function encodeMoveUplink(intent: MoveIntent): Uint8Array {
   return encodeClientFrame(new TextEncoder().encode(json), true);
 }
 
+
+/** 上行**攻击意图**。`mobId` 取自快照里的 `state.wildlife[].mobId`。 */
+export interface AttackIntent {
+  /** 目标生物 id(服务端 `applyAttack(userId, bonus, mobId)` 的第三个参数)。 */
+  mobId: string;
+  /** 客户端声明的加成;服务端自己判上限,不采信这个数(反作弊)。 */
+  bonus?: number;
+}
+
+/** 把攻击意图编成上行文本帧(与 `encodeMoveUplink` 同一形态:文本 + `t` 分流)。 */
+export function encodeAttackUplink(intent: AttackIntent): Uint8Array {
+  const json = JSON.stringify({ t: 'attack', ...intent });
+  return encodeClientFrame(new TextEncoder().encode(json), true);
+}
 /**
  * 从**上行帧**里剥掉类型头。导出是为了让 WS-12 能测它 ——
  * 这是本模块里唯一**纯**的部分(其余都需要真 WebSocket)。
@@ -416,6 +438,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
     sendMove(intent: MoveIntent): boolean {
       if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
       socket.send(encodeMoveUplink(intent));
+      return true;
+    },
+    sendAttack(intent: AttackIntent): boolean {
+      if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
+      socket.send(encodeAttackUplink(intent));
       return true;
     },
     close(): void {

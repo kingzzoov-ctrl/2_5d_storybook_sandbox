@@ -32,11 +32,21 @@
     background: #121a2b; font: 13px/1.7 ui-monospace, Menlo, Consolas, monospace;
     color: #ff9d9d; z-index: 100; overflow: auto; white-space: pre-wrap;
   }
+  /* 状态条:连接 / 坐标 / 最近一次命中 —— 「连没连上、打没打中」要在屏幕上看得见 */
+  #status {
+    position: fixed; top: 10px; left: 10px;
+    font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+    color: #a8f0c8; background: rgba(14,20,32,.78);
+    padding: 8px 12px; border-radius: 10px; pointer-events: none;
+    border: 1px solid rgba(120,200,160,.25); white-space: pre;
+  }
+  #status.bad { color: #ffcf8f; border-color: rgba(220,170,90,.35); }
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div id="hint">WASD / 方向键 平移 · 手机单指拖动</div>
+<div id="status">连接中…</div>
+<div id="hint">WASD/方向键 移动 · 手机单指拖动视角 · 本版世界里还没有生物(见 PLAY.md)</div>
 <pre id="fatal"></pre>
 <script type="module">
   /*

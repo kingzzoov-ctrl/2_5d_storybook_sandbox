@@ -53,7 +53,11 @@ declare global {
  */
 function serverUrlFromLocation(): string | null {
   const q = new URLSearchParams(window.location.search).get('server');
-  return q !== null && q !== '' ? q : null;
+  if (q !== null && q !== '') return q === 'off' ? null : q;
+  /* ★ 2026-11-14(`npm run play`):没给 `?server=` 时**默认连本机的 play 服务端** ——
+     「打开页面就能玩」就是这一行的目的。端口与 `scripts/play.ts` 的默认值(8791)一致。
+     ⚠️ 显式 `?server=off` 关闭联机:离线/截图自检时不能让重连噪音淹没真正的错误。 */
+  return `ws://${window.location.hostname || '127.0.0.1'}:8791/ws`;
 }
 
 function main(): void {
@@ -107,6 +111,55 @@ function main(): void {
      ⚠️ 相机仍是临时态:WASD **同时**在平移相机(`three/boot.ts` 的 `pan`),
      于是角色不会走出画面 —— 但那是**巧合**成立的,不是「相机跟随」。
      让相机跟随权威位置要动渲染路径,其验收只能靠看 ⇒ 单独一件,不在本轮。 */
+  /* ── 攻击与 HUD(2026-11-14:让「能玩」在屏幕上可见)── */
+  const statusEl = document.getElementById('status');
+  let lastHit = '还没打过';
+  const lastHp = new Map<string, number>();
+
+  /**
+   * 最近的怪 —— 从**权威快照**取(`store.state.wildlife`)。
+   * ⚠️ 客户端不自己维护怪列表:那是服务端的事,两份列表迟早分叉。
+   */
+  const nearestWildlife = (from: { x: number; y: number }):
+    { mobId: string; hp: number; maxHp: number; d: number } | null => {
+    let best: { mobId: string; hp: number; maxHp: number; d: number } | null = null;
+    for (const w of handle.store.state.wildlife) {
+      const d = Math.hypot(w.x - from.x, w.y - from.y);
+      if (best === null || d < best.d) best = { mobId: w.mobId, hp: w.hp, maxHp: w.maxHp, d };
+    }
+    return best;
+  };
+
+  /** 左键 / 空格:打**最近**那只(距离与伤害都由服务端判,客户端只给目标)。 */
+  const attackNearest = (): void => {
+    if (session === null) { lastHit = '未联机,打不了'; return; }
+    const w = nearestWildlife(predictor.pos);
+    if (w === null) { lastHit = '附近没有怪'; return; }
+    session.sendAttack({ mobId: w.mobId });
+    lastHit = `已发攻击 → ${w.mobId}(${w.d.toFixed(1)} 格)`;
+  };
+  window.addEventListener('mousedown', (ev) => { if (ev.button === 0) attackNearest(); });
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key === ' ' || ev.code === 'Space') { ev.preventDefault(); attackNearest(); }
+  });
+
+  /** 每 tick 刷一次状态条(连接态不是 live 时变黄 —— 一眼能看出「没连上」)。 */
+  const paintStatus = (
+    pos: { x: number; y: number },
+    near: { mobId: string; hp: number; maxHp: number; d: number } | null,
+  ): void => {
+    if (statusEl === null) return;
+    const st = session?.state ?? 'offline';
+    statusEl.textContent = [
+      `连接 ${st}`,
+      `坐标 ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}`,
+      near === null
+        ? '附近 无怪'
+        : `最近 ${near.mobId} hp ${near.hp.toFixed(0)}/${near.maxHp.toFixed(0)} (${near.d.toFixed(1)}格)`,
+      lastHit,
+    ].join('\n');
+    statusEl.classList.toggle('bad', st !== 'live');
+  };
   const input = new InputSource();
   const detachInput = attachKeyboard(window, input);
   const predictor = new LocalPredictor();
@@ -131,6 +184,18 @@ function main(): void {
     if (session !== null) {
       session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z });
     }
+    /* ── HUD:连没连上 / 站在哪 / 附近有没有怪 / 最近一次命中 ──
+       「命中量」不是客户端编的:它来自**权威快照里那只怪的血量下降**
+       (服务端 applyAttack 结算后写进快照)⇒ 这条反馈与战斗是同一个真值来源。 */
+    const near = nearestWildlife(p);
+    if (near !== null) {
+      const prev = lastHp.get(near.mobId);
+      if (prev !== undefined && near.hp < prev) {
+        lastHit = `命中 ${near.mobId} -${(prev - near.hp).toFixed(1)} HP`;
+      }
+      lastHp.set(near.mobId, near.hp);
+    }
+    paintStatus(p, near);
   }, DT * 1000);
 
   window.__stageReady = () => ({
