@@ -24,7 +24,7 @@
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
 | 层 | 服务端 `server/src` **61** `.ts` · 客户端 `client/src` **29** · 共享 `shared` **10** ⇒ **生产 .ts 合计 100** |
-| 测试 | `tests/*.test.ts` **32** 个套件 |
+| 测试 | `tests/*.test.ts` **33** 个套件 |
 | 工具 | `scripts/*.ts` **31** 个 |
 | 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
 | 门禁 | `scripts/verify.ts`(6230 行) |
@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1555 条 / 32 套件** | WS 1014 条 / 14 套件 · 基座 FND 541 条 / 18 套件 |
+| 用例 | **1561 条 / 33 套件** | WS 1014 条 / 14 套件 · 基座 FND 547 条 / 19 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,7 +387,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-77027b4bf0e9  README.md
+5eef232698ad  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
@@ -523,7 +523,7 @@ node scripts/count-audit.ts           ⇒ exit 0(1 处自称,全部与正解一�
 verify --all --strict-reach --strict-taut --strict-inert
   ⇒ **exit 0 / 行首 ✗ 0 项**(~26s,不含自检)
  生产可达性  88/98 → **91/100**(摘除 prediction.ts 的白名单条目 + 新增 2 个 client 模块)
- 用例        1526 → **1555 条 / 32 套件**(WS 1014 / 14 套件 · 基座 541 / 18 套件)
+用例        1526 → **1561 条 / 33 套件**(WS 1014 / 14 套件 · 基座 547 / 19 套件)
 入口可加载性 4 个入口实测可加载 · 1 个已登记豁免(原 2 个 —— room.colyseus.ts 的豁免**已摘**)
 入口执行层   1 个 verdict 守卫 handler 已登记,其中**成功路径为空 0 个**(原 1 个)
 装饰器例外   **0 处**(原 1 处)

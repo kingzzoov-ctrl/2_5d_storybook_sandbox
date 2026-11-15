@@ -145,6 +145,11 @@ export interface AssembleDeps {
   combatRng?: () => number;
   /** 是否生成野生动物(不传 = `WorldSim` 自己的默认)。 */
   mobs?: boolean;
+  /**
+   * 世界群系(刷怪配表 `BIOME_SPAWN` 的键)。不传 = `WorldSim` 自己的默认 `MEADOW`。
+   * 本仓没有每格群系,见 `WorldSim.biomeName` 的注释。
+   */
+  biome?: string;
   /** 房间名与准入方式,与 `NetPersistRoom.onCreate` 的同名字段一一对应。 */
   name?: string;
   accessMode?: AccessMode;
@@ -203,9 +208,11 @@ export interface Assembled {
  */
 export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
   /* ⚠️ `WorldSimOptions` 只有 `sizeCells` / `fluidBudget` / `wiring` / `mobs` /
-     `rng` / `combatRng` / `alchemy` 七个字段 —— **没有 `worldSeed`**。
+     `rng` / `combatRng` / `alchemy` / `biome` **八个**字段 —— **没有 `worldSeed`**。
      故这里只透传 `sizeCells`,并支持注入 `rng`/`combatRng` 以便测试完全可复现
-     (`worldSeed` 是**房间参数**,由 `rtOpts` 承载,见 `assemble()`)。 */
+     (`worldSeed` 是**房间参数**,由 `rtOpts` 承载,见 `assemble()`)。
+     ★ 加 `biome` 的理由:本仓没有每格群系,「世界群系」只能是一个**显式选择**,
+       而它是刷怪配表的键 ⇒ 不透传就等于让刷怪永远只走兜底。 */
   const sim = new WorldSim({
     /* 键**总是出现**(与房间侧 rtOpts 同一纪律:不靠条件展开省键)。 */
     sizeCells: deps.sizeCells,
@@ -215,6 +222,10 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
        `assemble()` 造出来的世界里**没有怪**,而 `applyAttack` 需要 mobId ⇒
        「能玩」这条路上打怪永远空转。启动器(`scripts/play.ts`)用它把世界填满。 */
     mobs: deps.mobs,
+    /* ★ 2026-11-14:`biome` 透传。它与 `mobs` 是一对:不传 `mobs` 世界里没怪,
+       不传 `biome` 刷怪只会走 `?? BIOME_SPAWN.MEADOW` 的兜底 ——
+       而那个兜底**没有任何地方会显示出来**。 */
+    biome: deps.biome,
   } as ConstructorParameters<typeof WorldSim>[0]);
   return sim;
 }

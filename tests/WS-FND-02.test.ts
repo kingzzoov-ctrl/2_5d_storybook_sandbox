@@ -1013,7 +1013,11 @@ test('C17 事件型伤害通道:蝎子伏击能打到玩家', () => {
 });
 
 test('C18 事件型伤害有距离限制(远离时不受伏击)', () => {
-  const s = new WorldSim({ sizeCells: 48 });
+  /* ⚠️ `mobs: false`(2026-11-14):刷怪在 `mobs !== false` 时**默认开**,
+     而本用例跑 1200 帧 ⇒ 期间世界里会自己刷出怪来,于是
+     `hitCount` 从 0 变成 3 —— 测到的就不再是「距 10 格不伏击」,
+     而是「世界里碰巧有别的怪」。本用例只想验证**显式加的那只**的距离判定。 */
+  const s = new WorldSim({ sizeCells: 48, mobs: false });
   s.addPlayer('p1', 24, 24);
   s.addMob('mob_scorpion', 'MEADOW', 34, 24); /* 10 格外 */
   for (let i = 0; i < 1200; i += 1) s.tick();

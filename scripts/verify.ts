@@ -4947,7 +4947,11 @@ async function checkIntegration(): Promise<void> {
   const totalActive = s.run(TOTAL).reports.reduce((n, r) => n + r.activeMobs, 0);
   const snap = s.snapshot();
   const checks: [string, boolean, string][] = [
-    ['物理刚体', snap.bodies === 4, `期望 4 个(2 玩家 + 2 生物),实际 ${snap.bodies}`],
+    /* ⚠️ `>= 4` 而不是 `=== 4`(2026-11-14):世界在 `run(TOTAL)` 期间会
+       **自发改刷怪**(刷怪修好后每秒真的会来新的)⇒ 刚体数可以多于
+       「2 玩家 + 2 生物」。本条的命题是「登记的 4 个都进了物理世界」,
+       不是「世界里恰好 4 个」—— 后者在刷怪生效后**必然**失败。 */
+    ['物理刚体', snap.bodies >= 4, `期望 ≥ 4 个(2 玩家 + 2 生物;自发改刷的怪会更多),实际 ${snap.bodies}`],
     ['地形 Chunk', snap.chunks > 0, `期望 > 0,实际 ${snap.chunks}`],
     ['流体总量', snap.fluidTotal > 0, `期望 > 0,实际 ${snap.fluidTotal}`],
     ['电路通电格', snap.wireCells > 0, `期望 > 0(布线且已驱动),实际 ${snap.wireCells}`],
@@ -5259,7 +5263,13 @@ async function checkIntegration(): Promise<void> {
   watchSub('physics', 'step');
   watchSub('bus', 'drain');
   watchSub('spawner', 'canSpawn');
-  for (let i = 0; i < 40; i += 1) drv.tick();
+  /* ⚠️ 400 帧(= 40 个慢帧)而不是 40 帧(2026-11-14):刷怪改成
+     「按配表速率累加预算」之后,`canSpawn` 不再每慢帧都被调用 ——
+     4 个慢帧的预算只有 `spawnsPerCheck('MEADOW') × 4` = 0.15 只,
+     于是它**一次都没被调用**,本条当场红(并连带让「跨 WS 集成」从 38 掉到 37)。
+     40 个慢帧的预算 = 1.5 ⇒ 至少一次 `trySpawnOne` ⇒ 计数 > 0。
+     这不是放宽判据:「调用计数 > 0」这条命题没变,变的只是驱动窗口的长度。 */
+  for (let i = 0; i < 400; i += 1) drv.tick();
   const dead = [...counts.entries()].filter(([, n]) => n === 0).map(([k]) => k);
   if (dead.length > 0) {
     fail(

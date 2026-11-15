@@ -12,6 +12,9 @@
  * 2 起 WS 服务端:startWsServer({ room }) —— 20Hz。房间的 step() 会推进世界
  *   (`room.ts` 里 task-59 接的 advance(1));世界会跑、怪会动
  * 3 起客户端 dev server(vite)并打印**可直接打开的地址**
+ *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来。实测:
+ *   预热 1200 帧(60 秒)⇒ 3 只;默认取 2400 帧(120 秒)⇒ 更多。
+ *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来
  * ```
  *
  * ## 为什么必须用 `assemble()` 而不是 `ws_demo.ts`
@@ -21,7 +24,8 @@
  * ⇒ 用它「能连上、能看到别人在动」,但**打不了、盖不了** —— 不是能玩的世界。
  * 本文件用生产装配路径(`createHost` → `WorldSim`),所以：
  * ```
- * 怪真的在世界里(WorldSim 的 mobs)
+ * 怪真的会被**刷出来**(2026-11-14 修:此前刷怪 tick 只计数不造怪,且
+ *   `upsertWildlife()` 全仓无人调用 ⇒ 世界里 0 只、快照里恒 `wildlife: []`)
  * 攻击真的结算(RoomRuntime.applyAttack → host.attackMobAuthorized)
  * 房间真的推世界(step → host.advance(1))
  * ```
@@ -68,6 +72,25 @@ async function main(): Promise<void> {
     sizeCells: WORLD_CELLS,
     mobs: true,
   });
+
+  /* ── 1b 预热世界(★ 2026-11-14)──
+     生物是按**配表速率**逐只刷出来的(慢帧 2Hz × `BIOME_SPAWN.perChunk`),
+     第一只约 13 秒世界时间 ⇒ 不预热的话你打开浏览器看到的是**空世界**,
+     很容易误判成"怪又没生效"。
+     ⇒ 让世界在你连上之前先跑一会儿 —— 真实的服务器本来就是这样(开机起就在跑)。
+     ⚠️ 预热推进的是**同一条刷怪路径**(同样的安全区/上限/群系规则),
+        不是在开局"摆"几只:去掉预热,世界只是空一会儿,规则不变。 */
+  const warmup = numArg('warmup', 1200);
+  const warmT0 = Date.now();
+  for (let i = 0; i < warmup; i += 1) assembled.runtime.step(null);
+  const mobs = assembled.host.listWildlife();
+  log(`预热 ${warmup} 帧(${(warmup / 20).toFixed(0)} 秒世界时间,耗时 ${Date.now() - warmT0}ms)`
+    + ` ⇒ 世界里有 ${mobs.length} 只生物`
+    + (mobs.length === 0 ? '  ⚠️ 一只都没有(若 --size 小到整图都在安全区里,就会是 0)' : ''));
+  if (mobs.length > 0) {
+    log('  ' + mobs.slice(0, 8).map((m) => `${m.mobId}(${m.hp}/${m.maxHp})`).join(' · ')
+      + (mobs.length > 8 ? ` … 共 ${mobs.length} 只` : ''));
+  }
   log(`房间 ${assembled.runtime.id} 就绪;host=${assembled.host === null ? 'null(异常)' : '已装配'}`);
 
   /* ── 2 WS 服务端(20Hz;room.step 推进世界) ── */
@@ -109,8 +132,6 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-  console.log('   操作:WASD/方向键 移动 · 手机单指拖动视角');
-  console.log('   ⚠️ 本版世界还没有生物 ⇒ 打怪/建造/合成尚未实装,见 PLAY.md');
 }
 
 main().catch((e: unknown) => {

@@ -23,6 +23,7 @@ import {
   PROTOCOL_VERSION,
 } from '../../../shared/net/delta.ts';
 import { EntityKind } from '../../../shared/types/wire.ts';
+import { removeWildlife, upsertWildlife } from './schema.ts';
 import {
   AntiCheatRoom,
   type Clock,
@@ -390,6 +391,31 @@ export interface WorldSaveHost {
       };
     } | null;
   };
+  /**
+   * 当前**存活**生物的快照(权威 → 投影,每帧一次)。
+   *
+   * ## 为什么必须由世界提供,而不是房间自己遍历
+   * 房间手里只有这个结构化接口,刻意**不 import 模拟层类型** ——
+   * 而 `state.wildlife` 总得有东西去填:实测接线前 `upsertWildlife()`
+   * 在**全仓 0 个调用点**,于是客户端快照里恒为 `wildlife: []`,
+   * 世界里有没有怪都看不见 ⇒ 打怪**永远没有目标**(不是"打不动",是没有)。
+   *
+   * ## 必选(刻意不写 `?`)
+   * 本接口的 `levelOf?` / `applyPlayerMove?` 都是可选的:老的世界源不实现时
+   * 整段跳过、不报错。但生物投影**不能**可选 —— 漏掉它的表现是
+   * 「世界里满是怪、客户端一只都看不到」,一个不抛错、不打日志的静默失效。
+   * ⇒ 写成必选:世界源不提供时,**装配处编译期就该红**。
+   *
+   * 形状与 `shared/types/wire.ts` 的 `WildlifeState` 逐字段相同
+   * (那 9 个字段),这里不 import 它,只为与 `WorldSaveHost` 其余成员
+   * 保持同一取舍:接口只描述形状,不引具体层。
+   */
+  listWildlife(): {
+    id: string; mobId: string;
+    x: number; y: number; z: number;
+    fsm: number; hp: number; maxHp: number;
+    tameOwnerId: string;
+  }[];
   /**
    * 玩家的**权威等级**(来自进度档案 `progression`,不是网络投影)。
    *
@@ -1725,9 +1751,55 @@ export class RoomRuntime {
        (放进去的话,纯内存模式 `db === null` 就永远不同步等级,
        而那正是测试最常用的形态。) */
     this.projectAllPlayers();
+    /* ★ 2026-11-14:生物投影。与等级投影**同一时机、同一理由**
+       (「权威一变,投影随即一致」),而且必须与下面的 `encodeDelta` 同帧 ——
+       否则客户端比世界晚一帧才看到生物(表现为「走过去才发现它在动」)。 */
+    this.projectWildlife();
     return prevSnapshot ? encodeDelta(prevSnapshot, this.state).bytes : new Uint8Array(0);
   }
 
+  /**
+   * 把世界的**存活生物清单**单向投影进 `state.wildlife`(权威 → 投影)。
+   *
+   * ## 它补的是一条**断了两头的**链路
+   * ```
+   * 世界侧  canSpawn(...) ⇒ spawned += 1          ← 只计数,不造怪(已于 world_sim 修)
+   * 网络侧  upsertWildlife()                      ← 全仓 0 个调用点(本方法补上)
+   * ```
+   * ⇒ 两头都缺时表现完全一样:**客户端 `wildlife: []`**,
+   *   而服务端一切"正常"(没有异常、没有日志、测试照过)。
+   * 这正是本仓反复记的那类缺陷:能力存在、通路缺失。
+   *
+   * ## 清账为什么必须做
+   * `upsertWildlife` 只**增/改**,没有对应的删除调用。不清的话,
+   * 被打死的生物会**永远留在客户端快照里**:一只打不动、也不反击的幽灵目标
+   * (`attackMobAuthorized` 对它回 `null`)。
+   * ⇒ 以「权威清单」为准做一次差集删除,而不是等客户端自己超时。
+   *
+   * ## 为什么不信 `this.state` 当权威
+   * 本方法只做单向写:读世界的 `listWildlife()`,不改它。
+   * 反向(把 `state.wildlife` 灌回世界)会让两处互为依据 ——
+   * 与 `projectAllPlayers` 的注释里记的是**同一个**病根形态。
+   */
+  private projectWildlife(): void {
+    const host = this.worldSaveHost;
+    /* `typeof` 守卫与上面 `host.advance` 同一写法:接口是必选的,
+       但**老的世界源**(测试里的手搓替身)可能不实现 ⇒ 退回"不投影",
+       而不是抛。 */
+    if (host === null || typeof host.listWildlife !== 'function') return;
+    const seen = new Set<string>();
+    for (const w of host.listWildlife()) {
+      seen.add(w.id);
+      upsertWildlife(this.state, {
+        id: w.id, mobId: w.mobId, x: w.x, y: w.y, z: w.z,
+        fsm: w.fsm, hp: w.hp, maxHp: w.maxHp, tameOwnerId: w.tameOwnerId,
+      });
+    }
+    for (let i = this.state.wildlife.length - 1; i >= 0; i -= 1) {
+      const id = this.state.wildlife[i]!.id;
+      if (!seen.has(id)) removeWildlife(this.state, id);
+    }
+  }
   /**
    * 把 SSOT 的 **8 个交集字段**单向投影到 `state.players[]`(契约 §2.3;裁决 2 + 3)。
    *

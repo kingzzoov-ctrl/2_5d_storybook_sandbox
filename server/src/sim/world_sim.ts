@@ -43,7 +43,8 @@ import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 import { PhysicsWorld, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
-import { MobSpawner, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import { MobSpawner, spawnableMobs, spawnsPerCheck, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import type { WildlifeState } from '../../../shared/types/wire.ts';
 import { SignalGraph } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
    只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
@@ -304,6 +305,11 @@ export interface WorldSimOptions {
   wiring?: boolean;
   /** 每帧快帧是否推进生物 FSM。默认 true。 */
   mobs?: boolean;
+  /**
+   * 世界群系(键应当是 `BIOME_SPAWN` 的键,否则判定会兜底 MEADOW)。
+   * 默认 `MEADOW`。见 `biomeName` 字段注释:本仓没有每格群系。
+   */
+  biome?: string;
   /** 确定性随机源,返回 [0,1)。默认用固定的 mulberry32。 */
   rng?: () => number;
   /**
@@ -509,6 +515,22 @@ export class WorldSim {
   private readonly fluidBudget: number;
   private readonly wiringOn: boolean;
   private readonly mobsOn: boolean;
+  /**
+   * 世界群系。
+   *
+   * ⚠️ 本仓**没有「每格/每区块群系」这回事** —— `Biome` 只是
+   * `shared/types/entities.ts` 里的枚举 + 每只怪的归属,地形生成不产出群系。
+   * 于是「刷怪配表按群系分档」这件事此前无处落地:刷怪 tick 里写的是
+   * `biome: 'PLAINS'`,而那个名字**不在 `BIOME_SPAWN` 表里**。
+   * ⇒ 改成一个**显式**的世界群系(默认 MEADOW,创世草甸;
+   * `decideSpawn` 对未知群系本来也兜底到 MEADOW)。将来真做了群系地图,
+   * 把本字段换成「按坐标查询」即可 —— 刷怪逻辑不用动。
+   */
+  readonly biomeName: string;
+  /** 刷怪预算的小数累加器(见 `tickSpawn()`)。 */
+  private spawnBudget = 0;
+  /** 预算上界(只/慢帧):防「整图被挡」时累积成一次雪崩。 */
+  private readonly spawnBudgetMax: number;
 
   private frameCount = 0;
   private players: AoiPlayer[] = [];
@@ -847,6 +869,8 @@ export class WorldSim {
     this.fluidBudget = Math.max(1, Math.trunc(opts.fluidBudget ?? FLUID_CELL_BUDGET));
     this.wiringOn = opts.wiring !== false;
     this.mobsOn = opts.mobs !== false;
+    this.biomeName = opts.biome ?? 'MEADOW';
+    this.spawnBudgetMax = 4;
     this.rng = opts.rng ?? mulberry32(0x5eed);
     /* 战斗随机**独立成一条流** —— 见 `combatRng` 字段注释。
        种子取 `0x5eed` 的派生值,同种子仍完全可复现。 */
@@ -3939,6 +3963,116 @@ export class WorldSim {
   }
 
   /**
+   * 慢帧 2Hz 刷怪:**把判定真的变成一只怪**。
+   *
+   * ## 速率不是新常数,是从配表推的
+   * 「这一拍该来几只」用 `spawnsPerCheck(biome)`(由 `BIOME_SPAWN.perChunk`
+   * 与 `intervalSec` 折算),小数部分累加、整数部分兑现 ⇒ 2Hz 慢帧下的
+   * **长期期望恰好等于配表密度**,不需要另发明一个「每帧刷百分之几」的魔数。
+   *
+   * ## 被拒的预算**退回**,但有上界
+   * 一次尝试被 `decideSpawn` 拒(安全区 / 阻挡 / 光照 / 夜行)时不吞预算,
+   * 而是退回去下次再试 —— 否则「城镇占了约 20% 面积」会让实际密度悄悄
+   * 低于配表,而**没有任何地方会显示这件事**。
+   * `spawnBudgetMax` 防的是反面:整张图都被挡住时预算无限累积,
+   * 一旦出现空格就瞬间涌出一大群。
+   */
+  private tickSpawn(): number {
+    const biome = this.biomeName;
+    this.spawnBudget = Math.min(
+      this.spawnBudget + spawnsPerCheck(biome), this.spawnBudgetMax,
+    );
+    let quota = Math.floor(this.spawnBudget);
+    if (quota <= 0) return 0;
+    this.spawnBudget -= quota;
+    let spawned = 0;
+    while (quota > 0) {
+      quota -= 1;
+      if (this.trySpawnOne(biome)) spawned += 1;
+      else this.spawnBudget = Math.min(this.spawnBudget + 1, this.spawnBudgetMax);
+    }
+    return spawned;
+  }
+
+  /**
+   * 试刷一只。成功 = 世界里**真的多了一只活的**
+   * (物理刚体 + AOI 记录 + 刷怪计数 + 宿主 AI,四件事由 `addMob` 一起做)。
+   *
+   * ## 每物种最多一只 —— 这是**当前 id 契约的限制**,不是设计选择
+   * `addMob(id, …)` 拿**同一个字符串**当实例 id 与 `MOB_BY_ID` 的查表键
+   * (见本文件 `addMob` 里的 `MOB_BY_ID.get(id)`);攻击路径的 `mobDistance`
+   * 与 `world_sim.ts:1974` 的 `MOB_BY_ID.get(mobId)`、以及驯养层 4 处查表
+   * 也都按**物种 id** 查 ⇒ 两只 `mob_sheep` 会在物理 / AOI / 宿主里撞成同一个键。
+   *
+   * 所以这里**按物种去重**:已经活着的物种不再刷,名额用完就自然停止 ——
+   * 而不是刷出两只同 id 的怪让其中一只静默失效。
+   * 想要「一片草甸上十几只」必须先拆开实例 id 与物种 id
+   * (实例加 `#n` 后缀 + 上面那 7 处查表点先查 `runtimeOf()`),那是独立一件。
+   * **本函数不假装能刷到 `hardCap` 那么多只。**
+   */
+  private trySpawnOne(biome: string): boolean {
+    const alive = this.mobHost.runtimes();
+    const roster = spawnableMobs(biome).filter((d) => !alive.some((r) => r.def.id === d.id));
+    if (roster.length === 0) return false;
+    const def = roster[Math.floor(this.rng() * roster.length) % roster.length]!;
+    /* +0.5:落在**格心**。整数坐标在 `WorldGrid` 上是格的角,
+       `blocked()` 查的是格 ⇒ 落在角上会让「刷在墙里/墙外」取决于取整方向。 */
+    const x = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    const y = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    const ctx: SpawnContext = {
+      biome,
+      x,
+      y,
+      biomeCount: this.spawner.state.biomeCounts.get(biome) ?? 0,
+      globalCount: this.spawner.state.globalCount,
+      mobId: def.id,
+    };
+    /* 判定用的 `roll` **必须新取**:`canSpawn` 把它交给 `decideSpawn` 做软上限
+       阻尼(≥softCap 时 roll < 0.5 直接拒)。复用坐标那两次取数会让
+       「刷不刷」与「刷在哪」完全相关 —— 同一片坐标永远同命运。 */
+    if (!this.spawner.canSpawn(ctx, this.spawnWorld(), this.rng())) return false;
+    this.addMob(def.id, biome, x, y);
+    return true;
+  }
+
+  /**
+   * 当前**存活**生物的快照 —— 房间把它投影进 `state.wildlife` 用。
+   *
+   * ## 为什么必须有这个口(2026-11-14 实测)
+   * 房间手里只有 `WorldSaveHost`(结构化接口,刻意不 import 模拟层类型),
+   * 所以它**没法自己遍历 `mobHost`**。而 `upsertWildlife()` 在 `net/schema.ts`
+   * 里躺着、全仓**没有任何调用点**(`git grep -n addWildlife` = 0 处)
+   * ⇒ 客户端快照里恒为 `wildlife: []`,即使世界里真有怪也看不见。
+   *
+   * ## `fsm` 为什么不从 `rt.fsm` 抄
+   * `rt.fsm` 是 `MobFsm` **对象**,而 `WildlifeState.fsm` 是 wire 上的 `uint8`
+   * (默认值见 `net/schema.ts` 的 `fsm: 0`);两者之间**没有定义过映射表**。
+   * 硬塞一个编号(比如按枚举顺序数)会让客户端拿到一个**看起来合法、
+   * 实际没有任何含义**的状态码。⇒ 保持 wire 默认值 0,并在 `docs` 里
+   * 记为待办,而不是编一个。
+   */
+  listWildlife(): WildlifeState[] {
+    const out: WildlifeState[] = [];
+    for (const rt of this.mobHost.runtimes()) {
+      if (!rt.alive) continue;
+      out.push({
+        id: rt.id,
+        mobId: rt.def.id,
+        x: rt.x,
+        y: rt.y,
+        z: rt.z,
+        fsm: 0,
+        hp: rt.hp,
+        maxHp: rt.maxHp,
+        /* 驯养归属在模拟层还没有状态位(全仓只有 wire 字段与 colyseus schema
+           的 `tameOwnerId = ''`)⇒ 报「野生」。不编一个假主人。 */
+        tameOwnerId: '',
+      });
+    }
+    return out;
+  }
+
+  /**
    * 推进一帧。
    *
    * 帧类型由**帧序**决定:偶数帧快帧、每第 10 帧同时是慢帧。
@@ -4144,15 +4278,18 @@ export class WorldSim {
 
       /* ── 慢帧 2Hz:刷怪决策 ── */
       if (this.mobsOn) {
-        const ctx: SpawnContext = {
-          biome: 'PLAINS',
-          x: (this.rng() * this.sizeCells) | 0,
-          y: (this.rng() * this.sizeCells) | 0,
-          biomeCount: this.spawner.state.biomeCounts.get('PLAINS') ?? 0,
-          globalCount: this.spawner.state.globalCount,
-          mobId: 'WILDLIFE',
-        };
-        if (this.spawner.canSpawn(ctx, this.spawnWorld(), this.rng())) spawned += 1;
+        /* ★ 2026-11-14:这块此前**只有判定、没有动作**。实测
+           `assemble({ mobs: true })` 推进 600 帧 ⇒ `state.wildlife` 仍是 **0 条**。
+           三个问题叠在一起:
+             1. `biome: 'PLAINS'` **不在 `BIOME_SPAWN` 表里**(表里是 MEADOW/VALLEY/
+                …/RUINS)⇒ 每次都静默走 `?? BIOME_SPAWN.MEADOW` 兜底;
+             2. `mobId: 'WILDLIFE'` 不是任何 `MOB_BY_ID` 里的 id ⇒ 即便真去
+                `addMob` 也只会进 `unknownMobs`(空壳,`runtimeOf()` 返回 null);
+             3. `spawned += 1` 只是**计数** —— `StepReport.spawned` 全仓没有
+                第二个消费者,所以「判定说该刷」与「世界里多了一只」之间
+                从来**没有任何代码**。
+           ⇒ 现在交给 `tickSpawn()` 真的造(它自己管密度与去重)。 */
+        spawned = this.tickSpawn();
       }
     }
 

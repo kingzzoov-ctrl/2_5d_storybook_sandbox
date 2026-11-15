@@ -1770,7 +1770,14 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
       let n = 0;
       const sim = new WorldSim({ sizeCells: 8, rng: () => { n += 1; return 0.5; }, combatRng: () => 0.5 });
       if (withRush) sim.startRushRun(1, () => 0.5);   /* 独立 rng,不碰 this.rng */
-      for (let i = 0; i < 20 * FAST_PER_SLOW; i += 1) sim.tick();
+      /* ⚠️ 窗口从 **20 个慢帧加长到 60**(2026-11-14):刷怪改成
+         「按配表速率累加预算」之后,`rng` 不再每慢帧都被调用 ——
+         20 个慢帧的预算只有 `spawnsPerCheck('MEADOW') × 20` = 0.75 只,
+         于是**一次 trySpawnOne 都没发生**,注入的 rng 被调用 0 次,
+         下面那句 `a > 0` 的分母检查当场红(实测 0)。
+         60 个慢帧的预算 = 2.25 ⇒ 至少触发两次 `trySpawnOne`(每次 3 次取数),
+         分母重新 > 0。这不是放宽断言,是把窗口调到能覆盖被测现象的长度。 */
+      for (let i = 0; i < 60 * FAST_PER_SLOW; i += 1) sim.tick();
       return n;
     };
     const a = count(false);

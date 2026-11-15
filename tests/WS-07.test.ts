@@ -4375,9 +4375,14 @@ function fakeHost(o: {
     hit: { hpLoss: number; result: { finalDamage: number; outOfReach: boolean; dodged: boolean } } | null;
   };
   levelOf: (id: string) => number;
+  listWildlife: () => {
+    id: string; mobId: string; x: number; y: number; z: number;
+    fsm: number; hp: number; maxHp: number; tameOwnerId: string;
+  }[];
 } {
   return {
     saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+    listWildlife: () => [],
     attackMobAuthorized: (p, m) => {
       o.onAttack?.(p, m);
       return {
@@ -4638,10 +4643,15 @@ function moveHost(o: { record?: string[]; onApply?: (id: string, x: number, y: n
   levelOf: () => number;
   applyPlayerMove: (id: string, x: number, y: number) => boolean;
   playerPosition: (id: string) => { x: number; y: number } | null;
+  listWildlife: () => {
+    id: string; mobId: string; x: number; y: number; z: number;
+    fsm: number; hp: number; maxHp: number; tameOwnerId: string;
+  }[];
 } {
   const pos = new Map<string, { x: number; y: number }>();
   return {
     saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+    listWildlife: () => [],
     attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
     levelOf: () => 1,
     applyPlayerMove: (id, x, y) => {
@@ -4697,6 +4707,7 @@ test('M2 ★ from 权威读回:state 显示的是**世界的位置**,不是客�
     roomId: 'm2b', ownerId: 'o', clock: fixedClock(1000),
     host: {
       saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
+      listWildlife: () => [],
       attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
       levelOf: () => 1,
       /* 写入被**忽略**(模拟击退已把刚体挪到 9.9),读回给出 9.9 */
