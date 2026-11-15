@@ -853,8 +853,14 @@ async function main(): Promise<void> {
     const b = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p2');
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p3');
     try {
-      await sleep(400);
-      eq(room.members.size, 3, '房间应有 3 名成员');
+      /* ⚠️ 这里原来是固定 `await sleep(400)` 再断言成员数 —— 单跑没问题,
+         但门禁**串行跑 38 个套件**时机器更忙,3 个 WebSocket 握手可能来不及
+         完成,于是 `members.size` 还是 0,这条用例就"随机"红(实测发生过两次:
+         两次都是本套件掉出统计,`用例汇总` 因此从 1014/14 变成 994/13)。
+         ⇒ 改成**等条件**(最长 3 秒),失败时把实测值写进消息。
+         判据本身没放宽:仍然是 `=== 3`,只是不再假设"400ms 一定够"。 */
+      for (let i = 0; i < 60 && room.members.size < 3; i += 1) await sleep(50);
+      eq(room.members.size, 3, `房间应有 3 名成员(实测 ${room.members.size})`);
       ok(a.got.welcome !== null && b.got.welcome !== null && c.got.welcome !== null,
         '三个客户端都应收到 welcome');
       ok(a.got.bin.length > 0 && b.got.bin.length > 0 && c.got.bin.length > 0,
@@ -871,21 +877,44 @@ async function main(): Promise<void> {
          ⇒ 正确判据:要比的是「**同一帧**是否同时到达了所有连接」,
            即**广播**这件事本身。故改为:等到三人都握手完成后再取
            **同一 tick** 的一帧(取末帧 —— 三人此时都已在线,状态相同)。 */
+      /* ⚠️ 2026-11-15 —— 这条用例的**前置条件**必须等够,否则比的是错的量:
+         · 原写法固定 `await sleep(400)`:门禁串行跑 38 个套件时 3 个握手来不及
+           ⇒ `members` 还是 0 ⇒ 偶发红(实测两次);
+         · 我第一版改成"等 members=3":握手只要几十毫秒,**此刻每人只收到首帧**,
+           而首帧是"各自加入那一刻的完整快照",长度本来就不同(实测 110 / 71)⇒ 又红。
+         ⇒ 正确前置:等 `members=3` **且** 每人至少收到 **2 帧**(广播已流过至少一拍),
+           此时三人的"末帧"才是**同一拍**的差量,可以逐字节比。
+         ★ 判据本身没动:仍是「同一拍、长度一致、逐字节一致」。 */
+      for (let i = 0; i < 80 && (a.got.bin.length < 2 || b.got.bin.length < 2 || c.got.bin.length < 2); i += 1) {
+        await sleep(50);
+      }
+      ok(a.got.bin.length >= 2 && b.got.bin.length >= 2 && c.got.bin.length >= 2,
+        `★ 三人应各收到 ≥2 帧(广播必须已经流过一拍;`
+        + `实得 ${a.got.bin.length}/${b.got.bin.length}/${c.got.bin.length})`);
       const la = a.got.bin[a.got.bin.length - 1]!;
       const lb = b.got.bin[b.got.bin.length - 1]!;
       const lc = c.got.bin[c.got.bin.length - 1]!;
-      eq(la.byteLength, lb.byteLength, '同一 tick 的帧长应一致(a/b)');
-      eq(lb.byteLength, lc.byteLength, '同一 tick 的帧长应一致(b/c)');
+      eq(la.byteLength, lb.byteLength, '同一拍的末帧长度应一致(a/b)');
+      eq(lb.byteLength, lc.byteLength, '同一拍的末帧长度应一致(b/c)');
       /* 逐字节比 —— 长度相同还不够,"同源"意味着内容也同 */
       let identical = true;
       for (let i = 0; i < la.byteLength; i += 1) if (la[i] !== lb[i]) { identical = false; break; }
-      ok(identical, 'a 与 b 收的末帧应**逐字节一致**(同一份广播)');
+      ok(identical, 'a 与 b 的末帧应**逐字节一致**(同一拍、同一份差量)');
       /* 各客户端 playerId 不同(证明不是同一个连接被算了三次) */
       ok(a.got.welcome!.playerId !== b.got.welcome!.playerId, '两个客户端应是不同玩家');
-      /* ★ 负向对照:证明上面那条"逐字节一致"不是恒真 ——
-         a 的**首帧**(不同 tick)与末帧应不同,否则说明我比的字段没区分力。 */
-      ok(a.got.bin[0]!.byteLength !== la.byteLength || a.got.bin.length === 1,
-        'a 的首帧与末帧可不同(证明"比末帧"这个选择有区分力)');
+      /* ★ 负向对照:证明上面那条"逐字节一致"**有区分力** ——
+         把 a 的末帧改一个字节,比对应立刻不成立。
+         (原写法比"首帧与末帧的长度不同",那是**碰运气**的对照:世界不动时
+          首末帧可能一样长,于是它自己会红 —— 换成直接构造一个"差一个字节"的对照组。 */
+      const mutated = Uint8Array.from(la);
+      mutated[0] = (mutated[0]! ^ 0xff) & 0xff;
+      let sameAfterMutate = mutated.byteLength === lb.byteLength;
+      if (sameAfterMutate) {
+        for (let i = 0; i < mutated.byteLength; i += 1) {
+          if (mutated[i] !== lb[i]) { sameAfterMutate = false; break; }
+        }
+      }
+      ok(!sameAfterMutate, '★ 对照:改一个字节后"逐字节一致"必须不成立(证明这条比对真的在读字节)');
     } finally {
       await teardown([a, b, c], srv);
     }

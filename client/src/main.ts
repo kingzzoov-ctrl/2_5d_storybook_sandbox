@@ -130,9 +130,12 @@ function main(): void {
   /* WASD → InputCmd → 本地预测 → 上行(2026-11-14,task-83 选乙)。
      固定 20Hz:`predictStep` 的位移是 `v_max * DT`,而 DT 是服务端权威常数 ——
      跟着渲染帧走会让 60Hz 与 30Hz 的机器角色速度不同,且不报错。
-     ⚠️ 相机仍是临时态:WASD **同时**在平移相机(`three/boot.ts` 的 `pan`),
-     于是角色不会走出画面 —— 但那是**巧合**成立的,不是「相机跟随」。
-     让相机跟随权威位置要动渲染路径,其验收只能靠看 ⇒ 单独一件,不在本轮。 */
+
+     ★ WS-FND-23 更新:WASD 现在**只**驱角色。相机跟随**权威位置**
+     (`three/boot.ts` 每帧一次 `net/camera_follow.ts` 的 `stepCamera`),
+     所以「角色不会走出画面」不再依赖按键。旧写法里「WASD 顺手平移相机」那半
+     已经删掉(`boot.ts` 的 `pan.x += ...` 没了)—— **别把它加回来**:
+     相机与角色共用一批按键时,跟随会重新退化成**巧合**(输入一变就失效、且不报错)。 */
   /* ── 攻击与 HUD(2026-11-14:让「能玩」在屏幕上可见)── */
   const statusEl = document.getElementById('status');
   let lastHit = '还没打过';

@@ -96,6 +96,19 @@ import { createAudio, type AudioHandle } from './audio_out.ts';
    这两个模块都**纯**(零三方、零 DOM)⇒ 可被 WS-12 直接 import 断言。 */
 import { ClientStateStore } from '../net/state_store.ts';
 import { telegraphCenterOf } from '../net/telegraph_center.ts';
+/* ★ WS-FND-23:相机跟随**权威位置**。判定全在 `net/camera_follow.ts`(纯函数、
+    零三方、零 DOM ⇒ 可被 `tests/WS-FND-23` 在 node 里直接断言),本文件只剩
+    **每帧一个调用点**。
+    ⚠️ 与此同批删掉了「WASD 顺手平移相机」的写点(`pan.x += ...`):那是**巧合**,
+    不是跟随 —— 相机现在由权威位置驱动,角色由 `main.ts` 的输入链路驱动。 */
+import {
+   CAMERA_EDGE_PAD,
+   CAMERA_SMOOTHING_SEC,
+   CAMERA_SNAP_DISTANCE,
+   cameraTargetFor,
+   stepCamera,
+   type CameraPoint,
+ } from '../net/camera_follow.ts';
 /* task-83:玩家可见物。位置来源**唯一** —— 权威状态经 `telegraphCenterOf`,
    本文件只把那个位置翻译成 three 的摆放参数(纯逻辑在 `stage/assembly_math.ts`)。 */
 
@@ -785,7 +798,7 @@ export function boot(container: HTMLElement): BootHandle {
     if (panel === UiPanel.INVENTORY || panel === UiPanel.RECIPE_TREE) refreshInventory();
   };
 
-  /* ── 相机平移状态 ──
+  /* ── 相机状态:聚焦点 `pan` + 跟随参数 + 一个**显式**的调试覆写 ──
    * ⚠ **声明顺序在这里很关键**,已被两个 bug 连环咬过:
    *
    * 1. `uiState()` / `telegraphGeometry()` 要用 `pan` —— 它们在 `tick` 里才被调用,
@@ -795,9 +808,39 @@ export function boot(container: HTMLElement): BootHandle {
    *    它同样读 `pan` —— 所以 `pan` 必须在 URL 块**之前**
    *    (实测:截图 `?at=44.5,44.5` 直接白屏报 `ReferenceError: Cannot access 'V'`)。
    *
-   * 结论:`pan` / `dragCtl` 声明在 `__uiDebug` 与 URL 块**之前**。
+   * 结论:`pan` / `camOverride` / `dragCtl` 声明在 `__uiDebug` 与 URL 块**之前**。
+   *
+   * ## `pan` 的语义(★ WS-FND-23 改了)
+   *
+   * 接线前它是「相机平移量」:WASD 与指针拖拽都在改它,它可以**离开玩家**。
+   * 现在它是**相机聚焦点**,由 `tick` 每帧用 `stepCamera` 往**权威位置**推
+   * (判定在 `net/camera_follow.ts`)⇒ WASD 不再写它(那两行已删),
+   * 「角色不会走出画面」因此不再是巧合。
+   *
+   * 变量名保留 `pan` 是**故意的**:`telegraphGeometry()` / 蓝图框选 / 拖拽都从它读
+   * 「相机在哪」,改名只增加噪声(那些读点与"谁推进它"无关)。
    */
   const pan = { x: WORLD_CELLS / 2, y: WORLD_CELLS / 2 };
+  /**
+   * 相机跟随的边界(世界格)与参数 —— 与 `stage/iso_camera.ts` 的 `DEFAULT_FOLLOW`
+   * 同口径(边缘留白 8 格)。
+   *
+   * 边界不是装饰:权威位置**来自网络**,若服务端下发一个越界坐标,不夹紧的相机
+   * 就飞到地图外看空白;夹紧后最多偏心 8 格(≈128px,视口半宽约 25 格)。
+   */
+  const CAMERA_BOUNDS = { minX: 0, minY: 0, maxX: WORLD_CELLS, maxY: WORLD_CELLS };
+  const CAMERA_OPTS = { bounds: CAMERA_BOUNDS, edgePad: CAMERA_EDGE_PAD };
+  /**
+   * 相机跟随的**显式覆写**(默认关闭,生产路径永不设置它)。
+   *
+   * 为什么需要:`?at=` 与 `__uiDebug.teleport()` 是**自检截图**用的 —— 它们要把镜头
+   * 搬到要看的地方(例如世界边上的那片屋顶)。若跟随每帧把相机拉回玩家,这两个钩子
+   * 就**静默失效**(截图拍到的是出生点,而"为什么没搬过去"没有任何提示)。
+   * ⇒ 覆写非 `null` 时暂停跟随、相机停在指定点;`__uiDebug.resumeFollow()` 清掉它。
+   *
+   * ⚠️ 它**不是**"WASD 平移相机"的替代品 —— 键盘那条路已经删了。
+   */
+  let camOverride: CameraPoint | null = null;
   /** 拖拽控制器(ui/state_machine):悬停/拿起/放下 —— 驱动背包格子高亮 */
   const dragCtl = new DragController();
 
@@ -830,8 +873,21 @@ export function boot(container: HTMLElement): BootHandle {
     summonBoss: (): boolean => { bossActive = true; return bossActive; },
     panel: (): string => uiFsm.activePanel,
     state: (): string => uiFsm.state,
-    /** 走过屋顶下方 —— 用来验证 roof_transparency 真的淡出 */
-    teleport: (gx: number, gy: number): void => { pan.x = gx; pan.y = gy; syncCamera(); },
+    /**
+     * 把**相机**搬到某格(自检截图用)。
+     *
+     * ⚠️ 它**不动玩家** —— 玩家位置唯一来源是权威状态(`telegraphCenterOf`),
+     * 客户端不许自己搬自己(那是"把相机当玩家",S1 已删掉那种写法)。
+     * ⚠️ 也正因如此,它会**停住跟随**(`camOverride`),否则下一帧跟随就把镜头
+     * 拉回玩家、钩子静默失效。看完调 `resumeFollow()` 交还给跟随。
+     */
+    teleport: (gx: number, gy: number): void => {
+      pan.x = gx; pan.y = gy;
+      camOverride = { x: gx, y: gy };
+      syncCamera();
+    },
+    /** 交还相机给**跟随**(清掉自检覆写) */
+    resumeFollow: (): boolean => { camOverride = null; return camOverride === null; },
     /** 点一个背包格子(验证 inventory 图标真的画在图集上) */
     clickSlot: (indexInPage: number): string => {
       const sl = invView.slots[indexInPage];
@@ -873,8 +929,15 @@ export function boot(container: HTMLElement): BootHandle {
     if (at) {
       const [gx, gy] = at.split(',').map(Number);
       if (Number.isFinite(gx) && Number.isFinite(gy)) {
+        /* ★ 把**相机**搬到 `at`(`pan` 是相机聚焦点)。
+           ⚠️ 必须同时立 `camOverride`:否则第一帧的跟随就把镜头拉回玩家,
+           截图脚本拍到的会是出生点,而"为什么没搬过去"没有任何提示。
+           `syncCamera()` 在这里显式调一次 —— 不能指望第一帧的跟随来同步
+           (覆写生效时跟随那一支根本不跑)。 */
         pan.x = gx;
         pan.y = gy;
+        camOverride = { x: gx, y: gy };
+        syncCamera();
       }
     }
     if (q.get('recipe') === '1') refreshRecipe();
@@ -900,7 +963,9 @@ export function boot(container: HTMLElement): BootHandle {
     bossGhost,
     telegraphNote: bossActive && boss ? String(boss.phases[0]?.telegraph ?? '') : '',
     blueprintNote: bpSummary,
-    keysHint: 'I 背包 · R 配方 · E 画架 · P 音高 · B Boss · 拖拽框选蓝图 · WASD 平移',
+    /* ★ 提示行说清"谁动"与"谁跟":WASD 动的是**角色**,相机是**跟随** ——
+       接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。 */
+    keysHint: 'I 背包 · R 配方 · E 画架 · P 音高 · B Boss · 拖拽框选蓝图 · WASD 移动角色(相机跟随)',
   });
 
   /** 预警圈屏幕坐标:交 `boss_hud.buildTelegraph` 算,本层只取结果 */
@@ -1008,12 +1073,15 @@ export function boot(container: HTMLElement): BootHandle {
     if (dragCtl.isDragging) dragCtl.cancel();
   };
 
-  /* ── 键盘 / 触摸平移 ──
+  /* ── 键盘:只剩面板/画架/Boss 快捷键 ──
+   *
+   * ★ WS-FND-23:这里**曾经**还维护一个 `keys` 集合,给渲染循环读去做相机平移。
+   *   那条路已删(相机现在跟权威位置走,见 `net/camera_follow.ts`),
+   *   `keys` 于是变成"只写不读"的死状态 ⇒ 一并删掉,不留一个看起来还在用的变量。
+   *   WASD 的去向完全在 `main.ts` 的输入链路里(`InputSource` → `predictor` → 上行)。
    * ⚠ `pan` / `dragCtl` 已在上面的 UI 运行时块中声明(那里要先用)——
    * 这里**不要**再声明一次,否则是重复定义。 */
-  const keys = new Set<string>();
   const onKeyDown = (e: KeyboardEvent): void => {
-    keys.add(e.key.toLowerCase());
     /* 面板快捷键 —— **走 state_machine 的合法迁移**,不是自己存字符串。
      * 这里也是 `state_machine` 的最直接接入点:按 I 打开背包,再按 I 关闭。 */
     switch (e.key.toLowerCase()) {
@@ -1036,9 +1104,8 @@ export function boot(container: HTMLElement): BootHandle {
       default: break;
     }
   };
-  const onKeyUp = (e: KeyboardEvent): void => { keys.delete(e.key.toLowerCase()); };
+  /* ⚠ 没有 `keyup` 监听:相机不再由按键驱动(WS-FND-23)⇒ 不需要"记着哪些键还按着" */
   window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
 
   /* 单指拖动(手机)+ UI 命中 */
   let drag: { x: number; y: number } | null = null;
@@ -1059,6 +1126,10 @@ export function boot(container: HTMLElement): BootHandle {
     const dx = e.clientX - drag.x;
     const dy = e.clientY - drag.y;
     drag = { x: e.clientX, y: e.clientY };
+    /* ★ WS-FND-23:这是**唯一**还允许手改相机的地方,而且它是**临时**的 ——
+       `tick` 在 `drag !== null` 期间跳过跟随(见那里的注释),松手后跟随把相机
+       自动拉回权威位置。`client/index.html` 的「单指拖动视角」指的就是它。
+       ⚠️ 键盘那条路**已删**:相机与角色共用一批按键是"看着像跟随"的根源。 */
     /* 屏幕位移换算成格:每格约 TILE_PX 像素,斜向除以根号 2 */
     const k = 1 / (16 * 1.414);
     pan.x += (-dx + dy) * k;
@@ -1074,6 +1145,10 @@ export function boot(container: HTMLElement): BootHandle {
   cv.addEventListener('pointerdown', onPointerDown);
   window.addEventListener('pointermove', onPointerMove);
   window.addEventListener('pointerup', onPointerUp);
+  /* ★ WS-FND-23:`pointercancel`(手势被系统/浏览器打断)也必须结束拖动 ——
+     否则 `drag` 永远非 null,而跟随在 `drag !== null` 期间是**暂停**的
+     ⇒ 相机再也不跟随,且屏幕上只表现为"镜头不动了"。这是静默降级,必须有出口。 */
+  window.addEventListener('pointercancel', onPointerUp);
 
   /** 把逻辑相机状态同步到 three 相机(唯一一处重复代码,抽出来) */
   function syncCamera(): void {
@@ -1102,19 +1177,19 @@ export function boot(container: HTMLElement): BootHandle {
     const dt = Math.min(100, now - last);
     last = now;
 
-    const speed = (12 * dt) / 1000;
-    let dx = 0;
-    let dy = 0;
-    if (keys.has('a') || keys.has('arrowleft')) dx -= 1;
-    if (keys.has('d') || keys.has('arrowright')) dx += 1;
-    if (keys.has('w') || keys.has('arrowup')) dy -= 1;
-    if (keys.has('s') || keys.has('arrowdown')) dy += 1;
-    if (dx !== 0 || dy !== 0) {
-      const len = Math.hypot(dx, dy);
-      pan.x += (dx / len) * speed;
-      pan.y += (dy / len) * speed;
-      syncCamera();
-    }
+    /* ── ★ WASD **不再**平移相机(WS-FND-23)──
+     *
+     * 这里曾经是:
+     * ```
+     *   if (keys.has('a')) dx -= 1; ...  pan.x += (dx / len) * speed;
+     * ```
+     * 「角色不会走出画面」当时**全靠它** —— 而那是**巧合**:角色由 `main.ts` 的输入链路
+     * 独立推进(本地预测 + 服务端权威),相机却在按**同一批键**猜位置。两边一旦
+     * 不同步(服务端纠偏 / 传送 / 别的输入设备),角色就直接走出画面,且**不报错**。
+     *
+     * ⇒ 整块删除。相机改由下面的「跟随权威位置」推进(每帧一次),
+     *   `keys` 集合随之消失(删掉读者之后它只剩"被写",那是死状态)。
+     */
 
     /* ── 每帧子系统推进(这些调用就是「模块真的在跑」的证据)── */
     /* 1. state_machine:推进打开动画(OPENING → OPEN) */
@@ -1132,6 +1207,39 @@ export function boot(container: HTMLElement): BootHandle {
       playerGx = center.cx;
       playerGy = center.cy;
       authoritySeen = true;
+    }
+
+    /* ── ★ 相机跟随**权威位置**(WS-FND-23)──
+     *
+     * 这一块才是「角色不会走出画面」的**依据**(不再依赖按键):
+     *   · 目标 = `playerGx/playerGy` —— 上面刚从 `telegraphCenterOf` 取到的**权威值**
+     *     (权威未知时它保持上一帧 ⇒ 相机不会被拉到世界原点);
+     *   · 推进 = `stepCamera`:指数平滑 + 距离超过 `CAMERA_SNAP_DISTANCE` 直接吸附。
+     *     后者是**服务端纠偏 / 传送**要用的 —— 纯平滑要 ~1 秒才追上,表现为
+     *     「角色被挪走了、画面还留在原地」。
+     *
+     * 判定全在 `net/camera_follow.ts`(纯函数 ⇒ `tests/WS-FND-23` 能在 node 里断言它),
+     * 这里只剩调用点。
+     *
+     * 两个**显式**的例外(都默认关闭 / 只是临时,正常玩不经过):
+     *   · `camOverride` —— 自检截图(`?at=` / `__uiDebug.teleport`)把相机停在指定点;
+     *   · 指针按住拖动 —— 玩家自己看一眼四周;拖动期间暂停跟随,**松手即自动拉回玩家**
+     *     (`client/index.html` 的「单指拖动视角」就指这个;归位不该要求玩家再按一次键)。
+     *
+     * `syncCamera()` 只在**真的动了**时调:收敛后每帧重建相机矩阵是纯浪费,
+     * 而 1e-3 格 ≈ 0.016px —— 肉眼与投影都不可能察觉。
+     */
+    if (camOverride === null && drag === null) {
+      /* 权威未知 ⇒ `cameraTargetFor` 给 null ⇒ 相机**保持不动**(不是跳到 (0,0)) */
+      const target = cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS);
+      if (target !== null) {
+        const next = stepCamera(pan, target, dt / 1000, CAMERA_SMOOTHING_SEC);
+        if (Math.abs(next.x - pan.x) > 1e-3 || Math.abs(next.y - pan.y) > 1e-3) {
+          pan.x = next.x;
+          pan.y = next.y;
+          syncCamera();
+        }
+      }
     }
     /* ── task-83:把玩家画出来,并让它跟着 20Hz 快照动 ──
      *
@@ -1209,6 +1317,25 @@ export function boot(container: HTMLElement): BootHandle {
       authoritativeCenter: telegraphCenterOf(authority.state, authority.localPlayerId),
       authorityDecodeErrors: authority.decodeErrors,
       authorityEmptyFrames: authority.emptyFrames,
+      /* ── ★ WS-FND-23 相机跟随自检口径 ──
+       *
+       * 让「相机是否真的跟着权威位置」**可被读出来**,而不是靠看图说"看着对":
+       *   `cameraFocus`     相机现在对准哪(每帧被 `stepCamera` 推进)
+       *   `cameraTarget`    这一帧的目标(= 权威位置经边界夹紧;权威未知为 `null`)
+       *   `cameraLagCells`  落后多少格 —— 稳态应 ≈ v×smoothing(步行约 0.5 格);
+       *                     一次巨大的落后只可能来自传送,而那种情况被 `stepCamera`
+       *                     **一步吸附**(见 `CAMERA_SNAP_DISTANCE`)
+       *
+       * ⚠️ 两个位置**分别**报,才分得清两种不同的坏法:
+       *   「目标对、聚焦点不收敛」= 跟随坏了;
+       *   「目标为 null」= 权威还没到(此时相机**故意**不动,不是缺陷)。
+       */
+      cameraFocus: { x: pan.x, y: pan.y },
+      cameraTarget: cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS),
+      cameraLagCells: Math.round(Math.hypot(playerGx - pan.x, playerGy - pan.y) * 1000) / 1000,
+      cameraFollowSmoothingSec: CAMERA_SMOOTHING_SEC,
+      cameraSnapDistanceCells: CAMERA_SNAP_DISTANCE,
+      cameraOverride: camOverride,
       /* ── task-83 玩家可见物自检口径 ──
        *
        * 这三个字段的作用与上面 `authoritySeen` 那一组**不同**:
@@ -1382,9 +1509,10 @@ export function boot(container: HTMLElement): BootHandle {
     dispose: () => {
       cancelAnimationFrame(raf);
       window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('keyup', onKeyUp);
+      /* 无 keyup 监听:相机不再由按键驱动(WS-FND-23) */
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
       window.removeEventListener('resize', onResize);
       cv.removeEventListener('pointerdown', onPointerDown);
       ui.dispose();
