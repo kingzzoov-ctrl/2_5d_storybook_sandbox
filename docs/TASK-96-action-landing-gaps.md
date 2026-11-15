@@ -13,7 +13,7 @@
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
 
-## 已接线(17 / 22)
+## 已接线(19 / 22)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -76,7 +76,20 @@
 
 判据:`WS-FND-28-party`(7)、`WS-FND-29-tame`(10)、`WS-FND-30-town`(8)、`WS-FND-31-alchemy`(8)。
 
-## 未接线(5 / 22)
+### 二之四、**自动化放置 / 布线编辑**(2026-11-15 接线,2 个)
+
+| 动作 | 落点 | 说明 |
+|---|---|---|
+| `PLACE_AUTOMATION` | `actions/place_automation.ts` | 落一件自动化件到空格子;种类合法性**只问** `hasComponentKind`(不自造名单),组件规格取自 `wiring/components.ts` |
+| `WIRE_EDIT` | `actions/wire_edit.ts` | 接/断一条导线;颜色域取 `ALL_COLORS`、通道域取 `CHANNEL_MIN..MAX`、方向域取 `DIR_VECTORS.length`(**三处都是 import 来的既有表**) |
+
+⚠️ 两条边界(**不计入达成**):
+1 两者**都不创建/修改世界实体**,也不写 `wiring/graph.ts` 的图 ⇒ 「放下去就通电」「接上就导通」**都不存在**;
+2 `WIRE_EDIT` **不下发任何报文** ⇒ `build/wiring_view.ts` 仍拿不到这份数据(还缺 WireView 下发报文 + 铺线 UI 面板)。
+
+判据:`WS-FND-32-automation`(8)、`WS-FND-33-wire`(7)。
+
+## 未接线(3 / 22)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 
@@ -96,12 +109,6 @@
 |---|---|
 | `RESET_WORLD` | 无世界重置入口(需要:重建 `WorldSim` + 保留/清除存档的裁决 + 通知所有客户端重新握手) |
 
-### 三、**有相邻机制、但缺中间一环**(2 个)
-
-| 动作 | 缺什么 |
-|---|---|
-| `PLACE_AUTOMATION` | 缺自动化件实体与放置校验;`wiring/` 有电路求值,但没有「放置」这一步 |
-| `WIRE_EDIT` | 同上:缺布线编辑的落点(`build/wiring_view.ts` 是**只读视图**,且它在 `orphan-audit` 里登记为"缺 WireView 下发报文 + 铺线 UI 面板") |
 
 ## 这张表怎么被维持
 

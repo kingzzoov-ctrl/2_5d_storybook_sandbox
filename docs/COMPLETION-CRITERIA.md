@@ -73,17 +73,17 @@ $ node scripts/backlog.ts
     ⇒ **仍未勾**:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
       + 客户端帧形态),本轮只做到「两侧各有断言 + 帧形态被钉住」。
 [x] 22 个 RoomAction 中,该有执行层的那些**真的执行**
-    ★ 现状(2026-11-15 第四轮):已接线 **17 个** —— 管理四件 + `CLOSE_ROOM` +
-      **物质层四件套** + **容器/合成/睡觉四件** + **派对/驯养/城镇/炼金四件**
-      (逐条落点与四条新边界见 `docs/TASK-96-action-landing-gaps.md` 的「二之二/二之三」);
-      **物质层四件套** + **容器/合成/睡觉四件**(`CRAFT` / `SLEEP` /
-      `OPEN_CHEST` / `USE_OWN_CHEST`,见 `docs/TASK-96-action-landing-gaps.md`
-      的「二之二」一节与它列出的三条如实边界);
-      —— 管理四件(`SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE`)
+    ★ 现状(2026-11-15 第五轮):已接线 **19 个** ——
+      管理四件(`SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE`)
       + `CLOSE_ROOM` + **物质层四件套**(`PLACE_BLOCK` / `BREAK_BLOCK` / `DROP_ITEM` /
-      `PICKUP_ITEM`);另有 2 个走**专用报文通道**(`MOVE` / `ATTACK`);
-      其余 5 个**显式** `NOT_IMPLEMENTED` 并逐条写明缺什么
+      `PICKUP_ITEM`)+ **容器/合成/睡觉四件**(`CRAFT` / `SLEEP` / `OPEN_CHEST` /
+      `USE_OWN_CHEST`)+ **派对/驯养/城镇/炼金四件**(`START_PARTY` / `BREED_TAME` /
+      `MODIFY_TOWN` / `USE_ALCHEMY_FURNACE`)+ **自动化放置 / 布线编辑两件**
+      (`PLACE_AUTOMATION` / `WIRE_EDIT`);
+      另有 2 个走**专用报文通道**(`MOVE` / `ATTACK`);
+      其余 3 个**显式** `NOT_IMPLEMENTED` 并逐条写明缺什么
       (`docs/TASK-96-action-landing-gaps.md`)。归类判据:`tests/WS-FND-18` 四组。
+      ⚠️ 每一波的**如实边界**都写在 `TASK-96` 的「二之二 ~ 二之四」,**不计入达成**。
     ★ **网络可达性已补齐**(2026-11-14 第二轮):客户端 `sendAction` →
       `ws_server` 的 `t:'action'` → `RoomRuntime.dispatchAction` → `t:'actionResult'`
       回执(**四种分类都回**:OK / INVALID / PERMISSION / NOT_IMPLEMENTED)。
@@ -91,8 +91,10 @@ $ node scripts/backlog.ts
     ★ 物质闭环的行为判据在 `tests/WS-FND-20-material-loop.test.ts`(11 条):
       每条都要求**世界与背包两侧同时**正确 —— 专门覆盖"扣了东西没放下"/
       "凭空多出一个块"/"背包 +1 而地上那件还在"这三种半截事务。
-    ⇒ **仍未勾**:剩下的 5 个仍未接线,其中 **1 个**在全仓**没有任何落地点**
-      (`RESET_WORLD`)—— 另外 2 个是世界突变类(`PLACE_AUTOMATION` / `WIRE_EDIT`)。
+    ⇒ **仍未勾**:剩下的 3 个仍未接线 —— `RESET_WORLD`(**全仓没有任何落地点**,
+      它的落点裁决与 owner 待定项见 `docs/TASK-97-world-reset-ruling.md`),以及
+      `MOVE` / `ATTACK`(**刻意**走专用报文通道,`dispatchAction('MOVE')` 回
+      `NOT_IMPLEMENTED` 是在表示"别从这里发")。
     ★ 容器/合成/睡觉三条的**如实边界**(客户端看不到箱内 / 箱内容不持久化 /
       `SLEEP` 只有登记没有世界侧读者)已写进 `TASK-96` 的二之二节,**不计入达成**。
 [x] 生产入口可跑性:三条阻塞**全部消除**(2026-11-14)
