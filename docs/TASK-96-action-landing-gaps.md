@@ -13,7 +13,7 @@
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
 
-## 已接线(9 / 22)
+## 已接线(13 / 22)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -43,7 +43,23 @@
 判据:`tests/WS-FND-20-material-loop.test.ts`(11 条,双侧账 + 退回 + 守恒)、
 `tests/WS-FND-21-action-e2e.test.ts`(5 条,**真 socket** 端到端:发 → 执行 → 回执 + 世界变了)。
 
-## 未接线(13 / 22)
+### 二之二、**容器 / 合成 / 睡觉**(2026-11-15 接线,4 个)
+
+| 动作 | 落点 | 说明 |
+|---|---|---|
+| `CRAFT` | `actions/craft.ts` + 内容层 `matchRecipeByTags` | 通用合成:配方**只从内容层读**(不新增配方表);扣料 → 给产物,产物收不下则**退回材料** |
+| `SLEEP` | `actions/sleep.ts` | 只登记「谁在睡、睡到何时」(per-room Map);卧室判定复用 `rooms/effects.ts` |
+| `OPEN_CHEST` | `actions/open_chest.ts` | 公共箱:同房间**共享**一份内容 |
+| `USE_OWN_CHEST` | `actions/use_own_chest.ts` | 私有抽屉:按 playerId 隔离(与公共箱同一套事务引擎) |
+
+⚠️ 三条**如实边界**(都写进各文件头与各自套件,不要当成已实现):
+1 箱子内容**不在 wire 上** ⇒ 客户端**看不到**箱内(只有 `OPEN_CHEST` 的只读回执带 `effect.stacks`);
+2 箱子内容**不持久化**(进程内 Map,房间重建即空);
+3 `SLEEP` 只登记状态,**世界侧还没有读者** ⇒ 现在"站进卧室照旧回血"与是否 dispatch 过 `SLEEP` **无关**。
+
+判据:`tests/WS-FND-25-craft.test.ts`(8 条)、`WS-FND-26-sleep.test.ts`(6 条)、`WS-FND-27-chests.test.ts`(7 条)。
+
+## 未接线(9 / 22)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 
@@ -55,24 +71,20 @@
 > ⚠️ 这两个的「已执行」由 `tests/WS-07` / `WS-10` 的行为断言钉住,
 > 不在本文的"缺什么"范围内 —— 但**必须写在这里**,否则读者会以为它们也缺。
 
-### 二、**仓库里完全没有落地点**(4 个)
+### 二、**仓库里完全没有落地点**(2 个)
 
-`docs/TASK-94-action-layer-landing-plan.md` 已实测:这 6 个在全仓**不存在**任何可复用的方法。
+`docs/TASK-94-action-layer-landing-plan.md` 已实测:这 2 个在全仓**不存在**任何可复用的方法。
 
 | 动作 | 缺什么 |
 |---|---|
-| `OPEN_CHEST` | 无公共储物箱实体与其内容物模型(手册的公共箱是**共享**模型,与 `USE_OWN_CHEST` 不同) |
-| `USE_OWN_CHEST` | 无「按玩家自己的箱子」的容器;`RoomRuntime` 只有背包总数与容量 |
 | `RESET_WORLD` | 无世界重置入口(需要:重建 `WorldSim` + 保留/清除存档的裁决 + 通知所有客户端重新握手) |
 | `MODIFY_TOWN` | 无城镇安全区 / 图腾实体,也无"谁有权改"的裁决 |
 
-### 三、**有相邻机制、但缺中间一环**(7 个)
+### 三、**有相邻机制、但缺中间一环**(5 个)
 
 | 动作 | 缺什么 |
 |---|---|
-| `CRAFT` | `cooking.ts` 有 `cookSoup`(料理站),但**通用合成**没有入口:缺「配方 → 材料扣减 → 产物」的事务性写入 |
 | `USE_ALCHEMY_FURNACE` | 炼金台在 `rooms/effects.ts` 只落到「识别 `ALCHEMY_LAB`」;缺**站台交互**与 LLM 炼金的接线 |
-| `SLEEP` | `RoomRuntime` 有 `sleep()` / `wake()`,但那是**房间休眠**(空闲暂停),**不是**玩家睡觉。玩家睡觉要的「床 + 时长 + 打盹状态」目前只在 `rooms/effects.ts` 的卧室判定里(`napping`),没有动作入口 |
 | `START_PARTY` | `PARTY_MODES`(手册 §6.3)已定义四种竞技模式与 `setPartyModeBy`,但**开局/计分/结算**的状态机不存在 |
 | `PLACE_AUTOMATION` | 缺自动化件实体与放置校验;`wiring/` 有电路求值,但没有「放置」这一步 |
 | `WIRE_EDIT` | 同上:缺布线编辑的落点(`build/wiring_view.ts` 是**只读视图**,且它在 `orphan-audit` 里登记为"缺 WireView 下发报文 + 铺线 UI 面板") |
