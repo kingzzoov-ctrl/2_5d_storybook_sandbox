@@ -76,6 +76,14 @@ export interface SessionEvents {
    * ★ 这个回调存在的唯一目的:**让静默丢帧变成可观测**。
    */
   onDrop?: (reason: string) => void;
+  /**
+   * 动作回执到了(服务端 `t:'actionResult'`)。
+   *
+   * ★ 这个回调存在的理由与 `onDrop` 同族:**让"被拒"变成可观测**。
+   *   没有它,客户端只能看见"我发了、什么都没发生" ——
+   *   而那正是本仓反复记的静默形态。
+   */
+  onActionResult?: (r: ActionResultFrame) => void;
 }
 
 /**
@@ -136,6 +144,15 @@ export interface SessionHandle {
    *    但中间这一段缺了 ⇒ 表现就是「按了没反应」。
    */
   sendAttack(intent: AttackIntent): boolean;
+  /**
+   * 上行一条**动作意图**(2026-11-14)。通用动作通道的客户端半边。
+   *
+   * 服务端在 `ws_server` 的 `onAction` 里收下并交给
+   * `RoomRuntime.dispatchAction`,回执是 `t:'actionResult'`(经
+   * `events.onActionResult` 交给调用方)。未连接时返回 `false`
+   * —— 与 `send` / `sendMove` / `sendAttack` 同一纪律:不抛、不假装成功。
+   */
+  sendAction(intent: ActionIntent): boolean;
   close(): void;
 }
 
@@ -246,6 +263,46 @@ export interface AttackIntent {
   mobId: string;
   /** 客户端声明的加成;服务端自己判上限,不采信这个数(反作弊)。 */
   bonus?: number;
+}
+
+/**
+ * 上行**动作意图**(2026-11-14)。线上是 `t:'action'`。
+ *
+ * `action` 取 `RoomAction` 的名字(字符串形式);其余字段是该动作的参数。
+ * 为什么不做成 `RoomAction` 联合类型:那个枚举住在**服务端**模块里,
+ * 客户端 import 它会把服务端拖进浏览器包 —— 而线上本来就是字符串。
+ */
+export interface ActionIntent {
+  action: string;
+  [k: string]: unknown;
+}
+
+/**
+ * 动作回执(服务端 `t:'actionResult'`)。
+ *
+ * `kind` 是**分类**而不是"成功/失败":`PERMISSION`(越权)与 `INVALID`
+ * (参数/状态不对)必须能被客户端区分开 —— 混成一个布尔值就没法给玩家
+ * 正确的提示("你没权限" vs "那儿放不了")。
+ */
+export interface ActionResultFrame {
+  t: 'actionResult';
+  action: string;
+  ok: boolean;
+  kind: 'OK' | 'INVALID' | 'PERMISSION' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
+  reason?: string;
+  effect?: Record<string, unknown>;
+}
+
+/**
+ * 把动作意图编成上行文本帧(与 `encodeMoveUplink` / `encodeAttackUplink` 同形态)。
+ *
+ * ⚠️ `t` 放在展开**之后**:这样调用方无法用一个同名的 `t` 覆盖类型头。
+ *    反过来写(`{ t:'action', ...intent }`)时,`intent.t` 会赢 ——
+ *    服务端就会按别的报文处理这一帧,而**两端都不会报错**。
+ */
+export function encodeActionUplink(intent: ActionIntent): Uint8Array {
+  const json = JSON.stringify({ ...intent, t: 'action' });
+  return encodeClientFrame(new TextEncoder().encode(json), true);
 }
 
 /** 把攻击意图编成上行文本帧(与 `encodeMoveUplink` 同一形态:文本 + `t` 分流)。 */
@@ -403,6 +460,14 @@ export function createSession(opts: SessionOptions): SessionHandle {
             store.setLocalPlayerId(w.playerId);
             opts.events.onWelcome?.(w);
             setState('live');
+          } else if (w.t === 'actionResult') {
+            /* ★ 2026-11-14:动作回执。**四种结果都送达**(OK / INVALID /
+               PERMISSION / NOT_IMPLEMENTED)—— 客户端据此区分"被拒"与
+               "服务器没听见"(见 `ws_server` 的 `onAction`)。
+               ⚠️ 这里**只**加动作回执,不加 `attackResult`:攻击的反馈走
+                  快照里那只怪的血量下降(见 `main.ts` 的 HUD 注释)——
+                  一条真值来源,不是两条。 */
+            opts.events.onActionResult?.(w as unknown as ActionResultFrame);
           }
         } catch (e) {
           /* 握手 JSON 坏 ⇒ 明确失败(握手无法猜) */
@@ -443,6 +508,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
     sendAttack(intent: AttackIntent): boolean {
       if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
       socket.send(encodeAttackUplink(intent));
+      return true;
+    },
+    sendAction(intent: ActionIntent): boolean {
+      if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
+      socket.send(encodeActionUplink(intent));
       return true;
     },
     close(): void {

@@ -4169,13 +4169,24 @@ test('ACT-1 ★★ 动作**真的执行**:5 个动作各改变可观测状态,�
 
 test('ACT-2 ★★ 消灭「静默成功」:未实现的动作**显式**返回 NOT_IMPLEMENTED', () => {
   const rt = actRoom();
-  /* 抽 3 个**确定**未实现的动作(见 docs/TASK-94 第三节:全仓无落点)。 */
-  for (const act of [RoomAction.PLACE_BLOCK, RoomAction.OPEN_CHEST, RoomAction.MODIFY_TOWN]) {
+  /* 抽 3 个**确定**未实现的动作(见 `docs/TASK-96` 第二节「全仓无落点」里
+     仍未接线的三个)。⚠️ 这份名单**会随接线而变**:2026-11-14 把
+     `PLACE_BLOCK` 换成了 `USE_OWN_CHEST`(前者已接线),并在下面补了一条
+     「接线之后仍不许静默」的断言 —— 名单变了,命题没变。 */
+  for (const act of [RoomAction.OPEN_CHEST, RoomAction.USE_OWN_CHEST, RoomAction.MODIFY_TOWN]) {
     const r = rt.dispatchAction('o', act);
     eq(r.ok, false, `★ ${act} 不得返回 ok=true —— 那就是静默成功(旧形态的病根)`);
     eq(r.kind, 'NOT_IMPLEMENTED', `★ ${act} 必须**显式**报告"尚无执行层"`);
     ok(typeof r.reason === 'string' && r.reason.length > 0, `${act} 的拒绝必须带原因`);
   }
+  /* ★ 2026-11-14:`PLACE_BLOCK` 已接线 ⇒ 它不再属于上面那组。但它在这间
+     **没有世界源**的房间里仍必须显式说"没有世界可放块":
+       回 OK      = 静默成功;
+       回 INVALID = 谎称"参数不对"(其实是世界不存在)。
+     这条守住的是「接线之后不许静默」这条性质**本身**。 */
+  const noWorld = rt.dispatchAction('o', RoomAction.PLACE_BLOCK, { x: 1, y: 1, itemId: 101 });
+  eq(noWorld.ok, false, '★ 没有世界源时 PLACE_BLOCK 不得回 ok=true');
+  eq(noWorld.kind, 'NOT_IMPLEMENTED', '★ 必须显式说"没有世界可放块",而不是含糊的 INVALID');
   /* 负对照:已接的动作**不**走 NOT_IMPLEMENTED —— 否则 ACT-2 会被"全都拒绝"骗过。 */
   const one = rt.dispatchAction('o', RoomAction.SET_PARTY_MODE, { partyMode: PartyMode.NONE });
   eq(one.kind, 'OK', '已接的动作必须走 OK,不能被一并标成 NOT_IMPLEMENTED');
@@ -4364,6 +4375,40 @@ test('task-38:包与装配层的模块形态 —— 列举式核对(防只读一
  * 这两个命题必须分开说:本假件由测试**手动传入**,而生产里
  * `server/src/index.ts` 不存在 ⇒ 没有人构造真 host(见 K5)。
  */
+/**
+ * 假件用的**物质层形状** —— 与 `WorldSaveHost.materials()` 同形
+ * (那边是内联声明;本文件是测试夹具,写一次给两处注解用)。
+ */
+interface FakeMaterials {
+  blockAt(x: number, y: number): number;
+  placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
+  breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string };
+  groundItemsNear(
+    x: number, y: number, radius: number,
+  ): { itemId: number; count: number; x: number; y: number; dist: number }[];
+  consumeGroundItem(itemId: number, count: number, nearX?: number, nearY?: number, radius?: number): number;
+  takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean;
+  dropItem(x: number, y: number, itemId: number, count: number): void;
+}
+
+/**
+ * 「**没有世界**」的物质层:每个方法如实说"没有",不抛、也不假装成功。
+ *
+ * 为什么写成"一律拒绝"而不是"什么都不做地返回成功":这些夹具用来测
+ * **房间自己的**行为(权限/分类/投影),它们没有世界 ⇒ 四个物质动作
+ * 在这类房间里必须走 `NOT_IMPLEMENTED` 那条路。若这里假装成功,
+ * 房间层那条"没有世界就别演"的断言就永远测不到。
+ */
+const NO_MATERIALS: FakeMaterials = {
+  blockAt: () => 0,
+  placeBlock: () => ({ ok: false as const, reason: '假件:没有世界,放不了块' }),
+  breakBlock: () => ({ ok: false as const, reason: '假件:没有世界,拆不了块' }),
+  groundItemsNear: () => [],
+  consumeGroundItem: () => 0,
+  takeGroundItemNear: () => false,
+  dropItem: () => { /* 假件:丢弃是空操作(它没有地面) */ },
+};
+
 function fakeHost(o: {
   level?: (id: string) => number;
   onAttack?: (player: string, mob: string) => void;
@@ -4379,10 +4424,12 @@ function fakeHost(o: {
     id: string; mobId: string; x: number; y: number; z: number;
     fsm: number; hp: number; maxHp: number; tameOwnerId: string;
   }[];
+  materials: () => FakeMaterials;
 } {
   return {
     saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
     listWildlife: () => [],
+    materials: () => NO_MATERIALS,
     attackMobAuthorized: (p, m) => {
       o.onAttack?.(p, m);
       return {
@@ -4647,11 +4694,13 @@ function moveHost(o: { record?: string[]; onApply?: (id: string, x: number, y: n
     id: string; mobId: string; x: number; y: number; z: number;
     fsm: number; hp: number; maxHp: number; tameOwnerId: string;
   }[];
+  materials: () => FakeMaterials;
 } {
   const pos = new Map<string, { x: number; y: number }>();
   return {
     saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
     listWildlife: () => [],
+    materials: () => NO_MATERIALS,
     attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
     levelOf: () => 1,
     applyPlayerMove: (id, x, y) => {
@@ -4708,6 +4757,7 @@ test('M2 ★ from 权威读回:state 显示的是**世界的位置**,不是客�
     host: {
       saveToDb: () => ({ hpSaved: 0, hpSkipped: 0, memRow: 0 }),
       listWildlife: () => [],
+      materials: () => NO_MATERIALS,
       attackMobAuthorized: () => ({ outcome: 'OUT_OF_AOI' as const, hit: null }),
       levelOf: () => 1,
       /* 写入被**忽略**(模拟击退已把刚体挪到 9.9),读回给出 9.9 */

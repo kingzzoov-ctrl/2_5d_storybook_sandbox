@@ -431,6 +431,14 @@ export type WsRoomLike = {
    * 可选,理由同 `applyMove`。
    */
   applyAttack?(userId: string, claimedBonus?: number, mobId?: string): unknown;
+  /**
+   * 应用一条**动作意图**(`RoomRuntime.dispatchAction` 的形状)。
+   *
+   * 与 `applyAttack` 同一取舍:这里只声明**形状**,不 import 具体层。
+   * `action` 收 `string`:房间侧对未知动作名有自己的分支(`NOT_IMPLEMENTED`),
+   * 所以网络层不必也不该在这里做一张动作名白名单 —— 那是第二份实现。
+   */
+  dispatchAction?(userId: string, action: string, payload?: Record<string, unknown>): unknown;
   /** 最近一次攻击结算报告(`RoomRuntime.lastAttackReport`);回给客户端做反馈。 */
   readonly lastAttackReport?: unknown;
   cloneState(): unknown;
@@ -707,6 +715,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           onAttack(c, parsed as { mobId?: unknown; bonus?: unknown });
           return;
         }
+        /* ★ 2026-11-14:`t:'action'` —— 通用动作通道(放置/破坏/丢弃/拾取/…)。
+           判据同 `move`/`attack`;判定与执行全在 `room.dispatchAction`。 */
+        if (parsed.t === 'action') {
+          onAction(c, parsed as { action?: unknown });
+          return;
+        }
         onHello(c, parsed);
         return;
       }
@@ -870,6 +884,54 @@ function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown }): void {
     return;
   }
   sendJson(c, { t: 'attackResult', report: opts.room.lastAttackReport ?? null, mobId });
+}
+
+/**
+ * 应用一条**动作意图**(2026-11-14)。`RoomAction` 的通用上行落点。
+ *
+ * ## 为什么 `attack` 之外还要单开一条
+ * `move` / `attack` 之所以有**专用报文**,是因为它们自带反作弊要判的语义
+ * (绝对坐标 + tick / 目标 id)。其余动作是「做一件事」——
+ * 放置 / 破坏 / 丢弃 / 拾取 / 合成 / 睡觉 / 布线 / 驯养 … 二十来个,
+ * 共用一个泛型通道更省,而且判定与执行**全在 `RoomRuntime.dispatchAction`**
+ * (权限 → 世界 → 背包三段都在那一处,不在网络层分叉)。
+ *
+ * ## 判据(与 `onMove` / `onAttack` 同规)
+ * 未 hello / 房间没有 `dispatchAction` / `action` 不是非空字符串 ⇒ 丢弃并出声。
+ * 其余**一切结果都回执**(OK / INVALID / PERMISSION / NOT_IMPLEMENTED),
+ * 否则客户端分不清「被拒」与「服务器没听见」。
+ *
+ * ## ⚠️ 未知动作名**也回执**
+ * 房间的 `default:` 分支会给出 `NOT_IMPLEMENTED` + 理由 ⇒ 客户端拿到的是
+ * "这个动作没有执行层",而不是沉默。这正是 `TASK-96` 那条纪律在网络层的兑现。
+ */
+function onAction(c: WsConn, msg: { action?: unknown }): void {
+  if (!c.helloDone || c.userId === null) {
+    log('动作意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    return;
+  }
+  const dispatch = opts.room.dispatchAction;
+  if (typeof dispatch !== 'function') {
+    log('本房间没有 dispatchAction ⇒ 动作无处应用(丢弃,不是丢包)');
+    return;
+  }
+  const action = typeof msg.action === 'string' ? msg.action : '';
+  if (action === '') {
+    log('动作意图缺 action ⇒ 丢弃(没有动作名就没有执行)');
+    sendJson(c, { t: 'actionResult', ok: false, kind: 'INVALID', reason: '缺 action' });
+    return;
+  }
+  let out: unknown;
+  try {
+    out = dispatch.call(opts.room, c.userId, action, msg);
+  } catch (e) {
+    log(`dispatchAction 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+    sendJson(c, { t: 'actionResult', action, ok: false, kind: 'INVALID', reason: '服务端执行抛错' });
+    return;
+  }
+  /* 回执里带 `action`:一个连接可能连着发多个动作,回执必须能对上号
+     (否则客户端"我发的是哪个"只能靠猜)。 */
+  sendJson(c, { t: 'actionResult', action, ...(out as Record<string, unknown>) });
 }
 function onMove(c: WsConn, msg: {
   tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;

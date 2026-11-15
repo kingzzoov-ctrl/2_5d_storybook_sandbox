@@ -13,7 +13,7 @@
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
 
-## 已接线(5 / 22)
+## 已接线(9 / 22)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -23,7 +23,27 @@
 | `SET_PARTY_MODE` | `RoomRuntime.setPartyModeBy()` | 自带闸 |
 | `CLOSE_ROOM` | `RoomRuntime.close()` | ★ 例外:`close()` 是生命周期方法(还被 `onDispose` / `reapEvictions` 调用)⇒ **不能**自带闸,闸写在 `dispatchAction` 里 |
 
-## 未接线(17 / 22)
+### 一之二、**物质层**(2026-11-14 接线,4 个)
+
+这四个是「建造 / 拆掉 / 丢下 / 捡起」这条最基本闭环的全部。接线前它们
+显式 `NOT_IMPLEMENTED` —— 世界里没有玩家改过的格,背包里的数字也只能从别处来。
+
+| 动作 | 落点 | 说明 |
+|---|---|---|
+| `PLACE_BLOCK` | `WorldSim.placeBlock()` + `RoomRuntime.applyInventory` | 判世界内 / 该格空 / 该格无实体;扣背包**失败即拒**,世界拒绝则**退回**那一件 |
+| `BREAK_BLOCK` | `WorldSim.breakBlock()` + 掉落凭证 | 拆下来的 obj 作为掉落物进背包;背包满则**落回原地**(不凭空销毁) |
+| `DROP_ITEM` | `WorldSim.dropItem()` | 落点取**权威位置**,不取客户端报的坐标 |
+| `PICKUP_ITEM` | `WorldSim.takeGroundItemNear()` | **先扣地面再进背包**(反过来会造复制品);附近没有就拒 |
+
+四条共同的三点纪律(**都写在 `dispatchAction` 里,不在网络层分叉**):
+1 权限闸在这里(世界方法没有"谁"这个参数 —— 与 `CLOSE_ROOM` 同一例外);
+2 背包增减一律走 `applyInventory`(总量守恒 + 凭证链都在那条路上);
+3 产出侧先 `grantItemSource`,否则被反作弊按"凭空产出"拒 —— 那是设计好的闸。
+`docs/TASK-94-action-layer-landing-plan.md` 已实测:这 4 个在全仓**不存在**任何可复用的方法。
+判据:`tests/WS-FND-20-material-loop.test.ts`(11 条,双侧账 + 退回 + 守恒)、
+`tests/WS-FND-21-action-e2e.test.ts`(5 条,**真 socket** 端到端:发 → 执行 → 回执 + 世界变了)。
+
+## 未接线(13 / 22)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 
@@ -35,25 +55,21 @@
 > ⚠️ 这两个的「已执行」由 `tests/WS-07` / `WS-10` 的行为断言钉住,
 > 不在本文的"缺什么"范围内 —— 但**必须写在这里**,否则读者会以为它们也缺。
 
-### 二、**仓库里完全没有落地点**(6 个)
+### 二、**仓库里完全没有落地点**(4 个)
 
 `docs/TASK-94-action-layer-landing-plan.md` 已实测:这 6 个在全仓**不存在**任何可复用的方法。
 
 | 动作 | 缺什么 |
 |---|---|
-| `BREAK_BLOCK` | 无 `removeObj` / `breakBlock` 这类方法。只能退化成 `setCell({obj: 0})`,而那是**底层写口**、不带玩家语义(不掉落、不记归属、不触发事件) |
-| `DROP_ITEM` | 无「把背包物品放到地面」的入口。`applyInventory` 只改**总数量差值**,不产生地面实体(`GroundItem`) |
 | `OPEN_CHEST` | 无公共储物箱实体与其内容物模型(手册的公共箱是**共享**模型,与 `USE_OWN_CHEST` 不同) |
 | `USE_OWN_CHEST` | 无「按玩家自己的箱子」的容器;`RoomRuntime` 只有背包总数与容量 |
 | `RESET_WORLD` | 无世界重置入口(需要:重建 `WorldSim` + 保留/清除存档的裁决 + 通知所有客户端重新握手) |
 | `MODIFY_TOWN` | 无城镇安全区 / 图腾实体,也无"谁有权改"的裁决 |
 
-### 三、**有相邻机制、但缺中间一环**(9 个)
+### 三、**有相邻机制、但缺中间一环**(7 个)
 
 | 动作 | 缺什么 |
 |---|---|
-| `PLACE_BLOCK` | 底层有 `WorldSim.setCell()` / `placeObj()`,但**没有「玩家放块」的薄入口**:缺①与物品消耗的绑定(放一块要扣一件)②与 `build` 权限位的连接③重复放置与占用的判定 |
-| `PICKUP_ITEM` | 缺**地面物品实体**及其拾取判定(`applyInventory` 只认"总数量变化",不认"地上那一件") |
 | `CRAFT` | `cooking.ts` 有 `cookSoup`(料理站),但**通用合成**没有入口:缺「配方 → 材料扣减 → 产物」的事务性写入 |
 | `USE_ALCHEMY_FURNACE` | 炼金台在 `rooms/effects.ts` 只落到「识别 `ALCHEMY_LAB`」;缺**站台交互**与 LLM 炼金的接线 |
 | `SLEEP` | `RoomRuntime` 有 `sleep()` / `wake()`,但那是**房间休眠**(空闲暂停),**不是**玩家睡觉。玩家睡觉要的「床 + 时长 + 打盹状态」目前只在 `rooms/effects.ts` 的卧室判定里(`napping`),没有动作入口 |

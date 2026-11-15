@@ -294,6 +294,35 @@ export const SIM_FAST_DT = DT;
 
 /** 一帧慢帧的现实时长(秒)。 */
 export const SIM_SLOW_DT = 1 / SLOW_TICK_HZ;
+/**
+ * 玩家语义的**物质层**契约(放置 / 破坏 / 地面物品)。
+ *
+ * 为什么单独一个接口,而不是把 7 个方法摊在 `WorldSaveHost` 上:
+ * 本仓所有**手写 host 假件**(`tests/WS-07` 3 个、`scripts/verify.ts` 若干)
+ * 都要逐个满足 `WorldSaveHost` —— 每扩一次能力,摊平写法就要改 N 处夹具;
+ * 打包成"一件能力"只需加 1 个成员。房间侧持有的是**结构化同名形状**
+ * (`room.ts` 的 `WorldSaveHost.materials()`),两侧形状若分叉,
+ * `createHost()` 里那句 `return sim` 会**编译期报错**(见 `index.ts` 的注释)。
+ */
+export interface MaterialApi {
+  /** 该格 obj 层 id(0 = 空)。 */
+  blockAt(x: number, y: number): number;
+  /** 放一个块(玩家语义:判世界内 / 该格空 / 该格无实体)。 */
+  placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
+  /** 拆一个块,返回被拆下来的 obj id(调用方拿它当掉落)。 */
+  breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string };
+  /** 附近的地面掉落物(由近及远)。 */
+  groundItemsNear(
+    x: number, y: number, radius: number,
+  ): { itemId: number; count: number; x: number; y: number; dist: number }[];
+  /** 从地面扣减,返回实际扣掉的数量(给范围就只扣范围内的)。 */
+  consumeGroundItem(itemId: number, count: number, nearX?: number, nearY?: number, radius?: number): number;
+  /** 拾取"最近的那一件";`false` = 附近没有这件。 */
+  takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean;
+  /** 把物品放到地面(背包 → 世界)。 */
+  dropItem(x: number, y: number, itemId: number, count: number): void;
+}
+
 
 /** 单个模拟实例的构造参数。 */
 export interface WorldSimOptions {
@@ -962,19 +991,7 @@ export class WorldSim {
       },
       players: () => this.mobPlayers,
       groundItems: () => this.mobGround,
-      consumeGroundItem: (itemId, count) => {
-        /* 从地面掉落里扣减,返回实际消耗数。 */
-        let left = count;
-        for (let i = this.mobGround.length - 1; i >= 0 && left > 0; i -= 1) {
-          const g = this.mobGround[i];
-          if (groundItemId(g) !== itemId) continue;
-          const take = Math.min(left, g.count);
-          g.count -= take;
-          left -= take;
-          if (g.count <= 0) this.mobGround.splice(i, 1);
-        }
-        return count - left;
-      },
+      consumeGroundItem: (itemId, count) => this.consumeGroundItem(itemId, count),
       setFloor: (x, y, floor) => {
         /* 写 FLOOR 层。用 `setCell` 而非直接改 tile —— 后者会绕过水位投影。 */
         this.setCell(Math.floor(x), Math.floor(y), { floor });
@@ -983,10 +1000,8 @@ export class WorldSim {
         this.setCell(Math.floor(x), Math.floor(y), { obj });
       },
       spawnItem: (x, y, itemId, count) => {
-        /* 两个字段都写:接口 `GroundItem` 声明 `id`,而本文件其余读点与
-           既有生产写入用 `itemId`。只写一个就会让另一侧读不到(实测
-           `consumeGroundItem` 对存在的货返回 0)。修法见 `groundItemId` 的注释。 */
-        this.mobGround.push({ id: itemId, itemId, x, y, count } as GroundItem);
+        /* 委托给 `dropItem` —— 单一实现(见那里的注释:两个字段都要写)。 */
+        this.dropItem(x, y, itemId, count);
       },
       frame: () => this.frameCount,
     };
@@ -997,6 +1012,132 @@ export class WorldSim {
     const cx = Math.floor(x / 16);
     const cy = Math.floor(y / 16);
     return this.grid.ensureChunk(cx, cy);
+  }
+
+  /* ═══════════ 玩家语义的物质层(2026-11-14)═══════════
+
+     `docs/TASK-96` 把 17 个未接线动作分成三档,其中 4 个
+     (`PLACE_BLOCK` / `BREAK_BLOCK` / `DROP_ITEM` / `PICKUP_ITEM`)属于
+     「有相邻机制、缺中间一环」:底层 `setCell` / `mobGround` 都在,
+     但缺一个**带玩家语义的薄入口**。这一节就是那层薄入口。
+
+     与底层写口的**分工**(这是它存在的全部理由):
+
+     ```
+     setCell(x,y,fields)   底层写口:不判"能不能",只管写(存档/相变/AI 都用它)
+     placeBlock(...)       玩家语义:判世界内 / 该格空 / 该格无实体,再写
+     ```
+
+     ⚠️ 「判能不能」必须在这里、而不是房间层:房间拿不到 `grid` 与
+        `physics.bodies`(私有),它只有 `WorldSaveHost` 这一层结构化接口
+        ⇒ 判定与写入同处一地,否则又变成"两份实现"。 */
+
+  /** 该点是否在世界内(格坐标)。 */
+  private inWorld(x: number, y: number): boolean {
+    return x >= 0 && y >= 0 && x < this.sizeCells && y < this.sizeCells;
+  }
+
+  /** 该格的 obj 层 id(0 = 空)。玩家放置/破坏的**读口**。 */
+  blockAt(x: number, y: number): number {
+    return this.inWorld(x, y) ? this.grid.objIdAt(Math.floor(x), Math.floor(y)) : 0;
+  }
+
+  /**
+   * 放一个块(**玩家语义的薄入口**)。
+   *
+   * 判三件事,按代价从低到高:
+   *   1 在世界内;
+   *   2 该格 **obj 层为空** —— 覆盖已有物件等于凭空拆掉别人的东西;
+   *   3 该格 **没有实体站着** —— 否则会把玩家/生物封进实体块,表现为卡死。
+   *
+   * ## `obj` 与 `item` 共用编号空间(这不是我发明的)
+   * `behaviors.ts:429` 就是 `world.placeObj(rt.x + 1, rt.y, ITEM.PLANK)` ——
+   * 生物 AI 直接把**物品 id** 写进 obj 层。所以 `PLACE_BLOCK` 的 `itemId`
+   * 同时就是 obj id,不需要第二张映射表(内容层里也确实没有那张表)。
+   */
+  placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string } {
+    if (!this.inWorld(x, y)) return { ok: false, reason: `坐标 ${x},${y} 在世界外` };
+    if (!Number.isInteger(objId) || objId <= 0) return { ok: false, reason: `物件 id 非法:${objId}` };
+    const gx = Math.floor(x);
+    const gy = Math.floor(y);
+    const cur = this.grid.objIdAt(gx, gy);
+    if (cur !== 0) return { ok: false, reason: `该格已有物件(${cur})` };
+    /* 实体占用:直接读物理刚体(玩家与生物都在 `bodies` 里)。
+       不用"格上有没有人"的启发式 —— 那会漏掉被击退到别格、或正卡在格边的。 */
+    for (const b of this.physics.bodies.values() as IterableIterator<{ x: number; y: number }>) {
+      if (Math.floor(b.x) === gx && Math.floor(b.y) === gy) {
+        return { ok: false, reason: '该格上有实体站着,不能放置' };
+      }
+    }
+    this.setCell(gx, gy, { obj: objId });
+    return { ok: true };
+  }
+
+  /**
+   * 拆掉一个块,返回**被拆下来的那个 obj id**(调用方拿它当掉落物)。
+   * 空格返回 `ok:false` —— 不给「拆空气」这种静默成功。
+   */
+  breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string } {
+    if (!this.inWorld(x, y)) return { ok: false, reason: `坐标 ${x},${y} 在世界外` };
+    const gx = Math.floor(x);
+    const gy = Math.floor(y);
+    const obj = this.grid.objIdAt(gx, gy);
+    if (obj === 0) return { ok: false, reason: '这一格没有物件' };
+    this.setCell(gx, gy, { obj: 0 });
+    return { ok: true, objId: obj };
+  }
+
+  /**
+   * 附近的地面掉落物(**玩家视角**:带格坐标与距离)。
+   * 生物 AI 那份是 `mobWorldAdapter().groundItems()`(只要 id、不要坐标);
+   * 两者读的是同一个 `mobGround` ⇒ 世界上不存在"两个地面"。
+   */
+  groundItemsNear(
+    x: number, y: number, radius: number,
+  ): { itemId: number; count: number; x: number; y: number; dist: number }[] {
+    const out: { itemId: number; count: number; x: number; y: number; dist: number }[] = [];
+    for (const g of this.mobGround) {
+      const dist = Math.hypot(g.x - x, g.y - y);
+      if (dist > radius) continue;
+      out.push({ itemId: groundItemId(g), count: g.count, x: g.x, y: g.y, dist });
+    }
+    /* 由近及远:拾取取的是"最近的那一件"(与玩家直觉一致)。 */
+    out.sort((a, b) => a.dist - b.dist);
+    return out;
+  }
+
+  /**
+   * 把地面上的某件东西**拿起来**(语义:扣掉地面上那一件)。
+   * 返回是否真的拿到了 —— `false` = 附近没有这件。
+   * ⚠️ 调用方**必须**据此决定要不要加背包:不能"先加背包、再假设拿到了"。
+   */
+  takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean {
+    if (!this.groundItemsNear(x, y, radius).some((g) => g.itemId === itemId)) return false;
+    return this.consumeGroundItem(itemId, 1, x, y, radius) === 1;
+  }
+
+  /**
+   * 把物品放到地面(背包 → 世界)。
+   *
+   * ⚠️ **两个字段都写**(`id` 与 `itemId`):`GroundItem` 接口声明的是 `id`,
+   * 而生产写入侧与 `groundItemId` 的读法用的是 `itemId`;只写一个会让另一侧
+   * 看不到这批货(实测 `consumeGroundItem` 对**确实存在**的货返回 0)。
+   * 那是本文件已记过的一个真实缺陷 ⇒ 这里作为**唯一写入点**,一次写全。
+   */
+  dropItem(x: number, y: number, itemId: number, count: number): void {
+    if (!Number.isInteger(itemId) || itemId <= 0 || count <= 0) return;
+    this.mobGround.push({ id: itemId, itemId, x, y, count } as GroundItem);
+  }
+
+  /**
+   * 玩家语义的物质层**一次性暴露**(给 `WorldSaveHost` 用)。
+   *
+   * 为什么打包成一件能力、而不是在接口上摊平 7 个成员:接口每多一个成员,
+   * 本仓所有**手写 host 假件**都要跟着补(实测 `tests/WS-07` 里就有 3 个)。
+   * 摊平 ⇒ 每扩一次能力就改 3 处测试夹具;打包 ⇒ 只加 1 个成员。
+   */
+  materials(): MaterialApi {
+    return this;
   }
 
   /**
@@ -1472,12 +1613,15 @@ export class WorldSim {
   /**
    * 从地面掉落物里扣减指定物品,返回**实际**扣减数。
    *
-   * 与 `mobWorldAdapter().consumeGroundItem` 是同一份逻辑,但那个适配器
-   * 只给生物 AI 用。编排层自己要扣料时不能再绕一层适配器 ——
-   * 那会让「谁在扣」变得不可读。两处都只是对 `mobGround` 的遍历,
-   * 真正的权威仍是这一个数组。
+   * ★ 2026-11-14:「两份实现」这一条已经收掉了 —— `mobWorldAdapter().consumeGroundItem`
+   *   现在**直接委托**本方法(不再各写一遍遍历)。这也修掉了当初那个"时灵时不灵"
+   *   的最坏之处:同一个类里两种读法。现在权威只有这一个数组、一种读法。
+   *
+   * ★ 同日加 `nearX/nearY/radius`:**给了范围**就只扣范围内的那些堆
+   *   (玩家拾取用:不该够到 3 格外的货);**不给**就是"全图扣"
+   *   (生物 AI 的既有语义)。两者共用同一段遍历 —— 语义差异只在过滤器。
    */
-  consumeGroundItem(itemId: number, count: number): number {
+  consumeGroundItem(itemId: number, count: number, nearX?: number, nearY?: number, radius?: number): number {
     let left = Math.max(0, Math.trunc(count));
     const want = left;
     for (let i = this.mobGround.length - 1; i >= 0 && left > 0; i -= 1) {
@@ -1489,6 +1633,10 @@ export class WorldSim {
          `itemId` 读 —— 同一个类里两种读法,正是这个缺陷最坏的地方:
          调用方看到时灵时不灵。 */
       if (groundItemId(g) !== itemId) continue;
+      /* 范围过滤:只在**调用方给的圈内**扣。缺省(不给三个参数)≡ 全图扣。 */
+      if (nearX !== undefined && nearY !== undefined && radius !== undefined) {
+        if (Math.hypot(g.x - nearX, g.y - nearY) > radius) continue;
+      }
       const take = Math.min(left, g.count);
       g.count -= take;
       left -= take;

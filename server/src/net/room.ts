@@ -60,6 +60,25 @@ import {
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 
 /** 空集合常引用 —— `grantedSourcesFor` 无凭证时返回它,避免每次分配。 */
+import { ITEM_LIST } from '../../../shared/constants/items.ts';
+
+/**
+ * 拾取半径(格)。
+ *
+ * 取值理由:与技术无关,是**手感**——1 格要求玩家精确站到那一格上,
+ * 3 格会出现"隔着墙把手伸过去捡"。2 格与"站在旁边"的直觉一致。
+ * 它与近战 `reach` **无关**:拾取不看朝向、也不看武器。
+ */
+const PICKUP_RADIUS = 2;
+
+/** 冻结内容表里的合法物品 id。用于拒绝"编号空投"(不在表里的 id 一律不认)。 */
+const ITEM_ID_SET: ReadonlySet<number> = new Set(ITEM_LIST.map((i) => i.id));
+
+/** 从 action payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
+function numField(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
 const EMPTY_SOURCE_SET: ReadonlySet<string> = new Set<string>();
 
 /* ═══════════════════════════ 1. 参数表 ═══════════════════════════ */
@@ -416,6 +435,28 @@ export interface WorldSaveHost {
     fsm: number; hp: number; maxHp: number;
     tameOwnerId: string;
   }[];
+  /**
+   * 玩家语义的**物质层**(放置 / 破坏 / 地面物品)。
+   *
+   * 形状与 `WorldSim.materials()` 逐字段相同(那边导出为 `MaterialApi`);
+   * 这里**再写一遍**是刻意的 —— 本接口的取舍是"只描述形状、不 import 具体层"。
+   * 两侧若分叉,`createHost()` 里那句 `return sim` 会**编译期**报错
+   * (机制说明见 `index.ts` 的 docblock)。
+   *
+   * 必选(不写 `?`):漏掉它的表现是「能放下、但世界没变」这类静默失效 ——
+   * 与 `listWildlife` 同一理由。
+   */
+  materials(): {
+    blockAt(x: number, y: number): number;
+    placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
+    breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string };
+    groundItemsNear(
+      x: number, y: number, radius: number,
+    ): { itemId: number; count: number; x: number; y: number; dist: number }[];
+    consumeGroundItem(itemId: number, count: number, nearX?: number, nearY?: number, radius?: number): number;
+    takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean;
+    dropItem(x: number, y: number, itemId: number, count: number): void;
+  };
   /**
    * 玩家的**权威等级**(来自进度档案 `progression`,不是网络投影)。
    *
@@ -807,7 +848,21 @@ export interface ActionPayload {
   /** `SET_ROOM_ACCESS`:密码房的口令 hash(`null` = 无密码)。 */
   passwordHash?: string | null;
   /** `SET_PARTY_MODE`:派对模式。 */
+  /** `SET_PARTY_MODE`:派对模式。 */
   partyMode?: PartyMode;
+  /* ── 物质层的四个动作(2026-11-14)────────────────────────────
+
+     这四个字段此前**不存在**,因为那四个动作没有执行层(`TASK-96`)。
+     它们都取"客户端只说**做什么**,不说**在哪/多少算数**"的口径:
+     `x`/`y` 是目标格,`itemId` 是内容表里的 id,`count` 是件数。
+     ⚠️ 丢弃/拾取**不用**客户端报的坐标 —— 落点取权威位置(见 `dispatchAction`)。 */
+  /** `PLACE_BLOCK` / `BREAK_BLOCK`:目标格坐标。 */
+  x?: number;
+  y?: number;
+  /** `PLACE_BLOCK` / `DROP_ITEM` / `PICKUP_ITEM`:物品 id(必须在冻结内容表里)。 */
+  itemId?: number;
+  /** `DROP_ITEM`:丢弃件数(默认 1)。 */
+  count?: number;
 }
 
 /**
@@ -1377,6 +1432,145 @@ export class RoomRuntime {
         if (!done) return { ok: false, kind: 'ROOM_CLOSED', reason: '房间已不是 OPEN' };
         return { ok: true, kind: 'OK', effect: { status: String(this.status) } };
       }
+      /* ── 玩家语义的物质层(2026-11-14:TASK-96 的 4 个动作接线)──────────
+
+         这四个此前显式 `NOT_IMPLEMENTED`。接线时三件事必须**在同一处**做,
+         否则就是本仓反复记的那种半截事务:
+
+           1 **权限闸**写在这里,不写在世界方法里 —— 世界方法没有"谁"这个
+             参数(与 `CLOSE_ROOM` 同一例外,理由见那段长注释);
+           2 背包**真的**增减一次,且走 `applyInventory` —— 反作弊的总量守恒
+             与凭证链都在那条路上,绕过它 = 绕过了本仓唯一的物品真值来源;
+           3 世界侧**真的**变了;失败时必须**退回**背包那一件
+             (不做"扣了东西却没放下")。
+
+         产出侧(破坏掉落 / 拾取)必须先 `grantItemSource`,否则
+         `checkInventory` 会按"凭空产出"拒(`FROM_NOTHING`)——
+         那是设计好的闸,不是障碍。
+
+         ⚠️ 顺序纪律:**先动世界、再动背包**至少要有一侧是"先扣"的 ——
+            拾取时先扣地面、再进背包;放块时先扣背包、再写世界。
+            两边都"先加"就会造出复制品。 */
+      case RoomAction.PLACE_BLOCK: {
+        const gate = this.authorize(actorId, action);
+        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
+        const x = numField(payload.x);
+        const y = numField(payload.y);
+        const itemId = numField(payload.itemId);
+        if (x === null || y === null || itemId === null) {
+          return { ok: false, kind: 'INVALID', reason: '需要 x / y / itemId(数字)' };
+        }
+        if (!ITEM_ID_SET.has(itemId)) {
+          return { ok: false, kind: 'INVALID', reason: `物品 ${itemId} 不在冻结内容表里` };
+        }
+        const mat = this.materialsOf();
+        if (mat === null) {
+          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可放块' };
+        }
+        /* 先扣背包:没这一件会被反作弊按 NEGATIVE 拒 ⇒ 不可能"凭空空投一个块"。 */
+        const spend = this.applyInventory(actorId, { ops: [{ itemId, delta: -1 }] });
+        if (!spend.allowed) {
+          return {
+            ok: false, kind: 'INVALID',
+            reason: `背包里没有可放置的 ${itemId}(${spend.rejectCode ?? '被拒'})`,
+          };
+        }
+        const r = mat.placeBlock(x, y, itemId);
+        if (!r.ok) {
+          /* 扣了东西却没放下 ⇒ **退回**(带凭证,见本段开头)。 */
+          const src = `place-refund:${x},${y}`;
+          this.grantItemSource(actorId, src);
+          this.applyInventory(actorId, { ops: [{ itemId, delta: 1, source: src }] });
+          return { ok: false, kind: 'INVALID', reason: r.reason };
+        }
+        return { ok: true, kind: 'OK', effect: { x, y, itemId } };
+      }
+      case RoomAction.BREAK_BLOCK: {
+        const gate = this.authorize(actorId, action);
+        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
+        const x = numField(payload.x);
+        const y = numField(payload.y);
+        if (x === null || y === null) return { ok: false, kind: 'INVALID', reason: '需要 x / y(数字)' };
+        const mat = this.materialsOf();
+        if (mat === null) {
+          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可拆' };
+        }
+        const r = mat.breakBlock(x, y);
+        if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
+        /* 拆下来的东西先给凭证再入背包;背包满就落回**原地** —— 不凭空销毁。 */
+        const src = `break:${x},${y}:${r.objId}`;
+        this.grantItemSource(actorId, src);
+        const gain = this.applyInventory(actorId, { ops: [{ itemId: r.objId, delta: 1, source: src }] });
+        if (gain.allowed) {
+          return { ok: true, kind: 'OK', effect: { x, y, objId: r.objId, gained: 1 } };
+        }
+        mat.dropItem(x, y, r.objId, 1);
+        return {
+          ok: true, kind: 'OK',
+          effect: {
+            x, y, objId: r.objId, gained: 0, dropped: 1,
+            note: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`,
+          },
+        };
+      }
+      case RoomAction.DROP_ITEM: {
+        const gate = this.authorize(actorId, action);
+        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
+        const itemId = numField(payload.itemId);
+        const count = numField(payload.count) ?? 1;
+        if (itemId === null) return { ok: false, kind: 'INVALID', reason: '需要 itemId(数字)' };
+        if (!Number.isInteger(count) || count <= 0) {
+          return { ok: false, kind: 'INVALID', reason: `count 必须是正整数(实测 ${payload.count})` };
+        }
+        const mat = this.materialsOf();
+        if (mat === null) {
+          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层' };
+        }
+        /* ⚠️ 落点取**权威位置**,不取客户端报的坐标:否则玩家可以把东西丢到地图另一头。 */
+        const at = this.hostPositionOf(actorId);
+        if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
+        const spend = this.applyInventory(actorId, { ops: [{ itemId, delta: -count }] });
+        if (!spend.allowed) {
+          return {
+            ok: false, kind: 'INVALID',
+            reason: `背包里不够 ${count} 个 ${itemId}(${spend.rejectCode ?? '被拒'})`,
+          };
+        }
+        mat.dropItem(at.x, at.y, itemId, count);
+        return { ok: true, kind: 'OK', effect: { itemId, count, x: at.x, y: at.y } };
+      }
+      case RoomAction.PICKUP_ITEM: {
+        const gate = this.authorize(actorId, action);
+        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
+        const itemId = numField(payload.itemId);
+        if (itemId === null) return { ok: false, kind: 'INVALID', reason: '需要 itemId(数字)' };
+        const mat = this.materialsOf();
+        if (mat === null) {
+          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层' };
+        }
+        const at = this.hostPositionOf(actorId);
+        if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
+        /* **先扣地面**:没扣到就不要动背包 —— 反过来会造出
+           "背包 +1 而地上那件还在"的复制品。 */
+        if (!mat.takeGroundItemNear(at.x, at.y, itemId, PICKUP_RADIUS)) {
+          return {
+            ok: false, kind: 'INVALID',
+            reason: `附近 ${PICKUP_RADIUS} 格内没有 ${itemId}(地上那件可能已被别人捡走)`,
+          };
+        }
+        const src = `pickup:${at.x},${at.y}:${itemId}`;
+        this.grantItemSource(actorId, src);
+        const gain = this.applyInventory(actorId, { ops: [{ itemId, delta: 1, source: src }] });
+        if (!gain.allowed) {
+          /* 背包满了 ⇒ **放回去**(不能把玩家已经捡起来的东西吞掉)。 */
+          mat.dropItem(at.x, at.y, itemId, 1);
+          return {
+            ok: false, kind: 'INVALID',
+            reason: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 已放回原地`,
+          };
+        }
+        return { ok: true, kind: 'OK', effect: { itemId, x: at.x, y: at.y } };
+      }
       default:
         return {
           ok: false,
@@ -1401,6 +1595,36 @@ export class RoomRuntime {
   private classifyFailure(actorId: string, action: RoomAction, reason: string | undefined): ActionOutcome {
     const gate = this.authorize(actorId, action);
     return { ok: false, kind: gate.allowed ? 'INVALID' : 'PERMISSION', reason };
+  }
+
+  /**
+   * 世界源的**物质层**;没有世界源时返回 `null`。
+   *
+   * 为什么单开一个取法:四个物质动作都要它,而「拿不到」必须**显式**变成
+   * 一条 `NOT_IMPLEMENTED` 回执 —— 不能写成 `?.` 之后静默跳过
+   * (那正是本仓反复记的那类静默失效)。
+   */
+  private materialsOf(): ReturnType<WorldSaveHost['materials']> | null {
+    const h = this.worldSaveHost;
+    return h === null ? null : h.materials();
+  }
+
+  /**
+   * 玩家的**权威位置**(`physics.bodies`);拿不到返回 `null`。
+   *
+   * `playerPosition` 是 `WorldSaveHost` 的**可选**成员(老世界源没有)⇒
+   * 这里显式判 `typeof`,由调用方给出可读的拒绝理由。
+   *
+   * ⚠️ 丢东西 / 捡东西的落点**只认这里** —— 客户端报的坐标一律不采信
+   * (否则玩家能把东西丢到地图另一头,或隔着半个世界捡东西)。
+   *
+   * ★ 本方法是这个读法的**唯一实现**:`applyMove` 里原来内联了一份同样的
+   *   `typeof` 判断,已改为调它(同一读法两处各写一遍就是"两份实现"的起点)。
+   */
+  private hostPositionOf(userId: string): { x: number; y: number } | null {
+    const h = this.worldSaveHost;
+    if (h === null || typeof h.playerPosition !== 'function') return null;
+    return h.playerPosition(userId);
   }
 
   /* ── 4.3 反作弊转发 ── */
@@ -1462,9 +1686,7 @@ export class RoomRuntime {
        ⚠️ z **不从权威读**:本次只接 x/y(跨轴混用是新的分叉点,见未做项)。 */
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {
-      const auth = host !== null && typeof host.playerPosition === 'function'
-        ? host.playerPosition(userId)
-        : null;
+      const auth = this.hostPositionOf(userId);
       p.x = auth?.x ?? intent.x;
       p.y = auth?.y ?? intent.y;
       p.z = intent.z;

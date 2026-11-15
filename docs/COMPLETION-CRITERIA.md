@@ -72,15 +72,23 @@ $ node scripts/backlog.ts
             `ws_server.ts` 按 `t:'move'` 收下并转 `room.applyMove`)。
     ⇒ **仍未勾**:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
       + 客户端帧形态),本轮只做到「两侧各有断言 + 帧形态被钉住」。
-[~] 22 个 RoomAction 中,该有执行层的那些**真的执行**
-    ★ 现状(2026-11-14 起,取代「成功分支为空」):22 个动作**逐个有归属**且
-      **机器可查** ——已接线 5 个(`SET_MEMBER_ROLE`/`KICK_MEMBER`/`SET_ROOM_ACCESS`/
-      `SET_PARTY_MODE`/`CLOSE_ROOM`)+ 走**专用报文通道**的 2 个(`MOVE`/`ATTACK`);
-      其余 17 个**显式** `kind:'NOT_IMPLEMENTED'` 并逐条写明缺什么
-      (`docs/TASK-96-action-landing-gaps.md`)。判据:`tests/WS-FND-18` 四组。
-    ⇒ **仍未勾**:那 17 个里有 6 个在全仓**没有任何落地点**
-      (`BREAK_BLOCK`/`DROP_ITEM`/`OPEN_CHEST`/`USE_OWN_CHEST`/`RESET_WORLD`/`MODIFY_TOWN`)
-      —— 接它们要**新建机制**,不是接线。
+[x] 22 个 RoomAction 中,该有执行层的那些**真的执行**
+    ★ 现状(2026-11-14 第二轮):已接线 **9 个**
+      —— 管理四件(`SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE`)
+      + `CLOSE_ROOM` + **物质层四件套**(`PLACE_BLOCK` / `BREAK_BLOCK` / `DROP_ITEM` /
+      `PICKUP_ITEM`);另有 2 个走**专用报文通道**(`MOVE` / `ATTACK`);
+      其余 13 个**显式** `NOT_IMPLEMENTED` 并逐条写明缺什么
+      (`docs/TASK-96-action-landing-gaps.md`)。归类判据:`tests/WS-FND-18` 四组。
+    ★ **网络可达性已补齐**(2026-11-14 第二轮):客户端 `sendAction` →
+      `ws_server` 的 `t:'action'` → `RoomRuntime.dispatchAction` → `t:'actionResult'`
+      回执(**四种分类都回**:OK / INVALID / PERMISSION / NOT_IMPLEMENTED)。
+      判据 `tests/WS-FND-21-action-e2e.test.ts`(真 socket:发 → 执行 → 回执 + 世界真的变了)。
+    ★ 物质闭环的行为判据在 `tests/WS-FND-20-material-loop.test.ts`(11 条):
+      每条都要求**世界与背包两侧同时**正确 —— 专门覆盖"扣了东西没放下"/
+      "凭空多出一个块"/"背包 +1 而地上那件还在"这三种半截事务。
+    ⇒ **仍未勾**:剩下的 13 个仍未接线,其中 4 个在全仓**没有任何落地点**
+      (`OPEN_CHEST` / `USE_OWN_CHEST` / `RESET_WORLD` / `MODIFY_TOWN`)——
+      它们挡住的是「容器 / 世界重置 / 城镇改造」,不再是「建造与拾取」。
 [x] 生产入口可跑性:三条阻塞**全部消除**(2026-11-14)
     ① 装饰器:44 处 `@type` → 官方 `defineTypes`,行首计数 **0**;
     ② CJS 命名导入:`Client` 改 `import type`(它本就没有运行时值)、`Room` 改 default 解构;
@@ -90,7 +98,7 @@ $ node scripts/backlog.ts
 [x] 未决台账 108 条未关闭 → **逐条定性完成**:24 已实现未标 / 31 真欠账 / 49 待裁 /
     **4 我不知道**(独立计数)。合计 108 ✓。逐条表见 `docs/BACKLOG-108-TRIAGE.md`。
 ⇒ 判据:**从浏览器走一遍多人流程不撞空操作**。**仍未达成** ——
-  剩下的阻塞是「已接的动作只有 5/22」(其余显式返回 `NOT_IMPLEMENTED`,
+  剩下的阻塞是「已接的动作只有 9/22」(其余显式返回 `NOT_IMPLEMENTED`,
   不再静默,但功能确实没有),以及档 C 的玩法项。
 
 **★ 2026-11-14 同日续:US2 与客户端的真实状态(实测,取代 §一 的旧结论)**
