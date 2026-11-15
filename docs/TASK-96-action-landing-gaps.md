@@ -13,7 +13,7 @@
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
 
-## 已接线(13 / 22)
+## 已接线(17 / 22)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -59,7 +59,24 @@
 
 判据:`tests/WS-FND-25-craft.test.ts`(8 条)、`WS-FND-26-sleep.test.ts`(6 条)、`WS-FND-27-chests.test.ts`(7 条)。
 
-## 未接线(9 / 22)
+### 二之三、**派对 / 驯养 / 城镇 / 炼金**(2026-11-15 接线,4 个)
+
+| 动作 | 落点 | 说明 |
+|---|---|---|
+| `START_PARTY` | `actions/start_party.ts` | 开局/计分/结算状态机(per-room Map + 可注入时钟);模式**只读**房间已选模式,不写第二份真值 |
+| `BREED_TAME` | `actions/breed_tame.ts` | 投喂/驯服/繁殖(**`payload.op` 分支**);宠物是**本模块的记录**,不是世界里的生物实体 |
+| `MODIFY_TOWN` | `actions/modify_town.ts` | 城镇配置登记 + `town` 权限裁决;**没有世界侧读者** ⇒ 刷怪/安全区行为一点没变 |
+| `USE_ALCHEMY_FURNACE` | `actions/use_alchemy_furnace.ts` | 站上炼金台 + 内容层配方;**本地确定性实现**(LLM 自由炼金不在本轮) |
+
+⚠️ 新增四条边界(同样**不计入达成**):
+1 `BREED_TAME` 的宠物**不是真生物实体**(不写 `WildlifeState`,世界/AI 不知道它被驯服);
+2 `MODIFY_TOWN` 的改造**没有世界侧读者**(`spawner.ts` 仍读常量 `TOWN_SAFE_RADIUS`);
+3 `START_PARTY` 的赛局**没有接到慢帧去真的计分**,也不落库;
+4 `USE_ALCHEMY_FURNACE` 的站位读口(`lastRoomEffects[].roomKey`)**不在 `WorldSaveHost` 契约里**,有最多 0.5 s 慢帧延迟。
+
+判据:`WS-FND-28-party`(7)、`WS-FND-29-tame`(10)、`WS-FND-30-town`(8)、`WS-FND-31-alchemy`(8)。
+
+## 未接线(5 / 22)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 
@@ -71,24 +88,20 @@
 > ⚠️ 这两个的「已执行」由 `tests/WS-07` / `WS-10` 的行为断言钉住,
 > 不在本文的"缺什么"范围内 —— 但**必须写在这里**,否则读者会以为它们也缺。
 
-### 二、**仓库里完全没有落地点**(2 个)
+### 二、**仓库里完全没有落地点**(1 个)
 
-`docs/TASK-94-action-layer-landing-plan.md` 已实测:这 2 个在全仓**不存在**任何可复用的方法。
+`docs/TASK-94-action-layer-landing-plan.md` 已实测:这 1 个在全仓**不存在**任何可复用的方法。
 
 | 动作 | 缺什么 |
 |---|---|
 | `RESET_WORLD` | 无世界重置入口(需要:重建 `WorldSim` + 保留/清除存档的裁决 + 通知所有客户端重新握手) |
-| `MODIFY_TOWN` | 无城镇安全区 / 图腾实体,也无"谁有权改"的裁决 |
 
-### 三、**有相邻机制、但缺中间一环**(5 个)
+### 三、**有相邻机制、但缺中间一环**(2 个)
 
 | 动作 | 缺什么 |
 |---|---|
-| `USE_ALCHEMY_FURNACE` | 炼金台在 `rooms/effects.ts` 只落到「识别 `ALCHEMY_LAB`」;缺**站台交互**与 LLM 炼金的接线 |
-| `START_PARTY` | `PARTY_MODES`(手册 §6.3)已定义四种竞技模式与 `setPartyModeBy`,但**开局/计分/结算**的状态机不存在 |
 | `PLACE_AUTOMATION` | 缺自动化件实体与放置校验;`wiring/` 有电路求值,但没有「放置」这一步 |
 | `WIRE_EDIT` | 同上:缺布线编辑的落点(`build/wiring_view.ts` 是**只读视图**,且它在 `orphan-audit` 里登记为"缺 WireView 下发报文 + 铺线 UI 面板") |
-| `BREED_TAME` | `mobs/taming.ts` 存在但为 **orphan**:缺宠物容器与驯服交互(`feedPet` 零生产调用) |
 
 ## 这张表怎么被维持
 

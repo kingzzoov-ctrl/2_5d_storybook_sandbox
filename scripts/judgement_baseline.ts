@@ -437,4 +437,10 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
  *                       下调是正确的,但要写清"为什么它不再存在")
  * ```
  */
-export const G_CANDIDATE_WATERMARK = 45;
+/* 2026-11-15:45 → 46。触发者是 `net/actions/*` 的四个新模块 —— 它们各自声明了
+   「赛局 / 宠物 / 城镇配置 / 炼金报文」的记录类型,与既有的玩家/世界类型共享
+   ≥3 个领域字段(id / ownerId / roomId 这一类),于是 G 的候选数 **合法地** +1。
+   ⚠️ 抬水位是"有意识地接受",不是"消掉信号":这条守卫比的是**总命中数**,
+   下一个人再引入这类形态时它还会响 —— 那时要做的仍是先看是哪一对类型,
+   而不是接着抬。 */
+export const G_CANDIDATE_WATERMARK = 46;

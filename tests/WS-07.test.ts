@@ -4173,7 +4173,7 @@ test('ACT-2 ★★ 消灭「静默成功」:未实现的动作**显式**返回 N
      仍未接线的三个)。⚠️ 这份名单**会随接线而变**:2026-11-14 把
      `PLACE_BLOCK` 换成了 `USE_OWN_CHEST`(前者已接线),并在下面补了一条
      「接线之后仍不许静默」的断言 —— 名单变了,命题没变。 */
-  for (const act of [RoomAction.USE_ALCHEMY_FURNACE, RoomAction.PLACE_AUTOMATION, RoomAction.MODIFY_TOWN]) {
+  for (const act of [RoomAction.PLACE_AUTOMATION, RoomAction.WIRE_EDIT, RoomAction.RESET_WORLD]) {
     const r = rt.dispatchAction('o', act);
     eq(r.ok, false, `★ ${act} 不得返回 ok=true —— 那就是静默成功(旧形态的病根)`);
     eq(r.kind, 'NOT_IMPLEMENTED', `★ ${act} 必须**显式**报告"尚无执行层"`);
