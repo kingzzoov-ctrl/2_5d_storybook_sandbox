@@ -227,12 +227,45 @@ Lead 全局复核(208 文件含 _design/):
 
 ### 未实测(明确列出)
 ```
-[ ] 真机 FPS —— 从未测过,只有 headless swiftshader 截图
-[ ] colyseus.js 与 vite 8 / es2022 的打包兼容性(依赖未装)
-[ ] `RoomSchema` 与 `prediction.ts` 的 `Snapshot` **逐字段**是否对齐(只读了签名)
-[ ] #245 玩家可达性
-[ ] z 轴:只接了 x/y(room.ts:868 自述「本次只接 x/y」)
-[ ] knockback 与移动的优先级(未明确)
+[x] 真机 FPS —— **headless 实测到数字,真机仍未测**:硬件 ANGLE/D3D11 540 fps、
+    SwiftShader 120–182 fps(主线程 0.19–0.38 ms/帧),带**空页对照**证明 540 = 浏览器
+    调度上限而非渲染成本。命令 `node scripts/fps-probe.ts [--gl=swiftshader]`;
+    全文 `docs/MEASUREMENTS-S5.md` §1。
+    ⇒ **仍未测**:真机(本环境没有真机,且 headless 无 vsync)⇒ 这些数**不是**玩家帧率。
+[x] colyseus.js 与 vite 8 / es2022 的打包兼容性 —— **未实测,且原因已取证**:
+    `colyseus.js` 在 `package.json`(optionalDependencies)与 `node_modules` **都不存在**;
+    用真 vite 8 + es2022 建对照包证明构建链本身通,而它在**解析阶段**即死
+    (`ERR_MODULE_NOT_FOUND`)。见 `docs/MEASUREMENTS-S5.md` §2。
+    ⇒ 「兼容」这一半**没有任何证据**,不许当成"已兼容"。
+[x] `RoomSchema` 与 `prediction.ts` 的 `Snapshot` **逐字段**对齐 —— 已出**逐字段表**
+    (14 字段 × 在 PlayerSchema?/类型一致?/在 Snapshot?/解码覆盖?),判据
+    `tests/WS-FND-24-contract-align.test.ts`(7 条)。查出**两条真实不一致**:
+    `dirtyChunkKeys` 声明并登记但 **0 个写入点**(`schema.colyseus.ts:283` / `:319`);
+    `tick` **不进**字段表(由报文头承载,`wire.ts:157-163` 无此键)
+    ⇒ 按"逐字段对齐"读会误判成缺字段。
+[x] #245 玩家可达性 —— ★ **它不是一个 issue 号,是一个物品 id**(`245 手持庆典烟花筒`)。
+    命题(237/245 的配方把染料硬编码成 `#166` ⇒ 玩家手握 `167/168/169` 时会失败)
+    **已修好且已实测**:两条都保留 `166` 登记键、加 `recipeAnyTag: [['染料']]`
+    (`shared/constants/items.ts:142-144`),匹配器 `matchRecipeByTags`(`:494`)。复现:
+    `node --input-type=module -e "const m=await import('./shared/constants/items.ts');for(const d of [166,167,168,169])console.log(d,m.matchRecipeByTags(245,{103:1,126:1,[d]:1}).ok)"`
+    ⇒ 四色全 `true`、缺染料 `false`。
+    ⇒ **仍未做的另一半**是「游戏内真的能合成」:`CRAFT` 至今**没有执行分支**
+    (`docs/TASK-96-action-landing-gaps.md` 第三节)—— 那属于档 B 的 13 个未接线动作。
+[~] z 轴:只接了 x/y —— **现状已逐行取证**(原文引的行号已过期:`room.ts:868` → **`:1686`**)。
+    z 在 wire(`wire.ts:114`)与刚体(`shared/types/physics.ts:51` 有 `z`/`vz`)**都有**,
+    丢在唯一那条写入链上:`world_sim.ts:2582` 的 `applyPlayerMove(playerId, x, y)` 签名只收
+    x/y、`:2606-2607` 只写 `b.x`/`b.y`;而 `room.ts:1692` **仍写** `p.z = intent.z`(声明值),
+    又被每帧 `projectAllPlayers` 的权威覆盖 ⇒ `p.z` **有两个语义不同的写者**。
+    所需改动已逐行列出(room.ts:491/1624/1681/1686-1692;world_sim.ts:2582/2602/2606-2608/3125)。
+    **本轮未改** —— 它在 `dispatchAction` 那条串行接缝上(见下)。
+[~] knockback 与移动的优先级 —— **裁决:今天它是 no-op,不是"谁压住谁"**。
+    取证:`damage.ts:441-446` 算出 `knockbackImpulse`,但 `attackMob`
+    (`world_sim.ts:1939-1999`)**只消费 `result.finalDamage`**;
+    `PhysicsWorld.applyImpulse`(`physics/world.ts:621`)生产调用点 **0** ⇒ 事实是"击退未实现"。
+    **裁决(给将来接线定规矩)**:击退走**速度**(`applyImpulse`)、移动走**位置**
+    (`applyPlayerMove` 直写 `b.x/b.y`、绕过积分)⇒ 只接速度的话,**下一次移动报文会把它抹掉**
+    (即"移动优先")。要让击退可见,必须给它一个**短时不可覆盖窗口**(或把移动也改成速度语义)。
+    那是独立一件;**本轮未接线**,故本条只到"已裁决"。
 ```
 
 ### 不能作为判据的

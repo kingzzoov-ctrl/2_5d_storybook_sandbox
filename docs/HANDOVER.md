@@ -392,7 +392,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-1b64c99ccff3  docs/COMPLETION-CRITERIA.md
+c0f232cc9a14  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。
