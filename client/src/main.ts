@@ -20,6 +20,10 @@
 
 import { boot, type BootHandle } from './three/boot.ts';
 import { createSession, type SessionHandle } from './net/session.ts';
+import {
+  ACTION_KEYS, cellInFront, cellUnder, describeActionResult, keyHints,
+  type Facing,
+} from './net/action_target.ts';
 import { InputSource, attachKeyboard } from './net/input.ts';
 import { LocalPredictor } from './net/predictor.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
@@ -85,6 +89,12 @@ function main(): void {
      取**权威**位置(`telegraphCenterOf` 的第二个参数)。 */
   let playerId: string | null = null;
   const url = serverUrlFromLocation();
+  /* 动作状态**先于** `createSession` 与键处理声明:两处都要用它们
+     (声明在后面会 TDZ —— 回执回调是异步的,但键处理不是)。 */
+  let lastAction = `按 ${keyHints()}`;
+  let lastItemId = 0;
+  const facing: Facing = { dx: 0, dy: 1 };
+
   if (url !== null) {
     session = createSession({
       url,
@@ -100,6 +110,18 @@ function main(): void {
         onWelcome: (w) => {
           playerId = w.playerId;
           console.info(`[session] 已加入房间 ${w.roomId}(玩家 ${w.playerId})`);
+        },
+        /* ★ 2026-11-14:动作回执。两件事:
+           1 变成玩家能读的一句话(分类不同,话不同 —— 见 `action_target.ts`);
+           2 **记下那次动过的物品 id** —— 快照里没有背包明细,而回执的 `effect`
+             是唯一"玩家真的碰过这件东西"的真值来源(下一步动作用它)。 */
+        onActionResult: (r) => {
+          lastAction = describeActionResult(r);
+          const e = r.effect;
+          if (e !== undefined) {
+            const id = e.objId ?? e.itemId;
+            if (typeof id === 'number' && Number.isFinite(id)) lastItemId = id;
+          }
         },
       },
     });
@@ -157,9 +179,45 @@ function main(): void {
         ? '附近 无怪'
         : `最近 ${near.mobId} hp ${near.hp.toFixed(0)}/${near.maxHp.toFixed(0)} (${near.d.toFixed(1)}格)`,
       lastHit,
+      /* 动作那两行:回执文案(分类不同话不同)+ 最近碰过的物品。
+         背包**明细**不在快照里(只有服务端有)⇒ 这里不编一个数字出来。 */
+      lastAction,
+      lastItemId === 0 ? '最近物品 (还没有)' : `最近物品 ${lastItemId}`,
     ].join('\n');
     statusEl.classList.toggle('bad', st !== 'live');
   };
+  /* ── 动作键位(2026-11-14 第二轮):让「建造 / 拆掉 / 丢下 / 捡起」在浏览器里真的能按 ──
+
+     ⚠️ 目标格的判定**不在**这里:它住在 `net/action_target.ts`(纯函数、有断言,
+        见 `tests/WS-FND-22`)。本文件只做"读键 → 调它 → 发报文 → 显示回执"。
+        ——判定留在不可测的入口里,就是本仓反复记的那种"改坏了没人知道"。 */
+  window.addEventListener('keydown', (ev) => {
+    const spec = ACTION_KEYS[ev.key.toLowerCase()];
+    if (spec === undefined) return;
+    if (session === null) { lastAction = `${spec.label} ✗ 未联机`; return; }
+    const me = handle.store.state.players.find((p) => p.id === handle.store.localPlayerId);
+    if (me === undefined) { lastAction = `${spec.label} ✗ 快照里还没有自己`; return; }
+    const cell = spec.target === 'front' ? cellInFront(me, facing) : cellUnder(me);
+    /* 三个动作要一个物品 id。用"**最近真的碰过的那件**"(回执 effect 里带回来的),
+       而不是"手上那件":快照的 `heldItemId` 目前恒 0(没有装备槽),
+       而拆一块 / 捡一件都会把 id 回给我们 ⇒ 那是唯一"玩家确实持有过"的真值来源。
+       一件都没有时**如实说**,不发一个注定被拒的报文。 */
+    const needItem = spec.action === 'PLACE_BLOCK' || spec.action === 'DROP_ITEM'
+      || spec.action === 'PICKUP_ITEM';
+    if (needItem && lastItemId === 0) {
+      lastAction = `${spec.label} ✗ 先按 E 拆一块或按 F 捡一件`;
+      return;
+    }
+    ev.preventDefault();
+    session.sendAction({
+      action: spec.action,
+      x: cell.x,
+      y: cell.y,
+      ...(needItem ? { itemId: lastItemId } : {}),
+      ...(spec.action === 'DROP_ITEM' ? { count: 1 } : {}),
+    });
+    lastAction = `${spec.label} → 格(${cell.x},${cell.y})`;
+  });
   const input = new InputSource();
   const detachInput = attachKeyboard(window, input);
   const predictor = new LocalPredictor();
