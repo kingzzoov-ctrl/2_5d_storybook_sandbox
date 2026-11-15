@@ -77,6 +77,51 @@ async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<
   try { return await Promise.race([p, timeout]); } finally { if (t !== undefined) clearTimeout(t); }
 }
 
+/**
+ * ★★ 条件等待 —— 「等**状态**」与「等**时间**」是**两件事**。
+ *
+ * ## 本文件原来错在哪(实测,不是假想)
+ * ```
+ * await sleep(220);            ← 这是**等时间**:「睡够 220ms 就该到了」
+ * eq(srv.uplinkRejected(), 1); ← 而这里要的是**状态**:包被处理完
+ * ```
+ * 计数的更新发生在**服务端的消息回调**里,与测试的 `sleep` **没有任何同步关系**:
+ * 机器空闲时握手 p50≈15ms(`sleep(220)` 余量巨大,所以平时看不出来),
+ * 一旦 CPU 被挤占,同一个 `sleep(220)` 之后计数**仍可能是旧值**
+ * ⇒ 断言读到的是「还没被处理」⇒ **假红**(实测 40 行等价探针在负载下 4/150 命中
+ *   「期望 1 / 实际 0」)。**判据没错,是采样早了。**
+ *
+ * ## 为什么超时要**抛**而不是静默放过
+ * 若条件永不成立时直接 return,那这个辅助函数就成了「把假红换成假绿」的工具 ——
+ * 与在被测代码里 catch 掉错误同形。⇒ 超时**即失败**,
+ * 且错误里必须带上**等了多久**与**实际值**(否则失败原因只剩一句无信息的「超时」)。
+ *
+ * ⚠️ 轮询间隔 5ms:相对实测握手 p50≈15ms 足够细,又不会自旋烧 CPU。
+ * ⚠️ 它**只改等待方式**:调用点后面的断言一个字都不用改(不许把 `eq` 放宽成 `ok`)。
+ */
+async function waitUntil(
+  pred: () => boolean, ms: number, what: string, observe?: () => unknown,
+): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    if (pred()) return;
+    const waited = Date.now() - started;
+    if (waited >= ms) {
+      let actual = '(调用点未提供 observe)';
+      if (observe !== undefined) {
+        try {
+          const v = observe();
+          actual = JSON.stringify(v) ?? String(v);
+        } catch (e) {
+          actual = `observe() 自身抛错:${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+      throw new Error(`等待条件超时:${what} —— 等了 ${waited}ms(上限 ${ms}ms),实际值 ${actual}`);
+    }
+    await sleep(Math.min(5, ms - waited));
+  }
+}
+
 /** 造一个最小房间(不 import 模拟层类型 —— 与 `WsRoomLike` 同纪律)。 */
 function makeRoom(): RoomRuntime {
   const rt = new RoomRuntime({
@@ -98,12 +143,22 @@ function uplink(tag: number, body: Uint8Array): Uint8Array {
 type Collected = { welcome: Record<string, unknown> | null; bin: Uint8Array[]; sentHello: boolean };
 
 /** 真 WS 客户端(同 `client/src/net/session.ts:266` 的写法:开连即发 hello)。 */
-function connect(url: string, userId: string): { ws: WebSocket; got: Collected; done: Promise<void> } {
+function connect(url: string, userId: string): {
+  ws: WebSocket; got: Collected; done: Promise<void>; opened: Promise<void>;
+} {
   const got: Collected = { welcome: null, bin: [], sentHello: false };
   const ws = new WebSocket(`${url}?userId=${userId}`);
   ws.binaryType = 'arraybuffer';
+  /* ★ `opened` —— 把「连接真的开了」做成**可 await 的状态**,而不是
+   *   「sleep 了大概够长的一段时间」。负载下后者会直接**同步抛**
+   *   `Sent before connected.`(FND14-2 / FND14-3 实测就是这样红的)——
+   *   那是「等时间」冒充「等状态」的另一种形态。
+   *   ⚠️ 在 `open` 回调**开头** resolve:等到它返回时 socket 必然已开 ⇒ 后续 `send` 不会再抛。 */
+  let markOpened: () => void = () => { /* 由下面 executor 同步覆盖 */ };
+  const opened = new Promise<void>((resolve) => { markOpened = resolve; });
   const done = new Promise<void>((resolve) => {
     ws.addEventListener('open', () => {
+      markOpened();
       const body = enc.encode(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null }));
       const payload = new Uint8Array(body.byteLength + 1);
       payload[0] = 0x01;
@@ -123,7 +178,7 @@ function connect(url: string, userId: string): { ws: WebSocket; got: Collected; 
     ws.addEventListener('close', (() => resolve()) as never);
     ws.addEventListener('error', () => resolve());
   });
-  return { ws, got, done };
+  return { ws, got, done, opened };
 }
 
 async function teardown(clients: { ws: WebSocket; done: Promise<void> }[], srv: WsServerHandle): Promise<void> {
@@ -164,11 +219,15 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'bob');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F1 前置:服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       ok(srv.connCount() >= 1, '前置:应有已握手的连接(否则上行发不出去)');
       const before = srv.uplinkParsed();
       c.ws.send(uplink(0x02, pktBytes));
-      await sleep(200);
+      /* ★ 等**这个包被解析完**这个状态;原来的 sleep(200) 只是「大概够了」 */
+      await waitUntil(() => srv.uplinkParsed() !== before, 5000, 'F1 解析成功计数增长(before → before+1)',
+        () => srv.uplinkParsed());
       eq(srv.uplinkParsed(), before + 1, '★ 合法包应使解析成功计数 **+1**');
       eq(srv.uplinkRejected(), 0, '合法包**不得**被计为失败');
 
@@ -210,12 +269,16 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'carol');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F2 服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       const p0 = srv.uplinkParsed();
       const r0 = srv.uplinkRejected();
       /* 版本字节错(0 instead of 1)⇒ decodePacket 必抛「协议版本不匹配」 */
       c.ws.send(uplink(0x02, Uint8Array.from([0x00, 0x01, 0, 0, 0, 0])));
-      await sleep(200);
+      /* ★ 等**失败计数真的动了**(状态);sleep(200) 只是「大概够了」 */
+      await waitUntil(() => srv.uplinkRejected() !== r0, 5000, 'F2 畸形包被计为失败(r0 → r0+1)',
+        () => srv.uplinkRejected());
       eq(srv.uplinkRejected(), r0 + 1, '★ 畸形包应使**失败**计数 +1');
       eq(srv.uplinkParsed(), p0, '★ 畸形包**不得**计入成功(**两个计数分开**的理由)');
       ok(srv.lastParseError() !== null, '应留下失败原因(不静默)');
@@ -245,13 +308,19 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'dan');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F3 服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       const s0 = srv.uplinkParsed();
       c.ws.send(uplink(0x02, p1));
-      await sleep(180);
+      /* ★ 等**第 1 个包被处理完**(状态);原来的 sleep(180) 只是「大概够了」 */
+      await waitUntil(() => srv.uplinkParsed() > s0, 5000, 'F3 第 1 个包处理完成(计数 > s0)',
+        () => srv.uplinkParsed());
       const s1 = srv.uplinkParsed();
       c.ws.send(uplink(0x02, p2));
-      await sleep(180);
+      /* ★ 等**第 2 个包被处理完**(状态) */
+      await waitUntil(() => srv.uplinkParsed() > s1, 5000, 'F3 第 2 个包处理完成(计数 > s1)',
+        () => srv.uplinkParsed());
       const s2 = srv.uplinkParsed();
       /* ★ 断言**严格递增**,而不是 `> 0` */
       ok(s1 > s0, `第 1 个包后计数应大于初始(实得 ${s0} → ${s1})`);
@@ -302,9 +371,13 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'eve');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F4 服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       c.ws.send(uplink(0x02, pktBytes));
-      await sleep(200);
+      /* ★ 对照段读计数前**先等该包被解析完**(状态),不等时间 */
+      await waitUntil(() => srv.uplinkParsed() > 0, 5000, 'F4 对照:真实实现已解析该包',
+        () => srv.uplinkParsed());
 
       /* ★★ 这里开始就是"负对照":用 F1 的**同一批判据**,但输入换成
        *    旧世界的行为(parsed 恒 0、无解析结果)⇒ 必须**不成立**。 */
@@ -363,11 +436,18 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'frank');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F5 服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       const p0 = srv.uplinkParsed();
       const r0 = srv.uplinkRejected();
       c.ws.send(uplink(0x02, junk));
-      await sleep(220);
+      /* ★★★ 采样改成「等失败计数真的动」——
+       *   下面的三条断言一个字都没改;原来只是**读得太早**:
+       *   计数在服务端的消息回调里更新,`sleep(220)` 与它没有任何同步关系
+       *   (机器被挤占时 p99 握手+处理可达 381ms ⇒ 220ms 后读到的还是旧值)。 */
+      await waitUntil(() => srv.uplinkRejected() !== r0, 5000, 'F5 大垃圾包被计为失败(r0 → r0+1)',
+        () => srv.uplinkRejected());
       eq(srv.uplinkParsed(), p0,
         '★★ 「没抛」**不得**算成功 —— 尾部有垃圾就必须算失败(否则计数可被垃圾灌水)');
       eq(srv.uplinkRejected(), r0 + 1, '★ 应被计为失败');
@@ -392,9 +472,13 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'heidi');
     try {
-      await sleep(120);
+      await c.opened;
+      await waitUntil(() => srv.connCount() >= 1, 5000, 'F6 服务端握手完成(connCount ≥ 1)',
+        () => srv.connCount());
       c.ws.send(uplink(0x02, bytes));
-      await sleep(200);
+      /* ★ 等的是**解析结果落地**这个状态 */
+      await waitUntil(() => srv.uplinkParsed() > 0, 5000, 'F6 该包已被解析成功',
+        () => srv.uplinkParsed());
       const fromServer = srv.lastParsedPacket();
       ok(fromServer !== null, '服务端应有解析结果');
       const local = decodePacket(bytes);
@@ -429,7 +513,9 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'ivan');
     try {
-      await sleep(150);
+      /* ★ 等的是**状态**(hello 的回执 welcome 到了),不是「150ms 大概够了」。 */
+      await waitUntil(() => c.got.welcome !== null, 5000, 'F7 握手回执(welcome)已下发',
+        () => ({ welcome: c.got.welcome !== null, binFrames: c.got.bin.length }));
       ok(c.got.welcome !== null, '前置:hello 应完成握手(证明文本分流没坏)');
       eq(srv.uplinkParsed(), 0, '★ 文本 hello **不得**被当成协议包解析成功');
       eq(srv.uplinkRejected(), 0, '★ 文本 hello 也**不得**被计为解析失败(分流正确)');
