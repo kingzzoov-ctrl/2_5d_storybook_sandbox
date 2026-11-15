@@ -59,26 +59,13 @@ import {
 } from './schema.ts';
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 
+import { lookupActionHandler } from './actions/action_table.ts';
+import { notImplemented } from './actions/not-implemented.ts';
+import type { ActionContext } from './actions/types.ts';
+/* 物质层的模块级常量(`PICKUP_RADIUS` / `ITEM_ID_SET`)与 `numField` 随那 4 个动作
+   一起搬去了 `net/actions/material.ts` —— 它们只为那 4 个 case 存在,留在这里就是死代码。 */
+
 /** 空集合常引用 —— `grantedSourcesFor` 无凭证时返回它,避免每次分配。 */
-import { ITEM_LIST } from '../../../shared/constants/items.ts';
-
-/**
- * 拾取半径(格)。
- *
- * 取值理由:与技术无关,是**手感**——1 格要求玩家精确站到那一格上,
- * 3 格会出现"隔着墙把手伸过去捡"。2 格与"站在旁边"的直觉一致。
- * 它与近战 `reach` **无关**:拾取不看朝向、也不看武器。
- */
-const PICKUP_RADIUS = 2;
-
-/** 冻结内容表里的合法物品 id。用于拒绝"编号空投"(不在表里的 id 一律不认)。 */
-const ITEM_ID_SET: ReadonlySet<number> = new Set(ITEM_LIST.map((i) => i.id));
-
-/** 从 action payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
-function numField(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
 const EMPTY_SOURCE_SET: ReadonlySet<string> = new Set<string>();
 
 /* ═══════════════════════════ 1. 参数表 ═══════════════════════════ */
@@ -1351,11 +1338,28 @@ export class RoomRuntime {
   /* ── 4.4 动作分派(RoomAction 的**执行层**)── */
 
   /**
-   * 把 `authorize()` 的「许可」变成「执行 + 回执」。
+   * 把 `authorize()` 的「许可」变成「执行 + 回执」—— **查注册表**,把活交给该动作自己的模块。
    *
-   * ## 此前的问题(实测,2026-11-14)
+   * ## 结构(2026-11-15 拆分:一个动作一支处理器 + 一张表)
    *
-   * `room.colyseus.ts` 的 `action` 报文 handler 只有一句:
+   * ```
+   * actions/action_table.ts 22 项归属表(`Record<RoomAction, ActionHandler>` ⇒ 编译期完整)
+   * actions/admin.ts        SET_MEMBER_ROLE / KICK_MEMBER / SET_ROOM_ACCESS /
+   *                         SET_PARTY_MODE / CLOSE_ROOM
+   * actions/material.ts     PLACE_BLOCK / BREAK_BLOCK / DROP_ITEM / PICKUP_ITEM
+   * actions/<action>.ts     其余 13 个各占一个模块(接线只改那一个文件 ⇒ 可并行)
+   * ```
+   * ⇒ 本方法只剩三步:**查表** → 没登记就 `NOT_IMPLEMENTED` → 调处理器。
+   *   处理器拿到的是 `ActionContext`(见 `actions/types.ts`),**不是** `RoomRuntime`:
+   *   它们碰不到私有态,也不会在这里长出第二份权限判定。
+   *
+   * ⚠️ 拆分是**纯重构**:回执的字面内容(`kind` / `reason` 文本 / `effect` 字段名)
+   *   一个字节都没变 —— 那是 `tests/WS-07`(ACT 系列)/ `WS-FND-18` / `WS-FND-20` /
+   *   `WS-FND-21` 钉着的东西。
+   *
+   * ## 此前的问题(实测,2026-11-14)—— 换结构不动这些结论
+   *
+   * `room.colyseus.ts` 的 `action` 报文 handler 原本只有一句:
    * ```
    * authorize(...) ⇒ !allowed ⇒ client.send('reject', ...)
    * ```
@@ -1363,221 +1367,70 @@ export class RoomRuntime {
    * 于是 22 个 `RoomAction` 长期处于「授权存在、执行不存在」的状态,
    * 而**失败是静默的** —— 玩家按了没反应,没有任何一处能看出原因。
    *
-   * ## 为什么本方法**不**自己判权限(这是刻意的分工)
+   * ## 为什么处理器**不**自己判权限(这是刻意的分工)
    *
-   * 下面 4 个动作的宿主方法(`setMemberRole` / `kick` / `setAccess` /
-   * `setPartyModeBy`)**各自第一行就是 `this.authorize(...)`**。
-   * 本方法若再判一次,就长出**第二份权限实现** —— 本仓 1 号病根
-   * (陷阱 31/41;同族的最近一例是 `vitals.ts:405-408` 记的「两侧都钳 = 两份实现」)。
-   * ⇒ 故:**宿主方法自带闸的,直接调用它,再把它的返回值翻译成本方法的返回类型。**
+   * 4 个管理动作的宿主方法(`setMemberRole` / `kick` / `setAccess` / `setPartyModeBy`)
+   * **各自第一行就是 `authorize(...)`**。处理器若再判一次,就长出**第二份权限实现**
+   * —— 本仓 1 号病根(陷阱 31/41)。⇒ 宿主方法自带闸的,直接调它,再把返回值翻译成回执。
    *
-   * ⚠️ 唯一的例外是 `CLOSE_ROOM`:`close()` 是**生命周期方法**,
-   *   还被 `onDispose` 与 `reapEvictions` 调用 ⇒ 它**不能**自带权限闸,
-   *   闸必须在这里。这个不对称是**刻意的**,不是遗漏。
+   * ⚠️ 唯一的例外是 `CLOSE_ROOM`:`close()` 是**生命周期方法**,还被 `onDispose` 与
+   *   `reapEvictions` 调用 ⇒ 它**不能**自带权限闸,闸必须写在 `actions/admin.ts` 里。
+   *   这个不对称是**刻意的**,不是遗漏。
    *
    * ## 未实现的动作**显式**返回 `NOT_IMPLEMENTED`
    *
-   * 静默成功正是本次要消灭的东西。若这里对未实现的动作返回 `ok: true`,
-   * 客户端会以为动作生效了,**而门禁一条都红不了**(它只查「成功分支是否为空」)。
-   * ⇒ 返回 `ok: false` + `kind: 'NOT_IMPLEMENTED'` ⇒ 它**可被断言**:
-   *   「发 `PLACE_BLOCK` ⇒ 回执必须是 NOT_IMPLEMENTED」。
-   *   将来谁把它接上,那条断言会**按设计变红**,提醒同时更新
-   *   `verify.ts` 的 `VERDICT_HANDLER_KNOWN` 登记。
-   *   ★ 这与本仓既有手法一致:**把"未做项"钉成一条会红的断言**,而不是留一句注释。
+   * 静默成功正是要消灭的东西。若对未实现的动作返回 `ok: true`,客户端会以为动作生效了,
+   * **而门禁一条都红不了**(它只查「成功分支是否为空」)。⇒ 回 `ok: false` +
+   * `kind: 'NOT_IMPLEMENTED'` ⇒ 它**可被断言**:「发 `PLACE_BLOCK` ⇒ 必须是 NOT_IMPLEMENTED」。
+   * 将来谁把它接上,那条断言会**按设计变红**,提醒同时更新 `verify.ts` 的
+   * `VERDICT_HANDLER_KNOWN` 登记。★ 本仓既有手法:把"未做项"钉成一条会红的断言,
+   * 而不是留一句注释。
    */
   dispatchAction(actorId: string, action: RoomAction, payload: ActionPayload = {}): ActionOutcome {
-    switch (action) {
-      case RoomAction.SET_MEMBER_ROLE: {
-        const targetId = payload.targetId;
-        const role = payload.role;
-        if (typeof targetId !== 'string' || role === undefined) {
-          return { ok: false, kind: 'INVALID', reason: '需要 targetId 与 role' };
-        }
-        const r = this.setMemberRole(actorId, targetId, role);
-        return r.ok
-          ? { ok: true, kind: 'OK', effect: { targetId, role: String(role) } }
-          : this.classifyFailure(actorId, action, r.reason);
-      }
-      case RoomAction.KICK_MEMBER: {
-        const targetId = payload.targetId;
-        if (typeof targetId !== 'string') {
-          return { ok: false, kind: 'INVALID', reason: '需要 targetId' };
-        }
-        const r = this.kick(actorId, targetId);
-        return r.ok
-          ? { ok: true, kind: 'OK', effect: { targetId } }
-          : this.classifyFailure(actorId, action, r.reason);
-      }
-      case RoomAction.SET_ROOM_ACCESS: {
-        const mode = payload.mode;
-        if (mode === undefined) return { ok: false, kind: 'INVALID', reason: '需要 mode' };
-        const r = this.setAccess(actorId, mode, payload.passwordHash ?? null);
-        return r.ok
-          ? { ok: true, kind: 'OK', effect: { mode: String(mode) } }
-          : this.classifyFailure(actorId, action, r.reason);
-      }
-      case RoomAction.SET_PARTY_MODE: {
-        const mode = payload.partyMode;
-        if (mode === undefined) return { ok: false, kind: 'INVALID', reason: '需要 partyMode' };
-        const r = this.setPartyModeBy(actorId, mode);
-        return r.ok
-          ? { ok: true, kind: 'OK', effect: { partyMode: String(mode) } }
-          : this.classifyFailure(actorId, action, r.reason);
-      }
-      case RoomAction.CLOSE_ROOM: {
-        /* ★ 例外:`close()` 不自带闸(见上方长注释)⇒ 闸在这里。 */
-        const gate = this.authorize(actorId, RoomAction.CLOSE_ROOM);
-        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-        const done = this.close();
-        if (!done) return { ok: false, kind: 'ROOM_CLOSED', reason: '房间已不是 OPEN' };
-        return { ok: true, kind: 'OK', effect: { status: String(this.status) } };
-      }
-      /* ── 玩家语义的物质层(2026-11-14:TASK-96 的 4 个动作接线)──────────
+    const handler = lookupActionHandler(action);
+    /* 没登记 ⇒ 报文里是个**不存在的动作名**(`tests/WS-FND-21` FND21-3 发的就是
+       `NO_SUCH_ACTION_NAME`)。理由文本与拆分前那个 `default:` 分支**逐字相同**
+       (唯一出处:`actions/not-implemented.ts`)。 */
+    if (handler === undefined) return notImplemented(action);
+    return handler(this.actionContextFor(actorId, action, payload));
+  }
 
-         这四个此前显式 `NOT_IMPLEMENTED`。接线时三件事必须**在同一处**做,
-         否则就是本仓反复记的那种半截事务:
-
-           1 **权限闸**写在这里,不写在世界方法里 —— 世界方法没有"谁"这个
-             参数(与 `CLOSE_ROOM` 同一例外,理由见那段长注释);
-           2 背包**真的**增减一次,且走 `applyInventory` —— 反作弊的总量守恒
-             与凭证链都在那条路上,绕过它 = 绕过了本仓唯一的物品真值来源;
-           3 世界侧**真的**变了;失败时必须**退回**背包那一件
-             (不做"扣了东西却没放下")。
-
-         产出侧(破坏掉落 / 拾取)必须先 `grantItemSource`,否则
-         `checkInventory` 会按"凭空产出"拒(`FROM_NOTHING`)——
-         那是设计好的闸,不是障碍。
-
-         ⚠️ 顺序纪律:**先动世界、再动背包**至少要有一侧是"先扣"的 ——
-            拾取时先扣地面、再进背包;放块时先扣背包、再写世界。
-            两边都"先加"就会造出复制品。 */
-      case RoomAction.PLACE_BLOCK: {
-        const gate = this.authorize(actorId, action);
-        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-        const x = numField(payload.x);
-        const y = numField(payload.y);
-        const itemId = numField(payload.itemId);
-        if (x === null || y === null || itemId === null) {
-          return { ok: false, kind: 'INVALID', reason: '需要 x / y / itemId(数字)' };
-        }
-        if (!ITEM_ID_SET.has(itemId)) {
-          return { ok: false, kind: 'INVALID', reason: `物品 ${itemId} 不在冻结内容表里` };
-        }
-        const mat = this.materialsOf();
-        if (mat === null) {
-          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可放块' };
-        }
-        /* 先扣背包:没这一件会被反作弊按 NEGATIVE 拒 ⇒ 不可能"凭空空投一个块"。 */
-        const spend = this.applyInventory(actorId, { ops: [{ itemId, delta: -1 }] });
-        if (!spend.allowed) {
-          return {
-            ok: false, kind: 'INVALID',
-            reason: `背包里没有可放置的 ${itemId}(${spend.rejectCode ?? '被拒'})`,
-          };
-        }
-        const r = mat.placeBlock(x, y, itemId);
-        if (!r.ok) {
-          /* 扣了东西却没放下 ⇒ **退回**(带凭证,见本段开头)。 */
-          const src = `place-refund:${x},${y}`;
-          this.grantItemSource(actorId, src);
-          this.applyInventory(actorId, { ops: [{ itemId, delta: 1, source: src }] });
-          return { ok: false, kind: 'INVALID', reason: r.reason };
-        }
-        return { ok: true, kind: 'OK', effect: { x, y, itemId } };
-      }
-      case RoomAction.BREAK_BLOCK: {
-        const gate = this.authorize(actorId, action);
-        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-        const x = numField(payload.x);
-        const y = numField(payload.y);
-        if (x === null || y === null) return { ok: false, kind: 'INVALID', reason: '需要 x / y(数字)' };
-        const mat = this.materialsOf();
-        if (mat === null) {
-          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可拆' };
-        }
-        const r = mat.breakBlock(x, y);
-        if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
-        /* 拆下来的东西先给凭证再入背包;背包满就落回**原地** —— 不凭空销毁。 */
-        const src = `break:${x},${y}:${r.objId}`;
-        this.grantItemSource(actorId, src);
-        const gain = this.applyInventory(actorId, { ops: [{ itemId: r.objId, delta: 1, source: src }] });
-        if (gain.allowed) {
-          return { ok: true, kind: 'OK', effect: { x, y, objId: r.objId, gained: 1 } };
-        }
-        mat.dropItem(x, y, r.objId, 1);
-        return {
-          ok: true, kind: 'OK',
-          effect: {
-            x, y, objId: r.objId, gained: 0, dropped: 1,
-            note: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`,
-          },
-        };
-      }
-      case RoomAction.DROP_ITEM: {
-        const gate = this.authorize(actorId, action);
-        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-        const itemId = numField(payload.itemId);
-        const count = numField(payload.count) ?? 1;
-        if (itemId === null) return { ok: false, kind: 'INVALID', reason: '需要 itemId(数字)' };
-        if (!Number.isInteger(count) || count <= 0) {
-          return { ok: false, kind: 'INVALID', reason: `count 必须是正整数(实测 ${payload.count})` };
-        }
-        const mat = this.materialsOf();
-        if (mat === null) {
-          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层' };
-        }
-        /* ⚠️ 落点取**权威位置**,不取客户端报的坐标:否则玩家可以把东西丢到地图另一头。 */
-        const at = this.hostPositionOf(actorId);
-        if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
-        const spend = this.applyInventory(actorId, { ops: [{ itemId, delta: -count }] });
-        if (!spend.allowed) {
-          return {
-            ok: false, kind: 'INVALID',
-            reason: `背包里不够 ${count} 个 ${itemId}(${spend.rejectCode ?? '被拒'})`,
-          };
-        }
-        mat.dropItem(at.x, at.y, itemId, count);
-        return { ok: true, kind: 'OK', effect: { itemId, count, x: at.x, y: at.y } };
-      }
-      case RoomAction.PICKUP_ITEM: {
-        const gate = this.authorize(actorId, action);
-        if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-        const itemId = numField(payload.itemId);
-        if (itemId === null) return { ok: false, kind: 'INVALID', reason: '需要 itemId(数字)' };
-        const mat = this.materialsOf();
-        if (mat === null) {
-          return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层' };
-        }
-        const at = this.hostPositionOf(actorId);
-        if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
-        /* **先扣地面**:没扣到就不要动背包 —— 反过来会造出
-           "背包 +1 而地上那件还在"的复制品。 */
-        if (!mat.takeGroundItemNear(at.x, at.y, itemId, PICKUP_RADIUS)) {
-          return {
-            ok: false, kind: 'INVALID',
-            reason: `附近 ${PICKUP_RADIUS} 格内没有 ${itemId}(地上那件可能已被别人捡走)`,
-          };
-        }
-        const src = `pickup:${at.x},${at.y}:${itemId}`;
-        this.grantItemSource(actorId, src);
-        const gain = this.applyInventory(actorId, { ops: [{ itemId, delta: 1, source: src }] });
-        if (!gain.allowed) {
-          /* 背包满了 ⇒ **放回去**(不能把玩家已经捡起来的东西吞掉)。 */
-          mat.dropItem(at.x, at.y, itemId, 1);
-          return {
-            ok: false, kind: 'INVALID',
-            reason: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 已放回原地`,
-          };
-        }
-        return { ok: true, kind: 'OK', effect: { itemId, x: at.x, y: at.y } };
-      }
-      default:
-        return {
-          ok: false,
-          kind: 'NOT_IMPLEMENTED',
-          reason: `动作 ${action} 尚无执行层(授权存在、执行不存在 —— 见 docs/TASK-94)`,
-        };
-    }
+  /**
+   * 为**一次**分派装配 `ActionContext`。
+   *
+   * ⚠️ 这里只**转交** `RoomRuntime` 已有的能力(绑定后的函数),不复制任何判定:
+   *   `classifyFailure` / `materialsOf` / `hostPositionOf` 仍是 `private`,
+   *   处理器拿不到 `this`,只能调下面列出的这些。
+   *
+   * ⚠️ `status` 必须是 **getter**:`CLOSE_ROOM` 的回执要在 `close()` **之后**读状态
+   *   (`effect: { status: 'CLOSED' }`)。若在这里取一次快照值,回执会谎报 `OPEN`
+   *   —— 那是**行为变化**,不是代码风格。
+   */
+  private actionContextFor(
+    actorId: string,
+    action: RoomAction,
+    payload: ActionPayload,
+  ): ActionContext {
+    const rt = this;
+    return {
+      actorId,
+      action,
+      payload,
+      state: rt.state,
+      host: rt.worldSaveHost,
+      get status() { return rt.status; },
+      authorize: (userId, a) => rt.authorize(userId, a),
+      classifyFailure: (id, a, reason) => rt.classifyFailure(id, a, reason),
+      materialsOf: () => rt.materialsOf(),
+      hostPositionOf: (userId) => rt.hostPositionOf(userId),
+      applyInventory: (userId, input) => rt.applyInventory(userId, input),
+      grantItemSource: (userId, source) => rt.grantItemSource(userId, source),
+      setMemberRole: (id, targetId, role) => rt.setMemberRole(id, targetId, role),
+      kick: (id, targetId) => rt.kick(id, targetId),
+      setAccess: (id, mode, passwordHash) => rt.setAccess(id, mode, passwordHash),
+      setPartyModeBy: (id, mode) => rt.setPartyModeBy(id, mode),
+      close: () => rt.close(),
+    };
   }
 
   /**
