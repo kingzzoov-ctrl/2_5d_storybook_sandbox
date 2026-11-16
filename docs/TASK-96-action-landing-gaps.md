@@ -13,7 +13,7 @@
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
 
-## 已接线(20 / 22)
+## 已接线(21 / 23)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -100,7 +100,24 @@
 落点裁决、逐行证据与**必须 owner 定的存档政策**见 `docs/TASK-97-world-reset-ruling.md`;
 判据 `WS-FND-34-world-reset`(6 条,其中一条把"今天确实没有"这个**事实本身**钉住了)。
 
-## 未接线(2 / 22)
+### 二之六、**使用道具**(2026-11-15 接线,1 个 —— **新动作**)
+
+| 动作 | 落点 | 说明 |
+|---|---|---|
+| `USE_ITEM` | `actions/use_item.ts` + `WorldSaveHost.useItem?`(`world_sim.ts` 实现) | 按 `itemId` 分派三种语义:733 救人 / 227 困人 / 料理吃 buff。执序「**判定 → 扣减 → 写回**」 |
+
+⚠️ 三条边界(**不计入达成**):
+1 **`itemId` 由客户端自报** —— 服务端没有按件背包明细读口(`PlayerState` 只有 `heldItemId`),
+   世界侧只信"是我认识的 id";扣减走 `applyInventory`(总量守恒,不足即整批拒)。
+2 **227 的"对活人连中 3 发"半边没有建模**(`BUBBLED` 住在 `DownedState`)⇒ 今天只对幽灵泡泡目标生效。
+3 料理 11 个字段里**只有 `hpFlat` 与即时回复**真的到达玩家(`hpFlat` 经 `maxHpForLevel` 并进上限);
+   `gravityMul`(冻结层 `integrateVertical` 无参数位)/ `gatherMul`(本仓无采集系统)/ `jumpMul`(无跳跃入口)
+   / `atkMul`·`critRate`·`critDmg`·`defFlat`·`moveMul`·`expMul`(战斗与经验管线未接第三参)**仍是未接**。
+
+判据:`tests/WS-FND-39-use-item.test.ts`(9 条;4 处注入验证:超距扣道具 / 不写回活的无敌 /
+不并 `hpFlat` / 永不扣道具 —— 全部能红且逐字节还原)。
+
+## 未接线(2 / 23)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 

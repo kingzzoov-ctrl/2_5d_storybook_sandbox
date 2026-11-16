@@ -124,6 +124,7 @@ export const RoomAction = {
   PLACE_AUTOMATION: 'PLACE_AUTOMATION',
   WIRE_EDIT: 'WIRE_EDIT',
   BREED_TAME: 'BREED_TAME',
+  USE_ITEM: 'USE_ITEM',
 } as const;
 export type RoomAction = (typeof RoomAction)[keyof typeof RoomAction];
 
@@ -181,6 +182,9 @@ export const ACTION_PERMISSION: Readonly<Record<RoomAction, keyof RolePermission
   SLEEP: 'baseline',
   USE_OWN_CHEST: 'baseline',
   BREED_TAME: 'baseline',
+  /* 使用道具是基础生存动作:吃/喝/投掷都不要求角色权限。
+     具体的**能用哪一件**由世界侧判定(未知道具 ⇒ 明确拒绝),不靠权限位表达。 */
+  USE_ITEM: 'baseline',
   PLACE_BLOCK: 'build',
   BREAK_BLOCK: 'build',
   CRAFT: 'build',
@@ -357,6 +361,28 @@ export interface AttackReport {
  * `PipelineDamageResult` 等模拟层类型 —— 否则 `net` 就依赖 `combat` 了。
  * 房间只关心四个整数/字符串:结果形态、掉了多少血、是否命中、目标死活。
  */
+/**
+ * `USE_ITEM` 的世界侧回执。
+ *
+ * ## 为什么 `consume` 与 `applied` 分开
+ *
+ * 「生效了」和「该扣道具」不是同一件事:
+ *   - 733 羽毛笔**超距**时:什么都没发生(不复活),而且**不许扣道具**;
+ *   - 733 命中时:复活了,扣 1 件。
+ * 一个布尔表达不了这两个维度 ⇒ 分成两个。动作层据此决定要不要 `applyInventory(-1)`
+ * (它只信这里回来的 `consume`,不自己再判一次距离 —— 那会是第二份实现)。
+ */
+export interface UseItemOutcome {
+  /** 这次使用是否**真的生效**(世界状态变了)。 */
+  applied: boolean;
+  /** 是否应扣掉 1 件。⚠️ 只有 `applied === true` 时才允许为 `true`。 */
+  consume: boolean;
+  /** 给人看的理由(`applied === true` 时为 `'ok'`)。 */
+  reason: string;
+  /** 回执明细(只允许标量,与 `ActionOutcome['effect']` 同口径)。 */
+  effect?: Record<string, string | number | boolean>;
+}
+
 export interface WorldSaveHost {
   saveToDb(
     db: DbLike,
@@ -675,6 +701,18 @@ export interface WorldSaveHost {
    *   实现者**不许**在这里"顺手清掉"任何旧数据。
    */
   resetWorld?(opts: { seed: number }): { applied: boolean; seed: number; reason?: string };
+  /**
+   * **使用一件道具**(`USE_ITEM` 的唯一世界侧落点)。
+   *
+   * 为什么是一个**通用**口而不是三个专用方法:道具语义按 `itemId` 分派
+   * (733 救队友 / 227 困人 / 料理吃 buff),三者共享同一套"判定 → 扣减 → 写回"纪律。
+   * 开三个方法会让动作层按 itemId 自己 `if/else`,把语义判断复制到两层。
+   *
+   * ⚠️ **今天没有"按件背包明细"读口**(`PlayerState` 只有 `heldItemId`)⇒
+   *   `itemId` 由动作层从报文取(客户端自报),世界侧**只信它是自己认识的 id**,
+   *   不校验"该玩家真的有这一件" —— 那需要先补按件读口(见 `TASK-99`)。
+   */
+  useItem?(actorId: string, req: { itemId: number; targetId?: string }): UseItemOutcome;
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */

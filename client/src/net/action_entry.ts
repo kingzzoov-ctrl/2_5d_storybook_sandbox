@@ -5,8 +5,9 @@
  * ```
  *   玩家按了/点了  ⇒  「要发哪个动作 + 什么载荷」  ⇒  交给人注入进来的 `sendAction`
  * ```
- * 于是 22 个 `RoomAction` 里已经**有执行层**的那 5 个
- * (`CRAFT` / `SLEEP` / `OPEN_CHEST` / `USE_OWN_CHEST` / `START_PARTY`)
+ * 于是 `RoomAction` 里已经**有执行层**的那几个
+ * (`CRAFT` / `SLEEP` / `OPEN_CHEST` / `USE_OWN_CHEST` / `START_PARTY`,
+ *  以及 `docs/TASK-99-use-item-verb.md` 裁决出来的 `USE_ITEM`)
  * 第一次有了**客户端入口** —— 此前它们的全部接线在服务端,客户端**零调用点**,
  * 表现就是「服务端能跑、玩家按了没反应」。
  *
@@ -126,6 +127,21 @@ export interface PartyInput {
 }
 
 /**
+ * `USE_ITEM` 的入参 —— 两格都**复用** `ActionPayload` 现成字段
+ * (`server/src/net/room.ts` 的 `itemId` / `targetId`),故 wire 与 `ActionPayload`
+ * 都不动(见 `docs/TASK-99-use-item-verb.md` §3)。
+ */
+export interface UseItemInput {
+  /** 要用掉的那件物品 id(内容表编号;**正整数**)。 */
+  itemId?: unknown;
+  /**
+   * 对**谁**用(玩家 id)。**省略 = 对自己用** —— 服务端 payload 缺省即此语义;
+   * ⇒ 本层省略时**整个键不出现**,不写 `undefined`(否则线上会多一个 `"targetId":null`)。
+   */
+  targetId?: unknown;
+}
+
+/**
  * 动作回执的最小形状 —— 与 `net/session.ts` 的 `ActionResultFrame` **结构兼容**
  * (那边多一个 `t`,结构上无妨),但本文件不 import 它:本层零依赖。
  */
@@ -165,7 +181,7 @@ function isDetail(v: unknown): v is Record<string, number> {
   return true;
 }
 
-/* ═══════════════════════════ 3. 五个构建器(纯函数) ═══════════════════════════ */
+/* ═══════════════════════════ 3. 六个构建器(纯函数) ═══════════════════════════ */
 
 /**
  * `CRAFT` —— 合成一份产物。
@@ -257,6 +273,37 @@ export function startPartyRequest(input: PartyInput = {}): BuildOutcome {
   return { ok: true, request: { action: 'START_PARTY', payload } };
 }
 
+/**
+ * `USE_ITEM` —— 对某个目标用掉背包里的**一件**(TASK-99)。
+ *
+ * `itemId` 必须是**正整数**:服务端 `itemId` 是内容表编号,`0` / 负数 / 小数 /
+ * 字符串在那边一律 `INVALID` ⇒ 在入口就拦,省掉一条注定被拒的往返。
+ *
+ * `targetId` **可选**,省略 = 对自己用。⚠️ 省略时**整个键不出现**(不写 `targetId: undefined`):
+ * 本层的载荷会被**逐键**读(判据比对键集合、`ActionEntry.submit` 再展开一次),
+ * 挂一个 `undefined` 就在键集合里多出一个键 ⇒ "键不存在"这条性质当场失真;
+ * 而服务端认的 `targetId` 只有两种形态:**非空字符串**,或**根本没有这个键**。
+ * (给了空串/非字符串则**明确拒绝** —— 那会被读成"有目标但解析不出来",
+ * 把「对自己用」变成「目标非法」,两种结果差得很远。)
+ */
+export function useItemRequest(input: UseItemInput = {}): BuildOutcome {
+  if (!isInt(input.itemId) || input.itemId <= 0) {
+    return { ok: false, reason: 'USE_ITEM 需要 itemId(正整数:内容表里的物品 id)' };
+  }
+  const payload: Record<string, unknown> = { itemId: input.itemId };
+  if (input.targetId !== undefined) {
+    if (typeof input.targetId !== 'string' || input.targetId.length === 0) {
+      return {
+        ok: false,
+        reason: 'USE_ITEM 的 targetId 若给出必须是非空字符串(目标玩家 id);'
+          + '想对自己用就**别给**这个键,别给空串',
+      };
+    }
+    payload.targetId = input.targetId;
+  }
+  return { ok: true, request: { action: 'USE_ITEM', payload } };
+}
+
 /* ═══════════════════════════ 4. 回执 → 玩家能读的一句话(纯) ═══════════════════════════ */
 
 /** 动作的**显示名**(只影响文案,不影响协议)。 */
@@ -266,6 +313,7 @@ const LABELS: Readonly<Record<string, string>> = {
   OPEN_CHEST: '开公共箱',
   USE_OWN_CHEST: '开自己的箱',
   START_PARTY: '派对开局',
+  USE_ITEM: '使用道具',
 };
 
 /** 把载荷压成一小段可读文本(对象/数组跳过 —— 一行 HUD 塞不下嵌套明细)。 */
@@ -363,6 +411,11 @@ export class ActionEntry {
   /** 派对开局。 */
   startParty(input: PartyInput = {}): EntryOutcome {
     return this.submit(startPartyRequest(input));
+  }
+
+  /** 对某个目标用掉一件(省略 `targetId` = 对自己用)。 */
+  useItem(input: UseItemInput = {}): EntryOutcome {
+    return this.submit(useItemRequest(input));
   }
 
   /**

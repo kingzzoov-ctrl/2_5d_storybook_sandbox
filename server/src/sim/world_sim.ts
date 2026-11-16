@@ -67,6 +67,10 @@ import {
   SOUP_POT_ID,
   KITCHEN_TABLE_ID,
   PIZZA_OVEN_ID,
+  foodBuffFrom,
+  tickFoodBuff,
+  mergeFoodBuffs,
+  type FoodBuff,
   type KitchenState,
 } from '../combat/cooking.ts';
 import {
@@ -206,6 +210,8 @@ import {
   createDowned,
   tickGhostBubble,
   touchRevive,
+  featherRevive,
+  bubbleGunHit,
   TOUCH_RADIUS,
   type DownedState,
   type EquipmentSnapshot,
@@ -2810,17 +2816,21 @@ export class WorldSim {
      * ```
      * ⇒ 修:本方法是「等级 → 属性」的**纯算子**转发,等级是**参数**给的,
      *   不需要玩家有档案。加档案检查等于凭空引入一个与等级无关的前提。
-     * ⚠️ 而 `playerId` 参数因此**没有用到** —— 保留它是为了两件事:
-     *   1 与投影读口的其它方法签名一致(调用方不必记特例)
-     *   2 将来看需要按玩家算(如装备加成)时不必改签名
-     *   ⇒ 用 `void` 显式表态「这个参数当前不参与运算」,而不是删掉它。
+     * ⚠️ `playerId` 曾经**没有用到**;2026-11-15 起它真的参与运算:
+     *   料理 buff 的 `hpFlat` 要并进上限(见下方 `mergeFoodBuffs` 那一行)。
+     *   当初保留这个参数的两个理由(签名一致 / 将来按玩家算)正好在此兑现 ——
+     *   调用方一个都没改。⇒ `void playerId` 已随这次接线删除。
      *
      * ⚠️ `progression` 是唯一算子(契约 §1):这里**只转发**
      *    `statsAtLevel` 的结果,不写 `100 + 15*(lv-1)` ——
      *    写出那条公式就是第二份实现(正是 W1 的成因)。 */
-    void playerId;
+    /* ★ 料理 buff 的 `hpFlat`(手册:602 最大生命 +30)并进上限。
+       接在这一层而不是 `syncMaxHp`:上限的**唯一**算子是本方法,
+       `vitals.syncMaxHp` 只负责"抬上限 / 钳 hp" —— 两边都不复述策略。 */
     const stats = statsAtLevel(level);
-    return Number.isFinite(stats.maxHp) ? stats.maxHp : null;
+    const hpFlat = mergeFoodBuffs(this.foodBuffs.get(playerId) ?? []).hpFlat;
+    const total = stats.maxHp + hpFlat;
+    return Number.isFinite(total) ? total : null;
   }
 
   /**
@@ -2833,6 +2843,123 @@ export class WorldSim {
    */
   syncMaxHp(playerId: string, derivedMaxHp: number): boolean {
     return this.vitals.syncMaxHp(playerId, derivedMaxHp);
+  }
+
+  /* ══════════════════ 使用道具(`USE_ITEM` 的世界侧落点)══════════════════ */
+
+  /** 每个玩家身上生效中的料理 buff。慢帧推进、过期即删。 */
+  private readonly foodBuffs = new Map<string, FoodBuff[]>();
+
+  /** 该玩家身上 buff 的合并结果(乘区相乘、加值相加)。只读,不返回内部数组。 */
+  buffsOf(playerId: string): FoodBuff['statMods'] {
+    return mergeFoodBuffs(this.foodBuffs.get(playerId) ?? []);
+  }
+
+  /**
+   * 慢帧:推进每个玩家 buff 的剩余时间,过期的移除。
+   * ⚠️ 先 `[...this.foodBuffs]` 复制:循环内部会 `delete`,边迭代 `Map` 边删键是未定义行为。
+   */
+  tickFoodBuffs(): void {
+    const dt = SIM_SLOW_DT;
+    for (const [id, list] of [...this.foodBuffs]) {
+      const kept: FoodBuff[] = [];
+      for (const b of list) {
+        const t = tickFoodBuff(b, dt);
+        if (!t.expired) kept.push(t.buff);
+      }
+      if (kept.length === 0) this.foodBuffs.delete(id);
+      else this.foodBuffs.set(id, kept);
+    }
+  }
+
+  /**
+   * `USE_ITEM` 的世界侧落点:按 `itemId` 分派三种语义。
+   *
+   * ## `applied` 与 `consume` 为什么分开
+   * 「生效」与「该扣道具」不是同一件事:733 超距 ⇒ 什么都没发生,**也不许扣**。
+   * 动作层只信这里回来的 `consume`,不自己再判一次距离(那会是第二份实现)。
+   *
+   * ## 三种语义
+   * 1 **733 复苏天使羽毛笔**:救 6 格内的幽灵泡泡队友,满血 + 3 秒无敌。
+   *    距离判定**只由** `featherRevive` 拥有 —— 这里不预判。
+   * 2 **227 泡泡连发水枪**:对**已有 `DownedState` 的目标**叠泡泡层,满 3 层 ⇒ `BUBBLED`。
+   *    ⚠️ 手册里「对活人连中 3 发」那半边**今天没有建模**(`BUBBLED` 住在 `DownedState`),
+   *    不在这里另造一份"活人泡泡"状态 —— 那会是第二份表示。
+   * 3 **料理**:吃一份成品 ⇒ 写入该玩家的 active buffs(`foodBuffFrom` 是唯一构造处),
+   *    即时回复 `instantHealHp`,`hpFlat` 由 `maxHpForLevel` 并进上限。
+   *
+   * ## ⚠️ 不校验"该玩家真的有这一件"
+   * 服务端今天**没有按件背包明细读口**(`PlayerState` 只有 `heldItemId`)⇒ `itemId` 是客户端自报的;
+   * 这里只信"它是我认识的 id"。扣减由动作层走 `applyInventory`(总量守恒),见 `TASK-99`。
+   */
+  useItem(actorId: string, req: { itemId: number; targetId?: string }): {
+    applied: boolean;
+    consume: boolean;
+    reason: string;
+    effect?: Record<string, string | number | boolean>;
+  } {
+    /* 道具 id 来自冻结内容表(`shared/constants/items.ts`);这里只写两个语义锚点。 */
+    const FEATHER_PEN_ID = 733;
+    const BUBBLE_GUN_ID = 227;
+    const itemId = Math.trunc(req.itemId);
+    const targetId = req.targetId ?? actorId;
+
+    if (itemId === FEATHER_PEN_ID) {
+      const d = this.downedStates.get(targetId);
+      if (d === undefined) {
+        return { applied: false, consume: false, reason: '目标不在幽灵泡泡状态' };
+      }
+      const a = this.physics.bodies.get(actorId);
+      const b = this.physics.bodies.get(targetId);
+      const distance = a === undefined || b === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.hypot(b.x - a.x, b.y - a.y);
+      const out = featherRevive({
+        downed: d, casterId: actorId, distance, progress: this.progressOf(targetId),
+      });
+      if (!out.revived || out.result === null) {
+        return { applied: false, consume: false, reason: out.reason };
+      }
+      this.lastRevive = out.result;
+      /* 写回**活的那一套**:受击判定读的是 `vitals.iframeSec`,不是 `DownedState.invulnSec`
+         (与 `tickDowned` 里 task-64 那条注释同源)。 */
+      this.vitals.revive(targetId, out.result.hpAfter, out.result.invulnSec);
+      this.downedStates.delete(targetId);
+      return {
+        applied: true, consume: true, reason: 'ok',
+        effect: {
+          itemId, targetId, hpAfter: out.result.hpAfter, invulnSec: out.result.invulnSec,
+        },
+      };
+    }
+
+    if (itemId === BUBBLE_GUN_ID) {
+      const d = this.downedStates.get(targetId);
+      if (d === undefined) {
+        return { applied: false, consume: false, reason: '目标不在幽灵泡泡状态(活人泡泡未建模)' };
+      }
+      const out = bubbleGunHit(d);
+      this.downedStates.set(targetId, out.downed);
+      return {
+        applied: true, consume: true, reason: 'ok',
+        effect: { itemId, targetId, trapped: out.trapped, stacks: out.downed.bubbleStacks },
+      };
+    }
+
+    const food = FOOD_BY_ID.get(itemId);
+    if (food !== undefined) {
+      const list = this.foodBuffs.get(actorId) ?? [];
+      list.push(foodBuffFrom(food));
+      this.foodBuffs.set(actorId, list);
+      let healed = 0;
+      if (food.instantHealHp > 0) healed = this.vitals.heal(actorId, food.instantHealHp);
+      return {
+        applied: true, consume: true, reason: 'ok',
+        effect: { itemId, buffs: list.length, healedHp: healed, durationSec: food.durationSec },
+      };
+    }
+
+    return { applied: false, consume: false, reason: `道具 ${itemId} 没有使用语义` };
   }
 
   /**
@@ -4417,6 +4544,10 @@ export class WorldSim {
          (`lastRoomScan` / `lastRoomCells`)。放在之前会读到上一帧的房间 ——
          玩家盖好卧室的当帧拿不到增益,表现为「晚一帧才生效」。 */
       this.tickRoomEffects();
+
+      /* ── 慢帧 2Hz:料理 buff 计时(`USE_ITEM` 吃下的那一半)──
+         放在房间效果之后无依赖;过期即删,所以"吃完过一会儿就没了"是可观察的。 */
+      this.tickFoodBuffs();
 
       /* ── 慢帧 2Hz:幽灵泡泡与救援(task-44)──
          读 `vitals.downed`(VitalsSystem 的瞬时判定),负责其后的持续状态:

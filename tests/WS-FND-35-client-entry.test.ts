@@ -37,6 +37,7 @@ import {
   openChestRequest,
   sleepRequest,
   startPartyRequest,
+  useItemRequest,
   useOwnChestRequest,
   type ActionPorts,
 } from '../client/src/net/action_entry.ts';
@@ -345,28 +346,152 @@ test('FND35-7 绑定层在**无 DOM** 环境可被驱动(假 window 也一样跑
 
 test('FND35-8 键位表与既有键位**不重叠**,提示行由表生成', () => {
   /* 撞键的后果:一次按键同时触发两件事,而**两边都不报错**。
-     `q/e/g/f` 是 `net/action_target.ts` 的 ACTION_KEYS(那里已有 WS-FND-22 钉着),
-     这里用**字面量**再钉一次"本层不许用它们"。 */
-  const taken = ['q', 'e', 'g', 'f'];
+     期望值全用**字面量**再钉一次"本层不许用它们"(q/e/g/f 另有 WS-FND-22 钉着)。 */
+  const taken = [
+    'q', 'e', 'g', 'f',            // net/action_target.ts 的 ACTION_KEYS
+    'w', 'a', 's', 'd',            // net/input.ts 的 MOVE_KEYS
+    'i', 'r', 'p', 'b',            // three/boot.ts 的面板快捷键
+    'z', 'y', 'x', 'c', 'escape',  // 同上(画架工具 + 退出)
+    ' ',                           // main.ts 空格 = 攻击
+  ];
   for (const k of Object.keys(ENTRY_KEYS)) {
-    ok(!taken.includes(k), `键 "${k}" 不能与既有动作键重叠(会一次触发两件事)`);
+    ok(!taken.includes(k), `键 "${k}" 不能与既有键位重叠(会一次触发两件事)`);
   }
-  eq(Object.keys(ENTRY_KEYS).length, 5, '五个动作各一个键');
+  eq(Object.keys(ENTRY_KEYS).length, 6, '六个动作各一个键');
   eq(
     new Set(Object.values(ENTRY_KEYS).map((s) => s.slot)).size,
-    5,
+    6,
     '两个键不能映射到同一个槽位(复制粘贴最容易出这种错)',
   );
 
   const hints = entryKeyHints();
   eq(
     hints,
-    'N 合成 · K 睡觉 · O 开公共储物箱 · U 开自己的储物箱 · V 派对开局',
+    'N 合成 · K 睡觉 · O 开公共储物箱 · U 开自己的储物箱 · V 派对开局 · T 使用道具',
     '提示行原文(由 ENTRY_KEYS 生成,不手写第二份)',
   );
   for (const k of Object.keys(ENTRY_KEYS)) {
     ok(hints.includes(k.toUpperCase()), `提示行应含键 ${k.toUpperCase()}`);
   }
+});
+
+/* ═══════════════════════════ 9 —— `USE_ITEM`(TASK-99) ═══════════════════════════ */
+
+test('FND35-9 USE_ITEM:合法 itemId 且**不给** targetId ⇒ 载荷逐字段正确,且 targetId 键**不存在**', () => {
+  /* 期望值全字面量:载荷两格都复用 `ActionPayload` 现成字段(`itemId` / `targetId`)。 */
+  eq(
+    useItemRequest({ itemId: 733 }),
+    { ok: true, request: { action: 'USE_ITEM', payload: { itemId: 733 } } },
+    '省略 targetId ⇒ 载荷只有 itemId(= 对自己用)',
+  );
+  const built = useItemRequest({ itemId: 733 });
+  if (!built.ok) { ok(false, '合法 itemId 不该被拒'); return; }
+  eq(Object.keys(built.request.payload), ['itemId'], '★ 键集合必须**恰好**是 ["itemId"]');
+  ok(
+    !Object.prototype.hasOwnProperty.call(built.request.payload, 'targetId'),
+    '★ 省略时不写 `targetId: undefined`(线上会多一个 null,服务端会把"对自己用"读成"目标非法")',
+  );
+
+  /* 经入口发出去的那条(铺平后)也不许冒出 targetId。 */
+  const r = recorder();
+  const entry = new ActionEntry(r.ports);
+  const out = entry.useItem({ itemId: 733 });
+  eq(out.sent, true, '合法输入 ⇒ 真的发出去');
+  eq(r.sent[0], { itemId: 733, action: 'USE_ITEM' }, '铺平后恰好是这两个键(动作名在展开之后)');
+  ok(
+    !Object.prototype.hasOwnProperty.call(r.sent[0], 'targetId'),
+    '★ 递出去的 intent 上也不许有 targetId 这个键',
+  );
+});
+
+test('FND35-10 USE_ITEM:带 targetId ⇒ 键存在且值正确', () => {
+  eq(
+    useItemRequest({ itemId: 227, targetId: 'p-42' }),
+    { ok: true, request: { action: 'USE_ITEM', payload: { itemId: 227, targetId: 'p-42' } } },
+    '给 targetId ⇒ 原样带上(对队友用)',
+  );
+  const built = useItemRequest({ itemId: 227, targetId: 'p-42' });
+  if (!built.ok) { ok(false, '合法输入不该被拒'); return; }
+  eq(Object.keys(built.request.payload), ['itemId', 'targetId'], '两个键都在');
+  eq(built.request.payload.targetId, 'p-42', '★ targetId 的值就是给进来的那个');
+
+  /* 空串 / 非字符串 ⇒ 拒绝:空串会被服务端读成"有目标但解析不出来"。 */
+  eq(useItemRequest({ itemId: 227, targetId: '' }).ok, false, 'targetId 空串 ⇒ 拒绝(想对自己用就别给这个键)');
+  eq(useItemRequest({ itemId: 227, targetId: 7 }).ok, false, 'targetId 非字符串 ⇒ 拒绝');
+
+  const r = recorder();
+  const entry = new ActionEntry(r.ports);
+  entry.useItem({ itemId: 227, targetId: 'p-42' });
+  eq(r.sent[0], { itemId: 227, targetId: 'p-42', action: 'USE_ITEM' }, '线上 intent 逐字正确');
+});
+
+test('FND35-11 USE_ITEM:itemId 非法(0 / -1 / 1.5 / 字符串 / 缺)⇒ ok:false 且**一次都不发**', () => {
+  const bad: unknown[] = [0, -1, 1.5, '733', undefined];
+  for (const itemId of bad) {
+    const built = useItemRequest({ itemId });
+    eq(built.ok, false, `itemId = ${String(itemId)} 必须被构建器拒绝`);
+    if (built.ok) continue;
+    ok(built.reason.length > 0, `itemId = ${String(itemId)} 的拒绝必须有可读理由(否则就是静默)`);
+  }
+  eq(useItemRequest().ok, false, '一个参数都不给 ⇒ 拒绝');
+  eq(useItemRequest({ itemId: 733, targetId: 'x' }).ok, true, '对照:同一批里合法的那条不被误拦');
+
+  /* 计数桩:五次非法触发,`sendAction` 必须 0 次被调用。 */
+  const r = recorder();
+  const entry = new ActionEntry(r.ports);
+  for (const itemId of bad) {
+    const out = entry.useItem({ itemId });
+    eq(out.sent, false, `itemId = ${String(itemId)} ⇒ 不发`);
+    eq(out.code, 'INVALID_INPUT', `itemId = ${String(itemId)} 的分类是"参数不对",不是"未连接"`);
+  }
+  eq(r.sent.length, 0, '★ 五次非法触发,一条报文都不该被递出去');
+  eq(entry.sentCount, 0, '入口自己的"发出计数"也必须是 0');
+});
+
+test('FND35-12 USE_ITEM:未连接 ⇒ NOT_CONNECTED 且不发(与"参数不对"分开)', () => {
+  const r = recorder({ live: false });
+  const entry = new ActionEntry(r.ports);
+  const out = entry.useItem({ itemId: 733, targetId: 'p-1' });
+  eq(out.sent, false, '未连接 ⇒ 不发');
+  eq(out.code, 'NOT_CONNECTED', '分类必须是"未连接"(两种失败两种修法)');
+  ok(out.status.includes('未连接'), '未连接要有可读分支');
+  eq(r.sent.length, 0, '★ 未连接时 sendAction 一次都不该被调用');
+});
+
+test('FND35-13 USE_ITEM 的键位 / 按钮路径:只查表 + 递参数', () => {
+  const r = recorder();
+  const entry = new ActionEntry(r.ports);
+  eq(ENTRY_KEYS.t?.slot, 'useItem', 'T 映射到 useItem 槽位');
+
+  /* 按钮路径:参数由调用方显式给。 */
+  const noHost = createActionBinding({
+    entry,
+    inputs: { craft: () => ({}), chestCell: () => ({ x: 0, y: 0 }), partyModeEcho: () => undefined },
+  });
+  const byButton = noHost.trigger('useItem', { useItem: { itemId: 733, targetId: 'p-9' } });
+  eq(byButton.request?.payload, { itemId: 733, targetId: 'p-9' }, '按钮路径给的参数原样进载荷');
+  eq(r.sent[0]?.action, 'USE_ITEM', '递出去的是 USE_ITEM');
+
+  /* 键盘路径:宿主没提供"当前选中的道具"⇒ **不发**,但必须**有话说**(不静默)。 */
+  const byKeyNoArgs = noHost.handleKey('t');
+  eq(byKeyNoArgs?.sent, false, '宿主给不出 itemId ⇒ 不发(不许拿 0 当默认值)');
+  eq(byKeyNoArgs?.code, 'INVALID_INPUT', '分类是参数不对');
+  ok((byKeyNoArgs?.status ?? '').includes('itemId'), '★ 按了 T 必须有话说:状态行点名缺 itemId');
+  eq(r.sent.length, 1, '没参数那次一条都没多发');
+
+  /* 宿主提供参数 ⇒ 同一条路发出去。 */
+  const withHost = createActionBinding({
+    entry,
+    inputs: {
+      craft: () => ({}),
+      chestCell: () => ({ x: 0, y: 0 }),
+      partyModeEcho: () => undefined,
+      useItem: () => ({ itemId: 227 }),
+    },
+  });
+  const byKey = withHost.handleKey('t');
+  eq(byKey?.sent, true, '宿主给得出参数 ⇒ 按 T 真的发');
+  eq(r.sent[1], { itemId: 227, action: 'USE_ITEM' }, '键盘路径发出去的也是逐字正确的 intent');
 });
 
 report('WS-FND-35-client-entry');

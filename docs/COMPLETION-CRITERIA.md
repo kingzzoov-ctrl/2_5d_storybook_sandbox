@@ -72,8 +72,8 @@ $ node scripts/backlog.ts
             `ws_server.ts` 按 `t:'move'` 收下并转 `room.applyMove`)。
     ⇒ **仍未勾**:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
       + 客户端帧形态),本轮只做到「两侧各有断言 + 帧形态被钉住」。
-[x] 22 个 RoomAction 中,该有执行层的那些**真的执行**
-    ★ 现状(2026-11-15 第六轮):已接线 **20 个** ——
+[x] 23 个 RoomAction 中,该有执行层的那些**真的执行**
+    ★ 现状(2026-11-15 第七轮):已接线 **21 个** ——
       管理四件(`SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE`)
       + `CLOSE_ROOM` + **物质层四件套**(`PLACE_BLOCK` / `BREAK_BLOCK` / `DROP_ITEM` /
       `PICKUP_ITEM`)+ **容器/合成/睡觉四件**(`CRAFT` / `SLEEP` / `OPEN_CHEST` /

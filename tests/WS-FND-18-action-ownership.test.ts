@@ -12,7 +12,7 @@
  *
  * ```
  * 每个动作 ∈ {已接线(dispatchAction 不返回 NOT_IMPLEMENTED), 未接线(显式 NOT_IMPLEMENTED)}
- * 两组不交、并集 = 全部 22 个 ⇒ 新增动作必须当场作决定
+ * 两组不交、并集 = `RoomAction` 的全部键 ⇒ 新增动作必须当场作决定(判据已改为逐键相等,不数总数)
  * 未接线的每个在 docs/TASK-96-action-landing-gaps.md 里写明「缺什么」
  * ```
  *
@@ -29,7 +29,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assemble } from '../server/src/index.ts';
-import { RoomAction, type ActionOutcome } from '../server/src/net/room.ts';
+import {
+  RoomAction, PERMISSION_MATRIX, ACTION_PERMISSION, type ActionOutcome,
+} from '../server/src/net/room.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -42,14 +44,20 @@ const mkRuntime = (): ReturnType<typeof assemble>['runtime'] => {
 };
 
 const ALL_ACTIONS: string[] = Object.values(RoomAction);
-
-test('FND18-1 动作清单:22 个,且每个都由 `dispatchAction` 给出**归类**(不交不重)', () => {
+test('FND18-1 动作清单:每个 `RoomAction` 都由 `dispatchAction` 给出**归类**(不交、不重、不漏)', () => {
   /* 变红条件:
-       1 有人加了第 23 个动作却没接线也没文档 ⇒ 本断言仍绿,但 FND18-2 的
-          「未接清单 ⊆ 文档」会红 —— 两条一起才有牙;
-       2 有人让 `dispatchAction` 对某个动作 **throw** ⇒ 归类直接失败。
-       ⚠️ 这里**不**断言"哪些个应该接" —— 那是产品裁决,不是测试能决定的。 */
-  eq(ALL_ACTIONS.length, 22, 'RoomAction 应有 22 个成员');
+       1 `RoomAction` 里两个键指向**同一个**动作名(复制粘贴手滑)⇒ 第一条红 ——
+          那会让「逐个动作归类」把同一个动作数两次、同时另一个动作静默消失;
+       2 有人让 `dispatchAction` 对某个动作 **throw** ⇒ 归类直接失败;
+       3 归类结果与 `RoomAction` 的**键集**不相等(某动作被 `continue` 掉 / 两边都在)⇒ 红。
+     ⚠️ 这里**不写死动作总数**(此前的形态是 `eq(ALL_ACTIONS.length, 22)` 与
+        `eq(wired.length + notImpl.length, 22)`:加第 23 个动作就得手改)。
+        要钉的是**结构** —— 键集 = 归类集、键值不重复;「一共几个」由 `RoomAction`
+        自己派生。加动作而不归类 ⇒ 仍然红,这正是要的信号。
+     ⚠️ 这里**不**断言"哪些个应该接" —— 那是产品裁决,不是测试能决定的。 */
+  /* 不重:值就是动作名,两个键不许指向同一个值。 */
+  eq(new Set(ALL_ACTIONS).size, ALL_ACTIONS.length,
+    'RoomAction 的值不许重复(重复会让归类结果虚高、真动作被吞掉)');
   const rt = mkRuntime();
   const wired: string[] = [];
   const notImpl: string[] = [];
@@ -66,11 +74,13 @@ test('FND18-1 动作清单:22 个,且每个都由 `dispatchAction` 给出**归�
   /* 不交:一个动作不能同时"接了"和"没接" */
   const both = wired.filter((a) => notImpl.includes(a));
   eq(both.join(','), '', `同一动作不能既接线又 NOT_IMPLEMENTED:${both.join(',') || '无'}`);
-  /* 不重 + 覆盖:两组加起来恰好是全部 22 个 */
-  eq(wired.length + notImpl.length, 22, '两组之和应恰为 22(不允许有动作被"漏掉归类")');
+  /* 不重 + 覆盖:**归类集 === RoomAction 的键集**(逐个相等,不是"数量相等") */
+  eq([...wired, ...notImpl].sort(), [...ALL_ACTIONS].sort(),
+    '归类结果必须恰好等于 RoomAction 的全部键:漏判(某动作没被裁决)与重判(同一动作进两组)都红');
   ok(wired.length > 0, '至少要有一个真的接上了(否则这条判据没有意义)');
-  /* 记录到判据里:数值本身由下方断言盯住变化 */
-  eq(`${wired.length}/${notImpl.length}`, `${wired.length}/${22 - wired.length}`, '归类数应自洽');
+  /* 归类数自洽:已接线 + 未接线 = 键数(键数派生,不写死) */
+  eq(wired.length + notImpl.length, Object.keys(RoomAction).length,
+    '归类数应自洽:已接线 + 未接线 = RoomAction 的键数');
 });
 
 test('FND18-2 未接线的动作必须**显式**返回 NOT_IMPLEMENTED,且理由在文档里逐条写明', () => {
@@ -119,20 +129,59 @@ test('FND18-4 越权**不执行**:已接线回 PERMISSION、未接线回 NOT_IMP
   const rt = a.runtime;
   rt.join({ userId: 'o' });
   rt.join({ userId: 'g', asGuest: true });
+  /* 表 = 「GUEST 被拒」的**结构**:每个 GUEST 缺的权限位至少一行(判据见下方 ②/③)。
+     ⚠️ 加动作**不必**改这里;只有当新动作落在「目前没有用例覆盖的被拒权限位」上时才红。 */
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ['MOVE', {}, 'NOT_IMPLEMENTED'],
-    ['CLOSE_ROOM', {}, 'PERMISSION'],
-    ['SET_ROOM_ACCESS', { mode: 'PUBLIC' }, 'PERMISSION'],
-    ['KICK_MEMBER', { targetId: 'o' }, 'PERMISSION'],
+    ['CLOSE_ROOM', {}, 'PERMISSION'], /* destructive */
+    ['SET_ROOM_ACCESS', { mode: 'PUBLIC' }, 'PERMISSION'], /* configure */
+    ['KICK_MEMBER', { targetId: 'o' }, 'PERMISSION'], /* manage */
+    ['PLACE_BLOCK', {}, 'PERMISSION'], /* build */
+    ['PLACE_AUTOMATION', {}, 'PERMISSION'], /* wiring */
+    ['OPEN_CHEST', {}, 'PERMISSION'], /* publicStorage */
+    ['MODIFY_TOWN', {}, 'PERMISSION'], /* town */
+    ['START_PARTY', {}, 'PERMISSION'], /* party */
   ];
   for (const [action, payload, expected] of cases) {
     const out = rt.dispatchAction('g', action as never, payload);
     ok(out.kind !== 'OK', `GUEST 执行 ${action} 不该成功(实得 ${out.kind})`);
     eq(out.kind, expected, `${action} 对 GUEST 的拒绝类别`);
   }
-  /* 负对照:OWNER 做同一件事应当成功(否则上面四条可能只是"全都失败了") */
+  /* 负对照:OWNER 做同一件事应当成功(否则上面这些可能只是"全都失败了") */
   const okOwner = rt.dispatchAction('o', 'KICK_MEMBER' as never, { targetId: 'g' });
   eq(okOwner.kind, 'OK', 'OWNER 踢 GUEST 应成功 —— 证明上面失败的是**权限**,不是这个动作本身');
-});
 
+  /* ═══ 表的**结构**判据(不含动作总数,新动作进来通常不需要改本段) ═══
+   * ① 表里每个名字都必须是 `RoomAction` 的真键 —— 否则那条用例在测一个**不存在**的动作,
+   *    「越权被拒」可能只是因为它压根不是动作(往表里塞一条 'NO_SUCH_THING' ⇒ 这里红);
+   * ② 表必须覆盖 GUEST **被拒的每一个权限位**(由 `PERMISSION_MATRIX.GUEST` 派生):
+   *    删掉某一行(如 CLOSE_ROOM)就会留下一个没有任何用例的 `destructive` 位 ⇒ 红;
+   * ③ 期望 PERMISSION 的行,其权限位必须真是 GUEST 没有的(同样派生,不靠人肉核对)。
+   *  ⚠️ 新增动作并纳进 `ACTION_PERMISSION` 后本段自然仍绿;若新动作占了一个**没有用例
+   *     覆盖**的被拒权限位 ⇒ 红 —— 那正是「加动作必须当场作决定」的信号。 */
+  const actionKeys = new Set<string>(Object.keys(RoomAction));
+  const guestPerms = PERMISSION_MATRIX.GUEST;
+  const deniedBits = Object.keys(guestPerms)
+    .filter((bit) => guestPerms[bit as keyof typeof guestPerms] === false);
+
+  for (const [action, , expected] of cases) {
+    ok(actionKeys.has(action),
+      `FND18-4 表里的 ${action} 不是 RoomAction 的键 ⇒ 这条用例在测一个不存在的动作`);
+    if (expected !== 'PERMISSION') continue;
+    const bit = ACTION_PERMISSION[action as RoomAction];
+    ok(guestPerms[bit] === false,
+      `${action} 期望 GUEST 回 PERMISSION,但 \`PERMISSION_MATRIX.GUEST.${String(bit)}\` 为 true`
+      + ' ⇒ 期望与权限矩阵矛盾');
+  }
+
+  const coveredBits = new Set<string>(
+    cases.filter(([, , expected]) => expected === 'PERMISSION')
+      .map(([action]) => String(ACTION_PERMISSION[action as RoomAction])),
+  );
+  const uncovered = deniedBits.filter((bit) => !coveredBits.has(bit));
+  eq(uncovered.join(','), '',
+    `GUEST 被拒的权限位必须各有至少一条越权用例(缺:[${uncovered.join(',')}];`
+    + `已覆盖:[${[...coveredBits].sort().join(',')}];被拒位:[${deniedBits.join(',')}])`);
+
+});
 report('WS-FND-18');

@@ -15,7 +15,8 @@
  * ⇒ 事实源应该是**源码本身**。`scripts/action-coverage.ts` 只读源码算出
  * `wired` / `unwired` / `total`;本套件做两件事:
  *
- *   1 钉住派生结果本身(总数 22、已知接线、刻意不接的 MOVE/ATTACK、不重不漏);
+ *   1 钉住派生结果本身(总数 = 运行期 `Object.keys(RoomAction).length`、已知接线、刻意不接的
+ *     MOVE/ATTACK、不重不漏);
  *   2 **交叉核对**上面三份硬编码名单 ——
  *     · ACT-2(FND38-5):正向「名单里的动作必须未接线」**且**反向
  *       「`unwired` 里的动作也必须出现在名单里,除非在 `ACT2_EXEMPT` 里写明理由」;
@@ -60,6 +61,9 @@ import { fileURLToPath } from 'node:url';
 
 import { deriveActionCoverage, extractFnd21List, formatCoverage } from '../scripts/action-coverage.ts';
 import type { ActionCoverage } from '../scripts/action-coverage.ts';
+/* 运行期的 `RoomAction` 本身 —— 用它与「读源码派生出的 total」对账(两条独立路径)。
+   ⚠️ 这里**不**写死动作总数:第 23 个动作进来时本文件不该需要手改。 */
+import { RoomAction } from '../server/src/net/room.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -215,18 +219,26 @@ function snapshot(): string {
 
 /* ═══════════════════════════════ 断言 ═══════════════════════════════ */
 
-test('FND38-1 动作总数 = 22:数字从 room.ts 的 RoomAction **派生**,断言用外部约定字面量', () => {
+test('FND38-1 动作总数从 room.ts 的 `RoomAction` **派生**:与运行期 `Object.keys(RoomAction)` 逐个一致', () => {
   /* 变红条件:
-       1 `RoomAction` 增删成员却没同步产品口径(22)⇒ 红;
-       2 派生器读不到 `RoomAction` 字面量(改名/搬家)⇒ cov() 抛错 ⇒ 红。
-     ⚠️ 22 在这里是**外部约定**(`docs/` 与三份名单都按 22 说),故意写死;
-        派生器内部**不**写死 22 —— 它数的是 `Object.keys(RoomAction).length`。
-        两边相等才叫「源码与约定一致」。 */
+       1 派生器读不到 `RoomAction` 字面量(改名/搬家)⇒ cov() 抛错 ⇒ 红;
+       2 派生器**数错/读漏**:文本派生的 `total` 与运行期 `Object.keys(RoomAction).length`
+          不等,或逐动作名单不相等 ⇒ 红。
+         这两条路径是**独立**的:一条正则读 `room.ts` 源码,一条真 `import` 运行期对象,
+         所以这不是恒真比较。
+     ⚠️ 这里**不再写死 22**(此前的形态是「外部约定 22」,加第 23 个动作就必须手改本行):
+        「动作一共几个」的事实源是 `RoomAction` 自己。加成员而派生器没跟上 ⇒ 仍然红 ——
+        那才是要的信号;加成员且派生器跟上 ⇒ 自然绿,不必人肉同步。 */
   const c = cov();
-  eq(c.total, 22, 'RoomAction 应有 22 个成员(派生自源码,断言用外部约定 22)');
-  eq(c.totalSource.file, 'server/src/net/room.ts', '22 的出处应是 room.ts');
-  ok(c.totalSource.line > 0, `必须给出 22 的出处行号(实得 ${c.totalSource.line})`);
-  eq(c.rows.length, c.total, '逐动作判定应与动作数一样多(每个动作都必须被裁决)');
+  const runtimeKeys = Object.keys(RoomAction);
+  eq(c.total, runtimeKeys.length, '派生出的动作总数必须等于运行期 RoomAction 的键数');
+  eq(c.totalSource.file, 'server/src/net/room.ts', '动作总数的出处应是 room.ts');
+  ok(c.totalSource.line > 0, `必须给出动作总数的出处行号(实得 ${c.totalSource.line})`);
+  eq(
+    c.rows.map((r) => r.action),
+    runtimeKeys,
+    '逐动作判定的名单与顺序都必须等于 RoomAction 的声明序(漏一个或多一个都红 ⇒ 每个动作都必须被裁决)',
+  );
 });
 
 test('FND38-2 已知接线:CRAFT / SLEEP / OPEN_CHEST / RESET_WORLD 必须在 wired 里', () => {

@@ -91,6 +91,36 @@ function mods(p: Partial<FoodBuff['statMods']> = {}): FoodBuff['statMods'] {
   };
 }
 
+/**
+ * 由 `FoodDef` 构造一条**生效中**的料理 buff。
+ *
+ * 存在的理由:`USE_ITEM`(吃掉一份成品)需要与 `cookSoup` **完全同形**的 buff,
+ * 而"同形"必须只有一份声明 —— 默认值表在 `mods()`,key 命名与 stack 语义在这里。
+ * ⚠️ `cookSoup` 内部**暂时仍写着自己的字面量**(它多算大铁铲词条与 branch 覆盖);
+ *   `tests/WS-FND-39` 有一条断言把两边对同一种料理的结果**逐字段比**,
+ *   所以两边一旦漂就会红 —— 这是不直接改 `cookSoup` 的代价,也就是那条断言的存在理由。
+ */
+export function foodBuffFrom(
+  def: FoodDef,
+  opts: {
+    durationSec?: number;
+    statMods?: FoodBuff['statMods'];
+    extraFlags?: Record<string, number | string | boolean>;
+  } = {},
+): FoodBuff {
+  const durationSec = opts.durationSec ?? def.durationSec;
+  return {
+    key: `food_${def.id}`,
+    sourceItemId: def.id,
+    branch: def.branch,
+    durationSec,
+    remainingSec: durationSec,
+    stacks: 1,
+    statMods: opts.statMods ?? mods(def.statMods),
+    flags: { ...def.flags, ...(opts.extraFlags ?? {}) },
+  };
+}
+
 /** 恶作剧判定优先级:列表靠前者优先命中。 */
 export const PRANK_PRIORITY: readonly number[] = [607, 608, 609, 610, 611];
 

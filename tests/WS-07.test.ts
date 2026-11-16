@@ -2542,15 +2542,19 @@ test('F12 【权限矩阵】MEMBER 可建造但不可配置/破坏;ADMIN 不可�
   eq(rt.authorize('owner', RoomAction.SET_ROOM_ACCESS).allowed, true);
 });
 
-test('F13 权限矩阵表结构完整:4 角色 × 9 权限位 × 22 动作全覆盖', () => {
+test('F13 权限矩阵表结构完整:4 角色 × 9 权限位 × **全动作覆盖**(动作数从 `RoomAction` 派生,不写死)', () => {
   eq(Object.keys(PERMISSION_MATRIX).length, 4);
   for (const role of [RoomRole.OWNER, RoomRole.ADMIN, RoomRole.MEMBER, RoomRole.GUEST]) {
     const p = PERMISSION_MATRIX[role];
     eq(Object.keys(p).length, 9, `${role} 权限位数`);
     ok(p.baseline === true, `${role} 必须有 baseline`);
   }
-  const actions = Object.keys(ACTION_PERMISSION);
-  eq(actions.length, Object.keys(RoomAction).length, '每个动作都要映射到权限位');
+  /* 动作总数**不写死**:钉「`ACTION_PERMISSION` 的定义域 === `RoomAction` 的键集」。
+     加第 23 个动作而没登记权限位 ⇒ 这里红(信号);登记了就自然绿,不必手改数量。 */
+  const actions = Object.keys(ACTION_PERMISSION).sort();
+  const declaredActions = Object.values(RoomAction).sort();
+  eq(actions.join(','), declaredActions.join(','),
+    '每个动作都要映射到权限位 —— 定义域必须逐个等于 RoomAction 的键(多一个/少一个都红)');
   for (const a of Object.values(RoomAction)) {
     ok(ACTION_PERMISSION[a] in PERMISSION_MATRIX.OWNER, `${a} 的权限位非法`);
   }
@@ -3979,10 +3983,18 @@ test('task-40 判定:prediction 是**客户端**模块,已搬到 client/src/net/
  * 判据不是可达性,而是**「授权数量 vs 执行数量」的落差**。
  * 门禁查不到「声明了 22 个动作、只有 3 个能真的发生」这种形态。 */
 
-test('task-38 【已改向】RoomAction 声明 22 个动作;4 条报文通道均已接执行层', () => {
-  /* ① 动作面:声明了多少 */
+test('task-38 【已改向】RoomAction 逐条声明动作(键名自证、不重复);4 条报文通道均已接执行层', () => {
+  /* 1 动作面:声明表的**形状**。
+     ⚠️ 原先这里是 `eq(declared.length, 22)`:第 23 个动作(`USE_ITEM`)一进 `RoomAction`
+        本行就红,而它想说的只是「声明表还在、还自洽」。改钉结构(不含总数):
+        键名 = 动作名(自名映射)、值不重复 ⇒ 改名 / 两个键指同一动作会红;
+        「一共几个」由 `F13`(`:2554` 起)对 `ACTION_PERMISSION` 的定义域派生,不在这里数。 */
   const declared = Object.values(RoomAction);
-  eq(declared.length, 22, 'RoomAction 声明 22 个动作');
+  eq(Object.keys(RoomAction).join(','), declared.join(','),
+    'RoomAction 必须是「键名 = 动作名」的自名映射(顺序也要一致)');
+  eq(new Set(declared).size, declared.length,
+    '动作值不许重复(重复会让「声明的动作数」虚高)');
+  ok(declared.length > 0, '至少要声明一个动作');
 
   /* ② 通道面:客户端真实能发的消息 */
   const roomColyseus = readFileSync(join(ROOT_DIR, 'server', 'src', 'net', 'room.colyseus.ts'), 'utf8');
@@ -4245,12 +4257,18 @@ test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是
       `room.ts 没有 ${missing}() ⇒ 该动作无执行者`);
   }
 
-  /* ⇒ 结论固化:动作**声明**数远大于**可执行**数。这个落差是本缺陷的度量。 */
+  /* ⇒ 结论固化:动作**声明**数远大于**可执行**数。这个落差是本缺陷的度量。
+     ⚠️ 这份名单是**手抄**的:「有没有执行者」是语义判断,派生不出来。
+        加动作就得在这里加一行,否则下面那条**集合相等**会红 —— 这是**有意的**信号
+        (第 23 个 `USE_ITEM` 就是这么补进来的),不是「忘了同步」。
+        ⚠️ 判据从「数量相等」升为「逐项相等」:漏登记、写错名、重复都会红。 */
   const executable = ['MOVE', 'ATTACK', 'PLACE_BLOCK', 'BREAK_BLOCK', 'PICKUP_ITEM',
     'DROP_ITEM', 'CRAFT', 'USE_ALCHEMY_FURNACE', 'OPEN_CHEST', 'USE_OWN_CHEST', 'SLEEP',
     'START_PARTY', 'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
-    'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME'];
-  eq(executable.length, declared.length, '逐条枚举覆盖全部动作(防止未来加动作时漏登记)');
+    'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME',
+    'USE_ITEM'];
+  eq(executable.slice().sort(), declared.slice().sort(),
+    '逐条枚举必须**逐个等于** RoomAction 的键集,而不只是数量相等(漏登记/写错名/重复都红)');
 });
 
 /* ═══ task-38:「可达 ≠ 可跑」—— 生产入口可跑性的**结构**判据 ═══ */

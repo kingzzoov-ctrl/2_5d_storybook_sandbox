@@ -26,9 +26,10 @@
  * net/action_target.ts 的 ACTION_KEYS  q / e / g / f
  * three/boot.ts 的面板快捷键          i / r / e / p / b / z / y / x / c / escape
  * main.ts                             ' '(空格) = 攻击
- * ⇒ 本层用 n / k / o / u / v(五个都不在以上任何一个集合里)
+ * net/input.ts 的 MOVE_KEYS           w / a / s / d(+ 四个方向键)
+ * ⇒ 本层用 n / k / o / u / v / t(六个都不在以上任何一个集合里)
  * ```
- * `tests/WS-FND-34-client-entry.test.ts` 有一条判据钉住「与 `ACTION_KEYS` 不重叠」。
+ * `tests/WS-FND-35-client-entry.test.ts` 的 FND35-8 有一条判据钉住「与以上集合不重叠」。
  */
 
 import {
@@ -37,12 +38,13 @@ import {
   type ChestInput,
   type CraftInput,
   type EntryOutcome,
+  type UseItemInput,
 } from './action_entry.ts';
 
 /* ═══════════════════════════ 1. 槽位与键位表(唯一一处) ═══════════════════════════ */
 
-/** 入口的五个槽位。UI 按钮与键位都映射到它。 */
-export type EntrySlot = 'craft' | 'sleep' | 'openChest' | 'useOwnChest' | 'startParty';
+/** 入口的六个槽位。UI 按钮与键位都映射到它。 */
+export type EntrySlot = 'craft' | 'sleep' | 'openChest' | 'useOwnChest' | 'startParty' | 'useItem';
 
 /**
  * 槽位 → **玩家读到的名字**。UI 按钮的标题取这里(提示行也取这里)——
@@ -54,6 +56,7 @@ export const ENTRY_SLOTS: Readonly<Record<EntrySlot, string>> = {
   openChest: '开公共储物箱',
   useOwnChest: '开自己的储物箱',
   startParty: '派对开局',
+  useItem: '使用道具',
 };
 
 /** 一条键位定义:这个键属于哪个槽位。 */
@@ -74,6 +77,15 @@ export const ENTRY_KEYS: Readonly<Record<string, EntryKeySpec>> = {
   o: { slot: 'openChest' },
   u: { slot: 'useOwnChest' },
   v: { slot: 'startParty' },
+  /*
+   * `t` 给 `USE_ITEM`(TASK-99)。**为什么不是别的字母**:
+   * 空闲集是 { h, j, l, m, t }(q/e/g/f 属 ACTION_KEYS,w/a/s/d 属 MOVE_KEYS,
+   * i/r/p/b/z/y/x/c/escape 属 boot.ts 的面板键,空格属 main.ts 的攻击,
+   * n/k/o/u/v 已被上面五个槽位占掉)。五个都能用,取 `t` 是因为它与既有键
+   * **不同指**、也不落在 WASD 手位上(移动中按不到 ⇒ 不会一边跑一边误用道具),
+   * 而 h/j/l/m 全在左手移动手位附近。
+   */
+  t: { slot: 'useItem' },
 };
 
 /** 一行提示(键与文案分别来自两张表,不手写第二份)。 */
@@ -101,6 +113,15 @@ export interface EntryInputs {
   chestCell(): { x: unknown; y: unknown };
   /** 房间已选派对模式的**回声**;拿不到返回 `undefined`(入口则不核对)。 */
   partyModeEcho(): unknown;
+  /**
+   * `USE_ITEM` 的参数(哪件道具、对谁用)。
+   *
+   * **可选**:装配根(`main.ts`)目前还没有"当前选中的道具"这一格来源
+   * (`heldItemId` 在快照里恒 0,见 `main.ts` 的注释)⇒ 省掉它不会让宿主编译失败。
+   * 省略时键盘路径按 `{}` 调构建器,入口会回一句"需要 itemId"而**不是**静默 ——
+   * 这正是本层要保证的那条:按了没反应必须变成**按了有话说**。
+   */
+  useItem?(): UseItemInput;
 }
 
 /** 一次触发可显式给的参数(按钮路径用;省略的项回落到 `EntryInputs`)。 */
@@ -111,6 +132,8 @@ export interface TriggerArgs {
   cell?: { x: unknown; y: unknown };
   /** 派对模式回声。 */
   partyMode?: unknown;
+  /** `USE_ITEM` 的参数(哪件道具、对谁用;省略 `targetId` = 对自己用)。 */
+  useItem?: UseItemInput;
 }
 
 /* ═══════════════════════════ 3. 键盘目标(结构化,不引 DOM 类型) ═══════════════════════════ */
@@ -166,6 +189,12 @@ export function createActionBinding(opts: {
       }
       case 'startParty':
         return entry.startParty({ partyMode: args.partyMode ?? inputs.partyModeEcho() });
+      /*
+       * `USE_ITEM`:参数**先看显式给的**(按钮路径),再回落到宿主(键盘路径),
+       * 都没有就按 `{}` 递给构建器 —— 由构建器说"需要 itemId",本层不替它判。
+       */
+      case 'useItem':
+        return entry.useItem(args.useItem ?? inputs.useItem?.() ?? {});
     }
   };
 
