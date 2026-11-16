@@ -67,6 +67,8 @@ import {
   SOUP_POT_ID,
   KITCHEN_TABLE_ID,
   PIZZA_OVEN_ID,
+  BIG_SHOVEL_ID,
+  EXTINGUISH_RADIUS,
   foodBuffFrom,
   foodCombatInput,
   tickFoodBuff,
@@ -1956,7 +1958,11 @@ export class WorldSim {
        此前第三参恒缺 ⇒ 只有 `hpFlat` 那条路(`maxHpForLevel`)真的到达玩家。
        `hpMul` **不臆造**:食物给的是**加值**(`hpFlat`),不是乘区;`allyCount` 属于 731 徽章光环,不是料理。
        ⚠️ 仍无消费者的:`defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul`
-         —— 见 `docs/TASK-96` 二之六;`muOverride` 还差一个具名默认值导出(否则会退化成硬编码 0.75)。 */
+         —— 见 `docs/TASK-96` 二之六。
+       ★ 2026-11-16 更正:`muOverride` **不是**"缺一个具名默认值导出" —— 名字与语义
+         现在都在 `cooking.ts`(`MU_OVERRIDE_NONE = 0`)与地板表(`world/chunk.ts` 的
+         `DEFAULT_MU` = 0.75 / `muOfSlot`)里。它缺的是**接线**(滑溜料理要不要盖过
+         冰面的 0.98),那是玩法裁决,不是常量问题。 */
     const food = this.buffsOf(playerId);
     const attacker = combatantStats(level, [...wearing], foodCombatInput(food));
     const weaponId = opts.weaponId ?? attacker.flags.weaponId;
@@ -2681,6 +2687,17 @@ export class WorldSim {
   private static readonly FLAG_OBJ_ID = 435;
 
   /**
+   * 227 泡泡连发水枪 —— `useItem` 的**使用语义锚点**。
+   *
+   * ⚠️ 提到静态字段是因为它现在有**两个消费点**(活人半边的叠层 / 器件半边的灭火),
+   * 而原先是 `useItem` 里的一个局部量 ⇒ 灭火分支只能再写一遍 `227`。
+   * 一个数字两处出现就是漂移的入口(改一处忘另一处,静默失效)。
+   */
+  private static readonly BUBBLE_GUN_ITEM_ID = 227;
+  /** 212 大铁铲 —— `cooking.ts` 的注释点名它也能浇灭炉火,与 227 同一分支。 */
+  private static readonly SHOVEL_ITEM_ID = BIG_SHOVEL_ID;
+
+  /**
    * 生效中的击退:玩家 → 剩余位移(格)。**由慢帧推进**,推进期间拒绝位置搬家。
    *
    * ## 为什么是"位移"而不是"速度"
@@ -3114,7 +3131,7 @@ export class WorldSim {
   }
 
   /**
-   * `USE_ITEM` 的世界侧落点:按 `itemId` 分派三种语义。
+   * `USE_ITEM` 的世界侧落点:按 `itemId` + **目标类型**分派四种语义。
    *
    * ## `applied` 与 `consume` 为什么分开
    * 「生效」与「该扣道具」不是同一件事:733 超距 ⇒ 什么都没发生,**也不许扣**。
@@ -3123,17 +3140,19 @@ export class WorldSim {
    * ## 三种语义
    * 1 **733 复苏天使羽毛笔**:救 6 格内的幽灵泡泡队友,满血 + 3 秒无敌。
    *    距离判定**只由** `featherRevive` 拥有 —— 这里不预判。
-   * 2 **227 泡泡连发水枪**:对**已有 `DownedState` 的目标**叠泡泡层,满 3 层 ⇒ `BUBBLED`。
-   *    ⚠️ 手册里「对活人连中 3 发」那半边**今天没有建模**(`BUBBLED` 住在 `DownedState`),
-   *    不在这里另造一份"活人泡泡"状态 —— 那会是第二份表示。
+   * 2 **227 泡泡连发水枪**:**两半都有落点** —— 目标已有 `DownedState` ⇒ `bubbleGunHit`
+   *    (叠 3 层 ⇒ `BUBBLED`);目标是活人 ⇒ `combat/live_bubble.ts` 的状态机
+   *    (手册 §3.7:连中 3 发 ⇒ 装进大泡泡)。两者是**不同主体**,不是同一件事两份实现。
    * 3 **料理**:吃一份成品 ⇒ 写入该玩家的 active buffs(`foodBuffFrom` 是唯一构造处),
    *    即时回复 `instantHealHp`,`hpFlat` 由 `maxHpForLevel` 并进上限。
+   * 4 **器件(料理站)**:**227 水枪 / 212 大铁铲**浇灭炉火(`extinguishStationAt`)。
+   *    距离由内容层常量 `EXTINGUISH_RADIUS` 判 —— 动作层不预判,世界侧一处说了算。
    *
    * ## ⚠️ 不校验"该玩家真的有这一件"
    * 服务端今天**没有按件背包明细读口**(`PlayerState` 只有 `heldItemId`)⇒ `itemId` 是客户端自报的;
    * 这里只信"它是我认识的 id"。扣减由动作层走 `applyInventory`(总量守恒),见 `TASK-99`。
    */
-  useItem(actorId: string, req: { itemId: number; targetId?: string }): {
+  useItem(actorId: string, req: { itemId: number; targetId?: string; targetDeviceId?: number }): {
     applied: boolean;
     consume: boolean;
     reason: string;
@@ -3141,9 +3160,15 @@ export class WorldSim {
   } {
     /* 道具 id 来自冻结内容表(`shared/constants/items.ts`);这里只写两个语义锚点。 */
     const FEATHER_PEN_ID = 733;
-    const BUBBLE_GUN_ID = 227;
+    const BUBBLE_GUN_ID = WorldSim.BUBBLE_GUN_ITEM_ID;
     const itemId = Math.trunc(req.itemId);
     const targetId = req.targetId ?? actorId;
+
+    /* 0 **器件目标**:`targetDeviceId` 一出现就走灭火这条路,不再看 `targetId`
+       (否则"对着锅喊队友名字"会两边都算 —— 两种目标是互斥的报文形态)。 */
+    if (req.targetDeviceId !== undefined) {
+      return this.extinguishDeviceByHand(actorId, itemId, Math.trunc(req.targetDeviceId));
+    }
 
     if (itemId === FEATHER_PEN_ID) {
       const d = this.downedStates.get(targetId);
@@ -3394,16 +3419,20 @@ export class WorldSim {
   }
 
   /**
-   * 某玩家的**有效生命上限**(含房间增益)。
+   * 某玩家的**有效生命上限**(含房间增益)—— 与权威值**同一个数**的读数口。
    *
-   * ## 为什么不直接改 `PlayerVitals.maxHp`
+   * ## ★ 2026-11-16 更正:权威值是哪一份
    *
-   * `vitals.ts` 明说 `maxHp` 是**构造期常量**,且 `importVitals` 刻意
-   * **不信任存档里的 maxHp**(见那里的注释)。若房间效果直接写 `maxHp`,
-   * 存档往返一次就把增益固化,离开温泉也回不去 —— 与那条不变量冲突。
+   * 权威值是 `vitals.maxHp`,而它**已经含房间乘区** —— 乘区套在
+   * `maxHpForLevel`(上限的**唯一**算子)里,再经 `syncMaxHp` 落到 vitals。
+   * 「离开温泉即撤销」靠的是**每帧重算**(`onsenSec` 归零 ⇒ 下一次重算回到基准),
+   * 不是"从不写进 vitals"。
    *
-   * ⇒ 基准值留在 `vitals.maxHp`,增益在此**派生**。这样「离开即撤销」
-   * 天然成立,不需要任何反向记账(WT-03-64 的负对照钉住这条)。
+   * ⚠️ 本文曾写"基准值留在 `vitals.maxHp`、增益在此派生" —— 那是上一版的实现,
+   * 与本版**相反**。本方法现在的存在理由是:`WorldSim` 的**纯用法**(测试夹具,
+   * 没有房间运行时去推 `syncMaxHp`)也要能拿到同一个数,所以按同一口径重算一遍。
+   * 基准取 `baseMaxHp`(算子入参备忘),**不是** `v.maxHp`:后者在房间里已经含乘区,
+   * 再乘一次就是 ×1.69。`WS-03` 的 WT-03-64 负对照钉住"离开即撤销"。
    */
   effectiveMaxHp(id: string): number {
     const v = this.vitals.get(id);
@@ -4448,19 +4477,31 @@ export class WorldSim {
   }
 
   /**
+   * 器件在**图上的第一格**(`null` = 全图没有这件器件)。
+   *
+   * ## 为什么需要它(而不是各处自己 `for x for y`)
+   * 同一段扫描现在有**两个**消费点:出锅落点(`freeTileNear`)与灭火距离
+   * (`extinguishDeviceByHand`)。抄两份就会漂两份 —— 尤其"找不到器件时返回什么"
+   * 这种细节(这里**返回 `null`**,由调用方决定退路:出锅退回 (0,0)、灭火直接拒绝)。
+   */
+  private deviceTileOf(deviceId: number): { x: number; y: number } | null {
+    for (let y = 0; y < this.sizeCells; y += 1) {
+      for (let x = 0; x < this.sizeCells; x += 1) {
+        if (this.grid.objIdAt(x, y) === deviceId) return { x, y };
+      }
+    }
+    return null;
+  }
+
+  /**
    * 找站点旁一个空格放成品。找不到理想位就退回站点自身坐标
    * (宁可落在站上,也不让产物凭空消失)。
    */
   private freeTileNear(deviceId: number): { x: number; y: number } {
-    let sx = 0;
-    let sy = 0;
-    let found = false;
-    for (let y = 0; y < this.sizeCells && !found; y += 1) {
-      for (let x = 0; x < this.sizeCells && !found; x += 1) {
-        if (this.grid.objIdAt(x, y) === deviceId) { sx = x; sy = y; found = true; }
-      }
-    }
-    if (!found) return { x: 0, y: 0 };
+    const at = this.deviceTileOf(deviceId);
+    if (at === null) return { x: 0, y: 0 };
+    const sx = at.x;
+    const sy = at.y;
     for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]] as const) {
       const nx = sx + dx;
       const ny = sy + dy;
@@ -4491,6 +4532,65 @@ export class WorldSim {
   /** 浇灭某料理站的炉火(227 水枪 / 212 大铁铲)。锅内料保留,只是不再出锅。 */
   extinguishStationAt(deviceId: number): void {
     this.stationState(deviceId).fireOut = true;
+  }
+
+  /**
+   * **手持灭火**(器件半边):227 水枪 / 212 大铁铲 对着料理站 ⇒ 浇灭它的炉火。
+   *
+   * ## 这补的是哪个缺口(C3 的灭火半边)
+   * `cooking.ts` 的 `extinguishStation` / `EXTINGUISH_RADIUS` 与
+   * `WorldSim.extinguishStationAt` **都早已存在**,判据也有(`WS-14` 的 D 组,
+   * 直接调 `sim.extinguishStationAt`),但**玩家手里没有动词** ——
+   * 从 `USE_ITEM` 走过来时只有"对玩家用"一条路(见 `TASK-96` 二之七 ⚠️3)。
+   *
+   * ## 判定次序(每一步都能单独被证伪)
+   * 1 道具必须是这两个之一(**别的道具**对着锅用 ⇒ 拒绝,不是"什么都不做但扣掉");
+   * 2 器件必须是**料理站**(只有它有炉火概念)—— 对着箱子用 ⇒ 拒绝;
+   * 3 器件必须**在图上有格子** —— 凭空报一个 id ⇒ 拒绝;
+   * 4 距离必须 `<= EXTINGUISH_RADIUS`(内容层常量,不在这里写死格子数);
+   * 5 已经灭了 ⇒ 拒绝(不许把一件道具浪费在已经灭了的炉子上)。
+   *
+   * ⚠️ 拒绝一律 `consume: false`:动作层会据此把刚扣的那一件**退回**。
+   */
+  private extinguishDeviceByHand(actorId: string, itemId: number, deviceId: number): {
+    applied: boolean;
+    consume: boolean;
+    reason: string;
+    effect?: Record<string, string | number | boolean>;
+  } {
+    if (itemId !== WorldSim.BUBBLE_GUN_ITEM_ID && itemId !== WorldSim.SHOVEL_ITEM_ID) {
+      return { applied: false, consume: false, reason: `道具 ${itemId} 没有浇灭器件的语义` };
+    }
+    if (deviceId !== SOUP_POT_ID && deviceId !== PIZZA_OVEN_ID && deviceId !== KITCHEN_TABLE_ID) {
+      return { applied: false, consume: false, reason: `器件 ${deviceId} 不是料理站(没有炉火)` };
+    }
+    const b = this.physics.bodies.get(actorId);
+    if (b === undefined) {
+      return { applied: false, consume: false, reason: '施术者在这个房间里没有刚体' };
+    }
+    const at = this.deviceTileOf(deviceId);
+    if (at === null) {
+      return { applied: false, consume: false, reason: `图上没有器件 ${deviceId}` };
+    }
+    /* 距离按**格中心**算(与 `nearestFlag` 同一口径:玩家坐标是格中心)。 */
+    const distance = Math.hypot(at.x + 0.5 - b.x, at.y + 0.5 - b.y);
+    if (distance > EXTINGUISH_RADIUS) {
+      return {
+        applied: false, consume: false,
+        reason: `离器件 ${deviceId} 太远(要 ${EXTINGUISH_RADIUS} 格内,实测 ${Math.round(distance * 1000) / 1000})`,
+      };
+    }
+    if (this.stationState(deviceId).fireOut) {
+      return { applied: false, consume: false, reason: `器件 ${deviceId} 的炉火已经灭了` };
+    }
+    this.extinguishStationAt(deviceId);
+    return {
+      applied: true, consume: true, reason: 'ok',
+      effect: {
+        itemId, deviceId, x: at.x, y: at.y,
+        distance: Math.round(distance * 1000) / 1000, fireOut: true,
+      },
+    };
   }
 
   /**

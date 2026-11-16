@@ -52,8 +52,9 @@ import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
  * 本常量    「还没进入成长系统 / 还没同步过等级」时的初始值        ← 降级为缺省
  * ```
  * ⇒ 等级 30 的权威上限**不是**本常量,而是派生值(当前内容 = 535)。
- * ⇒ 温泉「+30% 生命上限」这类乘区乘在 `v.maxHp`(**已是派生值**)上,
- *   不乘在本常量上(`world_sim.effectiveMaxHp` 即此口径)。
+ * ⇒ 温泉「+30% 生命上限」这类乘区**乘在派生值上**:`WorldSim.maxHpForLevel`
+ *   (上限的**唯一**算子)先算 `statsAtLevel(level).maxHp + hpFlat`,再套
+ *   `maxHpMulOf`,结果经 `syncMaxHp` 落到 `v.maxHp` —— 不乘在本常量上。
  *
  * ## 为什么仍保留 100
  *

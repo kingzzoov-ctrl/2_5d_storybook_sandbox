@@ -20,6 +20,13 @@
  *   "超距也扣掉一件羽毛笔" —— 那正是 `TASK-98` 要避免的形态。
  *   `tests/WS-FND-39` 里有一条断言直接钉这个方向。
  *
+ * ## 两种目标(`targetId` / `targetDeviceId`)
+ *
+ * `targetId` = **玩家**(救队友 / 困人 / 吃 buff 的对象);`targetDeviceId` = **器件**
+ * (227 水枪 / 212 大铁铲 浇灭料理站炉火 —— C3 的灭火半边)。
+ * 二者**互斥**:世界侧见到 `targetDeviceId` 就**不再读** `targetId`,
+ * 免得"对着锅喊队友名字"两边都算。
+ *
  * ## ⚠️ 不校验"该玩家真的有这一件"
  *
  * 服务端今天**没有按件背包明细读口**(`PlayerState` 只有 `heldItemId`),
@@ -31,7 +38,7 @@ import type { ActionOutcome, ActionPayload } from '../room.ts';
 import type { ActionHandler } from './types.ts';
 
 /** 本动作的报文(`itemId` / `targetId` 已在 `ActionPayload` 里声明,这里只做窄化)。 */
-type UseItemPayload = ActionPayload & { itemId?: unknown; targetId?: unknown };
+type UseItemPayload = ActionPayload & { itemId?: unknown; targetId?: unknown; targetDeviceId?: unknown };
 
 /** 取正整数;不是 ⇒ `null`(不做字符串转换,不猜默认值)。 */
 function positiveInt(v: unknown): number | null {
@@ -53,6 +60,12 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     return { ok: false, kind: 'INVALID', reason: `${ctx.action} 需要 itemId(正整数)` };
   }
   const targetId = typeof p.targetId === 'string' && p.targetId !== '' ? p.targetId : undefined;
+  /* 器件目标:报了就必须是**正整数**(器件在内容表里是物件 id)。值不合法 ⇒ 当场拒,
+     不退回"对玩家用" —— 那是把报文含义悄悄改掉,比报错更难查。 */
+  const targetDeviceId = p.targetDeviceId === undefined ? undefined : positiveInt(p.targetDeviceId);
+  if (p.targetDeviceId !== undefined && targetDeviceId === null) {
+    return { ok: false, kind: 'INVALID', reason: `${ctx.action} 的 targetDeviceId 需要正整数(器件 id)` };
+  }
 
   /* 3 没有世界源 ⇒ 显式说出来(与 `material.ts` 同一契约,不静默成功)。 */
   const host = ctx.host;
@@ -85,7 +98,11 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
   };
 
-  const out = host.useItem(ctx.actorId, targetId === undefined ? { itemId } : { itemId, targetId });
+  /* 缺省字段**不塞 `undefined`**:世界侧用 `in` 语义判"这次有没有给器件目标"。 */
+  const req: { itemId: number; targetId?: string; targetDeviceId?: number } = { itemId };
+  if (targetId !== undefined) req.targetId = targetId;
+  if (targetDeviceId !== undefined && targetDeviceId !== null) req.targetDeviceId = targetDeviceId;
+  const out = host.useItem(ctx.actorId, req);
   if (!out.applied) {
     /* 世界侧说"没生效" ⇒ 退回刚才那一扣。733 超距走的就是这条。 */
     refund();

@@ -126,7 +126,11 @@
    ★ 2026-11-15 更新:`atkMul` / `critRate` / `critDmg` **已经进战斗管线**
    (`world_sim.ts` 的 `combatantStats` 第三参由 `combat/cooking.ts` 的 `foodCombatInput` 换算;
    ⚠️ 两侧约定不同,`critDmg` 必须 `-1` 换算 —— 直接传会把伤害从 14 抬到 24,这条由 `WS-FND-39` FND39-11/12 钉住)。
-   `muOverride` 仍缺一个具名默认值导出(否则会退化成硬编码 `0.75`)。
+   ★ 2026-11-16 更正:`muOverride` **不缺**默认值了 ——"中性"现在有名字
+   (`combat/cooking.ts` 的 `MU_OVERRIDE_NONE = 0`),地板侧的默认也在
+   (`world/chunk.ts` 的 `DEFAULT_MU` = 0.75、`muOfSlot`;裸地 `BARE_GROUND_MU` = 0.72)。
+   它真正缺的是**接线**:滑溜料理(0.96)要不要盖过冰面的 0.98 —— **玩法裁决**,
+   不是常量问题。硬编码 `0.75` 的那句错写已在常量 docblock 里点名。
 
 ## 二之七、**世界侧读者**这一波(2026-11-15,不动动作表)
 
@@ -166,11 +170,42 @@
 **审查指出、仍未修**(逐条留档,不假装已解决):
 
 1 `liveBubbles` 的层数**不衰减** ⇒ 跨任意时长能凑满"连中 3 发";连击窗口是**平衡数值**,要 owner 裁;
-2 `effectiveMaxHp` 与 `maxHpForLevel` 两个读数口并存(前者生产调用点 0)—— `baseMaxHp` 已消掉 ×1.69 风险,但 `rooms/effects.ts` / `combat/vitals.ts` 两处旧 docblock 与新实现**相反**,待一并改;
+2 `effectiveMaxHp` 与 `maxHpForLevel` 两个读数口并存(前者生产调用点 0)—— `baseMaxHp` 已消掉 ×1.69 风险;**两处旧 docblock 已在下一节改正**(`rooms/effects.ts` / `combat/vitals.ts` / `world_sim.ts` 的 `effectiveMaxHp`);
 3 客户端 z 的**相机高度是硬跳变**(真浏览器观感未验)。
 
 判据:`tests/WS-FND-39-use-item.test.ts`(9 条;4 处注入验证:超距扣道具 / 不写回活的无敌 /
 不并 `hpFlat` / 永不扣道具 —— 全部能红且逐字节还原)。
+
+
+### 二之九、2026-11-16 **第二批**(C3 灭火 / 真网关 / 相机平滑 / 三处更正)
+
+| 事项 | 落点 | 判据 |
+| **C3 灭火半边**:227 对**器件** | `USE_ITEM` 新增 `targetDeviceId`(器件目标与玩家目标**互斥**);`WorldSim.useItem` 的 0 号分支 → `extinguishDeviceByHand`(227 / 212,`EXTINGUISH_RADIUS` 3 格内浇灭料理站炉火);`deviceTileOf` 把「图上第一格」的扫描收成**一处**(出锅落点也改用它) | `WS-FND-52`(10 条;三处注入能红) |
+| **C3 灭火半边**:227 对**器件** | `USE_ITEM` 新增 `targetDeviceId`(器件目标与玩家目标**互斥`);`WorldSim.useItem` 的 0 号分支 → `extinguishDeviceByHand`(227 / 212,`EXTINGUISH_RADIUS` 3 格内浇灭料理站炉火);`deviceTileOf` 把「图上第一格」的扫描收成**一处**(出锅落点也改用它) | `WS-FND-52`(10 条;三处注入能红) |
+| **US2 真网关** | 不动生产码:测试用真 `Server.listen(0)` + 生产注册助手 + `matchMaker.createRoom`,证明 `createHost()/wireHost()` 在网关路径生效 | `WS-FND-50`(7 条;注入 `host: null` 红 4 条) |
+| **客户端相机不再硬跳变** | `client/src/net/height_placement.ts` 的 `stepCameraHeight`(纯函数,α 与 dt 挂钩)+ `three/boot.ts` 每帧推进(目标 / 当下分开命名) | `WS-FND-51`(7 条;两种改坏各红 2–3 条) |
+
+**三处更正(文档与实现相反,改的是描述不是行为)**:
+
+1 `muOverride` 不缺默认值 —— 中性值现在有名字(`combat/cooking.ts` 的 `MU_OVERRIDE_NONE`),
+  地板侧默认在 `world/chunk.ts`(`DEFAULT_MU` / `muOfSlot`);**缺的是接线口径**(玩法裁决);
+2 `rooms/effects.ts` / `combat/vitals.ts` / `world_sim.ts::effectiveMaxHp` 三处 docblock
+  原写「倍率不落 `vitals.maxHp`、基准值留在那里」—— 与本版实现相反,已逐处写明更正与理由;
+3 本文件 `二之六` 的 `muOverride` 行(见上一节末尾)同步改正。
+
+**仍未做(逐条给卡点,不假装已支持)**:
+
+1 **受击击退接到受击点** —— `vitals.applyHit` 没有击退参数;内容层唯一的击退量在**武器侧**
+  (`weapons.ts` 的 `knockback`,属攻方装备),拿它当"被打飞多远"是**发明数值**;
+  实测接上会打红 `WS-10` 三条既有判据 ⇒ **等玩法裁决**;
+2 **`liveBubbles` 层数衰减** —— 冻结内容里没有"连中窗口秒数"这个数
+  (`shared/constants/items.ts:120` 只写"连射队友 3 发")⇒ **等平衡裁决**;
+3 **`forgeUnlocked`** —— `shared/constants/items.ts` 检索 `forge` / `tier` 命中 **0**,
+  没有"中高级锻造"的分档可解锁 ⇒ **等内容分档裁决**;
+4 **`defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul`** —— 冻结层无参数位
+  或全仓无该子系统(采集 / 跳跃),逐条见上一节;
+5 **227 浇灭 coop 工位**(`rush_order.ts` 的 `STATION_STATE.BURNING` / `opts.spraying`)——
+  工位槽位**没有世界坐标**,`opts.spraying` 只能按"种类"喂 ⇒ 玩家动作无法映射到它(设计缺口)。
 
 ## 未接线(2 / 23)
 

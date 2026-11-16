@@ -177,14 +177,17 @@ export function maxHpMulOf(st: RoomEffectState): number {
 /**
  * 推进一个玩家的房间效果一帧。
  *
- * ## 为什么 maxHp 用**倍率**而不是直接改 `PlayerVitals.maxHp`
+ * ## ★ 2026-11-16 更正:`maxHp` 乘区**在哪里套**
  *
- * `vitals.ts` 的注释明说 `maxHp` 是**构造期常量**,`importVitals` 刻意
- * **不信任存档里的 maxHp**。若房间效果直接写 `maxHp`,会与那条不变量冲突:
- * 存档往返一次 maxHp 就被固化,离开温泉也回不去。
+ * 这里的 `maxHpMulOf` 只**派生倍率**;真正把它乘上去的是
+ * `WorldSim.maxHpForLevel`(上限的**唯一**算子),结果经 `syncMaxHp` 写进
+ * `vitals.maxHp` —— 权威上限因此是**含乘区**的(否则泡温泉时回血填不满上限:
+ * 上限 130、实际钳在 100)。
  *
- * ⇒ 这里只**派生**倍率,由调用方决定怎么用(vitals 上的 `maxHp` 保持基准值,
- * 派生值单独暴露)。这样「离开即撤销」是天然成立的,不需要反向记账。
+ * ⚠️ 本文曾写"vitals 上的 `maxHp` 保持基准值、派生值单独暴露" —— 那是上一版的实现,
+ * 与本版相反。`effectiveMaxHp`(同口径读数口)与 `maxHpForLevel` 现已统一到
+ * `maxHpMulOf` **一处**条件上。「离开温泉即撤销」靠的是**每帧重算**
+ * (`onsenSec` 归零 ⇒ 下一次重算回到基准),不是"从不写进 vitals"。
  */
 export function stepRoomEffects(st: RoomEffectState, input: RoomEffectInput): RoomEffectResult {
   const dt = input.dt;

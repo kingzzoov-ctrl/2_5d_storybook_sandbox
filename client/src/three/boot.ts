@@ -115,7 +115,13 @@ import {
    「跳起来的玩家」与「站在地上的玩家」在屏幕上**完全一样**,且不报任何错。
    ⚠️ `z = 0`(服务端 `physics.spawn(..., z: 0)` 的默认值)时本模块的输出与接线前
    **逐字段相同**(立牌 z 仍只取地形高程,相机 `focusZ` 仍是 0)⇒ 既有表现不变。 */
-import { placementForHeight, localPlayerZOf } from '../net/height_placement.ts';
+import {
+  placementForHeight,
+  localPlayerZOf,
+  /* ★ WS-FND-51:相机高度的**每帧推进**也走纯函数 —— 接线时那一版是直接赋值,
+     镜头在同一帧内跳到目标高度(真浏览器里闪一下,且不报任何错)。 */
+  stepCameraHeight,
+} from '../net/height_placement.ts';
 /* task-83:玩家可见物。位置来源**唯一** —— 权威状态经 `telegraphCenterOf`,
    本文件只把那个位置翻译成 three 的摆放参数(纯逻辑在 `stage/assembly_math.ts`)。 */
 
@@ -868,10 +874,24 @@ export function boot(container: HTMLElement): BootHandle {
    * 记着同款实测事故)。
    *
    * 值由纯函数 `placementForHeight` 定(`z × 0.5` 夹在 ±1 格,理由在那边文件头),
-   * 本文件只做「取值 → 塞进相机」。`z = 0` ⇒ `0`,而 `0` 正是 `createCamera()` 的
-   * `focusZ` 缺省值 ⇒ 接线前的相机表现**逐字段不变**。
+   * 本文件只做「取值 → 每帧推进 → 塞进相机」。`z = 0` ⇒ 目标 `0`、当下 `0`,
+   * 而 `0` 正是 `createCamera()` 的 `focusZ` 缺省值 ⇒ 接线前的相机表现**逐字段不变**。
+   *
+   * ★ WS-FND-51:这个量是**当下**的高度(每帧被 `stepCameraHeight` 推进一步),
+   * **不是**目标 —— 目标在下面的 `cameraFocusZTarget`。两者**分开命名**是有意的:
+   * 合成一个变量就再也分不出「镜头平滑到哪了」与「这一帧该到哪」,
+   * 而那正是「硬跳变」与「平滑跟随」的唯一区别。
    */
   let cameraFocusZ = 0;
+  /**
+   * 相机聚焦点高度的**目标**(本帧的摆放结果 `mount.cameraFocus.z`)。
+   *
+   * 与 `cameraFocusZ`(当下)分开:目标每帧随权威 z 直接变(那是对的 —— 目标是读数),
+   * 当下由 `stepCameraHeight` 按 `dt` 追它(那才是画面平滑)。
+   * ⚠️ 只在本帧的摆放块里写、在相机块里读:两处相隔十几行,但**同一帧**同一个值
+   * (跨帧复用会给镜头引入一帧滞后)。
+   */
+  let cameraFocusZTarget = 0;
   /** 拖拽控制器(ui/state_machine):悬停/拿起/放下 —— 驱动背包格子高亮 */
   const dragCtl = new DragController();
 
@@ -1313,25 +1333,38 @@ export function boot(container: HTMLElement): BootHandle {
      *
      * `syncCamera()` 只在**真的动了**时调:收敛后每帧重建相机矩阵是纯浪费,
      * 而 1e-3 格 ≈ 0.016px —— 肉眼与投影都不可能察觉。
-     * ★ WS-FND-48:那个「真的动了」现在还含**高度分量**(`cameraFocusZ`),否则
-     *   `z` 的变化会被这个判断吞掉 —— 立牌抬起来了、镜头纹丝不动,且不报错。
+     * ★ WS-FND-48:那个「真的动了」现在还含**高度分量**,否则 `z` 的变化会被这个判断
+     *   吞掉 —— 立牌抬起来了、镜头纹丝不动,且不报错。
+     * ★ WS-FND-51:高度分量是**按 dt 推进**的(`stepCameraHeight`),不再直接赋值。
+     *   直接赋值 = 同一帧内跳到目标高度(真浏览器里一次可见的「闪」)。
      */
     if (camOverride === null && drag === null) {
       /* 权威未知 ⇒ `cameraTargetFor` 给 null ⇒ 相机**保持不动**(不是跳到 (0,0)) */
       const target = cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS);
       if (target !== null) {
         const next = stepCamera(pan, target, dt / 1000, CAMERA_SMOOTHING_SEC);
-        /* ★ WS-FND-48:高度**变了也必须重建相机** —— 否则 z 的变化会被上面那个
-           「相机没动」的判断吞掉(表现:立牌抬起来了、镜头纹丝不动,且不报任何错)。
-           `cameraFocusZ` 是**当下**的相机高度分量,`mount` 是本帧的目标。 */
+        /* ★ WS-FND-51:高度分量在这里**按 dt 推进**(不再直接赋值)。
+           时间步 = 本帧的 `dt / 1000`(与 `uiFsm.tick` / `updateRoof` 同一个来源,
+           没有再引第二个时钟)。`dt ≤ 0` / 非有限时 `stepCameraHeight` **原样返回**。 */
+        cameraFocusZTarget = mount.cameraFocus.z;
+        const focusZPrev = cameraFocusZ;
+        if (Math.abs(cameraFocusZTarget - cameraFocusZ) > 1e-3) {
+          cameraFocusZ = stepCameraHeight(cameraFocusZ, cameraFocusZTarget, dt / 1000);
+        } else if (cameraFocusZ !== cameraFocusZTarget) {
+          /* 残差已 < 1e-3 格(≈0.016px,与上面那句同一个口径)⇒ 落定到目标。
+             这一笔小到看不见,但它让「当下」**真的等于**目标:否则平滑值永远差最后
+             一点点,`syncCamera()` 就会因为「高度还在动」被每帧叫醒。 */
+          cameraFocusZ = cameraFocusZTarget;
+        }
+        /* 高度**当下值**真的变了也必须重建相机 —— 否则 z 的变化会被上面那个
+           「相机没动」的判断吞掉(表现:立牌抬起来了、镜头纹丝不动,且不报错)。 */
         if (
           Math.abs(next.x - pan.x) > 1e-3
           || Math.abs(next.y - pan.y) > 1e-3
-          || Math.abs(mount.cameraFocus.z - cameraFocusZ) > 1e-3
+          || cameraFocusZ !== focusZPrev
         ) {
           pan.x = next.x;
           pan.y = next.y;
-          cameraFocusZ = mount.cameraFocus.z;
           syncCamera();
         }
       }
@@ -1421,16 +1454,22 @@ export function boot(container: HTMLElement): BootHandle {
       /* ── ★ WS-FND-48 高度轴(`z`)自检口径 ──
        *
        * 让「z 真的被用起来了」**可被读出来**,而不是靠看图说"看着抬起来了":
-       *   `playerGz`          权威高度(入参)
-       *   `cameraFocusZ`      相机聚焦点的高度分量(出参,= clamp(z × 0.5, ±1))
-       *   `playerMarkerPos.z` 立牌的世界 z(= 地形高程 + z;上面已有该字段)
+       *   `playerGz`           权威高度(入参)
+       *   `cameraFocusZTarget` 本帧的**目标**(= clamp(z × 0.5, ±1);随 z 直接变)
+       *   `cameraFocusZ`       **当下**的聚焦高度(每帧被 `stepCameraHeight` 推向目标)
+       *   `playerMarkerPos.z`  立牌的世界 z(= 地形高程 + z;上面已有该字段)
+       *
+       * ★ WS-FND-51:目标与当下**两个都报** —— 只报一个会把「镜头正在平滑地追」
+       * 误读成「镜头没跟上」(`cameraFocusZ` 在 z 突变的头几帧**故意**不等于目标),
+       * 而只报当下又看不出「这一帧该到哪」。两者之差才是「还在不在追」。
        *
        * 三者一起读才分得清三种坏法:
        *   `playerGz ≠ 0` 而 `playerMarkerPos.z` 没变 ⇒ 高度根本没接线(本任务要抓的那类);
-       *   `playerGz ≠ 0` 而 `cameraFocusZ` 恒 0   ⇒ 只接了立牌、漏了相机;
+       *   `playerGz ≠ 0` 而两个 `cameraFocusZ*` 恒 0 ⇒ 只接了立牌、漏了相机;
        *   两个都是 0 而 `playerMarkerPos.z` == 地形高程 ⇒ 正常(z = 0,接线前表现)。
        */
       playerGz,
+      cameraFocusZTarget,
       cameraFocusZ,
       cameraFollowSmoothingSec: CAMERA_SMOOTHING_SEC,
       cameraSnapDistanceCells: CAMERA_SNAP_DISTANCE,

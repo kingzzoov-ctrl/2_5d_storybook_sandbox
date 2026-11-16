@@ -315,10 +315,24 @@ Lead 全局复核(208 文件含 _design/):
 
 | 条目 | 当时的结论 | 实测(2026-11-16) | 证据 |
 |---|---|---|---|
-| `:68` US2 网关 | 端到端未证 | 仍未证,**但理由要改**:`colyseus` **装着且能解析**(`optionalDependencies` 已装)⇒ **不是"缺依赖"**;缺的是"点燃真网关的端到端用例" | `node -e "import('colyseus')"` → 可解析:是;`Test-Path node_modules/colyseus` → True |
+| `:68` US2 网关 | 端到端未证 | 仍未证,**但理由要改**:`colyseus` **装着且能解析**(`optionalDependencies` 已装)⇒ **不是"缺依赖"**;缺的是"点燃真网关的端到端用例" ⇒ **本批已补,见下方「第二批收口」** | `node -e "import('colyseus')"` → 可解析:是;`Test-Path node_modules/colyseus` → True |
 | `:147` 9 种房间增益 | 到玩家的只有卧室回血 | **温泉 `×1.3` 已到权威**、**大餐乘区已真的算**、卧室回血早就在;**`forgeUnlocked` 仍无消费点** —— 卡点是内容层**没有"中高级锻造"的分档**(`shared/constants/items.ts` 里 `forge|tier` 命中 **0**)⇒ 卡在**内容分档裁决**,不是卡在接线 | `WS-FND-49` FND49-1/2、`WS-FND-47` 8 条 |
-| `:152` 料理消费点 | 大餐乘区未触发 | **已触发**(`hasMealBuff` 由 `tickRoomEffects` 喂);**仍未接**的字段:`defFlat`/`moveMul`/`gravityMul`(冻结层无参数位)/`jumpMul`/`gatherMul`(无采集系统)/`expMul`;`muOverride` 缺具名默认值导出 | `WS-FND-47`、`WS-FND-39` 15 条 |
+| `:152` 料理消费点 | 大餐乘区未触发 | **已触发**(`hasMealBuff` 由 `tickRoomEffects` 喂);**仍未接**的字段:`defFlat`/`moveMul`/`gravityMul`(冻结层无参数位)/`jumpMul`/`gatherMul`(无采集系统)/`expMul`;`muOverride` 的具名中性值**本批补上**(`MU_OVERRIDE_NONE`),缺的是接线口径 | `WS-FND-47`、`WS-FND-39` 15 条 |
 | `:273` z 轴 | 只接了 x/y | **两头都接上了**:服务端 `applyPlayerMove(...,z?)` 写刚体 + 投影从权威读回;客户端 `client/src/net/height_placement.ts`(z 只进第三分量,`z=0` 与接线前逐字段相同) | `WS-FND-49` FND49-3/4/5、`WS-FND-48` 7 条 |
 | `:280` knockback | no-op | **已生效**:`applyKnockback` + 慢帧推位移 + **推进期间 `applyPlayerMove` 拒搬**(`lastMoveRejection = 'KNOCKBACK'`) | `WS-FND-49` FND49-6/7/8 |
 
 ⚠️ **行号漂移**:本轮改动后,本文件与 `HANDOVER`/`TASK-96`/`TASK-98`/`TASK-99` 引用的 `world_sim.ts` / `room.ts` / `cooking.ts` / `effects.ts` 行号**大量失效**(审查 B 给了逐条清单)。**按符号名定位,不要按行号。**
+
+---
+
+## ★ 2026-11-16 第二批收口(上一张表之后的实测)
+
+| 项 | 上一张表说的 | 实测(本批) | 证据 |
+|---|---|---|---|
+| US2 网关 | "缺的是点燃真网关的用例" | **已证**:真 `Server.listen(0)` + 生产注册助手 `gameServerConfig(...).initializeGameServer` + `matchMaker.createRoom`(房间由 Colyseus 自己 `new`,`onCreate` 真跑)⇒ 断言 `RoomRuntime.host` **非 null**、城镇 provider(24 → 8)与 SLEEP 读口**在网关路径**生效、真 `RoomSchema` 与权威值一致 | `tests/WS-FND-50-gateway-colyseus.test.ts`(7 条);注入 `host: null` ⇒ 4 条变红;未覆盖:真 socket(无 `colyseus.js` 客户端)、patch 同步按设计关闭 |
+| C3 灭火半边(227 对器件) | "只认玩家目标" | **已接**:`USE_ITEM` 新增 `targetDeviceId`;227 水枪 / 212 大铁铲 在 `EXTINGUISH_RADIUS`(3 格)内浇灭**料理站**炉火;五种拒绝(道具不对 / 不是料理站 / 图上没有该器件 / 太远 / 已灭)各有判据 + 负对照 | `tests/WS-FND-52-c3-extinguish-device.test.ts`(10 条);三处注入(去掉置位 / 去掉距离门 / 不传 `targetDeviceId`)分别红 4 / 2 / 8 条,全部逐字节还原 |
+| 客户端 z 相机 | "硬跳变(观感未验)" | **已平滑**:`stepCameraHeight(当下, 目标, dt)` 纯函数(α = 1 − (1 − ratio)^dt,帧率无关),`boot.ts` 每帧推进且**目标与当下分开命名**;`z = 0` 时目标与当下都逐位 = 0 | `tests/WS-FND-51-client-z-camera-smooth.test.ts`(7 条);真 Chrome 探针(本仓 `fps-probe`)零异常、零 fatal;⚠️ **观感本身仍未验**(无 headless 驱动跳跃的手段) |
+| `muOverride` | "缺具名默认值导出" | **更正**:中性值已有名字(`combat/cooking.ts` 的 `MU_OVERRIDE_NONE = 0`),地板侧默认在 `world/chunk.ts`(`DEFAULT_MU` = 0.75 / `muOfSlot`,裸地 0.72);真正缺的是**接线口径**(滑溜料理要不要盖过冰面 0.98)⇒ **玩法裁决** | `docs/TASK-96` 二之六已改正;`world_sim.ts` 计算面板处注释已改正 |
+| 受击击退(接到受击点) | "机制已生效" | **仍未接**,且**不是缺常数**:mob → 玩家那条路 `vitals.applyHit` **没有击退参数**;内容层唯一的击退量是**武器侧**(`weapons.ts` 的 `knockback`,属攻方装备)⇒ 拿它当"被打飞多远"是**发明数值**,接上会打红 `WS-10` 三条既有判据 | `world_sim.ts` 受击点注释;本文件 `:280` 的裁决原文("今天它是 no-op") |
+| 连击窗口 / 锻造分档 | 需裁决 | **仍未做**:`liveBubbles` 层数不衰减 —— 冻结内容里**没有**"连中窗口秒数"这个数(`shared/constants/items.ts:120` 只写"连射队友 3 发");`forgeUnlocked` **无内容分档**(`items.ts` 检索 `forge` / `tier` 命中 0) | 检索清单见 `docs/TASK-96` 二之九 |
+| 一键交接 | — | `README` / `HANDOVER` 的用例数字与 §九 sha256 表已随本批同步(66 套件 / 1822 条) | `node scripts/verify.ts --all` 的「README 用例汇总」「HANDOVER sha256 表」两栏 |

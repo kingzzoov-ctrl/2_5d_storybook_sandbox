@@ -41,11 +41,15 @@
  *   而地形那一格的实际高程由调用方给(`groundZ`,来自 `boot.ts` 的 `zAt` 表)。
  *   本函数**只把它与 z 相加**,不自己查表(查表要 tile 解包,不属于本层)。
  *
- * ## 不预测、不插值(这是 `prediction.ts` 的地盘)
+ * ## 不预测(那是 `prediction.ts` 的地盘);`dt` 只作**入参**,不作模块状态
  *
- * `prediction.ts` 管的是「本地输入 → 位置」的推测。本函数是纯粹的摆放换算:
- * 同一个入参永远同一输出,没有历史、没有 dt、没有上一帧。
- * 相机的时间平滑仍由 `net/camera_follow.ts` 独占(见下面 `CAMERA_HEIGHT_*` 的取舍)。
+ * `prediction.ts` 管的是「本地输入 → 位置」的推测。本文件的 `placementForHeight` 是
+ * 纯粹的摆放换算:同一个入参永远同一输出,没有历史、没有 dt、没有上一帧。
+ *
+ * 本文件里唯一带 `dt` 的是 `stepCameraHeight`(WS-FND-51「相机高度按帧平滑」)。
+ * 它**仍然无状态**:上一帧的高度是**入参** `current`,不是模块里的变量 ⇒
+ * 同样的 `(current, target, dt)` 永远同一输出,依旧可以在 node 里直接断言。
+ * x/y 的时间平滑仍归 `net/camera_follow.ts` 独占(见下面 `CAMERA_HEIGHT_*` 的取舍)。
  *
  * ## 两条「z 影响哪个轴、为什么」的取舍
  *
@@ -65,6 +69,11 @@
  *
  * ⚠️ 相机的高度分量**只吃 z,不吃地形高程**:若把 `groundZ` 也加进去,那么 z = 0 的
  * 玩家一走上坡镜头就会动 —— 而「z = 0 必须与接线前逐字段相同」是本题的硬判据。
+ *
+ * ★ WS-FND-51:上面算出来的是**目标**(`cameraFocus.z`)。真正落到 `IsoCamera.focusZ`
+ * 还要按帧推进(`stepCameraHeight`)—— 直接赋值会在**同一帧**内跳到目标高度,
+ * 真浏览器里就是一次可见的「闪」。目标与当下在 `boot.ts` 里**分开命名**
+ * (`cameraFocusZTarget` / `cameraFocusZ`),不再一个变量两用。
  *
  * ## 空/坏输入(NaN、±Infinity)的处置:**按 0(= 站在地面)兜底,并把标志交出去**
  *
@@ -163,6 +172,61 @@ export function placementForHeight(pos: HeightPoint, groundZ: number): HeightPla
     usedZ,
     zFallback,
   };
+}
+
+/**
+ * 一帧的**相机高度**推进:从 `current` 朝 `target` 走一步 —— ★ WS-FND-51。
+ *
+ * ## 它修的是什么
+ *
+ * `IsoCamera.focusZ` 接线后是**直接赋值**(`cameraFocusZ = mount.cameraFocus.z`),
+ * 即「同一帧内跳到目标高度」。z 是网络来的数:一次跳跃 / 一次纠偏 / 一个迟到的快照
+ * 都会让镜头在一次 16ms 内平移若干像素 —— 真浏览器里表现为**闪一下**,
+ * 而它**不抛错、不进日志**:静态截图里完全看不出来。
+ *
+ * ## 为什么落在本文件(与文件头同一条硬约束)
+ *
+ * 判定写在 `three/boot.ts` 里就**结构上不可测**(那半含三方 `three`,node 里 import 不了)。
+ * ⇒ 平滑本身是**纯函数**,`boot.ts` 那边只剩「每帧一次调用 + 两个变量」。
+ *
+ * ## 公式:`α = 1 − (1 − ratio)^dt`,dt 单位 = **秒**
+ *
+ * 与 `net/camera_follow.ts` 的 `stepCamera` 是同一个族(`α = 1 − e^(−dt/τ)`):
+ * 底数 `1 − ratio > 0` ⇒ 对**时长**可加(两帧 `dt₁ + dt₂` 与一帧 `dt₁ + dt₂` 结果相同)
+ * ⇒ **帧率无关**:30Hz 与 60Hz 的机器追到同一个地方,只是步数不同(判据 FND51-6 钉住)。
+ * 区别只是时间常数由 `CAMERA_HEIGHT_FOLLOW_RATIO` 定:
+ * `τ = −1 / ln(1 − 0.5) ≈ 1.4427 s`。
+ *
+ * ⚠️ 它比 x/y 的 `CAMERA_SMOOTHING_SEC = 0.12` **慢一个数量级**,这是有意的:
+ *   高度分量只吃 z、幅度被 `CAMERA_HEIGHT_MAX_OFFSET` 夹在 ±1 格;
+ *   若按 x/y 那个速度追,一次跳跃(airtime ≈ 0.5s)就会把整屏上下推 ~10px ——
+ *   那正是文件头「取舍 2」要避免的「每一次跳跃变成整屏上下抖」。
+ *   慢到一帧只走百分之一量级 ⇒ 手感上是"镜头缓缓跟上来",而不是"画面抖一下"。
+ *
+ * ## 拒绝而非夹取(判定顺序是有意的,与 `stepCamera` 同形)
+ *
+ * ```
+ * dt ≤ 0 / 非有限        ⇒ 原样返回(**不是**夹到 0:这一帧没过去时间,就不该动)
+ * current/target 非有限  ⇒ 原样返回(NaN 一旦写进 focusZ 就再也回不来 ⇒ 画面整体消失)
+ * current === target     ⇒ 原样返回(**逐位**恒等,连 0.0 × 任何数 的舍入都不引入)
+ * 其余                   ⇒ α ∈ (0, 1) ⇒ 结果**严格**落在 current 与 target 之间
+ * ```
+ *
+ * ## 为什么「永不过冲」不是靠夹紧
+ *
+ * `0 < α < 1` 是**结构性**的:`dt > 0` 且 `0 < ratio < 1` ⇒ `(1 − ratio)^dt ∈ (0, 1)`
+ * ⇒ 既不会越过 target,也不会反向。⇒ 无需 `clamp(..., min(cur,target), max(cur,target))`
+ * 那种「夹住算出来的错值」的写法(夹紧会把「反向跑」这种真错掩盖成『只是慢』)。
+ * `dt` 大到 `(1 − ratio)^dt` 下溢成 0 时 `α === 1` ⇒ 正好落到 target,仍不过冲。
+ *
+ * 纯函数:只读入参,不写任何模块状态(上一帧的值是 `current`,不是隐藏变量)。
+ */
+export function stepCameraHeight(current: number, target: number, dt: number): number {
+  if (!Number.isFinite(dt) || dt <= 0) return current;
+  if (!Number.isFinite(current) || !Number.isFinite(target)) return current;
+  if (current === target) return current;
+  const alpha = 1 - Math.pow(1 - CAMERA_HEIGHT_FOLLOW_RATIO, dt);
+  return current + (target - current) * alpha;
 }
 
 /**

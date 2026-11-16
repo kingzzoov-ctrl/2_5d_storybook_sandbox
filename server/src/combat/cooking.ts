@@ -83,10 +83,27 @@ export interface FoodDef {
   note: string;
 }
 
+/**
+ * `muOverride` 的**中性值**(= 这条 buff 不管摩擦,地面 μ 照旧)。
+ *
+ * ## 为什么 `0` 不能理解成"摩擦为零"
+ *
+ * 真正的地面 μ 来自地板表:`world/chunk.ts` 的 `muOfSlot`(缺省 = `DEFAULT_MU` = 0.75;
+ * 裸地 `BARE_GROUND_MU` = 0.72;冰面 0.98、湿滑 0.40)。所以 `0` 的语义是
+ * **"没意见"**,不是"打滑到底"。
+ *
+ * ⚠️ 将来把它接进物理时**不许**写成
+ *   `if (muOverride > 0) mu = muOverride; else mu = 0.75;` ——
+ *   那个字面量 `0.75` 就是第二份真值:冰面(0.98)与湿地(0.40)会被它抹平。
+ *   "不覆盖"的正确做法是**别动**地板表给的值(读 `muOfSlot`)。
+ *   本常量只是给"没意见"一个名字,让上面那句错写无从下笔。
+ */
+const MU_OVERRIDE_NONE = 0;
+
 function mods(p: Partial<FoodBuff['statMods']> = {}): FoodBuff['statMods'] {
   return {
     atkMul: 1.0, hpFlat: 0, defFlat: 0, moveMul: 1.0, critRate: 0, critDmg: 1.0,
-    gravityMul: 1.0, muOverride: 0, jumpMul: 1.0, gatherMul: 1.0, expMul: 1.0,
+    gravityMul: 1.0, muOverride: MU_OVERRIDE_NONE, jumpMul: 1.0, gatherMul: 1.0, expMul: 1.0,
     ...p,
   };
 }
@@ -542,7 +559,7 @@ export function mergeFoodBuffs(buffs: readonly FoodBuff[]): FoodBuff['statMods']
     out.critRate += b.statMods.critRate;
     out.critDmg *= b.statMods.critDmg;
     out.gravityMul *= b.statMods.gravityMul;
-    if (b.statMods.muOverride > 0) out.muOverride = Math.max(out.muOverride, b.statMods.muOverride);
+    if (b.statMods.muOverride > MU_OVERRIDE_NONE) out.muOverride = Math.max(out.muOverride, b.statMods.muOverride);
     out.jumpMul *= b.statMods.jumpMul;
     out.gatherMul *= b.statMods.gatherMul;
     out.expMul *= b.statMods.expMul;

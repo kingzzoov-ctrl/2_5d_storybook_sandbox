@@ -713,7 +713,7 @@ export interface WorldSaveHost {
    *   `itemId` 由动作层从报文取(客户端自报),世界侧**只信它是自己认识的 id**,
    *   不校验"该玩家真的有这一件" —— 那需要先补按件读口(见 `TASK-99`)。
    */
-  useItem?(actorId: string, req: { itemId: number; targetId?: string }): UseItemOutcome;
+  useItem?(actorId: string, req: { itemId: number; targetId?: string; targetDeviceId?: number }): UseItemOutcome;
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */
@@ -906,6 +906,14 @@ export interface ActionPayload {
   itemId?: number;
   /** `DROP_ITEM`:丢弃件数(默认 1)。 */
   count?: number;
+  /**
+   * `USE_ITEM`:目标**器件**(料理站等设备 id)。
+   *
+   * 与 `targetId`(玩家)是**互斥**的两种报文形态:器件目标走"浇灭炉火",
+   * 玩家目标走"救人 / 困人 / 吃 buff"。世界侧见 `targetDeviceId` 就**不再看** `targetId`。
+   * 器件在内容表里是**物件 id**(506 汤锅 / 507 切菜台 / 508 披萨炉),不是玩家 id。
+   */
+  targetDeviceId?: number;
 }
 
 /**
