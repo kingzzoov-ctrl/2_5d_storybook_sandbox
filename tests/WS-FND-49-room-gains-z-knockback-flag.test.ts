@@ -191,4 +191,32 @@ test('FND49-11 ★ 被泡泡困住 ⇒ 不能移动(227 的"困住 5 秒"不再�
   eq(sim.lastMoveRejection, 'TRAPPED', '★ 拒绝理由应为 TRAPPED(可观测,不是静默 true)');
 });
 
+/* ══════════════════ 6 大餐乘区:世界侧读得到 ══════════════════ */
+
+test('FND49-12 ★ `lastRoomEffects[].mealMul` 真的从世界侧读得到(接在 `tickRoomEffects` 上)', () => {
+  const a = assemble({ roomId: 'r_meal_wire', ownerId: 'p1', sizeCells: 24, mobs: false });
+  a.runtime.join({ userId: 'p1' });
+  const sim = a.host as unknown as WorldSim;
+  sim.addPlayer('p1', 12.5, 12.5);
+  sim.advance(60);
+
+  const before = sim.lastRoomEffects.find((r) => r.playerId === 'p1');
+  ok(before !== undefined, '前置:房间效果记录应存在');
+  /* 不在食堂 ⇒ 1.0(两个条件缺一不行;食堂那一半由 `WS-FND-47` FND47-1 用字面量 1.4 钉住 ——
+     在这里盖一间食堂要复刻整间封闭房,而这条要钉的是**世界侧读口存不存在**)。 */
+  eq(before?.mealMul, 1, '★ 不在食堂 ⇒ mealMul = 1.0(字段必须存在且是数值)');
+  eq(typeof before?.mealMul, 'number', '★ 必须是数值(不是 undefined)');
+
+  /* 吃一份料理 ⇒ 字段仍在、仍 1.0(不在食堂);证明它不是"有 buff 就加"的错口径。 */
+  const src = 'seed:602';
+  a.runtime.grantItemSource('p1', src);
+  a.runtime.applyInventory('p1', { ops: [{ itemId: 602, delta: 1, source: src }] });
+  const used = a.runtime.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: 602 });
+  eq(used.kind, 'OK', '前置:料理应能吃下');
+  sim.advance(60);
+
+  const after = sim.lastRoomEffects.find((r) => r.playerId === 'p1');
+  eq(after?.mealMul, 1, '★ 有 buff 但不在食堂 ⇒ 仍是 1.0(条件是两个,不是一个)');
+});
+
 report('WS-FND-49');
