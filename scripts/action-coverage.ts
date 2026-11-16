@@ -8,8 +8,9 @@
  * ## 谁该跑它(别让它变成第 N 个死脚本)
  *
  *   1 `tests/WS-FND-38-action-coverage.test.ts` —— 每次跑测试都调 `deriveActionCoverage()`,
- *     并用它交叉核对 `tests/WS-07.test.ts`(ACT-2)与 `tests/WS-FND-18`(FND18-4)里
- *     那两份**硬编码名单**。名单一过期,那两条就红;
+ *     并用它交叉核对 **三份**硬编码名单:`tests/WS-07.test.ts`(ACT-2)、
+ *     `tests/WS-FND-18-action-ownership.test.ts`(FND18-4)与
+ *     `tests/WS-FND-21-action-e2e.test.ts`(FND21-3)。名单一过期,那三条就红;
  *   2 将来在门禁里挂一条(`scripts/verify.ts` 的接线类判据)时,直接
  *     `import { deriveActionCoverage }` 或 spawn 本脚本 —— 本文件是纯只读的,
  *     import 它**没有**顶层副作用(有 `import.meta.main` 守卫)。
@@ -677,6 +678,103 @@ export function formatCoverage(rows: readonly ActionCoverageRow[]): string {
     out.push(`  · ${r.action} —— ${r.evidence}   [${r.file}:${r.verdictLine}]`);
   }
   return out.join('\n');
+}
+
+/* ────────── 4 硬编码名单抽取:FND21-3(供 WS-FND-38 交叉核对)──────────
+ *
+ * 本仓最后一份**靠人肉维护**的名单(FND21-3)此前没有机器可查的出处:
+ * `tests/WS-FND-21-action-e2e.test.ts` 的 FND21-3 里那一条
+ *
+ *     const known = await act(w, { action: 'MOVE' });
+ *     eq(known.kind, 'NOT_IMPLEMENTED', ...);     // 「已知但未接线」
+ *
+ * ⚠️ 它一旦过期(比如 `MOVE` 哪天真的接了线),那条断言**不会**说「名单过期了」:
+ *   它只会以别的方式红(回执变成 OK / 世界变了 / 超时),或者更糟 —— 因为落在
+ *   别的原因上而**静默变绿**。所以「这条名单写了谁」也得能被抽出来对账。
+ *
+ * 为什么抽取器住在这里,而不是像 ACT-2 / FND18-4 那样住进测试:
+ *   那两处的抽取逻辑与判据在同一文件里,改一处就自证;这一处的抽取规则与派生器
+ *   放一起(只有一份),`tests/WS-FND-38` 只负责「喂文本 + 与 unwired 对账」。
+ *   输入是**文本**而非路径 ⇒ 本函数不碰文件系统,注入验证可以直接喂任意文本。
+ *
+ * 抽取规则(与 FND21-3 的写法一样窄,并**故意**窄):
+ *   · 只在 `FND21-3` 这个测试的**块内**找(遇到块尾 `})` 或下一个 `FND21-N` 就停),
+ *     否则会抽到 FND21-1/2/4/5 里那些 `act(w, { action: 'BREAK_BLOCK' })` 之类;
+ *   · 只认 `const known = await act(w, { action: 'X' })` 这一种形状
+ *     (`known` 这个变量名就是 FND21-3 里「已知但未接线」的那一支);
+ *   · 抽不到就是抽不到:返回 `foundTest: false` / `names: []`,由调用方
+ *     **非空洞断言**判红 —— 绝不静默返回空数组当「名单为空,自然通过」。
+ */
+
+/** `extractFnd21List()` 的结果。**空结果不是正常结果**,调用方必须断言。 */
+export interface Fnd21List {
+  /** 抽到的动作名(按出现序;今天只有一条)。空数组 = 抽取失败,判据必须红。 */
+  names: string[];
+  /** 是否找到了 `FND21-3` 这个测试(找不到 ⇒ 名单搬家了,判据失效)。 */
+  foundTest: boolean;
+  /** 是否找到了 `const known = await act(w, { action: ... })` 那一行。 */
+  foundKnownCall: boolean;
+  /** 每个名字的出处行号(1 起,与 `names` 同序),报错时直接指过去。 */
+  lines: number[];
+  /** 抽取器停下(或扫完)时的行号,便于说明「扫到哪儿就放弃了」。 */
+  stopLine: number;
+}
+
+/** 分块大小:与 `tests/WS-FND-38` 的 `scanLines` 一致(64 KiB)。 */
+const FND21_CHUNK = 1 << 16;
+
+/**
+ * 从 `tests/WS-FND-21-action-e2e.test.ts` 的**全文**里抽出 FND21-3 那条
+ * 「已知但未接线」的动作名。
+ *
+ * 分块 + 逐行推进(不是 `text.split('\n')`):与 `tests/WS-FND-38` 的流式扫描同风格,
+ * 一旦拿到名单或确定拿不到就 `return`(`visit` 返回 `false` ⇒ 立刻停)。
+ */
+export function extractFnd21List(text: string): Fnd21List {
+  const names: string[] = [];
+  const lines: number[] = [];
+  let foundTest = false;
+  let foundKnownCall = false;
+  let stopLine = 0;
+
+  /** 返回 `false` ⇒ 停止扫描(已经拿到名单,或者已经确定拿不到)。 */
+  const visit = (line: string, lineNo: number): boolean => {
+    stopLine = lineNo;
+    if (!foundTest) {
+      /* 阶段 1:先定位 `FND21-3` 这个**测试**本身(前两个测试里也有 `act(w, { action: ... })`,
+         所以必须锚在 `atest('FND21-3` 上,而不是任意一行出现 `FND21-3` ——
+         它上方那行「── FND21-3 未知动作名也要回执 ──」注释会先把扫描器骗停)。 */
+      if (/(?:atest|test)\(\s*'FND21-3\b/.test(line)) foundTest = true;
+      return true;
+    }
+    /* 阶段 2:只在这个测试的块内找。块尾 `});` 或**下一个** `atest('FND21-…` ⇒ 停
+       (否则会一路扫下去,抽到 FND21-1/4/5 里那些 `act(w, { action: … })` 的名字)。 */
+    if (/^\s*\}\);\s*$/.test(line) || /(?:atest|test)\(\s*'FND21-/.test(line)) return false;
+    const m = /\bconst\s+known\s*=\s*await\s+act\(\s*w\s*,\s*\{\s*action\s*:\s*'([^']*)'/.exec(line);
+    if (m === null) return true;
+    foundKnownCall = true;
+    names.push(m[1]);
+    lines.push(lineNo);
+    return true;
+  };
+
+  let carry = '';
+  let lineNo = 0;
+  for (let off = 0; off < text.length; off += FND21_CHUNK) {
+    carry += text.slice(off, off + FND21_CHUNK);
+    let nl = carry.indexOf('\n');
+    while (nl >= 0) {
+      const line = stripCR(carry.slice(0, nl));
+      carry = carry.slice(nl + 1);
+      lineNo += 1;
+      if (!visit(line, lineNo)) return { names, foundTest, foundKnownCall, lines, stopLine };
+      nl = carry.indexOf('\n');
+    }
+  }
+  /* 末行没有换行符时的收尾。 */
+  if (carry !== '') visit(stripCR(carry), lineNo + 1);
+
+  return { names, foundTest, foundKnownCall, lines, stopLine };
 }
 
 /** 直接跑时的入口。**只打印**,不写任何文件。 */

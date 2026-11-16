@@ -7,7 +7,7 @@
  *
  *   · `tests/WS-07.test.ts`(ACT-2)                `for (const act of [MOVE, ATTACK])`
  *   · `tests/WS-FND-18-action-ownership.test.ts`(FND18-4)  `['MOVE', {}, 'NOT_IMPLEMENTED']`
- *   · `tests/WS-FND-21-action-e2e.test.ts`(FND21-3)        `{ action: 'MOVE' }`
+ *   · `tests/WS-FND-21-action-e2e.test.ts`(FND21-3)        `const known = await act(w, { action: 'MOVE' })`
  *
  * 最近三个波次里这份名单**每次都过期**(接了线却仍列在「未接」里,或者反过来),
  * 每次都靠人肉发现 —— 也就是说「哪些接线了」这件事此前**没有**机器可查的事实源。
@@ -16,9 +16,15 @@
  * `wired` / `unwired` / `total`;本套件做两件事:
  *
  *   1 钉住派生结果本身(总数 22、已知接线、刻意不接的 MOVE/ATTACK、不重不漏);
- *   2 **交叉核对**上面那两份硬编码名单 —— 名单里的动作必须在派生的 `unwired` 里,
- *     而且(反向,见 FND38-5)`unwired` 里的动作也必须出现在名单里,除非在
- *     `ACT2_EXEMPT` 里写明为什么它**不该**出现在 ACT-2 里。
+ *   2 **交叉核对**上面三份硬编码名单 ——
+ *     · ACT-2(FND38-5):正向「名单里的动作必须未接线」**且**反向
+ *       「`unwired` 里的动作也必须出现在名单里,除非在 `ACT2_EXEMPT` 里写明理由」;
+ *     · FND18-4(FND38-6):只做正向(它是「逐条期望 NOT_IMPLEMENTED」的表);
+ *     · FND21-3(FND38-9):只做正向(它是一条**抽样探针**,不是清单 —— 理由见该条注释)。
+ *
+ *   ⚠️ 今天的现状:**三份名单全部纳入机器核对,没有哪一份再靠人肉**。
+ *      将来若新增第四份手抄名单,请照 FND38-9 的形状接上(脚本里一个导出抽取器 +
+ *      本文件一条带非空洞断言的判据),别只加注释。
  *
  * 第 2 点才是牙齿:名单一旦过期(接线了却仍列在未接里,或未接线却没进名单)⇒ 红,
  * 而不是等谁想起来去看一眼。
@@ -47,12 +53,12 @@
  */
 
 import { test, ok, eq, report } from '../shared/testing/harness.ts';
-import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { deriveActionCoverage, formatCoverage } from '../scripts/action-coverage.ts';
+import { deriveActionCoverage, extractFnd21List, formatCoverage } from '../scripts/action-coverage.ts';
 import type { ActionCoverage } from '../scripts/action-coverage.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -62,6 +68,7 @@ const ACTIONS_DIR = join(ROOT, 'server', 'src', 'net', 'actions');
 const ROOM_FILE = join(ROOT, 'server', 'src', 'net', 'room.ts');
 const WS07 = join(ROOT, 'tests', 'WS-07.test.ts');
 const WS_FND_18 = join(ROOT, 'tests', 'WS-FND-18-action-ownership.test.ts');
+const FND21 = join(ROOT, 'tests', 'WS-FND-21-action-e2e.test.ts');
 const SCRIPT = join(ROOT, 'scripts', 'action-coverage.ts');
 const SELF = join(ROOT, 'tests', 'WS-FND-38-action-coverage.test.ts');
 
@@ -384,6 +391,50 @@ test('FND38-8 依据行号可回读:每条的 declLine 真的落在该处理器�
       );
     }
     ok(row.why.length > 0, `${row.action}: 必须给出判定理由`);
+  }
+});
+
+test('★ FND38-9 交叉核对 WS-FND-21 的 FND21-3:「已知但未接线」的动作必须在 unwired 里', () => {
+  /* 第三份(也是最后一份)硬编码名单。它与前两份形状不同:FND21-3 里是**单条**
+       const known = await act(w, { action: 'MOVE' });
+       eq(known.kind, 'NOT_IMPLEMENTED', ...);
+     ⇒ 名单一旦过期(比如 `MOVE` 接了线),那条断言**不会**说「名单过期了」:
+       它只会以**别的方式**红(回执变成 OK —— 前提是它那条分支真的走到),
+       或者因为落在别的原因上而**静默变绿**。这一条把「名单写了谁」也拿来对账。
+
+     方向与 FND38-6 一致(只做正向:**名单 → unwired**)。
+     ⚠️ 为什么**不**做反向(FND38-5 对 ACT-2 那样要求 `unwired ⊆ 名单`):
+        ACT-2 的命题是「未接线的动作**逐个**都没被漏掉」—— 双向是对的;
+        FND21-3 的命题是「**一个**已知但未接线的名字也能显式回 NOT_IMPLEMENTED」,
+        它是一条**抽样探针**,不是清单(今天只写了 MOVE,ATTACK 故意不在)。
+        要反向就得再给 ATTACK 之类补一份豁免白名单 —— 那等于用白名单把抽样探针
+        伪装成清单,反而**放宽**判据。所以这里只钉「名单里的名字必须真的未接线」。
+
+     变红条件(逐条):
+       1 FND21-3 里的动作被接线了 ⇒ 名单过期(最常见的形态);
+       2 那个名字写错/不存在(如 `NO_SUCH_ACTION_XYZ`)⇒ 它不是「已知动作」,
+          这条用例测的就不是它自称的东西 ⇒ 红(绝不静默通过);
+       3 抽取失效(找不到 `FND21-3`,或块里没有 `const known = ...`)
+          ⇒ 下面三条**非空洞断言**直接红,不许「空名单自然通过」。 */
+  const c = cov();
+  const { names, foundTest, foundKnownCall, lines } = extractFnd21List(readFileSync(FND21, 'utf8'));
+
+  ok(foundTest, '在 tests/WS-FND-21-action-e2e.test.ts 里找不到 `FND21-3` —— 名单搬家了?本判据已失效');
+  ok(foundKnownCall, 'FND21-3 里找不到 `const known = await act(w, { action: ... })` —— 名单形状变了?本判据已失效');
+  ok(names.length > 0, 'FND21-3 的「已知但未接线」动作抽出来是空的 —— 判据失效(不许空过)');
+
+  for (let i = 0; i < names.length; i += 1) {
+    const name = names[i];
+    ok(
+      c.rows.some((r) => r.action === name),
+      `FND21-3 写的 ${name}(WS-FND-21-action-e2e.test.ts:${lines[i]})不是 RoomAction 里的动作名`
+      + ' ⇒ 那条用例在测「不存在的名字」,而不是它自称的「已知但未接线」',
+    );
+    ok(
+      c.unwired.includes(name),
+      `FND21-3 期望 ${name} 回 NOT_IMPLEMENTED(「已知但未接线」),但派生结果说它**已接线** ⇒ 名单过期`
+      + `(派生的 wired=[${c.wired.join(',')}])`,
+    );
   }
 });
 
