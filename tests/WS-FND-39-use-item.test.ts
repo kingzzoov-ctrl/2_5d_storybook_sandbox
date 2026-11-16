@@ -124,9 +124,14 @@ test('FND39-2 慢帧推进 ⇒ 剩余时间下降;到期后 buff 清空、上限
   ok(d !== undefined, '前置:602 应在内容表里');
   ok((d?.durationSec ?? 0) > 0, '前置:602 应有时长');
 
-  /* 慢帧 0.5s / 次 ⇒ 推 (duration×30 + 60) 快帧足够跨过到期。 */
-  const frames = Math.ceil((d?.durationSec ?? 0) * 30) + 60;
-  r.sim.advance(frames);
+  /* 慢帧 0.5s / 次 ⇒ 先推到**一半时长**:buff 必须还在(证明它是按时长消耗,不是立刻消失)。 */
+  const half = Math.ceil(((d?.durationSec ?? 0) / 2) * 30);
+  r.sim.advance(half);
+  eq(r.sim.buffsOf('p1').hpFlat, 30, '★ 中途仍在:buff 应按剩余时间消耗,而不是一次跳空');
+
+  /* 再推过剩余的时长 ⇒ 必须清空、上限回落。 */
+  const rest = Math.ceil((d?.durationSec ?? 0) * 30) + 60;
+  r.sim.advance(rest);
 
   eq(r.sim.buffsOf('p1').hpFlat, 0, '★ 到期后不应再有 hpFlat');
   eq(r.sim.maxHpForLevel('p1', 1), base, '★ 上限应回落');
@@ -177,9 +182,11 @@ test('FND39-4 ★ 超距(6.1 格)⇒ 不复活且**一件都不扣**(背包总�
   eq(v?.downed, true, '★ 目标仍是幽灵泡泡(没被救)');
 });
 
-test('FND39-5 itemId 非法(缺 / 0 / 1.5 / 字符串)⇒ INVALID 且世界零变化', () => {
+test('FND39-5 itemId 非法(缺 / 0 / 1.5 / 字符串)⇒ INVALID 且**背包一点不动**', () => {
   const r = makeRoom();
   const before = r.sim.maxHpForLevel('p1', 1);
+  const total = r.rt as unknown as { authoritativeItemTotal(u: string): number };
+  const t0 = total.authoritativeItemTotal('p1');
 
   for (const bad of [{}, { itemId: 0 }, { itemId: 1.5 }, { itemId: '733' }, { itemId: -1 }]) {
     const out = disp(r.rt, bad);
@@ -192,6 +199,7 @@ test('FND39-5 itemId 非法(缺 / 0 / 1.5 / 字符串)⇒ INVALID 且世界零�
   }
   eq(r.sim.buffsOf('p1').hpFlat, 0, '★ 五次非法请求之后没有任何 buff');
   eq(r.sim.maxHpForLevel('p1', 1), before, '★ 上限也没变');
+  eq(total.authoritativeItemTotal('p1'), t0, '★ 背包也一件没动');
 });
 
 test('FND39-6 未知道具 ⇒ INVALID 且理由说清"没有使用语义"', () => {
@@ -261,6 +269,23 @@ test('FND39-9 `foodBuffFrom` 与 `cookSoup` 对同一料理**同形**(防两份�
   eq(mine.stacks, cooked.buff.stacks, 'stacks 应一致');
   eq(JSON.stringify(mine.statMods), JSON.stringify(cooked.buff.statMods),
     '★ statMods 应逐字段一致(两边一旦漂就会红)');
+});
+
+test('FND39-10 同一目标重复投羽毛笔 ⇒ 第二次**明确拒绝**(已不是幽灵泡泡)', () => {
+  const r = makeRoom();
+  down(r.sim, 'p2');
+  place(r.sim, 'p1', 5);
+  place(r.sim, 'p2', 8);
+  const total = r.rt as unknown as { authoritativeItemTotal(u: string): number };
+  const t0 = total.authoritativeItemTotal('p1');
+
+  const first = r.rt.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: FEATHER, targetId: 'p2' });
+  const second = r.rt.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: FEATHER, targetId: 'p2' });
+
+  eq(first.kind, 'OK', '第一次应成功');
+  eq(second.ok, false, '★ 第二次必须被拒(目标已经不是幽灵泡泡)');
+  eq(second.kind, 'INVALID', `应是 INVALID(kind=${second.kind})`);
+  eq(total.authoritativeItemTotal('p1'), t0 - 1, '★ 只扣了 1 件(第一次),不是 2 件');
 });
 
 report('WS-FND-39');

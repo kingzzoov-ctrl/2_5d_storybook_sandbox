@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1723 条 / 53 套件** | WS 1014 条 / 14 套件 · 基座 FND 709 条 / 39 套件 |
+| 用例 | **1724 条 / 53 套件** | WS 1014 条 / 14 套件 · 基座 FND 710 条 / 39 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,7 +387,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-6189b46a3a41  README.md
+1cf2e0ef148f  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
