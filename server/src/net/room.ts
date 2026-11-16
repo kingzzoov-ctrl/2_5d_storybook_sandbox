@@ -502,13 +502,13 @@ export interface WorldSaveHost {
    * 可选:老的世界源不实现它时,`applyMove` 退回「只写 state」——
    * 与 `levelOf` / `saveToDb` 同一 null 契约,不报错也不假装。
    */
-  applyPlayerMove?(playerId: string, x: number, y: number): boolean;
+  applyPlayerMove?(playerId: string, x: number, y: number, z?: number): boolean;
   /**
    * 读回玩家的**权威位置**。与 `applyPlayerMove` 成对:
    * 写入后从权威读回、投影到 `state`,才能让**击退/搬运**对客户端可见
    * (那两条走 `applyImpulse` 改速度,不经过 `applyPlayerMove`)。
    */
-  playerPosition?(playerId: string): { x: number; y: number } | null;
+  playerPosition?(playerId: string): { x: number; y: number; z?: number } | null;
   /**
    * 把玩家**登记进世界**(进场)。与 `applyPlayerMove` 是**一对**。
    *
@@ -1530,7 +1530,7 @@ export class RoomRuntime {
    * ★ 本方法是这个读法的**唯一实现**:`applyMove` 里原来内联了一份同样的
    *   `typeof` 判断,已改为调它(同一读法两处各写一遍就是"两份实现"的起点)。
    */
-  private hostPositionOf(userId: string): { x: number; y: number } | null {
+  private hostPositionOf(userId: string): { x: number; y: number; z?: number } | null {
     const h = this.worldSaveHost;
     if (h === null || typeof h.playerPosition !== 'function') return null;
     return h.playerPosition(userId);
@@ -1587,18 +1587,20 @@ export class RoomRuntime {
     /* 1 先写进世界(权威)。没有世界则跳过 —— 不报错,不假装。 */
     const host = this.worldSaveHost;
     if (host !== null && typeof host.applyPlayerMove === 'function') {
-      host.applyPlayerMove(userId, intent.x, intent.y);
+      host.applyPlayerMove(userId, intent.x, intent.y, intent.z);
     }
 
     /* 2 再把**权威值**投影到 state。
        有世界就从权威读回(含击退/搬运的结果);没有世界就只有声明值可写。
-       ⚠️ z **不从权威读**:本次只接 x/y(跨轴混用是新的分叉点,见未做项)。 */
+       ★ z 也从权威读回(2026-11-16 接通):`applyPlayerMove` 已把 z 写进刚体,
+       这里读回它 ⇒ 客户端声明的 z **不再是最终值**(与 x/y 同一口径)。
+       `host.playerPosition` 的 `z` 是**可选**的(老世界源只回 x/y)⇒ 回退到声明值。 */
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {
       const auth = this.hostPositionOf(userId);
       p.x = auth?.x ?? intent.x;
       p.y = auth?.y ?? intent.y;
-      p.z = intent.z;
+      p.z = auth?.z ?? intent.z;
     }
     this.touch(this.clock.nowMs());
     return v;

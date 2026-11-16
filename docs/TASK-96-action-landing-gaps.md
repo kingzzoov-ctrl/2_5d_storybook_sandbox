@@ -144,6 +144,30 @@
 2 `SLEEP` 的世界侧读者**只记录事实**,不改变任何回血数值(那要产品裁决);
 3 城镇配置对 `bosses/raid.ts` 的祭坛校验**不可见**(它仍以默认 24 调用 `isInsideSafeRadius`);
 4 宠物归属**不持久化**(模块级 Map,进程重启即空)。
+### 二之八、2026-11-16 这一轮接的六处 + 审查抓出的**五个真缺陷**
+
+| 事项 | 落点 | 判据 |
+|---|---|---|
+| 温泉上限 `×1.3` 到**权威** | 乘区收进 `maxHpForLevel`(上限的**唯一**算子);`baseMaxHp` 备忘防二次乘(×1.69) | `WS-FND-49` FND49-1/2(注入 M1 能红) |
+| z 轴两头接通 | 服务端 `applyPlayerMove(pid,x,y,z?)` + 投影从权威读回;客户端 `client/src/net/height_placement.ts` | `WS-FND-49` FND49-3/4/5(注入 M2)·`WS-FND-48` 7 条 |
+| 击退真的发生 | `applyKnockback` + 慢帧推位移 + **推进期间拒绝搬家** | `WS-FND-49` FND49-6/7/8(注入 M3) |
+| 复活旗 C2 | `tickDowned` 里**旗优先**(旗与救援共用 `reviveProgress` **一个**字段,同时推进就是两份实现抢它) | `WS-FND-49` FND49-9/10(注入 M4) |
+| 227 的"困住"有消费者 | `applyPlayerMove` 的 `TRAPPED` 拒绝 | `WS-FND-49` FND49-11(注入 M5) |
+| 大餐乘区真的算 | `tickRoomEffects` 喂 `hasMealBuff` + `lastRoomEffects[].mealMul` | `WS-FND-47` 8 条 |
+
+**对抗性审查抓出、已修的真缺陷**(不修都会"算错",每条都配了判据):
+
+1 **三处注入只在 `assemble()`** ⇒ 生产(Colyseus)路径**全空**(赛局恒 0 / `sleeping` 恒 0 / 城镇半径恒 24):全部搬进 `createHost()` 的 `wireHost()`,**两条路共同入口**;
+2 **世界与运行时的 roomId 不同源**(`''` vs `'room_main'`)⇒ 城镇配置永远取不到:`createHost`/`assemble` 用**同一个** `roomId` 局部量;
+3 **`USE_ITEM` 先生效后扣** ⇒ 没有道具也能无限救人 / 无限叠 `hpFlat`:改成**先扣后生效**(扣不动 ⇒ 世界侧根本没跑);扣了但没生效 ⇒ 用 `grantItemSource` + 正向 ops **退回**;
+4 **赛局计分发在去重之前** ⇒ 同一实例二次结算时"经验去重、分数双发":改为 `settleMobExp` 之后、且 `deduped` 时不发;
+5 **刷怪去重把尸体也算"已刷"** ⇒ 每个物种杀一只后**永不重生**:`runtimes().filter((rt) => rt.alive)`。
+
+**审查指出、仍未修**(逐条留档,不假装已解决):
+
+1 `liveBubbles` 的层数**不衰减** ⇒ 跨任意时长能凑满"连中 3 发";连击窗口是**平衡数值**,要 owner 裁;
+2 `effectiveMaxHp` 与 `maxHpForLevel` 两个读数口并存(前者生产调用点 0)—— `baseMaxHp` 已消掉 ×1.69 风险,但 `rooms/effects.ts` / `combat/vitals.ts` 两处旧 docblock 与新实现**相反**,待一并改;
+3 客户端 z 的**相机高度是硬跳变**(真浏览器观感未验)。
 
 判据:`tests/WS-FND-39-use-item.test.ts`(9 条;4 处注入验证:超距扣道具 / 不写回活的无敌 /
 不并 `hpFlat` / 永不扣道具 —— 全部能红且逐字节还原)。

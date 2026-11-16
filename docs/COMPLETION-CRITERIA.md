@@ -309,3 +309,16 @@ Lead 全局复核(208 文件含 _design/):
 | 6 | 料理 buff / 三件死道具的**玩法裁决** | 需 owner 决定 | CR-21 / task-64 C 待裁 |
 
 **⇒ 序 1 是唯一的关键路径** —— 其余五项都与它并行,只有它是「不修则多人游戏不存在」。
+---
+
+## ★ 2026-11-16 状态更正(上面五条 `[~]` 的**最新实测**)
+
+| 条目 | 当时的结论 | 实测(2026-11-16) | 证据 |
+|---|---|---|---|
+| `:68` US2 网关 | 端到端未证 | 仍未证,**但理由要改**:`colyseus` **装着且能解析**(`optionalDependencies` 已装)⇒ **不是"缺依赖"**;缺的是"点燃真网关的端到端用例" | `node -e "import('colyseus')"` → 可解析:是;`Test-Path node_modules/colyseus` → True |
+| `:147` 9 种房间增益 | 到玩家的只有卧室回血 | **温泉 `×1.3` 已到权威**、**大餐乘区已真的算**、卧室回血早就在;**`forgeUnlocked` 仍无消费点** —— 卡点是内容层**没有"中高级锻造"的分档**(`shared/constants/items.ts` 里 `forge|tier` 命中 **0**)⇒ 卡在**内容分档裁决**,不是卡在接线 | `WS-FND-49` FND49-1/2、`WS-FND-47` 8 条 |
+| `:152` 料理消费点 | 大餐乘区未触发 | **已触发**(`hasMealBuff` 由 `tickRoomEffects` 喂);**仍未接**的字段:`defFlat`/`moveMul`/`gravityMul`(冻结层无参数位)/`jumpMul`/`gatherMul`(无采集系统)/`expMul`;`muOverride` 缺具名默认值导出 | `WS-FND-47`、`WS-FND-39` 15 条 |
+| `:273` z 轴 | 只接了 x/y | **两头都接上了**:服务端 `applyPlayerMove(...,z?)` 写刚体 + 投影从权威读回;客户端 `client/src/net/height_placement.ts`(z 只进第三分量,`z=0` 与接线前逐字段相同) | `WS-FND-49` FND49-3/4/5、`WS-FND-48` 7 条 |
+| `:280` knockback | no-op | **已生效**:`applyKnockback` + 慢帧推位移 + **推进期间 `applyPlayerMove` 拒搬**(`lastMoveRejection = 'KNOCKBACK'`) | `WS-FND-49` FND49-6/7/8 |
+
+⚠️ **行号漂移**:本轮改动后,本文件与 `HANDOVER`/`TASK-96`/`TASK-98`/`TASK-99` 引用的 `world_sim.ts` / `room.ts` / `cooking.ts` / `effects.ts` 行号**大量失效**(审查 B 给了逐条清单)。**按符号名定位,不要按行号。**

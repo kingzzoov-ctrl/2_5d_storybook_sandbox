@@ -21,6 +21,25 @@
  * 2. **不新增冻结层字段**:9 种房间的增益全部在服务端派生,`shared/**` 零改动。
  * 3. **增益随离开撤销**,不是「进过一次永久生效」—— 这是房间效果与一次性解锁
  *    的本质区别(WELL 断言 WT-03-64/65 的负对照钉住它)。
+ *
+ * ## `hasMealBuff` → `mealMul`:谁传、在谁身上生效、今天到哪一步
+ *
+ * 大餐乘区是本文件里**唯一需要调用方喂一个「玩家身上有什么」的事实**的效果 ——
+ * 其余效果只看「站在哪个房间」,房外的世界状态一概不需要。
+ *
+ * · **谁传**:`WorldSim` 的慢帧房间效果推进(`server/src/sim/world_sim.ts` 的
+ *   `tickRoomEffects`,那里持有玩家的 `FoodBuff` 表)按玩家身上的料理 buff 算出
+ *   `hasMealBuff` 再喂进来。本文件刻意**不 import `cooking.ts`** —— 那会让
+ *   「房间效果」依赖「料理/战斗」,而这里只需要一个**已经判好的事实**。
+ *   ⚠️ **调用方必须传**:`undefined` 与 `false` 在本文件里同义 ⇒
+ *   漏传**不报错**,只让乘区**静默**恒 `1.0`(判据
+ *   `tests/WS-FND-47-meal-mul.test.ts` 第 4 条专门钉这个"漏传的显式后果")。
+ * · **在谁身上生效**:`stepRoomEffects` 只**返回** `mealMul`;把它记进
+ *   `WorldSim.lastRoomEffects` 是调用方的事。乘区最终乘在**该玩家的攻击 /
+ *   生命上限**上(手册 §3.8:「Boss 战前全团 +40% 攻击/生命上限大餐」)。
+ * · **今天到哪一步**:本文件**已**返回 `mealMul`(纯函数,判据有牙);
+ *   `WorldSim` 侧**尚未**传 `hasMealBuff`、`lastRoomEffects` 里**尚未**有
+ *   `mealMul` ⇒ **生产路径上乘区恒 `1.0`**。即:判据有牙、接线未完成。
  */
 
 /** 房内每秒恢复的 HP(手册:【森系茶歇卧室】躺上去每秒 15 HP)。 */
@@ -113,8 +132,17 @@ export interface RoomEffectInput {
   /**
    * 玩家**当前是否带着料理 buff**(由调用方从他身上的 `FoodBuff` 列表算)。
    *
-   * 可选:不传 = 没有(而不是"报错")。理由:它是**加成的触发条件**,
-   * 而"没有 buff"是完全正常的状态 —— 让每个调用方都传 `false` 不产生任何信息。
+   * ⚠️ **调用方必须传这个字段** —— 见文件头「谁传 / 在谁身上生效 / 今天到哪一步」。
+   *
+   * 类型上写 `?` 只为让与它无关的调用(只想看回血/上限的房间)仍能编译,
+   * **不是**"可以不传":`undefined` 与 `false` 在本文件里**同一含义**,
+   * 都不触发乘区。漏传的后果是**静默**的(不抛错、门禁全绿,而玩家拿不到 +40%),
+   * 这正是乘区"算完即丢"时的形态 ⇒ 判据 `tests/WS-FND-47-meal-mul.test.ts`
+   * 第 4 条把"不传"钉成 `1.0`。
+   *
+   * 非布尔值同样按"没有 buff"处理(判定用 `=== true`),**不抛错**:这个字段是
+   * 加成的**触发条件**,而"没有 buff"是完全正常的状态 —— 让一个脏输入炸掉
+   * 整帧物理不值得(判据第 7 条)。
    */
   hasMealBuff?: boolean;
 }
@@ -188,7 +216,10 @@ export function stepRoomEffects(st: RoomEffectState, input: RoomEffectInput): Ro
     /* 生命上限倍率:站在温泉里 **或** 泡澡增益未过期都生效。 */
     maxHpMul: maxHpMulOf({ onsenSec, inOnsen, inBedroom, inForge, inCanteen }),
     /* 大餐乘区:食堂 **且** 带着料理 buff —— 手册说的是「大餐」,
-       而大餐是 `cooking.ts` 的产物 ⇒ 空手站在食堂里**不该**拿到 +40%。 */
+       而大餐是 `cooking.ts` 的产物 ⇒ 空手站在食堂里**不该**拿到 +40%。
+       ⚠️ `hasMealBuff` 是**入参**、不是本函数能推断的事实:调用方漏传
+       ⇒ 本行恒 `1.0`(静默失效,见文件头那一小节 + 判据第 4 条)。
+       非 `true` 的值一律按"没有 buff":乘区是触发条件,不是校验对象。 */
     mealMul: inCanteen && input.hasMealBuff === true ? CANTEEN_MEAL_MUL : 1.0,
     forgeUnlocked: inForge,
   };

@@ -109,6 +109,13 @@ import {
    stepCamera,
    type CameraPoint,
  } from '../net/camera_follow.ts';
+/* ★ WS-FND-48:线上 `z`(**高度**)终于被用起来 —— 判定全在 `net/height_placement.ts`
+   (纯函数、零三方、零 DOM ⇒ 可被 `tests/WS-FND-48` 在 node 里直接断言),本文件只剩
+   **每帧一个调用点**。接线前 `z` 被解析进 `RoomState` 却没有任何读者 ⇒
+   「跳起来的玩家」与「站在地上的玩家」在屏幕上**完全一样**,且不报任何错。
+   ⚠️ `z = 0`(服务端 `physics.spawn(..., z: 0)` 的默认值)时本模块的输出与接线前
+   **逐字段相同**(立牌 z 仍只取地形高程,相机 `focusZ` 仍是 0)⇒ 既有表现不变。 */
+import { placementForHeight, localPlayerZOf } from '../net/height_placement.ts';
 /* task-83:玩家可见物。位置来源**唯一** —— 权威状态经 `telegraphCenterOf`,
    本文件只把那个位置翻译成 three 的摆放参数(纯逻辑在 `stage/assembly_math.ts`)。 */
 
@@ -652,6 +659,17 @@ export function boot(container: HTMLElement): BootHandle {
   /* 出生点:第一帧权威值到达前的占位(与 `pan` 初值一致,视觉上不跳) */
   let playerGx = WORLD_CELLS / 2;
   let playerGy = WORLD_CELLS / 2;
+  /**
+   * 本地玩家的**高度** `z`(权威状态里的第三个分量,单位「格」)。`0` = 站在地面。
+   *
+   * ★ WS-FND-48:它是**新**的一个轴 —— 接线前这个值被解析进 `RoomState` 却无人读,
+   * 于是「跳起来」在屏幕上不存在。这里只存值;「z 怎么影响画面」全在
+   * `net/height_placement.ts`(纯函数,含 `z = 0` 时与接线前逐字段相同的保证)。
+   *
+   * 初值 0 与出生点占位同一条理由:第一帧权威值还没到,画面上就是「站在地面」,
+   * 而不是某个「合法但错」的高度(`localPlayerZOf` 的未知分支也给 0,见那边注释)。
+   */
+  let playerGz = 0;
   /** 权威位置是否已到达过一次 —— 供 `summary()` 自检与 WS-12 观测。 */
   let authoritySeen = false;
   /**
@@ -841,6 +859,19 @@ export function boot(container: HTMLElement): BootHandle {
    * ⚠️ 它**不是**"WASD 平移相机"的替代品 —— 键盘那条路已经删了。
    */
   let camOverride: CameraPoint | null = null;
+  /**
+   * 相机聚焦点的**高度**分量(`IsoCamera.focusZ`)—— ★ WS-FND-48 新增的那个轴。
+   *
+   * ⚠️ **声明顺序不能挪**:`?at=` / `__uiDebug.teleport()` 会在下面的 URL 块里
+   * **立刻**调 `syncCamera()`,而它读这个量 —— 声明若排在后面就是 TDZ,
+   * 首帧直接抛 `Cannot access '...' before initialization`(上面 `pan` 的注释里
+   * 记着同款实测事故)。
+   *
+   * 值由纯函数 `placementForHeight` 定(`z × 0.5` 夹在 ±1 格,理由在那边文件头),
+   * 本文件只做「取值 → 塞进相机」。`z = 0` ⇒ `0`,而 `0` 正是 `createCamera()` 的
+   * `focusZ` 缺省值 ⇒ 接线前的相机表现**逐字段不变**。
+   */
+  let cameraFocusZ = 0;
   /** 拖拽控制器(ui/state_machine):悬停/拿起/放下 —— 驱动背包格子高亮 */
   const dragCtl = new DragController();
 
@@ -981,9 +1012,9 @@ export function boot(container: HTMLElement): BootHandle {
       chargeSec: 0.8,
       danger: 0.8,
     };
-    const cam = createCamera(window.innerWidth, window.innerHeight);
-    cam.focusX = pan.x;
-    cam.focusY = pan.y;
+    /* ★ WS-FND-48:预警圈的屏幕投影必须用**与渲染同一个**相机口径(含 `focusZ`),
+       否则立牌抬起来后它在屏幕上会与镜头差半格 —— 而这种错没有任何东西会报 */
+    const cam = cameraAtFocus();
     const g = buildTelegraph(spec, cam);
     return { outer: g.screenOuter, inner: g.screenInner, vertices: g.screenOuter.length + g.screenInner.length };
   };
@@ -1059,9 +1090,7 @@ export function boot(container: HTMLElement): BootHandle {
       const rect = normalizeScreenRect(bpDrag);
       if (isDrag(rect)) {
         /* 屏幕 → 世界 → 裁剪 → 收集,四步全部走 blueprint.ts 的纯函数 */
-        const cam = createCamera(window.innerWidth, window.innerHeight);
-        cam.focusX = pan.x;
-        cam.focusY = pan.y;
+        const cam = cameraAtFocus();
         const world = screenRectToWorldRect(rect, cam, 0);
         const range = clampCellRange(world);
         const bp = collectBlueprint(range, tileAt, [0, 1, 2]);
@@ -1150,11 +1179,27 @@ export function boot(container: HTMLElement): BootHandle {
      ⇒ 相机再也不跟随,且屏幕上只表现为"镜头不动了"。这是静默降级,必须有出口。 */
   window.addEventListener('pointercancel', onPointerUp);
 
-  /** 把逻辑相机状态同步到 three 相机(唯一一处重复代码,抽出来) */
-  function syncCamera(): void {
+  /**
+   * 造一个**逻辑相机**并把它对准「跟随出来的相机聚焦点 + 高度分量」。
+   *
+   * 为什么抽成一个函数(而不是三处各写一遍三行):本文件有三个地方要从 `pan` 造相机
+   * —— 渲染(`syncCamera`)、预警圈的屏幕投影、蓝图框选的世界换算。三处若各写一份
+   * `focusZ`,高度轴就会在某一处**静默漏掉**(表现:立牌抬起来了,但框选/预警圈仍按
+   * 地面算 ⇒ 差半格,而没有任何东西会报错)。★ WS-FND-48 把它们收敛成一个口径。
+   *
+   * `focusZ: cameraFocusZ`(`z = 0` ⇒ `0` ⇒ 与 `createCamera()` 的缺省值相同)。
+   */
+  function cameraAtFocus(): IsoCamera {
     const c = createCamera(window.innerWidth, window.innerHeight);
     c.focusX = pan.x;
     c.focusY = pan.y;
+    c.focusZ = cameraFocusZ;
+    return c;
+  }
+
+  /** 把逻辑相机状态同步到 three 相机(唯一一处重复代码,抽出来) */
+  function syncCamera(): void {
+    const c = cameraAtFocus();
     c.zoom = isoCam.zoom;
     const nc = buildOrthographicCamera(c);
     camera.position.copy(nc.position);
@@ -1209,6 +1254,46 @@ export function boot(container: HTMLElement): BootHandle {
       authoritySeen = true;
     }
 
+    /* ── ★ WS-FND-48:线上 `z`(**高度**)──
+     *
+     * 与 x/y **同源**(同一个 `RoomState` + 同一个 `localPlayerId`),但走**独立入口**:
+     * x/y 经 `telegraphCenterOf`,z 经 `localPlayerZOf` —— 两个都在纯模块里,可被 node 断言。
+     * ⚠️ 不给 `telegraphCenterOf` 的返回加一个 `cz`:它的形状被 `tests/WS-12` **逐字段**
+     *   断言成 `{cx, cy}`,加字段会让那条已绿的判据变红。
+     *
+     * 语义:单位「格」,**相对地表**的高度,`0` = 站在地面
+     * (服务端 `physics.spawn(..., z: 0)` 的默认值;`applyPlayerMove` 只收 x/y ⇒
+     *  它**不是**绝对高程,见 `net/height_placement.ts` 的语义取证)。
+     */
+    playerGz = localPlayerZOf(authority.state, authority.localPlayerId);
+
+    /* ── task-83 + ★ WS-FND-48:把玩家画出来,并让它跟着 20Hz 快照动 ──
+     *
+     * 这一块就是「快照 ⇒ 屏幕」的**唯一接口**. 位置**不重新算** ——
+     * `center` 已由权威状态给出(上面那几行),这里只做「翻译成摆放参数」.
+     *
+     * 高度 = **地形那一格的高程**(与 `zAt` 表同源)+ **权威高度 `z`**:
+     * 前者让玩家跟着地形起伏(而不是悬在一个固定平面上),后者让「跳起来 / 沉下去」
+     * 在屏幕上**真的看得见** —— 接线前 `z` 没有任何读者,跳与站是同一张图且不报错.
+     * 两件事都由纯函数 `placementForHeight` 合成:`z = 0` 时 `mount.sprite` 与 `base`
+     * 的 `gx/gy/gz` **逐字段相同**(既有表现不变).
+     *
+     * `visible` 仍由 `playerMarkerPlacement` 决定:`center === null` ⇒ 不可见.
+     * ⇒ 权威没到时**不画**,而不是画到世界原点(那会是一个看起来合法的错误位置).
+     *
+     * ⚠️ 本块**必须在相机块之前**:相机的高度分量要用**同一帧**的这份摆放结果
+     * (`mount.cameraFocus.z`),放在后面等于给镜头引入一帧滞后。
+     */
+    const base = playerMarkerPlacement(center, zAt);
+    const mount = placementForHeight({ x: base.gx, y: base.gy, z: playerGz }, base.gz);
+    /* ⚠️ 下面两行**刻意保留原来的字面写法**(`cell.gx/gy/gz` 与 `cell.visible`):
+       `tests/WS-09` 用源码文本钉住「每帧写入立牌位置」与「可见性由 pure 层裁决」,
+       它们守的正是「本块不许被绕过」。⇒ 把合成结果**折回** `cell` 的字段名,
+       而不是去改那条判据。`cell.gz` 里已经含了 `z`(`mount.sprite.z = base.gz + z`)。 */
+    const cell = { gx: mount.sprite.x, gy: mount.sprite.y, gz: mount.sprite.z, visible: base.visible };
+    playerMarker.position.set(cell.gx, cell.gy, cell.gz);
+    playerMarker.visible = cell.visible;
+
     /* ── ★ 相机跟随**权威位置**(WS-FND-23)──
      *
      * 这一块才是「角色不会走出画面」的**依据**(不再依赖按键):
@@ -1228,35 +1313,35 @@ export function boot(container: HTMLElement): BootHandle {
      *
      * `syncCamera()` 只在**真的动了**时调:收敛后每帧重建相机矩阵是纯浪费,
      * 而 1e-3 格 ≈ 0.016px —— 肉眼与投影都不可能察觉。
+     * ★ WS-FND-48:那个「真的动了」现在还含**高度分量**(`cameraFocusZ`),否则
+     *   `z` 的变化会被这个判断吞掉 —— 立牌抬起来了、镜头纹丝不动,且不报错。
      */
     if (camOverride === null && drag === null) {
       /* 权威未知 ⇒ `cameraTargetFor` 给 null ⇒ 相机**保持不动**(不是跳到 (0,0)) */
       const target = cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS);
       if (target !== null) {
         const next = stepCamera(pan, target, dt / 1000, CAMERA_SMOOTHING_SEC);
-        if (Math.abs(next.x - pan.x) > 1e-3 || Math.abs(next.y - pan.y) > 1e-3) {
+        /* ★ WS-FND-48:高度**变了也必须重建相机** —— 否则 z 的变化会被上面那个
+           「相机没动」的判断吞掉(表现:立牌抬起来了、镜头纹丝不动,且不报任何错)。
+           `cameraFocusZ` 是**当下**的相机高度分量,`mount` 是本帧的目标。 */
+        if (
+          Math.abs(next.x - pan.x) > 1e-3
+          || Math.abs(next.y - pan.y) > 1e-3
+          || Math.abs(mount.cameraFocus.z - cameraFocusZ) > 1e-3
+        ) {
           pan.x = next.x;
           pan.y = next.y;
+          cameraFocusZ = mount.cameraFocus.z;
           syncCamera();
         }
       }
     }
-    /* ── task-83:把玩家画出来,并让它跟着 20Hz 快照动 ──
+    /* ── task-83 的立牌摆放**已上移**到相机块之前(★ WS-FND-48)──
      *
-     * 这一行就是「快照 ⇒ 屏幕」的**唯一接口**. 位置**不重新算** ——
-     * `center` 已经由权威状态给出(上面那几行),这里只做「翻译成摆放参数」.
-     *
-     * 高程取**地形那一格**的实际高度(与 `boot.ts` 建 `zAt` 表同源),
-     * 这样玩家会跟着地形起伏,而不是悬在一个固定的平面上.
-     *
-     * `visible` 由 `playerMarkerPlacement` 决定:`center === null` ⇒ 不可见.
-     * ⇒ 权威没到时**不画**,而不是画到世界原点(那会是一个看起来合法的错误位置).
-     */
-    {
-      const cell = playerMarkerPlacement(center, zAt);
-      playerMarker.position.set(cell.gx, cell.gy, cell.gz);
-      playerMarker.visible = cell.visible;
-    }
+     * 它现在与 `playerGz` 的读取、`placementForHeight` 的合成紧挨在一起 —— 因为相机块的
+     * **高度分量**必须用**同一帧**的摆放结果(`mount.cameraFocus.z`),
+     * 留在原处会给镜头引入一帧滞后(60Hz 下 16ms 的抖动)。
+     * 入口仍是同一句:`playerMarkerPlacement(center, zAt)`(高程来源没换)。 */
     updateRoof(dt / 1000);
     /* 把算出来的 alpha 真的喂给材质 —— 否则「淡出」只是内存里的一个数 */
     (roofMesh.material as THREE.MeshLambertMaterial).opacity = roofOpacity();
@@ -1333,6 +1418,20 @@ export function boot(container: HTMLElement): BootHandle {
       cameraFocus: { x: pan.x, y: pan.y },
       cameraTarget: cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS),
       cameraLagCells: Math.round(Math.hypot(playerGx - pan.x, playerGy - pan.y) * 1000) / 1000,
+      /* ── ★ WS-FND-48 高度轴(`z`)自检口径 ──
+       *
+       * 让「z 真的被用起来了」**可被读出来**,而不是靠看图说"看着抬起来了":
+       *   `playerGz`          权威高度(入参)
+       *   `cameraFocusZ`      相机聚焦点的高度分量(出参,= clamp(z × 0.5, ±1))
+       *   `playerMarkerPos.z` 立牌的世界 z(= 地形高程 + z;上面已有该字段)
+       *
+       * 三者一起读才分得清三种坏法:
+       *   `playerGz ≠ 0` 而 `playerMarkerPos.z` 没变 ⇒ 高度根本没接线(本任务要抓的那类);
+       *   `playerGz ≠ 0` 而 `cameraFocusZ` 恒 0   ⇒ 只接了立牌、漏了相机;
+       *   两个都是 0 而 `playerMarkerPos.z` == 地形高程 ⇒ 正常(z = 0,接线前表现)。
+       */
+      playerGz,
+      cameraFocusZ,
       cameraFollowSmoothingSec: CAMERA_SMOOTHING_SEC,
       cameraSnapDistanceCells: CAMERA_SNAP_DISTANCE,
       cameraOverride: camOverride,

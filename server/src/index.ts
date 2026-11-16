@@ -211,7 +211,47 @@ export interface Assembled {
  * ⇒ 故新增任何 `WorldSim` 能力并打算让房间用时,**必须同时**在
  *    `WorldSaveHost` 里声明,否则这行 `return sim` 会把它悄悄藏起来。
  */
+
+/**
+ * 把**世界侧读口**装到 host 上(全部注入的**唯一**落点)。
+ *
+ * ## 为什么必须是"唯一落点"(这条是审查抓出来的真缺陷)
+ *
+ * 第一版把这几行写在 `assemble()` 里 ⇒ **生产(Colyseus)路径全空**:
+ * `room.colyseus.ts` 走 `resolveRoomHost()` → `createHost()`,**不经过 `assemble()`**
+ * ⇒ 赛局分数恒 0、`lastRoomEffects[].sleeping` 恒 0、城镇半径永远退回 24,
+ * 而 `WS-FND-43/44/45` 三条套件**全绿**(它们都用 `assemble()`)。
+ * 这正是本仓点名的「测试手动装、生产没装」形态。
+ * ⇒ 装在这里:`createHost()` 是**两条路共同的**造世界入口。
+ *
+ * ⚠️ `roomId` 必须与运行时用的是**同一个值**;否则世界问的是**别人的**配置
+ * (审查 A2:世界拿 `''`、运行时拿 `'room_main'` ⇒ 配置写在 `room_main`、
+ * 世界去问 `''` 拿回出厂 24 —— 数值上恰好与"没配"相同,所以没有断言会红)。
+ */
+function wireHost(host: WorldSaveHost, roomId: string): void {
+  /* 1 赛局计分:世界报告事实 → 规则换算 → `addScore`。 */
+  const partyHost = host as unknown as {
+    attachPartyScoreSink?: (fn: (ev: { kind: string; source?: string }) => void) => void;
+  };
+  partyHost.attachPartyScoreSink?.((ev) => {
+    const st = partyStateOf(roomId);
+    if (st === null) return; /* 没开局 ⇒ 不计分(没有"分数"这个对象) */
+    if (ev.source === undefined || ev.source === '') return; /* 无归属 ⇒ 不猜谁得分 */
+    const award = scoreOfPartyEvent(st.mode, ev);
+    if (award.points > 0) addScore(roomId, ev.source, award.points);
+  });
+
+  /* 2 城镇配置 → 刷怪器(装配层是唯一同时认识两边的地方,依赖单向)。 */
+  setTownRadiusProvider(townSafeRadiusProvider);
+
+  /* 3 睡眠读口:只**读**事实,不改任何回血数值(平衡性是产品裁决,不是接线)。 */
+  const sleepHost = host as unknown as { attachSleepSource?: (fn: (u: string) => boolean) => void };
+  sleepHost.attachSleepSource?.((userId: string) => sleepStateOf(roomId, userId).sleeping);
+}
 export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
+  /* ★ 房间号的**唯一**默认值:`createHost` 与 `assemble` 的 `rtOpts` 必须同源,
+     否则世界与运行时问的是两个房间(A2)。 */
+  const roomId = deps.roomId ?? 'room_main';
   /* ⚠️ `WorldSimOptions` 只有 `sizeCells` / `fluidBudget` / `wiring` / `mobs` /
      `rng` / `combatRng` / `alchemy` / `biome` **八个**字段 —— **没有 `worldSeed`**。
      故这里只透传 `sizeCells`,并支持注入 `rng`/`combatRng` 以便测试完全可复现
@@ -233,8 +273,9 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
     biome: deps.biome,
     /* ★ 房间号透传给世界:刷怪要靠它去问「本房间的安全区半径」
        (`modify_town.ts` 的配置从此真的生效;没给 ⇒ 退回常量 24)。 */
-    roomId: deps.roomId,
+    roomId,
   } as ConstructorParameters<typeof WorldSim>[0]);
+  wireHost(sim, roomId);
   return sim;
 }
 
@@ -247,24 +288,9 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
  */
 export function assemble(deps: AssembleDeps = {}): Assembled {
   const host = createHost(deps);
+  const roomId = deps.roomId ?? 'room_main';
 
 
-  /* ★ 把**赛局计分**接上:世界侧报告事实(击杀/采集/到达),这里换算成分并落到 `addScore`。
-     ⚠️ 分数的真值源仍是 `start_party.ts` 的 `scores`;这里只做"事实 → 增量"的换算与落账。 */
-  const partyHost = host as unknown as {
-    attachPartyScoreSink?: (fn: (ev: { kind: string; source?: string }) => void) => void;
-  };
-  partyHost.attachPartyScoreSink?.((ev) => {
-    const st = partyStateOf(rtOpts.roomId);
-    if (st === null) return; /* 没开局 ⇒ 不计分(没有"分数"这个对象) */
-    if (ev.source === undefined || ev.source === '') return; /* 无归属 ⇒ 不猜谁得分 */
-    const award = scoreOfPartyEvent(st.mode, ev);
-    if (award.points > 0) addScore(rtOpts.roomId, ev.source, award.points);
-  });
-  /* ★ 把**城镇配置**接给刷怪器:装配层是唯一同时认识两边的地方
-     (`spawner` 不认识 `modify_town`,反过来也一样)⇒ 适配器在这里塞进去,依赖单向。
-     不装 ⇒ `spawner` 用默认常量 24,与接线前逐字一致(WS-FND-40 的 FND40-1 钉这一条)。 */
-  setTownRadiusProvider(townSafeRadiusProvider);
 
   /* 与 `./net/room.colyseus.ts` 的 `rtOpts` 字面量**逐字段对齐**。
      ⚠️ 对齐的是**键集**,不只是「有这些语义」:房间那一份里 9 个键**总是出现**
@@ -274,7 +300,7 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
      ⇒ 这里全部**显式列出**,让两份的键集逐字相等。按键集相等来防分叉,
        比靠人读注释可靠(**这正是「两份装配并存」的检测手段**)。 */
   const rtOpts: RoomRuntimeOptions = {
-    roomId: deps.roomId ?? 'room_main',
+    roomId,
     ownerId: deps.ownerId ?? 'u_owner',
     clock: deps.clock ?? { nowMs: () => Date.now() },
     name: deps.name,

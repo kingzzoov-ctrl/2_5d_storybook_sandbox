@@ -118,12 +118,15 @@ test('FND45-5 击杀之外的事件当前**没有发射点**(如实边界,不是
      (只有击杀那一处在 `settleKill` 里)。这条判据把现状钉住:
      若将来有人补上发射点,它会红 —— 那时把这条改成正向断言。 */
   r.sim.notePartyEvent({ kind: PARTY_SCORE_EVENT.GATHER, source: 'p1' });
-  const awardGather = partyStateOf(r.roomId)?.scores.get('p1') ?? 0;
-  ok(awardGather >= 0, '采集事件的加分为非负(规则层允许)');
+  /* 采集按 BRIDGE_CTF 的单位分:2(`PARTY_MODE_UNIT_POINTS` × `PARTY_FOREIGN_EVENT_UNITS`)。
+     ⚠️ 用**字面量**锚:改坏规则表(或把 GATHER 删成 0 分)必须红 ——
+     审查 C2 指出原来那条 `ok(awardGather >= 0)` 是同义反复。 */
+  eq(partyStateOf(r.roomId)?.scores.get('p1') ?? 0, 2,
+    '★ 采集事件按单位分 2 落账(字面量;规则表被改坏会红)');
 
-  /* 但**世界自己**不会产生它:推 600 帧(含采集/移动路径)之后,
-     分数只能来自击杀 —— 这里没有击杀,所以仍是 0。 */
-  eq(partyStateOf(r.roomId)?.scores.get('p1') ?? 0, awardGather,
+  /* 但**世界自己**不会产生它:空推 600 帧之后分数不动(说明没有第二个发射点)。 */
+  r.sim.advance(600);
+  eq(partyStateOf(r.roomId)?.scores.get('p1') ?? 0, 2,
     '★ 空推世界不会自己产出赛局事件(采集/到达的发射点尚未接)');
 });
 

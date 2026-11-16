@@ -245,24 +245,23 @@ test('FND39-8 泡泡水枪:对幽灵泡泡目标连中 3 次 ⇒ 第 3 次困住
 });
 
 test('FND39-9 `foodBuffFrom` 与 `cookSoup` 对同一料理**同形**(防两份构造漂移)', () => {
-  const def = FOOD_BY_ID.get(FOOD_HP);
-  ok(def !== undefined, '前置:602 应在内容表里');
+  /* ⚠️ 必须用**真能出菜**的配方:审查 C1 指出旧版 `{602:1}` 根本不成立
+     ⇒ `cooked.buff === null` ⇒ 下面那条"逐字段比 statMods"是**死代码**
+     (改坏 `foodBuffFrom` 的默认值表也不会红)。
+     604 的配方 = `{104:1, 124:2, 121:2}`(见 `cooking.ts` 的配方表)。 */
+  const SOUP = 604;
+  const def = FOOD_BY_ID.get(SOUP);
+  ok(def !== undefined, '前置:604 应在内容表里');
   if (def === undefined) return;
 
   const mine = foodBuffFrom(def);
-  /* 用 `cookSoup` 真做一份,取它产出的 buff 逐字段比。配方:大汤锅 + 投料。 */
   const cooked = cookSoup({
     stationId: 506,
-    inputs: { [FOOD_HP]: 1 },
+    inputs: { 104: 1, 124: 2, 121: 2 },
   } as unknown as Parameters<typeof cookSoup>[0]);
 
-  if (cooked.buff === null) {
-    /* 配方不成立时,退一步只比"我自己构造的形状自洽"(仍能抓默认值表漂移)。 */
-    eq(mine.key, `food_${FOOD_HP}`, 'key 命名应可推导');
-    eq(mine.stacks, 1, 'stacks 应为 1');
-    eq(mine.remainingSec, mine.durationSec, '新建 buff 的剩余时间应等于总时长');
-    return;
-  }
+  ok(cooked.buff !== null, '前置:该配方必须真的出菜(否则这条判据又变成死代码)');
+  if (cooked.buff === null) return;
 
   eq(mine.sourceItemId, cooked.buff.sourceItemId, 'sourceItemId 应一致');
   eq(mine.branch, cooked.buff.branch, 'branch 应一致');

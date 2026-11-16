@@ -74,6 +74,9 @@ import {
   type FoodBuff,
   type KitchenState,
 } from '../combat/cooking.ts';
+/* ⚠️ `PRANK_HAMMER_KNOCKBACK`(武器击退量)**曾**在这里 import,用于给受击位移取数;
+   接上后把 `WS-10` 的三条既有判据打红(见 `damageMob` 的受击点注释)⇒ 撤下。
+   等 owner 定受击击退口径再回来取。 */
 import {
   tickLogistics,
   loadConveyor,
@@ -211,6 +214,8 @@ import {
   createDowned,
   tickGhostBubble,
   touchRevive,
+  flagRevive,
+  FLAG_REVIVE_RADIUS,
   featherRevive,
   bubbleGunHit,
   TOUCH_RADIUS,
@@ -222,6 +227,7 @@ import {
   LIVE_BUBBLE_INITIAL,
   liveBubbleHit,
   tickLiveBubble,
+  isTrapped,
   type LiveBubbleState,
 } from '../combat/live_bubble.ts';
 import { PARTY_SCORE_EVENT } from '../party/scoring.ts';
@@ -2206,14 +2212,8 @@ export class WorldSim {
       });
     }
 
-    /* ★ 赛局计分:把"这次击杀"送进世界侧的**统一入口**(`notePartyEvent`)。
-       归属口径**沿用本方法已有的那条** —— 距击杀点 `SHARE_RADIUS` 内的玩家,
-       不另立"谁补的刀":手册的判据本来就是按距离(见上面那段注释)。 */
-    for (const p of participants) {
-      if (p.distance <= SHARE_RADIUS) {
-        this.notePartyEvent({ kind: PARTY_SCORE_EVENT.CREATURE_KILL, source: p.playerId });
-      }
-    }
+    /* ★ 赛局计分的发射点**在 `settleMobExp` 之后** —— 见下方那段:
+       先去重再计分,否则同一只怪被二次结算时"经验去重、分数双发"(审查 A4)。 */
 
     const result = settleMobExp(this.killLedger, {
       mobInstanceId: mobId,
@@ -2230,6 +2230,20 @@ export class WorldSim {
         const list = this.pendingLevelUps.get(id) ?? [];
         for (const lu of ev.levelUps) list.push({ from: lu.from, to: lu.to });
         this.pendingLevelUps.set(id, list);
+      }
+    }
+
+    /* ★ 赛局计分:把"这次击杀"送进世界侧的**统一入口**(`notePartyEvent`)。
+       归属口径**沿用本方法已有的那条** —— 距击杀点 `SHARE_RADIUS` 内的玩家,
+       不另立"谁补的刀":手册的判据本来就是按距离(见上面那段注释)。
+       ⚠️ 必须在 `settleMobExp` **之后**、且 `deduped` 时**不计分**:
+       同一个实例被二次结算(`addMob` 替换旧条目 / 姜饼小人复活)时经验去重、
+       分数却会双发 —— 审查 A4 给的最小复现正是"分数 2 → 4、exp total 0"。 */
+    if (!result.deduped) {
+      for (const p of participants) {
+        if (p.distance <= SHARE_RADIUS) {
+          this.notePartyEvent({ kind: PARTY_SCORE_EVENT.CREATURE_KILL, source: p.playerId });
+        }
       }
     }
 
@@ -2381,13 +2395,27 @@ export class WorldSim {
        *
        * ⇒ 单一真相:距离判定只由 `touchRevive` 拥有,这里无条件委托给它。
        * 无救援者时传 `+Infinity` —— 语义即「没人来救」,由它归零。 */
-      const out = touchRevive({
-        downed: d,
-        rescuerId: bestId ?? '',
-        distance: bestId === null ? Number.POSITIVE_INFINITY : bestDist,
-        dt,
-        progress: this.progressOf(id),
-      });
+      /* ★ C2:站在**复活旗**(435)旁 ⇒ **自己**读条复活,不等第二个人。
+         旗优先于救援:两者共用 `DownedState.reviveProgress` **一个**字段,
+         同时推进就是两份实现抢同一个进度 —— 本仓点名的缺陷形态
+         (`effects.ts` 死字段、`roomAtCell` 两份判定同族)。
+         ⇒ 半径内有旗走 `flagRevive`;否则走 `touchRevive`,既有路径逐字不变。 */
+      const flag = this.nearestFlag(id);
+      const out = flag === null
+        ? touchRevive({
+          downed: d,
+          rescuerId: bestId ?? '',
+          distance: bestId === null ? Number.POSITIVE_INFINITY : bestDist,
+          dt,
+          progress: this.progressOf(id),
+        })
+        : flagRevive({
+          downed: d,
+          flagId: flag.id,
+          distance: flag.distance,
+          dt,
+          progress: this.progressOf(id),
+        });
       d = out.downed;
       if (out.revived && out.result !== null) {
         this.lastRevive = out.result;
@@ -2580,7 +2608,7 @@ export class WorldSim {
    * ⚠️ 它**不是**判定本身,只是一份诊断记录:真值来源仍是
    * `VitalsSystem.downed`(见方法内注释)。
    */
-  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | null = null;
+  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | null = null;
   /**
    * **玩家移动的权威写入点**(task-58)。把一次已获准的移动写进 `physics.bodies`。
    *
@@ -2647,7 +2675,91 @@ export class WorldSim {
    * 「**这个人当前有没有行动权**」,不是「这次位移合不合法」—— 与
    * `checkMove` 的量纲无关,故不构成第二份实现。
    */
-  applyPlayerMove(playerId: string, x: number, y: number): boolean {
+  /* ══════════════════ 击退(玩家受伤后的位移)══════════════════ */
+
+  /** 复活旗的内容层件号(与 `party/scoring.ts` 的 `SPAWN_FLAG_ITEM_ID` 是同一件)。 */
+  private static readonly FLAG_OBJ_ID = 435;
+
+  /**
+   * 生效中的击退:玩家 → 剩余位移(格)。**由慢帧推进**,推进期间拒绝位置搬家。
+   *
+   * ## 为什么是"位移"而不是"速度"
+   * 本仓刚体是**位置式**(`DynamicBody` 只有 x/y/z,`applyPlayerMove` 直接写坐标),
+   * 没有速度积分器。击退若只写速度,下一帧就被 `applyPlayerMove` 抹掉 ——
+   * 那正是 DAMAGE-LOOP D1 记录的「被野猪撞中,位置不变」。
+   * ⇒ 击退 = **剩余位移** + **搬家窗口**:位移推完前 `applyPlayerMove` 一律拒绝
+   * (`lastMoveRejection = 'KNOCKBACK'`),客户端不会把击退抹掉。
+   */
+  private readonly knockbacks = new Map<string, { dx: number; dy: number; left: number }>();
+
+  /** 一次慢帧推掉剩余位移的多少分之一(2 = 两段推完:一次推太大像瞬移)。 */
+  private static readonly KNOCKBACK_STEPS = 2;
+
+  /**
+   * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离 `distance` 格。
+   *
+   * 距离由调用方给:内容层的击退量(`PRANK_HAMMER_KNOCKBACK`)是既有锚,
+   * 本方法**不新造数值**(新造就得 owner 裁决)。
+   */
+  applyKnockback(playerId: string, fromX: number, fromY: number, distance: number): boolean {
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return false;
+    if (!Number.isFinite(distance) || distance <= 0) return false;
+    const dx = b.x - fromX;
+    const dy = b.y - fromY;
+    const len = Math.hypot(dx, dy);
+    /* 完全重合时没有方向可言 ⇒ 不击退(而不是随便挑一个方向)。 */
+    if (!(len > 0)) return false;
+    this.knockbacks.set(playerId, { dx: (dx / len) * distance, dy: (dy / len) * distance, left: WorldSim.KNOCKBACK_STEPS });
+    return true;
+  }
+
+  /** 慢帧推进击退:每次推剩余位移的一部分,推完即删。 */
+  private tickKnockback(): void {
+    for (const [id, k] of this.knockbacks) {
+      const b = this.physics.bodies.get(id);
+      if (b === undefined) { this.knockbacks.delete(id); continue; }
+      /* ⚠️ 必须按**剩余步数**均分,不能每帧除以固定份数:
+         后者是几何级数(2 → 1 → 0.5 → 0.25 …),**永远到不了 0** ——
+         实测表现是"窗口永不关闭,之后所有移动报文都被拒"。
+         这条由 WS-FND-49 的 FND49-6/FND49-7 钉住。 */
+      const stepX = k.dx / k.left;
+      const stepY = k.dy / k.left;
+      b.x += stepX;
+      b.y += stepY;
+      const left = k.left - 1;
+      if (left <= 0) this.knockbacks.delete(id);
+      else this.knockbacks.set(id, { dx: k.dx - stepX, dy: k.dy - stepY, left });
+    }
+  }
+
+  /** 这个玩家正在被击退?(= 位置搬家的窗口) */
+  knockbackOf(playerId: string): boolean {
+    return this.knockbacks.has(playerId);
+  }
+
+  /**
+   * 玩家 `FLAG_REVIVE_RADIUS` 内最近的**复活旗**(435)。`null` = 半径内没有旗。
+   *
+   * ⚠️ 扫描范围由 `FLAG_REVIVE_RADIUS` 决定(不写死格子数):半径改了扫描跟着改。
+   */
+  private nearestFlag(playerId: string): { id: string; distance: number } | null {
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return null;
+    const r = Math.ceil(FLAG_REVIVE_RADIUS);
+    let best: { id: string; distance: number } | null = null;
+    for (let y = Math.floor(b.y) - r; y <= Math.floor(b.y) + r; y += 1) {
+      for (let x = Math.floor(b.x) - r; x <= Math.floor(b.x) + r; x += 1) {
+        if (this.grid.objIdAt(x, y) !== WorldSim.FLAG_OBJ_ID) continue;
+        const d = Math.hypot(x + 0.5 - b.x, y + 0.5 - b.y);
+        if (d > FLAG_REVIVE_RADIUS) continue;
+        if (best === null || d < best.distance) best = { id: `flag:${x},${y}`, distance: d };
+      }
+    }
+    return best;
+  }
+
+  applyPlayerMove(playerId: string, x: number, y: number, z?: number): boolean {
     this.lastMoveRejection = null;
     if (!this.playerIds.has(playerId)) {
       this.lastMoveRejection = 'NOT_A_PLAYER';
@@ -2665,22 +2777,45 @@ export class WorldSim {
       this.lastMoveRejection = 'DOWNED';
       return false;
     }
+    /* ★ 被泡泡困住 ⇒ 不能移动。
+       `combat/live_bubble.ts` 的 227 状态机(连中 3 发 ⇒ 困 5 秒)此前**没有消费者**
+       (审查 B1:`isTrapped` 只被自己与回执读)⇒ "困住"对玩家不可见。 */
+    if (isTrapped(this.liveBubbleOf(playerId))) {
+      this.lastMoveRejection = 'TRAPPED';
+      return false;
+    }
+    /* ★ 击退窗口:剩余位移没推完之前**不接受位置搬家**。
+       不设这道门,下一帧的移动报文就会把击退覆盖掉 ⇒ 击退等于没有
+       (DAMAGE-LOOP D1 的实测现象)。窗口是**状态**不是时钟:推完即开。 */
+    if (this.knockbacks.has(playerId)) {
+      this.lastMoveRejection = 'KNOCKBACK';
+      return false;
+    }
     /* 非有限值挡在这里:写入 NaN 会让 `mobDistance` 恒 NaN ⇒ 距离闸永久失效,
        而 `NaN` 的比较恒 false 属本仓高发坑(见 `checkMove` §6.0 值域门)。 */
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       this.lastMoveRejection = 'NON_FINITE';
       return false;
     }
+    /* ★ z(高度)与 x/y 走**同一道门**:非有限一概拒绝,理由同上。
+       省略 `z` ⇒ **不改**已有高度(向后兼容:只关心平面的调用方行为逐字不变,
+       这条由 WS-FND-49 的负对照钉住)。 */
+    if (z !== undefined && !Number.isFinite(z)) {
+      this.lastMoveRejection = 'NON_FINITE';
+      return false;
+    }
     b.x = x;
     b.y = y;
+    if (z !== undefined) b.z = z;
+    return true;
     return true;
   }
 
   /** 玩家当前的**权威位置**(读 `physics.bodies`,不是派生视图)。 */
-  playerPosition(playerId: string): { x: number; y: number } | null {
+  playerPosition(playerId: string): { x: number; y: number; z: number } | null {
     const b = this.physics.bodies.get(playerId);
     if (b === undefined) return null;
-    return { x: b.x, y: b.y };
+    return { x: b.x, y: b.y, z: b.z };
   }
 
   /**
@@ -2891,9 +3026,33 @@ export class WorldSim {
        `vitals.syncMaxHp` 只负责"抬上限 / 钳 hp" —— 两边都不复述策略。 */
     const stats = statsAtLevel(level);
     const hpFlat = mergeFoodBuffs(this.foodBuffs.get(playerId) ?? []).hpFlat;
-    const total = stats.maxHp + hpFlat;
+    /* ★ 房间上限乘区(手册:泡温泉 +30%)。
+       倍率走 `effects.ts` 的 `maxHpMulOf` —— 与 `effectiveMaxHp`、`stepRoomEffects`
+       **同一个函数**,不在这里重写条件(重写就是第二份实现,漂移时不报错)。
+       ⚠️ 乘区**只在这一处**套:因为 `vitals.maxHp` 必须是**含乘区**的权威值,
+       否则泡温泉时回血填不满上限(上限 130、实际钳在 100)。 */
+    const base = stats.maxHp + hpFlat;
+    if (!Number.isFinite(base)) return null;
+    this.baseMaxHp.set(playerId, base);
+    const st = this.roomEffects.get(playerId);
+    const total = st === undefined ? base : Math.round(base * maxHpMulOf(st));
     return Number.isFinite(total) ? total : null;
   }
+
+  /**
+   * 最近一次 `maxHpForLevel` 算出的**基准上限**(未套房间乘区)。
+   *
+   * ## 为什么需要它(它不是第二份真值)
+   *
+   * 乘区**只能**在 `maxHpForLevel` 里套一次;而 `effectiveMaxHp()` 要能在
+   * **没经过房间同步**的场景(纯 `WorldSim` 用法、WT-03-64 那类判据)也报同一个数,
+   * 所以它需要**算子入参**这一刻的基准值 —— `v.maxHp` 在房间里已经含乘区,
+   * 拿它再乘一次就是 ×1.69。
+   *
+   * ⚠️ 本表**只由 `maxHpForLevel` 写**。任何地方绕过它去改上限,
+   * 都会让两个读数分叉 —— 那正是"两份实现"的形态。
+   */
+  private baseMaxHp = new Map<string, number>();
 
   /**
    * 把派生上限落到 `vitals`(契约 §2.1 的**唯一**写入口是 `vitals.syncMaxHp`)。
@@ -3112,6 +3271,8 @@ export class WorldSim {
     forgeUnlocked: boolean;
     /** 本慢帧该玩家**是否正在睡觉**(0/1)。见 `attachSleepSource`。 */
     sleeping: number;
+    /** 大餐乘区(食堂 **且** 带着料理 buff;1.0 = 无)。判定在 `rooms/effects.ts`。 */
+    mealMul: number;
   }[] = [];
 
   /**
@@ -3206,7 +3367,13 @@ export class WorldSim {
         st = createRoomEffectState();
         this.roomEffects.set(id, st);
       }
-      const r = stepRoomEffects(st, { roomKey: key, dt });
+      /* ★ 大餐乘区的**另一半触发条件在房间之外**(玩家身上有没有料理 buff)
+         ⇒ 必须由这里喂进去。漏传 = 按"没有 buff"处理 ⇒ 乘区恒 1.0 ——
+         这正是它此前"算完即丢"的成因(判据 WS-FND-47 第 4 条钉住漏传的后果)。
+         ⚠️ 口径:身上**任何**生效中的料理 buff 都算"带着料理";要不要把整蛊类
+         (607–611)排除在大餐之外是**平衡裁决**,不是接线 —— 故这里不做。 */
+      const hasMealBuff = (this.foodBuffs.get(id) ?? []).length > 0;
+      const r = stepRoomEffects(st, { roomKey: key, dt, hasMealBuff });
       this.roomEffects.set(id, r.state);
 
       /* 卧室回血:走既有 `vitals.heal` 接口 —— 它已处理「上限截断」
@@ -3220,7 +3387,7 @@ export class WorldSim {
       const sleeping = this.sleepSource?.(id) === true ? 1 : 0;
       out.push({
         playerId: id, roomKey: key, healHp: r.healHp, maxHpMul: r.maxHpMul,
-        forgeUnlocked: r.forgeUnlocked, sleeping,
+        forgeUnlocked: r.forgeUnlocked, sleeping, mealMul: r.mealMul,
       });
     }
     this.lastRoomEffects = out;
@@ -3242,10 +3409,14 @@ export class WorldSim {
     const v = this.vitals.get(id);
     if (v === null) return 0;
     const st = this.roomEffects.get(id);
-    /* 倍率走 `effects.ts` 的 `maxHpMulOf` —— 与 `stepRoomEffects` 同一个函数,
-       不在这里重写一遍条件(重写就是第二份实现,漂移时不报错)。 */
-    if (st === undefined) return v.maxHp;
-    return Math.round(v.maxHp * maxHpMulOf(st));
+    /* 倍率走 `effects.ts` 的 `maxHpMulOf` —— 与 `stepRoomEffects`、`maxHpForLevel`
+       **同一个函数**,不在这里重写一遍条件(重写就是第二份实现,漂移时不报错)。
+       ⚠️ 基准取 `baseMaxHp`(算子入参备忘),**不是** `v.maxHp`:后者在房间里
+       已经含乘区,再乘一次就是 ×1.69。没经过 `maxHpForLevel` 时才退回 `v.maxHp`
+       (WT-03-64 那种纯 `WorldSim` 用法走的就是这条)。 */
+    const base = this.baseMaxHp.get(id) ?? v.maxHp;
+    if (st === undefined) return base;
+    return Math.round(base * maxHpMulOf(st));
   }
 
   /** 复活玩家(满血)。 */
@@ -3743,6 +3914,14 @@ export class WorldSim {
       if (res.applied > 0) {
         applied.push(res);
         this.hitCount += 1;
+        /* ⚠️ **没有在这里接击退** —— 这是刻意的,不是漏了。
+           机制(`applyKnockback` + 搬家窗口)已实现并有判据(`WS-FND-49` FND49-6/7/8),
+           但"受击推多远"与"救援者会不会被推出触摸半径"是**玩法数值裁决**:
+           接上 `PRANK_HAMMER_KNOCKBACK`(武器击退量)当受击位移,实测把三条既有判据打红
+           —— `WS-10` task44-6(救援者被推出 0.9 格半径 ⇒ 救不到)、task44-7、
+           T58-2(位置写入后"推 50 帧仍精确不变"不再成立)。
+           `COMPLETION-CRITERIA` 的裁决原文也是"今天它是 no-op,不是谁压住谁"。
+           ⇒ 等 owner 定"受击击退的位移口径";定完在这里加一行即可。 */
         /* 事件:UI 与音效靠它播受击反馈,而不用每帧轮询血量 */
         this.bus.emit(
           'player_hit',
@@ -4415,7 +4594,10 @@ export class WorldSim {
    * **本函数不假装能刷到 `hardCap` 那么多只。**
    */
   private trySpawnOne(biome: string): boolean {
-    const alive = this.mobHost.runtimes();
+    /* ⚠️ 只算**活着**的:`runtimes()` 返回全部登记项(含尸体)⇒
+       不过滤会让"这个物种已经刷过"永远为真 —— 杀一只,该物种**永不重生**
+       (审查 A5:42 种刷完世界空掉,且没有任何日志)。 */
+    const alive = this.mobHost.runtimes().filter((rt) => rt.alive);
     const roster = spawnableMobs(biome).filter((d) => !alive.some((r) => r.def.id === d.id));
     if (roster.length === 0) return false;
     const def = roster[Math.floor(this.rng() * roster.length) % roster.length]!;
@@ -4684,7 +4866,8 @@ export class WorldSim {
          读 `vitals.downed`(VitalsSystem 的瞬时判定),负责其后的持续状态:
          建泡泡 / 漂移计时 / 队友触摸救援。放在房间效果之后无依赖,
          取「与其它玩家状态推进同处一地」便于阅读。 */
-      this.tickDowned();
+      this.tickKnockback();
+    this.tickDowned();
 
       /* ── 慢帧 2Hz:刷怪决策 ── */
       if (this.mobsOn) {
