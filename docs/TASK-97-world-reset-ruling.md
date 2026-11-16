@@ -45,9 +45,17 @@ resetWorld?(opts: { seed: number }): { applied: boolean; seed: number; reason?: 
 
 即使动作层接完,今天**生产里仍然重置不了**:
 
-1 **`worldSaveHost` 在生产是 `null`** —— 装配层那条路(`index.ts` 的 `createHost` → 交进房间)
-   至今没有真调用者(这是既有的"B 路装配"欠账),所以 `resetWorld` 连"能力缺失"
-   这一条都走不到,而是连宿主都没有;
+1 ★ **已更正(2026-11-15)**:本条原文写「`worldSaveHost` 在生产是 `null`」—— **那是过期的**。
+   实测:B 路**已经接上世界**(`net/room.colyseus.ts:31` `import { createHost } from '../index.ts'`、
+   `:189 resolveRoomHost()`、`:272 host: resolveRoomHost(this.deps)`,commit `8f1e065`),
+   `tests/WS-FND-12` 的 FND12-3/3b 就是它的行为断言。
+   ⇒ 所以 `RESET_WORLD` 今天**走得到** §2-R3 的「能力缺失」分支(宿主在、但 `resetWorld` 不存在),
+   走的不是"连宿主都没有"。这个更正很重要:它把这条从「缺装配」降级成**只缺宿主能力**。
+   **同时**发现一条更硬的:同一处 `onCreate` 把**库**传成 `this.deps?.db ?? null`(`:274`),
+   而 `this.deps` 在生产恒为 `undefined` ⇒ **世界会跑,落盘/读档永不发生**。
+   这条已修成与 A 路**共用**同一处解析(`index.ts` 的 `resolveAssembly`),判据 `tests/WS-FND-37`;
+   但「库从哪来」仍是**未裁决**项(见 §4 之类:文件路径?env?存哪?)—— 在裁决之前,
+   生产仍然是 `db: null`(**已知边界,不是遗漏**)。
 2 就算宿主有了,**重放"造世界"这一步**不是小改:`WorldSim` 的状态来自构造期播种
    (~3000 行里的初始化路径),要"换一个种子重生"必须有一条**重建**路径,而不是改几个字段;
 3 **客户端的旧世界**:换世界之后 chunk/实体/玩家坐标全是旧的,必须有一条

@@ -294,6 +294,28 @@ function resolveDb(deps: AssembleDeps): DbLike | null {
   return null;
 }
 
+/**
+ * A/B 两路**共用**的「世界 + 库」解析 —— 存在的唯一理由是**防分叉**。
+ *
+ * `assemble()`(A 路)与 `net/room.colyseus.ts`(B 路)各自 `new RoomRuntime`,
+ * 但两者取 host 与 db 的**规则必须一致**。此前 B 路自己写 `this.deps?.db ?? null`,
+ * 于是 deps 缺省时:A 路按 `resolveDb` 走(给了 `dbPath` 就开真库),B 路直接 `null`
+ * —— 同一个装配语义有两种答案,而两者都"看起来合理"。
+ *
+ * 规则与 `resolveDb` 逐条相同:
+ *   1 显式 `db` 优先;2 给了 `dbPath` ⇒ 开真库;3 都没有 ⇒ `null`(**不落盘**)。
+ *
+ * ⚠️ 第 3 条是**刻意的现状**,不是遗漏:生产里至今没有任何地方给 B 路提供库
+ *   (`withDeps` 零调用点,Colyseus 也不会把 deps 传给 `onCreate`),
+ *   所以「落盘 / 读档永不发生」是一条**已知边界**,不是 bug。
+ *   要让它真的发生,缺的**不是接线**,而是「库从哪来」的裁决(文件路径?env 变量?存哪?)。
+ */
+export function resolveAssembly(
+  deps: AssembleDeps = {},
+): { host: WorldSaveHost; db: DbLike | null } {
+  return { host: createHost(deps), db: resolveDb(deps) };
+}
+
 /** `createServer()` 的产物。刻意不 `listen`,便于 CI 与测试零副作用地检查装配。 */
 export interface AssembledServer {
   assembled: Assembled;

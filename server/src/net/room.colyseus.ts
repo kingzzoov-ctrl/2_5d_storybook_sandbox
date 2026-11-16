@@ -28,7 +28,7 @@ import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions, type WorldSaveHost 
 import { DT } from '../../../shared/types/physics.ts';
 import { AccessMode } from '../db/repo.ts';
 import type { DbLike } from '../db/repo.ts';
-import { createHost } from '../index.ts';
+import { createHost, resolveAssembly } from '../index.ts';
 
 /**
  * `Room` 的**运行时值**只能从默认导出上取(`colyseus` 是 CommonJS,根入口没有命名导出):
@@ -192,6 +192,24 @@ export function resolveRoomHost(deps?: NetPersistRoomOptions): WorldSaveHost | n
   return createHost();
 }
 
+/**
+ * B 路的**库**解析 —— 与 A 路(`assemble()`)用**同一套**规则(见 `index.ts` 的
+ * `resolveAssembly`)。
+ *
+ * 改这里的理由:此前是 `this.deps?.db ?? null`。那行在「生产默认」这一支上
+ * 与 A 路**不等价** —— A 路给了 `dbPath` 就会开真库,B 路无论如何都 `null`。
+ * 同一语义两种答案,迟早会漂;现在两支都走同一处解析。
+ *
+ * 三态与 `resolveRoomHost` 对齐:
+ *   没有 deps          ⇒ 走 `resolveAssembly()`(今天得到 `db: null` —— 见那边的注释)
+ *   `db: someDb`       ⇒ 用它
+ *   `db: null`(键在)  ⇒ 显式不落盘(负对照入口,别"修"它)
+ */
+export function resolveRoomDb(deps?: NetPersistRoomOptions): DbLike | null {
+  if (deps === undefined) return resolveAssembly().db;
+  return deps.db ?? null;
+}
+
 export type RoomCreateOptions = {
   roomId?: string;
   name?: string;
@@ -271,7 +289,11 @@ export class NetPersistRoom extends Room<RoomSchema> {
          变的只是:**两条路现在都有世界**。 */
       host: resolveRoomHost(this.deps),
     };
-    this.runtime = new RoomRuntime(rtOpts, this.deps?.db ?? null);
+    /* ★ 库的解析统一走 `resolveRoomDb`(与 A 路同一套规则)。
+       ⚠️ 生产里 `this.deps === undefined` ⇒ `resolveAssembly().db` ⇒ 今天仍是 `null`
+       ⇒ **落盘/读档不跑**。这是已知边界,不是遗漏:缺的是「库从哪来」的裁决,
+       而不是这一段接线(见 `index.ts` `resolveAssembly` 的注释)。 */
+    this.runtime = new RoomRuntime(rtOpts, resolveRoomDb(this.deps));
 
     /* ★ 报文入口的**唯一**注册点(task-95 补)。
      *
