@@ -23,8 +23,8 @@
 | 运行时依赖 | **0 个**(`dependencies = {}`) |
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
-| 层 | 服务端 `server/src` **79** `.ts` · 客户端 `client/src` **31** · 共享 `shared` **10** ⇒ **生产 .ts 合计 120** |
-| 测试 | `tests/*.test.ts` **47** 个套件 |
+| 层 | 服务端 `server/src` **79** `.ts` · 客户端 `client/src` **33** · 共享 `shared` **10** ⇒ **生产 .ts 合计 122** |
+| 测试 | `tests/*.test.ts` **49** 个套件 |
 | 工具 | `scripts/*.ts` **31** 个 |
 | 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
 | 门禁 | `scripts/verify.ts`(6230 行) |
@@ -93,11 +93,11 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1666 条 / 47 套件** | WS 1014 条 / 14 套件 · 基座 FND 652 条 / 33 套件 |
+| 用例 | **1681 条 / 49 套件** | WS 1014 条 / 14 套件 · 基座 FND 667 条 / 35 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
-| 生产可达性 | **111 / 120**(不可达 9,白名单 9) | 欠账构成:等客户端入口 0 / 等编排层接线 1 / 等服务端机制 3 / 等客户端机制 1 / 等裁决 0 |
+| 生产可达性 | **113 / 122**(不可达 9,白名单 9) | 欠账构成:等客户端入口 0 / 等编排层接线 1 / 等服务端机制 3 / 等客户端机制 1 / 等裁决 0 |
 | 同义反复候选 | **5 条**(白名单 5) | 历史:34 → 9 → 5 |
 | 类型检查基线 | **261 条 / 指纹 129** | 2026-11-14:267/132 → 265/131 → 261/129(`TS2304` 归零后继续下降) |
 | 未决台账 | **133 条**(108 未关闭 / **0 阻塞** / 25 已关闭) | |
@@ -387,12 +387,12 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-a3aae3cc031a  README.md
+e552035d4b0b  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-8f14f5598b7a  docs/COMPLETION-CRITERIA.md
+56fcd82dc26e  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。

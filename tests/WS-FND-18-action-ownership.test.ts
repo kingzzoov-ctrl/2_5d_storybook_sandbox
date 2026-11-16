@@ -108,7 +108,7 @@ test('FND18-3 已接线的动作回 `OK` 时必须带 `effect`(不留"回 OK 却
 });
 
 test('FND18-4 越权**不执行**:已接线回 PERMISSION、未接线回 NOT_IMPLEMENTED(都不许 OK)', () => {
-  /* 变红条件:某个动作只做业务、不做 `authorize` ⇒ GUEST 也能 `RESET_WORLD`。
+  /* 变红条件:某个动作只做业务、不做 `authorize` ⇒ GUEST 也能 `MODIFY_TOWN`。
      ⚠️ 这里给的是**合法 payload** —— 因为 `dispatchAction` 的判序是
         「先校验载荷形状,再问权限」:缺 payload 会先回 `INVALID`,
         那条路径测的是参数校验,不是权限闸。两条路径都要各自有断言,
@@ -120,7 +120,7 @@ test('FND18-4 越权**不执行**:已接线回 PERMISSION、未接线回 NOT_IMP
   rt.join({ userId: 'o' });
   rt.join({ userId: 'g', asGuest: true });
   const cases: Array<[string, Record<string, unknown>, string]> = [
-    ['RESET_WORLD', {}, 'NOT_IMPLEMENTED'],
+    ['MOVE', {}, 'NOT_IMPLEMENTED'],
     ['CLOSE_ROOM', {}, 'PERMISSION'],
     ['SET_ROOM_ACCESS', { mode: 'PUBLIC' }, 'PERMISSION'],
     ['KICK_MEMBER', { targetId: 'o' }, 'PERMISSION'],

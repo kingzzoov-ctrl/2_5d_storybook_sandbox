@@ -658,6 +658,23 @@ export interface WorldSaveHost {
      ⇒ 第 8 项的真实通路是:
        `projectInventoryTotalFor` → `host.inventoryDetailOf` → `projectInventoryTotal`
      ⇒ 故删声明而不补实现(已在 docs/WS-07-net-persist.md §9.1 记 CR)。 */
+  /**
+   * **世界重置**(`RESET_WORLD` 的唯一通路)。
+   *
+   * ⚠️ 今天是**可选**能力,且**没有实现者** —— `WorldSim` 不提供它,于是生产里
+   *   走的是「能力缺失」分支(动作层据此回**显式** `NOT_IMPLEMENTED`,不许静默成功)。
+   *   做成可选而不是必填的理由:本接口每个成员都要求实现者**真的做得到**;今天没有
+   *   任何宿主能重建世界(见 `docs/TASK-97-world-reset-ruling.md` §3),写成必填只会
+   *   逼实现者交一个假实现 —— 那正是本仓反复防的"静默成功"。配套那行 `return sim`
+   *   也说明了这点:可选成员**必须**在这里声明,否则会被结构化裁掉(见 `index.ts:196-207`)。
+   *
+   * 契约:重置是**破坏性的**;返回**实际生效**的语义(不是"我收到了请求"):
+   *   - `applied: true`  ⇒ 世界已经是新种子,调用方必须假定旧状态全部作废;
+   *   - `applied: false` ⇒ 一字未改,`reason` 说清为什么。
+   * ⚠️ 存档政策(丢弃 / 保留 / 归档)**尚未裁决**(`TASK-97` §4)⇒ 裁决之前,
+   *   实现者**不许**在这里"顺手清掉"任何旧数据。
+   */
+  resetWorld?(opts: { seed: number }): { applied: boolean; seed: number; reason?: string };
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */

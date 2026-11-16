@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     const w = await wire('r21b', 'mat');
     try {
       /* ⚠️ 用 `SET_ROOM_ACCESS`(权限位 `configure`)而**不是** `MODIFY_TOWN`:
-`RESET_WORLD` 至今**没有执行层**,它会走 `default:` 分支回
+`MOVE` / `ATTACK` **刻意**不走 `action` 通道(见 `docs/TASK-96` 第一节),它们回
 NOT_IMPLEMENTED —— 那样测到的是"没实现",而不是"没权限"。
          本条的命题是**权限分类**,所以必须挑一个**已接线且需要更高权限**的动作
          (并且要带一个合法的 mode:参数不全会先回 INVALID,走不到闸)。 */
@@ -181,7 +181,7 @@ NOT_IMPLEMENTED —— 那样测到的是"没实现",而不是"没权限"。
       ok(typeof r.reason === 'string' && r.reason.length > 0, '必须说明"尚无执行层"');
       /* ★ 再补一条:**已知动作名、但没有执行层**的也必须显式说出来。
          与"未知名字"分开记:前者是"我们还没做",后者是"没有这个东西"。 */
-    const known = await act(w, { action: 'RESET_WORLD' });
+    const known = await act(w, { action: 'MOVE' });
       eq(known.ok, false, '未接线的已知动作不能成功');
       eq(known.kind, 'NOT_IMPLEMENTED', '★ 已知但未接线也应显式 NOT_IMPLEMENTED');
       ok(typeof known.reason === 'string' && known.reason.length > 0, '同上:必须带理由');

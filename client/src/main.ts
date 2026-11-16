@@ -21,9 +21,13 @@
 import { boot, type BootHandle } from './three/boot.ts';
 import { createSession, type SessionHandle } from './net/session.ts';
 import {
-  ACTION_KEYS, cellInFront, cellUnder, describeActionResult, keyHints,
-  type Facing,
+  ACTION_KEYS, cellInFront, cellUnder, describeActionResult, keyHints, type Facing,
 } from './net/action_target.ts';
+/* ★ 2026-11-15:动作入口层(合成 / 睡觉 / 开箱 / 派对开局)。
+   纯逻辑在 `net/action_entry.ts`(0 import、可单测),键位薄绑定在 `net/action_binding.ts`;
+   本文件只做**装配根**:把真 `SessionHandle` 注进端口,再挂到 `window`。 */
+import { ActionEntry } from './net/action_entry.ts';
+import { createActionBinding, entryKeyHints, sessionPorts } from './net/action_binding.ts';
 import { InputSource, attachKeyboard } from './net/input.ts';
 import { LocalPredictor } from './net/predictor.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
@@ -91,9 +95,38 @@ function main(): void {
   const url = serverUrlFromLocation();
   /* 动作状态**先于** `createSession` 与键处理声明:两处都要用它们
      (声明在后面会 TDZ —— 回执回调是异步的,但键处理不是)。 */
-  let lastAction = `按 ${keyHints()}`;
+  let lastAction = `按 ${keyHints()} —— 动作入口 ${entryKeyHints()}`;
   let lastItemId = 0;
   const facing: Facing = { dx: 0, dy: 1 };
+
+  /* ── 动作入口(2026-11-15):让「合成 / 睡觉 / 开箱 / 派对开局」在浏览器里**真能按** ──
+     ⚠️ 判定**不在本文件**:构建载荷、三类分支(参数不对 / 未连接 / 发)、回执文案
+       全在 `net/action_entry.ts`(零 import、`tests/WS-FND-35-client-entry.test.ts` 有断言);
+        键位表在 `net/action_binding.ts`。本文件只做**装配根**:把真会话注进端口。
+        —— 把判定留在不可测的入口里,正是本仓反复记的"改坏了没人知道"。 */
+  const actionEntry = new ActionEntry(sessionPorts(() => session));
+  const actionBinding = createActionBinding({
+    entry: actionEntry,
+    inputs: {
+      /* 合成:`lastItemId` 是"**最近真的碰过的那件**"(回执 `effect` 带回来的)。
+         `have`(背包明细)客户端**拿不到** —— 快照里只有总量、没有明细
+         (见 `action_entry.ts` 的 `craftRequest`)。这里如实给 `undefined`
+         ⇒ 入口会**不发**并给出可读原因,而不是发一条注定被拒的报文。 */
+      craft: () => ({ itemId: lastItemId, have: undefined }),
+      /* 开箱:取**脚下**那格 —— 箱子是地面实体,站着就能开。 */
+      chestCell: () => {
+        const me = handle.store.state.players.find((p) => p.id === handle.store.localPlayerId);
+        return me === undefined ? { x: undefined, y: undefined } : cellUnder(me);
+      },
+      /* 派对模式回声:**不给**。`meta.partyMode` 是**下标**(1=BRIDGE_CTF...),
+         而服务端 `start_party.ts` 拿它跟**模式名**比(`String(declared) !== String(mode)`)
+         ⇒ 回声一个下标会被判"不一致"。模式词表的唯一出处是服务端,客户端不另写一份
+         ⇒ 不知道就**不声称**(省略这个键 = 不核对)。 */
+      partyModeEcho: () => undefined,
+    },
+  });
+  /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */
+  const detachActionKeys = actionBinding.attachKeyboard(window);
 
   if (url !== null) {
     session = createSession({
@@ -111,12 +144,18 @@ function main(): void {
           playerId = w.playerId;
           console.info(`[session] 已加入房间 ${w.roomId}(玩家 ${w.playerId})`);
         },
-        /* ★ 2026-11-14:动作回执。两件事:
+        /* ★ 2026-11-14:动作回执。三件事:
            1 变成玩家能读的一句话(分类不同,话不同 —— 见 `action_target.ts`);
            2 **记下那次动过的物品 id** —— 快照里没有背包明细,而回执的 `effect`
-             是唯一"玩家真的碰过这件东西"的真值来源(下一步动作用它)。 */
+             是唯一"玩家真的碰过这件东西"的真值来源(下一步动作用它);
+           3 ★ 2026-11-15:同一份回执也递给**动作入口**(`net/action_entry.ts`)——
+             它给五个新动作(CRAFT / SLEEP / OPEN_CHEST / USE_OWN_CHEST / START_PARTY)
+             翻出**带动作名**的一句话。四条失败分类在那里是**四句不同的话**,
+             而 `action_target.ts` 的键位表里没有这五个动作(它只管建造/拆/丢/捡)
+             ⇒ 少这一路,被拒就又是"按了没反应"。 */
         onActionResult: (r) => {
           lastAction = describeActionResult(r);
+          actionEntry.onActionResult(r);
           const e = r.effect;
           if (e !== undefined) {
             const id = e.objId ?? e.itemId;
@@ -185,6 +224,11 @@ function main(): void {
       /* 动作那两行:回执文案(分类不同话不同)+ 最近碰过的物品。
          背包**明细**不在快照里(只有服务端有)⇒ 这里不编一个数字出来。 */
       lastAction,
+      /* ★ 2026-11-15:五个新动作(合成/睡觉/开箱/派对开局)那一行。
+         它由**入口**给出:发出去时是"合成 → 已发 (itemId=151)",
+         被拒时是"开公共箱 ✗ 你没有这个权限"(四条失败分类四句话)。
+         ⇒ 玩家第一次能分清"我按错了"与"服务端不让我做"。 */
+      actionEntry.status,
       lastItemId === 0 ? '最近物品 (还没有)' : `最近物品 ${lastItemId}`,
     ].join('\n');
     statusEl.classList.toggle('bad', st !== 'live');
@@ -270,11 +314,18 @@ function main(): void {
     predictedPos: predictor.pos,
     pendingCmds: predictor.pendingCount,
     lastReconcileAction: predictor.lastReconcile?.action ?? null,
+    /* ★ 2026-11-15:动作入口也进自检口径。否则「按 N 到底发没发」只能靠肉眼看画面 ——
+       而这正是本仓记过一整轮的静默形态(`status` 是一句话,`sent` 是计数,
+       两者都由入口给出,**不是**截图脚本自己推断的)。 */
+    actionStatus: actionEntry.status,
+    actionSent: actionEntry.sentCount,
+    actionKeys: entryKeyHints(),
   });
   window.addEventListener('beforeunload', () => {
     detachInput();
     clearInterval(inputLoop);
     session?.close();
+    detachActionKeys();
     handle.dispose();
   });
 }
