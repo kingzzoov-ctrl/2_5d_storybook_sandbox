@@ -121,6 +121,32 @@ export function foodBuffFrom(
   };
 }
 
+/**
+ * 料理乘区 → 战斗 `BuffInput` 的**唯一**换算处。
+ *
+ * ## 为什么需要一个函数,而不是在调用点直接拼
+ *
+ * 两侧的**约定不同**,而且差得很隐蔽:
+ *   - `FoodBuff.statMods.atkMul` 是**乘区**(中性 `1.0`);`BuffInput.atkMul` 也是乘区(`?? 1.0`)⇒ 直接传;
+ *   - `FoodBuff.statMods.critDmg` 是**乘区**(中性 `1.0`),而 `BuffInput.critDmg` 是**加值**
+ *     (中性 `0`,`BASE_CRIT_DMG + … + buffs.critDmg`)⇒ 必须 `- 1`;
+ *   - `critRate` 两侧都是**加值**(中性 `0`)⇒ 直接传。
+ *
+ * 第一版在 `world_sim.ts` 的调用点直接传 `food.critDmg`,实测把 `tests/WS-10` 的伤害
+ * 从 **14 抬到 24**(等于白送 +100% 爆伤)。单位差在类型上完全看不出来 —— 所以换算要有**一个名字**,
+ * 也要有**判据**(见 `tests/WS-FND-39` 的 FND39-11/12)。
+ *
+ * ⚠️ `hpFlat` **不在这里**:食物给的是**加值**,而 `BuffInput.hpMul` 是乘区 —— 硬塞进去就是第二份语义。
+ *   `hpFlat` 走 `WorldSim.maxHpForLevel` 那条路。
+ */
+export function foodCombatInput(mods: FoodBuff['statMods']): {
+  atkMul: number;
+  critRate: number;
+  critDmg: number;
+} {
+  return { atkMul: mods.atkMul, critRate: mods.critRate, critDmg: mods.critDmg - 1 };
+}
+
 /** 恶作剧判定优先级:列表靠前者优先命中。 */
 export const PRANK_PRIORITY: readonly number[] = [607, 608, 609, 610, 611];
 

@@ -10,8 +10,14 @@
  *
  * 零运行时依赖;不使用 Date.now / performance.now,一切时间由外部注入。
  * 本文件不 import 测试桩,自带与 `harness.mulberry32` 位级一致的随机源。
+ *
+ * ★ 本文件末尾还有一节「事件 → 分」的**纯函数**(`scoreOfPartyEvent` /
+ *   `tallyPartyScores`):把世界侧赛局里发生的动作换算成「该给谁加多少分」。
+ *   那一节的块注释里写着**今天谁调它**(世界侧的 `party_event` 链)与
+ *   **分数的真值源链**(事件 → 本函数 → `start_party.ts` 的 `scores` → `TeamScore`)。
  */
 
+import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
 import type { Rng } from '../coop/rush_order.ts';
 
 /**
@@ -399,3 +405,328 @@ export function crownLine(board: Map<TeamKey, TeamScore>): string {
 export function paintStandingLine(s: readonly PaintStanding[]): string {
   return s.map((r) => `${r.rank}. ${TEAM_LABEL[r.team]} ${r.tiles} 格(${(r.ratio * 100).toFixed(1)}%)`).join('  ');
 }
+
+/* ═══════════════════════ 事件 → 分:世界侧唯一计分规则(纯函数) ═══════════════════════ */
+
+/**
+ * ## 这一节谁在调、分数的真值源在哪
+ *
+ * **今天的调用者(世界侧;那行接线由主线落)**:`server/src/sim/world_sim.ts` 的赛局推进
+ * —— 它每慢帧已经把 WS-11 的事件送上总线
+ * (`world_sim.ts:4102` `this.bus.emit('party_event', { kind: ev })`)。
+ * 赛局里**动作类**的事件(击杀生物 / 采集拾取 / 触碰目标件)由世界侧按下面的
+ * `PARTY_SCORE_EVENT` 词表发出,走本节换算成「该给谁加多少分」,再把 `award.points`
+ * 交给 `server/src/net/actions/start_party.ts:199` 的 `addScore(roomId, playerId, points)`
+ * 落账。**本节不调 `addScore`、不读 `PARTIES` 注册表、不写任何状态**:接线是主线的事。
+ *
+ * **分数的真值源链(自上而下,唯一的一条)**:
+ * ```
+ *   (1) 事实     世界侧事件(`events/bus.ts` 的 `GameEvent`)        ← 唯一输入
+ *   (2) 规则     本节的 `scoreOfPartyEvent` / `tallyPartyScores`    ← 计分规则的唯一实现
+ *   (3) 存储     `start_party.ts:102` 的 `PartyRecord.scores`(`addScore` 是唯一写口)
+ *   (4) 团队分表 本文件上面的 `TeamScore`(由 `party/modes.ts` 的四个 settle 函数写)
+ * ```
+ * (2) 与 (4) 是同一套口径的两个投影:`metric` 的四个值**就是** (4) 的字段名
+ * (`score` / `goals` / `crownSec` / `tiles`),故本函数给出的分不需要第二张换算表就能落板。
+ * 刻意这样对齐:多一张"分 → 板"的换算表,就多一处调参会漂移的地方。
+ *
+ * **纯(判据 4)**:不读全局(模式词表直接来自冻结层 `PARTY_MODES`,是常量不是状态)、
+ * 不看时钟(带时间的事件把秒数放进 `payload`,本函数只搬不算)、不写任何状态、不改入参。
+ *
+ * ## 数值的锚(判据 1/2:没有一个字面量是拍脑袋来的)
+ *
+ * 每个模式有一个**最小一档分**(`PARTY_MODE_UNIT_POINTS`)—— 它不是新发明的数,而是该模式
+ * **既有实现里已经当作"分"用的那个量**:
+ *
+ * | 模式 | 最小一档分 | 出处(逐条可查) |
+ * | :--- | :--- | :--- |
+ * | BRIDGE_CTF | 2 | `modes.ts:213` `BRIDGE_SCORE_PER_TILE = 2`「每一步建造/冲刺折算的团队分」;`settleBridgeRun` 用它算安慰分(`modes.ts:266`),`docs/WS-11-coop-prank-party.md:453`「未夺旗队 + 2 × built(安慰分)」 |
+ * | JELLY_BALL | 1 | `modes.ts:405` `ts.score += 1`(进球),`docs/WS-11-coop-prank-party.md:463`「进球 → 对手队 goals++、score++」 |
+ * | CROWN_BR | 1 | `modes.ts:519` `ts.crownSec += dt`,且 `settleCrown` 直接以 `crownSec` 为团队 `value`(`modes.ts:537`)⇒ 1 秒持冠 = 1 分 |
+ * | PAINT_WAR | 1 | `modes.ts:614` `getTeam(...).tiles = tiles`,且 `settlePaintWar` 以 `tiles` 为 `value`(`modes.ts:629`)⇒ 1 格色块 = 1 分 |
+ *
+ * 「到达/触碰目标点」按**各模式主目标件**计价(`PARTY_REACH_TARGET_POINTS`):
+ * 造桥夺旗 = 100(`modes.ts:212` `BRIDGE_SCORE_PER_FLAG = 100`,手册 §6.3 夺旗分;
+ * `docs/WS-11-coop-prank-party.md:453`「夺旗队 +100」)、果冻球 = 1(进球)、涂色 = 1 分/格、
+ * 抢皇冠 = **0**(那一模式的分在 `tickCrown` 的持冠秒上累积,拾冠本身不加分,`modes.ts:518-520`)。
+ *
+ * ## 只有一条"折算"规则,且它写在明面上
+ *
+ * 手册 §6.3 的四个模式**都没有**给「击杀生物」与「采集/拾取」定价(逐条核过 `modes.ts`
+ * 的四个 `settle*` 函数与 `docs/WS-11-coop-prank-party.md` 的 §4.10 四个小节(造桥夺旗/果冻球/
+ * 抢皇冠/圈地涂色))。唯一不拍脑袋的
+ * 写法是**折合成该模式的最小一档分**(`PARTY_FOREIGN_EVENT_UNITS = 1`):那一档分**就是**
+ * 该模式里"一次可玩动作"的计价粒度(1 块桥板 / 1 进球 / 1 秒持冠 / 1 格色块)。
+ * 取 **1** 而不是更大的倍数,因为它是**下界**:击杀/采集不会盖过该模式自己的主目标
+ * (100 分夺旗 / 进球 / 持冠秒 / 色块)。
+ */
+
+/** 计分事件的最小形状:是 `events/bus.ts` 的 `GameEvent` 的**子集**(可直接传整条 `GameEvent`)。 */
+export interface PartyScoreEvent {
+  /** 事件种类,词表见 `PARTY_SCORE_EVENT`;表外的一律按「未登记事件」处理(0 分)。 */
+  kind: string;
+  /** 事件负载(原样来自 `GameEvent.payload`);本节只读 `team` 一个键,其余键一概不信(防负载注入分数)。 */
+  payload?: Readonly<Record<string, number | string | boolean>>;
+  /** 完成动作的玩家 id(原样来自 `GameEvent.source`)。 */
+  source?: string;
+}
+
+/**
+ * 世界侧派给本节的**三种**事件词表(命名与既有 mob 事件同为 `snake_case`,
+ * 见 `mobs/behaviors.ts` 的 `world.emit('boar_wall_stun')` 一族)。
+ */
+export const PARTY_SCORE_EVENT = {
+  /** 击杀生物:玩家把生物打到 `alive = false`(`world_sim.ts:2116`)。 */
+  CREATURE_KILL: 'party_creature_kill',
+  /** 采集 / 拾取:玩家把地上的物品收进背包。 */
+  GATHER: 'party_gather',
+  /** 到达 / 触碰目标点:踩到本模式的**目标件**(435 对岸旗 / 410 球门框 / 434 皇冠底座)。 */
+  REACH_TARGET: 'party_reach_target',
+} as const;
+export type PartyScoreEventKind = (typeof PARTY_SCORE_EVENT)[keyof typeof PARTY_SCORE_EVENT];
+
+/** 加分的落点:这四个值**就是** `TeamScore` 的字段名(同一个词表,不另立)。 */
+export const PARTY_SCORE_METRIC = {
+  SCORE: 'score',
+  GOALS: 'goals',
+  CROWN_SEC: 'crownSec',
+  TILES: 'tiles',
+} as const;
+export type PartyScoreMetric = (typeof PARTY_SCORE_METRIC)[keyof typeof PARTY_SCORE_METRIC];
+
+/** 一次事件 → 一次加分的**完整回执**(纯值,与入参不共享引用)。 */
+export interface PartyScoreAward {
+  /** 这次事件是否**按规则计价**(false = 未登记的事件类型 / 模式非法 ⇒ 一律 0 分)。 */
+  accepted: boolean;
+  /** 事件里的模式(原样回显,便于世界侧核对"这分是哪个模式给的")。 */
+  mode: string;
+  /** 事件种类(原样回显)。 */
+  kind: string;
+  /** 本次事件的分数增量:**有限、整数、非负**(判据 6)。 */
+  points: number;
+  /** 加到计分板的哪一栏。 */
+  metric: PartyScoreMetric;
+  /** 得分归属玩家(`event.source`;没带 / 空串 ⇒ `null`)。 */
+  playerId: string | null;
+  /** 得分归属队伍(团队赛用;见 `teamFromPayload`;`null` = 由调用方按玩家归属折算)。 */
+  team: TeamKey | null;
+  /** 可读口径:数值 + 它的锚(可直接拼进播报文案)。 */
+  reason: string;
+}
+
+/** 各模式的**最小一档分**(出处见本节块注释的表;键集必须与冻结层 `PARTY_MODES` 一致)。 */
+export const PARTY_MODE_UNIT_POINTS: Readonly<Record<string, number>> = {
+  BRIDGE_CTF: 2,
+  JELLY_BALL: 1,
+  CROWN_BR: 1,
+  PAINT_WAR: 1,
+};
+
+/** 非主目标事件(击杀生物 / 采集拾取)折合几个标准单位。理由见块注释最后一段。 */
+export const PARTY_FOREIGN_EVENT_UNITS = 1;
+
+/** 各模式**主目标件**的分(出处见本节块注释)。 */
+export const PARTY_REACH_TARGET_POINTS: Readonly<Record<string, number>> = {
+  BRIDGE_CTF: 100,
+  JELLY_BALL: 1,
+  CROWN_BR: 0,
+  PAINT_WAR: 1,
+};
+
+/** 同上,落点(果冻球算 `goals`、涂色算 `tiles`,与既有 settle 函数读的字段一致)。 */
+export const PARTY_REACH_TARGET_METRIC: Readonly<Record<string, PartyScoreMetric>> = {
+  BRIDGE_CTF: PARTY_SCORE_METRIC.SCORE,
+  JELLY_BALL: PARTY_SCORE_METRIC.GOALS,
+  CROWN_BR: PARTY_SCORE_METRIC.CROWN_SEC,
+  PAINT_WAR: PARTY_SCORE_METRIC.TILES,
+};
+
+/** 最小一档分的锚(写进 `reason`;调这个数时,这条注释必须一起改)。 */
+const MODE_UNIT_ANCHOR: Readonly<Record<string, string>> = {
+  BRIDGE_CTF: 'modes.ts:213 BRIDGE_SCORE_PER_TILE=2(一块桥板的基础分)',
+  JELLY_BALL: 'modes.ts:405 进球 `ts.score += 1`(手册 §6.3「4v4 果冻球」)',
+  CROWN_BR: 'modes.ts:519 `crownSec += dt` + modes.ts:537 以 crownSec 为 value ⇒ 1 秒 = 1 分',
+  PAINT_WAR: 'modes.ts:614 `tiles = tiles` + modes.ts:629 以 tiles 为 value ⇒ 1 格 = 1 分',
+};
+
+/** 主目标件的锚(同上)。 */
+const REACH_ANCHOR: Readonly<Record<string, string>> = {
+  BRIDGE_CTF: 'modes.ts:212 BRIDGE_SCORE_PER_FLAG=100(手册 §6.3 夺旗分)',
+  JELLY_BALL: 'modes.ts:405 进球 `ts.score += 1`(手册 §6.3 进球计分)',
+  CROWN_BR: 'modes.ts:518-520 分在 `tickCrown` 的持冠秒上累积 ⇒ 拾冠(434)本身 0 分',
+  PAINT_WAR: 'modes.ts:614 与 629 色块数即分数 ⇒ 1 格 1 分',
+};
+
+/**
+ * 模式词表就是冻结层 `PARTY_MODES`(`shared/constants/bosses.ts:180`)。
+ * **不另写第二张**:`start_party.ts:87` 与 `party/modes.ts` 都从同一处取词表。
+ */
+function isLegalPartyMode(mode: unknown): mode is string {
+  return typeof mode === 'string' && PARTY_MODES.some((m) => m.key === mode);
+}
+
+/** 负载里的 `team` 若不是四色之一(或没带)⇒ `null`(由调用方按玩家归属折算)。 */
+function teamFromPayload(payload: PartyScoreEvent['payload']): TeamKey | null {
+  if (payload === undefined) return null;
+  const t = payload.team;
+  if (typeof t !== 'string') return null;
+  return (TEAM_ORDER as readonly string[]).includes(t) ? (t as TeamKey) : null;
+}
+
+/**
+ * **把一个赛局事件换算成「该给谁加多少分」**(纯函数:同一输入两次结果逐位相同、
+ * 不改入参、不看时钟、不读状态)。
+ *
+ * 判序(每条对着一条判据):
+ *   1 模式不是冻结层 `PARTY_MODES` 的 key(`NONE` / 空串 / 大小写不对 / 没传)⇒ **显式拒绝**:
+ *     `accepted=false` + `points=0` + 可读 `reason`(判据 7)。这里**选"返回 0"而不是"抛错"**:
+ *     世界侧在慢帧循环里逐个事件调它,抛错会把一整帧打死,而"模式没选"是配置问题,
+ *     不该升级成崩溃。
+ *   2 `REACH_TARGET` ⇒ 该模式主目标件的分(判据 1/2)。
+ *   3 `CREATURE_KILL` / `GATHER` ⇒ 该模式最小一档分 × `PARTY_FOREIGN_EVENT_UNITS`。
+ *   4 其它任何 kind ⇒ **不给分**:`accepted=false` + `points=0`(判据 3,**不抛错、不默认给 1**)。
+ *
+ * 分数的上界是 100(夺旗)、下界是 0,都是整数 ⇒ 判据 6 恒成立;负载里的数字
+ * **不参与计分**(`payload.points` 之类一律无视),故无法用事件刷分。
+ */
+export function scoreOfPartyEvent(mode: string, event: PartyScoreEvent): PartyScoreAward {
+  const kind = typeof event?.kind === 'string' ? event.kind : '';
+  const playerId = typeof event?.source === 'string' && event.source.length > 0 ? event.source : null;
+  const team = teamFromPayload(event?.payload);
+
+  if (!isLegalPartyMode(mode)) {
+    return {
+      accepted: false,
+      mode: typeof mode === 'string' ? mode : '',
+      kind,
+      points: 0,
+      metric: PARTY_SCORE_METRIC.SCORE,
+      playerId,
+      team,
+      reason: `模式未定义或非法(${String(mode)})⇒ 拒绝计分:模式必须是冻结层 PARTY_MODES 的 key`,
+    };
+  }
+
+  if (kind === PARTY_SCORE_EVENT.REACH_TARGET) {
+    const points = PARTY_REACH_TARGET_POINTS[mode] ?? 0;
+    return {
+      accepted: true,
+      mode,
+      kind,
+      points,
+      metric: PARTY_REACH_TARGET_METRIC[mode] ?? PARTY_SCORE_METRIC.SCORE,
+      playerId,
+      team,
+      reason: `触碰本模式目标件:+${points} 分(锚:${REACH_ANCHOR[mode] ?? '—'})`,
+    };
+  }
+
+  if (kind === PARTY_SCORE_EVENT.CREATURE_KILL || kind === PARTY_SCORE_EVENT.GATHER) {
+    const points = (PARTY_MODE_UNIT_POINTS[mode] ?? 0) * PARTY_FOREIGN_EVENT_UNITS;
+    const what = kind === PARTY_SCORE_EVENT.CREATURE_KILL ? '击杀生物' : '采集/拾取';
+    return {
+      accepted: true,
+      mode,
+      kind,
+      points,
+      metric: PARTY_SCORE_METRIC.SCORE,
+      playerId,
+      team,
+      reason: `${what}:折合 ${PARTY_FOREIGN_EVENT_UNITS} 个标准单位 = +${points} 分(锚:${MODE_UNIT_ANCHOR[mode] ?? '—'})`,
+    };
+  }
+
+  return {
+    accepted: false,
+    mode,
+    kind,
+    points: 0,
+    metric: PARTY_SCORE_METRIC.SCORE,
+    playerId,
+    team,
+    reason: `未登记的事件类型 ${kind === '' ? '(空)' : kind} ⇒ 0 分(词表见 PARTY_SCORE_EVENT)`,
+  };
+}
+
+/** 一批事件的累计结果:一个玩家一行。 */
+export interface PartyScoreTally {
+  playerId: string;
+  /** 本批事件给该玩家的总分(**仅** `accepted` 的事件;有限非负整数)。 */
+  points: number;
+  /** 按落点拆开:四个键**恒在**(固定的键序,未出现的为 0),便于直接比对序列化结果。 */
+  byMetric: Readonly<Record<PartyScoreMetric, number>>;
+  /** 计价过的事件数(含 0 分的合法事件,如抢皇冠时的拾冠)。 */
+  acceptedEvents: number;
+  /** 归属该玩家但**未计价**的事件数(未登记类型 / 模式非法)。 */
+  rejectedEvents: number;
+}
+
+/** 累计器的内部形态(`byMetric` 可变;对外暴露的 `PartyScoreTally` 是只读视图)。 */
+interface TallyAcc {
+  points: number;
+  byMetric: Record<PartyScoreMetric, number>;
+  acceptedEvents: number;
+  rejectedEvents: number;
+}
+
+/**
+ * **一批事件 → 每个玩家加多少分**(世界侧一慢帧收一撮事件后调它,再逐行 `addScore`)。
+ *
+ * 顺序无关(判据 5):累加走 `Map`,**行序按 `playerId` 的 UTF-16 码元序**,
+ * `byMetric` 的键序固定在对象字面量里 ⇒ 打乱输入顺序后 `JSON.stringify` 逐字节相同。
+ * 码元序这个约定与 `start_party.ts:256-259` 的 `rankingOf` 同一处理由:
+ * `localeCompare` 随 locale 变、`Map` 插入序随事件到达顺序变,两者都会让名次漂移。
+ *
+ * 没有 `source` 的事件(归属不到人)被**丢弃**:`addScore` 要的正是 `userId`。
+ * 调用方按 `row.points > 0` 决定是否落账(`acceptedEvents` 可能 > 0 而 `points` 为 0)。
+ */
+export function tallyPartyScores(mode: string, events: readonly PartyScoreEvent[]): PartyScoreTally[] {
+  const acc = new Map<string, TallyAcc>();
+  for (const e of events) {
+    const award = scoreOfPartyEvent(mode, e);
+    if (award.playerId === null) continue;
+    let row = acc.get(award.playerId);
+    if (row === undefined) {
+      row = { points: 0, byMetric: { score: 0, goals: 0, crownSec: 0, tiles: 0 }, acceptedEvents: 0, rejectedEvents: 0 };
+      acc.set(award.playerId, row);
+    }
+    if (!award.accepted) {
+      row.rejectedEvents += 1;
+      continue;
+    }
+    row.points += award.points;
+    row.byMetric[award.metric] += award.points;
+    row.acceptedEvents += 1;
+  }
+  return [...acc.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([playerId, r]) => ({
+      playerId,
+      points: r.points,
+      byMetric: r.byMetric,
+      acceptedEvents: r.acceptedEvents,
+      rejectedEvents: r.rejectedEvents,
+    }));
+}
+
+/**
+ * 自检:三张分表必须与冻结层 `PARTY_MODES` **逐键一致**。
+ * 少一个键就抛错,而不是"兜底给 0":那会让该模式的事件**静默落 0 分** ——
+ * "看起来能用但一点不干活"比抛错难查得多。
+ */
+function assertScoringTablesCoverFreezeLayer(): void {
+  const frozen = PARTY_MODES.map((m) => m.key).sort();
+  const tables: readonly (readonly [string, Readonly<Record<string, unknown>>])[] = [
+    ['PARTY_MODE_UNIT_POINTS', PARTY_MODE_UNIT_POINTS],
+    ['PARTY_REACH_TARGET_POINTS', PARTY_REACH_TARGET_POINTS],
+    ['PARTY_REACH_TARGET_METRIC', PARTY_REACH_TARGET_METRIC],
+  ];
+  for (const [name, table] of tables) {
+    const here = Object.keys(table).sort();
+    if (here.join(',') !== frozen.join(',')) {
+      throw new Error(`${name} 的模式键与冻结层 PARTY_MODES 不一致:${here.join(',')} vs ${frozen.join(',')}`);
+    }
+  }
+}
+
+assertScoringTablesCoverFreezeLayer();

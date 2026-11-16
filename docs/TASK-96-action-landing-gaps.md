@@ -65,13 +65,20 @@
 |---|---|---|
 | `START_PARTY` | `actions/start_party.ts` | 开局/计分/结算状态机(per-room Map + 可注入时钟);模式**只读**房间已选模式,不写第二份真值 |
 | `BREED_TAME` | `actions/breed_tame.ts` | 投喂/驯服/繁殖(**`payload.op` 分支**);宠物是**本模块的记录**,不是世界里的生物实体 |
-| `MODIFY_TOWN` | `actions/modify_town.ts` | 城镇配置登记 + `town` 权限裁决;**没有世界侧读者** ⇒ 刷怪/安全区行为一点没变 |
+| `MODIFY_TOWN` | `actions/modify_town.ts` + `mobs/spawner.ts` 的 provider | 城镇配置登记 + `town` 权限裁决;**配置真的生效**(`spawner` 按房间号问 provider ⇒ 安全区判定跟着变) |
 | `USE_ALCHEMY_FURNACE` | `actions/use_alchemy_furnace.ts` | 站上炼金台 + 内容层配方;**本地确定性实现**(LLM 自由炼金不在本轮) |
 
 ⚠️ 新增四条边界(同样**不计入达成**):
-1 `BREED_TAME` 的宠物**不是真生物实体**(不写 `WildlifeState`,世界/AI 不知道它被驯服);
-2 `MODIFY_TOWN` 的改造**没有世界侧读者**(`spawner.ts` 仍读常量 `TOWN_SAFE_RADIUS`);
-3 `START_PARTY` 的赛局**没有接到慢帧去真的计分**,也不落库;
+1 `BREED_TAME` 的宠物**不是真生物实体**(没有创建/重新归属任何 `WildlifeState`);但**世界已经知道它被驯服**
+  (2026-11-15:`net/room.ts` 的投影读 `tameOwnerOf` ⇒ `state.wildlife[].tameOwnerId` 有主人,判据 `WS-FND-46`);
+  未做的是"AI 行为随归属变化"(守卫/跟随),那需要 mob AI 侧接线;
+2 `MODIFY_TOWN` 的改造**已生效**(2026-11-15):`spawner.ts` 把半径从常量改成**可注入查询**,
+  装配层(`index.ts`)把 `modify_town.ts` 的适配器装上去,世界的 `roomId` 经 `WorldSimOptions.roomId`
+  透传进 `SpawnWorld` ⇒ 安全区判定按 per-room 配置。判据:`WS-FND-40`(读取口 8 条)、
+  `WS-FND-44`(端到端 4 条:改成 8 之后"24 内、8 外"的点不再算安全区)。
+3 `START_PARTY` 的赛局**已经真的计分**(2026-11-15:击杀在 `settleKill` → `notePartyEvent` →
+  装配层接 `scoreOfPartyEvent` → `addScore`,判据 `WS-FND-45`);**但只有击杀这一处发射点**,
+  采集/到达两类事件世界侧还没发;赛局**不落库**(进程内)。
 4 `USE_ALCHEMY_FURNACE` 的站位读口(`lastRoomEffects[].roomKey`)**不在 `WorldSaveHost` 契约里**,有最多 0.5 s 慢帧延迟。
 
 判据:`WS-FND-28-party`(7)、`WS-FND-29-tame`(10)、`WS-FND-30-town`(8)、`WS-FND-31-alchemy`(8)。
@@ -109,10 +116,34 @@
 ⚠️ 三条边界(**不计入达成**):
 1 **`itemId` 由客户端自报** —— 服务端没有按件背包明细读口(`PlayerState` 只有 `heldItemId`),
    世界侧只信"是我认识的 id";扣减走 `applyInventory`(总量守恒,不足即整批拒)。
-2 **227 的"对活人连中 3 发"半边没有建模**(`BUBBLED` 住在 `DownedState`)⇒ 今天只对幽灵泡泡目标生效。
+2 **227 的"对活人连中 3 发"半边已建模**(2026-11-15):`combat/live_bubble.ts`(纯状态机,
+  常量从 `revive.ts` import)。它与 `DownedState.BUBBLED` **不是两份实现** ——
+  `DownedState` 只在**倒地期间**存在,活人没有被困容器;两边是不同主体,共享的只有手册的词与两个数值。
+  判据:`WS-FND-39` 的 FND39-14/15。
 3 料理 11 个字段里**只有 `hpFlat` 与即时回复**真的到达玩家(`hpFlat` 经 `maxHpForLevel` 并进上限);
    `gravityMul`(冻结层 `integrateVertical` 无参数位)/ `gatherMul`(本仓无采集系统)/ `jumpMul`(无跳跃入口)
-   / `atkMul`·`critRate`·`critDmg`·`defFlat`·`moveMul`·`expMul`(战斗与经验管线未接第三参)**仍是未接**。
+   / `defFlat`·`moveMul`·`gravityMul`·`jumpMul`·`gatherMul`·`expMul` **仍是未接**。
+   ★ 2026-11-15 更新:`atkMul` / `critRate` / `critDmg` **已经进战斗管线**
+   (`world_sim.ts` 的 `combatantStats` 第三参由 `combat/cooking.ts` 的 `foodCombatInput` 换算;
+   ⚠️ 两侧约定不同,`critDmg` 必须 `-1` 换算 —— 直接传会把伤害从 14 抬到 24,这条由 `WS-FND-39` FND39-11/12 钉住)。
+   `muOverride` 仍缺一个具名默认值导出(否则会退化成硬编码 `0.75`)。
+
+## 二之七、**世界侧读者**这一波(2026-11-15,不动动作表)
+
+这一波不加动作,只把"已接线但世界侧没人读"的四处接上:
+
+| 事项 | 落点 | 判据 |
+|---|---|---|
+| `SLEEP` 的世界侧读者 | `WorldSim.attachSleepSource` + `lastRoomEffects[].sleeping`,装配层注入 `sleepStateOf` | `WS-FND-43`(6 条) |
+| 赛局真的计分 | `WorldSim.notePartyEvent` + 装配层接 `scoreOfPartyEvent` → `addScore`(击杀在 `settleKill` 里发) | `WS-FND-45`(5 条) |
+| 城镇配置生效 | `spawner` 的 provider + `WorldSimOptions.roomId` + 装配层装适配器 | `WS-FND-44`(4 条) |
+| 宠物被世界看见 | `net/room.ts` 投影读 `tameOwnerOf` ⇒ `state.wildlife[].tameOwnerId` | `WS-FND-46`(3 条) |
+
+⚠️ **仍未做**(如实列在这里,不许当成已支持):
+1 赛局只有**击杀**这一处发射点;`GATHER`(采集拾取)与 `REACH_TARGET`(到达目标)两个词表**规则已备但世界侧没有发射点**(`WS-FND-45` FND45-5 把现状钉住);
+2 `SLEEP` 的世界侧读者**只记录事实**,不改变任何回血数值(那要产品裁决);
+3 城镇配置对 `bosses/raid.ts` 的祭坛校验**不可见**(它仍以默认 24 调用 `isInsideSafeRadius`);
+4 宠物归属**不持久化**(模块级 Map,进程重启即空)。
 
 判据:`tests/WS-FND-39-use-item.test.ts`(9 条;4 处注入验证:超距扣道具 / 不写回活的无敌 /
 不并 `hpFlat` / 永不扣道具 —— 全部能红且逐字节还原)。

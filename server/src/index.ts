@@ -98,6 +98,11 @@
  */
 
 import { WorldSim } from './sim/world_sim.ts';
+import { addScore, partyStateOf } from './net/actions/start_party.ts';
+import { scoreOfPartyEvent } from './party/scoring.ts';
+import { sleepStateOf } from './net/actions/sleep.ts';
+import { setTownRadiusProvider } from './mobs/spawner.ts';
+import { townSafeRadiusProvider } from './net/actions/modify_town.ts';
 import { RoomRuntime, type RoomRuntimeOptions, type WorldSaveHost } from './net/room.ts';
 import { AccessMode } from './db/repo.ts';
 import type { DbLike } from './db/repo.ts';
@@ -226,6 +231,9 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
        不传 `biome` 刷怪只会走 `?? BIOME_SPAWN.MEADOW` 的兜底 ——
        而那个兜底**没有任何地方会显示出来**。 */
     biome: deps.biome,
+    /* ★ 房间号透传给世界:刷怪要靠它去问「本房间的安全区半径」
+       (`modify_town.ts` 的配置从此真的生效;没给 ⇒ 退回常量 24)。 */
+    roomId: deps.roomId,
   } as ConstructorParameters<typeof WorldSim>[0]);
   return sim;
 }
@@ -239,6 +247,24 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
  */
 export function assemble(deps: AssembleDeps = {}): Assembled {
   const host = createHost(deps);
+
+
+  /* ★ 把**赛局计分**接上:世界侧报告事实(击杀/采集/到达),这里换算成分并落到 `addScore`。
+     ⚠️ 分数的真值源仍是 `start_party.ts` 的 `scores`;这里只做"事实 → 增量"的换算与落账。 */
+  const partyHost = host as unknown as {
+    attachPartyScoreSink?: (fn: (ev: { kind: string; source?: string }) => void) => void;
+  };
+  partyHost.attachPartyScoreSink?.((ev) => {
+    const st = partyStateOf(rtOpts.roomId);
+    if (st === null) return; /* 没开局 ⇒ 不计分(没有"分数"这个对象) */
+    if (ev.source === undefined || ev.source === '') return; /* 无归属 ⇒ 不猜谁得分 */
+    const award = scoreOfPartyEvent(st.mode, ev);
+    if (award.points > 0) addScore(rtOpts.roomId, ev.source, award.points);
+  });
+  /* ★ 把**城镇配置**接给刷怪器:装配层是唯一同时认识两边的地方
+     (`spawner` 不认识 `modify_town`,反过来也一样)⇒ 适配器在这里塞进去,依赖单向。
+     不装 ⇒ `spawner` 用默认常量 24,与接线前逐字一致(WS-FND-40 的 FND40-1 钉这一条)。 */
+  setTownRadiusProvider(townSafeRadiusProvider);
 
   /* 与 `./net/room.colyseus.ts` 的 `rtOpts` 字面量**逐字段对齐**。
      ⚠️ 对齐的是**键集**,不只是「有这些语义」:房间那一份里 9 个键**总是出现**
@@ -265,6 +291,12 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
   };
 
   const runtime = new RoomRuntime(rtOpts, resolveDb(deps));
+
+  /* ★ 把**睡眠读口**接进世界:装配层是唯一知道"本房间 id"的地方,
+     而 `WorldSim` 不 import `net/actions/**`(那会让 sim 依赖 net)⇒ 在这里注入闭包,依赖单向。
+     ⚠️ 只**读**事实("这人正在睡吗"),不改变任何回血数值 —— 平衡性改动是产品裁决,不是接线。 */
+  const sleepHost = host as unknown as { attachSleepSource?: (fn: (u: string) => boolean) => void };
+  sleepHost.attachSleepSource?.((userId: string) => sleepStateOf(rtOpts.roomId, userId).sleeping);
   return { host, rtOpts, runtime };
 }
 

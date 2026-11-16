@@ -60,6 +60,7 @@ import {
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 
 import { lookupActionHandler } from './actions/action_table.ts';
+import { tameOwnerOf } from './actions/breed_tame.ts';
 import { notImplemented } from './actions/not-implemented.ts';
 import type { ActionContext } from './actions/types.ts';
 /* 物质层的模块级常量(`PICKUP_RADIUS` / `ITEM_ID_SET`)与 `numField` 随那 4 个动作
@@ -1922,7 +1923,11 @@ export class RoomRuntime {
       seen.add(w.id);
       upsertWildlife(this.state, {
         id: w.id, mobId: w.mobId, x: w.x, y: w.y, z: w.z,
-        fsm: w.fsm, hp: w.hp, maxHp: w.maxHp, tameOwnerId: w.tameOwnerId,
+        fsm: w.fsm, hp: w.hp, maxHp: w.maxHp,
+        /* ★ 宠物归属的**权威**是 `actions/breed_tame.ts`(`tameOwnerOf`),不在这里写第二份;
+           `null ⇒ ''` 就是 wire 的「野生」口径(`schema.ts` 里 `tameOwnerId` 默认为空串)。
+           此前这一格直接抄 `w.tameOwnerId`,而世界侧那格恒为 `''` ⇒ 世界/AI 永远不知道谁被驯服。 */
+        tameOwnerId: tameOwnerOf(this.state.roomId, w.id) ?? '',
       });
     }
     for (let i = this.state.wildlife.length - 1; i >= 0; i -= 1) {

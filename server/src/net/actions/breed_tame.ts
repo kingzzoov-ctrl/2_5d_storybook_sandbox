@@ -82,6 +82,56 @@
  * `ACTION_PERMISSION.BREED_TAME = 'baseline'`(`room.ts:183`)⇒ 只要在房里就能做
  * (GUEST 也行 —— `PERMISSION_MATRIX.GUEST.baseline = true`,`room.ts:169-172`)。
  * 闸写在这里,不写在别处:世界/内容方法没有「谁」这个参数(与 `material.ts` 同一例外)。
+ *
+ * ## 宠物归属**世界侧今天还看不见**(边界 + 那一行接线)
+ *
+ * 归属 / 好感 / 已投喂次数住在本文件的 `ROOM_PETS`(上面的 §2),**世界与 AI 完全
+ * 不知道**这条记录存在。投影链实测如下:
+ *
+ * ```
+ * 权威(本模块)  ROOM_PETS: roomId → petId → { ownerId, affection, feeds }
+ * 投影链(今天)   world_sim.ts:4329 listWildlife() 把 tameOwnerId **硬编码 `''`**
+ *                 ⇒ room.ts:1914 projectWildlife() 经 room.ts:1925 抄进 state.wildlife
+ *                 ⇒ 客户端快照恒为「野生」
+ * ```
+ *
+ * ⇒ 投影点的写入者只有 `world_sim.ts:4344`(`tameOwnerId: ''`)与 `room.ts:1925`
+ *   (`tameOwnerId: w.tameOwnerId`),**都不在本文件写域**。本文件这一侧给出的是一条
+ *   **可被取走的权威登记 + 只读查询**(`tameOwnerOf` / `tamedPetsOfRoom`);接线由
+ *   世界/房间侧补 —— 给 owner 的就是下面这一行:
+ *
+ * ```
+ * 建议接线(一行;归属以本模块为权威):
+ *   room.ts:1925   tameOwnerId: w.tameOwnerId,
+ *              ⇒   tameOwnerId: tameOwnerOf(this.state.roomId, w.id) ?? '',
+ *   并在 room.ts 顶部加 import { tameOwnerOf } from './actions/breed_tame.ts';
+ * ```
+ *
+ * **本条今天到哪一步 / 由谁做**:动作层(本文件)已给出**可查的权威归属** —— 判据
+ * `tests/WS-FND-41-tame-world.test.ts`(7 条);但世界侧**仍未接线**(`state.wildlife`
+ * 的 `tameOwnerId` 今天仍恒为 `''`,客户端看到的仍是「野生」)。**剩下那一行由房间/
+ * 世界侧的 owner 补**(`room.ts` / `world_sim.ts` 都不在本文件写域),补完即闭环 ——
+ * 本文件这一侧**无需再动**。
+ *
+ * 选 `room.ts:1925` 而非 `world_sim.ts:4344` 的理由:`WorldSim` **没有** `roomId`
+ * 实例字段(`world_sim.ts` 只在存档方法签名里收它),而 `RoomRuntime` 手里有
+ * `this.state.roomId`。在投影点按 `(roomId, petId)` 反查一次即得,不必把房间身份
+ * 线程进模拟层。⚠️ 本模块**绝不**自己写 `state.wildlife` —— 那会与投影层争同一个
+ * 字段(两份写者)。世界侧存活清单的权威只属于 `world_sim`,本模块只提供归属。
+ *
+ * ## 取走后**不清除**(关键口径)
+ *
+ * `tameOwnerOf` / `tamedPetsOfRoom` 是**纯读**:投影**每帧**都会问一次,若「取走
+ * 即清」则主人只能在一帧里被看见(下一帧又变回野生)。⇒ 查询**不**消费登记,同一
+ * `(roomId, petId)` 可无限次问、答案恒定(判据 7「无副作用」钉这一条)。
+ *
+ * ## `schema.ts` 的字段够不够 —— 核对结论:**够,故不改它**
+ *
+ * `WildlifeState.tameOwnerId` 是 `string`(`schema.ts:85` 默认 `''`;wire 注释
+ * `shared/types/wire.ts:133` 明写「空串=野生」)⇒ 语义 = 「主人 id,空串表示无主」。
+ * 本模块的 `ownerId` 是 `string | null`(`null` = 未驯服)⇒ 两者只差一步**哨兵转写**,
+ * 那一步就落在上面那行接线的 `?? ''`。字段形态**足以**表达「已驯服」⇒ 不动
+ * `schema.ts`(它不是冻结层,但这里确实没有必须改的理由)。
  */
 import { tameableMobs } from '../../../../shared/constants/mobs.ts';
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
@@ -196,6 +246,59 @@ export function petsOfRoom(roomId: string): PetEntry[] {
   return [...m.values()]
     .map((p) => ({ petId: p.petId, mobId: p.mobId, ownerId: p.ownerId, affection: p.affection, feeds: p.feeds }))
     .sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
+}
+
+/**
+ * 一条**归属登记**的只读副本:`petId → ownerId`。
+ *
+ * 形状是给**投影层**用的 —— `world_sim.listWildlife()` / `room.projectWildlife()`
+ * 手里只有一个生物 id,需要反查它的主人(见文件头「世界侧今天还看不见」)。
+ */
+export interface TameOwnerRecord {
+  petId: string;
+  /** 恒非空:本查询只列**有主**的宠物(`ownerId === null` 的不在此列)。 */
+  ownerId: string;
+}
+
+/**
+ * ★ 权威查询:某房间里某只宠物的主人。
+ *
+ * ```
+ * 已驯服           ⇒ 主人 id(非空字符串)
+ * 有记录但未驯服   ⇒ null
+ * 房间里没有该记录 ⇒ null
+ * ```
+ *
+ * ⚠️ 返回类型是 `string | null`,**永远不是 `undefined`** —— 宿主/投影层若用
+ *   `=== undefined` 判失败,会把「未驯服」与「查错了」混为一谈;这里把它压成一条
+ *   `null`(判据 6)。
+ *
+ * ⚠️ **纯读、不消费**:调用它**不会**清空或改动 `ROOM_PETS`(理由见文件头
+ *   「取走后不清除」)。投影**每帧**都会问 ⇒ 必须幂等(判据 7)。
+ */
+export function tameOwnerOf(roomId: string, petId: string): string | null {
+  /* 刻意**不**走 `roomPetsOf` —— 那个 helper 会「没有就建一个空 Map」,于是对任何
+     房间问一次就留下一份空登记(副作用)。这里只读,不 materialize。 */
+  const pet = ROOM_PETS.get(roomId)?.get(petId);
+  if (pet === undefined) return null;
+  return pet.ownerId;
+}
+
+/**
+ * 只读查询:某房间**全部有主宠物**的归属(每个元素都是**新副本**)。
+ *
+ * 用途同 `tameOwnerOf`,但一次给全量(投影层若要按宠物批量对齐时用它)。
+ * ⚠️ 返回的是**快照**:调用方改数组或改元素**都不会**回写内部(判据 5)。
+ */
+export function tamedPetsOfRoom(roomId: string): TameOwnerRecord[] {
+  const m = ROOM_PETS.get(roomId);
+  if (m === undefined) return [];
+  const out: TameOwnerRecord[] = [];
+  for (const p of m.values()) {
+    if (p.ownerId !== null) out.push({ petId: p.petId, ownerId: p.ownerId });
+  }
+  out.sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
+  return out;
 }
 
 /** 观测口:某房间已登记的全部繁殖记录(最旧在最前)。 */

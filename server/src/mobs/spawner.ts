@@ -6,6 +6,26 @@
  *  - `309 萤光星光夜路砖` 所在格:敌对野怪**不能在此格刷新**(且夜间发光半径 1 格内也抑制);
  *  - `522 暖橘光铁艺路灯` 半径 5 格内:不刷新敌对「夜行」怪;
  *  - 城镇安全区:半径 24 格内不刷怪,并对区内玩家施加护盾(免疫野生怪直接伤害)。
+ *
+ * ## 安全区半径是**可注入**的(`MODIFY_TOWN` 的世界侧读口)
+ *
+ * `TOWN_SAFE_RADIUS = 24` 仍是**默认值 / 内容口径的锚**(出厂城镇半径),但它**不再**
+ * 被直接当成判定半径:判定一律走 `townSafeRadiusFor(roomId)` ——
+ * 「先问 provider(`setTownRadiusProvider` 装的 `(roomId) => number`);拿不到 /
+ * 非法(负数 / `NaN` / 非有限 / 非数字 / `0`) / 抛错 ⇒ 退回 `TOWN_SAFE_RADIUS`」。
+ * provider 由**世界侧**在装配期装上,典型实现是 `MODIFY_TOWN` 的**只读**适配器
+ * `modify_town.ts` 的 `townSafeRadiusProvider(roomId) = townConfigOf(roomId).safeRadius`。
+ *
+ * ⚠️ 本模块**只消费**半径,**不校验**上下界(`MIN_TOWN_RADIUS..MAX_TOWN_RADIUS` 是
+ *   `modify_town.ts` 的事):这里只做「是不是一个正的有限数」这一个**类型级**守卫,
+ *   免得把配置层的不变量抄成第二份(抄了就会分叉)。
+ *
+ * ⚠️ **世界侧接线(主线做,本模块不改 `world_sim.ts`)**:把房间号喂进判定的那一行在
+ *   `server/src/sim/world_sim.ts` 的 `spawnWorld()`(今天约 r4266-4273 的返回对象)——
+ *   在该 `SpawnWorld` 字面量里加 `roomId: () => <本房间号>`,并在装配期调一次
+ *   `setTownRadiusProvider(townSafeRadiusProvider)`。
+ *   本模块**不** import `modify_town.ts`(会成环):只提供插槽,适配器由调用方接。
+ *   `SpawnWorld.roomId` 缺席 ⇒ 与历史行为逐字节一致(默认 24,零回归)。
  */
 
 import { Biome } from '../../../shared/types/entities.ts';
@@ -28,6 +48,58 @@ export const NIGHT_BRICK_RADIUS = 1;
 export const TOWN_SAFE_RADIUS = 24;
 /** 安全区护盾吸收比例(100% 免疫野生怪伤害)。 */
 export const SAFE_SHIELD_MULT = 1.0;
+/*
+ * ─────────────── 安全区半径:可注入提供者 ───────────────
+ *
+ * 为什么是**函数插槽**而不是把 `TOWN_SAFE_RADIUS` 改成 `let`:
+ *   1 `let` 只能是**一份全局标量**,而城镇配置是 **per-room** 的
+ *     (`modify_town.ts` 的 `Map<roomId, TownConfig>`)⇒ 半径必须能按 `roomId` 取;
+ *   2 提供者让依赖**单向**:本模块不认识 `modify_town`,由调用方把适配器塞进来
+ *     (否则 `spawner ↔ modify_town` 成环);
+ *   3 判据可装一个返回 8 / 40 的假提供者,不动任何真配置就能钉住边界。
+ */
+/** 半径提供者:给房间号,回半径。返回值**不做上下界校验**(那是 `modify_town.ts` 的事)。 */
+export type TownRadiusProvider = (roomId: string) => number;
+
+/** 当前装的提供者。`null` = 没装 ⇒ 一律用默认 `TOWN_SAFE_RADIUS`。 */
+let townRadiusProvider: TownRadiusProvider | null = null;
+
+/**
+ * 装 / 卸半径提供者。传 `null` 卸掉(恢复默认 24)。
+ *
+ * **立即生效**:判定每次调用都现读本插槽,不需要重建世界 / 刷新器(判据 6)。
+ */
+export function setTownRadiusProvider(fn: TownRadiusProvider | null): void {
+  townRadiusProvider = fn;
+}
+
+/**
+ * 半径的**唯一读取口**:先问 provider,拿不到 / 非法 / 抛错 ⇒ 退回 `TOWN_SAFE_RADIUS`。
+ *
+ * 口径(逐条对着判据):
+ *   - 没装 provider ⇒ 默认(判据 1);
+ *   - provider 返回有限的正数 ⇒ 用它(判据 2 / 3);
+ *   - 返回 负数 / `NaN` / `Infinity` / 非数字 / `0` ⇒ **退回默认**(判据 4)。
+ *     `0` 也退:半径 0 = 「安全区永远为空」,与默认 24 相比是**静默改变世界规则**;
+ *     宁可用出厂值,也不让一个越界配置把护盾悄悄关掉。
+ *     ⚠️ 这里**只**守卫「正的有限数」,**不**抄 `MIN_TOWN_RADIUS..MAX_TOWN_RADIUS`:
+ *     区间是配置层的裁决,判定层再判一次就是**第二份标准**。
+ *   - provider **抛错** ⇒ **吞掉并退回默认**(判据 5)。理由:本函数跑在 2Hz 刷怪慢帧里,
+ *     一次抛错会打断**整个**世界步进而**不只是一次刷新**;而半径是内容 / 配置细节,
+ *     它坏掉时应退回出厂值,而不是把进程带崩。
+ */
+export function townSafeRadiusFor(roomId: string): number {
+  const fn = townRadiusProvider;
+  if (fn === null) return TOWN_SAFE_RADIUS;
+  let raw: unknown;
+  try {
+    raw = fn(roomId);
+  } catch {
+    return TOWN_SAFE_RADIUS;
+  }
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return TOWN_SAFE_RADIUS;
+  return raw;
+}
 
 export interface BiomeSpawnConfig {
   /** 软上限:达到后刷新概率减半。 */
@@ -88,6 +160,11 @@ export interface SpawnWorld {
   townCenter(): { x: number; y: number };
   /** 是否夜间。 */
   isNight(): boolean;
+  /**
+   * 本世界的房间号(**可选**)。给了 ⇒ 安全区半径走 per-room 配置(`MODIFY_TOWN`),
+   * 并**立即生效**;不给 ⇒ 与历史行为逐字节一致(默认 `TOWN_SAFE_RADIUS` = 24)。
+   */
+  roomId?(): string;
 }
 
 export interface SpawnContext {
@@ -144,10 +221,13 @@ export function isInsideSafeRadius(
   return dx * dx + dy * dy <= r * r;
 }
 
-/** 城镇安全区判定(世界查询版)。 */
+/** 城镇安全区判定(世界查询版)。半径走 `townSafeRadiusFor`(见文件头「可注入」一节)。 */
 export function inSafeZone(world: SpawnWorld, x: number, y: number): boolean {
   const t = world.townCenter();
-  return isInsideSafeRadius(x, y, t.x, t.y);
+  /* 世界给了房间号 ⇒ 按该房间的配置取半径;没给 ⇒ 默认 24(与历史行为逐字节一致)。 */
+  const roomId = world.roomId?.();
+  const radius = roomId === undefined ? TOWN_SAFE_RADIUS : townSafeRadiusFor(roomId);
+  return isInsideSafeRadius(x, y, t.x, t.y, radius);
 }
 
 /**
@@ -155,7 +235,7 @@ export function inSafeZone(world: SpawnWorld, x: number, y: number): boolean {
  *
  * 判定顺序(短路,成本从低到高):
  *   1. 全局硬上限 200
- *   2. 城镇安全区(24 格)
+ *   2. 城镇安全区(半径来自配置,默认 24 格)
  *   3. 群系硬上限 → 软上限(概率减半)
  *   4. 地形阻挡
  *   5. 光照抑制(夜路砖 / 路灯) —— 最贵,放最后

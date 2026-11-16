@@ -68,6 +68,7 @@ import {
   KITCHEN_TABLE_ID,
   PIZZA_OVEN_ID,
   foodBuffFrom,
+  foodCombatInput,
   tickFoodBuff,
   mergeFoodBuffs,
   type FoodBuff,
@@ -217,6 +218,13 @@ import {
   type EquipmentSnapshot,
   type ReviveResult,
 } from '../combat/revive.ts';
+import {
+  LIVE_BUBBLE_INITIAL,
+  liveBubbleHit,
+  tickLiveBubble,
+  type LiveBubbleState,
+} from '../combat/live_bubble.ts';
+import { PARTY_SCORE_EVENT } from '../party/scoring.ts';
 
 /**
  * 读地面掉落物的物品 ID —— **兼容两种字段名**。
@@ -334,6 +342,11 @@ export interface MaterialApi {
 export interface WorldSimOptions {
   /** 世界边长(格)。默认 64 —— 够放 4×4 个 Chunk,便于调试与测试。 */
   sizeCells?: number;
+  /**
+   * 本房间号 —— 供"按房间查配置"用(今天唯一的用户是**城镇安全区半径**)。
+   * 空串 = 装配层没给 ⇒ 需要房间号的功能退回默认值。见 `spawnWorld().roomId`。
+   */
+  roomId?: string;
   /** 每帧慢帧最多处理多少个流体格。默认取 `FLUID_CELL_BUDGET`。 */
   fluidBudget?: number;
   /** 每帧慢帧是否推进电路泛洪。默认 true。 */
@@ -899,12 +912,19 @@ export class WorldSim {
     cooked: 0, lastItemId: 0, fedTotal: 0, potCount: 0,
   };
 
+  /**
+   * 本房间号(装配层经 `WorldSimOptions.roomId` 给)。空串 = 没给。
+   * ⚠️ 它**只是身份**,不是配置:`spawner` 拿到它之后去问 provider(见 `mobs/spawner.ts`
+   * 的"安全区半径可注入"一节),由装配层决定 provider 是 `modify_town.ts` 的适配器。
+   */
+  roomId = '';
   constructor(opts: WorldSimOptions = {}) {
     this.sizeCells = Math.max(16, Math.trunc(opts.sizeCells ?? 64));
     this.fluidBudget = Math.max(1, Math.trunc(opts.fluidBudget ?? FLUID_CELL_BUDGET));
     this.wiringOn = opts.wiring !== false;
     this.mobsOn = opts.mobs !== false;
     this.biomeName = opts.biome ?? 'MEADOW';
+    this.roomId = opts.roomId ?? '';
     this.spawnBudgetMax = 4;
     this.rng = opts.rng ?? mulberry32(0x5eed);
     /* 战斗随机**独立成一条流** —— 见 `combatRng` 字段注释。
@@ -1926,7 +1946,13 @@ export class WorldSim {
     const level = typeof rawLevel === 'number' && !Number.isNaN(rawLevel)
       ? Math.trunc(rawLevel)
       : 1;
-    const attacker = combatantStats(level, [...wearing]);
+    /* ★ 料理 buff 的**战斗**字段在这里进管线(`atkMul` / `critRate` / `critDmg`)。
+       此前第三参恒缺 ⇒ 只有 `hpFlat` 那条路(`maxHpForLevel`)真的到达玩家。
+       `hpMul` **不臆造**:食物给的是**加值**(`hpFlat`),不是乘区;`allyCount` 属于 731 徽章光环,不是料理。
+       ⚠️ 仍无消费者的:`defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul`
+         —— 见 `docs/TASK-96` 二之六;`muOverride` 还差一个具名默认值导出(否则会退化成硬编码 0.75)。 */
+    const food = this.buffsOf(playerId);
+    const attacker = combatantStats(level, [...wearing], foodCombatInput(food));
     const weaponId = opts.weaponId ?? attacker.flags.weaponId;
     const weapon = weaponId > 0 ? weaponById(weaponId) : null;
 
@@ -2180,6 +2206,15 @@ export class WorldSim {
       });
     }
 
+    /* ★ 赛局计分:把"这次击杀"送进世界侧的**统一入口**(`notePartyEvent`)。
+       归属口径**沿用本方法已有的那条** —— 距击杀点 `SHARE_RADIUS` 内的玩家,
+       不另立"谁补的刀":手册的判据本来就是按距离(见上面那段注释)。 */
+    for (const p of participants) {
+      if (p.distance <= SHARE_RADIUS) {
+        this.notePartyEvent({ kind: PARTY_SCORE_EVENT.CREATURE_KILL, source: p.playerId });
+      }
+    }
+
     const result = settleMobExp(this.killLedger, {
       mobInstanceId: mobId,
       mobLevel: def.level,
@@ -2202,6 +2237,33 @@ export class WorldSim {
     this.killSettleCount += 1;
     this.totalExpGranted += result.total;
     return result;
+  }
+
+  /* ══════════════════ 赛局计分(事件 → 分)的世界侧入口 ══════════════════ */
+
+  /**
+   * 世界侧的**唯一**计分入口:把一件已发生的事实("谁做了什么")送出去。
+   *
+   * ## 为什么是"入口"而不是"直接算分"
+   * 计分规则在 `party/scoring.ts`(纯函数),落账在 `actions/start_party.ts` 的 `addScore`。
+   * `WorldSim` 两边都不该认识(`sim` 依赖 `net/actions` 会形成反向依赖)⇒ 这里只负责
+   * **转发事实**,由装配层(`index.ts`)把 sink 接到"规则 + 落账"那一段。
+   *
+   * ⚠️ 没接 sink ⇒ 事件被丢弃(与"世界侧不知道"等价),判据按"分数不变"断言。
+   */
+  private partyScoreSink: ((ev: { kind: string; source?: string }) => void) | null = null;
+
+  /** 装配层注入计分 sink(幂等:后注入的覆盖先注入的)。 */
+  attachPartyScoreSink(fn: (ev: { kind: string; source?: string }) => void): void {
+    this.partyScoreSink = fn;
+  }
+
+  /**
+   * 报告一件与赛局有关的事实。三个发射点(击杀 / 采集拾取 / 到达目标)
+   * 各处就近调用它 —— 它们各自知道事实,但都不该知道"分数怎么算"。
+   */
+  notePartyEvent(ev: { kind: string; source?: string }): void {
+    this.partyScoreSink?.(ev);
   }
 
   /** 取(必要时新建)玩家成长档案。 */
@@ -2851,6 +2913,26 @@ export class WorldSim {
   private readonly foodBuffs = new Map<string, FoodBuff[]>();
 
   /** 该玩家身上 buff 的合并结果(乘区相乘、加值相加)。只读,不返回内部数组。 */
+  /* ── 活人被困进泡泡(227 的"活人半边")────────────────────────── */
+
+  /** 每个玩家当前的活人泡泡状态(层数 / 剩余困住秒)。**只在这里**存活人泡泡。 */
+  private readonly liveBubbles = new Map<string, LiveBubbleState>();
+
+  /** 只读:该玩家现在的活人泡泡状态(没记录 ⇒ 初始态,**不建记录**)。 */
+  liveBubbleOf(playerId: string): LiveBubbleState {
+    return this.liveBubbles.get(playerId) ?? LIVE_BUBBLE_INITIAL;
+  }
+
+  /** 慢帧:推进所有活人泡泡的困住计时;回到初始态即清记录。 */
+  tickLiveBubbles(): void {
+    const dt = SIM_SLOW_DT;
+    for (const [id, s] of [...this.liveBubbles]) {
+      const next = tickLiveBubble(s, dt);
+      if (next.stacks === 0 && next.trapSec === 0) this.liveBubbles.delete(id);
+      else this.liveBubbles.set(id, next);
+    }
+  }
+
   buffsOf(playerId: string): FoodBuff['statMods'] {
     return mergeFoodBuffs(this.foodBuffs.get(playerId) ?? []);
   }
@@ -2934,15 +3016,32 @@ export class WorldSim {
     }
 
     if (itemId === BUBBLE_GUN_ID) {
+      /* ① 目标是**幽灵泡泡**(倒地中)⇒ 走 `DownedState` 那条既有路径(叠层,满 3 层 `BUBBLED`)。 */
       const d = this.downedStates.get(targetId);
-      if (d === undefined) {
-        return { applied: false, consume: false, reason: '目标不在幽灵泡泡状态(活人泡泡未建模)' };
+      if (d !== undefined) {
+        const out = bubbleGunHit(d);
+        this.downedStates.set(targetId, out.downed);
+        return {
+          applied: true, consume: true, reason: 'ok',
+          effect: { itemId, targetId, trapped: out.trapped, stacks: out.downed.bubbleStacks, live: 0 },
+        };
       }
-      const out = bubbleGunHit(d);
-      this.downedStates.set(targetId, out.downed);
+      /* ② 目标是**活人** ⇒ 走 `combat/live_bubble.ts` 的状态机
+         (手册 §3.7:"对活人连中 3 发 ⇒ 装进大泡泡、随风飘 5 秒")。
+         ⚠️ 不是"同一件事两份实现":`DownedState` **只在倒地期间存在**,活人没有它;
+            两边共享的只有手册里的词与两个常量(常量从 `revive.ts` import,不重抄)。 */
+      const v = this.vitals.get(targetId);
+      if (v === null) {
+        return { applied: false, consume: false, reason: '目标不在这个房间里' };
+      }
+      const out = liveBubbleHit(this.liveBubbleOf(targetId));
+      this.liveBubbles.set(targetId, out.state);
       return {
         applied: true, consume: true, reason: 'ok',
-        effect: { itemId, targetId, trapped: out.trapped, stacks: out.downed.bubbleStacks },
+        effect: {
+          itemId, targetId, trapped: out.trapped, stacks: out.state.stacks,
+          trapSec: out.state.trapSec, live: 1,
+        },
       };
     }
 
@@ -3005,7 +3104,29 @@ export class WorldSim {
    * 施加了什么」暴露成可观测量。没有它,「增益没接」与「接了但这一帧恰好
    * 没人站在房里」从外面看不出区别。
    */
-  lastRoomEffects: { playerId: string; roomKey: string | null; healHp: number; maxHpMul: number; forgeUnlocked: boolean }[] = [];
+  lastRoomEffects: {
+    playerId: string;
+    roomKey: string | null;
+    healHp: number;
+    maxHpMul: number;
+    forgeUnlocked: boolean;
+    /** 本慢帧该玩家**是否正在睡觉**(0/1)。见 `attachSleepSource`。 */
+    sleeping: number;
+  }[] = [];
+
+  /**
+   * 「这个玩家正在睡吗」的世界侧读口 —— 由**装配层**接上(`index.ts` 调 `actions/sleep.ts` 的
+   * `sleepStateOf`),`WorldSim` 自己不 import `net/actions/**`(那会让 sim 依赖 net)。
+   *
+   * ⚠️ **可选**:没接 ⇒ 每条记录写 `sleeping: 0`,即"世界侧不知道"。
+   *   这不是"玩家没睡",而是"没有读者" —— 所以判据要按 0 断言,不要把它读成否定事实。
+   */
+  private sleepSource: ((userId: string) => boolean) | null = null;
+
+  /** 注入睡眠读口(幂等:后注入的覆盖先注入的)。 */
+  attachSleepSource(fn: (userId: string) => boolean): void {
+    this.sleepSource = fn;
+  }
   /**
    * 本慢帧**解锁了锻造**的玩家集合。
    *
@@ -3096,7 +3217,11 @@ export class WorldSim {
       if (r.forgeUnlocked) this.forgeUnlockedIds.add(id);
       else this.forgeUnlockedIds.delete(id);
 
-      out.push({ playerId: id, roomKey: key, healHp: r.healHp, maxHpMul: r.maxHpMul, forgeUnlocked: r.forgeUnlocked });
+      const sleeping = this.sleepSource?.(id) === true ? 1 : 0;
+      out.push({
+        playerId: id, roomKey: key, healHp: r.healHp, maxHpMul: r.maxHpMul,
+        forgeUnlocked: r.forgeUnlocked, sleeping,
+      });
     }
     this.lastRoomEffects = out;
   }
@@ -4234,6 +4359,10 @@ export class WorldSim {
       blocked: (x: number, y: number) => this.grid.objIdAt(x, y) !== 0,
       townCenter: () => ({ x: (this.sizeCells / 2) | 0, y: (this.sizeCells / 2) | 0 }),
       isNight: () => false,
+      /* ★ 房间号喂给刷怪器:它据此向 provider 问「本房间的安全区半径」
+         (此前只有一个常量 `TOWN_SAFE_RADIUS` ⇒ `MODIFY_TOWN` 改了也不生效)。
+         没给房间号(空串)⇒ `spawner` 退回默认常量,与历史逐字一致。 */
+      roomId: () => this.roomId,
     };
   }
 
@@ -4548,6 +4677,8 @@ export class WorldSim {
       /* ── 慢帧 2Hz:料理 buff 计时(`USE_ITEM` 吃下的那一半)──
          放在房间效果之后无依赖;过期即删,所以"吃完过一会儿就没了"是可观察的。 */
       this.tickFoodBuffs();
+      /* ── 慢帧 2Hz:活人泡泡的困住计时(227 的活人半边)── */
+      this.tickLiveBubbles();
 
       /* ── 慢帧 2Hz:幽灵泡泡与救援(task-44)──
          读 `vitals.downed`(VitalsSystem 的瞬时判定),负责其后的持续状态:

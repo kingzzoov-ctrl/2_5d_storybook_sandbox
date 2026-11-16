@@ -21,6 +21,15 @@
  *   也无『谁有权改』的裁决」。本模块补的是**最后一段**(裁决 + 可查记录);
  *   前两段(安全区实体、图腾实体)仍是缺口。
  *
+ * ## ★ 世界侧的**读口**已存在(接线待主线一行)
+ *
+ * `mobs/spawner.ts` 现在导出 `setTownRadiusProvider` / `townSafeRadiusFor`(半径可注入:
+ * 未装 provider ⇒ 仍是默认 `TOWN_SAFE_RADIUS` = 24;非法 / 抛错同样退回 24),本模块对应
+ * 导出**只读**适配器 `townSafeRadiusProvider`(见本文件「适配器」一节)。
+ * ⇒ 缺的只剩**世界侧那一行**:`world_sim.ts` 的 `spawnWorld()` 返回对象里带上
+ * `roomId: () => <本房间号>`,并在装配期 `setTownRadiusProvider(townSafeRadiusProvider)`。
+ * 在这两处接上**之前**,上面那句「改了就生效没有」仍然成立。
+ *
  * ## 为什么状态放在本模块的 per-room Map(而不是 `RoomState`)
  *
  * 与 `actions/sleep.ts` 同一条理由:`ActionContext` 只有一次分派的入参与宿主能力,
@@ -179,6 +188,26 @@ export function townConfigOf(roomId: string): TownConfig {
     updatedBy: cur.updatedBy,
     updatedAtMs: cur.updatedAtMs,
   };
+}
+
+/**
+ * `MODIFY_TOWN` 的 per-room 半径 → `spawner` 的 `TownRadiusProvider` 适配器(**只读**)。
+ *
+ * `townSafeRadiusProvider(roomId) = townConfigOf(roomId).safeRadius`,**不写**任何状态;
+ * 它把本模块的 per-room 半径喂给 `spawner.setTownRadiusProvider` —— 于是世界侧的
+ * 「安全区多大」第一次**真的**由 `MODIFY_TOWN` 决定(而不是 spawner 那个常量)。
+ *
+ * **谁调它**(世界侧接线,主线做;本模块**不自己**调 —— 那会让每个 import 本模块的
+ * 测试都拧上全局插槽,`spawner` 判据里「未装 provider ⇒ 默认 24」就再也测不到):
+ * ```ts
+ *   // 装配期一次(例如 server/src/index.ts 的 assemble 或启动引导里):
+ *   setTownRadiusProvider(townSafeRadiusProvider);
+ *   // 并让 world_sim.ts 的 spawnWorld() 返回对象带上 roomId:
+ *   //   roomId: () => <本房间号>
+ * ```
+ */
+export function townSafeRadiusProvider(roomId: string): number {
+  return townConfigOf(roomId).safeRadius;
 }
 
 /* ═══════════════════════ 2. 报文参数 ═══════════════════════ */

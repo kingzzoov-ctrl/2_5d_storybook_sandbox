@@ -27,7 +27,7 @@ import { assemble } from '../server/src/index.ts';
 import { RoomAction } from '../server/src/net/room.ts';
 import type { WorldSim } from '../server/src/sim/world_sim.ts';
 import { FOOD_BY_ID, cookSoup } from '../server/src/combat/cooking.ts';
-import { foodBuffFrom } from '../server/src/combat/cooking.ts';
+import { foodBuffFrom, foodCombatInput } from '../server/src/combat/cooking.ts';
 
 /** 733 复苏天使羽毛笔 / 227 泡泡连发水枪 / 602 最大生命 +30 的料理。 */
 const FEATHER = 733;
@@ -286,6 +286,72 @@ test('FND39-10 同一目标重复投羽毛笔 ⇒ 第二次**明确拒绝**(已�
   eq(second.ok, false, '★ 第二次必须被拒(目标已经不是幽灵泡泡)');
   eq(second.kind, 'INVALID', `应是 INVALID(kind=${second.kind})`);
   eq(total.authoritativeItemTotal('p1'), t0 - 1, '★ 只扣了 1 件(第一次),不是 2 件');
+});
+
+test('FND39-11 `foodCombatInput` 把两套约定换算对(中性 = 无副作用)', () => {
+  const neutral = foodCombatInput({
+    atkMul: 1, hpFlat: 0, defFlat: 0, moveMul: 1, critRate: 0, critDmg: 1,
+    gravityMul: 1, muOverride: 0, jumpMul: 1, gatherMul: 1, expMul: 1,
+  });
+  eq(neutral.atkMul, 1, '乘区中性值原样传(1.0)');
+  eq(neutral.critRate, 0, '加值中性值原样传(0)');
+  eq(neutral.critDmg, 0, '★ 爆伤必须换算成**加值**中性 0 —— 直接传 1.0 等于白送 +100% 爆伤');
+});
+
+test('FND39-12 料理爆伤 ×1.5 ⇒ `BuffInput` 得 +0.5(不是 1.5)', () => {
+  const bumped = foodCombatInput({
+    atkMul: 1.25, hpFlat: 0, defFlat: 0, moveMul: 1, critRate: 0.1, critDmg: 1.5,
+    gravityMul: 1, muOverride: 0, jumpMul: 1, gatherMul: 1, expMul: 1,
+  });
+  eq(bumped.atkMul, 1.25, '攻击乘区直接传');
+  eq(bumped.critRate, 0.1, '暴击率是加值,直接传');
+  eq(bumped.critDmg, 0.5, '★ 乘区 1.5 ⇒ 加值 +0.5');
+});
+
+test('FND39-13 只有 hpFlat 的料理(602)⇒ **战斗输入保持中性**(没有误加乘区)', () => {
+  const r = makeRoom();
+  const out = disp(r.rt, { itemId: FOOD_HP });
+  eq(out.kind, 'OK', '吃下 602');
+
+  const c = foodCombatInput(r.sim.buffsOf('p1'));
+  eq(c.atkMul, 1, '★ 602 不给攻击乘区');
+  eq(c.critRate, 0, '★ 602 不给暴击率');
+  eq(c.critDmg, 0, '★ 602 不给爆伤');
+});
+
+test('FND39-14 ★ 227 的**活人半边**:对活人连中 3 发 ⇒ 困住 5 秒(前两发不困)', () => {
+  const r = makeRoom();
+  /* p2 **不倒地** —— 这一条测的就是"活人"那一半(倒地那一半见 FND39-8)。 */
+  place(r.sim, 'p1', 5);
+  place(r.sim, 'p2', 6);
+  eq(r.sim.vitals.get('p2')?.downed, false, '前置:p2 是活人');
+
+  const hits = [1, 2, 3].map(() =>
+    r.rt.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: BUBBLE_GUN, targetId: 'p2' }));
+
+  eq(hits[0].kind, 'OK', '第 1 发应成功');
+  eq(eff(hits[0]).trapped, false, '第 1 发不该困住');
+  eq(eff(hits[1]).trapped, false, '第 2 发不该困住');
+  eq(hits[2].kind, 'OK', '第 3 发应成功');
+  eq(eff(hits[2]).trapped, true, '★ 第 3 发应困住');
+  eq(eff(hits[2]).trapSec, 5, '★ 困住 5 秒(手册字面量)');
+  eq(eff(hits[2]).live, 1, '★ 走的是**活人**那条路径(不是倒地那条)');
+  eq(r.sim.liveBubbleOf('p2').trapSec, 5, '世界侧状态也应记着 5 秒');
+});
+
+test('FND39-15 活人困住会按时长解开(慢帧推进)', () => {
+  const r = makeRoom();
+  place(r.sim, 'p1', 5);
+  place(r.sim, 'p2', 6);
+  for (let i = 0; i < 3; i += 1) {
+    r.rt.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: BUBBLE_GUN, targetId: 'p2' });
+  }
+  ok(r.sim.liveBubbleOf('p2').trapSec > 0, '前置:已困住');
+
+  /* 慢帧 0.5s / 次 ⇒ 推 5 秒 + 一点余量。 */
+  r.sim.advance(30 * 6);
+  eq(r.sim.liveBubbleOf('p2').trapSec, 0, '★ 5 秒之后应解开');
+  eq(r.sim.liveBubbleOf('p2').stacks, 0, '层数也回到初始');
 });
 
 report('WS-FND-39');
