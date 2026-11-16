@@ -84,4 +84,33 @@ test('FND37-6 两条路的解析各调一次不互相影响(无隐藏单例)', (
   eq(first.db, second.db, '库的解析结果应稳定(今天都是 null)');
 });
 
+test('FND37-7 `PI_DB_PATH` 是**显式部署开关**:给了就开库,不给仍是 null', () => {
+  const before = process.env.PI_DB_PATH;
+  try {
+    delete process.env.PI_DB_PATH;
+    eq(resolveAssembly().db, null, '没设环境变量 ⇒ 仍是 null(与今天逐字一致)');
+
+    process.env.PI_DB_PATH = ':memory:';
+    const on = resolveAssembly();
+    ok(on.db !== null, '★ 设了 `PI_DB_PATH` 就必须真的开库 —— 否则这开关是摆设');
+    ok(on.host !== null, '世界与库同一个解析,不能只给一个');
+  } finally {
+    if (before === undefined) delete process.env.PI_DB_PATH;
+    else process.env.PI_DB_PATH = before;
+  }
+});
+
+test('FND37-8 显式 `db`/`dbPath` 优先于环境变量(顺序不许反)', () => {
+  const before = process.env.PI_DB_PATH;
+  try {
+    process.env.PI_DB_PATH = ':memory:';
+    /* 显式 `db: null`(键在)必须赢过环境变量 —— 否则负对照入口被环境静默推翻。 */
+    eq(resolveRoomDb({ clock: CLOCK, db: null } as unknown as NetPersistRoomOptions), null,
+      '★ 显式 null 优先于 PI_DB_PATH');
+  } finally {
+    if (before === undefined) delete process.env.PI_DB_PATH;
+    else process.env.PI_DB_PATH = before;
+  }
+});
+
 report('WS-FND-37');

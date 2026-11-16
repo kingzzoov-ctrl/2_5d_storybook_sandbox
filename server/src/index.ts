@@ -290,7 +290,21 @@ function resolveDb(deps: AssembleDeps): DbLike | null {
   if (typeof deps.dbPath === 'string' && deps.dbPath !== '') {
     return openNodeSqlite(deps.dbPath);
   }
-  /* 3 两者都没有 ⇒ 纯内存(现状:不落盘)。 */
+  /* 3 **部署开关**:`PI_DB_PATH`。
+   *
+   * 为什么要有这一条:在此之前,`assemble()` 与 B 路(`net/room.colyseus.ts`)在生产
+   * 都拿不到库 ⇒ 「落盘 / 读档」两条路**永不执行**,而写代码的人以为它们在跑。
+   * 但"默认往磁盘写"又不是我能替 owner 定的(存哪?谁清?)。
+   *
+   * ⇒ 折中且**显式**:默认仍然 `null`(与今天逐字一致),只有环境变量给了路径才开库。
+   *   于是"生产能落盘"是一条**可开关、可验证**的行为,不是某个默认值悄悄决定的。
+   *   `PI_DB_PATH=:memory:` 也能用(内存库:路径会真的执行,但不留文件)。
+   */
+  const fromEnv = typeof process !== 'undefined' ? process.env?.PI_DB_PATH : undefined;
+  if (typeof fromEnv === 'string' && fromEnv !== '') {
+    return openNodeSqlite(fromEnv);
+  }
+  /* 4 都没有 ⇒ 纯内存(现状:不落盘)。 */
   return null;
 }
 

@@ -24,7 +24,7 @@
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
 | 层 | 服务端 `server/src` **79** `.ts` · 客户端 `client/src` **33** · 共享 `shared` **10** ⇒ **生产 .ts 合计 122** |
-| 测试 | `tests/*.test.ts` **50** 个套件 |
+| 测试 | `tests/*.test.ts` **52** 个套件 |
 | 工具 | `scripts/*.ts` **31** 个 |
 | 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
 | 门禁 | `scripts/verify.ts`(6230 行) |
@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1687 条 / 50 套件** | WS 1014 条 / 14 套件 · 基座 FND 673 条 / 36 套件 |
+| 用例 | **1708 条 / 52 套件** | WS 1014 条 / 14 套件 · 基座 FND 694 条 / 38 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,7 +387,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-3b05347afdba  README.md
+9d6601654dd6  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
