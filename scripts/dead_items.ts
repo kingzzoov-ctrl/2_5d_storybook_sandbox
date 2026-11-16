@@ -51,25 +51,27 @@ export const DEAD_ITEMS: readonly {
     name: '复苏天使羽毛笔',
     implemented: false,
     consumer: null,
-    reason: '复活机制本身在岗(`server/src/combat/revive.ts` 的倒地/宽限),'
-      + '但这件道具的**使用入口**(投掷命中 6 格内的幽灵泡泡队友 ⇒ 立即复活 + 3 秒无敌)没有实现,'
-      + '也没有投掷物命中队友的判定点',
+    reason: '使用入口**已接**(`USE_ITEM` → `combat/revive.ts` 的 `featherRevive`,判据 `WS-FND-39` FND39-3):'
+      + '6 格内命中幽灵泡泡队友 ⇒ 满血复活 + 3 秒无敌;仍缺:**投掷弹道** —— 现在是"点目标即生效",'
+      + '没有飞行物与落点判定(所以隔墙也能用)',
   },
   {
     id: 435,
     name: '四色队伍出生复活旗',
     implemented: false,
     consumer: null,
-    reason: '缺**队伍归属(红/蓝/黄/绿)**与旗帜范围内的复活点判定;'
-      + '`PARTY_MODES`(手册 §6.3)已定义四色模式,但竞技队伍状态机未实装',
+    reason: '旗**范围复活**已接(`WorldSim.tickDowned` 的旗优先半血复活,判据 `WS-FND-49` FND49-9/10);'
+      + '仍缺:**四色队伍归属(红/蓝/黄/绿)**与"呼救"流程 —— `PARTY_MODES`(手册 §6.3)已定义四色模式,'
+      + '但竞技队伍状态机未实装',
   },
   {
     id: 227,
     name: '泡泡连发水枪',
     implemented: false,
     consumer: null,
-    reason: '缺①水枪弹道对**高炉火苗 / 火灵护盾**的灭火判定 ②把队友装进大泡泡的抓取效果;'
-      + '`prank` 家族有免疫与玩具的骨架,但没有这条弹道消费点',
+    reason: '两个半边都**已接**:活人半边(`combat/live_bubble.ts`,连中 3 发装泡泡)与器件半边'
+      + '(`USE_ITEM` + `extinguishDeviceByHand` 浇灭料理站炉火),判据 `WS-FND-49` FND49-11 / `WS-FND-52`;'
+      + '仍缺:水枪弹道对**高炉火苗**(coop 工位槽位没有世界坐标)与**火灵护盾**的判定',
   },
 ];
 

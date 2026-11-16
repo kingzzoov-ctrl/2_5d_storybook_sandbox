@@ -25,9 +25,9 @@
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
 | 层 | 服务端 `server/src` **81** `.ts` · 客户端 `client/src` **34** · 共享 `shared` **10** ⇒ **生产 .ts 合计 125** |
 | 测试 | `tests/*.test.ts` **66** 个套件 |
-| 工具 | `scripts/*.ts` **31** 个 |
-| 文档 | `docs/` **77** 个 `.md` + 3 个 `.png` = 80 文件 / **2.67 MB** |
-| 门禁 | `scripts/verify.ts`(6230 行) |
+| 工具 | `scripts/*.ts` **35** 个 |
+| 文档 | `docs/` **83** 个 `.md` + 3 个 `.png` = 86 文件 / **2.83 MB** |
+| 门禁 | `scripts/verify.ts`(6635 行) |
 
 ### ★ 三条不许违反的语法约束(这不是风格问题,是能不能跑的问题)
 
@@ -113,7 +113,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 > ★ 教训不是"抄错了",而是:**手抄的数字不会因为被抄进表里就变成事实**。
 > ⇒ 现在两张数字表(本节 §三、§九 的 sha256 表)都由 `node scripts/verify.ts --docs`
 >   当场重算并比对;局部口径下算不出的行会明说「**未校验**(不是通过)」,不会静默变绿。
-**可达性 91/100 的 9 条不可达**:5 条欠账 + 4 条非欠账(gate-only 2 + 差集 2)。
+**可达性 116/125 的 9 条不可达**:5 条欠账 + 4 条非欠账(gate-only 2 + 差集 2)。
 
 ---
 
@@ -122,32 +122,32 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 ```
 2_5d_sandbox/
 ├── README.md            唯一入口 · 所有「N/N」自称都在这里(受门禁交叉校验)
-├── package.json         27 个 npm scripts · 零运行时依赖
+├── package.json         28 个 npm scripts · 零运行时依赖
 ├── tsconfig.json  vite.config.ts
-├── server/src/          61 .ts —— 服务端(权威侧)
+├── server/src/          81 .ts —— 服务端(权威侧)
 │   ├── sim/             世界模拟主体(3):world_sim.ts ⚠️ 承重文件
 │   ├── world/  physics/ 地形 / 20Hz 刚体
 │   ├── build/  wiring/  建造 · 接线层(3)
-│   ├── combat/  vitals / revive / progression(6)
+│   ├── combat/  vitals / revive / progression(7)
 │   ├── mobs/  bosses/   生物 AI / Boss(7 + 4)
 │   ├── alchemy/  coop/  party/  prank/  social/  各子系统
-│   ├── net/             网络层(6)—— ws_server.ts · room.ts · room.colyseus.ts …
+│   ├── net/             网络层(25)—— ws_server.ts · room.ts · room.colyseus.ts ...
 │   ├── content/  db/  events/  rooms/  基础设施
-├── client/src/          27 .ts —— 客户端(渲染 + 预测)
-│   ├── stage/(10) three/(4) ui/(7) net/(4)
+├── client/src/          34 .ts —— 客户端(渲染 + 预测)
+│   ├── stage/(10) three/(4) ui/(7) net/(11)
 ├── shared/              10 .ts —— 两端共享契约
 │   ├── types/           tile · entities · physics · wire · alchemy
 │   ├── constants/       items · mobs · bosses
 │   ├── net/delta.ts     协议编解码
 │   └── testing/harness.ts  ★ 测试基座(见第六节,必须理解它是 **throw 式**)
-├── tests/               28 .test.ts
-├── scripts/             31 .ts —— 门禁与审计器
-├── docs/                75 .md + 3 .png / 2.64 MB
+├── tests/               66 .test.ts
+├── scripts/             35 .ts —— 门禁与审计器
+├── docs/                83 .md + 3 .png / 2.83 MB
 │   ├── PROGRESS.md      443 KB ★ 陷阱库(全仓最重要的单份文档)
 │   ├── CHANGE_REQUESTS.md 187 KB · ARCH-GAPS.md 90 KB
 │   ├── LEAD-PLAN.md     当前计划与快照 ★ 接手先读这份 + PROGRESS
 │   ├── WS-01..14-*.md   14 份子系统设计(每份 ≥10 节 / ≥2000 字符,门禁强制)
-│   └── 其余 61 份        任务报告 / 审计 / 契约
+│   └── 其余 65 份        任务报告 / 审计 / 契约
 └── _*                   临时物,**不参与门禁,但不要随手删**(见第五节)
 ```
 
@@ -387,12 +387,12 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-8b0538babbd3  README.md
+d4fee24dd70a  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-b9d1ac06813d  docs/COMPLETION-CRITERIA.md
+905bb9734d24  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。

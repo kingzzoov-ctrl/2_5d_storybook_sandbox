@@ -180,18 +180,23 @@
 ### 二之九、2026-11-16 **第二批**(C3 灭火 / 真网关 / 相机平滑 / 三处更正)
 
 | 事项 | 落点 | 判据 |
-| **C3 灭火半边**:227 对**器件** | `USE_ITEM` 新增 `targetDeviceId`(器件目标与玩家目标**互斥**);`WorldSim.useItem` 的 0 号分支 → `extinguishDeviceByHand`(227 / 212,`EXTINGUISH_RADIUS` 3 格内浇灭料理站炉火);`deviceTileOf` 把「图上第一格」的扫描收成**一处**(出锅落点也改用它) | `WS-FND-52`(10 条;三处注入能红) |
-| **C3 灭火半边**:227 对**器件** | `USE_ITEM` 新增 `targetDeviceId`(器件目标与玩家目标**互斥`);`WorldSim.useItem` 的 0 号分支 → `extinguishDeviceByHand`(227 / 212,`EXTINGUISH_RADIUS` 3 格内浇灭料理站炉火);`deviceTileOf` 把「图上第一格」的扫描收成**一处**(出锅落点也改用它) | `WS-FND-52`(10 条;三处注入能红) |
+|---|---|---|
+| **C3 灭火半边**:227 对**器件** | `USE_ITEM` 新增 `targetDeviceId`;**两个目标同时给 ⇒ 动作层直接拒**(`INVALID`,不静默挑一个执行);`WorldSim.useItem` 的 0 号分支 → `extinguishDeviceByHand`(227 / 212,`EXTINGUISH_RADIUS` 3 格内浇灭料理站炉火);`deviceTileOf` 把「图上第一格」的扫描收成**一处**(出锅落点也改用它) | `WS-FND-52`(10 条;四处注入能红) |
 | **US2 真网关** | 不动生产码:测试用真 `Server.listen(0)` + 生产注册助手 + `matchMaker.createRoom`,证明 `createHost()/wireHost()` 在网关路径生效 | `WS-FND-50`(7 条;注入 `host: null` 红 4 条) |
 | **客户端相机不再硬跳变** | `client/src/net/height_placement.ts` 的 `stepCameraHeight`(纯函数,α 与 dt 挂钩)+ `three/boot.ts` 每帧推进(目标 / 当下分开命名) | `WS-FND-51`(7 条;两种改坏各红 2–3 条) |
 
-**三处更正(文档与实现相反,改的是描述不是行为)**:
+**五处更正(前四条改的是描述,第五条改的是行为)**:
 
 1 `muOverride` 不缺默认值 —— 中性值现在有名字(`combat/cooking.ts` 的 `MU_OVERRIDE_NONE`),
   地板侧默认在 `world/chunk.ts`(`DEFAULT_MU` / `muOfSlot`);**缺的是接线口径**(玩法裁决);
 2 `rooms/effects.ts` / `combat/vitals.ts` / `world_sim.ts::effectiveMaxHp` 三处 docblock
   原写「倍率不落 `vitals.maxHp`、基准值留在那里」—— 与本版实现相反,已逐处写明更正与理由;
 3 本文件 `二之六` 的 `muOverride` 行(见上一节末尾)同步改正。
+4 `net/actions/use_item.ts` 的**执序 docblock** 上一版写「判定 → 扣减 → 写回(**不是**先扣后退)」,
+  与 A3 之后的代码**相反**(代码就是先扣,世界侧说没生效再退回)—— 已改写并写明历史;
+5 **两个目标同时给** 此前只在世界侧"按分支先后静默忽略 `targetId`" ⇒ 现在**报文层直接拒**
+  (`INVALID`,理由指认 `targetId` / `targetDeviceId` 互斥,且拒绝发生在扣道具之前);
+  `WS-FND-52` FND52-10 同时钉住"报文层拒"与"世界侧兜底(器件优先、不碰玩家)"两道。
 
 **仍未做(逐条给卡点,不假装已支持)**:
 

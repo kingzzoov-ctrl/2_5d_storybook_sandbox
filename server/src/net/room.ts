@@ -910,7 +910,8 @@ export interface ActionPayload {
    * `USE_ITEM`:目标**器件**(料理站等设备 id)。
    *
    * 与 `targetId`(玩家)是**互斥**的两种报文形态:器件目标走"浇灭炉火",
-   * 玩家目标走"救人 / 困人 / 吃 buff"。世界侧见 `targetDeviceId` 就**不再看** `targetId`。
+   * 玩家目标走"救人 / 困人 / 吃 buff"。**两者同时给出 ⇒ 动作层直接拒(`INVALID`)**
+   * (`net/actions/use_item.ts`);世界侧另有一道兜底:见 `targetDeviceId` 就不读 `targetId`。
    * 器件在内容表里是**物件 id**(506 汤锅 / 507 切菜台 / 508 披萨炉),不是玩家 id。
    */
   targetDeviceId?: number;

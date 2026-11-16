@@ -193,15 +193,31 @@ test('FND52-9 报文字段校验:`targetDeviceId` 不是正整数 ⇒ 当场 INV
   eq(fireOut(s.sim, SOUP_POT), false, '★ 三次非法报文都不该碰到世界');
 });
 
-test('FND52-10 ★ 世界侧一手就能浇灭,且器件目标**压过**玩家目标(互斥)', () => {
+test('FND52-10 ★ 两个目标**同时给** ⇒ 动作层当场拒(不静默挑一个执行),世界侧另有兜底', () => {
   const s = NEAR(10);
-  /* 同一份报文里两个目标都给:器件优先 —— 不去碰 p2,只灭炉火。 */
-  const out = s.sim.useItem('p1', { itemId: BUBBLE_GUN, targetId: 'p2', targetDeviceId: SOUP_POT });
+  const total = totalOf(s.rt);
 
-  eq(out.applied, true, `世界侧应生效(reason=${out.reason})`);
-  eq(out.consume, true, '生效 ⇒ 该扣');
-  eq(eff(out).deviceId, 506, '走的是器件那条路');
-  ok(!('targetId' in eff(out)), '★ 回执里不该出现玩家目标(说明没走救人/困人那条)');
+  /* ① 报文层:同一份请求里两个意图都给 ⇒ 必须**拒**,不是"挑器件那个执行、回执看起来成功"。
+     审查抓到过这一条:此前只有世界侧按分支先后"静默忽略 targetId"。 */
+  const out = disp(s.rt, { itemId: BUBBLE_GUN, targetId: 'p2', targetDeviceId: SOUP_POT });
+
+  eq(out.ok, false, '两个目标同时给必须被拒');
+  eq(out.kind, 'INVALID', '应是 INVALID(不是 NOT_IMPLEMENTED)');
+  ok(why(out).includes('互斥'), `理由要指认两者互斥(实测:${why(out)})`);
+  ok(out.effect === undefined, '被拒就没有 effect(也就没有 consumed)');
+  eq(totalOf(s.rt), total, '★ 拒绝路径不许扣道具(拒绝在扣减之前)');
+  eq(fireOut(s.sim, SOUP_POT), false, '★ 拒绝路径不许碰到世界(炉火不变)');
+  eq(s.sim.liveBubbleOf('p2').stacks, 0, '★ p2 也不该被叠泡泡');
+
+  /* ② 世界侧兜底:直接调 `WorldSim.useItem` 两个都给 ⇒ 器件优先、不碰玩家。
+     这一道留在世界侧是**有意**的:两道各防一种改坏(前者防"客户端多报一个字段改变语义",
+     后者防"将来有人只改一处 ⇒ 世界侧悄悄按玩家处理")。 */
+  const direct = s.sim.useItem('p1', { itemId: BUBBLE_GUN, targetId: 'p2', targetDeviceId: SOUP_POT });
+
+  eq(direct.applied, true, `世界侧应生效(reason=${direct.reason})`);
+  eq(direct.consume, true, '生效 ⇒ 该扣');
+  eq(eff(direct).deviceId, 506, '走的是器件那条路');
+  ok(!('targetId' in eff(direct)), '★ 回执里不该出现玩家目标(说明没走救人/困人那条)');
   eq(fireOut(s.sim, SOUP_POT), true, '★ 炉火真的灭了');
   eq(s.sim.liveBubbleOf('p2').stacks, 0, '★ p2 不该被顺手叠上一层泡泡(器件目标没被当成玩家)');
 });

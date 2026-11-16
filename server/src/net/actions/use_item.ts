@@ -7,25 +7,33 @@
  * (`combat/revive.ts` 的 `featherRevive` / `bubbleGunHit`、`combat/cooking.ts` 的 buff 链路),
  * 但玩家触发不到 —— 缺的正是这个动词(`docs/TASK-99-use-item-verb.md`)。
  *
- * ## 执序:判定 → 扣减 → 写回(**不是**"先扣后退")
+ * ## 执序:**先扣后生效**(不是"先生效后扣",也不是"先扣后退")
  *
  * 1 权限闸(**第一行**,拒绝路径零副作用);
- * 2 报文校验:`itemId` 必须是正整数;
- * 3 交给世界:`ctx.host.useItem(...)` —— 语义判断**只在世界侧一处**(它在 `world_sim.ts`);
- * 4 **只有** `consume === true` 才扣 1 件(走 `applyInventory` 的负 delta);
+ * 2 报文校验:`itemId` 必须是正整数,`targetId` 与 `targetDeviceId` **不许同时给**(见下);
+ * 3 **先扣 1 件**(`applyInventory` 的负 delta)—— 扣不动 ⇒ 世界侧**根本没跑**;
+ * 4 交给世界:`ctx.host.useItem(...)` —— 语义判断**只在世界侧一处**(它在 `world_sim.ts`);
  * 5 回执:成功带 `effect`(世界侧给的标量表 + `consumed`)。
  *
- * ⚠️ 为什么**不**照抄 `placeBlock` 的"先扣后退":道具消耗**语义上依赖结果**
- *   (733 超距不该扣),而 `placeBlock` 是"先占格再校验"能自洽。照抄会让
- *   "超距也扣掉一件羽毛笔" —— 那正是 `TASK-98` 要避免的形态。
- *   `tests/WS-FND-39` 里有一条断言直接钉这个方向。
+ * ## ⚠️ 为什么是"先扣后生效",以及它**曾经**是反的
+ *
+ * 第一版是"先生效后扣":扣失败时世界侧的改动**已经落地** ⇒ 没有 733 的玩家也能无限救人、
+ * 没有料理也能无限叠 `hpFlat`(审查 A3)。改成先扣之后,白嫖被堵在门口。
+ * 反过来(扣成功而世界侧未生效 / 无需扣)⇒ **退回**:补偿走本仓既定的
+ * `grantItemSource` + 正向 ops 机制,不是就地撤销。
+ *
+ * ⚠️ 本文**上一版**写着「执序:判定 → 扣减 → 写回(**不是**"先扣后退")」并解释
+ *   "为什么**不**照抄 `placeBlock` 的先扣后退" —— 那是 A3 之前的实现,与现在的代码**相反**。
+ *   现在的顺序**就是**先扣后退(扣成功 → 世界侧说没生效 ⇒ 退回),区别在于:
+ *   退回是**异常路径**(世界侧拒绝),不是正常路径的第二步。
  *
  * ## 两种目标(`targetId` / `targetDeviceId`)
  *
  * `targetId` = **玩家**(救队友 / 困人 / 吃 buff 的对象);`targetDeviceId` = **器件**
  * (227 水枪 / 212 大铁铲 浇灭料理站炉火 —— C3 的灭火半边)。
- * 二者**互斥**:世界侧见到 `targetDeviceId` 就**不再读** `targetId`,
- * 免得"对着锅喊队友名字"两边都算。
+ * 二者**互斥**:**同时给出 ⇒ 报文层直接拒(`INVALID`),不进世界**。
+ * (世界侧另有一道兜底:见到 `targetDeviceId` 就不再读 `targetId`。两道都要 ——
+ *  前者防"客户端悄悄多报一个字段改变语义",后者防"将来有人只改一处"。)
  *
  * ## ⚠️ 不校验"该玩家真的有这一件"
  *
@@ -65,6 +73,17 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
   const targetDeviceId = p.targetDeviceId === undefined ? undefined : positiveInt(p.targetDeviceId);
   if (p.targetDeviceId !== undefined && targetDeviceId === null) {
     return { ok: false, kind: 'INVALID', reason: `${ctx.action} 的 targetDeviceId 需要正整数(器件 id)` };
+  }
+  /* ★ 两个目标**不许同时给**(审查:`use_item.ts` 的互斥此前只在世界侧按分支先后"静默忽略"
+     `targetId`)。报文层直接拒:客户端多报一个字段就能改变语义,是"静默忽略"最坏的一类 ——
+     请求里明写着两个意图,服务端挑一个执行,回执看起来却是成功的。
+     ⇒ 拒绝理由要**指认字段**,让调用方能改;而且要**在扣道具之前**(拒绝路径不碰背包)。 */
+  if (targetId !== undefined && targetDeviceId !== undefined) {
+    return {
+      ok: false,
+      kind: 'INVALID',
+      reason: `${ctx.action} 的 targetId 与 targetDeviceId 互斥(只能选一个)`,
+    };
   }
 
   /* 3 没有世界源 ⇒ 显式说出来(与 `material.ts` 同一契约,不静默成功)。 */

@@ -43,11 +43,6 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 |---|---|
 | `W A S D` / 方向键 | 移动(客户端本地预测 → 服务端权威校正) |
 | **鼠标左键** / **空格** | **攻击最近的那只生物**(距离与伤害都由服务端判) |
-| 单指拖动(触屏)| 平移视角 |
-| 键 | 作用 |
-|---|---|
-| `W A S D` / 方向键 | 移动(客户端本地预测 → 服务端权威校正) |
-| **鼠标左键** / **空格** | **攻击最近的那只生物**(距离与伤害都由服务端判) |
 | **`Q`** | **放置**:把「最近碰过的那件」放到**面前**那格 |
 | **`E`** | **拆除**:拆**面前**那格,拆下来的东西进背包 |
 | **`G`** | **丢下**:把「最近碰过的那件」丢在**脚下**(1 件) |
@@ -74,8 +69,9 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
   撞成同一个键。所以刷怪**按物种去重**,`BIOME_SPAWN.hardCap`(草甸 14 只)目前达不到 ——
   实测 96×96 世界预热 2 分钟后约 5-8 只。要「一片草甸上十几只」必须先拆实例 id 与物种 id,
   那是独立一件(见 `server/src/sim/world_sim.ts` 的 `trySpawnOne` 注释)。
-- **建 / 挖 / 拾取 / 合成**:22 个 `RoomAction` 里 17 个没有执行层,
-  逐条缺什么写在 [`docs/TASK-96-action-landing-gaps.md`](docs/TASK-96-action-landing-gaps.md)。
+- **动作执行层**:23 个 `RoomAction` 里 **21 个已接线**;`MOVE` / `ATTACK` 两个**刻意**不进
+  `action` 通道(走专用报文,保住「绝对位置 + tick」的坐标契约)。逐条状态与仍未做的三处
+  写在 [`docs/TASK-96-action-landing-gaps.md`](docs/TASK-96-action-landing-gaps.md)。
 - **生物 FSM 状态不下发**:`WildlifeState.fsm` 是 wire 上的 `uint8`,而模拟层的
   `MobFsmState` 是字符串枚举,两者之间**没有定义过映射表** ⇒ 快照里恒为 0(wire 默认值),
   而不是硬塞一个没有含义的编号。客户端目前不需要它。
