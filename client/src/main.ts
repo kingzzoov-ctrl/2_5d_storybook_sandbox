@@ -35,6 +35,11 @@ import { LocalPredictor } from './net/predictor.ts';
 import {
   AnalogStick, JOYSTICK_DEAD_ZONE, STICK_RADIUS_PX, mergeCmd,
 } from './net/joystick.ts';
+/* ★ 2026-11-16(D-08 第二步):把摇杆**画出来**。
+   判定在 `net/joystick.ts`,绘制在 `ui/joystick_ui.ts`(纯 DOM、零 three),
+   本文件只剩三根线:落指 → `show`、拖动 → `moveTo`、抬手/取消 → `hide`。
+   —— 只画不接 = 玩家仍然看不见手柄,而那**不会**让任何断言变红。 */
+import { createJoystickUI } from './ui/joystick_ui.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
 import { DT } from '../../shared/types/physics.ts';
 
@@ -279,23 +284,43 @@ function main(): void {
      ⚠️ 只跟**触屏/笔**(`pointerType === 'mouse'` 直接 return):
         鼠标左键仍是攻击(`attackNearest`)—— 一条输入不该同时干两件事。 */
   const stick = new AnalogStick({ maxRadius: STICK_RADIUS_PX });
+  /* ★ D-08 第二步:同一根手指,逻辑进 `stick`,视觉进 `stickUI`。
+     两者共用 `stick.origin`(基点只在一个地方记)⇒ 不会出现"帽画在 A 点、判定从 B 点算"。
+     挂到 `#app`(而不是 body):那一层是 `position:relative`,与画布同一个坐标系。 */
+  const stickUI = createJoystickUI();
+  stickUI.mount(root);
   let stickPointerId: number | null = null;
   const onStickDown = (ev: PointerEvent): void => {
-    if (ev.pointerType === 'mouse') return;
+    if (ev.pointerType === 'mouse') return; /* 桌面用 WASD:鼠标左键是攻击,不弹摇杆 */
     if (stickPointerId !== null) return; /* 只跟第一根手指:第二根按下不该改方向 */
     stickPointerId = ev.pointerId;
     stick.begin(ev.clientX, ev.clientY);
+    /* 手柄出现在**手指底下**(浮动摇杆):手机上的落点由拇指决定,
+       固定角落会逼玩家先去找手柄。 */
+    stickUI.show(ev.clientX, ev.clientY);
+    /* 触屏的 `pointerdown` 之后浏览器还会补发一次**兼容的** `mousedown`,
+       而 `attackNearest` 挂在 `mousedown` 上 ⇒ 表现是「想走路,结果挥了一刀」。
+       挡掉它:这一下是移动输入,不是攻击输入(鼠标在上面的 `return` 里已经走了)。
+       ⚠️ 不挡 `pointermove`/`pointerup`,画布的拖动与 UI 命中都还在指针事件上。 */
+    ev.preventDefault();
   };
   const onStickMove = (ev: PointerEvent): void => {
     if (stickPointerId !== ev.pointerId) return;
     stick.moveTo(ev.clientX, ev.clientY);
+    /* 帽的位移**从基点算**,基点只有一个出处(`stick.origin`)⇒ 视觉与判定用同一对坐标。
+       帽的夹取/死区在 `ui/joystick_ui.ts` 的 `knobOffset`(与 `stickVector` 同口径)。 */
+    const o = stick.origin;
+    stickUI.moveTo(ev.clientX - o.x, ev.clientY - o.y);
   };
   /* `pointercancel` 与 `pointerup` **同一处理**:系统手势 / 来电会发 cancel,
-     漏了它的表现是「角色一直朝最后方向走」(与 `input.clear()` 失焦那个病同形)。 */
+     漏了它的表现是「角色一直朝最后方向走」(与 `input.clear()` 失焦那个病同形)。
+     ★ 摇杆视觉必须走**同一条**出口:漏掉的话来电之后屏幕上永远挂着一个手柄
+       (帽停在最后那一点),而逻辑早已归零 —— 玩家会以为还在走。 */
   const onStickEnd = (ev: PointerEvent): void => {
     if (stickPointerId !== ev.pointerId) return;
     stickPointerId = null;
     stick.end();
+    stickUI.hide();
   };
   window.addEventListener('pointerdown', onStickDown);
   window.addEventListener('pointermove', onStickMove);
@@ -307,6 +332,7 @@ function main(): void {
     window.removeEventListener('pointerup', onStickEnd);
     window.removeEventListener('pointercancel', onStickEnd);
     stick.end();
+    stickUI.hide();
   };
 
   const predictor = new LocalPredictor();
@@ -365,6 +391,10 @@ function main(): void {
     stickActive: stick.active,
     stickMagnitude: stick.vector().magnitude,
     joystickDeadZone: JOYSTICK_DEAD_ZONE,
+    /* ★ D-08 第二步:手柄**在不在屏幕上**也进自检口径。
+       否则「摇杆视觉到底弹没弹」只能靠肉眼看截图 —— 而那正是它静默一整轮的原因。 */
+    joystickVisible: stickUI.visible,
+    joystickMounted: stickUI.mounted,
     ackedSeq: predictor.lastAckedSeq,
     prunedCmds: predictor.prunedTotal,
     /* ★ 2026-11-15:动作入口也进自检口径。否则「按 N 到底发没发」只能靠肉眼看画面 ——
@@ -377,6 +407,7 @@ function main(): void {
   window.addEventListener('beforeunload', () => {
     detachInput();
     detachStick();
+    stickUI.dispose();
     clearInterval(inputLoop);
     session?.close();
     detachActionKeys();

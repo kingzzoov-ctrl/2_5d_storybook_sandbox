@@ -137,6 +137,9 @@ import {
   createRushOrderSession,
   startRushOrder,
   tickRushOrder,
+  /* ★ D-13:把玩家坐标换成 `opts.spraying`(工位种类)的唯一函数 —— 半径口径也在那边。 */
+  stationsBeingSprayedBy,
+  type StationKind,
   type RushOrderSession,
 } from '../coop/rush_order.ts';
 import {
@@ -767,6 +770,19 @@ export class WorldSim {
    *   它让「没接」和「接了但这帧结算了」在外部**看得出区别**。
    */
   private rushRun: RushOrderSession | null = null;
+
+  /**
+   * ★ **D-13**:每个玩家"正在喷水"的意图窗口(以 `frameCount` 计,不是挂钟)。
+   *
+   * ## 为什么需要它(而不是每帧无条件喂坐标)
+   * `stationsBeingSprayedBy` 只判「谁在半径内**且**工位在烧」。若每慢帧无条件喂坐标,
+   * **站在燃烧工位旁边**就会自动 0.5 秒灭火 —— 那不是"浇水",那是"靠近即灭火"。
+   * ⇒ 只有**刚用过 227/212**(`useItem` 的灭火分支)的玩家,才在他的意图窗口内喂坐标。
+   *
+   * 窗口长度 = **一个慢帧**(`FAST_PER_SLOW` 快帧),即 0.5 秒 —— 刚好够
+   * `EXTINGUISH_SEC`(0.5)累计一次;**不新增数值常量**(两个都是既有常量)。
+   */
+  private readonly sprayUntil = new Map<string, number>();
 
   /** 最近一次慢帧有没有真正推进急单(1 = 调了 `tickRushOrder`,0 = 没开急单)。 */
   rushTicked = 0;
@@ -4478,7 +4494,17 @@ export class WorldSim {
     /* 急单(WS-11 §6)。★ 这一行是我**补上**的 —— 第一版漏了它,
        只 import 不调用 ⇒ 门禁全绿而什么都没推进。详见 `rushRun` 的注释。 */
     if (this.rushRun !== null) {
-      events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT));
+      /* ★ D-13:把"正在喷水"的玩家坐标换成工位种类 —— `opts.spraying` 今天唯一的生产者。 */
+      const spraying: StationKind[] = [];
+      for (const [pid, until] of this.sprayUntil) {
+        if (until < this.frameCount) { this.sprayUntil.delete(pid); continue; }
+        const b = this.physics.bodies.get(pid);
+        if (b === undefined) continue;
+        for (const kind of stationsBeingSprayedBy(this.rushRun, { x: b.x, y: b.y })) {
+          if (!spraying.includes(kind)) spraying.push(kind);
+        }
+      }
+      events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT, { spraying }));
       this.rushTicked = 1;
     } else {
       this.rushTicked = 0;
@@ -4687,6 +4713,9 @@ export class WorldSim {
       return { applied: false, consume: false, reason: `器件 ${deviceId} 的炉火已经灭了` };
     }
     this.extinguishStationAt(deviceId);
+    /* ★ D-13:记下"这个玩家刚喷过水"—— 工位灭火(`opts.spraying`)只认这个意图,
+       不认"站在旁边"。窗口 = 一个慢帧(见 `sprayUntil` 的 docblock)。 */
+    this.sprayUntil.set(actorId, this.frameCount + FAST_PER_SLOW);
     return {
       applied: true, consume: true, reason: 'ok',
       effect: {

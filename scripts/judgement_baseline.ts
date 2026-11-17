@@ -165,6 +165,22 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
   },
   {
     detector: 'C',
+    file: 'tests/WS-FND-60-joystick-ui.test.ts',
+    needle: "ok(!/from\\s+['\"][^'\"]*three/.test(src)",
+    verdict: '已定性无害',
+    reason: '定向检查「DOM 绘制层是否引了 three」——目标是**已知包名**,不需要枚举全部导入形态'
+      + '(与 `WS-09` 的 `importsThree` 同族)。',
+  },
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-60-joystick-ui.test.ts',
+    needle: "ok(!/from\\s+['\"][^'\"]*server\\//.test(src)",
+    verdict: '已定性无害',
+    reason: '定向检查「客户端是否反向依赖 server/」——同上,目标已知;动态 `import()` 由另一条'
+      + '(`[裸=有 动态=无]` 标注的正则分支)覆盖。',
+  },
+  {
+    detector: 'C',
     file: 'tests/WS-FND-01.test.ts',
     needle: 'content\\/baseline\\.ts',
     verdict: '假阳性',
