@@ -50,6 +50,15 @@
  * 版本由**入参形状**决定(见 `resolveWriteVersion`):入参本身是 v1 形状就写
  * v1。否则「对一个 v1 解码结果重新编码」会凭空升版,往返当场不成立。
  *
+ * ## 水位表有**自己的**预算(WS-FND-82,判据 `tests/WS-FND-82-archive-fluid-budget.test.ts`)
+ *
+ * 水位住在头里 ⇒ 计入**固定开销**;512×512 全湿是 262144 行(JSON ≈ 2MB)⇒
+ * 固定开销自己就超 1 MiB。所以 §1 给了水位一条独立上限
+ * (`FLUID_LEVELS_BUDGET_BYTES`),§5.5 是它的裁剪规则(amount 降序、同值 `(y,x)`
+ * 升序,保留**前缀**),`fitWorldArchive` 先裁水位再给块体分预算。丢弃行数与原因
+ * 写进头里的 `trim.fluidLevelsDropped` / `fluidReason`,并把「这些格的水位不可用」
+ * 列进 `planRestore().unavailable` —— **绝不静默丢水**。
+ *
  * ## 三处**刻意不做**的(边界,别当成已实现)
  *
  * 1 **不碰 `world_sim.ts`**:回滚只做到**计划层**(`RestorePlan` 是一份纯数据),
@@ -106,6 +115,59 @@ const MIN_CHUNK_BYTES = CHUNK_BYTES + 32 * 3 + 24;
 
 /** 裁剪规则的名字(进 `trim.rule`,让回执里的「为什么」可被机器判断)。 */
 export const TRIM_RULE_ID = 'built>activity>regenerable';
+
+/* ── 水位表的**独立**预算(WS-FND-82) ──
+ *
+ * ## 为什么水位不能和块体共用一套「装不下就裁」
+ *
+ * 块体预算 = `上限 - 固定开销`,而水位表**住在固定开销里**。512×512 全湿 ⇒ 262144
+ * 行(JSON ≈ 2MB)⇒ 固定开销自己就超了 1 MiB ⇒ `fitWorldArchive` 只能**如实抛错**
+ * (归档失败)。把水位塞进块体那个循环也不行:那个循环裁的单位是**整块地形**,
+ * 裁不掉「一行水」。一行水只能按自己的尺子裁 ⇒ 给它一个**独立**上限,超了按
+ * 可判定规则降采样并记账(**绝不静默丢水**)。
+ *
+ * ## 这个上限怎么来的(不是新发明的数字)
+ *
+ * 上限 = 库层单份快照的 blob 上限(`db/repo.ts:WORLD_ARCHIVE_MAX_BYTES` = 1048576)
+ * 减去给头与块体留的预留:
+ *
+ * ```
+ * ARCHIVE_BLOB_MAX_BYTES      1048576  与 repo 的 1 MiB 上限逐字节相同
+ * CHUNK_BODY_RESERVE_BYTES     131072  房间地形上限 chunk_radius 4 ⇒ 9×9 = 81 块,
+ *                                      每块 ≈ 1024(cells) + 96(位图) + 屋顶 RLE
+ *                                      ≈ 1145 字节 ⇒ 81 × 1145 ≈ 92.7KB,取整 128KiB
+ * FLUID_LEVELS_BUDGET_BYTES    917504  = 1048576 - 131072
+ * ```
+ *
+ * 头里其余部分(世界世代 / 玩家 / 生物 / 掉落 / 块表)**不做预留**:它是按真实
+ * 内容量出来的(`fixedOverheadBytes`),预留只会白丢水。
+ *
+ * ## 规则为什么「可判定」
+ *
+ * 按 `amount` 降序(值大的水更"重要":满格 1000 毫格的水洼 > 1 毫格的渗水),
+ * 同值按 `(y, x)` 升序 —— 全序、不随机、不看插入顺序 ⇒ 同一份水位表在任何机器上
+ * 裁出同一批行。保留集是这条优先级序的**前缀**(装不下的那一行之后一律丢):
+ * 只有一条分界线,回执里一个数字就说得清;否则「哪些被裁」得逐行解释。
+ */
+
+/** 水位裁剪规则的名字(进 `trim.fluidRule`,机器可判)。 */
+export const FLUID_LEVEL_TRIM_RULE_ID = 'amount>y>x';
+
+/** 库层单份快照的字节上限 —— 与 `db/repo.ts:WORLD_ARCHIVE_MAX_BYTES` 同一个数。 */
+const ARCHIVE_BLOB_MAX_BYTES = 1048576;
+
+/** 给块体留的预留:81 块 × ≈1145 字节 ≈ 92.7KB,向上取整到 128 KiB(见本节头)。 */
+const CHUNK_BODY_RESERVE_BYTES = 131072;
+
+/** 水位表**自己能**用的字节上限(= blob 上限 - 块体预留)。 */
+export const FLUID_LEVELS_BUDGET_BYTES = ARCHIVE_BLOB_MAX_BYTES - CHUNK_BODY_RESERVE_BYTES;
+
+/**
+ * `"fluid":{"width":512,"height":512,"levels":[…]}` 这层壳的字节数。
+ * 实测一版是 40 字节左右(两个 3 位数 + 键名),取 64 留余量:
+ * 预算按「行」算,壳不该吃行预算。
+ */
+const FLUID_FIELD_SHELL_BYTES = 64;
 
 /* ═══════════════════════ 2. 解码后的形状 ═══════════════════════ */
 
@@ -255,6 +317,19 @@ export interface ArchiveTrimReport {
   rule: string;
   /** 人类可读的原因(含优先级与「被裁块不可回滚」)。 */
   reason: string;
+  /**
+   * 水位表被裁掉了几行(**只有裁过水位才写这组键** —— 没裁时它们的缺席
+   * 就是「水位表完整」的证据,而不是「0 行」)。
+   */
+  fluidLevelsTotal?: number;
+  fluidLevelsKept?: number;
+  fluidLevelsDropped?: number;
+  /** 水位表能用的字节预算(`FLUID_LEVELS_BUDGET_BYTES` 或按本次上限算出来的那份)。 */
+  fluidBudgetBytes?: number;
+  /** 水位裁剪的规则标识(`FLUID_LEVEL_TRIM_RULE_ID`),机器可判。 */
+  fluidRule?: string;
+  /** 水位为什么被裁(含保留 / 丢弃行数与「被裁的格不回滚」)。 */
+  fluidReason?: string;
   /** 逐块清单(**只在本次裁剪的回执里有**;从库里读回时是空数组)。 */
   dropped: ArchiveTrimDroppedChunk[];
 }
@@ -376,10 +451,26 @@ function decodeChunk(raw: Uint8Array, cx: number, cy: number, index: number): Ar
   };
 }
 
+/**
+ * 可选整数字段(裁剪摘要里**只有裁过才有**的那一组键):缺席 ⇒ `undefined`。
+ * 给了就必须是整数 —— 坏数据照旧抛错,不「尽力读一部分」。
+ */
+function optionalIntField(v: unknown, where: string): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  return intField(v, where);
+}
+
+/** 可选字符串字段(同上)。缺席 ⇒ `undefined`(与「写了个空串」分得清)。 */
+function optionalStrField(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
+}
+
 /** 头里的 `trim` 扩展键(可选)。坏形状 ⇒ `null`(**不**把坏数据当「没裁过」之外的东西)。 */
 function decodeTrimNote(v: unknown): ArchiveTrimReport | null {
   if (v === undefined || v === null) return null;
   const o = recordField(v, 'header.trim');
+  /* 水位那组键**只在裁过水位时才有**:没裁 ⇒ `undefined`(键也不写回),
+     「缺席」与「0 行」在字节层是两回事(见 `ArchiveTrimReport`)。 */
   return {
     budgetBytes: intField(o.budgetBytes, 'header.trim.budgetBytes'),
     originalBytes: intField(o.originalBytes, 'header.trim.originalBytes'),
@@ -388,6 +479,12 @@ function decodeTrimNote(v: unknown): ArchiveTrimReport | null {
     droppedBytes: intField(o.droppedBytes, 'header.trim.droppedBytes'),
     rule: typeof o.rule === 'string' ? o.rule : '',
     reason: typeof o.reason === 'string' ? o.reason : '',
+    fluidLevelsTotal: optionalIntField(o.fluidLevelsTotal, 'header.trim.fluidLevelsTotal'),
+    fluidLevelsKept: optionalIntField(o.fluidLevelsKept, 'header.trim.fluidLevelsKept'),
+    fluidLevelsDropped: optionalIntField(o.fluidLevelsDropped, 'header.trim.fluidLevelsDropped'),
+    fluidBudgetBytes: optionalIntField(o.fluidBudgetBytes, 'header.trim.fluidBudgetBytes'),
+    fluidRule: optionalStrField(o.fluidRule),
+    fluidReason: optionalStrField(o.fluidReason),
     /* 逐块清单不持久化(见 `ArchiveTrimReport.dropped`)。 */
     dropped: [],
   };
@@ -788,7 +885,7 @@ export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
   header.ground = input.ground.map((g) => ({ itemId: g.itemId, count: g.count, x: g.x, y: g.y }));
   header.chunks = input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength }));
   if (input.trim !== undefined && input.trim !== null) {
-    header.trim = {
+    const trim: Record<string, unknown> = {
       budgetBytes: input.trim.budgetBytes,
       originalBytes: input.trim.originalBytes,
       keptChunks: input.trim.keptChunks,
@@ -797,6 +894,17 @@ export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
       rule: input.trim.rule,
       reason: input.trim.reason,
     };
+    /* ★ 水位那组键**只在裁过水位时**写(键序接在 `reason` 之后 —— 不裁时一个字节
+       都不多,`encode(decode(x)) === x` 与既有的裁剪字节全都原样保持)。
+       用赋值而不是写进上面的字面量:键缺席与「写个 0」在字节层是两回事。 */
+    const t = input.trim;
+    if (t.fluidLevelsTotal !== undefined) trim.fluidLevelsTotal = t.fluidLevelsTotal;
+    if (t.fluidLevelsKept !== undefined) trim.fluidLevelsKept = t.fluidLevelsKept;
+    if (t.fluidLevelsDropped !== undefined) trim.fluidLevelsDropped = t.fluidLevelsDropped;
+    if (t.fluidBudgetBytes !== undefined) trim.fluidBudgetBytes = t.fluidBudgetBytes;
+    if (t.fluidRule !== undefined) trim.fluidRule = t.fluidRule;
+    if (t.fluidReason !== undefined) trim.fluidReason = t.fluidReason;
+    header.trim = trim;
   }
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
   let bodyBytes = 0;
@@ -988,6 +1096,156 @@ export function planChunkTrim(
     }),
   };
 }
+/* ═══════════════════ 5.5 水位裁剪规则(纯函数,WS-FND-82) ═══════════════════
+ *
+ * ## 规则本体(一句话)
+ *
+ * 「**amount 大的水先留**,同值时 `(y, x)` 小的先留」;保留集是这条优先级序的
+ * **前缀**,装不下的第一行之后一律丢。
+ *
+ * ## 为什么这条规则是「可判定」的
+ *
+ * - 判据只有 `amount` 与 `(y, x)`,都来自水位表本身(不是「看起来重要」、不是随机、
+ *   不看 `Map` 插入顺序)⇒ 任何机器上裁出同一批行,`fitWorldArchive` 两次逐字节相同;
+ * - 语义上也说得通:1000 毫格(满格)的水洼比 1 毫格的渗水更接近「水面」,而回滚一张
+ *   水位表的目的是「把液面还回去」;
+ * - **前缀**而不是「能塞就塞」:分界线只有一个数字,回执里说得清;否则「哪些被裁」
+ *   要逐行解释,而逐行清单**不持久化**(见 `ArchiveTrimReport.dropped`)。
+ *
+ * ## 两条**不许**的写法
+ *
+ * 1 **不许静默丢**:丢了几行、原有多少、为什么,必须进 `trim`(头里)+ 回执;
+ * 2 **不许把丢弃的格写成 0**:那与「已还原」看不出区别 —— 被裁的格就是**不在表里**,
+ *   回滚计划会如实说「这些格的水位不可用」。
+ */
+
+/** 水位裁剪计划(纯数据)。 */
+export interface FluidLevelTrimPlan {
+  /** 保留的行(**按 `(y, x)` 升序**,即编码侧的规范序)。 */
+  kept: ArchiveFluidLevel[];
+  totalRows: number;
+  keptRows: number;
+  droppedRows: number;
+  /** 保留 / 丢弃的行在头 JSON 里占的字节(含行间逗号)。 */
+  keptBytes: number;
+  droppedBytes: number;
+  /** 本次给「行」的预算(不含 `fluid` 那层壳,见 `FLUID_FIELD_SHELL_BYTES`)。 */
+  budgetBytes: number;
+  /** 保留集是否装进预算。 */
+  fits: boolean;
+  /** 规则标识(`FLUID_LEVEL_TRIM_RULE_ID`),机器可判。 */
+  rule: string;
+  /** 人类可读的原因(保留 / 丢弃行数 + 「被裁的格不编 0」)。 */
+  reason: string;
+}
+
+/** 一行水位在头 JSON 里的字节数(`[x,y,amount]` + 一个分隔逗号)。 */
+function fluidRowBytes(l: ArchiveFluidLevel): number {
+  /* 三个值都是整数、JSON 里全是 ASCII ⇒ 字符数 = UTF-8 字节数。`+1` 是行间逗号;
+     最后一行会多算 1 字节 —— 偏向安全侧(宁少留一行,也不越过上限)。 */
+  return JSON.stringify([l.x, l.y, l.amount]).length + 1;
+}
+
+/**
+ * 水位优先级比较:`> 0` ⇒ `a` **更值得留**(裁的时候先裁 `b`)。
+ *
+ * 导出它,是为了让「规则可判定」这句话能被**单独测**:比较函数是纯的、全序的
+ * (坐标唯一 ⇒ 任意两行都分得出先后),与输入顺序无关。
+ */
+export function compareFluidLevelPriority(a: ArchiveFluidLevel, b: ArchiveFluidLevel): number {
+  if (a.amount !== b.amount) return b.amount - a.amount;
+  if (a.y !== b.y) return a.y - b.y;
+  return a.x - b.x;
+}
+
+/** 水位裁剪的**唯一**措辞点(计划、头里的 `trim.fluidReason`、回执共用)。 */
+function fluidTrimReason(args: {
+  totalRows: number;
+  keptRows: number;
+  droppedRows: number;
+  totalBytes: number;
+  droppedBytes: number;
+  budgetBytes: number;
+}): string {
+  return (
+    `水位表超预算:${args.totalRows} 行(${args.totalBytes} 字节)`
+    + ` > 水位预算 ${args.budgetBytes} 字节 ⇒ 按「${FLUID_LEVEL_TRIM_RULE_ID}」`
+    + `(amount 降序,同值按 (y, x) 升序)保留前 ${args.keptRows} 行,`
+    + `裁掉 ${args.droppedRows} 行(${args.droppedBytes} 字节)。`
+    + '⚠️ 被裁的格**不在水位表里**,回滚不会伪造(不编 0 —— 那与「已还原」看不出区别)。'
+  );
+}
+
+/**
+ * **水位裁剪规则本体**:水位表 + 行预算 → 保留集 / 行数 / 原因。纯函数。
+ *
+ * 预算足够时**一行都不裁**(判据 WS-FND-82 的「小世界全留」),原因也如实写
+ * 「预算足够」而不是留空 —— 空原因会让回执看起来像「没跑过规则」。
+ */
+export function planFluidLevelsTrim(
+  levels: readonly ArchiveFluidLevel[],
+  budgetBytes: number,
+): FluidLevelTrimPlan {
+  const budget = Number.isFinite(budgetBytes) ? Math.max(0, Math.trunc(budgetBytes)) : 0;
+  let totalBytes = 0;
+  for (const l of levels) totalBytes += fluidRowBytes(l);
+  const base = {
+    totalRows: levels.length,
+    totalBytes,
+    budgetBytes: budget,
+    rule: FLUID_LEVEL_TRIM_RULE_ID,
+  };
+  if (totalBytes <= budget) {
+    return {
+      kept: levels.map((l) => ({ x: l.x, y: l.y, amount: l.amount })),
+      keptRows: levels.length,
+      droppedRows: 0,
+      keptBytes: totalBytes,
+      droppedBytes: 0,
+      ...base,
+      fits: true,
+      reason: `预算足够:水位 ${levels.length} 行(${totalBytes} 字节)≤ 水位预算 ${budget} 字节 ⇒ 全部保留(不裁剪)`,
+    };
+  }
+  const order = levels.slice().sort(compareFluidLevelPriority);
+  const kept: ArchiveFluidLevel[] = [];
+  let keptBytes = 0;
+  let droppedBytes = 0;
+  /* 前缀语义:一旦有一行装不下,后面的都不再尝试(见本节头的第 3 条理由)。 */
+  let closed = false;
+  for (const l of order) {
+    const cost = fluidRowBytes(l);
+    if (!closed && keptBytes + cost <= budget) {
+      kept.push({ x: l.x, y: l.y, amount: l.amount });
+      keptBytes += cost;
+      continue;
+    }
+    closed = true;
+    droppedBytes += cost;
+  }
+  /* 编码侧要求全序:保留下来的那批也得按 `(y, x)` 排回去(否则
+     `encodeWorldArchive` 会替我们排 —— 但「计划」与「字节」用两把尺子迟早漂移)。 */
+  kept.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+  const droppedRows = levels.length - kept.length;
+  return {
+    kept,
+    keptRows: kept.length,
+    droppedRows,
+    keptBytes,
+    droppedBytes,
+    ...base,
+    fits: keptBytes <= budget,
+    reason: fluidTrimReason({
+      totalRows: levels.length,
+      keptRows: kept.length,
+      droppedRows,
+      totalBytes,
+      droppedBytes,
+      budgetBytes: budget,
+    }),
+  };
+}
+
 /* ═══════════════════ 6. 装进上限:解码 → 裁剪 → 重新编码 ═══════════════════
  *
  * ## 这一步解决的就是「大世界归档直接抛错」
@@ -1024,16 +1282,23 @@ export interface FitWorldArchiveResult {
 /**
  * 把「块表」换成空的再编码一次 = 不含地形的固定开销。
  *
- * ⚠️ 必须按**原版本**与**原水位**量(v2 的两项也在固定开销里):漏掉 `fluid`
- * 会让量出来的开销偏小,于是最后一步编码超出上限、被迫再让一块 —— 「水位把
- * 地形挤掉」这种数字上的因果关系在本文件里不该出现。
+ * ⚠️ 必须按**原版本**与**当前(可能已被裁过的)水位**量:漏掉 `fluid` 会让量出来的
+ * 开销偏小,于是最后一步编码超出上限、被迫再让一块 —— 「水位把地形挤掉」这种
+ * 数字上的因果关系在本文件里不该出现。
+ *
+ * `fluid` 由**调用方**给(不是直接读 `decoded.fluid`):水位裁过之后要拿**裁过的
+ * 那份**重新量,否则「裁完水位仍超上限」会在这里空转。传 `null` = 头里**不写**
+ * `fluid` 键,用来量「不含水位的固定开销」(见 `fitWorldArchive`)。
  */
-function fixedOverheadBytes(decoded: DecodedWorldArchive): number {
+function fixedOverheadBytes(
+  decoded: DecodedWorldArchive,
+  fluid: ArchiveFluidField | null,
+): number {
   return encodeWorldArchive({
     version: decoded.version,
     world: decoded.world,
     players: decoded.players,
-    fluid: decoded.fluid,
+    fluid,
     mobs: decoded.mobs,
     ground: decoded.ground,
     chunks: [],
@@ -1050,41 +1315,103 @@ function lowestPriorityAmong(kept: readonly ArchiveChunk[]): ArchiveChunk {
 }
 
 /**
- * **把一份快照装进字节上限**:够小就原样返回;超了就按 §5 的规则裁块并重新
- * 装回去。纯函数(不碰库、不碰世界)。
+ * **把一份快照装进字节上限**:够小就原样返回;超了就按 §5 / §5.5 的规则裁块与
+ * 裁水位,再装回去。纯函数(不碰库、不碰世界)。
  *
- * ## 裁剪**只裁地形**
+ * ## 顺序:**先水位,再地形**
  *
- * 玩家血量 / 流体水位 / 世界世代 / 生物 / 掉落都在头里,裁块不动它们
- * (预算里先扣掉固定开销,见 `fixedOverheadBytes`)。所以「裁过的归档」与
- * 「裁过之后回滚」仍然能还回玩家的血与液面 —— 只是缺了那几块地形。
+ * 水位表住在**固定开销**里(头 JSON),而块体预算 = `上限 - 固定开销`。512×512
+ * 全湿 ⇒ 262144 行 ⇒ 固定开销自己就超 1 MiB ⇒ 块体预算是 0(甚至负),
+ * 「连一块地形都不留」都装不进去 ⇒ 改造前只能**如实抛错**(归档失败)。
+ * 所以先让水位过它**自己的**预算(§5.5,常量见 `FLUID_LEVELS_BUDGET_BYTES`),
+ * 再按剩下多少给块体分预算。反过来(先裁块)会让水位把地形全挤掉,却没解决
+ * 超限本身。
+ *
+ * ## 裁剪**只裁地形与水位**
+ *
+ * 玩家血量 / 世界世代 / 生物 / 掉落原样保留;水位只按规则降采样(降采样结果与
+ * 原因写进头里的 `trim`,见 `ArchiveTrimReport.fluidLevelsDropped` /`fluidReason`)。
+ * 「裁过的归档」回滚时仍然能还回玩家的血、以及**留下的那些**液面 —— 缺口是
+ * **明说的**,不是静默丢的。
  *
  * 重编码时显式带上 `version` / `fluid`:不显式给就会**按形状推断**,
  * 而一份「v2 但没有水位」的入参推断出来的仍不是原版本 —— 逐字节可比会当场破掉。
  *
  * @param maxBytes 硬上限(生产是 `repo.ts:WORLD_ARCHIVE_MAX_BYTES` = 1 MiB)
- * @throws 解码失败(不是 `WSA1`)/ 连零块地形都装不下(如实失败,不写半截世界)
+ * @throws 解码失败(不是 `WSA1`)/ 水位已裁到 0 行、地形一块不留仍装不下(如实失败)
  */
 export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorldArchiveResult {
   const decoded = decodeWorldArchive(snapshot);
   const max = Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : 0;
   if (max <= 0) throw new Error(`WSA1 裁剪失败:上限 ${maxBytes} 不是正数`);
   if (decoded.totalBytes <= max) {
+    /* ★ 不裁 ⇒ **原样返回入参**(逐字节不变):多写一个 `trim` 键都会让「同一份
+       世界的两份归档」在字节上分叉。 */
     return { bytes: snapshot, trimmed: false, decoded, report: null };
   }
-  const fixed = fixedOverheadBytes(decoded);
+
+  /* ── 第一步:水位表过它**自己的**预算(§5.5) ──
+     水位不降下来,下面的块体预算就没有意义(固定开销自己超上限)。 */
+  let fluid: ArchiveFluidField | null = decoded.fluid;
+  let fluidPlan: FluidLevelTrimPlan | null = null;
+  let fixed = fixedOverheadBytes(decoded, fluid);
+  if (fixed > max && decoded.fluid !== null) {
+    /* 不含水位的固定开销是**量**出来的(不猜):预留只给块体,其余按真实内容。 */
+    const nonFluidFixed = fixedOverheadBytes(decoded, null);
+    const chunkReserve = Math.min(CHUNK_BODY_RESERVE_BYTES, decoded.bodyBytes);
+    let fluidBudget = Math.min(
+      FLUID_LEVELS_BUDGET_BYTES,
+      Math.max(0, max - nonFluidFixed - chunkReserve),
+    );
+    /* 行字节是**估算**(JSON 长度),壳与头里其它键还有几字节的余地 ⇒ 真装不下就
+       按超出的差额再收一次。循环有界:每次至少多让 `FLUID_FIELD_SHELL_BYTES`,
+       且保留集空时立即退出。 */
+    for (let guard = 0; guard < 32; guard += 1) {
+      const plan = planFluidLevelsTrim(
+        decoded.fluid.levels,
+        Math.max(0, fluidBudget - FLUID_FIELD_SHELL_BYTES),
+      );
+      fluid = { width: decoded.fluid.width, height: decoded.fluid.height, levels: plan.kept };
+      fluidPlan = plan;
+      fixed = fixedOverheadBytes(decoded, fluid);
+      if (fixed <= max || plan.keptRows === 0) break;
+      fluidBudget = Math.max(0, fluidBudget - Math.max(FLUID_FIELD_SHELL_BYTES, fixed - max));
+    }
+    /* 一行都没丢 ⇒ 水位本来不是瓶颈:别把「跑过规则」写成「裁过水位」
+       —— 那组键的**缺席**才是「水位表完整」的证据(见 `ArchiveTrimReport`)。 */
+    if (fluidPlan !== null && fluidPlan.droppedRows === 0) {
+      fluidPlan = null;
+      fluid = decoded.fluid;
+      fixed = fixedOverheadBytes(decoded, fluid);
+    }
+  }
   if (fixed > max) {
     throw new Error(
-      `WSA1 裁剪失败:即使一块地形都不留,固定部分(头/玩家(含血量)/生物/掉落/水位)仍 ${fixed} 字节`
-      + ` > 上限 ${max} 字节 —— 只有缩短玩家/生物列表、或减少非零水位格才能归档`
-      + '(不在这里替 owner 决定丢谁)',
+      `WSA1 裁剪失败:即使一块地形都不留、水位也已按预算裁过`
+      + `(现 ${fluid === null ? '不可用' : `${fluid.levels.length} 行`}),`
+      + `固定部分(头/玩家(含血量)/生物/掉落/水位)仍 ${fixed} 字节 > 上限 ${max} 字节`
+      + ' —— 只有缩短玩家/生物列表才能归档(不在这里替 owner 决定丢谁)',
     );
   }
-  const plan = planChunkTrim(decoded.chunks, max - fixed);
+
+  const chunkBudget = max - fixed;
+  const plan = planChunkTrim(decoded.chunks, chunkBudget);
   let kept = plan.kept.slice();
   const dropped = plan.dropped.slice();
   for (;;) {
     const droppedBytes = dropped.reduce((n, d) => n + d.bytes, 0);
+    /* 地形与水位各有各的账:没裁地形时**不许**照抄「超预算…裁掉 0 块」那句
+       —— 那会让回执看起来像「裁了地形但其实没有」。 */
+    const chunkReason = dropped.length > 0
+      ? trimReason({
+        totalBytes: decoded.bodyBytes,
+        budgetBytes: chunkBudget,
+        kept: kept.length,
+        dropped,
+        droppedBytes,
+      })
+      : `预算足够:地形 ${decoded.bodyBytes} 字节 ≤ 块体预算 ${chunkBudget} 字节`
+        + ` ⇒ ${kept.length} 块全部保留(不裁剪)`;
     const report: ArchiveTrimReport = {
       budgetBytes: max,
       originalBytes: decoded.totalBytes,
@@ -1092,20 +1419,22 @@ export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorl
       droppedChunks: dropped.length,
       droppedBytes,
       rule: TRIM_RULE_ID,
-      reason: trimReason({
-        totalBytes: decoded.bodyBytes,
-        budgetBytes: max - fixed,
-        kept: kept.length,
-        dropped,
-        droppedBytes,
-      }),
+      reason: fluidPlan === null ? chunkReason : `${chunkReason} ☵ 水位另裁:${fluidPlan.reason}`,
       dropped: dropped.slice(),
     };
+    if (fluidPlan !== null) {
+      report.fluidLevelsTotal = fluidPlan.totalRows;
+      report.fluidLevelsKept = fluidPlan.keptRows;
+      report.fluidLevelsDropped = fluidPlan.droppedRows;
+      report.fluidBudgetBytes = fluidPlan.budgetBytes;
+      report.fluidRule = fluidPlan.rule;
+      report.fluidReason = fluidPlan.reason;
+    }
     const out = encodeWorldArchive({
       version: decoded.version,
       world: decoded.world,
       players: decoded.players,
-      fluid: decoded.fluid,
+      fluid,
       mobs: decoded.mobs,
       ground: decoded.ground,
       chunks: kept,
@@ -1481,6 +1810,29 @@ export function planRestore(
     unavailable.push(
       `chunks:归档时已裁掉 ${missingChunks} 块(合计 ${trim.droppedBytes} 字节,平均 ${avg} 字节/块)`
       + ' ⇒ 这些块**没有**字节,计划不会伪造;原始地形可由 seed 重建,玩家建造部分不可回滚',
+    );
+  }
+  /* ★ 被裁掉的**水位**(WS-FND-82):必须在计划层读得出来 —— 归档少了哪些格、
+     为什么少。否则「液面回来了」与「液面被裁过」在回执上看不出区别(静默丢水)。
+     与块的 `unavailable` 同一种形态:说清**多少 + 为什么 + 计划不伪造什么**。 */
+  const fluidDropped = trim === null ? 0 : Math.max(0, Math.trunc(trim.fluidLevelsDropped ?? 0));
+  if (trim !== null && fluidDropped > 0) {
+    const keptRows = trim.fluidLevelsKept
+      ?? (snapshot.fluid === null ? 0 : snapshot.fluid.levels.length);
+    const totalRows = trim.fluidLevelsTotal ?? (keptRows + fluidDropped);
+    const fluidRule = trim.fluidRule ?? FLUID_LEVEL_TRIM_RULE_ID;
+    const why = trim.fluidReason !== undefined && trim.fluidReason.length > 0
+      ? trim.fluidReason
+      : fluidRule;
+    changes.push(
+      `流体水位:归档时按「${fluidRule}」裁掉了 ${fluidDropped} 行`
+      + `(原 ${totalRows} 行 ⇒ 保留 ${keptRows} 行,水位预算 ${trim.fluidBudgetBytes ?? 0} 字节)`
+      + ' ⇒ 只铺回保留的那些格,被裁的格**不编 0**',
+    );
+    unavailable.push(
+      `fluid.levels:归档时水位表被裁掉 ${fluidDropped} 行`
+      + `(原 ${totalRows} 行,保留 ${keptRows} 行;原因:${why})`
+      + ' ⇒ 这些格的水位**不在归档里**,计划不会伪造(不编 0 —— 那与「已还原」看不出区别)',
     );
   }
   return {

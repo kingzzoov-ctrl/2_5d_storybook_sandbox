@@ -24,7 +24,7 @@
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
 | 层 | 服务端 `server/src` **89** `.ts` · 客户端 `client/src` **40** · 共享 `shared` **14** ⇒ **生产 .ts 合计 143** |
-| 测试 | `tests/*.test.ts` **91** 个套件 |
+| 测试 | `tests/*.test.ts` **94** 个套件 |
 | 工具 | `scripts/*.ts` **35** 个 |
 | 文档 | `docs/` **83** 个 `.md` + 3 个 `.png` = 86 文件 / **2.83 MB** |
 | 门禁 | `scripts/verify.ts`(6635 行) |
@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **2053 条 / 91 套件** | WS 1014 条 / 14 套件 · 基座 FND 1039 条 / 77 套件(2026-11-17:FND 号段已到 **78** —— 61 协同浇水 e2e / 62 世界重置重建 / 63 ackedSeq e2e / 64 世界钟喂进电路 / 65 US2 跨进程 / 66 冻结层解锁 / 71 战斗深度 / 72 归档回滚 / 73 客户端表现 / 74 门禁硬化 / 75 房间系统 / 76 测试欠账 / 77 接线系统 / 78 归档实测) |
+| 用例 | **2070 条 / 94 套件** | WS 1014 条 / 14 套件 · 基座 FND 1056 条 / 80 套件(2026-11-17:FND 号段已到 **78** —— 61 协同浇水 e2e / 62 世界重置重建 / 63 ackedSeq e2e / 64 世界钟喂进电路 / 65 US2 跨进程 / 66 冻结层解锁 / 71 战斗深度 / 72 归档回滚 / 73 客户端表现 / 74 门禁硬化 / 75 房间系统 / 76 测试欠账 / 77 接线系统 / 78 归档实测) |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,11 +387,11 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-29d2b4dc6cbe  README.md
+90a0cef1f23f  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
-e236d9af2fd1  docs/CHANGE_REQUESTS.md
+1ba6a334f573  docs/CHANGE_REQUESTS.md
 8906f3d83f11  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。

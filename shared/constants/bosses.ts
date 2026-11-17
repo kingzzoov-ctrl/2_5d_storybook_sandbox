@@ -33,16 +33,17 @@ export const BOSS_LIST: readonly BossDef[] = [
     baseHp: 4800,
     summonItem: 735,
     exp: 1600,
-    /* ⚠️ CR-16:`loot` 保持字节级不变(它被 contentFingerprints 的 bosses 分区哈希)。
+    /* ⚠️ CR-16:`loot` 曾按「冻结纪律」保持字节级不变(它被 contentFingerprints 的 bosses 分区哈希)。
        手册 L496 的战利品列是「703 河狸钢牙×10 + 自动伐木机甲宠物图纸」:
         · 数量 10 → `lootQty`(缺省 1,故必须显式给,且与 loot 等长);
         · 「自动伐木机甲宠物图纸」→ CR-16 时 320 表内 0 命中,登记为 `lootAbstract`;
-          **CR-27**:它已补录为物品 #748(`items.ts` 的 `APPENDED`),但本 Boss 的 `loot`
-          仍**不动**(加 ID 会动 `contentFingerprints().bosses` 与 `tests/WS-05` 冻结快照);
+          **CR-27** 补录为物品 #748(`items.ts` 的 `APPENDED`);
+          ★ **CR-28**:按手册 L496 真正接进 `loot`(第 3 位,`count` 取 1 —— 手册只对 703 写了 ×10)。
+          `lootAbstract` 保留手册原文(WS-05 的 W5-53 逐字钉住它,删了会红)。
         · `437 叮当蒸汽小火车头` → 手册 L313 是**可造载具**,不是战利品 ⇒ 记 `lootDeviations`,
-          由 rollPersonalLoot 在生产掉落里过滤掉(不删 loot,删了会动指纹)。 */
-    loot: [703, 437],
-    lootQty: [10, 1],
+          由 rollPersonalLoot 在生产掉落里过滤掉(不删 loot)。 */
+    loot: [703, 437, 748],
+    lootQty: [10, 1, 1],
     lootAbstract: ['自动伐木机甲宠物图纸'],
     lootDeviations: [
       { itemId: 437, reason: '手册 L496 战利品列为「703×10 + 自动伐木机甲宠物图纸」;437 在 L313 是可造载具(寒铁金属锭×6+黄铜金属锭×4),非战利品' },
@@ -116,13 +117,16 @@ export const BOSS_LIST: readonly BossDef[] = [
      * 手册原文的两件(城堡图纸、姜饼人随从)在 CR-15 时的 320 项表内不存在,
      * 按「抽象奖励」处理、不塞进物品表(否则破坏当时的内容锁)。
      * ★ CR-27:两件已补录为 #754 城堡图纸 / #749 姜饼人随从,`loot` 仍按冻结纪律不动。
+     * ★ CR-28:按手册 L500 真正接进 `loot`,顺序照手册原文「城堡图纸与姜饼人随从」
+     *   ⇒ `754 城堡图纸` 在前、`749 姜饼人随从` 在后;两件 `count` 都取 1(手册未写数量)。
      */
-    loot: [609, 613],
+    loot: [609, 613, 754, 749],
     /* CR-16:手册 L500 的战利品列是「皇家甜点主题全套城堡图纸与姜饼人随从」——
        CR-16 时两件在 320 表内均 0 命中 ⇒ 登记为 `lootAbstract`(CR-15 已判明它们不属物品表)。
-       ★ CR-27:两件现已是 #754 / #749,但 `lootAbstract` 保留为**手册原文**登记。
+       ★ CR-27:两件现已是 #754 / #749;★ CR-28:两件已接进 `loot`,`lootAbstract` 仍保留为
+       **手册原文**登记(WS-05 的 W5-53 逐字钉住它,删了会红)。
        `609 庆典三层奶油蛋糕` 是 CR-15 给 739 自反馈换上的替代件,手册没写数量 ⇒ 1。 */
-    lootQty: [1, 1],
+    lootQty: [1, 1, 1, 1],
     lootAbstract: ['皇家甜点主题全套城堡图纸', '姜饼人随从'],
     phases: [
       { hpThreshold: 1.0, name: 'P1 巧克力浆泼洒', telegraph: '大面积紫色减速沼泽预警区(半径 4 格)', skill: '泼洒大面积减速巧克力浆,投掷会滚动的巨型焦糖球。' },
@@ -164,9 +168,17 @@ export const BOSS_LIST: readonly BossDef[] = [
     /* ⚠️ CR-16:手册 L502 战利品列是「708 永动发条太阳核 + 723 克洛诺斯磁暴齿轮炮
        + 纯金通关纪念碑」。前两件 loot 已有;「纯金通关纪念碑」CR-16 时在 320 表内 0 命中
        ⇒ 登记为 `lootAbstract`(不塞物品表,否则破坏当时的内容锁)。
-       ★ CR-27:它已补录为 #750,`loot` 仍不动(冻结纪律,见 CR-16 实施记录)。 */
-    loot: [708, 723],
-    lootQty: [1, 1],
+       ★ CR-27:它已补录为 #750;★ CR-28:按手册 L502 接进 `loot`(第 3 位,`count` 取 1)。
+
+       ★ CR-28 另挂 3 件**手册没有 Boss 归属**的抽象奖励 —— 依据「没有明确归属 ⇒ 挂通关里程碑/
+       最终 Boss」的裁决,落在本 Boss(§4.3 的最后一战):
+        · `751 稀有甜点食谱` —— 手册 L481 把它写给 `mob_choco_golem`(mob,不是 Boss);
+        · `752 蓬松彩羽`     —— 手册 L476 把它写给 `mob_chocobo`(mob,不是 Boss);
+        · `753 稀有树种`     —— 手册 L467 把它写给 `mob_squirrel`「101 原木 + 稀有树种」(mob,不是 Boss)。
+       三件的手册归属都是 **mob 掉落表**(`shared/constants/mobs.ts`,不在 CR-28 写域),本表只有
+       Boss 战利品 ⇒ 统一挂最终 Boss。`count` 一律 1:手册未写数量,不发明概率也不发明数量。 */
+    loot: [708, 723, 750, 751, 752, 753],
+    lootQty: [1, 1, 1, 1, 1, 1],
     lootAbstract: ['纯金通关纪念碑'],
     phases: [
       { hpThreshold: 1.0, name: 'P1 时间激光指针', telegraph: '从中心顺时针旋转的细长红色指针(宽 1 格,长 12 格,角速度恒定)', skill: '发射 360° 顺时针旋转的时间激光指针。' },

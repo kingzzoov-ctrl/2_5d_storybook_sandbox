@@ -3270,3 +3270,120 @@ typeof WebSocket = function(Node 24.13.0)
 - `docs/WS-04-mob-ai.md:554~559`(牧场产出「毛团/温泉橘」的出处)
 - `server/src/systems/ranch.ts:71~85`(`RANCH_PRODUCE_BY_SPECIES` / `resolveItemByName`)
 - `server/src/systems/wiring.ts:404~409`(`gatherMulOf`;件数放大规则此前**明确留白**等 owner 裁)
+
+---
+
+## [CR-28] 2026-11-18 task-84(fixer)— 手册 7 件抽象奖励**真正挂进 Boss 的 `loot`**(748~754)+ 指纹/快照同步
+
+**触发**:CR-27 把手册的 7 件抽象奖励补录成了物品表条目(`748~754`),但它们**没接进任何 Boss 的
+`loot`** —— `lootAbstract` 里还是纯文字登记(`自动伐木机甲宠物图纸` / `皇家甜点…` / `纯金通关纪念碑`
+…),生产掉落路径(`effectiveLoot → rollPersonalLoot`)只认 `loot`,于是「打完 Boss 拿不到那 7 件」。
+本 CR 按手册把它们挂上,并同步所有被冻结的指纹/快照。
+
+### 1. 逐件归属(奖励 → Boss → 依据 → 数量)
+
+| 物品 | 挂到的 Boss | 手册依据(原文/行号) | `count` |
+| :--- | :--- | :--- | :--- |
+| `748 自动伐木机甲图纸` | `boss_beaver_mecha` | **L496**「`1,600 EXP`、`703 河狸钢牙×10`、**自动伐木机甲宠物图纸**」(手册原文带「宠物」二字,物品名短一截 —— 是 CR-27 入表时的命名,不改) | 1 |
+| `754 城堡图纸` | `boss_ginger_troll` | **L500**「`8,500 EXP`、**皇家甜点主题全套城堡图纸**与姜饼人随从」(顺序照手册:图纸在前) | 1 |
+| `749 姜饼人随从` | `boss_ginger_troll` | **L500** 同一句的后半「…与**姜饼人随从**」 | 1 |
+| `750 纯金通关纪念碑` | `boss_chronos_colossus` | **L502**「`25,000 EXP`、`708 永动发条太阳核`、`723 克洛诺斯磁暴齿轮炮`、**纯金通关纪念碑**」 | 1 |
+| `751 稀有甜点食谱` | `boss_chronos_colossus`(通关里程碑) | **L481** 是写给 **mob** `mob_choco_golem`「掉 `105 焦糖威化木×5`、**稀有甜点食谱**」⇒ **没有 Boss 归属** | 1 |
+| `752 蓬松彩羽` | `boss_chronos_colossus`(通关里程碑) | **L476** 是写给 **mob** `mob_chocobo`「掉**蓬松彩羽**(驯服后装鞍可骑乘)」⇒ **没有 Boss 归属** | 1 |
+| `753 稀有树种` | `boss_chronos_colossus`(通关里程碑) | **L467** 是写给 **mob** `mob_squirrel`「掉 `101 原木`、**稀有树种**」⇒ **没有 Boss 归属** | 1 |
+
+**后 3 件为什么挂最终 Boss**(这是本 CR 唯一的规则性裁决,依据写在 `bosses.ts` 该 Boss 注里):
+
+1. 手册对它们的归属是 **mob 掉落表**(`shared/constants/mobs.ts`)—— mob 表不在本 CR 写域,
+   且本表(`bosses.ts`)只表达 **Boss** 战利品;
+2. ⇒ 按「**没有明确 Boss 归属 ⇒ 挂通关里程碑 / 最终 Boss**」统一挂 `boss_chronos_colossus`
+   (手册 §4.3 的最后一战、`8` 个 Boss 的终点)。
+
+**不发明概率、不发明数量**:7 件的 `count` 一律 `1`(`lootQty` 显式写 `1`,因为该字段与 `loot` 必须逐位等长)。
+手册只对两件写了 `×N`(`703×10` / `117×15`),那两处由 CR-16 落的 `lootQty` 保持不变。
+
+### 2. 改了什么(逐文件)
+
+| 文件 | 改了什么 |
+| :--- | :--- |
+| `shared/constants/bosses.ts` | 三个 Boss 的 `loot` / `lootQty` **尾部追加**:`boss_beaver_mecha` `[703,437]` → `[703,437,748]`(`lootQty [10,1]` → `[10,1,1]`);`boss_ginger_troll` `[609,613]` → `[609,613,754,749]`(`[1,1]` → `[1,1,1,1]`);`boss_chronos_colossus` `[708,723]` → `[708,723,750,751,752,753]`(`[1,1]` → `[1,1,1,1,1,1]`)。三处注释按「手册原文 → CR-27 入表 → CR-28 挂上」重写;**`normalizeBossLoot` / `bossLootEntries` 一行未改**;`lootAbstract` **保留**(它是手册原文登记,W5-53 逐字钉住) |
+| `server/src/content/content.baseline.json` | `node scripts/content-lock.ts --update` → `bosses e6bd03cc → 8f50dc95`、`overall 2f352d3d → 4ae9f66f`;`items / mobs / modes` 与 `counts` / `slots` / `names` 一字未动 |
+| `tests/WS-05.test.ts` | **W5-51 的冻结快照**(三行 `loot` 字面量)+ 该块头注释(写明 CR-28 已同步、指纹 `e6bd03cc → 8f50dc95`)。其余用例一字未改 |
+| `tests/WS-FND-84-abstract-loot.test.ts` | **新建**,6 条判据(FND84-1~6),每条带负对照 |
+| `tests/WS-FND-79-content-expansion.test.ts` | **FND79-3 的 `bosses` 字面量**(`'e6bd03cc'` → `'8f50dc95'`)+ 该行注释。⚠️ 该文件不在本 CR 写域,但它是「`WS-FND-79` 复跑必须绿」的硬约束下**唯一无法回避**的一处,见 §5 |
+| `shared/constants/items.ts` / `scripts/content-lock.ts` | **未改**(748~754 由 CR-27 入表,内容锁工具无需变动) |
+
+### 3. 指纹怎么变(命令原文)
+
+```
+$ node scripts/content-lock.ts --update
+══ 内容基线已重新生成 ══
+  指纹     : 2f352d3d → 4ae9f66f
+  物品     : 329
+  生物/Boss: 24 / 8
+  本次内容变更:
+    · bosses 指纹 e6bd03cc → 8f50dc95
+```
+
+- `bosses` 分区哈希 `{id,name,baseHp,summonItem,loot}`(`server/src/content/registry.ts:267`)—— 本 CR
+  正是改 `loot` ⇒ **`e6bd03cc` → `8f50dc95`** 是必然的。
+- `overall = fnv1a32('v1|items|mobs|bosses|modes')` ⇒ **`2f352d3d` → `4ae9f66f`**。
+- `items`(`6a0d6441`)/ `mobs`(`624808c4`)/ `modes`(`b854dbfe`)**未变**。
+
+### 4. 判据与注入证据(`tests/WS-FND-84-abstract-loot.test.ts`,6/6 通过)
+
+| # | 正面 | 负对照(内存假表,不动真数据) | 注入(改坏 ⇒ 红) |
+| :--- | :--- | :--- | :--- |
+| FND84-1 | 7 件各自**恰好**出现在一个 Boss 的 `loot`;全表命中总数 = 7 | 假表漏挂一件 / 塞第二份 | I1(河狸少 `748`)⇒ 红:「#748 … 没挂到任何 Boss 的 loot」 |
+| FND84-2 | 逐件经 `normalizeBossLoot` / `bossLootEntries` 读出 `count === 1`;`703×10` / `117×15` 未被带偏 | 假表把 `750` 改成 3 | I2(`lootQty[2]` = 3)⇒ 红:「#748 的 count 期望 1 / 实际 3」 |
+| FND84-3 | 既有 Boss 原有 loot **逐位不丢、不挪位**(8 个 Boss 与 CR-28 前快照比);新增只允许是 748~754,且总数 = 7 | 假表删 `703` / 把 `748` 插到队首 | I3(删 `703`)⇒ 红:「boss_beaver_mecha.loot[0] 期望 703,实际 437」 |
+| FND84-4 | 归属逐条对齐手册;`lootAbstract` 的手册原文仍在 | 假表把 `748` 挪到克洛诺斯 / 把 `751` 挪到河狸 | I4(748 挪去最终 Boss)⇒ 红:「挂错 Boss:手册归属 boss_beaver_mecha,实际 boss_chronos_colossus」 |
+| FND84-5 | 生产路径真发:7 件所在 Boss 的 `rollPersonalLoot` 光球都含该件且件数 ≥ 1 | `437`/`440`(手册里的可造载具)仍被 `lootDeviations` 过滤 | I5(`lootDeviations` 的 437 改成 999)⇒ 红:「437 不得当战利品发 期望 false / 实际 true」 |
+| FND84-6 | `bosses = 8f50dc95`、`overall = 4ae9f66f`,且与 `content.baseline.json` 一致 | 断言 `bosses ≠ e6bd03cc`(否则「什么都没改也能过」) | I6(基线写回旧值 `e6bd03cc`)⇒ 红:「基线 bosses 分区必须与当前内容同步」 |
+
+**注入纪律**:每条注入都「改坏 ⇒ 该条红 ⇒ 原始字节写回 ⇒ SHA256 前后一致」,实测 6/6 全部如此:
+
+```
+I1 miss-one        bosses.ts            restored byte-identical: True  sha256=41062EF8…57AD7
+I2 count-3         bosses.ts            restored byte-identical: True  sha256=41062EF8…57AD7
+I3 drop-703        bosses.ts            restored byte-identical: True  sha256=41062EF8…57AD7
+I4 wrong-boss      bosses.ts            restored byte-identical: True  sha256=41062EF8…57AD7
+I5 vehicle-passes  bosses.ts            restored byte-identical: True  sha256=41062EF8…57AD7
+I6 fingerprint     content.baseline.json restored byte-identical: True  sha256=43DA39D4…85A94
+```
+
+复跑:`[WS-05] 57/57 通过`、`[WS-FND-79] 11/11 通过`、`[WS-FND-84] 6/6 通过`。
+
+### 5. **写域外**锚点(本 CR 造成的红与需要的同步值)
+
+| 文件:行 | 现值 → 应改 | 现状 |
+| :--- | :--- | :--- |
+| `tests/WS-FND-01.test.ts:218` | `'2f352d3d'` → `'4ae9f66f'` | 红(A13) |
+| `tests/WS-FND-01.test.ts:222` | `'e6bd03cc'` → `'8f50dc95'` | 红(同一条用例,sync 完 218 才会轮到它) |
+| `tests/WS-FND-01.test.ts:230` | `'v1-2f352d3d'` → `'v1-4ae9f66f'` | 红(A14) |
+| `tests/WS-FND-06.test.ts:1001` | `'2f352d3d'` → `'4ae9f66f'` | 红([README] 指纹锚点) |
+| `scripts/data-conformance.ts:185` | `'v1-eaefa38b'` → `'v1-4ae9f66f'` | 早就该在 CR-27 改成 `2f352d3d`,仍滞留 `eaefa38b`(双重过期) |
+| `README.md:58` | `v1-2f352d3d` → `v1-4ae9f66f` | 红(文档锚点) |
+| `shared/types/entities.ts:146~188` | 注释「`loot` 保持字节级不变 / 一律走附加字段」**已过期** | 不红(纯注释);类型契约不变,`loot` 仍是 `number[]` |
+| `docs/HANDOVER.md` / `shared/contracts/FREEZE.md` | 实测 `grep '2f352d3d\|e6bd03cc\|v1-'` **0 命中** ⇒ 无需改 | — |
+
+`tests/WS-FND-79-content-expansion.test.ts:144` 的 `bosses` 字面量**本 CR 已同步**(见 §2 的说明:
+它是「WS-FND-79 必须绿」的硬约束下唯一必须动的一行)。
+
+### 6. 刻意**没做**的事
+
+- **没把 751/752/753 挂到手册的 mob 上**:`shared/constants/mobs.ts` 不在本 CR 写域,且 mob 掉落
+  走的是另一条结算路径;把它们挂最终 Boss 是「无 Boss 归属」规则的结果,不是「mob 侧已实现」。
+  ⇒ 若要落到 mob,需另开 CR(mobs 表 + mob 掉落结算)。
+- **没删 `lootAbstract`**:它是手册原文登记(WS-05 的 W5-53 逐字钉住),与 `loot` 里的 ID 并存
+  —— 「手册说什么」与「代码发了什么」两条记录都留着。
+- **没动 `437` / `440` 的 `lootDeviations`**:它们仍是手册里的可造载具,生产掉落继续过滤。
+
+### 7. 关联
+
+- CR-16(`lootQty` / `lootAbstract` / `lootDeviations` 的来历)· CR-27(内容表 320 → 329、`748~754` 入表)
+- P-03(`docs/DECISIONS.md:224`「作为抽象奖励在结算层表达,**不要**硬塞进物品表」——
+  CR-27 已由 owner 裁 D-19 改为入表,本 CR 完成「入表 → 挂掉落」的后半段)
+- 手册行号出处:`docs/DATA-CONFORMANCE.md:216~220`、`docs/ID-CROSSCHECK.md:276~282`、`:314~320`
+- `tests/WS-05.test.ts`(W5-51 冻结快照 / W5-53 抽象奖励登记)· `tests/WS-FND-79-content-expansion.test.ts`(FND79-3)
+- `shared/constants/bosses.ts#normalizeBossLoot`(唯一归一入口)· `server/src/bosses/raid.ts#effectiveLoot`

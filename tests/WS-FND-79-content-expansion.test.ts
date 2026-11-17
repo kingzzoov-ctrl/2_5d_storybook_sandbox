@@ -138,10 +138,12 @@ test('FND79-3 内容指纹与 content-lock 基线一致,且 bosses 分区未被�
   eq(raw.fingerprints.overall, f.overall, 'overall 指纹');
   eq(raw.counts.items, 329, '基线记录的内容件数');
 
-  /* ★ 负对照(结构性的):`loot` 是本批**唯一可能**让 bosses 分区漂移的字段。
-     它必须仍是 e6bd03cc —— 谁把 746~754 塞进某个 Boss 的 `loot`,这条立刻红
-     (那会同时撞红写域外的 `tests/WS-05` 冻结快照与 `WS-FND-01` A13)。 */
-  eq(f.bosses, 'e6bd03cc', '8 个 Boss 的 loot 字节级未变(CR-16 的纪律延续到 CR-27)');
+  /* ★ 负对照(结构性的):`loot` 是**唯一**能让 bosses 分区漂移的字段。
+     CR-27 时它仍是 e6bd03cc(746~754 只补进物品表,一件都没接进 Boss 的 `loot`)。
+     ★ CR-28 把这 7 件真接进了 `loot`(手册归属见 `shared/constants/bosses.ts` 的逐 Boss 注)
+     ⇒ bosses 分区 e6bd03cc → 8f50dc95,本行按 CR-28 同步(与 `content.baseline.json`、
+     `tests/WS-05` 的 W5-51 冻结快照同源)。守卫仍然有效:再往 `loot` 塞/删任何一件,这里立刻红。 */
+  eq(f.bosses, '8f50dc95', '8 个 Boss 的 loot 快照 = CR-28 之后的值(再动即红)');
 });
 
 /* ═════════════════ 4. 牧场产出可解析 ═════════════════ */

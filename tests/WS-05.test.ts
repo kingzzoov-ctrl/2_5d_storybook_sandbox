@@ -1189,8 +1189,11 @@ test('W5-50 生产入口真的存在:WorldSim 暴露 summon/damage/break/snapsho
  *
  * ⚠️ `loot` 被 `contentFingerprints()` 哈希(bosses 分区),改它会让指纹漂移并撞红
  *    WS-FND-01/06、data-conformance、README 四处**写域外**锚点。
- * ⇒ 修正一律走**新增可选字段**,`loot` 一个字节不动。下面每条都先断言「冻结字段没被改」,
- *    再断言「新字段把手册表达出来了」—— 前后两半互为约束。
+ * ⇒ CR-16 的修正一律走**新增可选字段**,`loot` 一个字节不动。
+ * ★ **CR-28**:手册的 7 件抽象奖励已由 CR-27 补录成物品(748~754),并按手册接进了
+ *    `loot` ⇒ 本块的 EXPECT 已同步为 CR-28 的值(bosses 分区 `e6bd03cc → 8f50dc95`),
+ *    与 `content.baseline.json` 同源。下面每条仍然「前半断言冻结字段的逐字快照、
+ *    后半断言手册内容被表达出来」—— 谁再动 `loot`,W5-51 立刻红。
  */
 
 test('W5-51 CR-16 冻结字段 loot 必须逐字保持原样(修正不得走改 loot 的路)', () => {
@@ -1198,13 +1201,16 @@ test('W5-51 CR-16 冻结字段 loot 必须逐字保持原样(修正不得走改 
      期望值抄自 CR-15 之后的实测快照,与 content.baseline.json 的 bosses 分区同源。 */
   const EXPECT: Record<string, number[]> = {
     boss_jelly_king: [704, 719, 727],
-    boss_beaver_mecha: [703, 437],
+    /* ★ CR-28:#748 自动伐木机甲图纸(手册 L496)接进 `loot` 第 3 位。 */
+    boss_beaver_mecha: [703, 437, 748],
     boss_fox_kitsune: [705, 720],
     boss_crab_kraken: [706, 721, 728],
     boss_scorpion_pharaoh: [707, 722],
-    boss_ginger_troll: [609, 613],
+    /* ★ CR-28:#754 城堡图纸 / #749 姜饼人随从(手册 L500)接进 `loot`。 */
+    boss_ginger_troll: [609, 613, 754, 749],
     boss_sky_whale: [117, 718, 440],
-    boss_chronos_colossus: [708, 723],
+    /* ★ CR-28:#750 纯金通关纪念碑(手册 L502)+ 3 件无 Boss 归属的 751/752/753(见 bosses.ts 注)。 */
+    boss_chronos_colossus: [708, 723, 750, 751, 752, 753],
   };
   eq(Object.keys(EXPECT).length, TOTAL_BOSS_COUNT, '8 个 Boss 全部登记,防止漏测');
   for (const [id, loot] of Object.entries(EXPECT)) {

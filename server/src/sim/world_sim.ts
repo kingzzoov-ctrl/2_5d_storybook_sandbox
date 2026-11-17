@@ -6539,10 +6539,19 @@ export class WorldSim {
    *    `fluid` ⇒ 计划里没有 `fluid` op ⇒ 液面按 `rebuildWorld` 后的空地重新开始;
    *    v2 有 ⇒ 逐格 `fluid.setCell({ amount })` 铺回去(未列出的格保持重建值,
    *    **不清零** —— 清零会把「归档里没有的水」也一并抹掉)。
-   * 3 **玩家血量:v1 归档没有 ⇒ 按不可用处理;v2 有则还原**。v1 头里没有 `hp`
-   *    ⇒ 玩家保持 `addPlayer` 登记后的满血(**不许**填一个 100);v2 有 ⇒ 写回
-   *    `vitals.hp` 并**自己重算 `downed`**(hp ≤ 0 ⇒ 倒地,避免「血量 0 不倒地」)。
-   */
+   * 3 **玩家血量与等级上限:v1 归档没有 `hp` ⇒ 按不可用处理;v2 有则还原**。
+   *    ★ 玩家分支的顺序是**硬约束**(换序静默出错,见方法内注释):
+   *    ```
+   *    ① 等级(progresses) → ② 上限(maxHpForLevel + syncMaxHp) → ③ hp → ④ downed
+   *    ```
+   *    ① 等级先落(v2 头里逐玩家写好);② 上限**复用** `maxHpForLevel`(唯一算子)
+   *    + `syncMaxHp`(vitals 唯一写入口),**不另写**派生公式;③ hp 原样交 `revive`
+   *    (钳制只在它那里);④ `downed` 由本层重算(hp ≤ 0 ⇒ 倒地,避免「血量 0 不倒地」)。
+   *    ⚠️ 若把 ③ 挪到 ② 之前:hp 会被 `addPlayer` 刚登记的构造缺省上限
+   *    `PLAYER_BASE_HP`(100)钳住 ⇒ 高等级玩家的归档血量**静默回滚成 100**。
+   *    ② 之前的 `level` 写回是它的前提(`levelOf` 读的就是这一份)。
+   *    v1 头里没有 `hp` ⇒ 上限照样按等级抬到位,`hp` 由 `revive` 缺省填满
+   *    (= 当前 `maxHp`,**不填一个 100** —— 高等级玩家填 100 不是满血)。 */
   applyRestore(plan: RestorePlan): {
     ok: boolean;
     reason?: string;
@@ -6605,16 +6614,34 @@ export class WorldSim {
       this.addPlayer(op.id, op.x, op.y);
       const b = this.physics.bodies.get(op.id);
       if (b !== undefined) b.z = op.z;
+      /* ★★ 顺序是**硬约束**(与 `restoreFromProfile` 同一条纪律;换序**静默出错**):
+         ```
+         ① 等级  →  ② 上限  →  ③ hp  →  ④ downed
+         ```
+         (1) `progressOf().level` 是权威等级(v2 头里逐玩家写好)。
+         (2) 上限**复用**既有的唯二入口:`maxHpForLevel`(上限的唯一算子 —— 纯转发
+            `statsAtLevel` + 料理 `hpFlat` + 房间乘区)+ `syncMaxHp`(vitals 的
+            唯一写入口)。这里**不写** `100 + 15*(lv-1)` —— 那是第二份派生公式,
+            正是 W1 的成因。
+         (3) hp 原样交给 `revive`,钳制(`0 ≤ hp ≤ maxHp`)**只**在它那里。
+         ⚠️ 反例(先 hp 后上限):`revive` 拿**当前**上限钳值,而 `addPlayer` 刚
+            登记的 `maxHp` 是构造缺省 `PLAYER_BASE_HP`(100)⇒ 5 级玩家归档里
+            的 160 血被钳成 100,归档值**当场丢**且**不报错**。
+            这就是 `restoreFromProfile` 第 3 步注释里记的同一个坑,这里由
+            `tests/WS-FND-83` 钉住。 */
       if (Number.isFinite(op.level)) this.progressOf(op.id).level = Math.trunc(op.level);
-      /* ★ v2 的玩家血量:`hp` **缺键 = 不可用**(v1 头里没有它)⇒ 保持
-         `addPlayer` 登记后的满血,**不许**在这里填一个 100。
-         有值才写回,并**自己重算 `downed`** —— `revive` 恒清 `downed`,
-         若把「hp ≤ 0 ⇒ 倒地」留给它就永远不成立(血量 0 却不倒地)。 */
-      if (op.hp !== undefined) {
-        this.vitals.revive(op.id, op.hp);
-        const v = this.vitals.get(op.id);
-        if (v !== null) v.downed = v.hp <= 0;
-      }
+      /* (2) 等级 → 上限。`levelOf` 取的是**上一步写回的**权威等级(没档案 = 1)。 */
+      const derived = this.maxHpForLevel(op.id, this.levelOf(op.id));
+      if (derived !== null) this.syncMaxHp(op.id, derived);
+      /* (3)(4) 血量:v2 有 `hp` 才写回;v1 缺键 = 不可用 ⇒ 满血
+         (`revive` 无参 = `hp = maxHp`,**不填一个 100** —— 上限此时已经是等级
+         派生值,填 100 就等于凭空扣血)。
+         倒地**自己重算**:`revive` 恒清 `downed`,若把「hp ≤ 0 ⇒ 倒地」留给它
+         就永远不成立(血量 0 却不倒地)。判据唯一输入是先写好的 `hp`。 */
+      if (op.hp !== undefined) this.vitals.revive(op.id, op.hp);
+      else this.vitals.revive(op.id);
+      const v = this.vitals.get(op.id);
+      if (v !== null) v.downed = v.hp <= 0;
       players += 1;
     }
 
