@@ -9,9 +9,9 @@
  *   node scripts/verify.ts --docs          # 只检查文档结构完整性
  *   node scripts/verify.ts --content       # 只做内容基线一致性检查
  *   node scripts/verify.ts --integration   # 只做跨 WS 集成检查
- *   node scripts/verify.ts --strict-taut   # 把「未登记的同义反复候选」升级为失败
- *   node scripts/verify.ts --strict-inert # 入口执行层:未登记项报错
- *   node scripts/verify.ts --strict-reach  # 把「未登记的不可达模块」升级为失败
+ *   node scripts/verify.ts --lenient       # 把「可达性缺口 / 同义反复候选 / 入口执行层失真」降级为只告警
+ *   (上面这三道**默认就拦**;旧参数 --strict-reach / --strict-taut / --strict-inert 保留为 no-op)
+ *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(用例数与耗时见其自身输出)
  *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(用例数与耗时见其自身输出)
  */
 
@@ -61,13 +61,20 @@ const frozenOnly = argv.includes('--frozen');
 const docsOnly = argv.includes('--docs');
 const integrationOnly = argv.includes('--integration');
 const contentOnly = argv.includes('--content');
-/** `--strict-reach`:把「未登记的不可达模块」从告警升级为失败。见 `checkReachability`。 */
-const strictReach = argv.includes('--strict-reach');
-/** `--strict-taut`:把「未登记的同义反复候选」从告警升级为失败。见 `checkTautology`。 */
-const strictTaut = argv.includes('--strict-taut');
-/* 入口执行层:与 --strict-reach / --strict-taut 同构 ——
-   新增未登记项默认只告警,本开关升级为失败。 */
-const strictInert = argv.includes('--strict-inert');
+/**
+ * ★ 2026-11-17(审计 P1):这三道**默认开启**。
+ *
+ * 旧口径是「新增欠账默认只告警,必须显式加 `--strict-*` 才拦」——
+ * 于是**漏带参数**就能让门禁全绿,而它自己只在汇总行印一句「按设计只告警」。
+ * 现在改成:默认三道都拦;`--lenient` 显式降级为只告警(必须主动写这个参数)。
+ * `--strict-*` 三个参数保留为向后兼容(现在是 no-op,不报错)。
+ */
+const LENIENT = argv.includes('--lenient');
+const strictReach = !LENIENT;
+/** 同 `strictReach`:默认拦,`--lenient` 才降级。见 `checkTautology`。 */
+const strictTaut = !LENIENT;
+/** 入口执行层,同上。见 `checkInertEntry`。 */
+const strictInert = !LENIENT;
 
 /**
  * `--all`:跑**全部**门禁(等价于不传任何选择性 flag)。
@@ -7444,8 +7451,8 @@ const adviseSuffix = advises === 0
   : ` · ⚠ ${advises} 项告警**未拦截**(`
     + [...advisedGates]
       .map((g) => (ADVISE_UPGRADE[g] === undefined
-        ? `${g}:**按设计只告警,无升级开关**`
-        : `${g}:加 ${ADVISE_UPGRADE[g]} 才算失败`))
+        ? `${g}:**按设计只告警(不属三道 strict)**`
+        : `${g}:去掉 --lenient 才算失败`))
       .join('; ')
     + ')';
 console.log(`\n${verdict}${adviseSuffix} · ${Date.now() - t0}ms`);
