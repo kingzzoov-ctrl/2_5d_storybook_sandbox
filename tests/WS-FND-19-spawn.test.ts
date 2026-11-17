@@ -33,11 +33,12 @@
  * 只有第 5 条会红 —— 它要求刷怪必须**经过** `decideSpawn` 的安全区判定。
  * 换句话说:它检验的不是「有没有怪」,而是「怪是按规则来的」。
  *
- * ## 已知边界(本套件不声称的事)
- * `addMob(id, …)` 用**同一个字符串**当实例 id 与 `MOB_BY_ID` 的查表键
- * ⇒ 当前世界**每物种最多一只**(见 `world_sim.ts` 的 `trySpawnOne` 注释)。
- * 故本文件断言的是「至少 1 只、且每只都是真物种」,
- * **不**断言能刷到 `BIOME_SPAWN.hardCap` 那么多只 —— 那要先拆 id 契约。
+ * ## 已知边界(本套件现在钉到哪)
+ * ★ 2026-11-16:`addMob(id, ...)` 的 id 契约**已拆成两层** —— 实例 id = `物种 id#序号`
+ * (`mobs/spawner.ts` 的 `mobInstanceId`),物种 id 仍是 `MOB_BY_ID` 的键。
+ * ⇒ 同物种**可以同时存在多只**(FND19-7/8/9 钉住),`BIOME_SPAWN.hardCap` 不再是死数。
+ * ⚠️ 但本文件**仍不声称能刷满 hardCap** —— 那要靠世界时间(每慢帧只试几只),
+ *    断言它会让套件变成"等 10 分钟"。这里钉的是**契约**,不是刷怪速度。
  */
 
 import { test, ok, eq, report, mulberry32 } from '../shared/testing/harness.ts';
@@ -84,7 +85,12 @@ const stepUntilWildlife = (rt: { step(p: unknown): unknown; cloneState(): unknow
  */
 type SimLike = {
   addMob(id: string, biome: string, x: number, y: number): void;
-  mobHost: { removeMob(id: string): boolean };
+  mobHost: {
+    removeMob(id: string): boolean;
+    runtimeOf(id: string): { def: { id: string }; alive: boolean } | null;
+    runtimes(): { id: string; alive: boolean }[];
+  };
+  unknownMobs: string[];
 };
 const hostSim = (a: { host: unknown }): SimLike => a.host as SimLike;
 
@@ -109,7 +115,10 @@ test('FND19-1 世界真的会刷出生物,而且进了权威快照', () => {
     ok(MOB_BY_ID.has(w.mobId), `快照里的 mobId 必须是真物种,实测 "${w.mobId}"`);
     ok(w.hp > 0, `${w.id} 应是活的(hp > 0),实测 ${w.hp}`);
     eq(w.maxHp > 0, true, `${w.id} 的 maxHp 应来自物种定义`);
-    eq(w.id, w.mobId, `当前 id 契约:实例 id = 物种 id(${w.id} vs ${w.mobId})`);
+    /* ★ 2026-11-16:实例 id 与物种 id 已拆开 ⇒ 实例 id 是 `物种 id#序号`。
+       (旧契约写的是 `eq(w.id, w.mobId, ...)` —— 那正是"每物种最多一只"的根。) */
+    ok(w.id.startsWith(`${w.mobId}${'#'}`), `${w.id} 应是「物种 id#序号」形态(物种 ${w.mobId})`);
+    ok(Number.isInteger(Number(w.id.split('#')[1])), `${w.id} 的序号应是整数`);
     /* 坐标必须落在世界内(刷怪点取的是格心,+0.5)。 */
     ok(w.x >= 0 && w.x < 64 && w.y >= 0 && w.y < 64, `${w.id} 的坐标应在世界内,实测 ${w.x},${w.y}`);
   }
@@ -215,6 +224,82 @@ test('FND19-6 刷出来的是**本群系**的物种(群系真的在起作用)', 
         `群系 ${biome} 只能刷本群系物种,实际刷出 "${w.mobId}"(不在 ${[...allowed].join('/')} 里)`);
     }
   }
+});
+/* ───────────────────────── 7 / 8 / 9:id 两层契约(2026-11-16)───────────────────────── */
+
+test('FND19-7 ★ 同物种**可以同时存在多只**(旧契约下第二只会覆盖第一只)', () => {
+  const a = world(32, false);
+  const sim = hostSim(a);
+  sim.addMob('mob_sheep#1', 'MEADOW', 4, 4);
+  sim.addMob('mob_sheep#2', 'MEADOW', 6, 6);
+
+  eq(sim.mobHost.runtimes().length, 2, '两只同物种实例必须**各自**登记');
+  eq(sim.mobHost.runtimeOf('mob_sheep#1')?.def.id, 'mob_sheep', '实例 #1 的物种仍是 mob_sheep');
+  eq(sim.mobHost.runtimeOf('mob_sheep#2')?.def.id, 'mob_sheep', '实例 #2 的物种仍是 mob_sheep');
+  eq(sim.unknownMobs.length, 0, '★ 带序号的 id 不该被当成"不认识的 id"');
+  /* 投影发生在 `step()` 里(`projectWildlife`),世界侧登记 ≠ 快照里有 —— 推一帧再读。 */
+  a.runtime.step(null);
+  eq(wildlifeOf(a.runtime).map((w) => w.id).sort().join(','), 'mob_sheep#1,mob_sheep#2',
+    '★★ 快照里两条各自独立(旧契约下这是同一个键 ⇒ 只剩一只)');
+});
+
+test('FND19-8 ★ 序号 id 查得到物种;老写法(纯物种 id)继续可用 + 未知物种仍要被抓出来', () => {
+  const a = world(32, false);
+  const sim = hostSim(a);
+  sim.addMob('mob_boar#7', 'MEADOW', 5, 5);
+  eq(sim.mobHost.runtimeOf('mob_boar#7')?.def.id, 'mob_boar', '带序号的 id ⇒ 仍解析到物种');
+  eq(sim.unknownMobs.includes('mob_boar#7'), false, '带序号的 id 不该进 unknownMobs');
+
+  /* 负对照:不能因为"都按 # 切一刀"就一律放行 —— 真·未知物种必须照旧显式登记。 */
+  sim.addMob('not_a_species#1', 'MEADOW', 9, 9);
+  eq(sim.unknownMobs.includes('not_a_species#1'), true, '★ 未知物种仍要进 unknownMobs(负对照)');
+
+  /* 兼容:测试与 `demo` 至今直接传物种 id ⇒ 必须继续工作(否则几十处夹具一起红)。 */
+  sim.addMob('mob_boar', 'MEADOW', 11, 11);
+  eq(sim.mobHost.runtimeOf('mob_boar')?.def.id, 'mob_boar', '纯物种 id 的老写法继续可用');
+});
+
+test('FND19-9 负对照:同一个实例 id 再放一次是**替换**,不是新增(序号必须唯一)', () => {
+  const a = world(32, false);
+  const sim = hostSim(a);
+  sim.addMob('mob_sheep#1', 'MEADOW', 4, 4);
+  sim.addMob('mob_sheep#1', 'MEADOW', 8, 8);
+  eq(sim.mobHost.runtimes().length, 1, '★ 序号重复 = 同一个实例 ⇒ 只应有一条(这正是世界侧要保证单调的原因)');
+  a.runtime.step(null);
+  eq(wildlifeOf(a.runtime).length, 1, '快照里也只应有一条');
+});
+
+test('FND19-10 ★★ 刷怪路径真的会刷出**同物种的第二只**(旧契约下这件事物理上不可能)', () => {
+  /* 为什么这条是本次改动的**唯一硬证据**:
+     FND19-7/8/9 钉的是"世界侧登记"这一层 —— 把 `trySpawnOne` 的按物种去重加回去,
+     它们照样全绿。只有"让刷怪自己刷出两只同物种"才能钉住那一行。
+
+     构造:SAKURA 群系只有 2 种可刷物种 ⇒ **抽 3 只必有重复**(鸽笼原理),
+     不需要等很久也不依赖运气。种子固定 ⇒ 结果确定(不是 flaky 断言)。 */
+  const a = assemble({
+    roomId: 'r_same_species', ownerId: 'u_owner', clock: { nowMs: () => 0 },
+    sizeCells: 48, mobs: true, biome: Biome.SAKURA, rng: mulberry32(5),
+  });
+  a.runtime.join({ userId: 'u_owner' });
+  const rt = a.runtime;
+
+  let frames = 0;
+  const MAX = 12000; /* 600 秒世界时间;实测远早于此(见断言里的 frames) */
+  while (frames < MAX && wildlifeOf(rt).length < 3) {
+    rt.step(null);
+    frames += 1;
+  }
+  const list = wildlifeOf(rt);
+  ok(list.length >= 3, `${MAX} 帧内应至少刷出 3 只(实测 ${list.length} 只 / ${frames} 帧)`);
+
+  const bySpecies = new Map<string, number>();
+  for (const w of list) bySpecies.set(w.mobId, (bySpecies.get(w.mobId) ?? 0) + 1);
+  const most = Math.max(...bySpecies.values());
+  ok(most >= 2,
+    `★ 同物种必须出现第二只(实测最多的一档只有 ${most} 只;为 1 说明刷怪仍在按物种去重)`);
+  /* 同物种多只 ⇒ 实例 id 必须互不相同(否则物理/AOI 会撞键,快照也会少一只)。 */
+  const ids = list.map((w) => w.id);
+  eq(new Set(ids).size, ids.length, '★ 实例 id 必须两两不同');
 });
 
 report('WS-FND-19');

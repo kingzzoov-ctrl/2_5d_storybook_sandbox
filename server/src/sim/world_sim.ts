@@ -43,7 +43,7 @@ import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 import { PhysicsWorld, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
-import { MobSpawner, spawnableMobs, spawnsPerCheck, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
 import { SignalGraph } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
@@ -174,7 +174,6 @@ import { createAfkPlayer, tickAfk, type AfkPlayer } from '../social/afk.ts';
 import '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
 import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
-import { MOB_BY_ID } from '../../../shared/constants/mobs.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
 import type { GroundItem, WorldPlayer, DamageResult } from '../mobs/behaviors.ts';
 import { DamageKind } from '../mobs/behaviors.ts';
@@ -522,6 +521,14 @@ export class WorldSim {
   readonly wiring: SignalGraph;
   readonly aoi: AoiManager;
   readonly spawner: MobSpawner;
+  /**
+   * **每个物种已经发到几号** —— 实例 id 的序号来源(见 `mobs/spawner.ts` 的 id 两层说明)。
+   *
+   * ⚠️ 单调递增、**永不复用**:复用会让"新刷的那只"继承死掉那只的击杀账
+   * (`killLedger` 按实例 id 去重)⇒ 经验被静默吞掉,而且不报错。
+   * 所以序号**不能**取"当前存活数 + 1"。
+   */
+  private readonly mobOrdinals = new Map<string, number>();
   readonly carry: CarrySystem;
   /**
    * 事件总线 —— 事件驱动子系统的共同出口。
@@ -2187,7 +2194,7 @@ export class WorldSim {
    * 返回 `ShareResult`,`null` 表示该怪不在 `MOB_BY_ID` 里(查不到等级/经验)。
    */
   private settleKill(mobId: string, x: number, y: number): ShareResult | null {
-    const def = MOB_BY_ID.get(mobId);
+    const def = mobDefOf(mobId);
     if (def === undefined) return null;
 
     /* 参与者 = 所有玩家,距离取与击杀点的平面距离。
@@ -3725,7 +3732,7 @@ export class WorldSim {
     this.spawner.add(biome, 1);
     /* 登记到宿主 —— 漏了这一步的表现是「AOI 唤醒了它,但宿主不认识,
        于是安静地跳过」:生物不动、不报错,像世界空了。 */
-    const def = MOB_BY_ID.get(id);
+    const def = mobDefOf(id);
     if (def) this.mobHost.addMob(id, def, x, y, { anchorX: x, anchorY: y });
     else this.unknownMobs.push(id);
   }
@@ -4681,24 +4688,19 @@ export class WorldSim {
    * 试刷一只。成功 = 世界里**真的多了一只活的**
    * (物理刚体 + AOI 记录 + 刷怪计数 + 宿主 AI,四件事由 `addMob` 一起做)。
    *
-   * ## 每物种最多一只 —— 这是**当前 id 契约的限制**,不是设计选择
-   * `addMob(id, …)` 拿**同一个字符串**当实例 id 与 `MOB_BY_ID` 的查表键
-   * (见本文件 `addMob` 里的 `MOB_BY_ID.get(id)`);攻击路径的 `mobDistance`
-   * 与 `world_sim.ts:1974` 的 `MOB_BY_ID.get(mobId)`、以及驯养层 4 处查表
-   * 也都按**物种 id** 查 ⇒ 两只 `mob_sheep` 会在物理 / AOI / 宿主里撞成同一个键。
+   * ## 实例 id 与物种 id 已经**拆开**(2026-11-16)
+   * 实例 id = `` `${物种 id}#序号` ``(`mobs/spawner.ts` 的 `mobInstanceId`),序号来自
+   * `mobOrdinals` 的单调计数器;物种 id 仍是 `MOB_BY_ID` 的键,查表一律走 `mobDefOf()`。
+   * ⇒ 同物种**可以同时存在多只**(原先"每物种最多一只"是 id 契约的限制,不是设计选择)。
+   * 配额由 `decideSpawn` 的群系 `softCap`/`hardCap` 与全局上限管,本函数不再自己按物种去重。
    *
-   * 所以这里**按物种去重**:已经活着的物种不再刷,名额用完就自然停止 ——
-   * 而不是刷出两只同 id 的怪让其中一只静默失效。
-   * 想要「一片草甸上十几只」必须先拆开实例 id 与物种 id
-   * (实例加 `#n` 后缀 + 上面那 7 处查表点先查 `runtimeOf()`),那是独立一件。
-   * **本函数不假装能刷到 `hardCap` 那么多只。**
+   * **本函数仍不假装能一次刷满** —— 每次慢帧只按 `spawnsPerCheck` 试几只。
    */
   private trySpawnOne(biome: string): boolean {
-    /* ⚠️ 只算**活着**的:`runtimes()` 返回全部登记项(含尸体)⇒
-       不过滤会让"这个物种已经刷过"永远为真 —— 杀一只,该物种**永不重生**
-       (审查 A5:42 种刷完世界空掉,且没有任何日志)。 */
-    const alive = this.mobHost.runtimes().filter((rt) => rt.alive);
-    const roster = spawnableMobs(biome).filter((d) => !alive.some((r) => r.def.id === d.id));
+    /* ★ 拆开两层之后不再按物种去重(旧写法:`alive.some(r => r.def.id === d.id)` 被过滤掉)。
+       `runtimes()` 里含尸体(`alive === false`),但实例 id 唯一 ⇒ 不会撞键,故不过滤。 */
+    const roster = spawnableMobs(biome);
+    if (roster.length === 0) return false;
     if (roster.length === 0) return false;
     const def = roster[Math.floor(this.rng() * roster.length) % roster.length]!;
     /* +0.5:落在**格心**。整数坐标在 `WorldGrid` 上是格的角,
@@ -4717,7 +4719,10 @@ export class WorldSim {
        阻尼(≥softCap 时 roll < 0.5 直接拒)。复用坐标那两次取数会让
        「刷不刷」与「刷在哪」完全相关 —— 同一片坐标永远同命运。 */
     if (!this.spawner.canSpawn(ctx, this.spawnWorld(), this.rng())) return false;
-    this.addMob(def.id, biome, x, y);
+    /* 序号**先增后用**:同一物种第二次刷出来是 `mob_sheep#2`,与 #1 各自独立(物理/AOI/账本)。 */
+    const ordinal = (this.mobOrdinals.get(def.id) ?? 0) + 1;
+    this.mobOrdinals.set(def.id, ordinal);
+    this.addMob(mobInstanceId(def.id, ordinal), biome, x, y);
     return true;
   }
 

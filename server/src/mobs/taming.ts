@@ -6,7 +6,11 @@
  * 出战上限:默认 1 只;装备 `628 繁花鹿角园艺冠` 后解锁第 2 只。
  */
 
-import { MOB_BY_ID, MOB_LIST } from '../../../shared/constants/mobs.ts';
+import { MOB_LIST } from '../../../shared/constants/mobs.ts';
+/* ★ 生物 id 的**两层**只有一处规则:`mobs/spawner.ts` 的 `mobDefOf` / `mobSpeciesId`。
+   这 5 处原先各自 `MOB_BY_ID.get(id)`,都隐含"id 就是物种 id" —— 实例 id 带 `#n` 之后
+   每一处漏改都是**静默**的(驯养返回 unknown_mob、农场不产出,都不抛错)。 */
+import { mobDefOf, mobSpeciesId } from './spawner.ts';
 import type { MobDef } from '../../../shared/types/entities.ts';
 import { MobBehavior } from '../../../shared/types/entities.ts';
 
@@ -83,21 +87,24 @@ export function tameableDefs(): MobDef[] {
 
 /** 生物是否为可驯养类别。 */
 export function canTame(mobId: string): boolean {
-  const def = MOB_BY_ID.get(mobId);
+  const def = mobDefOf(mobId);
   if (!def) return false;
   return def.behavior === MobBehavior.TAMEABLE || def.behavior === MobBehavior.MOUNT
     || def.behavior === MobBehavior.PASSIVE_UNKILLABLE;
 }
 
 export function createPetRecord(mobId: string, now = 0): PetRecord | null {
-  const def = MOB_BY_ID.get(mobId);
+  /* 记录里存**物种 id**:`PetRecord.mobId` 下游全按物种用(喂养需求 / 产出 / 负载),
+     存实例 id 会让同物种的第二只宠物自成一档。 */
+  const species = mobSpeciesId(mobId);
+  const def = mobDefOf(mobId);
   if (!def || !canTame(mobId)) return null;
   return {
-    mobId,
+    mobId: species,
     name: def.name,
     stage: TameStage.WILD,
     fedCount: 0,
-    requiredFeeds: TAME_FEED_COUNT[mobId] ?? DEFAULT_TAME_FEED_COUNT,
+    requiredFeeds: TAME_FEED_COUNT[species] ?? DEFAULT_TAME_FEED_COUNT,
     command: TameCommand.STAY,
     saddle: false,
     inRanch: false,
@@ -116,7 +123,7 @@ export function createPetRecord(mobId: string, now = 0): PetRecord | null {
  *  - 已驯化再次喂食 → 仅补充 `lastProduceAt`,不重复发奖。
  */
 export function feedPet(pet: PetRecord, itemId: number): TameResult {
-  const def = MOB_BY_ID.get(pet.mobId);
+  const def = mobDefOf(pet.mobId);
   if (!def) return { ok: false, stage: pet.stage, reason: 'unknown_mob' };
   if (pet.stage === TameStage.TAMED) {
     return { ok: false, stage: pet.stage, reason: 'already_tamed' };
@@ -216,7 +223,7 @@ export function tickRanch(pets: PetRecord[], now: number): RanchYield[] {
     if (!pet.inRanch) continue;
     if (now - pet.lastProduceAt < RANCH_PRODUCE_SEC) continue;
     pet.lastProduceAt = now;
-    const def = MOB_BY_ID.get(pet.mobId);
+    const def = mobDefOf(pet.mobId);
     if (!def) continue;
     const dropId = Number(Object.keys(def.drops)[0]);
     const bonus = (counts.get(pet.mobId) ?? 0) >= 3 ? 1 : 0;
@@ -236,7 +243,7 @@ export const CARRY_MAX_SLOTS = 12;
 export const CARRY_SPEED_PENALTY = 0.9;
 
 export function carrySlots(mobId: string): number {
-  const def = MOB_BY_ID.get(mobId);
+  const def = mobDefOf(mobId);
   if (!def) return 0;
   return Math.min(CARRY_MAX_SLOTS, CARRY_BASE_SLOTS + Math.floor(def.level / 5));
 }

@@ -30,7 +30,7 @@
 
 import { Biome } from '../../../shared/types/entities.ts';
 import { CHUNK_SIZE } from '../../../shared/types/tile.ts';
-import { MOB_LIST, mobsByBiome } from '../../../shared/constants/mobs.ts';
+import { MOB_BY_ID, MOB_LIST, mobsByBiome } from '../../../shared/constants/mobs.ts';
 import type { MobDef } from '../../../shared/types/entities.ts';
 import { MobBehavior } from '../../../shared/types/entities.ts';
 
@@ -348,3 +348,49 @@ export function biomeCoverage(): Record<string, number> {
 
 /** 全表生物数(供文档一致性校验)。 */
 export const SPAWNER_MOB_TOTAL = MOB_LIST.length;
+
+/* ═══════════ 生物 id 的**两层**:实例 id 与物种 id ═══════════ */
+
+/**
+ * 实例 id 与物种 id 的分隔符。
+ *
+ * ## 为什么要分两层(★ 拆掉的是一条**当前契约的限制**)
+ *
+ * 原先 `addMob(id, ...)` 拿**同一个字符串**同时当实例 id 与 `MOB_BY_ID` 的查表键,
+ * 于是「两只 `mob_sheep`」会在物理 / AOI / 宿主登记里撞成同一个键 ——
+ * 世界侧只能**按物种去重**(每物种最多 1 只),`BIOME_SPAWN.hardCap` 永远达不到。
+ *
+ * 现在:实例 id = `` `${物种 id}#序号` ``(**序号单调递增、永不复用**),
+ * 物种 id 仍然是内容表的键。两层之间的换算**只有下面三处导出**:
+ * 任何地方再写一次"按 `#` 切一刀"就是第二份实现。
+ *
+ * ⚠️ 序号**不许复用**:复用会让"新刷的那只"继承死掉那只的击杀账(`killLedger` 按实例 id 去重)
+ * ⇒ 经验被静默吞掉。所以序号来自世界侧的单调计数器,不是"当前存活数 + 1"。
+ */
+export const MOB_INSTANCE_SEP = '#';
+
+/** 生成实例 id(物种 id + 序号)。`ordinal` 必须 ≥ 1(0 会让首个实例与物种 id 同形)。 */
+export function mobInstanceId(speciesId: string, ordinal: number): string {
+  return `${speciesId}${MOB_INSTANCE_SEP}${Math.max(1, Math.trunc(ordinal))}`;
+}
+
+/**
+ * 从实例 id 取回**物种 id**。没有序号的字符串原样返回 ——
+ * 这条回退是**必需**的:测试与 `demo` 至今仍用物种 id 直接 `addMob`(同一个契约的老写法)。
+ */
+export function mobSpeciesId(instanceId: string): string {
+  const i = instanceId.indexOf(MOB_INSTANCE_SEP);
+  return i < 0 ? instanceId : instanceId.slice(0, i);
+}
+
+/**
+ * **唯一**的"按 id 查物种定义"处(实例 id 与物种 id 都吃)。
+ *
+ * 全仓原先有 8 处 `MOB_BY_ID.get(id)`(世界侧 2 处 + 驯养层 5 处 + 宿主注册 1 处),
+ * 每一处都隐含"id 就是物种 id"这个前提。拆开两层之后,任何一处漏改的表现都是
+ * **静默的**:查不到 def ⇒ 生物"存在但不行为"、驯养返回 `unknown_mob`、农场不产出
+ * —— 都不抛错。⇒ 收成一处。
+ */
+export function mobDefOf(id: string): MobDef | undefined {
+  return MOB_BY_ID.get(mobSpeciesId(id));
+}

@@ -212,6 +212,21 @@
 5 **227 浇灭 coop 工位**(`rush_order.ts` 的 `STATION_STATE.BURNING` / `opts.spraying`)——
   工位槽位**没有世界坐标**,`opts.spraying` 只能按"种类"喂 ⇒ 玩家动作无法映射到它(设计缺口)。
 
+### 二之十、2026-11-16 **第三批**:生物 id 拆成两层(实例 id ≠ 物种 id)
+
+| 事项 | 落点 | 判据 |
+|---|---|---|
+| 同物种可以存在多只 | `mobs/spawner.ts` 新增三处**唯一**的 id 规则:`MOB_INSTANCE_SEP` / `mobInstanceId` / `mobSpeciesId` / `mobDefOf`;`WorldSim.trySpawnOne` 用 `mobInstanceId(def.id, 序号)` 刷怪并**去掉按物种去重**;序号来自 `mobOrdinals`(单调、永不复用) | `WS-FND-19` FND19-7/8/9/10(10 条) |
+| 8 处查表点收成一处 | 世界侧 `settleKill` / `addMob`、驯养层 5 处,原先各自 `MOB_BY_ID.get(id)` —— 全部改走 `mobDefOf(id)` | FND19-8(带序号 ⇒ 查得到;未知物种 ⇒ 仍进 `unknownMobs`) |
+| 投影本来就分两层 | `listWildlife()` 早就有 `id` 与 `mobId` 两个字段 ⇒ **网络侧一行没改** | FND19-7(快照里两条各自独立) |
+
+**为什么这次能拆(而前几轮列成"独立一件")**:拆的前提是"8 处查表点全部收口 + 序号永不复用",
+两件事都在这一批里做掉了。**注入验证**:M10(让 `mobSpeciesId` 不切序号)⇒ 6 条红;
+M11(把按物种去重加回 `trySpawnOne`)⇒ 只有 FND19-10 红 —— 那正是它的存在理由。
+
+**仍未做**:刷满 `BIOME_SPAWN.hardCap` **没有被判据覆盖**(那要靠世界时间,断言它等于让套件等十分钟)
+⇒ 本批只钉"契约允许同物种多只 + 刷怪路径真的会刷出第二只",不声称"能刷满"。
+
 ## 未接线(2 / 23)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)

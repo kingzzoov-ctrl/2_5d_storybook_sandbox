@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1822 条 / 66 套件** | WS 1014 条 / 14 套件 · 基座 FND 808 条 / 52 套件 |
+| 用例 | **1826 条 / 66 套件** | WS 1014 条 / 14 套件 · 基座 FND 812 条 / 52 套件 |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,12 +387,12 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-d4fee24dd70a  README.md
+412fc3100d39  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-905bb9734d24  docs/COMPLETION-CRITERIA.md
+372425560824  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。
