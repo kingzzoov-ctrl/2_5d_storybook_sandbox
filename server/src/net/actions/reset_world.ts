@@ -9,8 +9,9 @@
  * 正是本仓反复防的那类两份实现。
  *
  * ⇒ 本文件是这条路的**动作层那一半**:权限 / 报文 / **能力缺失** / 回执。
- *    宿主那一半(`WorldSim.resetWorld`)今天**不存在**,故生产里走的是
- *    「能力缺失 ⇒ **显式** `NOT_IMPLEMENTED`」分支 —— 那是**如实**回执,不是占位。
+ *    宿主那一半(`WorldSim.resetWorld`)已于 **D-06** 落地(见 `world_sim.ts` 的
+ *    `resetWorld`,做法 = 同一实例 + 换新子系统,in-place rebuild);能力**仍然可选**,
+ *    缺能力时走「能力缺失 ⇒ **显式** `NOT_IMPLEMENTED`」分支 —— 那是**如实**回执,不是占位。
  *
  * ## 报文契约 `{ seed: number, confirm: true }`
  *
@@ -24,7 +25,7 @@
  * 1 `authorize`(`RESET_WORLD` 的权限位是 `destructive`,仅 OWNER)⇒ `PERMISSION`;
  * 2 `confirm === true` 且 `seed` 是有限整数 ⇒ 否则 `INVALID`;
  * 3 `host === null`(本房间没有模拟层)⇒ `NOT_IMPLEMENTED`(与 `material.ts` 同契约);
- * 4 `host.resetWorld` **不存在**(今天生产的形态)⇒ `NOT_IMPLEMENTED` + 可读理由;
+ * 4 `host.resetWorld` **不存在**(宿主没实现)⇒ `NOT_IMPLEMENTED` + 可读理由;
  * 5 调它:`applied: true` ⇒ `OK` + `effect`;`applied: false` ⇒ `NOT_IMPLEMENTED` + 宿主给的理由
  *   (「能力在、这次没成」不是客户端的错,也不是成功)。
  *

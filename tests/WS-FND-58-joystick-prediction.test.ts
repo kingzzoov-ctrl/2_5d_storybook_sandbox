@@ -24,8 +24,8 @@
  * | 5 | `mergeCmd`:摇杆推了压过 WASD,松手回落 WASD,`seq` 不变 | 两路**相加** / 合并时重编 seq |
  * | 6 | `ackedSeq` 前进 ⇒ `pending` 变短且 `prunedTotal` 增长(确定性) | 剪枝被删 / 计数器不涨 |
  * | 7 | 负对照:`ackedSeq` **未推进** ⇒ 一条都不剪 | 每帧无条件清队列(会"通过"6 却丢输入) |
- * | 8 | 服务端记录 `seq`;`shared/net/delta.ts` 里**没有** `ackedSeq` | 偷偷改冻结层 / 服务端不记 |
- * | 9 | `?server=off` ⇒ 不发包;`main.ts` 真装配了摇杆 | 把 `session !== null` 那道闸拆了 |
+ * | 8 | 服务端**每连接**记账(`lastAckedSeqFor`);冻结层**已解锁**(包头带 `ackedSeq`) | 偷偷删掉那 4 字节 / 退回全局 ack |
+ * | 9 | `?server=off` ⇒ 不发包;`main.ts` 装了摇杆 + **上行带 seq** + **下行 ack 喂进预测器** | 拆 `session !== null` 那道闸 / 少一个生产者 |
  */
 
 import { test, ok, eq, near, report } from '../shared/testing/harness.ts';
@@ -229,7 +229,7 @@ test('FND58-7 负对照:`ackedSeq` 未推进(重复/倒退/缺失)⇒ 一条都�
 
 /* ═══════════════ 4. 服务端那一半 + 冻结层的边界 ═══════════════ */
 
-test('FND58-8 服务端记录 `seq`(上行);`shared/net/delta.ts` 里**没有** `ackedSeq`', () => {
+test('FND58-8 服务端**每连接**记账;冻结层**已解锁**(包头带 `ackedSeq`)', () => {
   /* 1 上行 `seq` 可选且必须是非负整数 —— 它是"处理到第几条",不是坐标。 */
   const good = parseMoveIntent({ tick: 5, x: 1, y: 2, z: 0, seq: 7 });
   ok(good.ok, '合法移动意图不该被拒');
@@ -248,20 +248,30 @@ test('FND58-8 服务端记录 `seq`(上行);`shared/net/delta.ts` 里**没有** 
 
   /* 2 ★ 冻结层证据:`shared/net/delta.ts` 是**下行帧**的定义处,
      而里面**没有** `ackedSeq` ⇒ 要把 ack 放进**编码帧**,必须改冻结层。
-     这条断言的作用是**在测试里留证**:若哪天它变红,说明协议真的被扩了
-     —— 那时要么是 owner 解锁了冻结层(该更新本文件),要么是有人偷偷改的。 */
+     这条断言的作用是**在测试里留证**:它一旦变红,说明协议**又**被改了
+     (改回去/挪位置/换编码都算)。 */
   const deltaSrc = readCode('shared/net/delta.ts');
   ok(/export function encodeFull\(/.test(deltaSrc), 'encodeFull 仍在冻结层里(它不是本套件能改的东西)');
-  ok(!/ackedSeq/.test(deltaSrc), '`shared/net/delta.ts` 里不许出现 ackedSeq(未解锁就必须是 0 次)');
+  ok(/ackedSeq/.test(deltaSrc), '★ 冻结层已解锁:包头带 ackedSeq(本行变红 = 有人又把它删了)');
+  ok(/w\.u32\(0\)/.test(deltaSrc), 'encode 侧确实写出了那 4 字节占位(0 = 「没有 ack」)');
+  ok(/r\.u32\(\) - 1/.test(deltaSrc), 'decode 侧把线上值减 1 还原(线上编码 = ackedSeq + 1)');
 
-  /* 客户端也还没有消费点:`session.ts` 的下行分派只有 welcome / actionResult / 二进制包。 */
-  const sessionSrc = readCode('client/src/net/session.ts');
-  ok(!/ackedSeq/.test(sessionSrc), '`client/src/net/session.ts` 里 ackedSeq 仍应 0 次');
+  /* 3 ★ ack 的**落点**:由 delta.ts 解码 ⇒ 由 state_store.ts 记账。
+     ⚠️ 这里**不再**断言"session.ts 里 ackedSeq 0 次" —— 那是解锁**前**的口径
+     (冻结层没有这个字段时,"运输层也没碰它"才说明没人偷偷扩协议)。
+     现在 ack 已是协议的一部分,有意义的不变量变成「**谁**落了账」,
+     端到端的判据在 `tests/WS-FND-63-acked-seq-e2e.test.ts`。 */
+  const storeSrc = readCode('client/src/net/state_store.ts');
+  ok(/lastAckedSeq/.test(storeSrc), '★ ack 的消费点在 state_store(解码结果落账)');
+  ok(/pkt\.ackedSeq/.test(storeSrc), '★ 落的就是**解码**出来的那个数(不是本地推的)');
 
-  /* 服务端那一半确实在岗(否则上面的"等冻结层"就是个空借口)。 */
+  /* 4 服务端那一半确实在岗,而且必须是**每连接**的账。
+     旧写法是闭包级 `let lastAckedSeq`(多连接互相冒充)⇒ 这里同时钉住它**不在**。 */
   const wsSrc = readCode('server/src/net/ws_server.ts');
-  ok(/lastAckedSeq\(\): number/.test(wsSrc), 'WsServerHandle 必须暴露 lastAckedSeq');
-  ok(/lastAckedSeq = intent\.seq/.test(wsSrc), '只有**应用成功**之后才推进 ack');
+  ok(/lastAckedSeqFor\(userId: string\): number/.test(wsSrc), 'WsServerHandle 必须暴露**每连接**的 ack 读数');
+  ok(/c\.ackedSeq = intent\.seq/.test(wsSrc), '只有**应用成功**之后才推进,且推的是本连接的账');
+  ok(/withAckedSeq\(payload, c\.ackedSeq\)/.test(wsSrc), '广播必须**逐连接**重写包头那 4 字节');
+  ok(!/let lastAckedSeq\b/.test(wsSrc), '★ 闭包级全局 ack 必须消失(它正是"互相冒充"的成因)');
 });
 
 /* ═══════════════ 5. 生产装配(?server=off 与摇杆接线)═══════════════ */
@@ -284,6 +294,13 @@ test('FND58-9 `?server=off` 不发包;`main.ts` 真把摇杆接进了预测链(�
   /* 4 自检口径可读:否则"剪枝跑没跑"只能靠读代码 */
   ok(/ackedSeq: predictor\.lastAckedSeq/.test(main), '__stageReady 必须暴露 ackedSeq');
   ok(/stickMagnitude: stick\.vector\(\)\.magnitude/.test(main), '__stageReady 必须暴露摇杆幅值');
+  /* 5 ★ D-14(2026-11-17):上行 `seq` 的**生产者**与下行 ack 的**喂入点**。
+     缺任何一个,整条链就是"看起来接上了"而实际永不动:
+       · 不发 seq ⇒ 服务端永远没有 ack 可推(上游 TASK-100 实测:这个生产者此前**不存在**);
+       · 不喂 `store.lastAckedSeq` ⇒ 预测器永远不剪(剪枝实现只是"存在")。 */
+  ok(/seq: cmd\.seq/.test(main), '★ sendMove 必须带上 `cmd.seq`(整个上行 ack 的地基)');
+  ok(/ackedSeq: handle\.store\.lastAckedSeq/.test(main),
+    '★ 预测器必须吃**线上来的** ack(`store.lastAckedSeq`),不许本地另造一个');
 });
 
 report('WS-FND-58');

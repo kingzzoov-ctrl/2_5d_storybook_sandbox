@@ -425,29 +425,36 @@ console.log('\n— 下行帧分派(★ 含一处真实的值碰撞回归)—');
  *
  * ```
  * 服务端下行 = **裸协议包**(room.ts 三处出口都直接返回 `.bytes`)
- * 裸包首字节 = PROTOCOL_VERSION = **1** = 0x01 = FRAME_TEXT
- * ⇒ 第一版分派写的是 `if (bytes[0] === FRAME_TEXT) { 当 JSON 解析 }`
- *   ⇒ 裸包首字节恰好命中 ⇒ 被当 JSON ⇒ JSON.parse 抛 ⇒ state='failed'
- *   ⇒ ★ **端到端全线失败**
- * ⇒ 而本套件**从未测到** —— 因为原用例全部走 `binaryFrame()`(人为加了 0x02 tag),
- *   而真服务端**不加 tag**。
+ * 裸包首字节 = PROTOCOL_VERSION
+ *   v1 时它 = **1** = 0x01 = FRAME_TEXT
+ *   ⇒ 第一版分派写的是 `if (bytes[0] === FRAME_TEXT) { 当 JSON 解析 }`
+ *     ⇒ 裸包首字节恰好命中 ⇒ 被当 JSON ⇒ JSON.parse 抛 ⇒ state='failed'
+ *     ⇒ ★ **端到端全线失败**
+ *   ⇒ 而本套件**从未测到** —— 因为原用例全部走 `binaryFrame()`(人为加了 0x02 tag),
+ *     而真服务端**不加 tag**。
+ * ★ 2026-11-17(D-14 / 方案 A):版本 1 → **3**(包头加 4 字节 ackedSeq)。
+ *   3 既不等于 FRAME_TEXT(0x01)也不等于 FRAME_BINARY(0x02)
+ *   —— 这正是"跳过 2"的理由(2 会与 FRAME_BINARY 撞值)。
  * ```
- * ⇒ ∴ 本节同时钉两件事:① 四种下行形态都能通;② 那次碰撞的**具体值**被记住。
+ * ⇒ ∴ 本节同时钉三件事:1 判"是不是文本"**只能靠内容特征**;
+ *   2 四种下行形态都能通;3 版本号那两个**保留值**被记住(改回 1/2 会红)。
  */
-test('分派 · ★ 裸协议包(真服务端行为)必须能通 —— 这是碰撞点', () => {
+test('分派 · ★ 裸协议包(真服务端行为)必须能通 —— 首字节是版本号,不是 tag', () => {
   const st = createRoomState('r');
   st.players.push(createPlayerState('p1', { name: 'n', x: 1, y: 2 }));
   const bare = encodeFull(st, 7).bytes;
-  /* 先钉住碰撞的前提:裸包首字节 == FRAME_TEXT 的值(0x01) */
-  eq(bare[0], 0x01, '★ 裸包首字节是 1');
+  /* 字面量锚定:右侧**不是** import 来的常量(那会两边同源、改常量也全绿)。 */
+  eq(bare[0], 3, '★ 裸包首字节是版本号 3(v1 时是 1,与 FRAME_TEXT 撞值)');
   eq(bare[0], PROTOCOL_VERSION, '★ 它就是 PROTOCOL_VERSION');
-  ok(bare[0] === 0x01, '★ 而与 FRAME_TEXT(0x01)**同值** —— 这就是碰撞');
+  ok(bare[0] !== 0x01, '★ 不再与 FRAME_TEXT(0x01)同值 —— 那次碰撞已经消掉');
+  ok(bare[0] !== 0x02, '★★ 也**不许**与 FRAME_BINARY(0x02)同值 —— 所以版本不能是 2');
 
   const d = classifyDownlink(bare);
-  eq(d.kind, 'binary', '★ 必须判成 binary(不能因为首字节是 0x01 就当文本)');
+  eq(d.kind, 'binary', '★ 必须判成 binary(按内容特征判,不靠"首字节恰好是什么")');
   eq(d.payload.length, bare.length, '★ 且**不切字节**(裸包没有 tag 可切)');
   const pkt = decodePacket(d.payload);
   eq(pkt.tick, 7, '原样解码后 tick 正确');
+  eq(pkt.version, 3, '解码出的版本号 = 3');
 });
 
 test('分派 · 四种下行形态全部可通', () => {

@@ -232,6 +232,22 @@ export function encodeClientFrame(payload: Uint8Array, isText: boolean): Uint8Ar
  *       「dist(新旧坐标) / tick 差」与窗口速率 —— 方向向量喂给它没有意义。
  * 字段名与服务端 `room.colyseus.ts` 的 `onMessage('move')` 入参逐字相同。
  * ```
+ *
+ * ## ★ `seq`(D-14,2026-11-17):这条上行是「第几条命令」
+ *
+ * 它是下行包头 `ackedSeq` 的**因**:服务端在 `applyMove` **成功之后**记下
+ * 这条连接的 `seq`(见 `ws_server.ts` 的 `onMove`),下一帧把它写进包头
+ * ⇒ 客户端据此剪掉已确认的预测命令(`predictor.pruneCmds`)。
+ *
+ * ```
+ * 生产者:client/src/main.ts 把 `cmd.seq`(来自 input.ts,单调递增,首个 = 1)带上
+ * ```
+ * ⚠️ 没有它整条 ack 链**接不上**,而症状是「服务端收到了移动、客户端却永不剪枝」
+ *    —— 两边都不报错(上游 `docs/TASK-100-ackedseq-frozen-unlock.md` 实测:
+ *    这条生产者此前**不存在**)。
+ *
+ * ⚠️ 服务端对它的校验是「非负整数」,坏值(1.5 / -3 / NaN)当**没给**
+ *    (`ws_server.ts` 的 `parseMoveIntent`)—— 与 `speedMul` 同一取舍。
  */
 export interface MoveIntent {
   /** 客户端 tick(用于 ac 的速率窗口)。 */
@@ -241,6 +257,8 @@ export interface MoveIntent {
   z: number;
   /** 速度倍率(装备 / 料理 / 叠罗汉)。省略时服务端按 1 处理。 */
   speedMul?: number;
+  /** 客户端命令序号 —— 服务端回执(包头 `ackedSeq`)就是它。省略 ⇒ 这条不带 ack。 */
+  seq?: number;
 }
 
 /**

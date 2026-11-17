@@ -135,15 +135,20 @@ test('FND34-3 种子非法(缺 / 小数 / NaN / 字符串 / Infinity)⇒ INVALID
   eq(seen.length, 0, '★ 六种非法载荷之后宿主仍然是零调用');
 });
 
-test('FND34-4 **真宿主**没有这个能力(今天生产的形态)⇒ NOT_IMPLEMENTED + 理由说清', () => {
-  const r = makeRoom('OWNER'); /* 不挂能力 */
+test('FND34-4 真宿主**有**这个能力(D-06 已落地)⇒ 摘掉能力后 NOT_IMPLEMENTED + 理由说清', () => {
+  const r = makeRoom('OWNER');
 
-  /* 先把"今天确实没有"这个事实钉住 —— 将来宿主实现了它,这里会先红。 */
+  /* D-06 重钉:世界宿主今天**有** `resetWorld`(内存重建 + 注入归档口)。
+     旧的负对照('真宿主没有这个能力')已随裁决失效,故拆成两步:
+     1) 先钉住"生产形态确实有能力"(谁把 D-06 摘掉,这里先红);
+     2) 再用实例影子属性把能力摘掉 —— 动作层读的就是这条属性查找路径 ——
+        验证降级路径仍然**显式**(NOT_IMPLEMENTED + 说清理由),不是静默成功。 */
   eq(
     typeof (r.host as unknown as { resetWorld?: unknown }).resetWorld,
-    'undefined',
-    '今天的世界宿主没有 resetWorld(如实边界)',
+    'function',
+    'D-06:世界宿主必须提供 resetWorld',
   );
+  (r.host as unknown as { resetWorld?: unknown }).resetWorld = undefined;
 
   const out = disp(r.rt, { confirm: true, seed: 99 });
 

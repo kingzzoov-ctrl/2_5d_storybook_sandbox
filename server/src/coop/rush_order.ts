@@ -563,6 +563,51 @@ export function stationsBeingSprayedBy(
   }
   return out;
 }
+/* ───────────────────────────────────────────────────────────────────
+ * 2c. 工位状态**读口**(D-13 端到端判据缺的那一半)
+ *
+ * 起因:「玩家用 227 浇了正在起火的工位,0.5 秒后它真的不烧了」这句话
+ * 此前**写不成判据** —— `tickRushOrder` 只吃不吐(`string[]` 是事件名),
+ * 而 `RushOrderSession.stations` 是裸数组、会话又被 `world_sim.ts` 私有持有
+ * ⇒ 世界侧判据只能逐个字段翻 `.stations[i].state`(下标是**布局巧合**,不是接口)。
+ * ⇒ 缺的不是灭火规则,而是一个**只读出口**:说清「此刻这个工位什么状态」
+ *   与「此刻谁在烧」。owner 已批准加这两个(纯读,不动任何既有语义与签名)。
+ *
+ * ⚠️ 两者都是**纯读**:不推进计时、不写任何字段、不抛错。
+ *    `null` 会话(房间里没开急单)一律**明确返回**,绝不返回 `undefined`。
+ * ─────────────────────────────────────────────────────────────────── */
+
+/**
+ * 某工位**此刻**的状态;`null` 会话 / 会话里没有该工位 / 未知 kind ⇒ `null`。
+ *
+ * 为什么显式收 `null`:接线层用「`rushRun === null`」表示本房间没开急单
+ * (`world_sim.ts` 的 `rushRun`),判据从世界侧取到的**正是** `null`。
+ * 让它在这一层兜住,判据就不必先分支 —— 先分支的写法极易滑成
+ * 「没开局就直接跳过断言」,那样这条判据就没在测任何东西。
+ */
+export function stationStateOf(s: RushOrderSession | null, kind: StationKind): StationState | null {
+  if (s === null) return null;
+  for (const st of s.stations) if (st.kind === kind) return st.state;
+  return null;
+}
+
+/**
+ * 此刻**在烧**(`BURNING` / `EXTINGUISHING`)的工位种类,顺序 = 工位表顺序。
+ *
+ * 与 `stationsBeingSprayedBy` 的**状态口径逐字相同**(见 2b 节第 3 条):
+ * `EXTINGUISHING` 算「在烧」—— 排除它,累计 `EXTINGUISH_SEC` 的规则会在第二步
+ * 被自己的状态归零断掉(`dousedSec` 清零)⇒ 永远灭不掉。
+ * 两者只差**坐标**:本函数回答「谁在烧」,`stationsBeingSprayedBy` 回答
+ * 「站在这儿浇,能浇到谁」。
+ */
+export function sprayableKinds(s: RushOrderSession | null): StationKind[] {
+  const out: StationKind[] = [];
+  if (s === null) return out;
+  for (const st of s.stations) {
+    if (st.state === STATION_STATE.BURNING || st.state === STATION_STATE.EXTINGUISHING) out.push(st.kind);
+  }
+  return out;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 3. 偷木板河狸事件 + 222 大锤夺回

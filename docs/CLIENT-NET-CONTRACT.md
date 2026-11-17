@@ -99,9 +99,10 @@ enum-client 侧字段表:      **不存在**(client/src 里 FIELD_TABLE / POS_SC
 ### 2.3 报文**字节**布局(实测 `decodePacket`)
 
 ```
-version  u8    必须 === PROTOCOL_VERSION(=1),否则 throw
+version  u8    必须 === PROTOCOL_VERSION(=3),否则 throw  // D-14:1→3(2 与 FRAME_BINARY 0x02 撞值)
 op       u8    0=FULL 1=DELTA
 tick     u32   世界帧号;**无条件覆盖** meta.tick(单调时钟,不是 diff 字段)
+ackedSeq u32   该连接已应用的上行 seq + 1;0 = 尚无 ack(D-14,客户端据此剪预测历史)
 removedCount u16
   └ 每项: kind u8 + id str
 upsertCount  u16
@@ -373,7 +374,7 @@ ROOM_FIELD_TABLE 只有 `chunkVersions`(一个 "cx,cy:v;..." 的**版本号字�
 | P9 | 协议里**没有地形数据通道** | `_nc_*` + 读码 |
 | P10 | 客户端 `import` 指向 `server/`:**0 处** | `_nc_cross.ts` |
 
-**每个探针都带自证**:`POS_SCALE=1024` / `PROTOCOL_VERSION=1` 已知答案过;
+**每个探针都带自证**:`POS_SCALE=1024` / `PROTOCOL_VERSION=3` 已知答案过;
 **阴性对照**包括「重复 bit 的假表必须判红」「连死端口必须失败」「错位掩码必须解出不同字段集」。
 
 ### 6.2 不能证明的(未实测,不得当结论)

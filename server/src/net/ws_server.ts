@@ -273,8 +273,9 @@ export type UplinkKind =
  * ## ⚠️ 这与**下行**的处理不对称,而且是**必然**不对称
  * ```
  * 下行:客户端 `classifyDownlink` **不能**信 tag ——
- *   因为 `FRAME_TEXT(0x01)` 与 `PROTOCOL_VERSION(1)` **撞值**,
- *   而服务端下行是**裸包**(首字节就是 1)⇒ 只能靠内容特征(`{`)。
+ *   因为服务端下行是**裸包**(不带 tag),首字节是 `PROTOCOL_VERSION`
+ *   (它**会随版本变**,当前 = 3;而 0x01/0x02 是**帧 tag** 的保留值)
+ *   ⇒ 只能靠内容特征(`{`)判文本。
  * 上行:服务端**能且必须**信 tag ——
  *   因为上行**一定**带 tag(`encodeClientFrame` 无条件加),
  *   而 opcode 不可靠(内置客户端对 Uint8Array 一律发二进制)。
@@ -333,13 +334,22 @@ export type WsConn = {
    */
   urlUserId: string | null;
   /**
-   * ★ D-08 第二步:本连接**已应用成功的最高命令序号**(`-1` = 还没收到 `seq`)。
+   * ★ D-14(owner 2026-11-17 裁决,方案 A):本连接**已应用成功的最高命令序号**
+   * (`-1` = 还没收到 `seq`)。
    *
-   * 为什么存在连接上而不是直接进快照:下行快照是**冻结层**编码的字节
-   * (`shared/net/delta.ts` 的 `encodeFull/encodeDelta` → `decodePacket` 的字段表),
-   * 里面没有这个字段 ⇒ 本文件先把它记下来、由 `WsServerHandle.lastAckedSeq()` 暴露;
-   * 进帧那一步等 owner 解锁冻结层。**不偷偷扩协议**
-   * (判据:`tests/WS-FND-58-joystick-prediction.test.ts` 的 FND58-8/9)。
+   * ## 为什么必须**在连接上**(而不是一个闭包级全局)
+   * ```
+   * 旧写法:let lastAckedSeq(闭包级全局),onMove 推它
+   *   ⇒ 多连接下 ack 互相冒充:alice 的 seq=7 会被当成 bob 的 ack
+   *   ⇒ bob 的客户端会把 bob 根本没被处理的命令剪掉,且**不报错**
+   * ⇒ 现在:每条连接各记各的,推进只由**本连接自己的输入**触发。
+   * ```
+   *
+   * ## 它去哪儿了
+   * 下行帧包头 byte6..9(小端 u32,编码 = `ackedSeq + 1`,见
+   * `shared/net/delta.ts` 的包头注释)。广播是「`room.step()` 一次算、
+   * 一份字节发给所有人」⇒ 运输层必须**逐连接重写那 4 字节**
+   * (见广播循环里的 `withAckedSeq`)。读取口:`lastAckedSeqFor(userId)`。
    */
   ackedSeq: number;
 };
@@ -503,13 +513,20 @@ export type WsServerHandle = {
   /** 最近一次解析失败的原因原文(null = 没失败过)。 */
   lastParseError(): string | null;
   /**
-   * ★ 服务端**已应用成功的最高客户端命令序号**(`-1` = 还没收到带 `seq` 的移动意图)。
+   * ★ 某条连接**已应用成功的最高客户端命令序号**(`-1` = 该连接还没带过 `seq`)。
    *
-   * 这就是下行 `ackedSeq` 的**服务端那一半**(D-08 第二步):客户端拿它剪
-   * `LocalPredictor.pending`。它按"收到**并应用成功**"的 `seq` 单调推进,
+   * 这就是下行包头 `ackedSeq` 的**服务端那一半**(D-14 / 方案 A):客户端拿它剪
+   * `LocalPredictor.pending`。它按「收到**并应用成功**」的 `seq` 单调推进,
    * 与 `uplinkParsed`(报文解析成功)分开计 —— 两件事,两个数。
+   *
+   * ## ★ 为什么是 `For(userId)` 而不是一个无参的全局读数
+   * 旧接口 `lastAckedSeq(): number` 读的是**闭包级全局**:任一条连接带上来的
+   * `seq` 都会推进它 ⇒ 多连接互相冒充,而且它**同时**是"能变绿的假判据"
+   * (断言"服务端记到了"与断言"这条连接记到了"在旧接口下不可区分)。
+   * ⇒ 改成按连接取;不存在的 userId 返回 `-1`(与"还没收到"同一个值,
+   *    这是刻意的:没有连接就没有它自己的账)。
    */
-  lastAckedSeq(): number;
+  lastAckedSeqFor(userId: string): number;
   /**
    * 供测试:**模拟异常掉线** —— 直接 destroy 所有底层 TCP,不发 close 帧。
    *
@@ -596,12 +613,42 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let lastParsedPacket: DecodedPacket | null = null;
   let lastParseError: string | null = null;
   let nextConnSeq = 1;
-  /** ★ D-08 第二步:已应用成功的最高客户端命令序号(`-1` = 还没人带 `seq` 上来)。 */
-  let lastAckedSeq = -1;
+  /* ★ 旧的闭包级 `lastAckedSeq` 已删除(D-14):ack 是**每连接**的量,
+     全局那一份正是"多连接互相冒充"的成因。见 `WsConn.ackedSeq`。 */
 
   const write = (c: WsConn, bytes: Uint8Array): void => {
     if (c.closed || c.socket.destroyed) return;
     try { c.socket.write(bytes); } catch { c.closed = true; }
+  };
+
+  /* ── 包头里 ackedSeq 的位置与编码 ──
+     偏移 6(小端 u32),编码 = `ackedSeq + 1`(内部 `-1` ⇒ 线上 `0`)。
+     两处必须与 `shared/net/delta.ts` 的写/读顺序一致:
+     `ver u8 | op u8 | tick u32 | ackedSeq u32 | 载荷`。
+     ⚠️ 这里**只做那 4 字节的按连接覆写**(不改载荷、不改长度)——
+     "哪条连接的 ack" 是运输层的事,不进冻结层。 */
+  const ACKED_SEQ_OFFSET = 6;
+  /**
+   * 把包头 byte6..9 覆写成**本条连接**的 ack,返回一份新字节。
+   *
+   * ## 为什么必须拷贝(而不是就地改共享 payload)
+   * 广播循环里 `room.step()` 只算**一次**,那份 `Uint8Array` 会被发给
+   * **所有**连接(含后续帧的 `prevState` 演化无关)。就地改它等于
+   * "最后一条连接赢" —— 也就是旧全局 ack 那个病换个位置复发。
+   * ## 为什么长度不足就原样返回
+   * 合法包最短 = 头 10 + 两级计数 4 = 14 字节。短于 10 字节的东西
+   * 不可能是本协议的帧(0 字节特例由 `sendBinary` 先拦掉)。
+   * 与其写坏内存,不如原样发出去 —— 由客户端的解码器出声。
+   */
+  const withAckedSeq = (payload: Uint8Array, ackedSeq: number): Uint8Array => {
+    if (payload.byteLength < ACKED_SEQ_OFFSET + 4) return payload;
+    const out = Uint8Array.from(payload);
+    const raw = (ackedSeq + 1) >>> 0;
+    out[ACKED_SEQ_OFFSET] = raw & 0xff;
+    out[ACKED_SEQ_OFFSET + 1] = (raw >>> 8) & 0xff;
+    out[ACKED_SEQ_OFFSET + 2] = (raw >>> 16) & 0xff;
+    out[ACKED_SEQ_OFFSET + 3] = (raw >>> 24) & 0xff;
+    return out;
   };
 
   /** 下发:★ **不加 tag**(契约 §12.1)。 */
@@ -739,7 +786,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
               客户端的 hello 帧历史上不带 `t` 也能工作,不能因为加了一条新分支
               就把它判死(那是"顺手放宽/收紧"的另一半)。 */
         if (parsed.t === 'move') {
-          onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown });
+          onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown; seq?: unknown });
           return;
         }
         /* ★ 2026-11-14:`t:'attack'` —— 打怪的落点。判据同 `move`。 */
@@ -747,7 +794,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           onAttack(c, parsed as { mobId?: unknown; bonus?: unknown });
           return;
         }
-        /* ★ 2026-11-14:`t:'action'` —— 通用动作通道(放置/破坏/丢弃/拾取/…)。
+        /* ★ 2026-11-14:`t:'action'` —— 通用动作通道(放置/破坏/丢弃/拾取/...)。
            判据同 `move`/`attack`;判定与执行全在 `room.dispatchAction`。 */
         if (parsed.t === 'action') {
           onAction(c, parsed as { action?: unknown });
@@ -859,7 +906,9 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       resumed: res.resumed === true,
     });
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1) */
-    sendBinary(c, opts.room.snapshotFor(userId));
+    /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1)。
+       包头那 4 字节 ack 也按**本连接**填(此刻通常 = 0 ⇒ 「还没有 ack」)。 */
+    sendBinary(c, withAckedSeq(opts.room.snapshotFor(userId), c.ackedSeq));
   }
 
 /**
@@ -966,7 +1015,7 @@ function onAction(c: WsConn, msg: { action?: unknown }): void {
   sendJson(c, { t: 'actionResult', action, ...(out as Record<string, unknown>) });
 }
 function onMove(c: WsConn, msg: {
-  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown; seq?: unknown;
 }): void {
   /* ⚠️ 两个条件都要查,而不是只查 `helloDone`:类型上 `c.userId` 是 `string | null`,
      而 `applyMove` 要 `string`。只查前者会让类型检查多一条 TS2345
@@ -990,8 +1039,9 @@ function onMove(c: WsConn, msg: {
   try {
     apply.call(opts.room, c.userId, intent);
     /* ack 只在**应用成功之后**推进 —— 抛错那条路径不该被记成"服务端处理过了",
-       否则客户端会把一条从未生效的命令剪掉(那段位移再也补不回来)。 */
-    if (intent.seq !== undefined && intent.seq > lastAckedSeq) lastAckedSeq = intent.seq;
+       否则客户端会把一条从未生效的命令剪掉(那段位移再也补不回来)。
+       ★ 推进的是**本连接**的账(`c.ackedSeq`):多连接不许互相冒充。 */
+    if (intent.seq !== undefined && intent.seq > c.ackedSeq) c.ackedSeq = intent.seq;
   } catch (e) {
     log(`applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
   }
@@ -1007,8 +1057,10 @@ function onMove(c: WsConn, msg: {
       return;
     }
     if (payload.byteLength > 0) {
+      /* ★★ D-14:包头那 4 字节 ack 是**每连接**的量,而 `step()` 只算一次、
+         一份字节要发给所有人 ⇒ 逐连接重写它(拷贝,不动 `payload` 本体)。 */
       for (const c of conns) {
-        if (c.helloDone && !c.closed) sendBinary(c, payload);
+        if (c.helloDone && !c.closed) sendBinary(c, withAckedSeq(payload, c.ackedSeq));
       }
       framesSent += 1;
       lastFrameBytes = payload.byteLength;
@@ -1061,12 +1113,14 @@ function onMove(c: WsConn, msg: {
     uplinkRejected: (): number => uplinkRejected,
     lastParsedPacket: (): DecodedPacket | null => lastParsedPacket,
     lastParseError: (): string | null => lastParseError,
-    /* ★ 2026-11-16(D-08 第二步):服务端**已应用成功的最高客户端命令序号**。
+    /* ★ D-14(2026-11-17):**每连接**的"已应用成功的最高客户端命令序号"。
        与 `uplinkParsed`(报文解析成功)分开计 —— 这是"这条命令生效了"。
-       ⚠️ 它**还没上到下行帧**:快照字节由冻结层 `shared/net/delta.ts` 的
-       `encodeFull/encodeDelta` 决定,`decodePacket` 的字段表里没有这个字段
-       ⇒ 真要上线得先解锁冻结层(已上报 owner),本文件不偷偷扩协议。 */
-    lastAckedSeq: (): number => lastAckedSeq,
+       它同时是下行包头 `ackedSeq` 的真值来源(见广播循环)。
+       ⚠️ 语义曾经是"全局最高"(多连接互相冒充),现已按连接取。 */
+    lastAckedSeqFor: (userId: string): number => {
+      for (const c of conns) if (c.userId === userId) return c.ackedSeq;
+      return -1;
+    },
     /* ★ 模拟异常掉线:destroy 底层 socket(**不发 close 帧**)。
        服务端侧看到的与"客户端掉网"完全一致 ⇒ 走 `disconnect` 分支。 */
     dropConnectionsForTest: async (): Promise<void> => {
@@ -1088,12 +1142,15 @@ function onMove(c: WsConn, msg: {
   };
 }
 
-/** 协议版本 —— 与 shared/net/delta.ts 的 PROTOCOL_VERSION 同值。
+/** 协议版本 —— 与 shared/net/delta.ts 的 PROTOCOL_VERSION 同值(**3**)。
  *  ⚠️ 这个**常量**刻意不 import delta.ts:常量重复的代价是"两个数要一致",
- *     而它由 WS-13 §6-1 的 `welcome.protocolVersion` 断言钉住。
+ *     而它由 WS-13 §6-1 的 `welcome.protocolVersion` 断言、
+ *     以及 WS-FND-14 FND14-8(两个独立模块必须同值)钉住。
  *  ★ 2026-11-14(分片 2)订正:上一句原写「本服务端是运输层,不该依赖协议内容」——
  *     那个理由**只对常量成立,对解析器不成立**。运输层现在**确实** import 了
  *     `decodePacket`(见文件头 import 处的长注释):
  *     常量可复制(有断言钉住一致性),**解析逻辑不可复制**(没有任何断言能钉住
- *     "两份实现永远等价")。WS-13 §5「不造第二份口径」正是这条纪律的出处。 */
-export const PROTOCOL_VERSION = 1;
+ *     "两份实现永远等价")。WS-13 §5「不造第二份口径」正是这条纪律的出处。
+ *  ★ 2026-11-17(D-14 / 方案 A):1 → **3**(包头加 4 字节 `ackedSeq`)。
+ *     跳过 2 的理由见 `shared/net/delta.ts`:`FRAME_BINARY === 0x02` 会撞值。 */
+export const PROTOCOL_VERSION = 3;

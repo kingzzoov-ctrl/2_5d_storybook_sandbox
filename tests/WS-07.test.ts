@@ -871,14 +871,14 @@ test('C01 全量编码可解码:op=FULL,实体数 = 玩家 + 野怪 + Boss + 房
   const full = encodeFull(s, 100);
   const pkt = decodePacket(full.bytes);
   /* 版本号锚定**字面量**。此处原为 `eq(pkt.version, PROTOCOL_VERSION)` —— 断言右侧
-   * 取自被测常量 `delta.ts:50`,而 `encodeFull` 写进去的就是同一个常量,两边同源 ⇒
-   * 把 `PROTOCOL_VERSION` 改成 7 也全绿(实测:132/132)。它是**跨端协议版本号**,
-   * 静默改版会导致客户端/服务端不兼容而没有任何门禁报警。
-   *
-   * 基线值 1 的出处:`docs/WS-07-net-persist.md` §5 参数配表 —— `PROTOCOL_VERSION | 1 |
-   * 协议 bump 依据`,以及 §4.1 线格式 `w.write(u8 PROTOCOL_VERSION)`(u8,故 1 位字节可容纳)。
-   * 现有线格式为 v1,尚未 bump;改动线格式时必须**同时**改这里与实现,门禁即在此处变红。 */
-  eq(pkt.version, 1, '报文头版本号(协议基线 v1;线格式 bump 时此处必须同步)');
+   * 取自被测常量,两边同源 ⇒ 把 `PROTOCOL_VERSION` 改成 7 也全绿(实测:132/132)。
+   * 它是**跨端协议版本号**:静默改版会让两端不兼容而没有任何门禁报警。
+   * ★ 2026-11-17(D-14 / 方案 A)重钉:**1 → 3**。包头在 tick 之后加了 4 字节
+   *   `ackedSeq`(v3);跳过 2 是因为 `FRAME_BINARY === 0x02` 会撞值。
+   *   依据:`docs/DECISIONS.md` D-14 + `docs/TASK-100-ackedseq-frozen-unlock.md` §2.1/2.2。
+   *   本次线格式 bump 时正是这里变红的(WS-07 共 6 条)。
+   */
+  eq(pkt.version, 3, '报文头版本号(协议基线 v3 = 包头含 4 字节 ackedSeq;线格式 bump 时此处必须同步)');
   eq(pkt.op, PacketOp.FULL);
   eq(pkt.tick, 100);
   eq(pkt.removed.length, 0);
@@ -888,15 +888,15 @@ test('C01 全量编码可解码:op=FULL,实体数 = 玩家 + 野怪 + Boss + 房
 });
 
 test('C01b 协议版本门真的会拒:篡改报文头版本字节 → decodePacket 必须抛错', () => {
-  /* 上面 C01 只断言「写进去的版本号 == 1」。这只证明**编码端**写对,
+  /* 上面 C01 只断言「写进去的版本号 == 3」。那只证明**编码端**写对,
    * 不证明**解码端**会拒绝错误版本。这里手工把报文首字节(版本号)改成
-   * 非 1 的值,断言 decodePacket 抛错 —— 这才是「协议 bump 时旧客户端
-   * 会被拒」的真正门禁。若哪天有人把 delta.ts:425 的校验删掉,本断言变红。 */
+   * 非 3 的值,断言 decodePacket 抛错 —— 这才是「协议 bump 时旧客户端
+   * 会被拒」的真正门禁。若有人把 `decodePacket` 的版本校验删掉,本断言变红。 */
   const s = buildRoom(2);
   const bytes = encodeFull(s, 42).bytes;
-  eq(bytes[0], 1, '编码端应把版本号写在首字节(u8)');
+  eq(bytes[0], 3, '编码端应把版本号写在首字节(u8)');
 
-  for (const bad of [0, 2, 7, 255]) {
+  for (const bad of [0, 1, 2, 7, 255]) {
     const tampered = Uint8Array.from(bytes);
     tampered[0] = bad;
     let threw = false;
@@ -914,7 +914,7 @@ test('C01b 协议版本门真的会拒:篡改报文头版本字节 → decodePac
 
   /* 反向对照:版本号正确时不应抛错(证明上面的抛错来自版本校验,不是别的原因)。 */
   const okPkt = decodePacket(bytes);
-  eq(okPkt.version, 1, '未篡改时应正常解出 v1');
+  eq(okPkt.version, 3, '未篡改时应正常解出 v3');
 });
 
 test('C02 **字段级 diff**:只改一个玩家的一格坐标,报文只含该玩家 + x/y 两字段', () => {
@@ -1001,14 +1001,14 @@ test('C05 删除实体编码在 removed 段,应用后消失', () => {
   ok(!rebuilt.players.some((p) => p.id === 'p2'));
 });
 
-test('C06 无变化时差量只有头 + 两个计数(≤ 12 字节)', () => {
+test('C06 无变化时差量只有头 + 两个计数(≤ 16 字节)', () => {
   const prev = buildRoom(8);
   const next = cloneRoomState(prev);
   const d = encodeDelta(prev, next, 101);
   eq(d.stats.changedFields.length, 0, '不应有变更字段');
   eq(d.stats.removed.length, 0);
-  ok(d.bytes.length <= 12, `空闲帧 ${d.bytes.length}B 应 ≤ 12B`);
-  eq(d.bytes.length, 10, '头 6 + removedCount 2 + upsertCount 2');
+  ok(d.bytes.length <= 16, `空闲帧 ${d.bytes.length}B 应 ≤ 16B`);
+  eq(d.bytes.length, 14, '头 10 + removedCount 2 + upsertCount 2');
 });
 
 test('C07 浮点抖动被量化吸收:变化 < 1/1024 格不产生报文', () => {
@@ -1017,7 +1017,7 @@ test('C07 浮点抖动被量化吸收:变化 < 1/1024 格不产生报文', () =>
   next.players[0].x += 1 / 4096; // 半格 bit,远小于 1/1024
   const d = encodeDelta(prev, next, 101);
   eq(d.stats.changedFields.length, 0, '亚量化抖动不应产生字段变更');
-  eq(d.bytes.length, 10);
+  eq(d.bytes.length, 14, '空差量 = 头 10(ver/op/tick/ackedSeq)+ 两级计数 4');
 });
 
 test('C08 编码确定性:同 (prev,next) 两次编码逐字节一致', () => {
@@ -1076,13 +1076,13 @@ test('C12 带宽:4/8/16 人三档实测,单玩家边际成本 29 字节恒定', 
   eq(marginal1, marginal2, '单玩家边际成本应恒定');
   eq(marginal1, 29, '边际 = kind 1 + id 9 + mask 4 + xyz 12 + dir 1 + 低频摊薄 2');
 
-  /* 实测每帧:4 人 344B / 8 人 460B / 16 人 692B。 */
-  eq(tbl[0].frameBytes, 344);
-  eq(tbl[1].frameBytes, 460);
-  eq(tbl[2].frameBytes, 692);
+  /* 实测每帧:4 人 348B / 8 人 464B / 16 人 696B(= 旧值 + 每帧 4 字节 ackedSeq)。 */
+  eq(tbl[0].frameBytes, 348);
+  eq(tbl[1].frameBytes, 464);
+  eq(tbl[2].frameBytes, 696);
 
-  /* 单客户端下行:16 人 692B × 20Hz = 13.52 kB/s。
-   * 阈值取 14 kB/s(留 ~3% 余量);这是「每人收到的全房状态」,
+  /* 单客户端下行:16 人 696B × 20Hz = 13.59 kB/s(包头 +4 字节之后的实测值)。
+   * 阈值取 14 kB/s(仍留 ~3% 余量);这是「每人收到的全房状态」,
    * 而不是服务器总出口。 */
   ok(tbl[2].kbytesPerSec < 14, `16 人单客户端下行 ${tbl[2].kbytesPerSec.toFixed(2)} kB/s 应 < 14`);
   oftenBandwidthSanity(tbl);
@@ -2627,10 +2627,10 @@ test('F18 step() 推进 tick 并产出差量包;20 帧后 tick%20==0 落盘', ()
     const pkt = rt.step(prev);
     prev = rt.cloneState();
     sizes.push(pkt.length);
-    if (i < 19) eq(pkt.length, 10, `静止帧 ${i} 应为 10 字节(仅头),实际 ${pkt.length}`);
+    if (i < 19) eq(pkt.length, 14, `静止帧 ${i} 应为 14 字节(头 10 + 两级计数 4),实际 ${pkt.length}`);
   }
   eq(rt.state.meta.tick, 20);
-  ok(sizes.every((s) => s <= 12), '每帧都应是空差量');
+  ok(sizes.every((s) => s <= 16), '每帧都应是空差量(仅头 10 + 两级计数 4 = 14)');
   const roomRow = getRoom(db, 'room_alpha');
   eq(roomRow?.world_tick, 20, '第 20 帧应把 world_tick 落盘');
 });

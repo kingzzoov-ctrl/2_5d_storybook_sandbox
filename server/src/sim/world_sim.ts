@@ -370,7 +370,29 @@ export interface WorldSimOptions {
    * 默认 `MEADOW`。见 `biomeName` 字段注释:本仓没有每格群系。
    */
   biome?: string;
-  /** 确定性随机源,返回 [0,1)。默认用固定的 mulberry32。 */
+  /**
+   * 世界种子的**身份**(不是随机流本身)。
+   *
+   * ## 为什么必须单独一个字段(而不是从 `rng` 反推)
+   *
+   * `rng` 是一个**函数**(`mulberry32(seed)` 的产物),函数里没有种子。
+   * 于是「旧世界的种子是什么」在重置时**无从得知** —— 而 D-06 要求归档行
+   * 记下**旧世界**的种子(`db/repo.ts` 的 `WorldArchiveSummary.seed`)。
+   * ⇒ 种子必须作为**身份**被持有。
+   *
+   * 两者分工:
+   *   - `seed` = 身份(归档行、重置回执、可重放判据的键);
+   *   - `rng`  = 流(确定性随机序列,可被调用方注入以复现)。
+   *
+   * ⚠️ 注入 `rng` 的调用方**应当同时**给 `seed`(例如 `rng: mulberry32(13)`
+   *    ⇒ `seed: 13`),否则归档行会记下默认种子 `0x5eed` —— 那不是你那条流的
+   *    种子。**如实记,不猜**(猜出来的种子会让「回滚到这一版」重放成另一个世界)。
+   */
+  seed?: number;
+  /**
+   * 确定性随机源,返回 [0,1)。默认 `mulberry32(seed)`(没给 `seed` ⇒
+   * 构造期的默认 `0x5eed`,与接线前逐字一致)。
+   */
   rng?: () => number;
   /**
    * 战斗随机源(**与 `rng` 分离**),返回 [0,1)。供暴击/闪避取数。
@@ -410,6 +432,81 @@ export interface WorldSimOptions {
    * 真网关实现由部署层注入。
    */
   alchemy?: AlchemyService;
+  /**
+   * **世界归档口** —— 重置时把旧世界交出去的唯一通路(★ D-06)。
+   *
+   * ## 世界不持库
+   *
+   * `WorldSim` **不认识** `db`(它只把 `DbLike` 当**参数**收,见 `saveToDb` 的
+   * docblock:构造器一旦依赖 DB,17 个套件的纯对象用法全都得先搭库)。
+   * 而归档写入(`db/repo.ts:archiveWorldSnapshot`)属于存储层,装配层是唯一
+   * 同时认识两侧的地方 ⇒ 由 `index.ts` 注入一个闭包,依赖单向(sim → 不认识 net/db 的类型)。
+   *
+   * ⚠️ **没有 sink ≠ 归档失败**(两种都要如实报,但不许混成一种):
+   *   - 没 sink  ⇒ 本世界**根本没有归档能力**(装配层没给库)⇒ 回执
+   *     `archive: null` + `archiveError` 写明「没有库」;
+   *   - sink 抛错 ⇒ **归档失败**(磁盘满 / 超配额 / 表没建)⇒ 同样
+   *     `archive: null` + 错误原因。
+   * 两者都**不许**把 `applied` 改成 false —— 见 `resetWorld` 的判决顺序。
+   */
+  archiveSink?: WorldArchiveSink | null;
+}
+
+/* ══════════════ 世界重置 / 归档契约(★ D-06:归档 + 内存重建)══════════════
+ *
+ * 三个类型刻意**不 import** `db/repo.ts` 的类型(`WorldArchiveSummary` /
+ * `WorldArchiveWriteResult`):`sim` 对存储层的依赖面应当只有「一个闭包」,
+ * 两侧的形状对齐由**装配层**(`index.ts`)在编译期保证 —— 那里是唯一同时
+ * 认识两边的文件。这与 `room.ts` 的 `WorldSaveHost` 用结构化类型同一条纪律。
+ */
+
+/**
+ * 归档口的入参 —— 与 `repo.ts:archiveWorldSnapshot` 的入参**逐字段同名同义**
+ * (适配函数只有五行的字段搬运,见 `index.ts` 的 `makeArchiveSink`)。
+ */
+export interface WorldArchiveRequest {
+  /** 本房间号(`WorldSim.roomId`;空串 ⇒ 归档口会拒 —— 那是**如实失败**)。 */
+  roomId: string;
+  /** ★ **旧世界**的种子(不是新种子)。 */
+  seed: number;
+  /** 旧世界的可重建描述(格式见 `describeWorldForArchive`)。 */
+  snapshot: Uint8Array;
+  /** Unix 毫秒(归档行的时间戳;缺省由 `resetWorld` 取 `Date.now()`)。 */
+  nowMs: number;
+  /** 旧世界已推进的帧数。 */
+  worldTick: number;
+  /** 归档原因(人类可读;`repo.ts` 原样存进 `reason` 列)。 */
+  reason: string;
+}
+
+/** 归档口的回执 —— 只取回执里**可判定**的四项(与 `WorldArchiveSummary` 同形)。 */
+export interface WorldArchiveReceipt {
+  /** 稳定句柄(`<room_id>#<seq>`)。★ 空 id 不算归档成功(见 `archiveBeforeReset`)。 */
+  id: string;
+  seed: number;
+  archived_at: number;
+  bytes: number;
+}
+
+/** 注入的世界归档口(装配层把它接到 `repo.archiveWorldSnapshot`)。 */
+export type WorldArchiveSink = (req: WorldArchiveRequest) => WorldArchiveReceipt;
+
+/**
+ * `resetWorld` 的回执 —— 与 `net/room.ts` 的 `WorldSaveHost.resetWorld` **逐字段同形**
+ * (那份声明是本接口的对外契约,改动必须同步两处,否则 `index.ts` 的
+ * `return sim` 会当场编译不过 —— 这是刻意的防分叉)。
+ *
+ * `archive` 是**三态**的来源(`net/actions/reset_world.ts` 的 `resetEffect`):
+ *   `{...}` = 旧世界已归档;`null` = **明确**没归档(原因在 `archiveError`);
+ *   缺键    = 宿主没报告(本实现**永远**给键,所以生产里到不了第三态)。
+ */
+export interface WorldResetResult {
+  applied: boolean;
+  /** **实际生效**的种子(`applied === true` 时它就是新世界的种子)。 */
+  seed: number;
+  reason?: string;
+  archive: WorldArchiveReceipt | null;
+  archiveError?: string;
 }
 
 /** 单帧结算报告:把各子系统的返回值汇总成一份可观测账本。 */
@@ -520,12 +617,30 @@ const EMPTY_PROFILE: PlayerProfile = { wearing: [], heldItem: 0 };
  * 与「该板通电」落在同一帧里,不会被推迟一帧(那是 50ms 的可感知延迟)。
  */
 export class WorldSim {
-  readonly grid: WorldGrid;
-  readonly physics: PhysicsWorld;
-  readonly fluid: FluidField;
-  readonly wiring: SignalGraph;
-  readonly aoi: AoiManager;
-  readonly spawner: MobSpawner;
+  /*
+   * ⚠️ **这一组的 `readonly` 在 ★ D-06 被拿掉了**(`grid` / `physics` / `fluid` /
+   * `wiring` / `aoi` / `spawner` / `carry` / `bus` / `mobHost` / `bossRaid` /
+   * `vitals` / `rng` / `combatRng`)。
+   *
+   * 理由:`resetWorld` 要「按新种子在内存重建」,而重建的**唯一干净形态**是
+   * **换新实例**。逐个把旧实例的内部清零做不到干净:
+   *   - `SignalGraph` 的 `liveCells` / `driveCellsByColor` / `channelInput` 等
+   *     是 **private**,编排层既清不掉、也不该去清;
+   *   - `AoiManager` 连「枚举已登记生物」的读口都没有(只有 `getMob(id)`),
+   *     于是「清空 AOI」只能靠调用方自己记住有哪些 id;
+   *   - `CarrySystem` 的投掷冷却表同样是 private ⇒ 上一局的冷却会跨世代残留。
+   * 这些都是**不报错的残留**(看起来一切正常,只是行为莫名其妙),
+   * 正是本仓反复防的那一类。
+   *
+   * `readonly` 去掉只针对**这一组世界子系统**;`mobOrdinals` 之类的账本仍是
+   * `readonly`(它们靠 `clear()` / `reset()` 清,不需要换实例)。
+   */
+  grid: WorldGrid;
+  physics: PhysicsWorld;
+  fluid: FluidField;
+  wiring: SignalGraph;
+  aoi: AoiManager;
+  spawner: MobSpawner;
   /**
    * **每个物种已经发到几号** —— 实例 id 的序号来源(见 `mobs/spawner.ts` 的 id 两层说明)。
    *
@@ -534,21 +649,21 @@ export class WorldSim {
    * 所以序号**不能**取"当前存活数 + 1"。
    */
   private readonly mobOrdinals = new Map<string, number>();
-  readonly carry: CarrySystem;
+  carry: CarrySystem;
   /**
    * 事件总线 —— 事件驱动子系统的共同出口。
    *
    * 生物 AI 的 30 处 `emit` 走这里;伤害结算 / Boss 阶段 / 炼金等
    * 事件型子系统将来也接这里。见 `docs/EVENT-BUS.md`。
    */
-  readonly bus: EventBus;
+  bus: EventBus;
   /**
    * 生物宿主 —— `MobWorld` 的第一份真实实现。
    *
    * 25 个 AI 类的 `tick` 通过它访问世界。此前编排层的
    * `aoi.stepActive(() => {})` 是空回调,25 个实现一行都没跑过。
    */
-  readonly mobHost: MobHost;
+  mobHost: MobHost;
   /**
    * 炼金炉服务(WS-06)—— 六条链路的唯一编排出口。
    *
@@ -574,12 +689,16 @@ export class WorldSim {
    * `TIME_SHIELD_SEC` / `stunnedSec` 全是秒),与 `SIM_SLOW_DT = 0.5` 同量纲;
    * 挂快帧会让护盾/眩晕以 10 倍速流失 —— 不报错,但行为全错。
    */
-  readonly bossRaid: BossRaidRuntime;
+  bossRaid: BossRaidRuntime;
 
   readonly sizeCells: number;
-  private readonly rng: () => number;
-  /** 战斗专用随机流(与 `rng` 分离,见 `WorldSimOptions.combatRng`)。 */
-  private readonly combatRng: () => number;
+  /**
+   * 确定性随机流。★ D-06 起**可被重置**(`resetWorld` 用新种子重造),
+   * 故 `readonly` 已摘除 —— 保留它会让「换种子」在类型上不可能。
+   */
+  private rng: () => number;
+  /** 战斗专用随机流(与 `rng` 分离,见 `WorldSimOptions.combatRng`)。重置时**同时**换。 */
+  private combatRng: () => number;
   private readonly fluidBudget: number;
   private readonly wiringOn: boolean;
   private readonly mobsOn: boolean;
@@ -951,6 +1070,30 @@ export class WorldSim {
    * 的"安全区半径可注入"一节),由装配层决定 provider 是 `modify_town.ts` 的适配器。
    */
   roomId = '';
+  /**
+   * 本世界的**种子身份**(构造期 `WorldSimOptions.seed`;`resetWorld` 换新种子)。
+   *
+   * 与 `rng` 的分工见 `WorldSimOptions.seed` 的 docblock:这是**身份**,不是流。
+   * 归档行记的是它(旧世界的种子),`tests/WS-FND-62` 用它断言「重置真的换了种子」。
+   */
+  worldSeed = 0x5eed;
+  /**
+   * 每个玩家**首次进入本世界时**的位置 = 出生点(`addPlayer` 单写)。
+   *
+   * ## 为什么世界要自己记一份
+   *
+   * 出生点是**房间**定的(`room.ts:spawnPoint()`:`0.5 + n*1.5`),世界只在
+   * `addPlayer(id, x, y)` 时被**告知**一次。重置要把玩家「送回出生点」——
+   * 而世界既没有房间的出生点函数,也不该去问(那会让 sim 依赖 net)。
+   * ⇒ 记住**首次**进入时的坐标,重置时回到那里。
+   *
+   * ⚠️ 只在**首次**登记时写(`if (!has)`):重进(重连/读档)时的坐标是
+   * **当前位置**,不是出生点 —— 覆盖它会让「重置回出生点」把玩家送到
+   * 上一次断线的地方(而那正是本仓库多次踩过的"重进被拉回/被推到别处"同族缺陷)。
+   */
+  private readonly spawnPoints = new Map<string, { x: number; y: number }>();
+  /** 注入的世界归档口(★ D-06)。`null` = **没有库**(装配层没给)。 */
+  private readonly archiveSink: WorldArchiveSink | null;
   constructor(opts: WorldSimOptions = {}) {
     this.sizeCells = Math.max(16, Math.trunc(opts.sizeCells ?? 64));
     this.fluidBudget = Math.max(1, Math.trunc(opts.fluidBudget ?? FLUID_CELL_BUDGET));
@@ -959,9 +1102,13 @@ export class WorldSim {
     this.biomeName = opts.biome ?? 'MEADOW';
     this.roomId = opts.roomId ?? '';
     this.spawnBudgetMax = 4;
-    this.rng = opts.rng ?? mulberry32(0x5eed);
+    /* ★ 种子**身份**先落位:`rng` 的默认值由它派生(没给 `seed` ⇒ 0x5eed,
+       与接线前 `mulberry32(0x5eed)` 逐字一致)。 */
+    this.worldSeed = Number.isFinite(opts.seed) ? Math.trunc(opts.seed as number) : 0x5eed;
+    this.archiveSink = opts.archiveSink ?? null;
+    this.rng = opts.rng ?? mulberry32(this.worldSeed);
     /* 战斗随机**独立成一条流** —— 见 `combatRng` 字段注释。
-       种子取 `0x5eed` 的派生值,同种子仍完全可复现。 */
+       种子取构造期默认值 `0xc0ffee` 的派生值,同种子仍完全可复现。 */
     this.combatRng = opts.combatRng ?? mulberry32(0xc0ffee);
 
     this.grid = new WorldGrid();
@@ -979,18 +1126,10 @@ export class WorldSim {
 
     /* 物理需要一个 PhysTerrain;WorldGrid 已实现 TerrainSource,
        但两边的接口名略有差异,这里用一层薄适配把名字对齐 —— 
-       不复制逻辑,只转发调用。 */
-    this.physics = new PhysicsWorld({
-      terrain: {
-        floorSlotAt: (x: number, y: number) => this.grid.floorSlotAt(x, y),
-        objIdAt: (x: number, y: number) => this.grid.objIdAt(x, y),
-        elevAt: (x: number, y: number) => this.grid.elevAt(x, y),
-        faceDirAt: (x: number, y: number) => this.grid.faceDirAt(x, y),
-        poweredAt: (x: number, y: number) => this.grid.poweredAt(x, y),
-        roofAt: (x: number, y: number) => this.grid.roofAt(x, y),
-      },
-      bounds: { minX: 0, minY: 0, maxX: this.sizeCells - 1, maxY: this.sizeCells - 1 },
-    });
+       不复制逻辑,只转发调用。
+       ★ D-06 起这段搬进 `makePhysicsWorld()`:重建世界要用**同一份**适配
+       (抄第二遍就会漂移,而漂移在物理上表现为"水穿墙/踩不到地板")。 */
+    this.physics = this.makePhysicsWorld();
     this.carry = new CarrySystem(this.carryActors());
 
     /* 事件总线 + 生物宿主。宿主通过下面这个窄适配器访问世界 ——
@@ -2616,13 +2755,24 @@ export class WorldSim {
     };
   }
 
-  /** 登记一个「玩家」:物理刚体 + AOI 唤醒源,一次注册两处保持一致。 */  addPlayer(id: string, x: number, y: number): void {    this.physics.spawn(id, { x, y, z: 0 });
+  /**
+   * 登记一个「玩家」:物理刚体 + AOI 唤醒源,一次注册两处保持一致。
+   *
+   * ★ D-06 起**顺带记住出生点**(只在首次登记时写):`resetWorld` 要把玩家
+   *   送回「他们进入这个世界时的位置」,而那个位置只有调用方知道一次。
+   *   见 `spawnPoints` 的 docblock。
+   */
+  addPlayer(id: string, x: number, y: number): void {
+    this.physics.spawn(id, { x, y, z: 0 });
     this.aoi.registerMob(id, x, y);
     /* 记账 —— 供 syncPlayers 区分玩家与生物(两者都在 physics.bodies 里) */
     this.playerIds.add(id);
     /* 登记生命值 —— 漏了这一步的表现是「生物打玩家永远不掉血」,
        因为 vitals.applyHit 找不到该玩家就静默返回 0 伤害。 */
     this.vitals.register(id);
+    /* ★ 出生点**只记首次**:重进(重连/读档)传进来的是**当前位置**,
+       覆盖它会让「重置回出生点」把玩家送到上一次断线的地方。 */
+    if (!this.spawnPoints.has(id)) this.spawnPoints.set(id, { x, y });
     this.syncPlayers();
   }
 
@@ -2979,6 +3129,9 @@ export class WorldSim {
        (表现为「刚上线就不提供 AOI 唤醒能量、还只拿 30% 经验」)。
        与上面 `roomEffects` 是同一类残留。 */
     this.afkPlayers.delete(id);
+    /* 出生点一并清掉:留着会让**重新加入**的同名玩家被重置送到上一局的出生点
+       (房间把出生点按席位排开,席位是会变的)。与上面两条是同一类残留。 */
+    this.spawnPoints.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -3759,6 +3912,379 @@ export class WorldSim {
     return { hpApplied, memApplied: mem.applied, memSkipped: mem.skipped };
   }
 
+  /* ═══════════════ 世界重置(★ D-06:归档 + 内存重建)═══════════════
+   *
+   * 裁决原文(`docs/DECISIONS.md` **D-06**):
+   *   「世界按新 seed **在内存重建**,旧世界存成一份**可回滚快照行**
+   *     (不删、也不原地不管)」
+   *   「`WorldSim.resetWorld({seed})` 负责内存重建,归档由宿主/DB 侧做」
+   *
+   * 本节就是这条裁决的**宿主那一半**:
+   *   `resetWorld`               —— 唯一入口;顺序 = **描述 → 归档 → 重建**
+   *   `describeWorldForArchive`  —— 旧世界的**可重建描述**(字节格式见其 docblock)
+   *   `rebuildWorld`             —— 内存重建(清空世界世代 + 玩家复位)
+   *
+   * ⚠️ 本文件**不 import 存储层的类型**:归档经注入的 `archiveSink` 走
+   *   (`WorldSimOptions.archiveSink`),装配层(`index.ts`)把它接到
+   *   `repo.archiveWorldSnapshot` —— 依赖单向,sim 不认识 db 的类型面。
+   */
+
+  /**
+   * **在内存里重建世界**(`WORLD_RESET` 的宿主那一半,`RESET_WORLD` 的落点)。
+   *
+   * ## 顺序是硬约束:**先取描述 → 归档 → 再重建**
+   *
+   * ``` 
+   * 1 describeWorldForArchive()   ← 此刻世界还是**旧**的,描述才等于"旧世界"
+   * 2 archiveBeforeReset(...)     ← 把那份描述交给归档口(D-06)
+   * 3 rebuildWorld(seed)          ← 之后才是新世界
+   * ```
+   * 一旦反序,归档下来的就是**新世界**(或半新半旧),而回滚出去的会是错的 ——
+   * 且这种错误在回执上**看不出来**(`archiveId` 照样非空)。
+   *
+   * ## 归档失败**不改 `applied`**(判决,不是风格)
+   *
+   * 「旧世界没存下来」与「新世界没生效」是**两件事**:
+   *   - 归档口抛错 / 没有库 ⇒ 回 `archive: null` + `archiveError`(**如实**说清),
+   *     但世界**照样重建**、`applied` 照样 `true`;
+   *   - 把 `applied` 也改成 `false` 是**谎报**:世界其实已经换了,客户端却会以为
+   *     还停在旧世界(继续用旧 chunk / 旧实体),那比"少了一份快照"严重得多。
+   * `net/actions/reset_world.ts` 的 `resetEffect` 正是按这个分工写的
+   * (它能表达的三种归档态:ARCHIVED / NOT_ARCHIVED / UNREPORTED)。
+   *
+   * ## 参数
+   *
+   * - `seed`:**新世界**的种子(有限整数;非法 ⇒ `applied: false` + 零副作用)。
+   *   动作层已经校验过一遍,这里再拦一次是因为本方法是**公开 API**
+   *   (`net/room.ts` 的 `WorldSaveHost.resetWorld` 就是它),不能只靠上游守门。
+   * - `nowMs`:归档行的 Unix 毫秒。**刻意做成可选**:动作层手里没有时钟
+   *   (它的报文里只有 `seed` / `confirm`),缺省用 `Date.now()`。
+   *   ⚠️ 它**只进归档行**,不进模拟 —— 世界时钟是 `frameCount` 派生的(D-07),
+   *   故挂钟不会污染确定性。
+   *
+   * @returns `WorldResetResult`(与 `WorldSaveHost.resetWorld` 逐字段同形;
+   *          `applied:false` 时**一字未改**,`reason` 说清为什么)。
+   */
+  resetWorld(opts: { seed: number; nowMs?: number }): WorldResetResult {
+    const raw = opts === null || opts === undefined ? undefined : opts.seed;
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw)) {
+      return {
+        applied: false,
+        seed: 0,
+        reason: `世界重置需要有限整数种子(实得 ${String(raw)})—— 不猜默认值`,
+        archive: null,
+      };
+    }
+    const seed = Math.trunc(raw);
+    const nowMs = Number.isFinite(opts.nowMs) ? Math.trunc(opts.nowMs as number) : Date.now();
+
+    /* 1 旧世界的可重建描述(**必须**在重建之前取)。 */
+    const snapshot = this.describeWorldForArchive();
+    /* 2 归档(D-06)。失败只影响回执,不影响重建 —— 见本方法 docblock。 */
+    const archived = this.archiveBeforeReset(seed, snapshot, nowMs);
+    /* 3 重建。 */
+    this.rebuildWorld(seed);
+
+    const out: WorldResetResult = { applied: true, seed, archive: archived.archive };
+    if (archived.error !== null) out.archiveError = archived.error;
+    return out;
+  }
+
+  /**
+   * 把旧世界交给归档口(★ D-06),**只负责回执**,不碰世界。
+   *
+   * 三种结果刻意分开(不许合并 —— 合并就是"把不确定说成确定"):
+   *   1 没有 sink ⇒ `archive: null` + `error` 写明**没有库**;
+   *   2 sink 抛错 / 回执没有 id ⇒ `archive: null` + `error` 写明原因;
+   *   3 成功 ⇒ `archive: {id, seed, archived_at, bytes}`。
+   *
+   * ⚠️ 第 2 条的"回执没有 id"这一支不是洁癖:`net/actions/reset_world.ts` 的
+   *    `resetEffect` 见到非空对象就回 `ARCHIVED` + `archiveId`,于是**空 id 会被
+   *    当成一次成功的归档**广播出去(而回滚读口拿这个 id 什么也取不到)。
+   *    这里拦住它,让"没有句柄"表现为**如实失败**。
+   */
+  private archiveBeforeReset(
+    newSeed: number,
+    snapshot: Uint8Array,
+    nowMs: number,
+  ): { archive: WorldArchiveReceipt | null; error: string | null } {
+    const sink = this.archiveSink;
+    if (sink === null) {
+      return {
+        archive: null,
+        error: '本世界没有库:装配层没有给归档口(WorldSimOptions.archiveSink)⇒ 旧世界无法归档',
+      };
+    }
+    try {
+      const r = sink({
+        roomId: this.roomId,
+        /* ★ **旧世界**的种子 —— 此刻 `worldSeed` 还没被重建改写。 */
+        seed: this.worldSeed,
+        snapshot,
+        nowMs,
+        worldTick: this.frameCount,
+        reason: `RESET_WORLD(seed ${newSeed})`,
+      });
+      if (r === null || typeof r !== 'object' || typeof r.id !== 'string' || r.id.length === 0) {
+        return { archive: null, error: '归档口没有给出归档句柄(id 为空)⇒ 这份快照取不回来' };
+      }
+      return {
+        archive: {
+          id: r.id,
+          seed: Number(r.seed),
+          archived_at: Number(r.archived_at),
+          bytes: Number(r.bytes),
+        },
+        error: null,
+      };
+    } catch (e) {
+      return { archive: null, error: `归档失败:${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  /**
+   * 旧世界的**可重建描述**(D-06 的「可回滚快照」原料)。
+   *
+   * ## 字节格式(自描述,单遍可解)
+   *
+   * ```
+   * [0,4)              magic 'WSA1'          —— 认出"这是我们自己的快照"
+   * [4,8)              uint32 LE 版本 = 1
+   * [8,12)             uint32 LE headerLen
+   * [12, 12+headerLen) header JSON(UTF-8)
+   * [12+headerLen, +4) uint32 LE chunkCount
+   * 之后               chunkCount 段 `Chunk.serializeSnapshot()` 原始字节,
+   *                    长度/坐标在 header 的 `chunks[]` 里(顺序 = 按 (cy,cx) 升序)
+   * ```
+   *
+   * ## 为什么用 `Chunk.serializeSnapshot()` 而不是自己造一份地形编码
+   *
+   * 那是 `world/chunk.ts` **已有**的扩展快照(它的 docblock 明写「本地存档 /
+   * 回滚用」),含打包单元 + 脏位图 + 台账 + 屋顶层 RLE。自己再写一份就是
+   * 第二份地形序列化 —— 两份必然漂移,而且漂移发生在"回滚"这条**最少被走**
+   * 的路径上(等到要用的时候才发现读不回来)。
+   *
+   * ## 内容裁到「重建得起来」为止
+   *
+   * header 里有:世界身份(`roomId` / `seed` / `sizeCells` / `biome`)、时钟
+   * (`frame` / `hourOfDay`)、玩家(位置)、生物(种类/位置/血量)、地面掉落。
+   * 地形是主体(字节数占 99%),所以走二进制段而不是塞进 JSON。
+   *
+   * ⚠️ **有大小上限**:`repo.ts` 的 `WORLD_ARCHIVE_MAX_BYTES`(1 MiB)。一个
+   *    完全建满的 512×512 世界,光地形就 ~1 MiB(1024 chunk × 1144 B);
+   *    超限时归档口会**抛错**(它拒绝截断),于是重置回
+   *    `archive: null` + `archiveError`,而**世界照样重建** —— 这是如实失败,
+   *    不是静默丢档。要归档那种世界需要先裁"哪些 chunk 值得留",那是新裁决。
+   */
+  private describeWorldForArchive(): Uint8Array {
+    const chunks = [...this.grid.chunks.values()]
+      .slice()
+      /* 顺序必须**确定性**:Map 的插入顺序取决于建造历史,两台机器上不同 ⇒
+         同一世界归档出两种字节,而"逐字节可比"是回滚判据的基础。 */
+      .sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
+    const blobs = chunks.map((c) => c.serializeSnapshot());
+
+    const players = [...this.playerIds].slice().sort().map((id) => {
+      const b = this.physics.bodies.get(id);
+      return { id, x: b?.x ?? 0, y: b?.y ?? 0, z: b?.z ?? 0, level: this.levelOf(id) };
+    });
+    const mobs = this.mobHost.runtimes().map((rt) => ({
+      id: rt.id, mobId: rt.def.id, x: rt.x, y: rt.y, z: rt.z, hp: rt.hp, maxHp: rt.maxHp,
+    }));
+    const ground = this.mobGround.map((g) => ({
+      itemId: groundItemId(g), count: g.count, x: g.x, y: g.y,
+    }));
+
+    const header = {
+      version: 1,
+      roomId: this.roomId,
+      /* ★ **旧世界**的种子:它决定"回滚到这一版"重放出来的是不是同一个世界。 */
+      seed: this.worldSeed,
+      sizeCells: this.sizeCells,
+      biome: this.biomeName,
+      frame: this.frameCount,
+      hourOfDay: this.hourOfDay(),
+      players,
+      mobs,
+      ground,
+      chunks: chunks.map((c, i) => ({ cx: c.cx, cy: c.cy, bytes: blobs[i].byteLength })),
+    };
+    const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+
+    const bodyBytes = blobs.reduce((n, b) => n + b.byteLength, 0);
+    const out = new Uint8Array(12 + headerBytes.byteLength + 4 + bodyBytes);
+    const dv = new DataView(out.buffer);
+    /* magic 用**逐字节赋值**:写成字符串会经 UTF-8 编码,长度未必是 4。 */
+    out[0] = 0x57; /* W */
+    out[1] = 0x53; /* S */
+    out[2] = 0x41; /* A */
+    out[3] = 0x31; /* 1 */
+    dv.setUint32(4, 1, true);
+    dv.setUint32(8, headerBytes.byteLength, true);
+    out.set(headerBytes, 12);
+    let off = 12 + headerBytes.byteLength;
+    dv.setUint32(off, blobs.length, true);
+    off += 4;
+    for (const b of blobs) {
+      out.set(b, off);
+      off += b.byteLength;
+    }
+    return out;
+  }
+
+  /**
+   * **内存重建**:同一个 `WorldSim` 实例,换成新种子的世界。
+   *
+   * ## 为什么是「同一实例、换子系统」而不是「new 一个 WorldSim」
+   *
+   * `RoomRuntime` 持有的是**这个对象**(`rtOpts.host = sim`),装配层还往它身上
+   * 挂了两条闭包(赛局计分 sink / 睡眠读口)。换整个实例会让房间继续拿旧世界
+   * 发号施令(位置投影、攻击、存档都写到已经没人推进的那一个上),而且**不会报错**
+   * —— 那正是「谁持有世界」出现两个答案的那类缺陷。子系统是纯数据/纯算法,
+   * 没有外部引用,换掉它们是**干净的**;见类头那段注释。
+   *
+   * ## 清的与留的(**这条界线就是本方法的契约**)
+   *
+   * ```
+   * 清:世界世代 —— 地形 / 生物 / 掉落 / 时钟 / 房间识别 / 厨房 / 物流 /
+   *                 Boss / 瞬态(料理 buff、活人泡泡、倒地、击退、喷射意图、
+   *                 击杀账、DoT、对局运行时、地面物品)
+   * 留:玩家世代 —— 玩家本身、装备档案(`profiles`)、等级/经验(`progresses`)、
+   *                 打盹玩法(`afkRuns`)、连接态打盹标记(`afkPlayers`)、
+   *                 出生点(`spawnPoints`)、注入的归档口与接线 sink
+   * ```
+   * 「留在世界里的玩家数据」是**玩家的**,不是世界的世代 —— 顺手清掉它
+   * (等级/装备)是**破坏玩家数据**的超范围动作,不属于"重建世界"。
+   */
+  private rebuildWorld(seed: number): void {
+    /* 1 随机流:两条**一起**换 —— `rng` / `combatRng` 分离的不变量不能因为重置
+       丢掉(丢掉的后果是"重置后攻击会扰动远处生物",同 `WorldSimOptions.combatRng`)。
+       战斗流用构造期既有默认值 `0xc0ffee` 当盐(xor),不新造数值常量。 */
+    this.rng = mulberry32(seed);
+    this.combatRng = mulberry32((seed ^ 0xc0ffee) >>> 0);
+    this.worldSeed = seed;
+
+    /* 2 子系统**整件重建**(顺序与构造器逐行一致:地形 → 物理 → 电路 → 生物)。
+       ⚠️ `carry` 必须在 `physics` **之后**建:`carryActors()` 在调用时抓
+          `physics.bodies` 那张表,先建会绑到刚被丢掉的那张上 ⇒ 举投系统
+          从此看不见任何人(表现为"扛不动了",不报错)。 */
+    this.grid = new WorldGrid();
+    this.fluid = new FluidField(this.sizeCells, this.sizeCells);
+    this.wiring = new SignalGraph(this.sizeCells, this.sizeCells);
+    this.aoi = new AoiManager();
+    this.spawner = new MobSpawner();
+    this.physics = this.makePhysicsWorld();
+    this.carry = new CarrySystem(this.carryActors());
+    this.bus = new EventBus();
+    this.mobHost = new MobHost(this.mobWorldAdapter(), { bus: this.bus, rng: this.rng });
+    this.bossRaid = new BossRaidRuntime();
+    /* vitals 换新 ⇒ 玩家"满血 + 非倒地"是**结构上**的结果(register 恒满血),
+       不靠"把 hp 写回去"那种漏一个字段就静默失效的写法。 */
+    this.vitals = new VitalsSystem();
+
+    /* 3 世界世代的账本与派生视图清零(逐项点名,不做"清空一切")。 */
+    this.mobGround = [];                 /* 地面掉落 */
+    this.mobPlayers = [];
+    this.players = [];
+    this.unknownMobs.length = 0;
+    this.mobOrdinals.clear();            /* 实例序号从 #1 重来(见 mobOrdinals 注释) */
+    this.spawnBudget = 0;
+    this.lastMobTicks = [];
+    this.mobErrors = 0;
+    this.lastBossTick = { ticked: 0, phaseSwitched: [], stunEnded: [] };
+    this.lastLogisticsTick = {
+      beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0,
+      exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0,
+    };
+    this.logisticsBelts.clear();
+    this.logisticsSorters.clear();
+    this.logisticsArms.clear();
+    this.logisticsDrills.clear();
+    this.partyRun = null;
+    this.rushRun = null;
+    this.rushTicked = 0;
+    this.lastPartyTick = { partyTicked: 0, afkTicked: 0, afkDew: 0, events: [] };
+    /* 瞬态:喷射意图窗口 / 击退窗口 / 倒地 / 活人泡泡 / 料理 buff / DoT /
+       厨房锅内状态(含 `fireOut` —— 一份"炉火已浇灭"跨世代留着就是错的)。 */
+    this.sprayUntil.clear();
+    this.knockbacks.clear();
+    this.downedStates.clear();
+    this.liveBubbles.clear();
+    this.foodBuffs.clear();
+    this.dots.clear();
+    this.dotSeq = 0;
+    this.kitchens.clear();
+    this.lastCookReport = { cooked: 0, lastItemId: 0, fedTotal: 0, potCount: 0 };
+    /* ★ 击杀账必须清:`mobOrdinals` 重置后新世界的实例 id 又从 `#1` 开始,
+       账本里旧世代那条 `mob_sheep#1` 会让**新世界里第一只羊的击杀被静默吞掉**
+       (经验不到账、不报错)。这是"清账"与"重置序号"必须成对的原因。 */
+    this.killLedger.reset();
+    this.pendingLevelUps.clear();
+    this.lastKillSettle = null;
+    this.lastRevive = null;
+    this.killSettleCount = 0;
+    this.totalExpGranted = 0;
+    this.lastHits = [];
+    this.hitCount = 0;
+    this.warnsChecked = 0;
+    /* 房间效果是**地形派生**的,地形没了就重算(`forgeUnlockedIds` 同理)。 */
+    this.roomEffects.clear();
+    this.forgeUnlockedIds.clear();
+    /* 房间识别:结果与脏标记一起重来(新世界里还没有任何一格地形)。 */
+    this.lastRoomScan = [];
+    this.lastRoomCells = [];
+    this.lastRoomScanArea = 0;
+    this.roomScanCount = 0;
+    this.roomsDirty = true;
+    /* 蓝图接力与它的落位基准 */
+    this.relay = null;
+    this.relayOrigin = { x: 0, y: 0 };
+    this.relayPlacedCount = 0;
+
+    /* 4 ★ 钟点回 06:00 —— D-07 把"游戏时间 0 帧 = 06:00"定死,而时间是由
+       `frameCount` **派生**的(不存累加器,见 `hourOfDay` 的注释)⇒ 重建世界
+       就是让帧序归零。这也是"喷射意图窗口"之类以帧序计的窗口一起失效的原因。 */
+    this.frameCount = 0;
+
+    /* 5 玩家**保留**:回出生点、满血、非倒地。
+       `addPlayer` 一次做全四件事(物理刚体 / AOI / `playerIds` / `vitals.register`),
+       所以这里只调它 —— 不另写一份"重生玩家"的实现(那会是第二份注册逻辑,
+       漏掉 AOI 或 vitals 就是"看不见"或"打不掉血")。 */
+    const keep = [...this.playerIds].sort();
+    this.playerIds.clear();
+    for (const id of keep) {
+      const sp = this.spawnPoints.get(id)
+        ?? { x: this.sizeCells / 2, y: this.sizeCells / 2 };
+      this.addPlayer(id, sp.x, sp.y);
+    }
+    this.syncPlayers();
+  }
+
+  /**
+   * 造一个绑定到**当前** `this.grid` / `this.sizeCells` 的物理世界。
+   *
+   * 为什么是方法:构造器与 `rebuildWorld` 都要它。抄两遍就是两份实现 ——
+   * 日后有人在其中一处补一条 terrain 投影(例如 `wireAt`),另一处不会跟着改,
+   * 而表现是**静默**的(与本仓踩过的"水穿墙"同族:两套影子状态不同步)。
+   *
+   * ⚠️ 里面的闭包读的是**调用时**的 `this.grid`(不是构造时抓的引用),
+   *   所以重建时"先换 grid 再调本方法"与"先调本方法再换 grid"都安全 ——
+   *   但仍按构造器的顺序写,免得下一个人以为顺序有讲究。
+   */
+  private makePhysicsWorld(): PhysicsWorld {
+    return new PhysicsWorld({
+      terrain: {
+        floorSlotAt: (x: number, y: number) => this.grid.floorSlotAt(x, y),
+        objIdAt: (x: number, y: number) => this.grid.objIdAt(x, y),
+        elevAt: (x: number, y: number) => this.grid.elevAt(x, y),
+        faceDirAt: (x: number, y: number) => this.grid.faceDirAt(x, y),
+        poweredAt: (x: number, y: number) => this.grid.poweredAt(x, y),
+        roofAt: (x: number, y: number) => this.grid.roofAt(x, y),
+      },
+      bounds: { minX: 0, minY: 0, maxX: this.sizeCells - 1, maxY: this.sizeCells - 1 },
+    });
+  }
+
   /** 从 AOI 的当前状态重建玩家列表(位置每帧会变,必须同步)。 */
   private syncPlayers(): void {
     const list: AoiPlayer[] = [];
@@ -3968,7 +4494,7 @@ export class WorldSim {
    * (`behaviors.ts`)的接口,加 `hp` 会让它的 55 条断言与假 `MobWorld` 全改。
    * 而职责上 AI 只需要「玩家在哪、在做什么」,不需要知道剩多少血。
    */
-  readonly vitals = new VitalsSystem();
+  vitals = new VitalsSystem();
 
   /** 最近一次慢帧的命中结果(诊断用)。 */
   lastHits: MobHitResult[] = [];

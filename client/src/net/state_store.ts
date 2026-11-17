@@ -73,7 +73,9 @@ export function emptyRoomState(): RoomState {
   };
 }
 
-/** `apply()` 的结果。调用方**按它决定**要不要重画,不靠副作用。 */
+/**
+ * `apply()` 的结果。调用方**按它决定**要不要重画,不靠副作用。
+ */
 export interface ApplyResult {
   /** 状态是否真的变了(跳过空帧、解码失败时为 false)。 */
   changed: boolean;
@@ -83,6 +85,12 @@ export interface ApplyResult {
   skipped: 'empty-frame' | 'decode-failed' | null;
   /** `skipped === 'decode-failed'` 时的原因文本(便于诊断与断言)。 */
   error?: string;
+  /**
+   * ★ D-14:本帧包头带回的 `ackedSeq`(服务端**已应用**到的客户端命令序号,
+   * `-1` = 本帧没带 ack)。**跳过 / 失败时为 `null`** —— 它来自帧本身,
+   * 不是本地推出来的数(见 `ClientStateStore.lastAckedSeq`)。
+   */
+  ackedSeq: number | null;
 }
 
 export class ClientStateStore {
@@ -92,6 +100,20 @@ export class ClientStateStore {
   private decodeErrors_ = 0;
   private emptyFrames_ = 0;
   private lastError_: string | undefined;
+  /**
+   * ★ D-14:最近一帧包头带回的 `ackedSeq`(`-1` = 还没收到过任何 ack)。
+   *
+   * ## 为什么它住在 store 而不是 session
+   * 它是**解码结果的一部分**(`decodePacket` 的字段),而解码只在这里发生
+   * ⇒ 放这里,`session.ts` 的运输层**不需要**知道协议头长什么样
+   *   (它只把字节交过来)。判据:`tests/WS-FND-58` 的 FND58-8 钉住这一点。
+   *
+   * ## 它的消费方
+   * `main.ts` 每 tick 把它喂进 `LocalPredictor.onAuthoritative({ackedSeq})`,
+   * 由预测器剪 `pending`。**不许**在客户端另外造一个 ack(那会让
+   * "剪枝真的发生"变成一条本地可以伪造的断言 —— 见 WS-FND-63 的负对照)。
+   */
+  private ackedSeq_ = -1;
 
   /** 当前权威状态。**只读**:调用方不得就地改它(`applyPacket` 每帧返回新对象)。 */
   get state(): RoomState {
@@ -116,6 +138,11 @@ export class ClientStateStore {
     return this.lastError_;
   }
 
+  /** ★ D-14:服务端**已应用**到的客户端命令序号(最近一帧包头带回;`-1` = 还没有)。 */
+  get lastAckedSeq(): number {
+    return this.ackedSeq_;
+  }
+
   /** 握手拿到自己的 id 时调一次。空串表示未知(圆心会因此返回 `null`)。 */
   setLocalPlayerId(id: string): void {
     this.localId_ = id;
@@ -134,7 +161,7 @@ export class ClientStateStore {
        实测 decodePacket(new Uint8Array(0)) 会抛("报文截断") ⇒ 必须在此拦下。 */
     if (bytes === null || bytes.byteLength === 0) {
       this.emptyFrames_ += 1;
-      return { changed: false, tick: tickBefore, skipped: 'empty-frame' };
+      return { changed: false, tick: tickBefore, skipped: 'empty-frame', ackedSeq: null };
     }
 
     /* ── 解码:版本不符 / op 未知 / 截断 都会在此抛 ── */
@@ -144,7 +171,10 @@ export class ClientStateStore {
     } catch (e) {
       this.decodeErrors_ += 1;
       this.lastError_ = (e as Error).message ?? String(e);
-      return { changed: false, tick: tickBefore, skipped: 'decode-failed', error: this.lastError_ };
+      return {
+        changed: false, tick: tickBefore, skipped: 'decode-failed',
+        error: this.lastError_, ackedSeq: null,
+      };
     }
 
     /* ── 坑 1:`applyPacket` 返回**新对象** ⇒ 必须接住返回值。
@@ -152,6 +182,9 @@ export class ClientStateStore {
        状态不变、不报错、画面冻住而没有任何提示。 */
     this.state_ = applyPacket(this.state_, pkt);
 
-    return { changed: true, tick: this.state_.meta.tick, skipped: null };
+    /* ★ D-14:包头带回的 ack 也是**这一帧的事实** —— 与状态一起落账。 */
+    this.ackedSeq_ = pkt.ackedSeq;
+
+    return { changed: true, tick: this.state_.meta.tick, skipped: null, ackedSeq: pkt.ackedSeq };
   }
 }

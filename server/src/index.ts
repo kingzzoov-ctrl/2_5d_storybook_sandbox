@@ -98,13 +98,18 @@
  */
 
 import { WorldSim } from './sim/world_sim.ts';
+/* ★ D-06:归档口要接给世界 —— 只 import **类型**与那一个写入函数;
+   世界的归档回执形状(`WorldArchiveReceipt`)与 `repo.ts` 的
+   `WorldArchiveSummary` 由下面 `makeArchiveSink` 的**字段搬运**对齐
+   (对接错误 = 编译期红,而不是运行期一个空 id)。 */
+import type { WorldArchiveRequest, WorldArchiveReceipt, WorldArchiveSink } from './sim/world_sim.ts';
 import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
 import { setTownRadiusProvider } from './mobs/spawner.ts';
 import { townSafeRadiusProvider } from './net/actions/modify_town.ts';
 import { RoomRuntime, type RoomRuntimeOptions, type WorldSaveHost } from './net/room.ts';
-import { AccessMode } from './db/repo.ts';
+import { AccessMode, archiveWorldSnapshot } from './db/repo.ts';
 import type { DbLike } from './db/repo.ts';
 /* ★ task-70:生产入口终于有了 `driver.sqlite.ts` 的**消费者**。
    接线前实测:`db/driver.sqlite.ts` 与 `db/memory_db.ts` 都只被**测试**引用
@@ -124,6 +129,19 @@ export interface AssembleDeps {
   clock?: Clock;
   /** 数据库;`null` = 纯内存(测试默认)。 */
   db?: DbLike | null;
+  /**
+   * ★ D-06:**世界归档口**(重置时把旧世界写成一份可回滚快照行)。
+   *
+   * 缺省时由 `db` **派生**(见下面的 `makeArchiveSink`):给了库就有归档能力,
+   * 没给库就是"没有库"(重置会如实回 `archiveError`)。
+   *
+   * 显式注入这一条存在两个用途:
+   *   1 **负对照**:`tests/WS-FND-62` 注入一个抛错的 sink,证明"归档失败
+   *      ⇒ `applied` 仍是 true + `archiveError` 非空"。没有这个口就只能在
+   *      测试里手动改装配后的对象 —— 而本仓的纪律是"别让测试手动装"。
+   *   2 将来的网关/对象存储实现:归档不一定落在 SQLite 上。
+   */
+  archiveSink?: WorldArchiveSink | null;
   /**
    * SQLite 存档文件路径。**给出它就自动开真库**(task-70)。
    *
@@ -248,14 +266,59 @@ function wireHost(host: WorldSaveHost, roomId: string): void {
   const sleepHost = host as unknown as { attachSleepSource?: (fn: (u: string) => boolean) => void };
   sleepHost.attachSleepSource?.((userId: string) => sleepStateOf(roomId, userId).sleeping);
 }
-export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
+/**
+ * 把 `repo.archiveWorldSnapshot` 适配成世界侧的**归档口**(★ D-06)。
+ *
+ * 为什么适配住在装配层:`WorldSim` 的 `WorldArchiveRequest` 刻意不 import 存储层
+ * 类型(见那边的注释),`repo.ts` 也不认识世界 —— 本文件是**唯一**同时认识两侧的
+ * 地方 ⇒ 形状对齐在这里发生,**错了是编译期红**(`archived_at` 拼成 `archivedAt`
+ * 会当场 `TS2339`),而不是运行期一个 `undefined` 混进回执。
+ *
+ * ⚠️ 只搬四个字段:回执要的是"可判定的句柄 + 可显示的摘要",
+ * 把整个 `WorldArchiveWriteResult`(含 `pruned` / BLOB)摊给世界没有消费者,
+ * 却会把存储层的形状泄漏进模拟层。
+ */
+function makeArchiveSink(db: DbLike): WorldArchiveSink {
+  return (req: WorldArchiveRequest): WorldArchiveReceipt => {
+    const r = archiveWorldSnapshot(db, {
+      roomId: req.roomId,
+      seed: req.seed,
+      snapshot: req.snapshot,
+      nowMs: req.nowMs,
+      worldTick: req.worldTick,
+      reason: req.reason,
+    });
+    return {
+      id: r.archived.id,
+      seed: r.archived.seed,
+      archived_at: r.archived.archived_at,
+      bytes: r.archived.bytes,
+    };
+  };
+}
+
+/**
+ * @param db 本房间**正在用的**那个库(由 `assemble` / `resolveAssembly` 解析一次
+ *           后传进来)。**不在这里调 `resolveDb`** —— 那会为同一个 `dbPath`
+ *           开第二条连接,而 `:memory:` 下那会是**另一个库**:
+ *           归档写进 A、房间读 B,于是"重置归档成功但列表里没有" —— 静默错。
+ *           缺省 `null` ⇒ 世界没有归档口(重置**如实**回 `archiveError`)。
+ */
+export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): WorldSaveHost {
   /* ★ 房间号的**唯一**默认值:`createHost` 与 `assemble` 的 `rtOpts` 必须同源,
      否则世界与运行时问的是两个房间(A2)。 */
   const roomId = deps.roomId ?? 'room_main';
-  /* ⚠️ `WorldSimOptions` 只有 `sizeCells` / `fluidBudget` / `wiring` / `mobs` /
-     `rng` / `combatRng` / `alchemy` / `biome` **八个**字段 —— **没有 `worldSeed`**。
-     故这里只透传 `sizeCells`,并支持注入 `rng`/`combatRng` 以便测试完全可复现
-     (`worldSeed` 是**房间参数**,由 `rtOpts` 承载,见 `assemble()`)。
+  /* ★ D-06 归档口:显式注入优先(`deps.archiveSink`),否则由**库**派生。
+     `deps.db` 也认(调用方显式给了同一个库对象时,不必再传第二遍)。 */
+  const archiveDb = db ?? deps.db ?? null;
+  const archiveSink: WorldArchiveSink | null =
+    deps.archiveSink ?? (archiveDb === null ? null : makeArchiveSink(archiveDb));
+  /* ⚠️ `WorldSimOptions` 透传的口子见那边的 interface。**没有 `worldSeed`**:
+     `worldSeed` 是**房间参数**(由 `rtOpts` 承载,见 `assemble()`),而世界侧
+     对应的是 `seed`(随机流的**身份**,见 `WorldSimOptions.seed`)。
+     ⇒ 两者**同源**但不共用一个名字:房间的 `worldSeed` 是「这一局的世界身份」,
+     世界的 `seed` 是「这条随机流的身份」;装配层把它们接成同一个值
+     (`seed: deps.worldSeed`),世界内部不再第二份推导。
      ★ 加 `biome` 的理由:本仓没有每格群系,「世界群系」只能是一个**显式选择**,
        而它是刷怪配表的键 ⇒ 不透传就等于让刷怪永远只走兜底。 */
   const sim = new WorldSim({
@@ -274,6 +337,11 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
     /* ★ 房间号透传给世界:刷怪要靠它去问「本房间的安全区半径」
        (`modify_town.ts` 的配置从此真的生效;没给 ⇒ 退回常量 24)。 */
     roomId,
+    /* ★ D-06:世界的**种子身份**。没给 ⇒ 世界用它自己的默认 `0x5eed`
+       (那确实就是它那条流的种子,如实记,不猜)。 */
+    seed: deps.worldSeed,
+    /* ★ D-06:归档口。`null` = 没有库 ⇒ 重置回 `archiveError`(如实)。 */
+    archiveSink,
   } as ConstructorParameters<typeof WorldSim>[0]);
   wireHost(sim, roomId);
   return sim;
@@ -287,7 +355,11 @@ export function createHost(deps: AssembleDeps = {}): WorldSaveHost {
  * 本仓 8 例「测试全绿 + 生产零消费」的共同形态正是:测试手动装,生产没装。
  */
 export function assemble(deps: AssembleDeps = {}): Assembled {
-  const host = createHost(deps);
+  /* ★ 库**只解析一次**,同一个对象交给 host(归档口)与运行时(落盘/读档)。
+     分两次解析在 `dbPath` 下会开两条连接、在 `:memory:` 下会是**两个库** ——
+     于是"重置归档了一行,房间里读不到"这种静默错就有了入口。 */
+  const db = resolveDb(deps);
+  const host = createHost(deps, db);
   const roomId = deps.roomId ?? 'room_main';
 
 
@@ -316,7 +388,7 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
     host,
   };
 
-  const runtime = new RoomRuntime(rtOpts, resolveDb(deps));
+  const runtime = new RoomRuntime(rtOpts, db);
 
   /* ★ 把**睡眠读口**接进世界:装配层是唯一知道"本房间 id"的地方,
      而 `WorldSim` 不 import `net/actions/**`(那会让 sim 依赖 net)⇒ 在这里注入闭包,依赖单向。
@@ -385,7 +457,10 @@ function resolveDb(deps: AssembleDeps): DbLike | null {
 export function resolveAssembly(
   deps: AssembleDeps = {},
 ): { host: WorldSaveHost; db: DbLike | null } {
-  return { host: createHost(deps), db: resolveDb(deps) };
+  /* ★ D-06:库**只解析一次**并同时交给 host(归档口)与房间(落盘/读档)——
+     见 `assemble()` 里的同一条注释。 */
+  const db = resolveDb(deps);
+  return { host: createHost(deps, db), db };
 }
 
 /** `createServer()` 的产物。刻意不 `listen`,便于 CI 与测试零副作用地检查装配。 */

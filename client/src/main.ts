@@ -351,14 +351,22 @@ function main(): void {
         predictor.reset({ x: pose.cx, y: pose.cy, z: 0 });
         seeded = true;
       } else {
-        predictor.onAuthoritative({ x: pose.cx, y: pose.cy, z: 0 });
+        /* ★ D-14(2026-11-17):ack 是**这一帧包头**带回来的数(`store` 解码时落账),
+           不是本地推出来的 —— 否则"剪枝真的发生"会变成一条本地可以伪造的断言。
+           `?server=off` 时 store 恒为空 ⇒ `lastAckedSeq === -1` ⇒ 一条都不剪。 */
+        predictor.onAuthoritative({
+          x: pose.cx, y: pose.cy, z: 0, ackedSeq: handle.store.lastAckedSeq,
+        });
       }
     }
     predictor.absorbVisual(DT);
     /* ⚠️ `?server=off` ⇒ `session === null` ⇒ **不发包**(单机/截图自检靠这条:
-       没连上却每 tick 调 `sendMove`,表现是控制台刷"还没连上"而画面不动)。 */
+       没连上却每 tick 调 `sendMove`,表现是控制台刷"还没连上"而画面不动)。
+       ★ D-14(2026-11-17):上行**必须带 `cmd.seq`** —— 服务端只把**应用成功**的
+       `seq` 写进下行包头 `ackedSeq`,客户端据此剪 `pending`。漏了它的症状是
+       「移动照常、永不剪枝」,而两端**都不报错**(TASK-100 实测:生产者此前不存在)。 */
     if (session !== null) {
-      session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z });
+      session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z, seq: cmd.seq });
     }
     /* ── HUD:连没连上 / 站在哪 / 附近有没有怪 / 最近一次命中 ──
        「命中量」不是客户端编的:它来自**权威快照里那只怪的血量下降**

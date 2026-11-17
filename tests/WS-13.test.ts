@@ -56,6 +56,37 @@
  * [ ] 重连的 **30 秒宽限期语义** —— 在 room.ts,不在本套件(契约 §12.2 记为待办)
  * [ ] 真机延迟/丢包 —— 未测
  * ```
+ *
+ * ## ⚠️ 2026-11-17 时序抖动(全量门禁下偶发红)的根因与修法
+ * ```
+ * 症状:单独跑恒 20/20;门禁满载下偶发
+ *   ✗ WS13-6-1 — 应已发出 hello
+ * (整套退出码 1,该套件掉出汇总统计)
+ *
+ * 根因:异步区**用固定 `sleep(N)` 等异步到达的事件**。
+ *   `await sleep(400)` 一条压着三条断言(hello 已发出 / welcome 已到 /
+ *   ≥2 个二进制帧),而这三件事的真实耗时在满载下是**重尾**的。
+ *   实测(探针直接量同一条链,32 核机器):
+ *     空闲   n=10: connect→open p50 1ms / max 9ms
+ *     1024 线程 n=80: connect→open p50 2ms / p99 223ms / max 223ms
+ *   ⇒ 400ms 固定预算只比满载 p99 大 1.8 倍 ⇒ 偶发把"还没到"判成"没发生"。
+ *   实测复现(未改版 + 2048 线程压力,15 次):**2 次红**,红的正是固定 sleep 压的两条
+ *     WS13-6-1 应收到 ≥2 帧(实得 1) / WS13-6-5 应收到帧
+ *   ★ 这些断言**没有任何重试**:不是"偶发网络问题",是**预算写死**。
+ *
+ * 修法(只改本文件):把"等固定时间"一律改成"等条件成立 + 具名上限"
+ *   (`waitUntil` + `WS_*_BUDGET_MS`,每个常量注明它在等哪一段)。
+ *   端口不用改:服务端本来就是 `listen(0)` 由 OS 分配、`srv.port` 读回实际端口。
+ *
+ * 为什么这**不是掩蔽**:
+ *   1 条件式等待的超时**不是放行**:到点条件仍为假 ⇒ 原来那条 `ok/eq` 照旧红,
+ *     且消息里带"等满 Nms 仍不成立"与 closed/err 状态 ⇒ 红了能立刻分清
+ *     "握手真没发生"与"只是慢"。
+ *   2 上限比原来的固定 sleep **更宽但不是放行**:同一批断言一条没少、强度没动
+ *     (仍是 `sentHello===true`、`bin.length>=2`、`framesSent()>0`)。
+ *   3 反而更硬:注入验证(把上限改成 0)⇒ 该条**必红**(因为"没发生"仍判红)。
+ * ```
+ *
  */
 
 import {
@@ -644,6 +675,12 @@ type Collected = {
   bin: Uint8Array[];
   closed: { code: number; reason: string } | null;
   sentHello: boolean;
+  /**
+   * ★ 连接级**终态**错误(2026-11-17 加):原实现只 `resolve()` 不记详情,
+   * 于是"握手真的失败"与"只是慢"在报告里长得**一模一样**。
+   * 记下来只为了让红的报告能自证是哪一种 —— 不影响任何判据强度。
+   */
+  err: string | null;
 };
 
 /**
@@ -675,7 +712,7 @@ const withTimeout = async <T>(p: Promise<T>, ms: number, what: string): Promise<
 function connect(url: string, userId?: string): {
   ws: WebSocket; got: Collected; done: Promise<void>;
 } {
-  const got: Collected = { welcome: null, bin: [], closed: null, sentHello: false };
+  const got: Collected = { welcome: null, bin: [], closed: null, sentHello: false, err: null };
   const full = userId === undefined ? url : `${url}${url.includes('?') ? '&' : '?'}userId=${userId}`;
   const ws = new WebSocket(full);
   ws.binaryType = 'arraybuffer';
@@ -698,19 +735,46 @@ function connect(url: string, userId?: string): {
     ws.addEventListener('close', ((ev: { code: number; reason: string }) => {
       got.closed = { code: ev.code, reason: ev.reason }; resolve();
     }) as never);
-    ws.addEventListener('error', () => resolve());
+    ws.addEventListener('error', ((ev: { error?: { name?: string; message?: string } }) => {
+      got.err = ev.error
+        ? `${ev.error.name ?? 'Error'}: ${ev.error.message ?? ''}`
+        : 'error(无详情)';
+      resolve();
+    }) as never);
   });
   return { ws, got, done };
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
+/* ═══════════════ 6.0 ★ 具名等待上限(2026-11-17:修时抖)═══════════════
+ * 每个常量都写清"它在等哪一段异步链"。取值口径:
+ *   满载实测该链的 p99(见文件头)+ 一个数量级以上的余量
+ *   ⇒ 服务端**坏了**(条件永不成立)仍会红;只是**慢**(满载 p99 的 20 倍内)不再误红。
+ * ⚠️ 这些上限**不是**"放宽":到点条件仍为假时,下游那条 `ok/eq` 照旧红。
+ */
+/** 等:`startWsServer` 返回 → TCP connect → HTTP Upgrade(101)→ 客户端 `open` 事件。
+ *  满载实测 p99 = 223ms(120 样本,1024 线程)⇒ 5000ms 是它的 22 倍。 */
+const WS_OPEN_BUDGET_MS = 5000;
+/** 等:`open` → 上行 hello → 服务端 join 进房 → welcome 文本帧回到客户端。 */
+const WS_WELCOME_BUDGET_MS = 5000;
+/** 等:join 首帧(`snapshotFor`)+ 20Hz 广播循环**至少一拍**差量帧 ⇒ 客户端 ≥2 帧。 */
+const WS_BIN_FRAMES_BUDGET_MS = 5000;
+/** 等:70000 字节上行帧经真 socket 抵达服务端(以**服务端** `lastUplink()` 观测)。 */
+const WS_UPLINK_BUDGET_MS = 5000;
+/** 等:3 条连接**全部**完成握手并进房(`room.members.size === 3`)。 */
+const WS_MEMBERS_BUDGET_MS = 5000;
+/** 等:异常断开(destroy)后服务端把玩家记为离线(`onlineCount()` 归零)。
+ *  实测 p50 44.4ms / max 46.1ms ⇒ 2000ms 是它的 43 倍(见 `waitUntil` 注释)。 */
+const WS_OFFLINE_BUDGET_MS = 2000;
+
 /**
  * ★ 轮询等待条件成立,取代**固定 sleep**。
  *
  * ## 为什么加它(task-78 的实测结论)
  * ```
- * 本套件有 9 处 `await sleep(N)`:400/300/400/250/250/60/250/300/300(ms)
+ * 本套件原有 9 处 `await sleep(N)`:400/300/400/250/250/60/250/300/300(ms)
+ * (2026-11-17 已**全部**改成条件等待,见 6.0 的 `WS_*_BUDGET_MS`)
  * 全部形态都是「固定等一段 ⇒ 断言某件**异步**到达的事」。
  * ⇒ 实测各段的**真实延迟**与门限的比值(各 200 样本,见 _t78_lat.ts):
  *      startWsServer 返回   max 1.7ms
@@ -745,9 +809,38 @@ async function waitUntil(cond: () => boolean, budgetMs: number, stepMs = 5): Pro
   const t0 = Date.now();
   for (;;) {
     if (cond()) return Date.now() - t0;
-    if (Date.now() - t0 > budgetMs) return -1;
+    /* ★ 用 `>=` 而**不是** `>`:`budgetMs = 0` 必须表示"**不看**,当场只看一眼" ——
+       否则 `0` 会白送一个 `stepMs`(5ms),注入验证(I1:上限改 0)就**不会红**,
+       那条注入也就证明不了"等待是载荷的"。实测:用 `>` 时 0 预算下 6-1 仍 20/20 绿。 */
+    if (Date.now() - t0 >= budgetMs) return -1;
     await sleep(stepMs);
   }
+}
+
+/** 把 `waitUntil` 的返回值写成报告里能读的话:≥0 = 成立耗时,<0 = 等满上限仍未成立。 */
+function waitedText(waited: number, budgetMs: number): string {
+  return waited < 0 ? `等满 ${budgetMs}ms 仍不成立` : `等了 ${waited}ms`;
+}
+
+/** 连接级**终态**的原始值 —— 只用来解释"为什么红",不参与任何判据。 */
+function connState(got: Collected): string {
+  return `closed=${got.closed === null ? 'null' : String(got.closed.code)}`
+    + `,err=${got.err ?? 'null'}`;
+}
+
+/**
+ * ★ 等一个**连接级**条件成立;若连接已进入终态(error/close ⇒ 不可能再来事件),
+ * **提前**结束等待。
+ *
+ * ## 为什么提前结束**不是**放行
+ * ```text
+ * 它不改任何状态 ⇒ 调用点断言的原条件此时仍为假 ⇒ 那条 `ok/eq` **照旧红**。
+ * 它只是把"明知不会再来"的情况从"白等满 5 秒"变成"立刻红,并把 closed/err
+ * 写进消息" ⇒ 报告第一次能区分「握手真没发生」与「只是慢」。
+ * ```
+ */
+async function waitConn(cond: () => boolean, got: Collected, budgetMs: number): Promise<number> {
+  return await waitUntil(() => cond() || got.closed !== null || got.err !== null, budgetMs);
 }
 
 /** 安全关掉一个客户端 + 服务端(每一步都有超时,不会挂死套件)。 */
@@ -766,16 +859,34 @@ async function main(): Promise<void> {
     /* ⚠️ 进 try **之前**只允许"获取资源",不放断言 ——
        断言写在 try 外时一旦抛,finally 不执行 ⇒ srv 不关 ⇒ 进程不退。 */
     try {
-      await sleep(400);
-      ok(got.sentHello, '应已发出 hello');
-      ok(got.welcome !== null, `应收到 welcome,实得 ${got.welcome === null ? 'null' : '非空'}`);
+      /* ── ① 等 hello 发出(旧写法:`await sleep(400); ok(got.sentHello)`)──
+         ★★ 2026-11-17 抖动的**根因**就是这一行:400ms 是**猜**的固定预算。
+         满载实测 connect→open 的 p99 = 223ms(120 样本,1024 线程,见文件头)
+         ⇒ 余量只剩 1.8x ⇒ 偶发把"还没到"判成"没发生"(未改版实测复现 2/15)。
+         ⇒ 改成等条件成立(上限 `WS_OPEN_BUDGET_MS`)。
+         ⚠️ **不削弱**:到点 `sentHello` 仍为 false ⇒ 下面这条 `ok` 照旧红,
+            且消息里写明等了多久 + 连接的 closed/err 状态。 */
+      const tHello = await waitConn(() => got.sentHello, got, WS_OPEN_BUDGET_MS);
+      ok(got.sentHello,
+        `应已发出 hello(${waitedText(tHello, WS_OPEN_BUDGET_MS)};${connState(got)})`);
+      /* ── ② 等 welcome(旧:`sleep(400)` 顺带等它)── */
+      const tWelcome = await waitConn(() => got.welcome !== null, got, WS_WELCOME_BUDGET_MS);
+      ok(got.welcome !== null,
+        `应收到 welcome,实得 ${got.welcome === null ? 'null' : '非空'}`
+        + `(${waitedText(tWelcome, WS_WELCOME_BUDGET_MS)};${connState(got)})`);
       const w = got.welcome!;
       eq(w.t, 'welcome', 'welcome.t');
       eq(w.playerId, 'alice', 'welcome.playerId 应等于 URL 里声明的 userId');
       eq(w.protocolVersion, PROTOCOL_VERSION, 'welcome.protocolVersion');
       eq(w.roomId, 'r-ws13', 'welcome.roomId');
 
-      ok(got.bin.length > 0, `应收到 ≥1 个二进制帧,实得 ${got.bin.length}`);
+      /* ── ③ 等"首帧 + ≥1 拍广播帧"(旧:`sleep(400)` 顺带等它)──
+         等的是 `>= 2`(两条断言的分水岭);下面 `>0` 与 `>=2` **两条都保留** ——
+         它们红的含义不同(前者 = 一帧都没到;后者 = 广播循环没发)。 */
+      const tBin = await waitConn(() => got.bin.length >= 2, got, WS_BIN_FRAMES_BUDGET_MS);
+      ok(got.bin.length > 0,
+        `应收到 ≥1 个二进制帧,实得 ${got.bin.length}`
+        + `(${waitedText(tBin, WS_BIN_FRAMES_BUDGET_MS)})`);
       /* ★★ 这里必须区分**两个来源**,否则断言看不见引导期死锁(实测抓到):
          ```
          bin[0] 来自 join 时的 `snapshotFor()`(encodeFull)—— **不经过** step 循环
@@ -791,6 +902,7 @@ async function main(): Promise<void> {
         + '只靠 join 时的首帧不足以证明 step/prevState 那条链是活的');
       ok(got.bin.length >= 2,
         `★ 应收到 ≥2 帧(首帧 + ≥1 广播帧),实得 ${got.bin.length}`
+        + `(${waitedText(tBin, WS_BIN_FRAMES_BUDGET_MS)};${connState(got)})`
         + ' —— 若只有 1 帧,说明广播循环没发出来(prevState 引导期死锁)');
       /* ★ 下行**无 tag**:首字节应是 PROTOCOL_VERSION(1),不是 0x02。
          若这里加了 tag ⇒ 客户端 `classifyDownlink` 会把它当二进制再剥一层
@@ -829,8 +941,12 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
     const { ws, got, done } = connect(`ws://127.0.0.1:${srv.port}/ws`, 'bob');
     try {
-      await sleep(300);
-      ok(got.bin.length > 0, '先要收到帧,否则负向对照无从谈起');
+      /* ★ 旧:`await sleep(300); ok(got.bin.length > 0)` —— 与 6-1 同一个根因(固定预算)。
+         ⇒ 等条件成立;到点仍 0 帧 ⇒ 下面这条 `ok` 照旧红。 */
+      const tBin = await waitConn(() => got.bin.length > 0, got, WS_BIN_FRAMES_BUDGET_MS);
+      ok(got.bin.length > 0,
+        `先要收到帧,否则负向对照无从谈起(${waitedText(tBin, WS_BIN_FRAMES_BUDGET_MS)};`
+        + `${connState(got)})`);
       const raw = got.bin[0]!;
       /* 故意不剥 tag:给协议包前面塞一个 0x02(真实现的 tag 值) */
       const withTag = uplink(0x02, raw);
@@ -854,15 +970,23 @@ async function main(): Promise<void> {
     const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p3');
     try {
       /* ⚠️ 这里原来是固定 `await sleep(400)` 再断言成员数 —— 单跑没问题,
-         但门禁**串行跑 38 个套件**时机器更忙,3 个 WebSocket 握手可能来不及
-         完成,于是 `members.size` 还是 0,这条用例就"随机"红(实测发生过两次:
-         两次都是本套件掉出统计,`用例汇总` 因此从 1014/14 变成 994/13)。
-         ⇒ 改成**等条件**(最长 3 秒),失败时把实测值写进消息。
+         但门禁**串行跑套件**时机器更忙,3 个 WebSocket 握手可能来不及
+         ⇒ `members.size` 还是 0 ⇒ "随机"红(实测发生过两次:本套件直接掉出统计)。
+         ⇒ 2026-11-15 改成"等条件";2026-11-17 把散落的 `for + sleep(50)` 轮询
+           统一成 `waitUntil` + **具名上限** `WS_MEMBERS_BUDGET_MS`(含义见常量注释),
+           并把"等了多久"写进失败消息。
          判据本身没放宽:仍然是 `=== 3`,只是不再假设"400ms 一定够"。 */
-      for (let i = 0; i < 60 && room.members.size < 3; i += 1) await sleep(50);
-      eq(room.members.size, 3, `房间应有 3 名成员(实测 ${room.members.size})`);
+      const tMembers = await waitUntil(() => room.members.size >= 3, WS_MEMBERS_BUDGET_MS);
+      eq(room.members.size, 3,
+        `房间应有 3 名成员(实测 ${room.members.size};${waitedText(tMembers, WS_MEMBERS_BUDGET_MS)})`);
+      /* 三人**都**收到 welcome 同样是"握手真完成了"的证据 —— 也等,不猜。 */
+      const tWelcomes = await waitUntil(
+        () => a.got.welcome !== null && b.got.welcome !== null && c.got.welcome !== null,
+        WS_WELCOME_BUDGET_MS,
+      );
       ok(a.got.welcome !== null && b.got.welcome !== null && c.got.welcome !== null,
-        '三个客户端都应收到 welcome');
+        `三个客户端都应收到 welcome(${waitedText(tWelcomes, WS_WELCOME_BUDGET_MS)}`
+        + `;a:${connState(a.got)},b:${connState(b.got)},c:${connState(c.got)})`);
       ok(a.got.bin.length > 0 && b.got.bin.length > 0 && c.got.bin.length > 0,
         `三个客户端都应收到二进制帧(实得 ${a.got.bin.length}/${b.got.bin.length}/${c.got.bin.length})`);
       /* ★★ 这里我第一版**比错了对象**(实测复盘):
@@ -885,12 +1009,14 @@ async function main(): Promise<void> {
          ⇒ 正确前置:等 `members=3` **且** 每人至少收到 **2 帧**(广播已流过至少一拍),
            此时三人的"末帧"才是**同一拍**的差量,可以逐字节比。
          ★ 判据本身没动:仍是「同一拍、长度一致、逐字节一致」。 */
-      for (let i = 0; i < 80 && (a.got.bin.length < 2 || b.got.bin.length < 2 || c.got.bin.length < 2); i += 1) {
-        await sleep(50);
-      }
+      const tBins = await waitUntil(
+        () => a.got.bin.length >= 2 && b.got.bin.length >= 2 && c.got.bin.length >= 2,
+        WS_BIN_FRAMES_BUDGET_MS,
+      );
       ok(a.got.bin.length >= 2 && b.got.bin.length >= 2 && c.got.bin.length >= 2,
         `★ 三人应各收到 ≥2 帧(广播必须已经流过一拍;`
-        + `实得 ${a.got.bin.length}/${b.got.bin.length}/${c.got.bin.length})`);
+        + `实得 ${a.got.bin.length}/${b.got.bin.length}/${c.got.bin.length})`
+        + `(${waitedText(tBins, WS_BIN_FRAMES_BUDGET_MS)})`);
       const la = a.got.bin[a.got.bin.length - 1]!;
       const lb = b.got.bin[b.got.bin.length - 1]!;
       const lc = c.got.bin[c.got.bin.length - 1]!;
@@ -961,8 +1087,13 @@ async function main(): Promise<void> {
       /* 第一次:正常加入,然后**异常断开**(destroy 底层 TCP,不发 close 帧) */
       const first = connect(url);
       clients.push(first);
-      await sleep(250);
-      ok(first.got.welcome !== null, '第一次应收到 welcome');
+      /* ★ 旧:`await sleep(250)` —— 与 6-1 同一个根因(固定预算等握手)⇒ 等条件。 */
+      const tFirstWelcome = await waitConn(
+        () => first.got.welcome !== null, first.got, WS_WELCOME_BUDGET_MS,
+      );
+      ok(first.got.welcome !== null,
+        `第一次应收到 welcome(${waitedText(tFirstWelcome, WS_WELCOME_BUDGET_MS)};`
+        + `${connState(first.got)})`);
       eq(first.got.welcome!.resumed, false, '第一次加入 ⇒ resumed 应为 false');
       eq(room.members.size, 1, '第一次加入后应有 1 名成员');
 
@@ -975,7 +1106,7 @@ async function main(): Promise<void> {
            · 服务端**坏了**(永不归零)  ⇒ 2000ms 后仍未归零 ⇒ 红(余量 45x,牙更硬)
            · 服务端只是**慢了**(71ms)   ⇒ 绿(不再假阳性)
          ⇒ 判据第一次能区分「坏了」与「慢了」。 */
-      const waited = await waitUntil(() => room.onlineCount() === 0, 2000);
+      const waited = await waitUntil(() => room.onlineCount() === 0, WS_OFFLINE_BUDGET_MS);
       ok(waited >= 0,
         `★ 异常断开后服务端应在 2s 内把玩家记为离线(实测 ${waited < 0 ? '超时未归零' : waited + 'ms'})`);
       /* ★ 席位应**仍在**(异常断开保留 30s 宽限)——
@@ -986,8 +1117,13 @@ async function main(): Promise<void> {
       /* 第二次:同一 userId 重连 ⇒ 必须是 resumed */
       const second = connect(url);
       clients.push(second);
-      await sleep(250);
-      ok(second.got.welcome !== null, '第二次应收到 welcome');
+      /* ★ 旧:`await sleep(250)` —— 与 6-1 同一个根因(固定预算等握手)⇒ 等条件。 */
+      const tSecondWelcome = await waitConn(
+        () => second.got.welcome !== null, second.got, WS_WELCOME_BUDGET_MS,
+      );
+      ok(second.got.welcome !== null,
+        `第二次应收到 welcome(${waitedText(tSecondWelcome, WS_WELCOME_BUDGET_MS)};`
+        + `${connState(second.got)})`);
       eq(second.got.welcome!.resumed, true,
         '★ 同一 userId 在宽限期内重连 ⇒ resumed 必须为 true'
         + '(若随机生成 id 或断开时误用 leave,这里会是 false)');
@@ -1009,8 +1145,10 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
     const { ws, got, done } = connect(`ws://127.0.0.1:${srv.port}/ws`, 'dave');
     try {
-      await sleep(300);
-      ok(got.bin.length > 0, '应收到帧');
+      /* ★ 旧:`await sleep(300); ok(got.bin.length > 0)` —— 与 6-1 同一根因(固定预算)。 */
+      const tFrame = await waitConn(() => got.bin.length > 0, got, WS_BIN_FRAMES_BUDGET_MS);
+      ok(got.bin.length > 0,
+        `应收到帧(${waitedText(tFrame, WS_BIN_FRAMES_BUDGET_MS)};${connState(got)})`);
       /* 逐帧校验:收到的每一帧长度都应 > 0(0 字节帧被服务端跳过) */
       for (const [i, f] of got.bin.entries()) {
         ok(f.byteLength > 0, `第 ${i + 1} 帧不应为 0 字节`);
@@ -1022,9 +1160,12 @@ async function main(): Promise<void> {
       const big = new Uint8Array(70000);
       big[0] = PROTOCOL_VERSION;
       ws.send(uplink(0x02, big));
-      await sleep(300);
+      /* ★ 旧:`await sleep(300)` 后直接读 `lastUplink()` —— 70000 字节经真 socket
+         的到达时间同样是重尾 ⇒ 改成"等 `lastUplink()` 非空"(上限 WS_UPLINK_BUDGET_MS)。
+         ⚠️ 判据不变:仍要求 `byteLength === 70000` 且首字节是 PROTOCOL_VERSION。 */
+      const tUplink = await waitUntil(() => srv.lastUplink() !== null, WS_UPLINK_BUDGET_MS);
       const up = srv.lastUplink();
-      ok(up !== null, '服务端应收到上行载荷');
+      ok(up !== null, `服务端应收到上行载荷(${waitedText(tUplink, WS_UPLINK_BUDGET_MS)})`);
       eq(up!.byteLength, 70000, '★ 70000 字节上行应**完整**到达(剥 tag 后仍 70000)');
       eq(up![0], PROTOCOL_VERSION, '上行剥 tag 后首字节应为 PROTOCOL_VERSION');
     } finally {

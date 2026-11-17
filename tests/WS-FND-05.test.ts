@@ -395,16 +395,18 @@ function mkRoom(n: number) {
   return room;
 }
 
-test('16 人静止帧压到 10 字节', () => {
-  /* 静止帧 = 协议版本 1 + op 1 + tick 4 + removed u16 2 + plans u16 2 = 10。
+test('16 人静止帧压到 14 字节', () => {
+  /* 静止帧 = 协议版本 1 + op 1 + tick 4 + ackedSeq 4 + removed u16 2 + plans u16 2 = 14。
      这是字段级 diff 的结构极限:没有任何字段变化时只剩报文骨架。
-     判据 = 10(由协议骨架字段宽度算术推出,非魔法数)。 */
+     判据 = 14(由协议骨架字段宽度算术推出,非魔法数)。
+     ★ 2026-11-17(D-14 / 方案 A)重钉:10 → 14 —— 包头在 tick 之后加了
+       4 字节 `ackedSeq`(协议 v3)。骨架仍是**算术推出来的**,不是魔法数。 */
   const prev = mkRoom(16);
   const still = mkRoom(16);
   still.meta.tick = 2;
   const pkt = encodeDelta(prev, still, 2);
-  const skeleton = 1 + 1 + 4 + 2 + 2; /* version + op + tick + removed + plans */
-  eq(skeleton, 10, '报文骨架应为 10 字节');
+  const skeleton = 1 + 1 + 4 + 4 + 2 + 2; /* version + op + tick + ackedSeq + removed + plans */
+  eq(skeleton, 14, '报文骨架应为 14 字节');
   eq(pkt.bytes.length, skeleton, `静止帧应只剩骨架,实测 ${pkt.bytes.length}B`);
 });
 

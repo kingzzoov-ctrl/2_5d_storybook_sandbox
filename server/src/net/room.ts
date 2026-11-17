@@ -686,22 +686,53 @@ export interface WorldSaveHost {
        `projectInventoryTotalFor` → `host.inventoryDetailOf` → `projectInventoryTotal`
      ⇒ 故删声明而不补实现(已在 docs/WS-07-net-persist.md §9.1 记 CR)。 */
   /**
-   * **世界重置**(`RESET_WORLD` 的唯一通路)。
+   * **世界重置**(`RESET_WORLD` 的唯一通路)。★ **2026-11-16 起有实现者**:
+   * `WorldSim.resetWorld`(`server/src/sim/world_sim.ts`),落点见
+   * `docs/DECISIONS.md` **D-06**(= 归档 + 内存重建)。
    *
-   * ⚠️ 今天是**可选**能力,且**没有实现者** —— `WorldSim` 不提供它,于是生产里
-   *   走的是「能力缺失」分支(动作层据此回**显式** `NOT_IMPLEMENTED`,不许静默成功)。
-   *   做成可选而不是必填的理由:本接口每个成员都要求实现者**真的做得到**;今天没有
-   *   任何宿主能重建世界(见 `docs/TASK-97-world-reset-ruling.md` §3),写成必填只会
-   *   逼实现者交一个假实现 —— 那正是本仓反复防的"静默成功"。配套那行 `return sim`
-   *   也说明了这点:可选成员**必须**在这里声明,否则会被结构化裁掉(见 `index.ts:196-207`)。
+   * ## 为什么仍是**可选**成员
    *
-   * 契约:重置是**破坏性的**;返回**实际生效**的语义(不是"我收到了请求"):
-   *   - `applied: true`  ⇒ 世界已经是新种子,调用方必须假定旧状态全部作废;
-   *   - `applied: false` ⇒ 一字未改,`reason` 说清为什么。
-   * ⚠️ 存档政策(丢弃 / 保留 / 归档)**尚未裁决**(`TASK-97` §4)⇒ 裁决之前,
-   *   实现者**不许**在这里"顺手清掉"任何旧数据。
+   * 本接口每个成员都要求实现者**真的做得到**。手写 host 假件(`tests/**`、
+   * `scripts/**` 里那几份)不实现它本来就合法 —— 那种宿主走的是动作层的
+   * 「能力缺失」分支(显式 `NOT_IMPLEMENTED`,不许静默成功)。
+   * 做成必填会逼所有假件补一个**假实现**,那正是本仓反复防的"静默成功"。
+   * 配套那行 `return sim` 也说明了这点:可选成员**必须**在这里声明,
+   * 否则会被结构化裁掉(`index.ts` 的 `createHost` docblock)。
+   *
+   * ## 契约:返回**实际生效**的语义(不是"我收到了请求")
+   *
+   * - `applied: true`  ⇒ 世界已经是新种子,调用方必须假定旧状态全部作废
+   *   (地形 / 生物 / 掉落 / 钟点 06:00;玩家保留、满血、回出生点);
+   * - `applied: false` ⇒ **一字未改**,`reason` 说清为什么。
+   *
+   * ## 归档回执(★ D-06,三态的来源)
+   *
+   * `archive` **必填**(不是可选):
+   *   - `{ id, seed, archived_at, bytes }` = 旧世界**已归档**;
+   *   - `null` = **明确**没归档,原因在 `archiveError`(`'没有库'` / sink 抛错 / …)。
+   *
+   * ⚠️ **归档失败不许改 `applied`**:世界确实已经重建了,把 `applied` 写成
+   *   `false` 会让调用方以为还停在旧世界(继续用旧 chunk)。动作层
+   *   (`net/actions/reset_world.ts` 的 `resetEffect`)按这三态回 `ARCHIVED` /
+   *   `NOT_ARCHIVED` / `UNREPORTED`,本接口的形状必须与它**逐字段同形**。
+   *
+   * ## 参数
+   *
+   * - `seed`:**新世界**的种子(有限整数;非法 ⇒ `applied: false` + 零副作用);
+   * - `nowMs`:**可选**归档时间戳(动作层手里没有时钟,缺省世界自己取
+   *   `Date.now()`)。它**只进归档行**,不进模拟 —— 世界时钟由帧序派生(D-07),
+   *   挂钟不会污染确定性。
    */
-  resetWorld?(opts: { seed: number }): { applied: boolean; seed: number; reason?: string };
+  resetWorld?(opts: { seed: number; nowMs?: number }): {
+    applied: boolean;
+    /** **实际生效**的种子(`applied: true` 时 = 新世界的种子)。 */
+    seed: number;
+    reason?: string;
+    /** 旧世界归档回执(★ D-06):`{...}` = 已归档;`null` = 明确没归档。 */
+    archive: { id: string; seed: number; archived_at: number; bytes: number } | null;
+    /** 归档失败 / 没有库的原因(归档没成不该让回执看起来一切正常)。 */
+    archiveError?: string;
+  };
   /**
    * 该玩家是否已**解锁高级锻造**(★ D-11:站进 `FORGE_MASTER` 房间 ⇒ true)。
    *

@@ -249,8 +249,10 @@ async function main(): Promise<void> {
        *   而不是"拿常量跟自己比"。
        * ```
        * ⇒ 修法是**保留检查、改成合规形态**:字面量锚定 + 显式跨模块断言。
-       *   ★ 不删掉它 —— 删掉就丢了一条真的跨端检查(见 FND14-8)。 */
-      eq(got!.version, 1, 'version = 1(字面量锚定:报文里编的是 delta.ts 的那个 1)');
+       *   ★ 不删掉它 —— 删掉就丢了一条真的跨端检查(见 FND14-8)。
+       * ★ 2026-11-17(D-14 / 方案 A)重钉:1 → **3**(包头加 4 字节 ackedSeq)。
+       *   这条**必须**跟着改 —— 它就是"线格式一改就会红"的那个锚。 */
+      eq(got!.version, 3, 'version = 3(字面量锚定:报文里编的是 delta.ts 的那个 3)');
       eq(got!.upserts.length > 0, true, '解析结果应含实体');
       /* ★ 想拿到的实体必须在里面 —— 只断言"解出了一个对象"太弱 */
       const ids = got!.upserts.map((u) => u.id);
@@ -487,6 +489,7 @@ async function main(): Promise<void> {
       eq(fromServer!.op, local.op, 'op 一致');
       eq(fromServer!.tick, local.tick, 'tick 一致');
       eq(fromServer!.bytesConsumed, local.bytesConsumed, 'bytesConsumed 一致');
+      eq(fromServer!.ackedSeq, local.ackedSeq, 'ackedSeq 一致(新增字段也走同一个解析器)');
       eq(fromServer!.removed.length, local.removed.length, 'removed 条数一致');
       eq(fromServer!.upserts.length, local.upserts.length, 'upserts 条数一致');
       eq(JSON.stringify(fromServer!.upserts.map((u) => u.id)),

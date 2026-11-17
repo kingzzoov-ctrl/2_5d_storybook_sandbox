@@ -9,10 +9,14 @@
  *
  * 线上布局(小端)
  * ```
- *  ┌────────┬────────┬───────┬─────────────────────────────────────┐
- *  │ ver u8 │ op u8  │ tick  │ ...载荷                             │
- *  └────────┴────────┴──u32──┴─────────────────────────────────────┘
+ *  ┌────────┬────────┬───────┬──────────┬────────────────────────────────┐
+ *  │ ver u8 │ op u8  │ tick  │ ackedSeq │ ...载荷                        │
+ *  └────────┴────────┴──u32──┴────u32───┴────────────────────────────────┘
  *   op = 0 全量快照 / 1 差量
+ *   ackedSeq = 客户端命令确认号,线上存 **ackedSeq + 1**
+ *              ⇒ `0` 天然表示「还没有 ack」(内部 `-1`),不引入魔法值。
+ *              编码侧只写占位 `0`;**真值由运输层按连接覆写**
+ *              (见 `server/src/net/ws_server.ts` 的广播循环)。
  *
  *   载荷:
  *     u16 removedCount   × { u8 kind, str id }                ← 删除
@@ -47,7 +51,23 @@ import {
   type WildlifeState,
 } from '../types/wire.ts';
 
-export const PROTOCOL_VERSION = 1;
+/*
+ * 协议版本 —— **3**(D-14 owner 裁决:方法 A,包头加 `ackedSeq`)。
+ *
+ * ★ 为什么必须 bump:`decodePacket` 按顺序读字段,老解码器会把多出来的
+ *   4 字节 ack 读成 `removedCount` ⇒ 轻则「报文截断」,重则解出一堆
+ *   垃圾实体而**完全不报错**(本仓最忌的形态)。bump 是让老客户端
+ *   **明确失败**的唯一手段(`client/src/net/session.ts` 的版本门)。
+ *
+ * ★ 为什么**不能**是 2:`FRAME_BINARY` 就是 `0x02`(见 session.ts),
+ *   而 `classifyDownlink` 的规则 3 依赖 `PROTOCOL_VERSION !== FRAME_BINARY`
+ *   ⇒ 版本 = 2 时「裸包首字节」与「帧 tag」不可区分,下行分流变成
+ *   不可判定。跳过 2、取 3。
+ *
+ * 连带:resume token 串含本常量(`server/src/net/room.ts`),版本一变,
+ * 30s 宽限期内的旧 token 不再匹配 —— 一次性影响,已登记。
+ */
+export const PROTOCOL_VERSION = 3;
 
 export const PacketOp = {
   FULL: 0,
@@ -331,6 +351,11 @@ export function encodeDelta(
   w.u8(PROTOCOL_VERSION);
   w.u8(prev ? PacketOp.DELTA : PacketOp.FULL);
   w.u32(tick);
+  /* ── ackedSeq 槽位(4 字节,小端)──
+     编码 = `ackedSeq + 1`(内部 `-1` ⇒ 线上 `0`)。**这里只写占位 0**:
+     它是**每连接**的量,真值由运输层逐连接覆写(冻结层不需要知道
+     ack 属于哪条连接)。 */
+  w.u32(0);
 
   const removed: { kind: number; id: string }[] = [];
   const plans: UpsertPlan[] = [];
@@ -414,6 +439,11 @@ export interface DecodedPacket {
   version: number;
   op: PacketOp;
   tick: number;
+  /**
+   * 服务端**已应用**到的客户端命令序号(`-1` = 本帧没带 ack)。
+   * 线上存的是 `ackedSeq + 1` ⇒ 这里减回来;`0` 不表示「第 0 条」。
+   */
+  ackedSeq: number;
   removed: { kind: number; id: string }[];
   upserts: { kind: number; id: string; mask: number; fields: Record<string, unknown> }[];
   bytesConsumed: number;
@@ -426,6 +456,8 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
   const op = r.u8() as PacketOp;
   if (op !== PacketOp.FULL && op !== PacketOp.DELTA) throw new Error(`未知 op:${op}`);
   const tick = r.u32();
+  /* ackedSeq:线上 = 内部 + 1 ⇒ 这里减 1 还原(占位 0 ⇒ -1 = 无 ack)。 */
+  const ackedSeq = r.u32() - 1;
 
   const removedCount = r.u16();
   const removed: { kind: number; id: string }[] = [];
@@ -444,7 +476,7 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
     }
     upserts.push({ kind, id, mask, fields });
   }
-  return { version, op, tick, removed, upserts, bytesConsumed: r.pos };
+  return { version, op, tick, ackedSeq, removed, upserts, bytesConsumed: r.pos };
 }
 
 /** 把解码结果套用到一份状态上,得到重建后的状态(round-trip 断言用)。 */
@@ -539,7 +571,7 @@ export interface BandwidthReport {
  *   * 野生动物 8 只处于 AOI 内,每帧 6 只动:每只 42 字节。
  *   * Boss 1 只:每帧 33 字节(坐标 12 + 预警几何 13 + phase 1 + mask/op 7)。
  *   * 房间级 meta:每帧 chunkVersions 变化时 40 字节;稳态 20 帧才变 1 次 → 摊 2 字节/帧。
- *   * 报文头 6 字节 + 两级计数 4 字节 = 10 字节。
+ *   * 报文头 10 字节(ver/op/tick/ackedSeq)+ 两级计数 4 字节 = 14 字节。
  */
 export function estimateBandwidth(players: number, tickHz = 20): BandwidthReport {
   const STR_ID = 9;               // u8 长度 + 8 字节 id
@@ -548,7 +580,7 @@ export function estimateBandwidth(players: number, tickHz = 20): BandwidthReport
   const wildlifeMoving = 6;
   const perWildlife = 1 + STR_ID + 4 + 12 + 1 + 2; // 42
   const perBoss = 1 + STR_ID + 4 + 12 + 1 + 13 + 2; // 33+... 见文档
-  const header = 10;
+  const header = 14;
   const roomMeta = 2;
 
   const breakdown = [

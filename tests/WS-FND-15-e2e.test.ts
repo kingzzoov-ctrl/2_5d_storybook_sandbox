@@ -144,10 +144,12 @@ async function main(): Promise<void> {
       eq(w.t, 'welcome', 'welcome 的类型判别字段');
       eq(w.playerId, 'e2e', '★ playerId 来自握手 URL 的 ?userId=(不是随机)');
       eq(w.roomId, 'r15a', 'welcome 带回房间 id');
-      /* ⚠️ 这里用**字面量 1** 而不是 import 来的 `PROTOCOL_VERSION`:
+      /* ⚠️ 这里用**字面量**而不是 import 来的 `PROTOCOL_VERSION`:
          断言的右侧若取自被测模块的导出常量,就是**同义反复**
-         (本仓 `--strict-taut` 会当场抓住 —— 实测第一次就是被它抓到的)。 */
-      eq(w.protocolVersion, 1, '协议版本必须是 1(字面量锚点,不是 self-reference)');
+         (本仓 `--strict-taut` 会当场抓住 —— 实测第一次就是被它抓到的)。
+         ★ 2026-11-17(D-14 / 方案 A)重钉:1 → **3**(包头加 4 字节 ackedSeq)。
+           它与 `tests/WS-07` C01 / `WS-FND-14` F1 是同一族的"线格式锚"。 */
+      eq(w.protocolVersion, 3, '协议版本必须是 3(字面量锚点,不是 self-reference)');
       ok(w.contentClaim.length > 0, `服务端必须给内容指纹(实得 ${JSON.stringify(w.contentClaim)})`);
 
       /* 至少等到一帧**已合入**的快照 —— 「连上了」与「状态到了」是两件事。 */
