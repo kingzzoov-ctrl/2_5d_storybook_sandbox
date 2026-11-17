@@ -193,6 +193,17 @@ export class SignalGraph {
   /** 本帧累积的组件广播(OR 语义,帧末提升到 `channelBroadcast`) */
   private channelInput: Map<number, boolean>;
   private channelPending: Map<number, PendingWrite[]>;
+  /**
+   * **世界环境读数口**(可选):`param(key)` 在组件静态参数里找不到该键时,退回这里。
+   *
+   * 为什么需要:有些参数不是"这个件的设置",而是"世界此刻的状态" ——
+   * 典型是 405 昼夜感光器读的 `hour`(D-07 的世界钟)。静态 `params` 只能由摆放者手填,
+   * 那会把"白天黑夜"变成一次性常量;挂上环境口后,钟点是**每帧求值**的。
+   *
+   * 语义刻意是"静态优先":已有组件参数一个都不变(找不到才问环境),
+   * 所以这条接线不会悄悄改掉任何既有件的读数。
+   */
+  private envSrc: ((key: string) => number) | null = null;
 
   /**
    * **共享跑酷计时器**(跑酷是跨件的单一比赛时钟,不属于任何单个件)。
@@ -755,10 +766,23 @@ export class SignalGraph {
         comp.state[key] = v;
       },
       param(key: string): number {
-        return comp.params[key] ?? 0;
+        /* 静态参数优先;没有就退回世界环境(见 envSrc)。没有环境口时与旧行为逐字节一致(0)。 */
+        return comp.params[key] ?? graph.envOf(key);
       },
       race: this.race,
     };
+  }
+
+  /* ── 世界环境读数(见 `envSrc`)── */
+
+  /** 挂上/摘掉世界环境读数口(`null` = 摘掉,回到"缺失参数一律 0")。 */
+  setEnvSource(fn: ((key: string) => number) | null): void {
+    this.envSrc = fn;
+  }
+
+  /** 读世界环境(组件的 `param()` 在静态表里找不到键时的兜底层)。没挂 ⇒ 0。 */
+  envOf(key: string): number {
+    return this.envSrc === null ? 0 : this.envSrc(key);
   }
 
   /* ── 统计与诊断 ── */

@@ -24,7 +24,7 @@
 | 开发依赖 | `typescript` · `vite`(仅客户端构建用) |
 | 远端 | `https://github.com/kingzzoov-ctrl/2_5d_storybook_sandbox.git` |
 | 层 | 服务端 `server/src` **81** `.ts` · 客户端 `client/src` **36** · 共享 `shared` **10** ⇒ **生产 .ts 合计 127** |
-| 测试 | `tests/*.test.ts` **77** 个套件 |
+| 测试 | `tests/*.test.ts` **78** 个套件 |
 | 工具 | `scripts/*.ts` **35** 个 |
 | 文档 | `docs/` **83** 个 `.md` + 3 个 `.png` = 86 文件 / **2.83 MB** |
 | 门禁 | `scripts/verify.ts`(6635 行) |
@@ -93,7 +93,7 @@ node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --stric
 
 | 指标 | 值 | 说明 |
 |:---|:---|:---|
-| 用例 | **1899 条 / 77 套件** | WS 1014 条 / 14 套件 · 基座 FND 885 条 / 63 套件(2026-11-17 新增 FND-61 协同浇水 e2e / FND-62 世界重置重建 / FND-63 ackedSeq e2e) |
+| 用例 | **1904 条 / 78 套件** | WS 1014 条 / 14 套件 · 基座 FND 890 条 / 64 套件(2026-11-17 新增 FND-61 协同浇水 e2e / FND-62 世界重置重建 / FND-63 ackedSeq e2e / FND-64 世界钟喂进电路) |
 | 门禁自检 | **30/30** | 2026-11-14:28→29 修 T37 锚点 bug → 加 T38×2 成 31 → 移除 1 条过期用例成 30 |
 | 跨 WS 集成 | 38/38 | |
 | 冻结层不变量 | 17 | |
@@ -387,7 +387,7 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-8e784f4612f7  README.md
+33c1850fd838  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md

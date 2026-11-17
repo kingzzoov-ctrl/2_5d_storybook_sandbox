@@ -1121,6 +1121,9 @@ export class WorldSim {
      * 这类失败没有异常、没有日志,只有泛洪统计里那个恒为 0 的数字。
      */
     this.wiring = new SignalGraph(this.sizeCells, this.sizeCells);
+    /* D-07 的世界钟必须**每帧**可读:405 昼夜感光器读的 `hour` 不是摆放时的静态参数。
+       两条构造路径(构造器 / `rebuildWorld`)都要挂,否则重置之后感光器会退回"缺失 = 0"。 */
+    this.installWorldClockEnv();
     this.aoi = new AoiManager();
     this.spawner = new MobSpawner();
 
@@ -2934,6 +2937,36 @@ export class WorldSim {
   }
 
   /**
+   * 把**世界钟**挂到电路求值环境上(★ 让 D-07 有可观测效果)。
+   *
+   * 为什么需要:405 昼夜感光器读 `ctx.param('hour')`,而组件的 `params` 是**摆放时**的静态表 ——
+   * 不挂这一口,感光器拿不到钟点(`param` 缺失 ⇒ 0 ⇒ `isNight(0)` = 夜 ⇒ **恒亮**),
+   * D-07 的钟点就只是个没人读的字段。
+   *
+   * 挂的时机:`SignalGraph` 每次被新建都要重挂(构造器与 `rebuildWorld` 两条路径),
+   * 否则重置过的世界会悄悄退回"恒亮"。
+   *
+   * 只提供 `hour` 与 `night` 两个键:其余键仍按"缺失 = 0"走,既有组件读数一个不变。
+   */
+  private installWorldClockEnv(): void {
+    this.wiring.setEnvSource((key: string): number => {
+      if (key === 'hour') return this.hourOfDay();
+      if (key === 'night') return this.isNightNow() ? 1 : 0;
+      return 0;
+    });
+  }
+
+  /**
+   * 读电路求值环境里的某个键(公开读口,给判据用)。
+   *
+   * 它读的是**真的挂上去了没有**,不是另算一遍:没人调 `installWorldClockEnv()` 或中途被摘掉,
+   * 这里就返回 0 —— 于是"接线断了"能变成一条红,而不是一个静默的恒亮感光器。
+   */
+  wiringEnvOf(key: string): number {
+    return this.wiring.envOf(key);
+  }
+
+  /**
    * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离 `distance` 格。
    *
    * 距离由调用方给:内容层的击退量(`PRANK_HAMMER_KNOCKBACK`)是既有锚,
@@ -4171,6 +4204,7 @@ export class WorldSim {
     this.grid = new WorldGrid();
     this.fluid = new FluidField(this.sizeCells, this.sizeCells);
     this.wiring = new SignalGraph(this.sizeCells, this.sizeCells);
+    this.installWorldClockEnv();
     this.aoi = new AoiManager();
     this.spawner = new MobSpawner();
     this.physics = this.makePhysicsWorld();
