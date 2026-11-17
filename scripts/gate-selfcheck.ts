@@ -836,10 +836,10 @@ const CASES: Case[] = [
    */
   {
     group: 'T38',
-    name: '把 README 的「同义反复白名单 5 条」改坏 ⇒ 计数对账必须红(T38-a)',
-    file: 'README.md',
-    from: '✅(白名单 5 条',
-    to: '✅(白名单 4 条',
+   name: '把 README 的「同义反复白名单 0 条」改坏 ⇒ 计数对账必须红(T38-a)',
+   file: 'README.md',
+   from: '✅(白名单 0 条',
+   to: '✅(白名单 1 条',
     expect: 'red',
     wantMsg: /文档自称与代码正解不一致/,
     args: ['--docs'],

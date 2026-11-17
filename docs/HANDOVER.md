@@ -387,12 +387,12 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-bf0b8a157720  README.md
+784e3c8e3de4  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
 039b4f7e1ad1  docs/CHANGE_REQUESTS.md
-413b064df1c4  docs/COMPLETION-CRITERIA.md
+3ae1339732fb  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。
 # 口径:**LF 归一后的字节**(= 索引 blob 的字节),**不是**工作区原始字节。

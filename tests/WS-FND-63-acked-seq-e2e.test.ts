@@ -53,6 +53,14 @@ async function atest(name: string, fn: () => Promise<void>): Promise<void> {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
+/**
+ * **握手预算**(不是重试):真 socket + 真房间,满载跑门禁时 `connect → open` 是重尾。
+ * 2026-11-17 实测:全量门禁并发下 5 s 会偶发超时(「超时 5000ms:连接打开」),
+ * 而单跑该套件每次都在 0.4 s 内到 —— 所以是**预算太紧**,不是时序缺陷(与 WS-13 同族)。
+ * 超时仍会红:条件没成立就是没成立,这里只是给它足够时间成立。
+ */
+const WS_HANDSHAKE_BUDGET_MS = 15000;
+
 /** 带超时兜底 —— 挂起的测试在 CI 里表现为「卡住」,不是「失败」。 */
 async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let t: NodeJS.Timeout | undefined;
@@ -283,7 +291,7 @@ async function main(): Promise<void> {
   await atest('FND63-2 ★★ 端到端:上行 seq ⇒ 服务端 ack ⇒ 包头 ⇒ store.lastAckedSeq', async () => {
     const c = await connectReal('r63e2e', 'e2e63');
     try {
-      const w = await withTimeout(c.welcomeArrived, 5000, 'welcome 到达');
+      const w = await withTimeout(c.welcomeArrived, WS_HANDSHAKE_BUDGET_MS, 'welcome 到达');
       eq(w.protocolVersion, 3, 'welcome 带回的协议版本 = 3(字面量;版本门两端都认 3)');
       eq(c.session.state, 'live', '握手通过后应进 live(版本不匹配的话这里就是 failed)');
       eq(c.srv.lastAckedSeqFor('e2e63'), -1, '还没发过带 seq 的 move ⇒ 该连接的 ack 仍是 -1');
@@ -318,7 +326,7 @@ async function main(): Promise<void> {
   await atest('FND63-3 ★★ 客户端剪枝:pending 变短 + prunedTotal 增长(数来自线上)', async () => {
     const c = await connectReal('r63prune', 'prune63');
     try {
-      await withTimeout(c.welcomeArrived, 5000, 'welcome 到达');
+      await withTimeout(c.welcomeArrived, WS_HANDSHAKE_BUDGET_MS, 'welcome 到达');
 
       /* 预测器先攒 4 条待确认(与生产同一入口 `step`)。 */
       const p = new LocalPredictor();
@@ -361,7 +369,7 @@ async function main(): Promise<void> {
     const A = rawConnect(srv.port, 'alice63');
     const B = rawConnect(srv.port, 'bob63');
     try {
-      await withTimeout(Promise.all([A.opened, B.opened]), 5000, '两条连接都打开');
+      await withTimeout(Promise.all([A.opened, B.opened]), WS_HANDSHAKE_BUDGET_MS, '两条连接都打开');
       await waitUntil(() => srv.connCount() >= 2, 5000, '服务端握手完成 2 条', () => srv.connCount());
 
       /* A 连发 5 条带 seq;B **一条都不发**。 */
@@ -397,7 +405,7 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
     const c = rawConnect(srv.port, 'causal63');
     try {
-      await withTimeout(c.opened, 5000, '连接打开');
+      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
       await waitUntil(() => srv.connCount() >= 1, 5000, '握手完成', () => srv.connCount());
       await waitUntil(() => c.welcome !== null, 5000, 'welcome 到达');
 

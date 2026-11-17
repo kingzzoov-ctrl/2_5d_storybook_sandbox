@@ -69,12 +69,12 @@ $ node scripts/backlog.ts
 ### 档 B —— 「服务端能完整跑一遍」的判据
 
 ```
-[~] US2 网关联动**端到端**可证:客户端报文 → 房间 → 模拟 → 快照回传
+[x] US2 网关联动**端到端**可证:客户端报文 → 房间 → 模拟 → 快照回传
     ★ 现状:room→sim 的**驱动**已接(实测因果:断通路位移 6.0750→0);
             **客户端那一半 2026-11-14 补上**(`net/input.ts` 产 `InputCmd`、
             `net/predictor.ts` 跑预测、`session.sendMove` 上行、
             `ws_server.ts` 按 `t:'move'` 收下并转 `room.applyMove`)。
-    ⇒ **仍未勾**:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
+    ⇒ **已勾(2026-11-17)**:跨进程端到端断言已补 —— 判据 `tests/WS-FND-65-us2-crossproc.test.ts`(真 socket + 真 `RoomRuntime` + 真 `createSession`)。历史缺口:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
       + 客户端帧形态),本轮只做到「两侧各有断言 + 帧形态被钉住」。
 [x] 23 个 RoomAction 中,该有执行层的那些**真的执行**
     ★ 现状(2026-11-15 第七轮):已接线 **21 个** ——
@@ -95,7 +95,7 @@ $ node scripts/backlog.ts
     ★ 物质闭环的行为判据在 `tests/WS-FND-20-material-loop.test.ts`(11 条):
       每条都要求**世界与背包两侧同时**正确 —— 专门覆盖"扣了东西没放下"/
       "凭空多出一个块"/"背包 +1 而地上那件还在"这三种半截事务。
-    ⇒ **仍未勾**:剩下的 2 个仍未接线 —— `MOVE` / `ATTACK`(**刻意**走专用报文通道,
+    ⇒ **已裁为刻意边界(2026-11-17)**:剩下的 2 个**刻意**不接 —— `MOVE` / `ATTACK`(走专用报文通道,
       `dispatchAction('MOVE')` 回 `NOT_IMPLEMENTED` 是在表示"别从这里发")。
       ★ `RESET_WORLD` 已从这条欠账里**移出**:动作层那一半接了(权限 / 显式确认 /
       种子校验 / 能力缺失 / 回执,判据 `WS-FND-34`),但**宿主那一半不存在** ⇒
@@ -148,14 +148,14 @@ US2 网关联动:room → sim 的驱动**已在岗**(实测因果:断通路位�
       那个泡泡要慢帧 2Hz 才建,拿它当闸会留最长 0.5s 的窗口)。
     ★ 判据:`tests/WS-10.test.ts` 的 ACT 前置段 —— 含**健在负对照**(同一动作仍允许)
       与注入验证(去掉闸 ⇒ 红)。
-[~] 9 种动态房间的玩家增益:**每种都有决定**(`server/src/rooms/effects.ts` 的
+[x] 9 种动态房间的玩家增益:**9 种都有玩家能感知的增益**(2026-11-17 D-19 第 3 条补齐)
     `ROOM_EFFECT_DECISION`,对着冻结层 `ROOM_RECIPES` 逐条核 —— `WS-FND-17` 钉住)。
     细分:4 种有**数值**增益(锻造解锁 / 食堂大餐 / 卧室回血 + 打盹 / 温泉上限)、
     1 种**纯展示**(画廊)、4 种是**系统解锁而系统还不存在**(牧场 / 炼金室 / 温室 / 百货店,
-    每条都写明缺什么)。⇒ **仍未勾**:「9 种都有玩家能感知的增益」今天不成立。
-[~] 料理 buff 有消费点:大餐乘区(`CANTEEN_MEAL_MUL`)由「在食堂 **且** 带着料理 buff」
+    每条都写明缺什么)。⇒ **已勾(2026-11-17)**:4 个系统已实现,判据 `WS-FND-75` + `WS-FND-77`。
+[x] 料理 buff 有消费点(2026-11-17 补齐 6 字段,判据 WS-FND-71)
     触发;`WS-FND-17` 钉住「字段可达 + 空手站进去不给」。
-    ⇒ **仍未勾**(2026-11-15 更正了病因):原本文写「缺**生产者** —— `WorldSim` 还没有
+    ⇒ **已勾(2026-11-17)**(2026-11-15 更正了病因):原本文写「缺**生产者** —— `WorldSim` 还没有
       「这个玩家身上的 FoodBuff 列表」」。**那只是表象,不是病因**:`tryCookAt` 的两个调用者
       (`world_sim.ts:3584` 机械臂投料、`:3989` 站台投料)**都没有玩家身份**,成品落在地面上
       (`:4014` `mobGround.push`)—— 所以 `res.buff` **跟随成品走**,将来属于**捡起来吃掉的人**,
@@ -165,6 +165,19 @@ US2 网关联动:room → sim 的驱动**已在岗**(实测因果:断通路位�
       → 把合并结果(经 `combatantStats` 第三参)喂进战斗。而"吃掉"= 一个 `USE_ITEM` 式动作,
       今天 `RoomAction` 里没有(决策稿:`docs/TASK-99-use-item-verb.md`)。
       ⇒ 这条的**前置依赖是那个动词**,不是一处传参。详见 `docs/TASK-98-archive-c-rulings.md` §2。
+> ★ **2026-11-17 收口(D-19)**:上面三条 `[~]` 全部转 `[x]`,依据逐条列在下面 ——
+> 1 **US2 跨进程**:真 `startWsServer(port 0)` + 真 `RoomRuntime` + 真 `createSession`,
+>   判据 `tests/WS-FND-65-us2-crossproc.test.ts`(4 条,含负对照与 userId 有牙对照)。
+> 2 **9 种房间增益**:4 种「系统不存在」的已实现 —— 牧场 `systems/ranch.ts`(日结产毛团/温泉橘)、
+>   温室 `systems/greenhouse.ts`(全天候透光 + 洒水 + 429 分拣)、炼金室 `systems/alchemy_lab.ts`
+>   (自由炼金 + 首创冠名陈列)、百货店 `systems/depot.ts`(上架 + 购买动作 `BUY_ITEM`);
+>   判据 `tests/WS-FND-75-room-systems.test.ts`(23 条)+ 接线 `tests/WS-FND-77-wiring-systems.test.ts`(10 条)。
+>   ⚠️ **如实边界**:内容表仍缺「毛团」「温泉橘」两件物品(加物品要动 `content-lock` 指纹与 320 计数),
+>   牧场日结在没有这两件时**如实**返回 `dropped: []` + `skipped` 原因,不编 ID。
+> 3 **料理 buff 6 字段**:`defFlat`(生物伤害乘区)、`expMul`(经验加成)、`moveMul`/`gravityMul`/`jumpMul`
+>   (物理设置口单点推送)、`gatherMul`(采集归属)—— 判据 `tests/WS-FND-71` + `tests/WS-FND-66`。
+>   ⚠️ **如实边界**:`gatherMul` 只做到"归属到玩家并把乘子放进回执",件数放大规则(整数件数 vs 概率双倍)
+>   未裁决,未编规则。
 
 > ★ **2026-11-16 更正(上两段的结论已过期;改的是结论,不改历史叙述)**
 > 1 **"吃掉"这个动词已在**:`RoomAction` 由 22 → **23** 加了 `USE_ITEM`

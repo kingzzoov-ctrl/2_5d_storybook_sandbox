@@ -2007,6 +2007,16 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
     + '⚠️ 但它与那几条有个关键区别:它住在 `shared/`,而 `shared/` 是**跨层契约目录**,'
     + '客户端与服务端都能 import ⇒ **接线条件是「两侧都不该接」,不是「等谁接线」**。'
     + '若哪天它被生产 import,那反而是缺陷(会把测试依赖拖进生产闭包),本表自检会报「已可达,应移出」。'],
+  // ── D-19 冻结层解锁带来的三条「契约先行」模块(2026-11-17)──
+  // 它们由 owner 裁决(D-19 第 2 条)新建/解锁,判据在 tests/WS-FND-66-frozen-unlock.test.ts;
+  // 生产侧消费点本批只接了 defFlat/expMul(world_sim + combat),其余槽位与事件命名空间
+  // 是**契约先行**:先在冻结层把形状定死,再由后续接线消费。
+  // ⇒ 与 shared/testing/harness.ts 同族(门禁/判据真消费、生产暂不消费),**不是欠账**;
+  // ⚠️ 这里刻意用行注释而不是块注释:上面 harness 条目的理由里含 `tests/**`(星号斜杠序列),
+  //    任何紧随其后出现的「块注释结束符」都会与它凑成假配对,把本表剩下条目整段吞掉
+  ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。属 gate-only 家族(判据真消费、生产 0 引用,与 harness.ts 同判据)。判据 WS-FND-66 9 条;生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线 ⇒ 不是欠账。'],
+  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。属 gate-only 家族:判据真消费(WS-FND-66),生产侧由 shared/types/cooking.ts 的合并函数间接消费 ⇒ 不是欠账。'],
+  ['shared/types/events.ts', '契约先行(D-19 第 2 条 / RULINGS-DRAFT EVENT-BUS U6):29 种事件名的命名空间 SSoT。属 gate-only 家族:判据反向扫生产文本防过期(WS-FND-66 第 7 组);生产侧事件名仍是扁平字符串 ⇒ 等编排层接线。'],
 ]);
 
 /**
