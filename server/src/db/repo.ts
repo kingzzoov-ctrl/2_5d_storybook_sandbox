@@ -2,7 +2,10 @@
  * WS-07 · 持久层仓储(零运行时依赖)
  *
  * 设计要点
- *  1. 本模块**只** import `node:*` 与 `shared/**`,不 import `better-sqlite3`。
+ *  1. 本模块**只** import `node:*`、`shared/**` 与 `world/archive.ts`(唯一例外,
+ *     D-19 第 5 条的 chunk 裁剪:1 MiB 上限的「拒绝 vs 裁剪」必须和读侧**共用
+ *     同一份** WSA1 解码器,否则就是两份必然漂移的格式实现),
+ *     不 import `better-sqlite3`。
  *     真实 SQLite 绑定由 `driver.sqlite.ts` 通过结构化类型注入,测试用
  *     `memory_db.ts` 的内存实现顶替 —— 二者都实现同一个 `DbLike`。
  *  2. `DbLike` 是**行级操作**抽象(insert/update/get/select/...),不是原始 SQL 字符串
@@ -19,6 +22,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { CHUNK_BYTES, CHUNK_CELLS } from '../../../shared/types/tile.ts';
 import { BodyState } from '../../../shared/types/physics.ts';
+/* ★ 唯一的跨层 import:WSA1 解码/裁剪器(理由见文件头第 1 条)。
+   `import type` 与值导入分开写:类型面不进运行时,裁剪函数才进。 */
+import { fitWorldArchive, type ArchiveTrimReport } from '../world/archive.ts';
 
 /* ═══════════════════════════ 1. 依赖注入契约 ═══════════════════════════ */
 
@@ -921,10 +927,16 @@ export const WORLD_ARCHIVE_MIGRATION_NAME = 'ws_fnd57_world_archive';
 export const WORLD_ARCHIVE_KEEP_PER_ROOM = 6;
 
 /**
- * 单份快照的字节上限;超出**拒绝**而不是静默截断。
+ * 单份快照的字节上限。超限的处置分两种(D-19 第 5 条):
  *
- * 截断的快照回滚出去就是一个**坏世界**(地形缺块、静默丢玩家建筑),
- * 而"拒绝"会让调用方立刻知道归档没成 —— 本仓纪律:不静默改数据。
+ * 1 **是合法的 `WSA1`**(真实世界快照)⇒ 按 `world/archive.ts:planChunkTrim`
+ *    的规则**裁 chunk** 降到上限内再写(规则 = 玩家建造 > 活动 > 原始地形;
+ *    逐块记账,绝不切碎块体),回执里带 `trim`(裁了几块 / 多少字节 / 为什么);
+ * 2 **不是 `WSA1`**(来源不明的一大坨字节)⇒ **仍然拒绝**:没有块可以裁,
+ *    「按字节截断」出来的东西回滚出去就是一个坏世界。
+ *
+ * 所以「上限」并没有被放宽:写进去的字节永远 ≤ 1048576,而且**裁剪**是
+ * 「少了哪几块 + 为什么」可查的,不是静默丢数据。
  * 1MiB 远高于 radius 4 的全量地形(~81KB),却小到一次误传撑不爆库。
  */
 export const WORLD_ARCHIVE_MAX_BYTES = 1048576;
@@ -1013,6 +1025,15 @@ export interface WorldArchiveWriteResult {
   archived: WorldArchiveSummary;
   /** 本次写入顺手裁掉了几条旧行(配额生效的**可观测**证据,别只靠"表里有几条")。 */
   pruned: number;
+  /**
+   * 本次写入是否**裁过地形块**(D-19 第 5 条)。`undefined` = 没裁过
+   * (快照本来就 ≤ 上限)。
+   *
+   * ★ 裁剪摘要**同时写进快照头**(`header.trim`),所以这一项不是唯一
+   *   来源:`loadWorldArchive` + `decodeWorldArchive` 也能读回来。这里再带
+   *   一份是为了让**写入当次**的回执能直接说「裁了几块 / 为什么」。
+   */
+  trim?: ArchiveTrimReport;
 }
 
 /** 时间倒序(同毫秒用 `seq` 兜底),保证两个后端排序一致。 */
@@ -1065,6 +1086,15 @@ export function pruneWorldArchives(
  * (那会让配额在一段窗口内失效,而窗口正好是最坏情况:有人在狂点重置)。
  *
  * 返回值带 `pruned`:配额不是"应该有效",而是**每次都报数**。
+ *
+ * ## 超 1 MiB 时(D-19 第 5 条)
+ *
+ * 顺序是「先裁 **chunk**,再进事务」:
+ *   * 合法的 `WSA1` ⇒ `world/archive.ts:fitWorldArchive` 按规则裁块到 ≤
+ *     `WORLD_ARCHIVE_MAX_BYTES`,写进去的是**裁过的字节**(回执里 `trim` 说清
+ *     裁了几块 / 多少字节 / 为什么;同样的摘要也写进了快照头);
+ *   * 不是 `WSA1` ⇒ 照旧抛(没有块可裁,而不许截断)。
+ * 裁剪发生在事务**之前**:裁失败时一行都不写,不存在「写进去半份」的中间态。
  */
 export function archiveWorldSnapshot(
   db: DbLike,
@@ -1086,14 +1116,37 @@ export function archiveWorldSnapshot(
   }
   if (!Number.isFinite(input.nowMs)) throw new Error('归档需要 nowMs(Unix 毫秒)');
   if (!(input.snapshot instanceof Uint8Array)) throw new Error('归档快照必须是 Uint8Array');
-  const bytes = input.snapshot.byteLength;
-  if (bytes === 0) throw new Error('归档快照不能是 0 字节(空快照回滚出去就是一个空世界)');
-  if (bytes > WORLD_ARCHIVE_MAX_BYTES) {
-    throw new Error(
-      `归档快照 ${bytes} 字节超出上限 ${WORLD_ARCHIVE_MAX_BYTES}`
-      + '(拒绝而不是截断 —— 截断的快照回滚出去是坏世界)',
-    );
+  if (input.snapshot.byteLength === 0) {
+    throw new Error('归档快照不能是 0 字节(空快照回滚出去就是一个空世界)');
   }
+  /* ★ D-19 第 5 条:超限**裁剪**而不是拒绝 —— 但只对合法的 `WSA1` 成立。
+     裁剪的单位是**整块 chunk**(规则见 `world/archive.ts:planChunkTrim`),
+     绝不是按字节截断;裁了什么、为什么进回执 + 快照头。 */
+  let snapshot = input.snapshot;
+  let trim: ArchiveTrimReport | undefined;
+  if (snapshot.byteLength > WORLD_ARCHIVE_MAX_BYTES) {
+    const oversized = snapshot.byteLength;
+    let fitted: { bytes: Uint8Array; report: ArchiveTrimReport | null };
+    try {
+      fitted = fitWorldArchive(snapshot, WORLD_ARCHIVE_MAX_BYTES);
+    } catch (e) {
+      throw new Error(
+        `归档快照 ${oversized} 字节超出上限 ${WORLD_ARCHIVE_MAX_BYTES},`
+        + `且无法按 chunk 裁剪(${e instanceof Error ? e.message : String(e)})`
+        + ' —— 拒绝而不是截断:截断的快照回滚出去是坏世界',
+      );
+    }
+    if (fitted.report === null || fitted.bytes.byteLength > WORLD_ARCHIVE_MAX_BYTES) {
+      /* 理论上到不了(超限 ⇒ 一定裁过),但「没有报告」不能当成「裁过」。 */
+      throw new Error(
+        `归档快照 ${oversized} 字节超出上限 ${WORLD_ARCHIVE_MAX_BYTES},`
+        + '裁剪没有给出可核对的结果 —— 拒绝写入(不静默降级)',
+      );
+    }
+    snapshot = fitted.bytes;
+    trim = fitted.report;
+  }
+  const bytes = snapshot.byteLength;
   const worldTick = Number.isFinite(input.worldTick)
     ? Math.max(0, Math.trunc(input.worldTick as number))
     : 0;
@@ -1111,14 +1164,16 @@ export function archiveWorldSnapshot(
       seq,
       seed: input.seed,
       world_tick: worldTick,
-      snapshot_blob: input.snapshot,
+      snapshot_blob: snapshot,
       snapshot_bytes: bytes,
       reason,
       archived_at: input.nowMs,
     };
     db.insert(WORLD_ARCHIVE_TABLE, row);
     const pruned = pruneWorldArchives(db, input.roomId);
-    return { archived: toWorldArchiveSummary(row), pruned };
+    const out: WorldArchiveWriteResult = { archived: toWorldArchiveSummary(row), pruned };
+    if (trim !== undefined) out.trim = trim;
+    return out;
   });
 }
 

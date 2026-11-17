@@ -398,3 +398,80 @@ export const PARTICLE_PRESETS: Record<ParticleKind, { rate: number; life: number
   4: { rate: 20, life: 1.4, size: 0.5, gravityScale: -0.05 },
   5: { rate: 6, life: 1.0, size: 1.2, gravityScale: 0 },
 };
+
+/* ───────────────────────── 画质档 → 粒子速率 ───────────────────────── */
+
+/**
+ * 画质档(WS-09 U6)。
+ *
+ * 为什么粒子速率必须跟画质档走:樱花 + 水花 + 火星 + 冰晶 + 染色雾 + 光环
+ * 六类同时活着的填充率**只由粒子数决定**,而粒子数是唯一能「降了立刻有效」的旋钮。
+ * 早先的写法是「所有档共用 `PARTICLE_PRESETS[kind].rate`」—— 于是低端机
+ * 与高端机跑同一份密度,帧率被填充率吃光,而 UI 上「低画质」看起来什么都没变。
+ *
+ * ★ 档位顺序即**单调性契约**:`LOW < MEDIUM < HIGH`,且 `HIGH` 必须恰好等于
+ *   预设原值(1.0 倍)—— 否则「高画质」会莫名比手册参数表更省,参数表与实现脱节。
+ */
+export const RenderQualityTier = {
+  LOW: 'LOW',
+  MEDIUM: 'MEDIUM',
+  HIGH: 'HIGH',
+} as const;
+export type RenderQualityTier = (typeof RenderQualityTier)[keyof typeof RenderQualityTier];
+
+/** 档位由低到高(单调性判据按这个顺序遍历) */
+export const RENDER_QUALITY_TIERS: readonly RenderQualityTier[] = ['LOW', 'MEDIUM', 'HIGH'];
+
+/**
+ * 各档的速率倍率。取值理由:
+ *  - LOW 0.25:低端机上限就在四分之一左右(填充率瓶颈),再低就看不出「有粒子」;
+ *  - MEDIUM 0.5:一半密度,肉眼仍能看到飘落节奏;
+ *  - HIGH 1.0:与 `PARTICLE_PRESETS` 完全一致 —— 参数表才是手册口径。
+ */
+export const QUALITY_RATE_SCALE: Record<RenderQualityTier, number> = {
+  LOW: 0.25,
+  MEDIUM: 0.5,
+  HIGH: 1,
+};
+
+export function isRenderQualityTier(v: unknown): v is RenderQualityTier {
+  return v === 'LOW' || v === 'MEDIUM' || v === 'HIGH';
+}
+
+/** 档位序号(0 = LOW);未知档按 MEDIUM 处理,避免 NaN 扩散到速率 */
+export function qualityTierIndex(tier: RenderQualityTier): number {
+  return tier === 'LOW' ? 0 : (tier === 'HIGH' ? 2 : 1);
+}
+
+/** 某档的速率倍率 */
+export function qualityRateScale(tier: RenderQualityTier): number {
+  return QUALITY_RATE_SCALE[isRenderQualityTier(tier) ? tier : 'MEDIUM'];
+}
+
+/**
+ * 某类粒子在某画质档下的**实际速率**(个/秒)。
+ *
+ * 这是 `PARTICLE_PRESETS` 的**唯一**消费口径:任何直接读 `presets[kind].rate`
+ * 建发射器的地方都绕过了画质档 —— 那正是本裁决要消灭的写法。
+ */
+export function scaledRate(kind: ParticleKind, tier: RenderQualityTier): number {
+  const base = PARTICLE_PRESETS[kind].rate;
+  return base * qualityRateScale(tier);
+}
+
+/**
+ * 按画质档建连续发射器(消费点)。
+ *
+ * 保留 `createEmitter(ratePerSec)` 不动:它就是「给定速率」的底层构造,
+ * 本函数负责**从画质档推出速率**这一步。
+ */
+export function createEmitterFor(kind: ParticleKind, tier: RenderQualityTier): ContinuousEmitter {
+  return createEmitter(scaledRate(kind, tier));
+}
+
+/** 爆发类粒子的数量也按档缩放(至少 1 个,否则低画质下爆发「完全消失」) */
+export function scaledBurstCount(count: number, tier: RenderQualityTier): number {
+  const n = Math.max(0, Math.trunc(count));
+  if (n === 0) return 0;
+  return Math.max(1, Math.round(n * qualityRateScale(tier)));
+}

@@ -314,11 +314,11 @@ WS-10 是「玩家打生物」,要武器/连段/元素/护盾/反伤;生物打�
 
 | ID | 问题 | 影响 |
 | :--- | :--- | :--- |
-| **D1** | 玩家受伤后**击退**与**硬直**未实现:被野猪冲锋撞中,位置不变 | 手感偏硬;击退需要写回 `PhysicsBody`,涉及移动权威归属 |
+| **D1** | ~~玩家受伤后**击退**与**硬直**未实现:被野猪冲锋撞中,位置不变~~ **已关闭(2026-11-17 已实现)**:受击经 `applyHit` 折算击退量并写回 `PhysicsBody` —— 编排层 `world_sim.ts` 里取武器侧的 `result.knockbackImpulse`,`physics.applyImpulse(...)` 是**生产调用点**。判据 `tests/WS-FND-71-combat-depth.test.ts` FND71-1/2 | 原描述「击退需要写回 `PhysicsBody`,涉及移动权威归属」已落地:写回就在编排层的受击结算里,不再是「定义存在、生产调用点为 0」;移动权威一侧另有 `lastMoveRejection = 'KNOCKBACK'`,客户端不会把击退抹掉 |
 | **D2** | 生物攻击**不检查视线**:隔着 1 格墙也能打中 | 需在 `resolveStrikes` 里加射线遮挡判定 |
-| **D3** | PvP 与「Boss 技能对玩家的特殊效果」(冻结/麻痹)未做 | 依赖状态机层 |
-| **D4** | 伤害无**元素抗性**:生物的攻击不区分元素 | 玩家装备的元素抗性目前只对生物生效 |
-| **D5** | `tanuki_ambush` 的致盲效果只有 `mem.blindSec`,玩家侧无对应状态 | 致盲需玩家的输入层配合 |
+| **D3** | ~~PvP 与「Boss 技能对玩家的特殊效果」(冻结/麻痹)未做~~ **已关闭(2026-11-17 已实现)**:`server/src/combat/damage.ts` 的 `pvpVerdict` 成为 PvP 的**唯一授权判定**(房间层 / 结算层 / 反伤三处都走它),Boss 技能对玩家的冻结/麻痹已落地。判据 `tests/WS-FND-71-combat-depth.test.ts` FND71-5/6/7/8 | 原描述「依赖状态机层」已满足:判定抽成具名纯函数,避免「每个调用方各写一个 `if (pvpOn)`」那种迟早漂移的形态 |
+| **D4** | ~~伤害无**元素抗性**:生物的攻击不区分元素~~ **已关闭(2026-11-17 已实现)**:玩家侧元素抗性经 `server/src/combat/vitals.ts` 的 `elementResistOf` 在 `applyHit` 内折算,与生物侧共用同一条伤害管线。判据 `tests/WS-FND-71-combat-depth.test.ts` FND71-9 | 原描述「玩家装备的元素抗性目前只对生物生效」已不成立:抗性系数现在**在玩家侧结算处**出现 |
+| **D5** | ~~`tanuki_ambush` 的致盲效果只有 `mem.blindSec`,玩家侧无对应状态~~ **已关闭(2026-11-17 已实现)**:玩家侧有自己的 `blindSec`(`vitals.ts` 的 `applyBlind` 计时 + `BLIND_VIEW_MUL` 视野衰减)。判据 `tests/WS-FND-71-combat-depth.test.ts` FND71-10/11/12 | 原描述「致盲需玩家的输入层配合」已满足。⚠️ 玩家侧那份与生物 `mobs/behaviors.ts` 的 `rt.mem.blindSec` **刻意分成两份**:语义不同(玩家的输入/视野 vs 生物的 AI 计时),不是「同一状态的两份实现」 |
 | **D6** | ~~倒下后无**复活流程**~~ **已解决(task-44)**:`downed=true` 后编排层经 `touchRevive` 走 `combat/revive.ts` 的幽灵泡泡/队友触碰复活;该模块自 task-44 起进入生产闭包(探针实测 `world_sim.ts` 出现 `touchRevive`)。**残留**:死亡界面与重生点选择仍属客户端层 | 原描述「只能靠 `revivePlayer` 手动复活」已不成立 —— `revivePlayer` 现由服务端编排层在队友触碰时驱动 |
 | **D7** | 玩家血量**不持久化**:重连后满血 —— **部分解决(task-17 通道 + task-21 闭环,详见下)**:三层(DB 读写 / 编排层 `saveToDb`·`loadFromDb` / 房间 `step()` 每 20 帧)**均已接通并有测试守护**,但生产装配 `room.colyseus.ts` 尚未挂 `worldSaveHost`,故**线上重连仍会满血** | 原描述属实且比文字更严重:`savePlayerState` 在**全仓只有测试调用、零生产调用点**;`vitals.register` 恒设满血(`vitals.ts:310`)。task-21 补齐 db 层与房间生命周期,用 C23/C25 断言读回**状态值**;**剩余工作仅一行装配**(见 §10.1 末表,依赖 US2) |
 | **D8** | `resolveStrikes` 的 `blockedKeys` 参数**功能有效但编排层不传它** | 实测:不传 → 命中 1 次;传 `{'m1→p1'}` → 命中 **0** 次。它种下 `used` 集合防同一帧重复命中。编排层当前不传,是因为「同一攻击者同一帧只打一次」已由预警通道的 `warnSec` 到期语义保证。保留它是为**预测式结算**(客户端先报命中、服务端校验)预留的入口 —— 不是死参数 |

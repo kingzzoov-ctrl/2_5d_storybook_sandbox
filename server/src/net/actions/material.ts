@@ -92,23 +92,28 @@ export const breakBlock: ActionHandler = (ctx: ActionContext): ActionOutcome => 
   if (mat === null) {
     return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可拆' };
   }
-  const r = mat.breakBlock(x, y);
+  /* ★ WS-FND-77(W 线 `gatherMul`):把**发起者**交给物质层 ——
+     采集乘子(602「伐木与采矿速度 +20%」)只有知道是谁在采集才归属得出去。
+     不传时的旧行为由 `MaterialApi.breakBlock` 的可选参数保证(回执不多键)。 */
+  const r = mat.breakBlock(x, y, ctx.actorId);
   if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
   /* 拆下来的东西先给凭证再入背包;背包满就落回**原地** —— 不凭空销毁。 */
   const src = `break:${x},${y}:${r.objId}`;
   ctx.grantItemSource(ctx.actorId, src);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: r.objId, delta: 1, source: src }] });
-  if (gain.allowed) {
-    return { ok: true, kind: 'OK', effect: { x, y, objId: r.objId, gained: 1 } };
-  }
-  mat.dropItem(x, y, r.objId, 1);
-  return {
-    ok: true, kind: 'OK',
-    effect: {
-      x, y, objId: r.objId, gained: 0, dropped: 1,
-      note: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`,
-    },
+  /* `gatherMul` **只在世界源给出非中性值**时才进回执(1 = 中性 ⇒ 键缺席,与
+     `WorldArchiveReceipt.trim` 同一纪律:键的存在本身是可判定事实)。
+     写成可变对象再按需加键:`effect` 的值域是 `string|number|boolean`,
+     用条件展开会把联合类型带进去(TS2322)。 */
+  const effect: Record<string, string | number | boolean> = {
+    x, y, objId: r.objId, gained: gain.allowed ? 1 : 0,
   };
+  if (r.gatherMul !== undefined && r.gatherMul !== 1) effect.gatherMul = r.gatherMul;
+  if (gain.allowed) return { ok: true, kind: 'OK', effect };
+  mat.dropItem(x, y, r.objId, 1);
+  effect.dropped = 1;
+  effect.note = `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`;
+  return { ok: true, kind: 'OK', effect };
 };
 
 /** `DROP_ITEM`:丢东西。落点取**权威位置**,不取客户端报的坐标。 */

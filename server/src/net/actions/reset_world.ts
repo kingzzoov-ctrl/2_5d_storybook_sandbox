@@ -43,6 +43,24 @@
  * 三者不能合并:把"没报告"写成"没归档"就是**把不确定说成确定**,
  * 客户端会据此认为"旧世界已经没了"。
  *
+ * ## 裁剪回执(D-19 第 5 条)
+ *
+ * 旧世界快照超过 1 MiB 时,归档侧不再失败,而是按 chunk 规则裁剪
+ * (`world/archive.ts:planChunkTrim`:玩家建造 > 活动 > 原始地形)。裁过之后
+ * `archiveBytes` 仍是**真正落库的字节数**(不是裁剪前的),所以「归档了多大一份」
+ * 这一项不会说谎;但只报字节数会让客户端以为旧世界完整 —— 于是再报三项:
+ *
+ *   * `effect.archiveTrim` = `'TRIMMED'` / `'INTACT'` / `'UNREPORTED'`(**三态**,
+ *     同 `archive` 的理由:宿主没报告 ≠ 没裁);
+ *   * `effect.archiveDroppedChunks` / `effect.archiveDroppedBytes` —— **被裁掉多少**;
+ *   * `effect.archiveTrimReason` —— **为什么裁**(人类可读,含「被裁块不可回滚」)。
+ *
+ * ⚠️ 只有 `archive === 'ARCHIVED'` 时才谈裁剪:没归档就没有「裁过」可言,
+ *    此时**不写**这三项(写了会让"没归档"看起来像"归档但裁了")。
+ * ⚠️ 这三项来自**宿主上报**(`WorldResetHostResult.archiveTrim`);今天
+ *    `world_sim.ts` / `index.ts` 还没有把它接出来 ⇒ 生产里通常是
+ *    `'UNREPORTED'`。这是**边界**,不是"已经接通"。
+ *
  * ## ⚠️ 本动作**不做**的事(边界,别当成已实现)
  *
  * - **不做客户端重新握手**:换世界之后客户端手里的 chunk / 实体全是旧的,而今天
@@ -94,12 +112,33 @@ type WorldResetHostResult = {
   archive?: { id: string; seed: number; archived_at: number; bytes: number } | null;
   /** 归档失败的原因(归档没成不该让回执看起来一切正常)。 */
   archiveError?: string;
+  /**
+   * **裁剪报告**(D-19 第 5 条,宿主可选上报):快照超 1 MiB 时归档侧按 chunk
+   * 规则裁过,宿主可以把「裁了几块 / 多少字节 / 为什么」原样递上来。
+   *
+   * 字段刻意全是 `unknown`:动作层**只做校验**,不替宿主猜类型
+   * (猜错就是「把不确定说成确定」)。缺键 ⇒ `effect.archiveTrim = 'UNREPORTED'`。
+   */
+  archiveTrim?: {
+    droppedChunks?: unknown;
+    droppedBytes?: unknown;
+    reason?: unknown;
+  } | null;
 };
 
 /** `effect.archive` 的三种取值。"没报告"与"没归档"必须分开,理由见文件头。 */
 const ARCHIVED = 'ARCHIVED';
 const NOT_ARCHIVED = 'NOT_ARCHIVED';
 const UNREPORTED = 'UNREPORTED';
+
+/** 裁剪的两种**已报告**取值(第三态复用 `UNREPORTED`)。 */
+const TRIMMED = 'TRIMMED';
+const INTACT = 'INTACT';
+
+/** 取非负整数字段;不是 ⇒ `null`(半截报告当成**没报告**,不猜)。**/
+function countField(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.trunc(v)) : null;
+}
 
 /**
  * 宿主的回执 ⇒ `effect`。
@@ -114,8 +153,28 @@ function resetEffect(r: WorldResetHostResult): Record<string, string | number | 
     effect.archive = ARCHIVED;
     effect.archiveId = String(archive.id);
     effect.archiveSeed = Number(archive.seed);
+    /* ★ 仍是**真正落库**的字节数(裁过就是裁后的) —— 这一项不许换成"原始大小"。 */
     effect.archiveBytes = Number(archive.bytes);
     effect.archivedAt = Number(archive.archived_at);
+    /* 裁剪报告只在**归档成立**时才有意义(见文件头)。 */
+    const trim = r.archiveTrim;
+    if (trim !== null && typeof trim === 'object') {
+      const droppedChunks = countField(trim.droppedChunks);
+      const droppedBytes = countField(trim.droppedBytes);
+      if (droppedChunks === null || droppedBytes === null) {
+        /* 半截报告 = 没报告:缺一项就分不清"没裁"与"裁了但没说清"。 */
+        effect.archiveTrim = UNREPORTED;
+      } else {
+        effect.archiveTrim = droppedChunks > 0 ? TRIMMED : INTACT;
+        effect.archiveDroppedChunks = droppedChunks;
+        effect.archiveDroppedBytes = droppedBytes;
+        if (typeof trim.reason === 'string' && trim.reason.length > 0) {
+          effect.archiveTrimReason = trim.reason;
+        }
+      }
+    } else {
+      effect.archiveTrim = UNREPORTED;
+    }
   } else if (archive === null) {
     effect.archive = NOT_ARCHIVED;
   } else {

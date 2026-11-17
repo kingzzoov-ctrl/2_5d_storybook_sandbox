@@ -42,6 +42,50 @@
  *   `mealMul` ⇒ **生产路径上乘区恒 `1.0`**。即:判据有牙、接线未完成。
  */
 
+import { RANCH_SYSTEM } from '../systems/ranch.ts';
+import { GREENHOUSE_SYSTEM } from '../systems/greenhouse.ts';
+import { ALCHEMY_LAB_SYSTEM } from '../systems/alchemy_lab.ts';
+import { DEPOT_SYSTEM } from '../systems/depot.ts';
+
+/**
+ * 一个「系统解锁」房间的实现登记:模块路径 + 接线方要调的那个入口。
+ *
+ * ## 为什么这不是一张字符串表
+ *
+ * 这四个 `SYSTEM_UNLOCK` 房间此前在 `ROOM_EFFECT_DECISION` 里只写了一句
+ * 「⇒ 未实装」——**文字**。文字不可判定:模块改名、文件被删、入口函数不存在,
+ * 那句话照样在那儿,门禁照样绿。
+ *
+ * ⇒ 现在每个系统在自己的模块里导出一个 `*_SYSTEM` 常量(`module` = 仓库相对
+ * 路径、`entry` = 入口函数名),本文件把它们**真的 import 进来**登记成一张表:
+ *   · `implementedBy` 由这张表派生(单一事实源,不会两处漂移);
+ *   · 判据可以核「文件真的存在」「入口函数真的导出」;
+ *   · 这四个模块因此是**生产可达**的(不是只被测试引用的孤儿)。
+ */
+export interface RoomSystemImpl {
+  roomKey: string;
+  module: string;
+  entry: string;
+}
+
+/** `SYSTEM_UNLOCK` 四种房间 → 实现落点。 */
+export const ROOM_SYSTEM_IMPL: Readonly<Record<string, RoomSystemImpl>> = Object.freeze({
+  ECO_RANCH: RANCH_SYSTEM,
+  ALCHEMY_LAB: ALCHEMY_LAB_SYSTEM,
+  AUTO_GREENHOUSE: GREENHOUSE_SYSTEM,
+  CLOUD_DEPOT: DEPOT_SYSTEM,
+});
+
+/**
+ * 这个房间的系统**是否已实装**:登记表里有它、且模块路径与入口都不是空串。
+ *
+ * ⚠️ 它只回答「有没有落点」,不回答「落点接进世界了没有」—— 后者要看
+ * `WorldSim` 的调用点(见各系统文件头的接线说明)。
+ */
+export function isRoomSystemImplemented(roomKey: string): boolean {
+  const impl = ROOM_SYSTEM_IMPL[roomKey];
+  return impl !== undefined && impl.module.length > 0 && impl.entry.length > 0;
+}
 /** 房内每秒恢复的 HP(手册:【森系茶歇卧室】躺上去每秒 15 HP)。 */
 export const BEDROOM_HEAL_PER_SEC = 15;
 
@@ -69,8 +113,9 @@ export const ONSEN_BUFF_SEC = 1200;
  *
  * ⇒ 这张表把「另外 6 条怎么办」从**沉默**变成**决定**:
  *   · `PLAYER_NUMERIC` —— 有可观测数值,本文件实现它;
- *   · `SYSTEM_UNLOCK`  —— 它的 bonus 是**解锁一个系统**(商店/物流/炼金/饲养),
- *     而那个系统在仓库里**还不存在** ⇒ 明确写出来,不假装已实现;
+ *   · `SYSTEM_UNLOCK`  —— 它的 bonus 是**解锁一个系统**(商店/物流/炼金/饲养)。
+ *     这四个系统的实装落在 `server/src/systems/**`,由 `ROOM_SYSTEM_IMPL` 登记、
+ *     `implementedBy` 指路;房间本身**不产生玩家数值**(数值都在系统的纯函数里)。
  *   · `DISPLAY_ONLY`   —— 它本来就不产生玩家数值(画廊展示)。
  *
  * ⚠️ 判据是**覆盖性**,且对着**冻结层**核:`tests/WS-FND-17` 断言
@@ -79,18 +124,26 @@ export const ONSEN_BUFF_SEC = 1200;
  */
 export const ROOM_EFFECT_DECISION: Readonly<Record<string, {
   kind: 'PLAYER_NUMERIC' | 'SYSTEM_UNLOCK' | 'DISPLAY_ONLY';
-  /** 该房间的增益内容 + (若非 PLAYER_NUMERIC)缺什么。 */
+  /** 该房间的增益内容(PLAYER_NUMERIC)或解锁的系统 + 实现落点。 */
   purpose: string;
+  /**
+   * 实现落点 = **仓库相对路径**;由 `ROOM_SYSTEM_IMPL` 派生。
+   *
+   * 只有 `SYSTEM_UNLOCK` 的四种有(数值/展示类房间的效果就在本文件里,
+   * 不需要指路)。判据 `tests/WS-FND-75-room-systems.test.ts` 核它
+   * 非空、文件存在、入口函数真的导出。
+   */
+  implementedBy?: string;
 }>> = Object.freeze({
   FORGE_MASTER: { kind: 'PLAYER_NUMERIC', purpose: '解锁中高级武器护甲与魔能电路锻造(`forgeUnlocked`)' },
   COZY_CANTEEN: { kind: 'PLAYER_NUMERIC', purpose: '大餐:站内**且带着料理 buff** 时攻击 / 生命上限 ×1.4(见 `CANTEEN_MEAL_MUL`)' },
   COZY_BEDROOM: { kind: 'PLAYER_NUMERIC', purpose: '每秒回 15 HP(`BEDROOM_HEAL_PER_SEC`)+ 打盹状态(`napping`)' },
   SAKURA_ONSEN: { kind: 'PLAYER_NUMERIC', purpose: '泡澡获 20 分钟生命上限 ×1.3(`ONSEN_MAX_HP_MUL` / `ONSEN_BUFF_SEC`)' },
-  ECO_RANCH: { kind: 'SYSTEM_UNLOCK', purpose: '圈养动物自动进食 + 每日产出毛团/温泉橘 —— **需饲养与产出的日结系统**,仓库里没有 ⇒ 未实装' },
+  ECO_RANCH: { kind: 'SYSTEM_UNLOCK', implementedBy: ROOM_SYSTEM_IMPL.ECO_RANCH.module, purpose: '圈养动物自动进食 + 每日产出毛团/温泉橘 ⇒ 已实装:`server/src/systems/ranch.ts` 的 `settleRanchDay` / `canAutoFeed`(日结);系统解锁本身**不产生玩家数值** —— 产出在系统的纯函数里' },
   ART_GALLERY: { kind: 'DISPLAY_ONLY', purpose: '像素画作与自定义纹章**展示** —— 按手册不产生玩家数值' },
-  ALCHEMY_LAB: { kind: 'SYSTEM_UNLOCK', purpose: '大模型自由炼金 + 全服首创冠名陈列 —— **需 LLM 与陈列系统** ⇒ 未实装' },
-  AUTO_GREENHOUSE: { kind: 'SYSTEM_UNLOCK', purpose: '全天候透光 + 自动洒水与分拣物流 —— **需物流系统** ⇒ 未实装' },
-  CLOUD_DEPOT: { kind: 'SYSTEM_UNLOCK', purpose: '上架稀有材料与奇物供购买 —— **需商店/交易系统** ⇒ 未实装' },
+  ALCHEMY_LAB: { kind: 'SYSTEM_UNLOCK', implementedBy: ROOM_SYSTEM_IMPL.ALCHEMY_LAB.module, purpose: '自由炼金 + 全服首创冠名陈列 ⇒ 已实装:`server/src/systems/alchemy_lab.ts` 的 `brewAndRecord`(复用 `alchemy/degrade.ts` 的确定性降级,不联网)+ `firstDiscovererOf` / `galleryOrder`;系统解锁本身**不产生玩家数值**' },
+  AUTO_GREENHOUSE: { kind: 'SYSTEM_UNLOCK', implementedBy: ROOM_SYSTEM_IMPL.AUTO_GREENHOUSE.module, purpose: '全天候透光 + 自动洒水与分拣物流 ⇒ 已实装:`server/src/systems/greenhouse.ts` 的 `cellGrowth`(夜/暴风雨照长)/ `morningMoisture` / `sprinklerCells`(5×5)/ `sortHarvest`;系统解锁本身**不产生玩家数值**' },
+  CLOUD_DEPOT: { kind: 'SYSTEM_UNLOCK', implementedBy: ROOM_SYSTEM_IMPL.CLOUD_DEPOT.module, purpose: '上架稀有材料与奇物 + 购买结算 ⇒ 已实装:`server/src/systems/depot.ts` 的 `listable` / `buy`;价格只取内容表,内容表没有 `price` 就照实返回「无定价」(**不发明价格**);系统解锁本身**不产生玩家数值**' },
 });
 
 /**

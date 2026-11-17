@@ -2114,7 +2114,7 @@ test('像素画架:256 像素、单点上色、撤销重做、笔画合并', () 
   eq(TRANSPARENT_INDEX, -1, '透明哨兵');
 
   const e = new PixelEasel();
-  eq(e.get(0, 0), TRANSPARENT_INDEX, '初始透明');
+  eq(e.get(0, 0), -1, '初始透明');
   eq(e.coverage(), 0, '初始覆盖率 0');
   ok(e.paint(3, 4, 7), '上色成功');
   eq(e.get(3, 4), 7, '颜色已写入');
@@ -2125,7 +2125,7 @@ test('像素画架:256 像素、单点上色、撤销重做、笔画合并', () 
   ok(e.undo(), '撤销');
   eq(e.get(3, 4), 7, '回到 7');
   ok(e.undo(), '再撤销');
-  eq(e.get(3, 4), TRANSPARENT_INDEX, '回到透明');
+  eq(e.get(3, 4), -1, '回到透明');
   ok(!e.undo(), '无更多撤销');
   ok(e.redo(), '重做');
   eq(e.get(3, 4), 7, '重做到 7');
@@ -2135,12 +2135,12 @@ test('像素画架:256 像素、单点上色、撤销重做、笔画合并', () 
   ok(!e.paint(-1, 0, 1), '负坐标无效');
   ok(!e.paint(16, 0, 1), '越界无效');
   ok(!e.paint(0.5, 0, 1), '非整数无效');
-  eq(e.get(99, 99), TRANSPARENT_INDEX, '越界读出透明');
+  eq(e.get(99, 99), -1, '越界读出透明');
 
   /* 越界色 → 擦除 */
   e.paint(5, 5, 0);
   ok(e.paint(5, 5, 999), '越界色视为擦除且算变化');
-  eq(e.get(5, 5), TRANSPARENT_INDEX, '被擦除');
+  eq(e.get(5, 5), -1, '被擦除');
 
   /* 笔画合并 */
   const e2 = new PixelEasel();
@@ -2162,7 +2162,7 @@ test('像素画架:矩形填充、洪水填充、变换、序列化往返', () =
   ok(e.fillRect(0, 0, 7, 7, 5), '填充左上 8×8');
   eq(e.coverage(), 64 / 256, '覆盖 1/4');
   eq(e.get(7, 7), 5, '含端点');
-  eq(e.get(8, 8), TRANSPARENT_INDEX, '端点外未填充');
+  eq(e.get(8, 8), -1, '端点外未填充');
   ok(!e.fillRect(0, 0, 7, 7, 5), '重复填充无变化');
   /* 坐标自动交换 */
   ok(e.fillRect(15, 15, 12, 12, 9), '反序坐标自动交换');
@@ -2184,7 +2184,7 @@ test('像素画架:矩形填充、洪水填充、变换、序列化往返', () =
   e3.paint(0, 0, 1);
   e3.transform('flipX');
   eq(e3.get(15, 0), 1, 'flipX 移到右上');
-  eq(e3.get(0, 0), TRANSPARENT_INDEX, '原位置清空');
+  eq(e3.get(0, 0), -1, '原位置清空');
   e3.transform('flipY');
   eq(e3.get(15, 15), 1, 'flipY 移到右下');
   e3.transform('rotate180');
@@ -2718,7 +2718,7 @@ test('乐器战歌混音总线:同音合并、音轨上限、软削波', () => {
 test('音高砖编辑面板与 408 共鸣传感器掩码', () => {
   eq(PITCH_BRICK_ROWS, 2, '2 行');
   eq(PITCH_BRICK_COLS, 16, '16 列');
-  eq(PITCH_BRICK_ROWS * PITCH_BRICK_COLS, PITCH_COUNT, '2×16 = 32 音');
+  eq(PITCH_BRICK_ROWS * PITCH_BRICK_COLS, 32, '2×16 = 32 音');
 
   eq(pitchBrickIndex(0, 0), 0, '左上 = 音高 0');
   eq(pitchBrickIndex(0, 15), 15, '第一行末');
@@ -2850,9 +2850,9 @@ test('装配纯数学:相机朝向恒为单位向量,正交半宽 = 像素/scale
   near(f.x, -d.x, 1e-15, '前向 = 偏移方向取反');
   near(f.z, -d.z, 1e-15, '前向 z 取反');
 
-  /* 相机位置到焦点的距离恒为 ORTHO_DISTANCE(与角度无关) */
+  /* 相机位置到焦点的距离恒为 512(正交距离;常量由 :2832 `eq(ORTHO_DISTANCE, 512)` 锚定) */
   const pos = cameraPosition(0, 0, 0);
-  near(Math.hypot(pos.x, pos.y, pos.z), ORTHO_DISTANCE, 1e-9, '相机到焦点距离 = 512');
+  near(Math.hypot(pos.x, pos.y, pos.z), 512, 1e-9, '相机到焦点距离 = 512');
   const pos2 = cameraPosition(10, 20, 1);
   near(Math.hypot(pos2.x - 10, pos2.y - 20, pos2.z - 1), 512, 1e-9, '平移焦点后距离不变');
   near(pos2.x - pos.x, 10, 1e-12, '焦点平移 10 ⇒ 相机平移 10');
@@ -3321,8 +3321,9 @@ test('音名与唱名常量表:与十二平均律自洽', () => {
   eq([...NOTE_NAMES], ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'], '音名表');
   eq([...SOLFEGE], ['Do', 'Do#', 'Re', 'Re#', 'Mi', 'Fa', 'Fa#', 'Sol', 'Sol#', 'La', 'La#', 'Si'], '唱名表');
 
-  /* 音高 9 = A4 = 440Hz,MIDI 69(与 A4_MIDI 交叉验证) */
-  eq(pitchInfo(9).midi, A4_MIDI, '音高 9 的 MIDI = A4_MIDI');
+  /* 音高 9 = A4 = 440Hz,MIDI 69 —— 期望值写字面量 69(不取 A4_MIDI);
+     常量本身由 :3318 `eq(A4_MIDI, 69)` 锚点钉住。 */
+  eq(pitchInfo(9).midi, 69, '音高 9 的 MIDI = 69');
   eq(pitchInfo(9).hz, 440, '音高 9 = 440Hz');
   eq(pitchInfo(9).noteName, 'A4', '音高 9 音名');
   eq(pitchInfo(9).solfege, 'La', '音高 9 唱名');

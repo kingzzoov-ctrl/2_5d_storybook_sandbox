@@ -35,10 +35,42 @@
  * 4. **不重复实现**:子系统已有的逻辑一律调用,本层只负责**顺序与节奏**。
  */
 
-import { SLOW_TICK_HZ, TICK_HZ, DT } from '../../../shared/types/physics.ts';
+import { SLOW_TICK_HZ, TICK_HZ, DT, BASE_MOVE_SPEED } from '../../../shared/types/physics.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
-import { Chunk, type TileFields } from '../world/chunk.ts';
+import { Chunk, chunkKey, type TileFields } from '../world/chunk.ts';
+/* ★ WS-FND-77 / D-19:四个房间系统 + 料理 3 字段的**世界侧单一装配点**。
+   `systems/**` 里那四个模块在此之前**零生产调用点**(只有 tests/WS-FND-75 在用),
+   于是「牧场日结 / 温室生长 / 炼金首创陈列 / 百货购买」在运行期一件都不发生。
+   ⇒ 世界只在**一个**地方调它们(`systems/wiring.ts` 的薄封装),见那边的文件头。 */
+import {
+  createRoomSystemsState,
+  plantCrop as plantCropIn,
+  growCrops,
+  settleRanch,
+  brewInLab,
+  galleryDisplay,
+  foodPhysicsOf,
+  gatherMulOf as gatherMulOfMods,
+  producedItemIdOf,
+  type CropCellState,
+  type HarvestRow,
+  type GrowInput,
+  type GalleryDisplayRow,
+  type RoomSystemsState,
+} from '../systems/wiring.ts';
+import { sprinklerCells, type Weather } from '../systems/greenhouse.ts';
+import { feedItemOf, type RanchAnimal, type RanchDayResult } from '../systems/ranch.ts';
+import { buy, type BuyResult } from '../systems/depot.ts';
+/* ★ A-3:炼金的**中性初判**不在这里发明 —— 复用 `alchemy/**` 既有的口径:
+   `NEUTRAL_AFFINITY`(0.7 = 不倾斜)与 `S_LOGIC_BASE + SPAN × affinity`
+   (`gate.ts:204` 的公式,本文件只照它算默认值,允许调用方显式覆盖)。 */
+import { S_LOGIC_BASE, S_LOGIC_SPAN, S_LOGIC_FLOOR, S_LOGIC_CEIL } from '../alchemy/gate.ts';
+import { NEUTRAL_AFFINITY } from '../alchemy/degrade.ts';
+/* ★ B:把归档回滚计划**真的应用**到世界上(此前计划层是纯数据,没人接)。
+   只 import **类型** —— 运行期不依赖 `world/archive.ts`(它反过来认识
+   `Chunk`,不依赖 sim)。 */
+import type { RestorePlan } from '../world/archive.ts';
 import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 import { PhysicsWorld, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
@@ -179,7 +211,11 @@ import '../wiring/components.ts';
 import { isNight as isNightAtHour } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
 import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
-import { VitalsSystem, resolveStrikes, collectEventStrikes, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
+import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, warnHitsPlayer, BLIND_VIEW_MUL, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
+/* ★ D2(视线遮挡):纯函数模块(`server/src/world/vision.ts`)。
+   生物 → 玩家的打击在**结算前**过一次射线遮挡 —— 修前隔着 1 格墙也能打中
+   (`docs/DAMAGE-LOOP.md` D2),因为这条判定在仓库里**根本不存在**。 */
+import { losBlocked } from '../world/vision.ts';
 import type { GroundItem, WorldPlayer, DamageResult } from '../mobs/behaviors.ts';
 import { DamageKind } from '../mobs/behaviors.ts';
 /* 玩家 → 生物 方向的伤害管线(task-33 接线)。
@@ -191,6 +227,17 @@ import {
   makeDot,
   tickDot,
   DamageSource,
+  /* ★ D1/D3/D4 + 烹饪字段消费:四个**内容层**锚点。
+     - `DEFAULT_UNARMED_KNOCKBACK`:生物没有武器时用的击退量(与第 8 步同源,不新造数)
+     - `MOB_ELEMENT_BY_ID`:生物的元素归属(抗性折算的输入,唯一出处)
+     - `ARMOR_K`:护甲递减曲线常数(烹饪 `defFlat` 的折算用同一曲线,不另造公式)
+     - `pvpVerdict` / `targetFromStats`:PvP 的唯一授权判定与受击方档案 */
+  DEFAULT_UNARMED_KNOCKBACK,
+  MOB_ELEMENT_BY_ID,
+  ARMOR_K,
+  pvpVerdict,
+  targetFromStats,
+  type AttackInput as PipelineAttackInput,
   type DotTask,
   type DamageResult as PipelineDamageResult,
 } from '../combat/damage.ts';
@@ -311,6 +358,10 @@ import type {
   SummonWithOfferingResult,
 } from '../bosses/raid.ts';
 import type { BreakResult } from '../bosses/breaks.ts';
+/* ★ D3(Boss 技能对玩家的特殊效果):Boss 的**地面预警几何**由 `phases.ts` 按
+   阶段产出(每阶段半径/角度/时长都是内容值,`phases.ts:156`)。编排层拿它当
+   第三条 strike 通道 ⇒ 此前 Boss 的招式只对着空气(没有任何玩家侧结算)。 */
+import { skillWarnGeoms } from '../bosses/phases.ts';
 
 /** 快帧与慢帧的固定比例:20Hz / 2Hz = 10。 */
 export const FAST_PER_SLOW = TICK_HZ / SLOW_TICK_HZ;
@@ -335,8 +386,18 @@ export interface MaterialApi {
   blockAt(x: number, y: number): number;
   /** 放一个块(玩家语义:判世界内 / 该格空 / 该格无实体)。 */
   placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
-  /** 拆一个块,返回被拆下来的 obj id(调用方拿它当掉落)。 */
-  breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string };
+  /**
+   * 拆一个块,返回被拆下来的 obj id(调用方拿它当掉落)。
+   *
+   * `actorId` **可选**:给了才多一个 `gatherMul`(采集乘子的归属口,见实现处)。
+   * 现有的所有调用点(旧世界源假件、`actions/material.ts` 的旧写法)不传它 ⇒
+   * 形状与行为都不变。
+   */
+  breakBlock(
+    x: number,
+    y: number,
+    actorId?: string,
+  ): { ok: true; objId: number; gatherMul?: number } | { ok: false; reason: string };
   /** 附近的地面掉落物(由近及远)。 */
   groundItemsNear(
     x: number, y: number, radius: number,
@@ -479,13 +540,45 @@ export interface WorldArchiveRequest {
   reason: string;
 }
 
-/** 归档口的回执 —— 只取回执里**可判定**的四项(与 `WorldArchiveSummary` 同形)。 */
+/**
+ * 归档**裁剪回执**的四件(★ B / D-19 第 5 条)。
+ *
+ * `repo.archiveWorldSnapshot` 在快照超 1 MiB 时会按 `world/archive.ts` 的规则
+ * 裁地形块,并把 `trim: ArchiveTrimReport` 放进回执。那份摘要此前在
+ * **两处**被丢掉:
+ * ```
+ * index.ts:makeArchiveSink   只搬 id/seed/archived_at/bytes ⇒ trim 丢
+ * world_sim:archiveBeforeReset 又新建一个只有四字段的回执 ⇒ 再丢一次
+ * ```
+ * ⇒ 「归档成功了」与「归档是**裁过的**」在回执里不可区分,而回滚恰恰要读它
+ * (`planRestore` 的 `missingChunks` 就来自同一份 `trim`)。
+ *
+ * ⚠️ **键缺席 = 没裁过**(不写 `status: 'KEPT'`):`WorldResetResult.archive`
+ *   的三态纪律(有对象 / `null` / 缺键)同理 —— 补一个恒存在的键会让
+ *   「这次归档裁了几块」这个事实在**每一次**重置里都出现,反而不可判定。
+ */
+export interface WorldArchiveTrimReceipt {
+  /** `'TRIMMED'` = 这次真的裁了块(`'KEPT'` 预留给"显式报告没裁")。 */
+  status: 'TRIMMED' | 'KEPT';
+  /** 裁掉的地形块数。 */
+  droppedChunks: number;
+  /** 裁掉的块体字节合计。 */
+  droppedBytes: number;
+  /** 人类可读原因(取自 `trim.reason`,**原样转发**,不在这一层重写)。 */
+  reason: string;
+  /** 规则标识(取自 `trim.rule`,机器可判)。 */
+  rule: string;
+}
+
+/** 归档口的回执 —— 可判定的句柄 + 摘要(+ **裁剪四件**,没裁过则键缺席)。 */
 export interface WorldArchiveReceipt {
   /** 稳定句柄(`<room_id>#<seq>`)。★ 空 id 不算归档成功(见 `archiveBeforeReset`)。 */
   id: string;
   seed: number;
   archived_at: number;
   bytes: number;
+  /** 裁剪摘要(**没裁过 ⇒ 键缺席**)。 */
+  trim?: WorldArchiveTrimReceipt;
 }
 
 /** 注入的世界归档口(装配层把它接到 `repo.archiveWorldSnapshot`)。 */
@@ -713,7 +806,7 @@ export class WorldSim {
    * `decideSpawn` 对未知群系本来也兜底到 MEADOW)。将来真做了群系地图,
    * 把本字段换成「按坐标查询」即可 —— 刷怪逻辑不用动。
    */
-  readonly biomeName: string;
+  biomeName: string;
   /** 刷怪预算的小数累加器(见 `tickSpawn()`)。 */
   private spawnBudget = 0;
   /** 预算上界(只/慢帧):防「整图被挡」时累积成一次雪崩。 */
@@ -1092,6 +1185,37 @@ export class WorldSim {
    * 上一次断线的地方(而那正是本仓库多次踩过的"重进被拉回/被推到别处"同族缺陷)。
    */
   private readonly spawnPoints = new Map<string, { x: number; y: number }>();
+  /* ══════════ ★ WS-FND-77 / D-19:四个房间系统 + 料理 3 字段的世界侧状态 ══════════
+   *
+   * 全部状态**只在这里**(`systems/wiring.ts` 的 `RoomSystemsState` 是纯数据容器)。
+   * 为什么世界要持有一份:四个系统的实现是**纯函数**(不碰世界、不读时钟),
+   * 而「谁的牧场 / 哪一格作物 / 陈列馆里有什么 / 摊位还剩几件」是**世界世代**
+   * 的一部分 —— 它们必须随 `rebuildWorld` 一起换代(见那里的注释)。
+   */
+  private roomSystemsState: RoomSystemsState = createRoomSystemsState();
+  /** 天气(世界侧唯一来源;`greenhouse.ts` 只接受判好的值,不自己判定)。 */
+  private weatherNow: Weather = 'CLEAR';
+  /**
+   * 累计的「过了多少天」的小数部分(牧场跨日结算用)。
+   *
+   * 为什么不直接用 `frameCount`:一整天是 `WORLD_DAY_SEC = 1200` 秒
+   * (24000 帧),用帧号算跨日要除两次;而 `advanceRoomSystems` 已经按
+   * 「天的一部分」推进,同一个累加器同时服务温室(按天生长)与牧场(按天结算)。
+   */
+  private dayFraction = 0;
+  /** 最近一次四系统慢帧报告(`null` = 还没跑过)。 */
+  private lastRoomSystems: {
+    grown: number;
+    matured: HarvestRow[];
+    ranchDays: number;
+    ranchProduced: number;
+    ranchDropped: number;
+  } | null = null;
+  /** 无人自助售货摊(515)的库存:`物品 id → 件数`(世界世代的一部分)。 */
+  private stallStock: Record<number, number> = {};
+  /** 最近一次牧场日结的**落货**账(哪些产出真的落到地上 / 哪些没物品 id)。 */
+  private lastRanchDrop: { dropped: { itemId: number; count: number; x: number; y: number }[]; skipped: string[] } =
+    { dropped: [], skipped: [] };
   /** 注入的世界归档口(★ D-06)。`null` = **没有库**(装配层没给)。 */
   private readonly archiveSink: WorldArchiveSink | null;
   constructor(opts: WorldSimOptions = {}) {
@@ -1277,14 +1401,34 @@ export class WorldSim {
   /**
    * 拆掉一个块,返回**被拆下来的那个 obj id**(调用方拿它当掉落物)。
    * 空格返回 `ok:false` —— 不给「拆空气」这种静默成功。
+   *
+   * ## `actorId`(可选,WS-FND-77 / W 线:`gatherMul`)
+   *
+   * 采集乘子(602「伐木与采矿速度 +20%」)只有在**知道是谁在采集**时才能用 ——
+   * 此前的签名里没有 actor,于是那个字段永远无处归属(第 3 个无人消费的料理字段)。
+   *
+   * ⚠️ **不给 actor ⇒ 与接线前逐位相同**(返回值连键都不多一个);
+   *   给 actor ⇒ 回执多一个 `gatherMul`(该玩家当前的合并乘子)。
+   *   为什么要把它放回执而不是在这里乘件数:一次 `breakBlock` 只产出 1 件,
+   *   而「+20% 的采集速度」在没有采集时长的模型里没有可乘的量纲 ——
+   *   件数放大规则要 owner 裁决(`items.ts` 的 `flags.dropDoubleChance` 那一族),
+   *   本方法**不编规则**(见 `systems/wiring.ts:gatherMulOf`)。
    */
-  breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string } {
+  breakBlock(
+    x: number,
+    y: number,
+    actorId?: string,
+  ): { ok: true; objId: number; gatherMul?: number } | { ok: false; reason: string } {
     if (!this.inWorld(x, y)) return { ok: false, reason: `坐标 ${x},${y} 在世界外` };
     const gx = Math.floor(x);
     const gy = Math.floor(y);
     const obj = this.grid.objIdAt(gx, gy);
     if (obj === 0) return { ok: false, reason: '这一格没有物件' };
     this.setCell(gx, gy, { obj: 0 });
+    /* 只有给了 actor 才把采集乘子带上(不给 ⇒ 回执与接线前**逐位相同**)。 */
+    if (typeof actorId === 'string' && actorId.length > 0) {
+      return { ok: true, objId: obj, gatherMul: this.gatherMulOfPlayer(actorId) };
+    }
     return { ok: true, objId: obj };
   }
 
@@ -1997,8 +2141,101 @@ export class WorldSim {
       ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
     });
     return { outcome: 'OK', hit, rejected: null };
+    return { outcome: 'OK', hit, rejected: null };
   }
 
+  /**
+   * **玩家 → 玩家** 的伤害入口(D3 的 PvP 那一半)。
+   *
+   * ## 修前是什么样
+   *
+   * `docs/DAMAGE-LOOP.md` §8 的表格里写着「玩家攻击玩家的 PvP 结算 | 未实现」。
+   * 实测:`attackMobAuthorized` 的第一个闸就把「目标不是生物」拒了,而
+   * **没有任何别的入口** —— 所以 PvP 不是「打错方向」,是**根本不存在**。
+   *
+   * ## 三道闸,顺序不可换
+   *
+   * ```
+   * 1 双方都是登记玩家 + 都没倒下   (与 attackMobAuthorized 的 0/0b 同源)
+   * 2 pvpVerdict(...)               ← 唯一授权判定(在 damage.ts)
+   * 3 视线(D2 同一条射线)          ← 隔墙不能砍人,对玩家同样成立
+   * ```
+   *
+   * ## 伤害走八步公式,而不是 `applyHit`
+   *
+   * 受击方是玩家 ⇒ 有装备/护甲/闪避/反伤(`combatantStats`),这些只有在
+   * `computeDamage` 里才有。算完之后用 `vitals.applyDamage` 落账
+   * (它负责无敌帧与 `downed`,不重算公式)。击退用**武器侧**的
+   * `result.knockbackImpulse`(内容值)写回刚体 —— 与 D1 同一条写回路径。
+   *
+   * @returns `rejected`: `'NOT_A_PLAYER' | 'DOWNED' | 'PVP_OFF' | 'PVP_SELF' | 'NO_LOS' | 'OUT_OF_AOI'`,
+   *          `null` = 真的结算了(`applied` 可能为 0:被闪避/无敌帧)。
+   */
+  attackPlayerAuthorized(
+    attackerId: string,
+    targetId: string,
+  ): {
+    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'PVP_OFF' | 'PVP_SELF' | 'PVP_NO_TARGET' | 'NO_LOS' | 'OUT_OF_AOI' | null;
+    applied: number;
+    result: PipelineDamageResult | null;
+  } {
+    if (!this.playerIds.has(attackerId) || !this.playerIds.has(targetId)) {
+      return { rejected: 'NOT_A_PLAYER', applied: 0, result: null };
+    }
+    if (this.vitals.get(attackerId)?.downed === true || this.vitals.get(targetId)?.downed === true) {
+      return { rejected: 'DOWNED', applied: 0, result: null };
+    }
+    /* ★ 唯一授权判定 —— 本方法**不**自己判 `this.pvpEnabled`
+       (那会长出第二份 PvP 语义,日后与 `pvpVerdict` 漂移)。 */
+    const verdict = pvpVerdict({ pvpEnabled: this.pvpEnabled, attackerId, targetId });
+    if (!verdict.allowed) {
+      const r = verdict.reason;
+      const rejected = r === 'PVP_SELF' ? 'PVP_SELF'
+        : r === 'PVP_NO_TARGET' ? 'PVP_NO_TARGET'
+          : 'PVP_OFF';
+      return { rejected, applied: 0, result: null };
+    }
+    const a = this.physics.bodies.get(attackerId);
+    const b = this.physics.bodies.get(targetId);
+    if (a === undefined || b === undefined) return { rejected: 'NOT_A_PLAYER', applied: 0, result: null };
+    const distance = Math.hypot(b.x - a.x, b.y - a.y);
+    if (distance > AOI_WAKE_DISTANCE) return { rejected: 'OUT_OF_AOI', applied: 0, result: null };
+    if (losBlocked(a.x, a.y, b.x, b.y, (cx, cy) => this.grid.isSolidAt(cx, cy))) {
+      return { rejected: 'NO_LOS', applied: 0, result: null };
+    }
+
+    const attackerStats = combatantStats(this.levelOf(attackerId), [...this.wearingOf(attackerId)], foodCombatInput(this.buffsOf(attackerId)));
+    const targetStats = combatantStats(this.levelOf(targetId), [...this.wearingOf(targetId)], foodCombatInput(this.buffsOf(targetId)));
+    const weaponId = attackerStats.flags.weaponId;
+    const weapon = weaponId > 0 ? weaponById(weaponId) : null;
+    const target = targetFromStats(targetStats, { id: targetId, name: targetId });
+    const input: PipelineAttackInput = {
+      attacker: attackerStats,
+      target,
+      weapon,
+      skill: null,
+      comboMul: 1.0,
+      critRoll: this.combatRng(),
+      dodgeRoll: this.combatRng(),
+      distance,
+      source: DamageSource.PVP,
+    };
+    const result = computeDamage(input);
+    const out = this.vitals.applyDamage(targetId, result.finalDamage);
+    if (out.applied > 0) {
+      this.hitCount += 1;
+      /* 击退:**武器侧**的内容量(`result.knockbackImpulse`),与 D1 同一条写回路径。 */
+      const len = distance > 1e-6 ? distance : 1;
+      const m = b.mass > 0 ? b.mass : 1;
+      const j = result.knockbackImpulse * m;
+      this.physics.applyImpulse(targetId, ((b.x - a.x) / len) * j, ((b.y - a.y) / len) * j, 0);
+      this.bus.emit('player_hit', {
+        playerId: targetId, attacker: attackerId, damage: out.applied, hp: this.vitals.get(targetId)?.hp ?? 0,
+      }, attackerId);
+      if (out.downed) this.bus.emit('player_downed', { playerId: targetId, by: attackerId }, attackerId);
+    }
+    return { rejected: null, applied: out.applied, result };
+  }
   /* ── 玩家 → 生物 的伤害入口(task-33 接线)─────────────────────────
    *
    * ## 为什么必须新增入口,而不是「让 damageMob 内部算一下」
@@ -2141,6 +2378,15 @@ export class WorldSim {
     /* 3 受击方档案 —— 由冻结层 MobDef 派生(缺的字段见 mobCombatProfile)。 */
     const target = mobCombatProfile(rt.def, { hp: rt.hp });
 
+    /* ★ D5:致盲对**命中**的实际影响。
+       机制:看不见 ⇒ 只能打到**贴身**的东西。判据用 `TOUCH_RADIUS`
+       (revive.ts 的既有常量 0.9 格,不是新数),超出的这一次攻击**落空**。
+       为什么不是「降低伤害」:致盲夺走的是**瞄准**,不是力气 —— 降伤会让
+       玩家以为自己的武器变弱了,而落空把「我瞎了」这件事表达得更直接。
+       落空走**公式自己的第 0a 步**(`distance = Infinity` ⇒ `outOfReach`),
+       不另造一个「未命中」的假结果:否则 `float`/`outOfReach`/`steps` 三处
+       都出现第二份口径。 */
+    const blindMiss = this.vitals.blindOf(playerId) > 0 && distance > TOUCH_RADIUS;
     /* 4 八步公式。暴击/闪避注入确定性随机。
        ⚠ 用 `combatRng` 而非 `this.rng` —— 后者与生物 AI 共用,
        拿它取战斗随机会把「玩家攻击次数」变成生物 AI 的隐式输入
@@ -2155,7 +2401,7 @@ export class WorldSim {
       comboMul: opts.comboMul,
       critRoll,
       dodgeRoll,
-      distance,
+      distance: blindMiss ? Number.POSITIVE_INFINITY : distance,
       source: opts.skill ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
     });
 
@@ -2381,6 +2627,12 @@ export class WorldSim {
            见 `afkPlayers` 的 docblock:写死 false 会让
            `progression.ts:350` 的 `afkMul` **永不生效**。 */
         afk: this.afkPlayers.has(id),
+        /* ★ 烹饪 `expMul` 的**消费点**(613 庆典蛋糕 = 1.30)。
+           `progression.ts:356` 早已把 `expBonusMul` 乘进 `bonusMul`,
+           缺的只是**有人把料理的那个字段填进来** —— 修前恒 `undefined`(按 1.0 算),
+           所以「经验 +30%」这道菜在生产里从来不生效。
+           ⚠️ 不在这里做第二套「乘多少」的判断:乘区算式仍在 progression 一处。 */
+        expBonusMul: this.buffsOf(id).expMul,
         hasDreamTalent: p === undefined ? false : isTalentUnlocked(p.level, 'talent_dream_revelation'),
       });
     }
@@ -2792,7 +3044,7 @@ export class WorldSim {
    * ⚠️ 它**不是**判定本身,只是一份诊断记录:真值来源仍是
    * `VitalsSystem.downed`(见方法内注释)。
    */
-  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | null = null;
+  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | 'STUNNED' | null = null;
   /**
    * **玩家移动的权威写入点**(task-58)。把一次已获准的移动写进 `physics.bodies`。
    *
@@ -2874,6 +3126,13 @@ export class WorldSim {
   private static readonly BUBBLE_GUN_ITEM_ID = 227;
   /** 212 大铁铲 —— `cooking.ts` 的注释点名它也能浇灭炉火,与 227 同一分支。 */
   private static readonly SHOVEL_ITEM_ID = BIG_SHOVEL_ID;
+  /**
+   * 733 复苏天使羽毛笔。
+   *
+   * 提到静态字段的理由与 227 相同:`itemUseKind`(语义表的唯一出处)与
+   * `useItem`(分派)两个消费点都要它 —— 原先只在 `useItem` 里当局部量。
+   */
+  private static readonly FEATHER_PEN_ITEM_ID = 733;
 
   /**
    * 生效中的击退:玩家 → 剩余位移(格)。**由慢帧推进**,推进期间拒绝位置搬家。
@@ -3032,6 +3291,9 @@ export class WorldSim {
 
   applyPlayerMove(playerId: string, x: number, y: number, z?: number): boolean {
     this.lastMoveRejection = null;
+    /* 闸 0:身份。`physics.bodies` 里玩家与生物**混在一起**(`addPlayer` 与
+       `addMob` 都调 `physics.spawn`)⇒ 不查这一条就能用一只生物冒充玩家改坐标。
+       判据是「**是不是玩家**」,与「位移合不合法」正交(不构成反作弊的第二份实现)。 */
     if (!this.playerIds.has(playerId)) {
       this.lastMoveRejection = 'NOT_A_PLAYER';
       return false;
@@ -3046,6 +3308,14 @@ export class WorldSim {
        由 `applyHit` 写入、`revive` 清除。 */
     if (this.vitals.get(playerId)?.downed === true) {
       this.lastMoveRejection = 'DOWNED';
+      return false;
+    }
+    /* ★ D3:Boss 技能把玩家**定住**时不能移动。
+       状态来源是 `vitals.stunnedSec`(慢帧倒计时,`revive` 清零),
+       与 `TRAPPED`(227 泡泡)是**两个不同来源的同一个后果**:
+       分开留痕才能在断言里区分「被泡泡困住」与「被 Boss 冻住」。 */
+    if (this.vitals.stunOf(playerId) > 0) {
+      this.lastMoveRejection = 'STUNNED';
       return false;
     }
     /* ★ 被泡泡困住 ⇒ 不能移动。
@@ -3418,6 +3688,39 @@ export class WorldSim {
   }
 
   /**
+   * 道具的**使用语义分类**(`USE_ITEM` 的唯一语义表)。
+   *
+   * ## 为什么单独抽出来,而且必须是**纯**的
+   *
+   * 动作层要在**扣道具之前**回答「这件东西到底能不能用」(否则非法请求会先扣再退,
+   * 而「退了」这件事在回执里是看不出来的)。若它自己维护一张 id 白名单,
+   * 那张表与 `useItem` 的分支**必然漂移**(本仓陷阱 31/41)。
+   * ⇒ 语义只在这里定义一次:动作层查它做前置门,`useItem` 用它做分派。
+   *
+   * ## 四种语义 + `null`
+   *
+   * ```
+   * FEATHER  733 复苏天使羽毛笔(救幽灵泡泡)
+   * BUBBLE   227 泡泡连发水枪(叠/困人)
+   * DEVICE   227 / 212 大铁铲 —— 浇灭料理站炉火(与 BUBBLE 同一件道具,两条语义)
+   * FOOD     内容表 `FOOD_BY_ID` 里的料理
+   * null     没有使用语义(调用方必须**拒绝**,不是"什么都不做但扣掉")
+   * ```
+   *
+   * ⚠️ 这里**不判目标**:「227 对玩家是泡泡枪,对炉子是灭火器」由调用方按
+   * `targetDeviceId` 选分支(报文里两者互斥)。
+   */
+  itemUseKind(itemId: number): 'FEATHER' | 'BUBBLE' | 'DEVICE' | 'FOOD' | null {
+    if (!Number.isFinite(itemId)) return null;
+    const id = Math.trunc(itemId);
+    if (id === WorldSim.FEATHER_PEN_ITEM_ID) return 'FEATHER';
+    if (id === WorldSim.BUBBLE_GUN_ITEM_ID) return 'BUBBLE';
+    if (id === WorldSim.SHOVEL_ITEM_ID) return 'DEVICE';
+    if (FOOD_BY_ID.has(id)) return 'FOOD';
+    return null;
+  }
+
+  /**
    * `USE_ITEM` 的世界侧落点:按 `itemId` + **目标类型**分派四种语义。
    *
    * ## `applied` 与 `consume` 为什么分开
@@ -3445,10 +3748,9 @@ export class WorldSim {
     reason: string;
     effect?: Record<string, string | number | boolean>;
   } {
-    /* 道具 id 来自冻结内容表(`shared/constants/items.ts`);这里只写两个语义锚点。 */
-    const FEATHER_PEN_ID = 733;
-    const BUBBLE_GUN_ID = WorldSim.BUBBLE_GUN_ITEM_ID;
-    const itemId = Math.trunc(req.itemId);
+    /* 道具 id 来自冻结内容表(`shared/constants/items.ts`);语义表见 `itemUseKind`。 */
+    const itemId = Number.isFinite(req.itemId) ? Math.trunc(req.itemId) : 0;
+    const kind = this.itemUseKind(itemId);
     const targetId = req.targetId ?? actorId;
 
     /* 0 **器件目标**:`targetDeviceId` 一出现就走灭火这条路,不再看 `targetId`
@@ -3457,7 +3759,7 @@ export class WorldSim {
       return this.extinguishDeviceByHand(actorId, itemId, Math.trunc(req.targetDeviceId));
     }
 
-    if (itemId === FEATHER_PEN_ID) {
+    if (kind === 'FEATHER') {
       const d = this.downedStates.get(targetId);
       if (d === undefined) {
         return { applied: false, consume: false, reason: '目标不在幽灵泡泡状态' };
@@ -3486,7 +3788,7 @@ export class WorldSim {
       };
     }
 
-    if (itemId === BUBBLE_GUN_ID) {
+    if (kind === 'BUBBLE') {
       /* ① 目标是**幽灵泡泡**(倒地中)⇒ 走 `DownedState` 那条既有路径(叠层,满 3 层 `BUBBLED`)。 */
       const d = this.downedStates.get(targetId);
       if (d !== undefined) {
@@ -4061,15 +4363,18 @@ export class WorldSim {
       if (r === null || typeof r !== 'object' || typeof r.id !== 'string' || r.id.length === 0) {
         return { archive: null, error: '归档口没有给出归档句柄(id 为空)⇒ 这份快照取不回来' };
       }
-      return {
-        archive: {
-          id: r.id,
-          seed: Number(r.seed),
-          archived_at: Number(r.archived_at),
-          bytes: Number(r.bytes),
-        },
-        error: null,
+      const receipt: WorldArchiveReceipt = {
+        id: r.id,
+        seed: Number(r.seed),
+        archived_at: Number(r.archived_at),
+        bytes: Number(r.bytes),
       };
+      /* ★ B / D-19 第 5 条:裁剪四件**原样上报**(块数 / 字节 / 原因 / 状态)。
+         没裁过 ⇒ `trim` 键**缺席**(而不是写一个 `KEPT`)—— 见
+         `WorldArchiveTrimReceipt` 的注释;从库里读回时它也在快照头里
+         (`header.trim`),两份来源同一事实。 */
+      if (r.trim !== undefined) receipt.trim = r.trim;
+      return { archive: receipt, error: null };
     } catch (e) {
       return { archive: null, error: `归档失败:${e instanceof Error ? e.message : String(e)}` };
     }
@@ -4274,6 +4579,17 @@ export class WorldSim {
     this.relay = null;
     this.relayOrigin = { x: 0, y: 0 };
     this.relayPlacedCount = 0;
+    /* ★ WS-FND-77 / D-19:四系统与百货摊位的状态是**世界世代**的一部分 ——
+       一起换代。漏掉 `roomSystemsState` 的后果是「重置后牧场还在按旧动物结算、
+       537 陈列还挂着上一局的冠名」;漏掉 `stallStock` 是「重置后摊位库存不刷新」。
+       两者都不报错,只是跨世代残留(与 `killLedger` / `mobOrdinals` 同一纪律)。 */
+    this.roomSystemsState = createRoomSystemsState();
+    this.stallStock = {};
+    this.dayFraction = 0;
+    this.lastRoomSystems = null;
+    this.lastRanchDrop = { dropped: [], skipped: [] };
+    /* 天气**不重置**:它是外部输入(天气系统/许愿喷泉 528),不是世界世代的账本;
+       重置它会让「刚报过 STORM 的房间重置后突然放晴」—— 那是一个没人下过的指令。 */
 
     /* 4 ★ 钟点回 06:00 —— D-07 把"游戏时间 0 帧 = 06:00"定死,而时间是由
        `frameCount` **派生**的(不存累加器,见 `hourOfDay` 的注释)⇒ 重建世界
@@ -4537,6 +4853,103 @@ export class WorldSim {
   /** 累计检查过的预警几何数(诊断用:为 0 说明 AI 从没产出过预警)。 */
   warnsChecked = 0;
 
+  /* ══════════════════ D1 / D2 / D3 / D5 + 烹饪字段消费(2026-11-18)══════════════════
+   *
+   * 这一段的四个可观测字段都是**计数器/开关**,不是派生态:
+   * 「接了但这一帧没发生」与「根本没接」在断言里必须可区分
+   * (与 `lastSaveReport` / `lastAttackReport` 同一种取舍)。
+   */
+
+  /**
+   * **PvP 开关**(★ D3)。
+   *
+   * 缺省 **关** —— 与修前语义等价:那时玩家之间**根本没有入口**,
+   * 所以「关」不会改变任何既有行为;而缺省开会让每个已有房间一上线就变成可互殴。
+   * 唯一的判定在 `damage.ts` 的 `pvpVerdict`(本字段只是它的输入)。
+   */
+  pvpEnabled = false;
+
+  /** 上一慢帧被**视线**挡下的打击数(D2 的可观测出口)。 */
+  lastLosBlocked = 0;
+  /** 累计被视线挡下的打击数(单调,防「一次伪造」)。 */
+  losBlockedTotal = 0;
+  /** 上一慢帧落地的致盲次数(D5)。 */
+  lastBlindsApplied = 0;
+  /** 上一慢帧落地的 Boss 特殊效果(便于断言「真的发生了哪一种」)。 */
+  lastBossEffects: { bossId: string; playerId: string; effect: string }[] = [];
+
+  /**
+   * 开关 PvP(世界侧唯一写入口)。
+   *
+   * @returns 开关后的状态(便于调用方/断言读回,而不是自己记一份)
+   */
+  setPvp(on: boolean): boolean {
+    this.pvpEnabled = on === true;
+    return this.pvpEnabled;
+  }
+
+  /**
+   * 玩家**视野半径**(D5 的「视野」那一半)。
+   *
+   * 基准取 `AOI_WAKE_DISTANCE`(AOI 唤醒半径 = 客户端可见范围的事实基准),
+   * 致盲时乘 `BLIND_VIEW_MUL`。**不新造第二个半径常量** ——
+   * 两处各写一个数,日后必然一个改了一个没改。
+   */
+  viewRadiusOf(playerId: string): number {
+    const base = AOI_WAKE_DISTANCE;
+    return this.vitals.blindOf(playerId) > 0 ? base * BLIND_VIEW_MUL : base;
+  }
+
+  /**
+   * 烹饪 `defFlat` 的**消费点**:把它折算成「生物打玩家」的伤害乘区。
+   *
+   * ## 为什么用 `ARMOR_K` 那条曲线,而不是 `1 - defFlat/100`
+   *
+   * 本仓「玩家打生物」的减伤曲线是 `ARMOR_K / (ARMOR_K + DEF)`(`damage.ts` 第 6 步)。
+   * 生物打玩家若另造一条线性公式,同一个「防御 +22」在两个方向上会是两个不同的
+   * 减伤率 —— 那正是本仓反复点名的「两份实现」。⇒ 复用同一条曲线:
+   * `mul = ARMOR_K / (ARMOR_K + defFlat)`,`defFlat = 0` 时恰为 1.0(与修前同值)。
+   * `defFlat` 来自 `buffsOf(playerId)`(料理聚合的**唯一**出口)。
+   */
+  mobDamageMulFor(playerId: string): number {
+    const defFlat = this.buffsOf(playerId).defFlat;
+    if (!Number.isFinite(defFlat) || defFlat <= 0) return 1;
+    return ARMOR_K / (ARMOR_K + defFlat);
+  }
+
+  /**
+   * Boss 技能对玩家的**特殊效果**表(D3)。
+   *
+   * ## 每一行都有内容出处(不新造数值)
+   *
+   * - `boss_jelly_king` P1:内容写着「环形果冻波,**击退并减速**」⇒ `KNOCKBACK`
+   * - `boss_jelly_king` P3:内容写着「巨口**吸气**」⇒ `STUN`(被吸住 = 动不了)
+   * - `boss_fox_kitsune` P2:内容写着「地面留下**迷魂花阵**」⇒ `BLIND`
+   * - `boss_scorpion_pharaoh` P2:内容写着「黄金**沙暴**」⇒ `BLIND`
+   *
+   * ## 时长一律取自内容层的 `warnSec`
+   *
+   * 效果持续 = 该招式预警几何自己的 `warnSec`(`phases.ts` 给的值),
+   * 不在这里另写「眩晕几秒」。内容改招式时长,效果时长跟着改,不会漂。
+   */
+  private static readonly BOSS_PHASE_EFFECTS: readonly {
+    bossId: string;
+    phase: number;
+    effect: 'KNOCKBACK' | 'STUN' | 'BLIND';
+  }[] = [
+    { bossId: 'boss_jelly_king', phase: 0, effect: 'KNOCKBACK' },
+    { bossId: 'boss_jelly_king', phase: 2, effect: 'STUN' },
+    { bossId: 'boss_fox_kitsune', phase: 1, effect: 'BLIND' },
+    { bossId: 'boss_scorpion_pharaoh', phase: 1, effect: 'BLIND' },
+  ];
+
+  /** 查某个 Boss 当前阶段的特殊效果;没登记 ⇒ `null`(只有伤害)。 */
+  bossEffectOf(bossId: string, phase: number): 'KNOCKBACK' | 'STUN' | 'BLIND' | null {
+    for (const r of WorldSim.BOSS_PHASE_EFFECTS) {
+      if (r.bossId === bossId && r.phase === phase) return r.effect;
+    }
+    return null;
+  }
   /**
    * 把本帧活跃生物产出的预警几何与玩家位置对照并结算。
    *
@@ -4550,6 +4963,9 @@ export class WorldSim {
    * 让 25 个 AI 各有一套「我打中了吗」的判断,必然漂移。
    */
   private resolveMobStrikes(): void {
+    this.lastLosBlocked = 0;
+    this.lastBlindsApplied = 0;
+    this.lastBossEffects = [];
     const players = this.players.map((p) => {
       const body = this.physics.bodies.get(p.id);
       return { id: p.id, x: body ? body.x : p.x, y: body ? body.y : p.y, z: body ? body.z : 0 };
@@ -4561,7 +4977,9 @@ export class WorldSim {
       const rt = this.mobHost.runtimeOf(t.id);
       if (!rt || !rt.alive) continue;
       for (const w of t.warns) {
-        strikes.push({ attackerId: t.id, attackerLevel: rt.def.level, warn: w });
+        /* ★ D4:放**生物的元素归属**(内容表 `MOB_ELEMENT_BY_ID` 的唯一出处)。
+           没登记的生物是 `NONE` ⇒ 抗性系数 1.0 ⇒ 与修前逐字段相同。 */
+        strikes.push({ attackerId: t.id, attackerLevel: rt.def.level, warn: w, element: this.elementOfAttacker(t.id) });
       }
     }
     /* ── 第二条通道:事件型攻击 ──
@@ -4577,6 +4995,32 @@ export class WorldSim {
       (id) => this.mobHost.runtimeOf(id)?.def.level ?? 1,
     );
     for (const e of eventStrikes) strikes.push(e);
+
+    /* ── 第三条通道:Boss 技能(D3)──
+       `phases.skillWarnGeoms` 早就按阶段产出了 Boss 的**地面几何**
+       (半径/角度/时长全是内容值),但全仓没有任何玩家侧结算 ——
+       Boss 的招式等于对着空气放。这里把它并进同一条结算路径
+       (而不是另写一套命中判定:那样「玩家被什么打中」会有两份口径)。 */
+    for (const s of this.bossStrikes(players)) strikes.push(s);
+
+    /* ── 事件型**致盲**(D5)──
+       `tanuki_ambush` 是**零伤害**事件,故不进 `strikes`(否则会污染
+       `hitCount`/`lastHits`,玩家会看到「被打中 0 点」)。它单独结算成状态。 */
+    const blindEvents = collectEventBlinds(
+      this.mobHost.frameEmits,
+      (id) => {
+        const rt = this.mobHost.runtimeOf(id);
+        return rt ? { x: rt.x, y: rt.y } : null;
+      },
+    );
+    for (const b of blindEvents) {
+      for (const p of players) {
+        if (!warnHitsPlayer(b.warn, p.x, p.y, p.z)) continue;
+        this.vitals.applyBlind(p.id, b.sec);
+        this.lastBlindsApplied += 1;
+        this.bus.emit('player_blinded', { playerId: p.id, by: b.attackerId, sec: b.sec }, b.attackerId);
+      }
+    }
 
     if (strikes.length === 0 || players.length === 0) {
       /* 即使没有攻击,**计时器也要推进** —— 否则无敌帧永不结束
@@ -4599,16 +5043,37 @@ export class WorldSim {
     const applied: MobHitResult[] = [];
     for (const h of strikeResult.results) {
       const rt = this.mobHost.runtimeOf(h.attackerId);
-      const lv = rt ? rt.def.level : 1;
-      const res = this.vitals.applyHit(h.attackerId, h.playerId, lv, 1.0, h.distance);
+      const lv = rt ? rt.def.level : this.bossLevelOf(h.attackerId);
+      /* ── ★ D2:视线遮挡 ──
+         `resolveStrikes` 只做**几何**判定(圈里/锥里),它不知道中间有没有墙。
+         这里在**扣血之前**过一次射线:挡下 ⇒ 本次不结算(计数留痕)。
+         为什么放在这里而不是 `resolveStrikes` 内部:那个函数是纯几何(它拿不到
+         `WorldGrid`),把地形塞进去会让它同时依赖两件事,而它的断言全在 2×2 假
+         地形上早就写好了。 */
+      const from = this.attackerPosOf(h.attackerId);
+      const to = players.find((p) => p.id === h.playerId);
+      if (from !== null && to !== undefined &&
+          losBlocked(from.x, from.y, to.x, to.y, (cx, cy) => this.grid.isSolidAt(cx, cy))) {
+        this.lastLosBlocked += 1;
+        this.losBlockedTotal += 1;
+        continue;
+      }
+      /* ★ D4 抗性 + 烹饪 `defFlat`(护甲曲线)两个乘区进同一次结算:
+         - `element` → `vitals.elementResistOf` 在 `applyHit` 内部折算;
+         - `defFlat` → `mobDamageMulFor` 作为等级伤害的乘数。 */
+      const res = this.vitals.applyHit(
+        h.attackerId,
+        h.playerId,
+        lv,
+        this.mobDamageMulFor(h.playerId),
+        h.distance,
+        DEFAULT_UNARMED_KNOCKBACK,
+        this.elementOfAttacker(h.attackerId),
+      );
       if (res.applied > 0) {
         applied.push(res);
         this.hitCount += 1;
         /* ★ D-09(owner,2026-11-16):受击击退 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**。
-           这里此前是 no-op,注释解释过"为什么不敢接",两种坏法是:
-             · 借 `PRANK_HAMMER_KNOCKBACK`(8 格)当位移 ⇒ 把救援者推出 0.9 格触摸半径,
-               `WS-10` 的 task44-6/7、T58-2 会红;
-             · 写速度 ⇒ 下一帧 `applyPlayerMove` 就把它抹掉(本仓没有速度积分器)。
            裁决给了数值(伤害折算 + 上限 2 格)⇒ 按它接,且**位移仍走 `applyKnockback`**
            (慢帧推 + 搬家窗口),不写速度。
            ⚠️ 若这条把 `WS-10` 的救援判据打红:**按 D-09 重钉那条判据**,不许改回 no-op。 */
@@ -4616,7 +5081,42 @@ export class WorldSim {
           WorldSim.KNOCKBACK_MAX_CELLS,
           res.applied / WorldSim.KNOCKBACK_DAMAGE_PER_CELL,
         );
-        if (rt !== null && pushCells > 0) this.applyKnockback(res.playerId, rt.x, rt.y, pushCells);
+        if (from !== null && pushCells > 0) this.applyKnockback(res.playerId, from.x, from.y, pushCells);
+        /* ── ★ D1:击退**写回 PhysicsBody**(`physics.applyImpulse`)──
+           与上一段 `applyKnockback` 不是同一件事的两份实现,而是**两个分量**:
+           ```
+           水平位移   applyKnockback → 位置(慢帧两段推 + 搬家窗口)
+           纵向速度   applyImpulse    → 刚体 vz(物理步积分,`ensureFinite` 兜 NaN)
+           ```
+           ⚠️ **为什么是纵向而不是水平**:D-09 已把「水平位移」定成
+           `min(2, 伤害/20)` 格并逐字钉死(`WS-FND-53` FND53-1/3 实测 2.0000)。
+           若把内容层的击退量**再**加到水平速度上,物理步会把刚体多推约 0.26 格
+           (实测 2.2571)—— 那是**同一件事被算两遍**,不是新功能。
+           ⇒ 纵向分量取内容层的击退量:玩家的「被打飞一下」由它表达,
+             水平预算仍只由 D-09 那一条公式花。
+           量纲:内容给的是**格/秒**,`applyImpulse` 里 `Δv = J / m`,
+           故这里乘 `mass` 让 Δv 恰为内容值。 */
+        if (res.knockbackPerSec > 0) {
+          const body = this.physics.bodies.get(res.playerId);
+          if (body !== undefined) {
+            const m = body.mass > 0 ? body.mass : 1;
+            this.physics.applyImpulse(res.playerId, 0, 0, res.knockbackPerSec * m);
+          }
+        }
+        /* ── ★ D3:Boss 技能对玩家的特殊效果 ──
+           时长取该招式预警几何自己的 `warnSec`(内容值)。`KNOCKBACK` 已由上面
+           两段落地,这里只处理「动不了」与「看不见」。 */
+        const bossEffect = this.bossEffectOf(h.attackerId, this.bossPhaseOf(h.attackerId));
+        const warnSec = this.bossWarnSecOf(h.attackerId);
+        if (bossEffect === 'STUN' && warnSec > 0) {
+          this.vitals.applyStun(res.playerId, warnSec);
+          this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'STUN' });
+        } else if (bossEffect === 'BLIND' && warnSec > 0) {
+          this.vitals.applyBlind(res.playerId, warnSec);
+          this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'BLIND' });
+        } else if (bossEffect === 'KNOCKBACK') {
+          this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'KNOCKBACK' });
+        }
         /* 事件:UI 与音效靠它播受击反馈,而不用每帧轮询血量 */
         this.bus.emit(
           'player_hit',
@@ -4630,6 +5130,82 @@ export class WorldSim {
     }
     this.lastHits = applied;
     this.vitals.stepTimers(SIM_SLOW_DT);
+  }
+
+  /**
+   * 某个攻击者的**元素归属**(D4)。生物查内容表;Boss 没有元素表 ⇒ `NONE`。
+   *
+   * 为什么 Boss 不「顺手分配一个元素」:元素矩阵是 6×6 的克制关系,
+   * 凭空赋值等于凭空发明平衡(与 `MOB_ELEMENT_BY_ID` 的注释同一裁决)。
+   */
+  private elementOfAttacker(attackerId: string): string {
+    const rt = this.mobHost.runtimeOf(attackerId);
+    const defId = rt?.def.id ?? attackerId;
+    const el: Element = MOB_ELEMENT_BY_ID.get(defId) ?? Element.NONE;
+    return el;
+  }
+
+  /** Boss 的技能几何(第三条 strike 通道,D3)。没有在场 Boss ⇒ 空数组。 */
+  private bossStrikes(players: readonly { id: string; x: number; y: number; z: number }[]): PendingStrike[] {
+    const out: PendingStrike[] = [];
+    if (this.bossRaid.size === 0 || players.length === 0) return out;
+    const t = (this.frameCount * DT) as number;
+    for (const bossId of this.bossRaid.aliveIds()) {
+      const st = this.bossRaid.stateOf(bossId);
+      if (st === undefined) continue;
+      /* 目标 = 最近的玩家(Boss 的招式本来就朝人放;`skillWarnGeoms` 要一个朝向点)。 */
+      let best: { x: number; y: number; d: number } | null = null;
+      for (const p of players) {
+        const d = Math.hypot(p.x - st.x, p.y - st.y);
+        if (best === null || d < best.d) best = { x: p.x, y: p.y, d };
+      }
+      if (best === null) continue;
+      /* `skillWarnGeoms` 在 `stunnedSec > 0` 时返回空数组 ⇒ 破防即打断(D-05 的控场语义,
+         由内容层自己保证,这里不重复判)。 */
+      for (const g of skillWarnGeoms(st, { x: best.x, y: best.y }, t)) {
+        out.push({ attackerId: bossId, attackerLevel: st.def.level, warn: g });
+      }
+    }
+    return out;
+  }
+
+  /** Boss 的等级(`attackerPosOf` / 结算用);不是 Boss ⇒ 1。 */
+  private bossLevelOf(bossId: string): number {
+    return this.bossRaid.stateOf(bossId)?.def.level ?? 1;
+  }
+
+  /** Boss 的当前阶段号;不是 Boss ⇒ -1(不会命中任何效果行)。 */
+  private bossPhaseOf(bossId: string): number {
+    return this.bossRaid.stateOf(bossId)?.phaseIndex ?? -1;
+  }
+
+  /**
+   * 该 Boss 本次结算的**效果时长** = 它当前阶段预警几何的 `warnSec`(内容值)。
+   *
+   * 为什么不另存一份「眩晕几秒」:那是内容层的数(0.8 / 1.0 / 1.5),
+   * 二份就会漂。取不到 ⇒ 0(不施加),而不是猜一个默认值。
+   */
+  private bossWarnSecOf(bossId: string): number {
+    const st = this.bossRaid.stateOf(bossId);
+    if (st === undefined) return 0;
+    const geoms = skillWarnGeoms(st, { x: st.x, y: st.y }, 0);
+    let max = 0;
+    for (const g of geoms) if (g.warnSec > max) max = g.warnSec;
+    return max;
+  }
+
+  /**
+   * 攻击者的**权威位置**:先查生物宿主,再查 Boss 运行时。
+   *
+   * 为什么需要统一入口:D1 的击退方向与 D2 的视线都用「谁在哪儿」,
+   * 而第三条通道(Boss)的攻击者不在 `mobHost` 里 ⇒ 两处各写一遍必然漂一个。
+   */
+  private attackerPosOf(attackerId: string): { x: number; y: number } | null {
+    const rt = this.mobHost.runtimeOf(attackerId);
+    if (rt !== null) return { x: rt.x, y: rt.y };
+    const st = this.bossRaid.stateOf(attackerId);
+    if (st !== undefined) return { x: st.x, y: st.y };
+    return null;
   }
 
   /* ══════════════════ 自动化物流接线(WS-08)══════════════════ */
@@ -5456,6 +6032,561 @@ export class WorldSim {
    * 用 `accumulator += dt` 判断会让「第几次慢帧」受浮点误差影响,
    * 长跑后出现 119 或 121 次的偏差(这是粒子发射器踩过的同一个坑)。
    */
+  /* ══════════ ★ WS-FND-77 / D-19:四个房间系统接进生产(唯一装配点)══════════
+   *
+   * 这一整块的职责只有一个:**把世界状态翻译成四个纯函数的入参,并把结果落回世界**。
+   * 判定全在 `systems/**`(那份实现有 `tests/WS-FND-75` 的 23 条钉着),
+   * 本块**不重写任何判定**,也不自己算平衡数字。
+   *
+   * ```
+   * A-1 牧场  settleRanchIfDayChanged()  → ranch.ts:settleRanchDay
+   * A-2 温室  advanceRoomSystems()       → greenhouse.ts:cellGrowth / morningMoisture /
+   *                                        sprinklerCells / sortHarvest(经 wiring.ts)
+   * A-3 炼金  brewAtFurnace()            → alchemy_lab.ts:brewAndRecord + 537 陈列投影
+   * A-4 百货  purchaseQuote/Commit       → depot.ts:buy / priceOf
+   * C        syncFoodPhysics()           → physics/world.ts:setSpeedCap/setGravityMul/setJumpMul
+   * ```
+   *
+   * ⚠️ **不 import `mobs/taming.ts`**:它仍是 `scripts/verify.ts` 的不可达白名单成员
+   *   (宠物容器未接线),从这里 import 会把那条白名单变成陈旧条目,而
+   *   `scripts/verify.ts` 不在本线写域。⇒ 圈养名单由 `setRanchPets` 注入,
+   *   唯一权威仍是 `mobs/taming.ts` 的「在圈标记」(见 `systems/wiring.ts` 文件头)。
+   *   ⚠️ 那里**只用文字描述**、不写那个字段的名字:`tests/WS-04` 的 W4-38 系列用
+   *   **源码文本**判「world_sim 不碰宠物容器」(存在性无法用 import 表达),
+   *   在注释里写字段名会让那条判据红 —— 而它红得对(本文件确实没有容器)。 */
+
+  /** 内容表 `301 肥沃农田耕地` —— 能在上面播种的唯一地表。 */
+  private static readonly CROP_SOIL_ID = 301;
+  /** 内容表 `426 旋转自动洒水器` —— 温室的「每早 5×5 自动浇水」。 */
+  private static readonly SPRINKLER_OBJ_ID = 426;
+  /** 内容表 `529 牧场动物自动饲育槽` —— 牧场产出的落货点。 */
+  private static readonly RANCH_TROUGH_OBJ_ID = 529;
+  /** `AUTO_GREENHOUSE` 的房间 key(`rooms/effects.ts` 的 `ROOM_SYSTEM_IMPL` 同一字面量)。 */
+  private static readonly AUTO_GREENHOUSE_KEY = 'AUTO_GREENHOUSE';
+
+  /**
+   * 设天气(世界侧是**唯一**来源:`greenhouse.ts` 只接受判好的值,不自己判定)。
+   *
+   * 非法值一律**忽略**(保持原值):写成「未知 ⇒ STORM」会让一场谎报的报文
+   * 把全世界露天作物停摆,而那是不可观测的。
+   */
+  setWeather(w: Weather): boolean {
+    if (w !== 'CLEAR' && w !== 'RAIN' && w !== 'STORM') return false;
+    this.weatherNow = w;
+    return true;
+  }
+
+  /** 当前天气(只读)。 */
+  weather(): Weather {
+    return this.weatherNow;
+  }
+
+  /**
+   * 429 智能分拣交叉带的过滤规则(`设定过滤物品 ID ⇒ 分流进某条道`)。
+   *
+   * 空数组 = 一切产出 `lane: -1`(原样留在带上)—— 那是 `sortHarvest` 的既有语义。
+   */
+  setSortFilters(filters: readonly { lane: number; itemIds: readonly number[] }[]): void {
+    const out: { lane: number; itemIds: number[] }[] = [];
+    for (const f of filters) {
+      if (!Number.isFinite(f.lane)) continue;
+      out.push({ lane: Math.trunc(f.lane), itemIds: [...f.itemIds] });
+    }
+    this.roomSystemsState.sortFilters = out;
+  }
+
+  /**
+   * 播种:**只有耕地(内容表 301)**上能种。
+   *
+   * 「是不是耕地」在这里判(不在纯函数里)是因为**只有世界知道地形**:
+   * `systems/wiring.ts` 的 `plantCrop` 无 IO、无地形,它不猜。
+   */
+  plantCrop(x: number, y: number, cropId: number, matureDays?: number): { ok: boolean; reason: string } {
+    if (!this.inWorld(x, y)) return { ok: false, reason: `坐标 ${x},${y} 在世界外` };
+    const gx = Math.floor(x);
+    const gy = Math.floor(y);
+    const floor = this.grid.floorIdAt(gx, gy);
+    if (floor !== WorldSim.CROP_SOIL_ID) {
+      return {
+        ok: false,
+        reason: `这一格不是耕地(需要 ${WorldSim.CROP_SOIL_ID} 肥沃农田耕地,实得 ${floor})`,
+      };
+    }
+    return plantCropIn(this.roomSystemsState, gx, gy, cropId, matureDays);
+  }
+
+  /** 耕地上的作物一览(**拷贝**,供网络投影与判据;改返回值不影响世界)。 */
+  crops(): CropCellState[] {
+    return [...this.roomSystemsState.crops.values()].map((c) => ({ ...c }));
+  }
+
+  /** 某一格的作物(没有 ⇒ `undefined`)。 */
+  cropAt(x: number, y: number): CropCellState | undefined {
+    const c = this.roomSystemsState.crops.get(`${Math.floor(x)},${Math.floor(y)}`);
+    return c === undefined ? undefined : { ...c };
+  }
+
+  /** 累计收下来的作物(带 429 分拣道号;拷贝)。 */
+  harvestLog(): HarvestRow[] {
+    return this.roomSystemsState.harvest.map((h) => ({ ...h }));
+  }
+
+  /** 温室里的格集合(取**慢帧识别结果** `lastRoomScan`/`lastRoomCells`,不另做识别)。 */
+  private greenhouseCells(): { x: number; y: number }[] {
+    const out: { x: number; y: number }[] = [];
+    for (let i = 0; i < this.lastRoomScan.length; i += 1) {
+      if (this.lastRoomScan[i].key !== WorldSim.AUTO_GREENHOUSE_KEY) continue;
+      const cells = this.lastRoomCells[i];
+      if (!Array.isArray(cells)) continue;
+      for (const c of cells) out.push({ x: c.x, y: c.y });
+    }
+    return out;
+  }
+
+  /**
+   * 自动洒水器(426)的覆盖格集合 —— 每台以自身为中心的 5×5
+   * (半径与「5×5」的字面量都在 `greenhouse.ts`,本方法只做坐标展开)。
+   *
+   * ⚠️ 全图扫描只在**有作物**时才发生(`advanceRoomSystems` 的先决条件),
+   *   没有作物时这里零开销 —— 不让「加了温室」拖慢所有既有套件。
+   */
+  private sprinklerCoverage(): Set<string> {
+    const cover = new Set<string>();
+    for (let y = 0; y < this.sizeCells; y += 1) {
+      for (let x = 0; x < this.sizeCells; x += 1) {
+        if (this.grid.objIdAt(x, y) !== WorldSim.SPRINKLER_OBJ_ID) continue;
+        for (const c of sprinklerCells(x, y)) cover.add(`${c.x},${c.y}`);
+      }
+    }
+    return cover;
+  }
+
+  /**
+   * 四系统的**慢帧推进**(温室生长 + 牧场跨日结算)。
+   *
+   * @param dayFraction 推进了「多少天」。慢帧默认 `SIM_SLOW_DT / WORLD_DAY_SEC`
+   *        (2Hz × 1200 秒一天 ⇒ 每慢帧 1/2400 天);判据可以传 `1`(整整一天),
+   *        **走的是同一个实现** —— 这一点由 `tests/WS-FND-77` 用手算的 1/2、1/4 钉住。
+   */
+  advanceRoomSystems(dayFraction: number = SIM_SLOW_DT / WorldSim.WORLD_DAY_SEC): {
+    grown: number;
+    matured: HarvestRow[];
+    ranchDays: number;
+    ranchProduced: number;
+    ranchDropped: number;
+  } {
+    const frac = Number.isFinite(dayFraction) && dayFraction > 0 ? dayFraction : 0;
+
+    /* ── A-2 温室 ── */
+    let grown = 0;
+    let matured: HarvestRow[] = [];
+    if (frac > 0 && this.roomSystemsState.crops.size > 0) {
+      /* 房间识别是慢帧产物;地形刚变过就先刷一次(脏标记由 `setCell` 维护)。 */
+      if (this.roomsDirty) this.refreshRooms();
+      const house = new Set(this.greenhouseCells().map((c) => `${c.x},${c.y}`));
+      const cover = this.sprinklerCoverage();
+      const input: GrowInput = {
+        dayFraction: frac,
+        night: this.isNightNow(),
+        weather: this.weatherNow,
+        isGreenhouse: (x: number, y: number) => house.has(`${x},${y}`),
+        hasSprinkler: (x: number, y: number) => cover.has(`${x},${y}`),
+      };
+      const r = growCrops(this.roomSystemsState, input);
+      grown = r.grown;
+      matured = r.matured;
+    }
+
+    /* ── A-1 牧场:跨日结算(整数天)──
+       小数部分留在 `dayFraction` 里累计,整数部分结算 —— 于是「2.4 天」
+       只在第 3 天到来时才结 1 天,不会把 0.4 天折算成 0.4 份产出。 */
+    this.dayFraction += frac;
+    const whole = Math.floor(this.dayFraction);
+    let ranchDays = 0;
+    let ranchProduced = 0;
+    let ranchDropped = 0;
+    if (whole > 0) {
+      this.dayFraction -= whole;
+      const res = this.settleRanchIfDayChanged(whole);
+      ranchDays = res.days;
+      ranchProduced = res.produced;
+      ranchDropped = res.dropped;
+    }
+
+    this.lastRoomSystems = { grown, matured, ranchDays, ranchProduced, ranchDropped };
+    return this.lastRoomSystems;
+  }
+
+  /** 最近一次四系统慢帧报告(`null` = 还没跑过)。 */
+  lastRoomSystemsReport(): {
+    grown: number;
+    matured: HarvestRow[];
+    ranchDays: number;
+    ranchProduced: number;
+    ranchDropped: number;
+  } | null {
+    return this.lastRoomSystems === null ? null : { ...this.lastRoomSystems, matured: this.lastRoomSystems.matured.map((m) => ({ ...m })) };
+  }
+
+  /**
+   * 圈养名单(**投影**)。
+   *
+   * 唯一权威是 `mobs/taming.ts` 的「在圈标记」(该模块仍在不可达白名单里,
+   * 故本文件只做投影,不 import 它 —— 也不在注释里写那个字段的名字,见本块文件头)。
+   * 本方法只是把「谁在圈里 + 亲和多少」搬进来 —— 因为 `taming.ts` 仍在
+   * `scripts/verify.ts` 的不可达白名单里(见本块文件头)。
+   */
+  setRanchPets(animals: readonly RanchAnimal[]): void {
+    const out: RanchAnimal[] = [];
+    for (const a of animals) {
+      if (typeof a.speciesId !== 'string' || a.speciesId.length === 0) continue;
+      const affinity = Number.isFinite(a.affinity) ? a.affinity : 0;
+      out.push({ speciesId: a.speciesId, affinity });
+    }
+    this.roomSystemsState.ranchPets = out;
+  }
+
+  /** 当前圈养名单(拷贝)。 */
+  ranchPets(): RanchAnimal[] {
+    return this.roomSystemsState.ranchPets.map((a) => ({ ...a }));
+  }
+
+  /**
+   * 「槽里有多少饲料」——**世界地面上的 `tameItem`**。
+   *
+   * 为什么按世界范围统计而不是按半径:529 饲育槽的投喂半径要 owner 裁决
+   * (内容表只写「自动进食」,没写距离)。按世界范围统计**不编规则**,
+   * 且产出的落货点已经钉在槽上(`troughCell`),所以「喂在哪」在数据上是清楚的。
+   */
+  private ranchFeedStock(): Record<number, number> {
+    const out: Record<number, number> = {};
+    const wanted = new Set<number>();
+    for (const pet of this.roomSystemsState.ranchPets) {
+      const feedId = feedItemOf(pet.speciesId);
+      if (feedId !== null) wanted.add(feedId);
+    }
+    if (wanted.size === 0) return out;
+    for (const g of this.mobGround) {
+      const id = groundItemId(g);
+      if (!wanted.has(id)) continue;
+      out[id] = (out[id] ?? 0) + g.count;
+    }
+    return out;
+  }
+
+  /** 饲育槽(529)所在的格;世界里没有 ⇒ `null`(产出无处可落时如实记账)。 */
+  private troughCell(): { x: number; y: number } | null {
+    for (let y = 0; y < this.sizeCells; y += 1) {
+      for (let x = 0; x < this.sizeCells; x += 1) {
+        if (this.grid.objIdAt(x, y) === WorldSim.RANCH_TROUGH_OBJ_ID) return { x, y };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 牧场日结(**A-1 的唯一调用点**:慢帧与判据口都走它)。
+   *
+   * 结算 → 扣地面饲料 → 产出落到饲育槽。三步的顺序是刻意的:
+   * 先算出「吃掉多少 / 产出多少」,再动物化 —— 反过来会出现
+   * 「饲料扣了但没结算」的半截状态(`depot.buy` 的零副作用纪律同源)。
+   */
+  settleRanchIfDayChanged(days: number): {
+    days: number;
+    produced: number;
+    dropped: number;
+    ranch: RanchDayResult;
+  } {
+    const n = Math.max(0, Math.trunc(Number.isFinite(days) ? days : 0));
+    const feed = this.ranchFeedStock();
+    const ranch = settleRanch(this.roomSystemsState, this.roomSystemsState.ranchPets, feed, n);
+
+    /* 饲料按日结的账扣掉(地面上的那几件)。 */
+    for (const row of ranch.feedConsumed) {
+      this.consumeGroundItem(row.itemId, row.count);
+    }
+
+    /* 产出落货:内容表有这件物品就落到槽上;没有就**如实记缺口**。 */
+    const dropped: { itemId: number; count: number; x: number; y: number }[] = [];
+    const skipped: string[] = [];
+    const at = this.troughCell();
+    for (const p of ranch.produce) {
+      const itemId = p.itemId ?? producedItemIdOf(p.name);
+      if (itemId === null) {
+        skipped.push(`${p.name}:内容表没有这件物品(ranch.ts 的 unresolved 同源)`);
+        continue;
+      }
+      if (at === null) {
+        skipped.push(`${p.name}:世界里没有 529 饲育槽 ⇒ 无处落货`);
+        continue;
+      }
+      this.dropItem(at.x, at.y, itemId, p.count);
+      dropped.push({ itemId, count: p.count, x: at.x, y: at.y });
+    }
+    this.lastRanchDrop = { dropped, skipped };
+    return { days: ranch.days, produced: ranch.produce.length, dropped: dropped.length, ranch };
+  }
+
+  /** 最近一次牧场日结的回执(`null` = 还没结过)。 */
+  lastRanchSettle(): RanchDayResult | null {
+    return this.roomSystemsState.lastRanch;
+  }
+
+  /** 最近一次牧场落货账(哪些产出真的落地 / 哪些是内容表缺口)。 */
+  lastRanchDrops(): { dropped: { itemId: number; count: number; x: number; y: number }[]; skipped: string[] } {
+    return {
+      dropped: this.lastRanchDrop.dropped.map((d) => ({ ...d })),
+      skipped: [...this.lastRanchDrop.skipped],
+    };
+  }
+
+  /**
+   * A-3 炼金:`use_alchemy_furnace` 成功之后调它 ⇒ **首创冠名 + 537 陈列**。
+   *
+   * `affinity` / `suggestedSLogic` 缺省取 `alchemy/**` 的**中性口径**
+   * (`NEUTRAL_AFFINITY = 0.7`;`s_logic = clamp(0.75 + 0.45 × affinity)`)——
+   * 不在这里发明新的契合度。
+   *
+   * @returns 成功时 `entry`(冠名证书那一行)+ `display`(537 的完整陈列投影)。
+   */
+  brewAtFurnace(
+    actorId: string,
+    itemIds: readonly number[],
+    opts: { affinity?: number; suggestedSLogic?: number; at?: number } = {},
+  ): {
+    ok: boolean;
+    reason?: string;
+    first?: boolean;
+    entry?: GalleryDisplayRow & { schemaJson: string };
+    display: GalleryDisplayRow[];
+  } {
+    const affinity = Number.isFinite(opts.affinity) ? (opts.affinity as number) : NEUTRAL_AFFINITY;
+    const span = S_LOGIC_BASE + S_LOGIC_SPAN * affinity;
+    const suggestedSLogic = Number.isFinite(opts.suggestedSLogic)
+      ? (opts.suggestedSLogic as number)
+      : Math.min(S_LOGIC_CEIL, Math.max(S_LOGIC_FLOOR, span));
+    const at = Number.isFinite(opts.at) ? Math.trunc(opts.at as number) : this.frameCount;
+    const out = brewInLab(this.roomSystemsState, {
+      itemIds: [...itemIds],
+      affinity,
+      suggestedSLogic,
+      discovererName: actorId,
+      at,
+    });
+    if (!out.ok) {
+      return { ok: false, reason: out.reason, display: this.galleryProjection() };
+    }
+    const e = out.entry;
+    return {
+      ok: true,
+      first: out.first,
+      entry: {
+        recipeHash: e.recipeHash,
+        discovererName: e.discovererName,
+        itemName: e.itemName,
+        itemCategory: e.itemCategory,
+        craftCount: e.craftCount,
+        firstAt: e.firstAt,
+        schemaJson: e.schemaJson,
+      },
+      display: this.galleryProjection(),
+    };
+  }
+
+  /** 537「全服奇物发现博物架」的陈列投影(先发现先陈列)。 */
+  galleryProjection(): GalleryDisplayRow[] {
+    return galleryDisplay(this.roomSystemsState);
+  }
+
+  /* ── A-4 百货店(515 无人自助售货摊)── */
+
+  /** 摊位库存(装配层/管理动作注入;`物品 id → 件数`)。 */
+  setStallStock(stock: Readonly<Record<number, number>>): void {
+    const next: Record<number, number> = {};
+    for (const [k, v] of Object.entries(stock)) {
+      const id = Number(k);
+      if (!Number.isInteger(id) || id <= 0) continue;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) continue;
+      next[id] = Math.trunc(v);
+    }
+    this.stallStock = next;
+  }
+
+  /** 摊位库存快照(拷贝)。 */
+  stallStockOf(): Record<number, number> {
+    return { ...this.stallStock };
+  }
+
+  /**
+   * **报价**(纯判定,**零副作用**):用 `depot.buy` 在库存**副本**上算一遍。
+   *
+   * 为什么先报价再提交:动作层要在「扣玩家背包之前」知道这笔交易成不成立
+   * (否则失败时会出现"东西扣了但没买到")。`depot.buy` 本身就是
+   * 「副本上算、失败原样退回」的实现,所以报价 = 一次不提交的 buy。
+   */
+  purchaseQuote(itemId: number, qty: number): BuyResult {
+    return buy({ itemId, qty, stock: this.stallStock });
+  }
+
+  /**
+   * **提交**(把报价里算出的新库存在世界上落定)。只有 `ok` 才写。
+   *
+   * 与 `purchaseQuote` 是**同一次**结算的两次调用(`buy` 是纯函数)——
+   * 不是两份实现:两边都在调 `systems/depot.ts:buy`。
+   */
+  purchaseCommit(itemId: number, qty: number): { ok: boolean; cost: number; reason: string } {
+    const r = buy({ itemId, qty, stock: this.stallStock });
+    if (!r.ok) return { ok: false, cost: 0, reason: r.reason };
+    this.stallStock = r.stock;
+    return { ok: true, cost: r.cost, reason: r.reason };
+  }
+
+  /* ── C:料理 3 字段 → 物理层的**单点推送** ── */
+
+  /**
+   * ★ 把 `moveMul` / `gravityMul` / `jumpMul` 推给物理层。
+   *
+   * 与 `syncFoodFriction` 同一条纪律:**只推不算**(结算点在 `physics/world.ts`
+   * 的 `stepBody` / `jump`;这里再乘一次就是平方)。
+   *
+   * 中性(`=== 1`)**必须撤掉**设置而**不是**推 1:物理层的三张旁表以
+   * 「有没有记录」区分「中性」与「已设置」,推 1 会让「有没有 buff」这个
+   * 可观测事实被抹平(同 `muOverride` 的中性值 0)。
+   */
+  private syncFoodPhysics(): void {
+    for (const id of this.vitals.ids()) {
+      const t = foodPhysicsOf(this.buffsOf(id));
+      if (t.speedCapMul !== null) this.physics.setSpeedCap(id, BASE_MOVE_SPEED * t.speedCapMul);
+      else this.physics.clearSpeedCap(id);
+      if (t.gravityMul !== null) this.physics.setGravityMul(id, t.gravityMul);
+      else this.physics.clearGravityMul(id);
+      if (t.jumpMul !== null) this.physics.setJumpMul(id, t.jumpMul);
+      else this.physics.clearJumpMul(id);
+    }
+  }
+
+  /**
+   * 起跳(`jumpMul` 的**应用口**)。
+   *
+   * 仓库里原本**没有**跳跃通道(`physics/carry.ts` 的 `JUMP_VZ` 零消费点),
+   * 所以这里给一个薄口:初速由调用方给(内容/物理层的既有常量),
+   * `jumpMul` 的乘区在 `PhysicsWorld.jump` 里只结算一次。
+   */
+  jumpPlayer(playerId: string, baseVz: number): number | null {
+    return this.physics.jump(playerId, baseVz);
+  }
+
+  /** 采集乘子(602「伐木与采矿速度 +20%」)—— 归属到**发起采集的玩家**。 */
+  gatherMulOfPlayer(playerId: string): number {
+    return gatherMulOfMods(this.buffsOf(playerId));
+  }
+
+  /* ══════════ ★ B:归档回滚**真的应用**到世界(此前计划层是纯数据)══════════
+   *
+   * `server/src/world/archive.ts` 的 `planRestore()` 产出的是**自足的操作清单**
+   * (`world` / `player` / `chunk` / `mob` / `ground`),`applyRestorePlan()` 把它
+   * 走成一份「旧世界描述」。那份描述此前**没有任何消费者** —— 归档能写、
+   * 计划能算,而世界回不去。本方法就是那个消费者:把描述**落回 `WorldSim`**。
+   *
+   * ## 判据(见 `tests/WS-FND-78`)
+   * ```
+   * 归档(sink 捕获字节)→ 重置(新种子)⇒ 世界已变 → applyRestore(plan)
+   *   ⇒ 再归档一次,两份解码结果**逐字段相等**(地形块字节 / 玩家 / seed / 帧号)
+   * ```
+   *
+   * ## 刻意不做的三件(如实记账,不假装)
+   * 1 **`sizeCells` 不还原**:网格 / 流体场 / 物理边界都是按它构造的,换尺寸 =
+   *    换世界实例。尺寸不同 ⇒ 本方法**拒绝**(返回 `ok:false`),不改一半。
+   * 2 **流体场不还原**:chunk 快照里带 `wet/lava` 位图(地形格上的水流记号),
+   *    但 `FluidField` 自己的水位数组不在这份快照里 ⇒ 只还原「记号」,
+   *    液面高度按重建后的空地重新开始。
+   * 3 **玩家血量不还原**:WSA1 v1 的头里没有 hp(见 `archive.ts` 边界 3),
+   *    重建后的玩家是满血 —— 编一个 100 出来会让「回滚」变成「顺手改血量」。
+   */
+  applyRestore(plan: RestorePlan): {
+    ok: boolean;
+    reason?: string;
+    applied?: { chunks: number; players: number; mobs: number; ground: number; seed: number; frame: number };
+  } {
+    if (plan === null || typeof plan !== 'object' || !Array.isArray(plan.ops)) {
+      return { ok: false, reason: '回滚计划形状不对(需要一个带 ops 数组的对象)' };
+    }
+    const worldOp = plan.ops.find((o) => o.kind === 'world');
+    if (worldOp === undefined || worldOp.kind !== 'world') {
+      return { ok: false, reason: '回滚计划里没有 world 段 ⇒ 身份与时钟无法还原' };
+    }
+    if (worldOp.sizeCells !== this.sizeCells) {
+      return {
+        ok: false,
+        reason: `世界边长不可回滚(归档 ${worldOp.sizeCells} 格 vs 当前 ${this.sizeCells} 格)`
+          + ' —— 网格/流体/物理边界都按这个数构造',
+      };
+    }
+
+    /* 1 内存重建(地形/物理/电路/生物全部换成新实例,种子用**归档的**)。 */
+    this.rebuildWorld(worldOp.seed);
+    /* 2 世界身份:群系可还原(只影响刷怪配表的键)。 */
+    this.biomeName = worldOp.biome;
+
+    /* 3 地形块:字节**原样**搬回(解码由 `Chunk.deserializeSnapshot` 做,
+       那是仓库里唯一的地形快照解码器 —— 不在这里写第二份)。 */
+    let chunks = 0;
+    for (const op of plan.ops) {
+      if (op.kind !== 'chunk') continue;
+      this.grid.chunks.set(chunkKey(op.cx, op.cy), Chunk.deserializeSnapshot(op.bytes));
+      chunks += 1;
+    }
+
+    /* 4 玩家:`rebuildWorld` 会把**现有**玩家送回出生点 ⇒ 先清空,再按归档重建
+       (归档里没有的玩家不该留在"回到归档前"的世界里)。 */
+    for (const id of [...this.playerIds]) {
+      this.physics.remove(id);
+      this.playerIds.delete(id);
+    }
+    let players = 0;
+    for (const op of plan.ops) {
+      if (op.kind !== 'player') continue;
+      this.spawnPoints.delete(op.id);
+      this.addPlayer(op.id, op.x, op.y);
+      const b = this.physics.bodies.get(op.id);
+      if (b !== undefined) b.z = op.z;
+      if (Number.isFinite(op.level)) this.progressOf(op.id).level = Math.trunc(op.level);
+      players += 1;
+    }
+
+    /* 5 生物:重新注册(位置来自归档),血量按归档写回宿主运行时。 */
+    let mobs = 0;
+    for (const op of plan.ops) {
+      if (op.kind !== 'mob') continue;
+      this.addMob(op.id, this.biomeName, op.x, op.y);
+      const rt = this.mobHost.runtimes().find((r) => r.id === op.id);
+      if (rt !== undefined) {
+        if (Number.isFinite(op.hp)) rt.hp = op.hp;
+        if (Number.isFinite(op.maxHp)) rt.maxHp = op.maxHp;
+      }
+      mobs += 1;
+    }
+
+    /* 6 地面掉落。 */
+    let ground = 0;
+    for (const op of plan.ops) {
+      if (op.kind !== 'ground') continue;
+      this.dropItem(op.x, op.y, op.itemId, op.count);
+      ground += 1;
+    }
+
+    /* 7 时钟:帧号是**世界时钟的唯一来源**(`hourOfDay` 由它派生)⇒ 写回去,
+       钟点自动跟上(D-07 不存累加器,这里也不写第二份)。 */
+    this.frameCount = Math.max(0, Math.trunc(worldOp.frame));
+    this.syncPlayers();
+    /* 地形变了 ⇒ 房间识别必须重算。 */
+    this.roomsDirty = true;
+    return {
+      ok: true,
+      applied: { chunks, players, mobs, ground, seed: this.worldSeed, frame: this.frameCount },
+    };
+  }
+
   tick(): SimFrameReport {
     this.frameCount += 1;
     const frame = this.frameCount;
@@ -5652,6 +6783,23 @@ export class WorldSim {
       this.tickFoodBuffs();
       /* ★ D-12:把滑溜料理的 μ 乘区推给物理层(结算点只在 physics,这里只推乘子)。 */
       this.syncFoodFriction();
+      /* ★ WS-FND-77(C 线):料理的另外三个字段 —— `moveMul` / `gravityMul` /
+         `jumpMul` —— 推给物理层。位置紧贴 `syncFoodFriction`:
+         两者读的是**同一份**合并 buff(`buffsOf`),分开写会让
+         「同一帧里摩擦更新了而速度上限没更新」成为可能。 */
+      this.syncFoodPhysics();
+
+      /* ★ WS-FND-77 / D-19(A 线):四个房间系统的慢帧 —— 温室生长 + 牧场跨日结算。
+         ## 为什么放在这里
+         · 必须在 `tickRoomEffects()` **之后**:温室的「在不在温室里」读的是
+           `refreshRooms()` 的房间识别结果(`lastRoomScan`/`lastRoomCells`),
+           识别在本帧更早处完成(见上面的 `if (this.roomsDirty) this.refreshRooms()`)。
+         · 必须在 `tickFoodBuffs()` **之后**:两处都以「天/秒」为量纲,
+           但 buff 过期不该影响本帧的作物生长判定(读的是世界天气与钟点)。
+         · **不能放快帧**:`cellGrowth` 的口径是「每天」,而 `advanceRoomSystems`
+           的默认参数是 `SIM_SLOW_DT / WORLD_DAY_SEC`;放快帧会让生长速度 ×10
+           (这与流体/电路放快帧是同一类错误,见文件头的「10:1 不变量」)。 */
+      this.advanceRoomSystems();
       /* ── 慢帧 2Hz:活人泡泡的困住计时(227 的活人半边)── */
       this.tickLiveBubbles();
 

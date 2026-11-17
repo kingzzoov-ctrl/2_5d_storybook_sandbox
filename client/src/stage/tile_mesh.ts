@@ -271,15 +271,25 @@ export interface CullBox {
  * 若误写 `x1 >= minX`,刚好贴边的相邻 Chunk 会被多算一个,
  * 表现为视口边缘多渲染一列/一行看不见的区块。
  *
- * **返回值契约**:`visible` / `culled` 必须保留**完整的 `ChunkInput`**,
- * 而不只是它的几何边界。下游 `frameFaceCount(visible, lodFor)` 直接消费
- * 这个数组建面 —— 若只返回 `{key,cx,cy,minZ,maxZ}` 这类边界摘要,
- * 下游会拿到没有 `tiles` 的对象,在 `dominantZGrid` 里炸成
- * `Cannot read properties of undefined`。这个缺陷曾长期存在:
- * 单测只断言 `visible.length`,不把它喂给建面函数,所以从不报错。
- * 需要边界摘要的调用方请读 `boundsOf(key)` 或自行 `chunkBounds()`。
+ * **返回值契约(WS-09 U12 收紧)**:
+ *   1. `visible` / `culled` 必须保留**完整的 `ChunkInput`**,而不只是它的几何边界。
+ *      下游 `frameFaceCount(visible, lodFor)` 直接消费这个数组建面 —— 若只返回
+ *      `{key,cx,cy,minZ,maxZ}` 这类边界摘要,下游会拿到没有 `tiles` 的对象,
+ *      在 `dominantZGrid` 里炸成 `Cannot read properties of undefined`。这个缺陷曾长期
+ *      存在:单测只断言 `visible.length`,不把它喂给建面函数,所以从不报错。
+ *   2. `visible` 是**可见子集的副本**,不是原数组的视图:
+ *      · 数组本身是新数组(推/删不影响入参);
+ *      · **每个元素也是副本**(`tiles` 逐格复制)—— 于是 `visible[0].tiles[5] = …`
+ *        只改副本,不会把宿舍里的原始 Chunk 数据写脏。
+ *      为什么必须到元素级:渲染层拿到 `visible` 后会**就地**做 LOD 修补
+ *      (把粗档块的海拔拍平),那是写操作。若共享同一份 `Uint32Array`,
+ *      就会出现「某一帧改过的地形永久留在世界模型里」——
+ *      表现为玩家走远再走回来,地形颜色/高度被"记住"了上一次的临时状态。
+ *      代价是一次 O(可见格数) 的拷贝;相对于建面本身(每块 256 格的建面 + 顶点写出),
+ *      它不到 1%,可以接受。
+ *   3. `culled` 保持**引用**(下游只读它做统计,不需要副本)。
  *
- * 复杂度 O(chunks),求交 O(1)。
+ * 复杂度 O(chunks + 可见 Chunk 的格数)。
  */
 export function frustumCull(chunks: readonly ChunkInput[], cameraBounds: CullBox): FrustumCullResult {
   const visible: ChunkInput[] = [];
@@ -291,11 +301,26 @@ export function frustumCull(chunks: readonly ChunkInput[], cameraBounds: CullBox
     const y1 = y0 + CHUNK_SIZE;
     const hit = x0 <= cameraBounds.maxX && x1 > cameraBounds.minX
       && y0 <= cameraBounds.maxY && y1 > cameraBounds.minY;
-    if (hit) visible.push(c);
+    if (hit) visible.push(copyChunkInput(c));
     else culled.push(c);
   }
   const total = chunks.length;
   return { visible, culled, ratio: total === 0 ? 0 : visible.length / total };
+}
+
+/**
+ * 深拷贝一个 Chunk 输入(`tiles` 逐格复制)。
+ *
+ * 泛型拷贝而不是 `new Uint32Array(c.tiles)`:入参类型是 `ArrayLike<number>`,
+ * 测试里既有 `Uint32Array` 也有普通数组;`Uint32Array` 走原生拷贝最快,
+ * 其它 `ArrayLike` 退化为 `Array.from`(保持"能读能写"的最小语义)。
+ */
+function copyChunkInput(c: ChunkInput): ChunkInput {
+  const src = c.tiles;
+  const tiles: ArrayLike<number> = src instanceof Uint32Array
+    ? new Uint32Array(src)
+    : (Array.isArray(src) ? src.slice() : Array.from(src));
+  return { key: c.key, cx: c.cx, cy: c.cy, tiles };
 }
 
 /** 单位变换:把 `iso_camera.ViewBounds` 适配到 CullBox(min/max 同名) */

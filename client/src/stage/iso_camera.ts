@@ -74,9 +74,34 @@ export interface IsoCamera {
   originY: number;
 }
 
-/** 缩放档位:0.5× 全局俯视观景 → 2× 贴脸看像素画 */
-export const zoomLevels: readonly number[] = [0.5, 0.75, 1, 1.25, 1.5, 2];
-export const ZOOM_LEVELS = zoomLevels;
+/**
+ * 缩放档位:0.5× 全局俯视观景 → 2× 贴脸看像素画。
+ *
+ * ★ WS-09 U10「双导出清理」:**全仓只有这一处数组字面量**,且已冻结。
+ *
+ * 早先是 `export const zoomLevels = [...]` + `export const ZOOM_LEVELS = zoomLevels`,
+ * 两个名字指向同一数组,`client/src` 里 9 处引用分成两派。别名看着无害,实际有代价:
+ *   - `grep` 两个名字各命中外一半调用点 ⇒「谁在消费这六档」要先合并两次搜索;
+ *   - 有人给其中一个加 `.slice()` / `.map()` ⇒ 两个名字**悄悄分叉**,
+ *     而 `Object.is` 断言只存在于测试里。
+ *
+ * 收口结果:唯一的档位表是 `ZOOM_LEVELS`(冻结),`client/src` 的全部消费点
+ * (`snapZoom` / `stepZoom` / `assembly_math` 的注释)**一律走它**。
+ *
+ * ⚠️ 唯一残留:小写 `zoomLevels` 是**同一个冻结数组的弃用别名**,没有被删掉,
+ * 因为 `tests/WS-09.test.ts`(既有冻结测试,不在本次可改范围内)在
+ * 第 32/34/428/429 行同时 import 两个名字并断言 `Object.is(ZOOM_LEVELS, zoomLevels)` ——
+ * 删名会让那份测试在链接期直接失败。别名保留但标注 `@deprecated`,
+ * 新增代码**禁止**使用;`tests/WS-FND-73` 的判据「`client/**` 里小写名字只剩 1 处、
+ * 且就是这行别名、且与 `ZOOM_LEVELS` 同引用」正是钉这条纪律的。
+ */
+export const ZOOM_LEVELS: readonly number[] = Object.freeze([0.5, 0.75, 1, 1.25, 1.5, 2]);
+
+/**
+ * @deprecated 用 `ZOOM_LEVELS` —— 与它是**同一个冻结数组**(不复制、不派生)。
+ * 仅为既有冻结测试保留。
+ */
+export const zoomLevels: readonly number[] = ZOOM_LEVELS;
 
 export function pixelScale(cam: IsoCamera): number {
   return cam.scale * cam.zoom;
@@ -256,9 +281,9 @@ export function followCamera(
 
 /** 就近取缩放档位 */
 export function snapZoom(zoom: number): number {
-  let best = zoomLevels[0];
+  let best = ZOOM_LEVELS[0];
   let bestErr = Number.POSITIVE_INFINITY;
-  for (const z of zoomLevels) {
+  for (const z of ZOOM_LEVELS) {
     const err = Math.abs(z - zoom);
     if (err < bestErr) {
       bestErr = err;
@@ -271,9 +296,9 @@ export function snapZoom(zoom: number): number {
 /** 缩放档位步进:dir=+1 放大,dir=-1 缩小;越界保持端点 */
 export function stepZoom(cam: IsoCamera, dir: number): IsoCamera {
   const cur = snapZoom(cam.zoom);
-  const i = zoomLevels.indexOf(cur);
-  const next = Math.min(zoomLevels.length - 1, Math.max(0, i + (dir > 0 ? 1 : -1)));
-  return { ...cam, zoom: zoomLevels[next] };
+  const i = ZOOM_LEVELS.indexOf(cur);
+  const next = Math.min(ZOOM_LEVELS.length - 1, Math.max(0, i + (dir > 0 ? 1 : -1)));
+  return { ...cam, zoom: ZOOM_LEVELS[next] };
 }
 
 /** 世界坐标 → 该缩放下的像素可点区域(UI 命中测试用) */

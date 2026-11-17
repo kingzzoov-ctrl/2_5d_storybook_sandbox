@@ -115,6 +115,17 @@ function machineInfo(): string {
  */
 type Verdict = 'holds' | 'fails' | 'unknown' | 'not-in-manual';
 
+/**
+ * ★ 2026-11-14(RULINGS-DRAFT §4.4 / PERF U3):`not-in-manual` 三条**降级为标签,不删**。
+ *
+ * 为什么要一个独立的 `label` 字段而不是改 `verdict`:
+ * `verdict` 回答的是「**实测与手册断言**的关系」,这四条九种情形里
+ * `not-in-manual` 是**事实**(手册确实没写这个数字);而"它该不该留着"是**处置**。
+ * 把处置塞进裁决字段会得到"四种裁决其实是两种东西"的混合语义 —— 本仓反复吃亏的形态。
+ * ⇒ 裁决保留,处置单列 `label`,并在汇总里**单独一段**打印。
+ */
+export const PERF_U3_LABEL = '⊘ 标签(已降级·不删):手册无此断言,条目保留';
+
 interface Row {
   id: string;
   /** 手册原文断言(未在手册中的则标注实际出处)。 */
@@ -127,6 +138,8 @@ interface Row {
   actual: string;
   verdict: Verdict;
   note: string;
+  /** 处置标签(空 = 无标签)。PERF U3 的三条用 `PERF_U3_LABEL`。 */
+  label?: string;
 }
 
 const rows: Row[] = [];
@@ -356,6 +369,7 @@ function checkFluid(): void {
     expected: '手册未给出数字',
     actual: `满活跃 128×128 稳态单步 ${fmt(t128.median)}(中位)/ ${fmt(t128.min)}(最小);占 500ms 慢帧 ${(t128.median / 500 * 100).toFixed(2)}%`,
     verdict: 'not-in-manual',
+    label: PERF_U3_LABEL,
     note: `手册仅规定「2Hz 做元胞自动机扩散」。单格预算 FLUID_CELL_BUDGET=${FLUID_CELL_BUDGET}`,
   });
 
@@ -432,6 +446,7 @@ function checkWiring(): void {
     expected: '< 500 ms(慢帧预算)',
     actual: `world 512×512 / ${wireCells} 格:全量 ${fmt(tickFull.median)}、脏增量 ${fmt(tickDirty.median)}`,
     verdict: 'not-in-manual',
+    label: PERF_U3_LABEL,
     note: '手册未给出该规模数字;此处以手册的慢帧 500ms 预算作参考上界',
   });
 
@@ -486,6 +501,7 @@ function checkBandwidth(): void {
     expected: '手册未给出数字',
     actual: `实编:全量首帧 ${full.bytes.length} B / 移动稳态 ${moving.bytes.length} B / 静止帧 ${stagnant.bytes.length} B;解析模型 ${model.frameBytes} B、${model.kbytesPerSec.toFixed(2)} kB/s`,
     verdict: 'not-in-manual',
+    label: PERF_U3_LABEL,
     note: `模型/实编 = ${(model.frameBytes / moving.bytes.length).toFixed(2)}×,模型是保守上界而非实测值`,
   });
 
@@ -678,6 +694,16 @@ function main(): void {
   console.log(`  无法判断    ${tally.unknown}`);
   console.log(`  手册无此断言 ${tally['not-in-manual']}`);
   console.log(`  合计        ${rows.length}`);
+
+  /* ★ PERF U3:三条 `not-in-manual` 的**标签**(降级·不删)。
+     单列一段,而不是并进上面四种裁决 —— 裁决说"实测与手册的关系",
+     标签说"这条欠账怎么处置"。两者混在一起,读者会把"标签"读成第五种裁决。 */
+  const labelled = rows.filter((r) => r.label !== undefined);
+  if (labelled.length > 0) {
+    console.log(`\n═══ 标签(已处置,不是裁决)═══`);
+    for (const r of labelled) console.log(`  ${r.id}  ${r.label}`);
+    console.log('  依据:docs/RULINGS-DRAFT.md §4.4 PERF U3;门禁侧对账见 scripts/verify.ts 的 [PERF U3 标签降级]');
+  }
 
   if (tally.fails > 0) process.exitCode = 1;
 }

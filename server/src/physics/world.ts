@@ -270,8 +270,12 @@ export class PhysicsWorld {
 
   remove(id: string): boolean {
     this.trapTimers.delete(id);
-    /* 乘子必须跟着刚体一起消失:同 id 重生的新实体不得继承上一条命的滑溜状态。 */
+    /* 乘子必须跟着刚体一起消失:同 id 重生的新实体不得继承上一条命的滑溜状态。
+       ★ WS-FND-77:料理 3 字段的三张旁表同理 —— 漏删会让新刚体继承上一份 buff。 */
     this.muMuls.delete(id);
+    this.speedCaps.delete(id);
+    this.gravityMuls.delete(id);
+    this.jumpMuls.delete(id);
     return this.bodies.delete(id);
   }
 
@@ -288,6 +292,10 @@ export class PhysicsWorld {
     this.trapTimers.clear();
     this.openedTraps.clear();
     this.muMuls.clear();
+    /* ★ WS-FND-77:三张料理旁表一起清(重建世界 = 没有任何 buff 残留)。 */
+    this.speedCaps.clear();
+    this.gravityMuls.clear();
+    this.jumpMuls.clear();
     this.fx.length = 0;
     this.tickCount = 0;
     this.elapsed = 0;
@@ -297,7 +305,6 @@ export class PhysicsWorld {
 
   /**
    * 设置某刚体的 μ **乘子**(最终摩擦 = 地板 μ × mul)。
-   *
    * 用于滑溜料理:`setMuMul(id, 0.96)` ⇒ 冰面 0.98×0.96、湿地 0.40×0.96,
    * 两个方向都朝"滑溜"走(见 `muMuls` 的注释)。
    *
@@ -328,6 +335,135 @@ export class PhysicsWorld {
   /** 清掉某刚体的 μ 乘子(等价于 `setMuMul(id, MU_MUL_NEUTRAL)`)。 */
   clearMuMul(id: string): boolean {
     return this.muMuls.delete(id);
+  }
+
+  /* ── 料理 3 字段的**物理设置口**(WS-FND-77 / W 线:moveMul / gravityMul / jumpMul)──
+   *
+   * ## 为什么是「三张旁表 + stepBody 里的结算点」而不是改冻结层
+   *
+   * `shared/types/physics.ts` 的 `DynamicBody` 是冻结层(`integrateHorizontal` /
+   * `integrateVertical` 的签名锁着它),加字段要改冻结层。与本文件的 `muMuls`
+   * 同一手法:按**刚体 id** 索引的旁表,中性值 = 1。
+   *
+   * ## 三者的语义(与 `combat/cooking.ts` 的 `statMods` 逐字段对应)
+   *
+   * ```
+   * moveMul     601 暖心甜莓果茶「移动速度 +15%」 ⇒ **水平速度上限** = 基准速 × mul
+   * gravityMul  609 气球肚皮漂浮饮「重力降低 70%」⇒ 垂直积分的重力 × mul
+   * jumpMul     604 星光萤火蘑菇汤「跳跃高度 +50%」⇒ 起跳初速 × mul(`jump()`)
+   * ```
+   *
+   * ⚠️ **中性值是 1,且中性时逐位不变**:三处结算都写成 `if (mul !== 1)`,
+   *   所以没有料理 buff 的刚体与加这条通道之前完全一致(与本文件 `muMuls` 的
+   *   「中性乘子 1 ⇒ `mu * 1` 逐位不变」同一条纪律)。
+   *
+   * ⚠️ **结算只在 `stepBody` / `jump()` 里发生一次**。世界侧(`WorldSim`)只负责
+   *   「读 buff → 推乘子」,不自己乘 —— 两处都乘就是平方(见 `muMuls` 的注释)。
+   */
+
+  /** 刚体 id → 水平速度上限(格/秒)。缺省 = **不设上限**(与接线前逐字一致)。 */
+  private readonly speedCaps: Map<string, number> = new Map();
+  /** 刚体 id → 重力乘子。缺省 = 1。 */
+  private readonly gravityMuls: Map<string, number> = new Map();
+  /** 刚体 id → 起跳初速乘子。缺省 = 1。 */
+  private readonly jumpMuls: Map<string, number> = new Map();
+
+  /**
+   * 设某刚体的**水平速度上限**(格/秒)。用于 `moveMul`:世界侧推
+   * `BASE_MOVE_SPEED × moveMul`(基准速在冻结层,本文件不另立一份)。
+   *
+   * 只接受有限正数:非法输入是 **no-op**(与 `setMuMul` 同一取舍 ——
+   * 写一个「看起来夹过了」的 0 会让刚体原地定住,表现像卡进墙里)。
+   *
+   * @returns `true` = 已接受;`false` = 被拒(状态未变)。
+   */
+  setSpeedCap(id: string, cap: number): boolean {
+    if (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0) return false;
+    this.speedCaps.set(id, cap);
+    return true;
+  }
+
+  /** 某刚体的速度上限;没设过 ⇒ `null`(`null` 与「上限 0」不是同一件事)。 */
+  speedCapOf(id: string): number | null {
+    return this.speedCaps.get(id) ?? null;
+  }
+
+  /** 撤掉速度上限(回到「不设上限」)。 */
+  clearSpeedCap(id: string): boolean {
+    return this.speedCaps.delete(id);
+  }
+
+  /**
+   * 设某刚体的**重力乘子**(1 = 中性)。用于 609 的「重力降低 70%」⇒ 0.30。
+   *
+   * 只接受有限**正数**:0 会让刚体永远悬空(不是「无重力」而是永不落地),
+   * 负数会把重力翻成向上 —— 两者都是「看起来夹过了」的坏值,故一律拒。
+   */
+  setGravityMul(id: string, mul: number): boolean {
+    if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
+    if (mul === 1) {
+      this.gravityMuls.delete(id);
+      return true;
+    }
+    this.gravityMuls.set(id, mul);
+    return true;
+  }
+
+  /** 某刚体的重力乘子;没设过 ⇒ 1(中性)。 */
+  gravityMulOf(id: string): number {
+    return this.gravityMuls.get(id) ?? 1;
+  }
+
+  /** 撤掉重力乘子(等价于 `setGravityMul(id, 1)`)。 */
+  clearGravityMul(id: string): boolean {
+    return this.gravityMuls.delete(id);
+  }
+
+  /**
+   * 设某刚体的**起跳初速乘子**(1 = 中性)。用于 604 的「跳跃高度 +50%」⇒ 1.50。
+   *
+   * ⚠️ 本文件**不自己造跳跃初速**:起跳速度是内容/物理层的已有常量
+   *   (`physics/carry.ts` 的 `JUMP_VZ`),由调用方作为 `baseVz` 传给 `jump()`。
+   *   这样物理层没有第二个「跳跃高度」事实源。
+   */
+  setJumpMul(id: string, mul: number): boolean {
+    if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
+    if (mul === 1) {
+      this.jumpMuls.delete(id);
+      return true;
+    }
+    this.jumpMuls.set(id, mul);
+    return true;
+  }
+
+  /** 某刚体的起跳乘子;没设过 ⇒ 1(中性)。 */
+  jumpMulOf(id: string): number {
+    return this.jumpMuls.get(id) ?? 1;
+  }
+
+  /** 撤掉起跳乘子。 */
+  clearJumpMul(id: string): boolean {
+    return this.jumpMuls.delete(id);
+  }
+
+  /**
+   * **起跳**:把 `baseVz`(调用方给的初速,通常是 `carry.ts` 的 `JUMP_VZ`)
+   * 乘上该刚体的 `jumpMul` 写进 `vz`。
+   *
+   * 为什么需要这个方法(`jumpMul` 光有 setter 不成立):乘子必须有一个
+   * **被用到的瞬间**,否则它就是「存了但没人读」的第三条旁表 —— 本仓反复
+   * 点名的「实现完整、单测全绿、编排层不接」形态。
+   *
+   * @returns 实际写入的 `vz`;刚体不存在 / 参数非法 ⇒ `null`(不抛错)。
+   */
+  jump(id: string, baseVz: number): number | null {
+    const b = this.bodies.get(id);
+    if (b === undefined) return null;
+    if (typeof baseVz !== 'number' || !Number.isFinite(baseVz)) return null;
+    const vz = baseVz * this.jumpMulOf(id);
+    if (!Number.isFinite(vz)) return null;
+    b.vz = vz;
+    return vz;
   }
 
   /* ── 地形查询 ── */
@@ -530,14 +666,39 @@ export class PhysicsWorld {
       b.vy = 0;
     }
 
+    /* ★ WS-FND-77 / moveMul(601「移动速度 +15%」)的**唯一结算点**:
+       有上限才夹,且夹的是速度矢量(方向不变)。没设过上限 ⇒ 逐位不变
+       (与接线前完全一致 —— 本仓「中性值不得改变既有行为」的纪律)。
+
+       为什么不夹位移:位置由 `b.x += vx·dt` 直接得出,夹速度就等价地
+       限制了每帧位移;夹位移会让碰撞/反弹看到的速度与实际移动脱节。
+
+       ⚠️ 被击退/投掷的瞬时速度**也会**被这个上限夹住 —— 这是「移动速度 +15%」
+       这条 buff 挂在刚体上的必然结果(上限是刚体属性,不是输入属性)。
+       故世界侧只给**有 moveMul 的玩家**推上限,没吃料理的人完全不受影响。 */
+    const cap = this.speedCaps.get(b.id);
+    if (cap !== undefined) {
+      const sp = Math.hypot(b.vx, b.vy);
+      if (sp > cap) {
+        const k = cap / sp;
+        b.vx *= k;
+        b.vy *= k;
+      }
+    }
+
     b.x += b.vx * dt;
     b.y += b.vy * dt;
 
     /* — 垂直积分(冻结层) — */
     const gz = this.groundZAt(b.x, b.y);
     const vzBefore = b.vz;
-    /* 落穴时重力倍率抬高:GRAVITY 为负,乘 (gMul-1) 后增加值速度朝向 -z */
-    if (gMul !== 1) b.vz += GRAVITY * (gMul - 1) * dt;
+    /* ★ 重力倍率的**唯一结算点**:落穴倍率(`gMul`,机关,1.8)× 料理乘子
+       (`gravityMul`,609「重力降低 70%」⇒ 0.30)。两者中性值都是 1,
+       相乘为 1 时这一行整个跳过 ⇒ 没有落穴也没有料理时逐位不变。
+       GRAVITY 为负,乘 (total-1) 后增加值速度朝向 -z。 */
+    const gFood = this.gravityMuls.get(b.id) ?? 1;
+    const gTotal = gMul * gFood;
+    if (gTotal !== 1) b.vz += GRAVITY * (gTotal - 1) * dt;
     const vs = integrateVertical(b.z, b.vz, dt);
     b.z = vs.z;
     b.vz = vs.vz;

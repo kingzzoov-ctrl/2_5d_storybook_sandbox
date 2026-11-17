@@ -73,6 +73,19 @@ export const MOB_DEF_PER_LEVEL = 2.0;
 export const MOB_MASS_DEFAULT = 1.0;
 
 /**
+ * **空手**(没有武器)时的基础击退量(格/秒)。
+ *
+ * ## 它是既有数值的**具名化**,不是新数值
+ *
+ * 第 8 步此前写的是 `const wKnock = weapon ? weapon.knockback : 2.0;` ——
+ * 这个 `2.0` 一直存在,只是**没有名字**。D1 需要在「生物打玩家」那条路上
+ * 也给出击退量,而那条路**没有武器**(生物没有 `WeaponDef`)。
+ * 若不具名,就要在 `world_sim` 里再写一个 `2.0` —— 那就是两份实现,
+ * 日后一边改了另一边不会。⇒ 提到这里当**唯一出处**。
+ */
+export const DEFAULT_UNARMED_KNOCKBACK = 2.0;
+
+/**
  * 生物自身的元素属性表 —— **只收名称/行为里明确带元素语义的生物**。
  *
  * 未列出的生物一律 `Element.NONE`(元素矩阵对 NONE 恒 ×1,即无克制)。
@@ -100,6 +113,12 @@ export const DamageSource = {
   REFLECT: 'REFLECT',
   ENVIRONMENT: 'ENVIRONMENT',
   PRANK: 'PRANK',
+  /**
+   * **玩家打玩家**(D3)。单列一个来源而不是并进 `NORMAL_ATTACK`:
+   * PvP 的授权(`pvpVerdict`)与「谁吃反伤」两件事都只在 PvP 语义下成立,
+   * 混进普攻后 friendly-fire 的判据就只能靠调用方自觉(`docs/DAMAGE-LOOP.md` D3)。
+   */
+  PVP: 'PVP',
 } as const;
 export type DamageSource = (typeof DamageSource)[keyof typeof DamageSource];
 
@@ -438,7 +457,7 @@ export function computeDamage(input: AttackInput): DamageResult {
   });
 
   /* 8 击退冲量 */
-  const wKnock = weapon ? weapon.knockback : 2.0;
+  const wKnock = weapon ? weapon.knockback : DEFAULT_UNARMED_KNOCKBACK;
   const skKnock = skill ? skill.knockbackMul : 1.0;
   const knockbackImpulse = r2((wKnock * attacker.knockbackMul * skKnock) / Math.max(target.mass, 0.1));
   steps.push({
@@ -536,7 +555,51 @@ export function applyDamage(target: TargetProfile, result: DamageResult): Applie
   return { target: { ...target, hp, shield: shieldLeft }, result, downed: hp <= 0, shieldLeft };
 }
 
-/** 队友整蛊命中:0 伤害 + 固定 8 格/秒击退冲量(222 充气大锤)。 */
+/**
+ * PvP 授权判定(D3)—— **纯函数**,本仓 PvP 的唯一判据。
+ *
+ * ## 为什么必须是一个具名判定,而不是各调用方 `if (pvpOn)`
+ *
+ * `docs/DAMAGE-LOOP.md` D3 的两半里,这一半最容易被写成散落的布尔判断:
+ * ```
+ * 房间层  if (!pvp) 拒绝
+ * 结算层  if (!pvp) return
+ * 反伤     if (!pvp) 跳过
+ * ⇒ 三处各写一遍,改一处就漏两处(本仓陷阱 31/41 的原形)
+ * ```
+ * ⇒ 判定收在这里,返回**结构化的理由**(不是布尔):「为什么没打中」要能进回执。
+ *
+ * ## 三档结论
+ *
+ * | 输入 | allowed | reason |
+ * | :--- | :---: | :--- |
+ * | 自己打自己 | ✗ | `SELF` |
+ * | 房间 PvP 开关为关 | ✗ | `PVP_OFF` |
+ * | 空 id / 开关缺失 | ✗ | `PVP_NO_TARGET` / `PVP_OFF`(fail-closed) |
+ *
+ * ⚠️ **fail-closed**:`pvpEnabled` 缺省即关。D3 之前的行为是「玩家之间根本
+ * 打不到」(没有入口),所以「缺省关」与修前语义一致 —— 反过来(缺省开)
+ * 会让每个已有房间一上线就变成可互殴。
+ */
+export const PVP_REJECT = {
+  SELF: 'PVP_SELF',
+  OFF: 'PVP_OFF',
+  NO_TARGET: 'PVP_NO_TARGET',
+} as const;
+
+export function pvpVerdict(input: {
+  pvpEnabled: boolean;
+  attackerId: string;
+  targetId: string;
+}): { allowed: boolean; reason: (typeof PVP_REJECT)[keyof typeof PVP_REJECT] | null } {
+  if (typeof input.targetId !== 'string' || input.targetId === '') {
+    return { allowed: false, reason: PVP_REJECT.NO_TARGET };
+  }
+  if (input.attackerId === input.targetId) return { allowed: false, reason: PVP_REJECT.SELF };
+  if (input.pvpEnabled !== true) return { allowed: false, reason: PVP_REJECT.OFF };
+  return { allowed: true, reason: null };
+}
+
 export function allyPrankHit(target: TargetProfile): DamageResult {
   return {
     targetId: target.id, base: 0, levelMul: 1, weaponMul: 1, elementMulValue: 1, afterElement: 0,

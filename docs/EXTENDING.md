@@ -630,11 +630,11 @@ node scripts/extension-drill.ts --verify-faults
 
 | # | 未决项 | 现状 | 建议 |
 | :--- | :--- | :--- | :--- |
-| U1 | `scripts/verify.ts:125,141` 硬编码 320 | 有意为之(内容基线锁) | 扩容时必须同步改,建议改为读基线文件 |
-| U2 | 槽位仍定义为数组下标(`baseline.ts:78`) | 固有风险,已能检测不能消除 | 长期改为按 ID 取槽位,需存档迁移 |
-| U3 | 12 位 vs U16 双 ID 宽度 | 两通道并存,12 位更紧 | 新增物品不受影响;但若将来扩 `obj` 位宽,须同步核对网络字段 |
-| U4 | `INVENTORY_SLOTS=336` 仅余 16 个空位 | 扩到 337 件即需加行 | 加行是自动的(`computeSlotLayout`),但要重跑 C1 全套 |
-| U5 | `AI_CRAFTED` 类别当前无静态物品 | `auditContent()` 以 note 提示,不拦阻 | 运行时生成内容用该类别属预期,无需处理 |
+| U1 | `scripts/verify.ts:125,141` 硬编码 320 | 有意为之(内容基线锁) | 扩容时必须同步改,建议改为读基线文件 | **已关闭(2026-11-17)** | 由 D-19 落地(`verify.ts` 改读基线文件 `scripts/items-baseline.ts`),判据 `tests/WS-FND-74-gate-hardening.test.ts`;见 RULINGS-DRAFT §4.4 EXTENDING U1 |
+| U2 | 槽位仍定义为数组下标(`baseline.ts:78`) | 固有风险,已能检测不能消除 | 长期改为按 ID 取槽位,需存档迁移 | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):槽位按 ID 不做(需存档迁移);见 RULINGS-DRAFT §4.4 EXTENDING U2 |
+| U3 | 12 位 vs U16 双 ID 宽度 | 两通道并存,12 位更紧 | 新增物品不受影响;但若将来扩 `obj` 位宽,须同步核对网络字段 | **已关闭(2026-11-17)** | 由 D-19 落地(12 位 vs U16 统一 U16,冻结层解锁),判据 `tests/WS-FND-66-frozen-unlock.test.ts`;见 RULINGS-DRAFT §4.4 EXTENDING U3 |
+| U4 | `INVENTORY_SLOTS=336` 仅余 16 个空位 | 扩到 337 件即需加行 | 加行是自动的(`computeSlotLayout`),但要重跑 C1 全套 | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):`INVENTORY_SLOTS` 不扩容;见 RULINGS-DRAFT §4.4 EXTENDING U4 |
+| U5 | `AI_CRAFTED` 类别当前无静态物品 | `auditContent()` 以 note 提示,不拦阻 | 运行时生成内容用该类别属预期,无需处理 | **已关闭(2026-11-17)** | 已过期:`AI_CRAFTED` 为运行期分类、静态表应为 0 项(已有断言),判据 `tests/WS-09.test.ts` |
 
 **U1–U5 均不构成阻塞**:它们要么是「有意为之、扩容时同步」的约定,要么是已有检测手段的
 固有风险,要么是预期内的空类别。台账统计里它们应全部显示为非阻塞、未关闭。

@@ -34,6 +34,7 @@ import {
   SIGNAL_IDS,
   SPEC_BY_ID,
   SPLITTER_ROUTE_NAMES,
+  SPRING_COOLDOWN_TICKS,
   STATE_DEFAULTS,
   auditComponentCoverage,
   channelMatches,
@@ -684,7 +685,12 @@ test('WT-08-32 弹簧垫 422 / 旋转推杆 423 / 活塞臂 424', () => {
   spring.params.payloadAbove = 1;
   g.run(2);
   eq(spring.state.launches, 1, '弹簧垫弹射 1 次');
-  ok(spring.state.cooldown > 0, '弹射后进入冷却');
+  /* 双侧断言:原 `cooldown > 0` 只在常量被改到 ≤0 时才红 ⇒ 等于没盯常量。
+     现在两侧都钉:4 帧冷却(components.ts:49,2.0s @ 2Hz)在 `run(2)` 后
+     = 4 − 1(第 2 帧已递减 1)= 3 ⇒ 常量改大或改小都会红;
+     常量本身由下一行 `eq(SPRING_COOLDOWN_TICKS, 4)` 钉住。 */
+  eq(SPRING_COOLDOWN_TICKS, 4, '弹簧垫冷却 4 帧(2.0s @ 2Hz)');
+  eq(spring.state.cooldown, 3, '弹射后冷却 = 3(第 2 帧已递减 1)');
   eq(spring.state.armed, 1, '有载荷且通电应处于待发态');
   g.run(6);
   eq(spring.state.launches, 1, '边沿触发:持续通电 + 载荷不变不得重复弹射');

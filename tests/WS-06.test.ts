@@ -476,6 +476,9 @@ test('D7 T_eff 幂平均的性质:件数加成单调、垃圾料拖低、严格�
 });
 
 test('D8 ε 截断正态:10000 次采样全部落在 [0.80,1.25],均值≈1.0', () => {
+  /* 常量锚点:上/下界的期望值已换字面量(486 行),这里把常量本身钉住 ⇒ 改 0.8/1.25 会红。 */
+  eq(EPSILON_MIN, 0.8, 'ε 截断下界 = 0.8');
+  eq(EPSILON_MAX, 1.25, 'ε 截断上界 = 1.25');
   const rng = mulberry32(20260101);
   let sum = 0;
   let min = Infinity;
@@ -483,7 +486,7 @@ test('D8 ε 截断正态:10000 次采样全部落在 [0.80,1.25],均值≈1.0', 
   const N = 10000;
   for (let i = 0; i < N; i += 1) {
     const e = sampleTruncatedNormal({ mean: EPSILON_MEAN, sigma: EPSILON_SIGMA, min: EPSILON_MIN, max: EPSILON_MAX }, rng);
-    inRange(e, EPSILON_MIN, EPSILON_MAX, `第 ${i} 次采样越出截断区间`);
+    inRange(e, 0.8, 1.25, `第 ${i} 次采样越出截断区间`);
     sum += e;
     if (e < min) min = e;
     if (e > max) max = e;
@@ -880,6 +883,8 @@ test('H2 降级器确定性:同输入两次调用结果逐字节相同', () => {
 });
 
 test('H3 降级产物能跑完五步算法(Roll 不断线)', () => {
+  /* 常量锚点:期望值侧已换字面量 50,这里把常量本身钉住 ⇒ 改 attributes.ts 的 50 会红。 */
+  eq(UTIL_CAP_PERCENT, 50, 'Util 上限 = 50%(手册 §5)');
   const ms = [
     { id: 126, name: '爆裂火椒', tags: ['蔬果', '辛辣', '爆炸', '火焰'], value: 38 },
     { id: 112, name: '黄铜矿石', tags: ['金属', '导电', '机械'], value: 25 },
@@ -899,7 +904,7 @@ test('H3 降级产物能跑完五步算法(Roll 不断线)', () => {
   ok(out.stats.rolled.atk >= 0, '攻击不得为负');
   ok(out.stats.rolled.hp >= 0, '血量不得为负');
   inRange(out.stats.rarity_tier, 0, 3, '稀有度必须落 0~3 档');
-  inRange(out.stats.rolled.util, 0, UTIL_CAP_PERCENT, 'Util% 不得超过 50');
+  inRange(out.stats.rolled.util, 0, 50, 'Util% 不得超过 50');
   ok(out.stats.rolled.impulse >= IMPULSE_BASE, 'F_impulse 不得低于基数 3.0');
   ok(out.stats.rolled.affixes.length >= 1, '至少 1 条词条');
 });
@@ -1111,7 +1116,9 @@ test('K1 全 320 项物品都能被门禁与算法正确处理(不崩、不越�
       seed: i + 1,
     });
     inRange(out.stats.rarity_tier, 0, 3);
-    inRange(out.stats.rolled.util, 0, UTIL_CAP_PERCENT);
+    /* 期望值用**字面量** 50(手册 §5「Util 上限 50%」),不取被测常量;
+       常量由 H3 的 `eq(UTIL_CAP_PERCENT, 50)` 锚点钉住。 */
+    inRange(out.stats.rolled.util, 0, 50);
     ok(out.stats.budget >= 1);
     rolled += 1;
   }

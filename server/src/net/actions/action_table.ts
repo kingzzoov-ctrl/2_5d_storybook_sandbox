@@ -43,6 +43,7 @@ import { placeAutomation } from './place_automation.ts';
 import { wireEdit } from './wire_edit.ts';
 import { breedTame } from './breed_tame.ts';
 import { useItem } from './use_item.ts';
+import { buyItem } from './buy_item.ts';
 
 /**
  * 22 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
@@ -74,6 +75,8 @@ export const ACTION_HANDLERS: Readonly<Record<RoomAction, ActionHandler>> = {
   WIRE_EDIT: wireEdit,
   BREED_TAME: breedTame,
   USE_ITEM: useItem,
+  /* ★ WS-FND-77 A-4:百货店购买(515)。此前 `systems/depot.ts:buy` 只有测试在调。 */
+  BUY_ITEM: buyItem,
 };
 
 /**

@@ -1,0 +1,49 @@
+{
+  "_readme": "内容计数基线(物品 / 十大分表)。判据见 scripts/items-baseline.ts 顶部注释。有意扩容时:node scripts/items-baseline.ts --update;并同步 README 与手册。",
+  "generated": "2026-11-17",
+  "itemCount": 320,
+  "tableCount": 10,
+  "tableSum": 320,
+  "tables": {
+    "3.1": {
+      "count": 30,
+      "ids": 30
+    },
+    "3.2": {
+      "count": 20,
+      "ids": 20
+    },
+    "3.3": {
+      "count": 18,
+      "ids": 18
+    },
+    "3.4": {
+      "count": 35,
+      "ids": 35
+    },
+    "3.5": {
+      "count": 30,
+      "ids": 30
+    },
+    "3.6": {
+      "count": 35,
+      "ids": 35
+    },
+    "3.7": {
+      "count": 40,
+      "ids": 40
+    },
+    "3.8": {
+      "count": 37,
+      "ids": 37
+    },
+    "3.9": {
+      "count": 30,
+      "ids": 30
+    },
+    "3.10": {
+      "count": 45,
+      "ids": 45
+    }
+  }
+}

@@ -238,6 +238,45 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     };
   }
 
+  /* ★ WS-FND-77 A-3:把这一炉记进**首创冠名陈列**(`systems/alchemy_lab.ts` 的
+     `brewAndRecord`,经 `WorldSim.brewAtFurnace` 落到世界上),并把 537
+     「全服奇物发现博物架」的陈列投影带进回执。
+
+     ## 为什么在**成功之后**才调
+     `brewAndRecord` 会在陈列馆里**留下一条记录**(即使材料被拒也只是返回
+     `ok:false` 而不写入)。但本动作的纪律是「失败路径零副作用」——
+     把「记账」放在产物入包成功之后,材料不足 / 背包满两种失败就都不会
+     在 537 上留下"炼过但没出东西"的痕迹。
+
+     ## 材料清单取哪里
+     `match.consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件);
+     它同时也是 536 要求的「2~4 件材料」的权威来源 —— 不另抄一份报文。 */
+  const consumedIds = Object.entries(match.consumed)
+    .filter(([, n]) => n > 0)
+    .map(([k]) => Number(k))
+    .sort((a, b) => a - b);
+  /* `brewAtFurnace` 是 `WorldSaveHost` 的**可选**成员:老世界源没有它就
+     如实标 `gallery: null`(而不是假装陈列已更新)。 */
+  let certificate: Record<string, unknown> | null = null;
+  let display: unknown = [];
+  let brewReason: string | null = null;
+  const brew = ctx.host.brewAtFurnace;
+  if (typeof brew === 'function') {
+    const out = brew.call(ctx.host, ctx.actorId, consumedIds);
+    if (out.ok) {
+      certificate = {
+        ...(out.entry ?? {}),
+        first: out.first === true,
+      };
+      display = out.display;
+    } else {
+      brewReason = out.reason ?? '炼金记录被拒';
+      display = out.display;
+    }
+  } else {
+    brewReason = '世界源没有炼金陈列能力(brewAtFurnace)⇒ 冠名未记录';
+  }
+
   /* 回执:`consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件),不是配方需求表。
      该字段是嵌套对象,`ActionOutcome['effect']` 的值类型装不下 ⇒ 显式窄化(见文件头)。
      `freeForge: false` 如实标明这一版不是 LLM 自由炼金。 */
@@ -249,6 +288,10 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
       consumed: match.consumed,
       roomKey: ALCHEMY_LAB_ROOM_KEY,
       freeForge: false,
+      /* 537 陈列:证书(本次首创/复刻的那一行)+ 完整投影 + 记账失败原因。 */
+      certificate,
+      gallery: display,
+      galleryNote: brewReason,
     } as unknown as EffectRecord,
   };
 };

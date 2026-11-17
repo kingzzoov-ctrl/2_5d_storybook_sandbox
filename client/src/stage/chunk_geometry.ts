@@ -56,6 +56,13 @@ import {
   dominantZGrid,
   neighborZs,
 } from './tile_mesh.ts';
+import {
+  TERRAIN_COLOR_COMPONENTS,
+  elevLayerOfZ,
+  faceColor,
+  validateVertexColors,
+  writeVertexColor,
+} from './terrain_vcolor.ts';
 
 /** 一个 Chunk 的完整几何数据(引擎中立) */
 export interface ChunkGeometry {
@@ -71,6 +78,13 @@ export interface ChunkGeometry {
   vertexCount: number;
   /** 实际面数(应等于 batch.faceCount) */
   faceCount: number;
+  /**
+   * 顶点色,每顶点 `TERRAIN_COLOR_COMPONENTS`(=3)个 float,r/g/b ∈ [0,1]。
+   *
+   * ★ WS-09 U2:渲染走**顶点色**,不挂纹理图集。长度恒等于 `顶点数 × 3`,
+   *   由 `terrain_vcolor.validateVertexColors` 与 `validateChunkGeometry` 双重把守。
+   */
+  colors: Float32Array;
   /** 与顶点写出同源的计数(供一致性断言) */
   batch: QuadBatch;
 }
@@ -180,7 +194,7 @@ function collectCells(
 }
 
 /**
- * 把一个 Chunk 建成可提交给 GPU 的顶点/UV/法线/索引。
+ * 把一个 Chunk 建成可提交给 GPU 的顶点/UV/法线/顶点色/索引。
  *
  * **纯函数**:同样输入必得同样输出,可在 node 里直接测试,不需要引擎。
  */
@@ -195,6 +209,12 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
   const positions = new Float32Array(vertexCount * 3);
   const uvs = new Float32Array(vertexCount * 2);
   const normals = new Float32Array(vertexCount * 3);
+  /**
+   * 顶点色(WS-09 U2)。**长度 = 顶点数 × TERRAIN_COLOR_COMPONENTS** ——
+   * 这条恒等式是「渲染走顶点色」的可测口径:谁把它写成每面一色或每格一色,
+   * 长度立刻对不上,而只断言「数组非空」永远发现不了那种错位。
+   */
+  const colors = new Float32Array(vertexCount * TERRAIN_COLOR_COMPONENTS);
   const indices = new Uint32Array(faceCount * INDICES_PER_QUAD);
 
   let vi = 0; /* 顶点游标(以顶点为单位) */
@@ -204,7 +224,13 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
   const chunkOriginX = chunk.cx * CHUNK_SIZE;
   const chunkOriginY = chunk.cy * CHUNK_SIZE;
 
-  const pushVertex = (x: number, y: number, z: number, u: number, v: number, nx: number, ny: number, nz: number): void => {
+  /** 写一个顶点;颜色与位置同一次写入,杜绝「几何更新了颜色没跟上」 */
+  const pushVertex = (
+    x: number, y: number, z: number,
+    u: number, v: number,
+    nx: number, ny: number, nz: number,
+    r: number, g: number, b: number,
+  ): void => {
     positions[vi * 3] = x;
     positions[vi * 3 + 1] = y;
     positions[vi * 3 + 2] = z;
@@ -213,6 +239,7 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     normals[vi * 3] = nx;
     normals[vi * 3 + 1] = ny;
     normals[vi * 3 + 2] = nz;
+    writeVertexColor(colors, vi, { r, g, b });
     vi += 1;
   };
 
@@ -238,6 +265,10 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     const v0 = (c.by * merge) / CHUNK_SIZE;
     const du = merge / CHUNK_SIZE;
 
+    /* 颜色:该块所处的海拔层。顶面用受光档,侧面用背光档 */
+    const topColor = faceColor(elevLayerOfZ(z), true);
+    const sideColor = faceColor(elevLayerOfZ(z), false);
+
     /* ── 顶面(法线 +Z)── */
     for (const [dx, dy] of TOP_CORNERS) {
       pushVertex(
@@ -247,6 +278,7 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
         u0 + dx * du,
         v0 + dy * du,
         0, 0, 1,
+        topColor.r, topColor.g, topColor.b,
       );
     }
     pushQuadIndices();
@@ -270,6 +302,7 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
           (k % 2 === 0 ? 0 : 1),
           dz,
           nrm[0], nrm[1], nrm[2],
+          sideColor.r, sideColor.g, sideColor.b,
         );
       }
       pushQuadIndices();
@@ -280,6 +313,7 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     positions,
     uvs,
     normals,
+    colors,
     indices,
     vertexCount: vi,
     faceCount: fi,
@@ -320,6 +354,9 @@ export function validateChunkGeometry(g: ChunkGeometry): string | null {
   if (g.positions.length !== g.vertexCount * 3) {
     return `positions 长度 ${g.positions.length} ≠ 顶点数×3 = ${g.vertexCount * 3}`;
   }
+  /* ── 顶点色(WS-09 U2):长度与值域,和 positions/indices 同级别把守 ── */
+  const colorErr = validateVertexColors(g.colors, g.vertexCount);
+  if (colorErr !== null) return colorErr;
   if (g.indices.length !== g.faceCount * INDICES_PER_QUAD) {
     return `indices 长度 ${g.indices.length} ≠ 面数×6 = ${g.faceCount * INDICES_PER_QUAD}`;
   }

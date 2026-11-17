@@ -1078,15 +1078,12 @@ test('管线5:暴击率边界与爆伤上限 3.0', () => {
   eq(edgeLow.critRolled, true, 'roll < critRate 即暴击(边界下沿)');
   const edgeHigh = computeDamage({ attacker: a, target, weapon: w, critRoll: 0.0701, dodgeRoll: 0.99 });
   eq(edgeHigh.critRolled, false, 'roll ≥ critRate 不暴击(边界上沿)');
-  /* 本行是 `eq(计算值, 导出常量)` 形态 —— 两侧同源,数学上恒真。
-   * 【task-23 定性结论:保留,不改为字面量】理由(注入实测):
-   *   注入 BASE_CRIT_DMG 1.5→2.5 ⇒ 本套件 43/44 变红(红在相邻的字面量断言),
-   *   即**该常量已被同套件独立锚点覆盖**,本行是冗余而非漏洞。
-   *   与 `REFLECT_RADIUS` 的处置不同 —— 那一条注入后 44/44 全绿(无守卫),故必须改;
-   *   本条注入会红(有守卫),属 verify.ts 白名单里已登记的**候选**,非缺陷。
-   *   改为字面量会使 `WS-10::BASE_CRIT_DMG` 条目失真 —— 那需要同步改 verify.ts,
-   *   不在本任务写域,故保持原样。 */
-  eq(edgeLow.critMul, BASE_CRIT_DMG, '基础爆伤 150%');
+  /* 【本行原为 `eq(计算值, BASE_CRIT_DMG)` —— 两侧同源、数学上恒真。
+   * 档2 第1组清零:期望值换**字面量 1.5**(手册 §6「基础爆伤 150%」),
+   * 常量本身由 :1086 的 `eq(BASE_CRIT_DMG, 1.5)` 锚点钉住 ⇒ 改 weapons.ts 的 1.5 会红。
+   * (注入实测见 `tests/WS-FND-76-test-debt.test.ts` 同款做法:1.5→2.5 ⇒ 锚点红。) */
+  eq(edgeLow.critMul, 1.5, '基础爆伤 150%');
+  eq(BASE_CRIT_DMG, 1.5, '基础爆伤常量 = 1.5(手册 §6)');
   near(edgeLow.finalDamage, noCrit.finalDamage * 1.5, 0.6, '暴击伤害约为 1.5 倍');
 
   /* 爆伤封顶:718 + 词条堆到 3.0 以上仍钳制为 3.0 */

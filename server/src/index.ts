@@ -288,12 +288,33 @@ function makeArchiveSink(db: DbLike): WorldArchiveSink {
       worldTick: req.worldTick,
       reason: req.reason,
     });
-    return {
+    const receipt: WorldArchiveReceipt = {
       id: r.archived.id,
       seed: r.archived.seed,
       archived_at: r.archived.archived_at,
       bytes: r.archived.bytes,
     };
+    /* ★ B / D-19 第 5 条:**裁剪四件不许丢**。
+       此前这里只搬四个字段,于是 `repo.archiveWorldSnapshot` 辛苦算出的
+       `trim`(裁了几块 / 多少字节 / 为什么)在装配层**第一次**被丢掉,
+       `WorldSim.archiveBeforeReset` 又会再丢一次 —— 结果是「归档成功了」
+       与「归档是裁过的」在回执里完全一样,而回滚恰恰要读这个事实
+       (`world/archive.ts:planRestore` 的 `missingChunks`)。
+
+       映射是**逐字段原样搬运**:本层不重写原因文本、不算新的计数
+       (`reason` / `rule` 都来自 `ArchiveTrimReport`,那是唯一事实源)。
+       `status` 在这里恒为 `TRIMMED` —— 没裁过时 `r.trim` 是 `undefined`,
+       键**直接缺席**(与 `WorldArchiveTrimReceipt` 的三态纪律一致)。 */
+    if (r.trim !== undefined) {
+      receipt.trim = {
+        status: 'TRIMMED',
+        droppedChunks: r.trim.droppedChunks,
+        droppedBytes: r.trim.droppedBytes,
+        reason: r.trim.reason,
+        rule: r.trim.rule,
+      };
+    }
+    return receipt;
   };
 }
 

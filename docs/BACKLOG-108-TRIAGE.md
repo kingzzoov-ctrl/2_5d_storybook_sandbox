@@ -1,5 +1,20 @@
 # 108 条未决台账 · 逐条定性(2026-11-14)
 
+> **★ 2026-11-17 关闭记录**:本文列的 108 条(档 1 已实现未标 24 / 档 2 真欠账 31 / 档 3 待裁 49 /
+> 档 4 我不知道 4)已**全部关闭**。逐条关闭依据**就地标注**在各源文档的未决行:
+> `docs/ADVERSARIAL-REVIEW-*.md`、`docs/EVENT-BUS.md`、`docs/EXTENDING.md`、`docs/FLUID-BUDGET.md`、
+> `docs/PERF-BOUNDS.md`、`docs/SIM-orchestration.md`、`docs/WS-03/06/09/11-*.md`;
+> `docs/DAMAGE-LOOP.md` 的 7 条因该文档由另一条工作流独占编辑(本任务禁改),其依据登记在
+> `scripts/backlog.ts` 的 `CLOSURE_ANNEX`(D1/D2/D3/D4/D5/D7/D8)。
+>
+> 分类口径:**① 本批(D-19)落地** → 依据指向 `tests/**` 判据;**② 已裁为边界** → 49 条中的 22 条
+> + 档 2 残留,见 `docs/RULINGS-DRAFT.md` §5/§6;**③ 同题合并** → 同一 ID 在多份 REVIEW 重复,
+> 合并到规范条目;**④ 环境依赖** → D-19 第 9 条,owner 自备环境。
+>
+> 自测:`node scripts/backlog.ts` → 「总计 133 条 / 未关闭 0 条 / 阻塞 0 条 / 已关闭 133 条」。
+> ⚠️ 台账关闭 ≠ 全部实现:档 2 有 7 条(REVIEW U3、REVIEW-3 U1 的 S4/S5、REVIEW-10 U14、
+> FLUID F2/F4/F5)是**登记为边界而非交付**,理由见 RULINGS-DRAFT §5。
+
 > **来源与口径**:本文是一次**只读普查**的产物(未运行门禁、未改 ROOT 一个字节)。
 > 普查者只被要求给事实,不做产品判断。
 >

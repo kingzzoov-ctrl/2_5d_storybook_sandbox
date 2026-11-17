@@ -126,6 +126,11 @@ export const RoomAction = {
   WIRE_EDIT: 'WIRE_EDIT',
   BREED_TAME: 'BREED_TAME',
   USE_ITEM: 'USE_ITEM',
+  /* ★ WS-FND-77 A-4:百货店购买(`515 无人自助售货摊` 的字面量
+     「上架……供游客购买」)。此前 `CLOUD_DEPOT` 的购买语义**没有入口**:
+     `depot.buy` 只有测试在调。加这一条把「买」变成一个可授权、可回执、
+     可判定的动作(判序见 `actions/buy_item.ts`)。 */
+  BUY_ITEM: 'BUY_ITEM',
 } as const;
 export type RoomAction = (typeof RoomAction)[keyof typeof RoomAction];
 
@@ -186,6 +191,9 @@ export const ACTION_PERMISSION: Readonly<Record<RoomAction, keyof RolePermission
   /* 使用道具是基础生存动作:吃/喝/投掷都不要求角色权限。
      具体的**能用哪一件**由世界侧判定(未知道具 ⇒ 明确拒绝),不靠权限位表达。 */
   USE_ITEM: 'baseline',
+  /* 购买(515 无人自助售货摊)是**基础生存动作**:游客也能在别人的店里买 ——
+     能不能成交由世界侧判(`depot.buy` 的定价/库存),不由权限位表达。 */
+  BUY_ITEM: 'baseline',
   PLACE_BLOCK: 'build',
   BREAK_BLOCK: 'build',
   CRAFT: 'build',
@@ -463,7 +471,9 @@ export interface WorldSaveHost {
   materials(): {
     blockAt(x: number, y: number): number;
     placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
-    breakBlock(x: number, y: number): { ok: true; objId: number } | { ok: false; reason: string };
+    breakBlock(
+      x: number, y: number, actorId?: string,
+    ): { ok: true; objId: number; gatherMul?: number } | { ok: false; reason: string };
     groundItemsNear(
       x: number, y: number, radius: number,
     ): { itemId: number; count: number; x: number; y: number; dist: number }[];
@@ -753,6 +763,62 @@ export interface WorldSaveHost {
    *   不校验"该玩家真的有这一件" —— 那需要先补按件读口(见 `TASK-99`)。
    */
   useItem?(actorId: string, req: { itemId: number; targetId?: string; targetDeviceId?: number }): UseItemOutcome;
+  /**
+   * **百货店购买(515)的报价**(`BUY_ITEM` 的第一步)。**零副作用**:
+   * 在库存副本上跑一遍 `systems/depot.ts:buy`,失败时世界一个字节都不改。
+   *
+   * 为什么拆成「报价 + 提交」两步:动作层要**先知道这笔能不能成**,
+   * 再去扣玩家背包(否则失败时会出现「扣了东西但没买到」)。
+   * `buy` 是纯函数 ⇒ 两次调用算的是同一件事,不构成第二份实现。
+   *
+   * 可选:老的世界源没有摊位 ⇒ 动作层回 `NOT_IMPLEMENTED`(显式能力缺失)。
+   */
+  purchaseQuote?(itemId: number, qty: number): {
+    ok: boolean;
+    reason: string;
+    cost: number;
+    stock: Record<number, number>;
+  };
+  /**
+   * **百货店购买(515)的提交**:只有成交才写库存。
+   *
+   * 与 `purchaseQuote` 一起构成「检查 → 扣背包 → 落定」的三段事务;
+   * 任何一段失败,库存与背包都回到原样(见 `actions/buy_item.ts` 的判序)。
+   */
+  purchaseCommit?(itemId: number, qty: number): { ok: boolean; cost: number; reason: string };
+  /**
+   * **炼金首创冠名 + 537 陈列投影**(`ALCHEMY_LAB` 的系统落点)。
+   *
+   * 为什么不是 `forgeAlchemy`:那条路要外部 LLM 网关,而本仓的确定性
+   * 降级路径(`systems/alchemy_lab.ts` → `alchemy/degrade.ts`)在离线也能出产物 ——
+   * 「全服首创」因此**在没有模型的房间里也可判定**。
+   */
+  brewAtFurnace?(actorId: string, itemIds: readonly number[], opts?: {
+    affinity?: number;
+    suggestedSLogic?: number;
+    at?: number;
+  }): {
+    ok: boolean;
+    reason?: string;
+    first?: boolean;
+    entry?: {
+      recipeHash: string;
+      discovererName: string;
+      itemName: string;
+      itemCategory: string;
+      craftCount: number;
+      firstAt: number;
+      schemaJson: string;
+    };
+    display: {
+      recipeHash: string;
+      discovererName: string;
+      itemName: string;
+      itemCategory: string;
+      craftCount: number;
+      firstAt: number;
+    }[];
+  };
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */
@@ -954,6 +1020,14 @@ export interface ActionPayload {
    * 器件在内容表里是**物件 id**(506 汤锅 / 507 切菜台 / 508 披萨炉),不是玩家 id。
    */
   targetDeviceId?: number;
+  /**
+   * `USE_ITEM`:服务端**账面**的格子序号(0 起,按 `itemId` 升序)。
+   *
+   * 它不是客户端自报的物品 id —— 服务端拿它去自己的按件账上翻出真实 `itemId`,
+   * 与申报的 `itemId` **不一致就拒**(见 `actions/use_item.ts`)。
+   * 之所以让客户端能报 slot:UI 列表天然是"第几格",而**翻译**这一步必须在服务端。
+   */
+  slot?: number;
 }
 
 /**
@@ -969,6 +1043,25 @@ export interface ActionOutcome {
   /** 成功时的后果摘要(回执用)。 */
   effect?: Record<string, string | number | boolean>;
 }
+
+/**
+ * **按件库存读口**(`USE_ITEM` 的 itemId 权威来源)。
+ *
+ * ## 为什么独立成接口,而不是塞进 `ActionContext`
+ *
+ * `actions/types.ts` 是**跨动作**的契约文件(另一条线在改它)。
+ * 这一项只有 `USE_ITEM` 用,且它必须由**房间**实现(账本在 `RoomRuntime`)。
+ * ⇒ 用结构化类型接线:`RoomRuntime` 直接把绑定后的两个函数放进 `ActionContext`,
+ * 处理器侧用 `Partial<ItemReadPort>` 窄化(**缺读口**时走"没有权威"分支,
+ * 而不是假装有 —— 与 `simReadView` 的逐口降级同一取舍)。
+ */
+export interface ItemReadPort {
+  /** 某玩家的某件道具**真的**有几件;0 = 账面没有。 */
+  itemCountOf(userId: string, itemId: number): number;
+  /** 该玩家按 itemId 升序的持有清单(`slot` 报文体据此翻译)。 */
+  itemIdsOf(userId: string): number[];
+}
+
 /**
  * 单个房间的运行时。**不 import colyseus** —— colyseus 的 Room 只是薄装配层
  * (`room.colyseus.ts`),把它的 onTick/onJoin 转发到这里的方法。
@@ -1516,7 +1609,11 @@ export class RoomRuntime {
     payload: ActionPayload,
   ): ActionContext {
     const rt = this;
-    return {
+    /* ★ `USE_ITEM` 的**按件**读口(见 `ItemReadPort` 的 docblock):
+       两个绑定函数独立挂在上下文上,而不是给 `ActionContext` 接口加成员 ——
+       `actions/types.ts` 是跨动作契约(另一条线在改),而读口只有这一个动作消费。
+       用交叉类型交出:处理器侧 `Partial<ItemReadPort>` 窄化即可。 */
+    const ctx: ActionContext & ItemReadPort = {
       actorId,
       action,
       payload,
@@ -1534,7 +1631,10 @@ export class RoomRuntime {
       setAccess: (id, mode, passwordHash) => rt.setAccess(id, mode, passwordHash),
       setPartyModeBy: (id, mode) => rt.setPartyModeBy(id, mode),
       close: () => rt.close(),
+      itemCountOf: (userId, itemId) => rt.authoritativeItemCount(userId, itemId),
+      itemIdsOf: (userId) => rt.authoritativeItemIds(userId),
     };
+    return ctx;
   }
 
   /**
@@ -1758,7 +1858,12 @@ export class RoomRuntime {
     if (r.violation) this.pendingViolations.push(r.violation);
     /* 通过的合法操作要落到总量记账上,否则下一次 beforeTotal 仍是旧值 ——
        那会让「总量守恒」这层在连续操作间隔里失真。 */
-    if (r.allowed) this.applyItemTotalDelta(userId, input.ops);
+    if (r.allowed) {
+      this.applyItemTotalDelta(userId, input.ops);
+      /* ★ 按件权威账的**唯一**写入口(与总量记账同一时机、同一前提:只有放行的 ops 才算)。
+         放在这里而不是 `use_item` 里:那里只该**读**,写会让「谁改的账」出现第二个来源。 */
+      this.applyItemCountDelta(userId, input.ops);
+    }
     /* 第 8 项:通过后立刻把**总量**按明细重算一次(契约 §2.3「变更时投影」)。
        ⚠️ 必须在 applyItemTotalDelta **之后** —— 否则重算读的是变更前的明细。
        ⚠️ 这条与 applyItemTotalDelta 不是重复:后者是纯内存模式的**退路缓存**,
@@ -1842,6 +1947,71 @@ export class RoomRuntime {
   /** 每 tick 的合法产出凭证:userId → source 集合。 */
   private readonly grantedSources = new Map<string, Set<string>>();
 
+  /* ══════════════ 按件权威账(`USE_ITEM` 的 itemId 读口)══════════════
+   *
+   * ## 为什么必须在这里、而且是一张**新的**表
+   *
+   * 修前 `USE_ITEM` 的 `itemId` 是**客户端自报**的(见 `actions/use_item.ts` 的
+   * 历史注释):服务端只有「总量」(`authoritativeItemTotal`)和「有没有这件」分开算不了。
+   * 后果是白嫖:背包里一件 733 都没有,也能无限发 `{itemId:733}` —— 因为扣减只看
+   * 「总量够不够」,随便什么别的道具都能被当成 733 扣掉。
+   *
+   * ## 数据源为什么**不是** `ai_item_instances`(库里的明细)
+   *
+   * 那张表存的是「AI 生成实例」(`slot` / `recipe_hash` / `stats_json`),
+   * **没有内容层 `itemId` 这一列** —— 拿它反查 `itemId` 是查不到东西的。
+   * 而 `applyInventory` 的 `ops` 恰恰带着 `itemId`,且它是**唯一的库存变更路径**
+   * (总量记账也在这里维护,`inventoryTotals` 是同一形态的先例)。
+   * ⇒ 按件账跟着 `ops` 走:唯一写入口 = `applyItemCountDelta`。
+   */
+  private readonly itemCounts = new Map<string, Map<number, number>>();
+
+  /**
+   * **某玩家真的有多少件 `itemId`**(服务端权威读口)。
+   *
+   * 返回值语义:
+   * ```
+   * > 0   真的拥有这么多件
+   * 0     账面没有 —— 调用方必须**拒绝**且零副作用
+   * ```
+   * ⚠️ 不接受负数 / 非有限 `itemId`:那不是「查不到」,是**坏参数** ⇒ 同样返回 0
+   * (fail-closed:坏参数的唯一安全结论是「没有」)。
+   */
+  authoritativeItemCount(userId: string, itemId: number): number {
+    if (!Number.isFinite(itemId)) return 0;
+    const n = this.itemCounts.get(userId)?.get(Math.trunc(itemId)) ?? 0;
+    return n > 0 ? n : 0;
+  }
+
+  /**
+   * 该玩家**按 itemId 升序**的持有清单(> 0 件才出现)。
+   *
+   * `USE_ITEM` 的 `slot` 报文体用它把「第几个格子」翻译成真实的 `itemId`
+   * (服务端说了算;客户端无法用一个 slot 号指认一件它没有的东西)。
+   * 排序是**定序**的关键:同一份账面必须每次都给出同样的 slot 序列,
+   * 否则「刷两次 slot 拿到两件不同的东西」会变成一个可复现的白嫖入口。
+   */
+  authoritativeItemIds(userId: string): number[] {
+    const m = this.itemCounts.get(userId);
+    if (m === undefined) return [];
+    return [...m.entries()].filter(([, n]) => n > 0).map(([id]) => id).sort((a, b) => a - b);
+  }
+
+  /** 把一次**已放行**的 ops 记到按件账上(唯一写入口)。 */
+  private applyItemCountDelta(userId: string, ops: readonly InventoryOp[]): void {
+    let m = this.itemCounts.get(userId);
+    for (const op of ops) {
+      if (!Number.isFinite(op.itemId) || !Number.isInteger(op.delta)) continue;
+      const id = Math.trunc(op.itemId);
+      if (m === undefined) {
+        m = new Map<number, number>();
+        this.itemCounts.set(userId, m);
+      }
+      const next = (m.get(id) ?? 0) + op.delta;
+      /* 不允许负件数 —— 与总量记账的 `next < 0 ? 0` 同一取舍(账面异常夹到 0)。 */
+      m.set(id, next > 0 ? next : 0);
+    }
+  }
   drainViolations(): Violation[] {
     const out = this.pendingViolations;
     this.pendingViolations = [];

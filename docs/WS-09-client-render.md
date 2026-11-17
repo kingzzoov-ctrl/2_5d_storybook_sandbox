@@ -713,15 +713,15 @@ node scripts/verify.ts --only WS-09   → 全部通过
 
 | # | 问题 | 现状 | 建议 | 需要谁裁决 |
 | :--- | :--- | :--- | :--- | :--- |
-| U1 | **`stage_assembly.ts` 依赖 `three`,而仓库零依赖** | 该文件无法在测试中 import | 需要一个**极简 `three` 相容层**(只要 `Scene` / `Mesh` / `BufferGeometry` / `DataTexture` 四个 facade),或把装配逻辑抽象成"产出描述对象"由宿主适配。当前测试覆盖不到它 | Lead |
-| U2 | **顶点颜色 vs 纹理图集** | `tile_mesh` 只输出 quad 批次与图集索引 | 若选纹理图集,`spriteIndex` 已经是图集下标,直接可用;若选顶点色,需要把图集索引改成调色盘索引。这是美术管线的**岔路口**,越晚定越贵 | Lead + 美术 |
-| U3 | **`flattenTree` 的叶子聚合口径** | 同 ID 合并计数 | 若两处需要不同批次数(如 3 个配方各需 1,合并成"需 3"),当前实现是对的;若要保留"来自哪个父节点"的溯源,需要额外结构 | Lead |
-| U4 | **`estimateFaceBreakdown` 的估算精度** | 上界估算 | 是否需要按每 Chunk 实际 `dominantZGrid` 精确算?当前估算是保守上界,配合 `cheapestLodWithinBudget` 够用;若实测有掉帧再改 | Lead |
-| U5 | **染色 `sprayAttenuation` 的距离衰减曲线** | 线性 | 喷枪边缘的柔和度是手感问题,建议由美术调参,不进冻结层 | 美术 + Lead |
-| U6 | **粒子预设的 `rate` 是否该随画质档缩放** | 固定值 | 低端机需要降密度。建议在装配层乘一个全局系数,而不改预设表(预设表是"标准画质"的意图) | Lead |
-| U7 | **`BossTelegraphRow` 与实际预警圈的字段对齐** | 已能 import | 预警圈的 5 种几何(圆/锥/矩形/环/线)与 Boss 表的字段映射需逐 Boss 核对一遍,防止某个 Boss 的预警形状灰落到默认值 | Lead + WS-05 |
+| U1 | **`stage_assembly.ts` 依赖 `three`,而仓库零依赖** | 该文件无法在测试中 import | 需要一个**极简 `three` 相容层**(只要 `Scene` / `Mesh` / `BufferGeometry` / `DataTexture` 四个 facade),或把装配逻辑抽象成"产出描述对象"由宿主适配。当前测试覆盖不到它 | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(极简 three 相容层 `client/src/three/compat.ts`),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U1 |
+| U2 | **顶点颜色 vs 纹理图集** | `tile_mesh` 只输出 quad 批次与图集索引 | 若选纹理图集,`spriteIndex` 已经是图集下标,直接可用;若选顶点色,需要把图集索引改成调色盘索引。这是美术管线的**岔路口**,越晚定越贵 | Lead + 美术 | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):采顶点色(美术管线决定;边界仍成立判据 `tests/WS-FND-73-client-presentation.test.ts`);见 RULINGS-DRAFT §4.3 U2 |
+| U3 | **`flattenTree` 的叶子聚合口径** | 同 ID 合并计数 | 若两处需要不同批次数(如 3 个配方各需 1,合并成"需 3"),当前实现是对的;若要保留"来自哪个父节点"的溯源,需要额外结构 | Lead | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):`flattenTree` 保留父节点溯源;见 RULINGS-DRAFT §4.3 U3 |
+| U4 | **`estimateFaceBreakdown` 的估算精度** | 上界估算 | 是否需要按每 Chunk 实际 `dominantZGrid` 精确算?当前估算是保守上界,配合 `cheapestLodWithinBudget` 够用;若实测有掉帧再改 | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(面数按 `dominantZGrid` 精确算),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U4 |
+| U5 | **染色 `sprayAttenuation` 的距离衰减曲线** | 线性 | 喷枪边缘的柔和度是手感问题,建议由美术调参,不进冻结层 | 美术 + Lead | **已关闭(2026-11-17)** | 由 D-19 落地(染色衰减曲线进冻结层,`shared/constants/dye.ts`),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U5 |
+| U6 | **粒子预设的 `rate` 是否该随画质档缩放** | 固定值 | 低端机需要降密度。建议在装配层乘一个全局系数,而不改预设表(预设表是"标准画质"的意图) | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(粒子 `rate` 随画质档缩放),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U6 |
+| U7 | **`BossTelegraphRow` 与实际预警圈的字段对齐** | 已能 import | 预警圈的 5 种几何(圆/锥/矩形/环/线)与 Boss 表的字段映射需逐 Boss 核对一遍,防止某个 Boss 的预警形状灰落到默认值 | Lead + WS-05 | **已关闭(2026-11-17)** | 由 D-19 落地(5 种预警几何逐 Boss 对照表),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U7 |
 | U8 | **已解决** ~~UI 面板的 320 格全展开是否太重~~ | 实测已改为**分页**:`SLOTS_PER_PAGE = 16 × 10 = 160`(不再是 320) | 原「现状」写「全展开」与代码不符 —— 代码早已走分页(`client/src/ui/inventory.ts:39,45,48`),`TOTAL_ITEM_COUNT = 320` 时必然分 2 页,分页路径不再退化。容量断言与分页切片由 `tests/WS-09.test.ts` 锁定。**本条由 task-14 台账核查判定为「已实现」,Lead 关行** | Lead |
-| U9 | **`client/src/**` 的中文注释曾被 GBK 污染** | 已用 `scripts/fix_mojibake.py` 修复 | 残留的**有损**损坏(字节被截断成 `?`)无法自动还原,需人工按上下文重写。已确认当前全部文件能通过 `--check` | Lead |
-| U10 | **`zoomLevels` 与 `ZOOM_LEVELS` 双导出** | 同一数组的两个名字 | 保留是为了兼容两处命名习惯;若要清理,应保留 `ZOOM_LEVELS` 并给 `zoomLevels` 加 deprecation 注释 | Lead |
-| U11 | **4-邻域 vs 8-邻域的屋顶连通域** | 4-邻域 | 4-邻域让对角相接的屋顶保持独立(已断言);但玩家可能期望"我的 L 形屋顶算一片"。若收到反馈,可加"对角权重"折中方案 | Lead |
-| U12 | **`frustumCull` 返回完整 `ChunkInput` 的内存代价** | 只是引用,不复制 | 当前是引用传递,零拷贝;若将来要传"可见子集的对象副本",需要重新评估 4096 Chunk × 256 单元的拷贝开销 | Lead |
+| U9 | **`client/src/**` 的中文注释曾被 GBK 污染** | 已用 `scripts/fix_mojibake.py` 修复 | 残留的**有损**损坏(字节被截断成 `?`)无法自动还原,需人工按上下文重写。已确认当前全部文件能通过 `--check` | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(GBK 损坏注释人工重写,全仓无 U+FFFD),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U9 |
+| U10 | **`zoomLevels` 与 `ZOOM_LEVELS` 双导出** | 同一数组的两个名字 | 保留是为了兼容两处命名习惯;若要清理,应保留 `ZOOM_LEVELS` 并给 `zoomLevels` 加 deprecation 注释 | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(`zoomLevels` 双导出清理为单一导出),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U10 |
+| U11 | **4-邻域 vs 8-邻域的屋顶连通域** | 4-邻域 | 4-邻域让对角相接的屋顶保持独立(已断言);但玩家可能期望"我的 L 形屋顶算一片"。若收到反馈,可加"对角权重"折中方案 | Lead | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):屋顶连通域保持 4-邻域(判据钉对角不连);见 RULINGS-DRAFT §4.3 U11 |
+| U12 | **`frustumCull` 返回完整 `ChunkInput` 的内存代价** | 只是引用,不复制 | 当前是引用传递,零拷贝;若将来要传"可见子集的对象副本",需要重新评估 4096 Chunk × 256 单元的拷贝开销 | Lead | **已关闭(2026-11-17)** | 由 D-19 落地(`frustumCull` 返回可见子集副本),判据 `tests/WS-FND-73-client-presentation.test.ts`;见 RULINGS-DRAFT §4.3 U12 |

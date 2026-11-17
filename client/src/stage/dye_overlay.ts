@@ -21,6 +21,12 @@
  */
 
 import { unpackTile } from '../../../shared/types/tile.ts';
+import {
+  dyeDecayAt,
+  dyeDecayColor,
+  formatCssRgb,
+  parseHexColor,
+} from './dye_decay.ts';
 
 /** 32 色调色盘(与 UI 的 `PALETTE_32` 同源;这里保留十六进制字符串,装配层转 RGB) */
 export const DYE_PALETTE: readonly string[] = [
@@ -336,6 +342,39 @@ export function sprayAttenuation(distance: number): number {
   if (d <= SPRAY_RANGE_NEAR) return 1;
   if (d >= SPRAY_RANGE_FAR) return 0;
   return 1 - (d - SPRAY_RANGE_NEAR) / (SPRAY_RANGE_FAR - SPRAY_RANGE_NEAR);
+}
+
+/* ───────────────── 距离衰减曲线(WS-09 U5 的消费点)───────────────── */
+
+/**
+ * 某色号在**某距离**下的实际颜色字符串(json → `rgb(r,g,b)`)。
+ *
+ * ## 这是曲线的**唯一**消费点
+ *
+ * 曲线本体住在 `stage/dye_decay.ts`(裁决 U5 的原定落点是 `shared/constants/**`,
+ * 该常量当前尚不存在,详见该文件头「落点说明」)。本函数只做两件事:
+ *   1. 用 `DyeChannel.colorOf` 把 6 bit 色号还原成调色盘基色;
+ *   2. 用 `dyeDecayColor` 把「基色 × 距离衰减」算成最终颜色。
+ *
+ * 为什么不让调用方自己乘:一旦 UI 一处、着色器一处、录制回放一处各自乘,
+ * 就会出现「准星预览的颜色 ≠ 真正喷上去的颜色」,而两边都"看起来合理"。
+ * 判据钉的是**端点 + 单调**(距离 0 等于原色、≥30 格等于黑、
+ * 沿距离亮度不回升),因此换曲线源不会让判据失效。
+ */
+export function sprayColorAtDistance(tintIndex: number, distance: number): string {
+  const base = parseHexColor(DyeChannel.colorOf(tintIndex));
+  return formatCssRgb(dyeDecayColor(base, distance));
+}
+
+/**
+ * 某距离下写进 `uDyeStrength` 的强度值(0..1)。
+ *
+ * 与 `sprayAttenuation`(线性,已冻结的旧口径)并存:`sprayAttenuation` 管
+ * 「这一枪能不能染上」,本函数管「染上去有多浓」。两者不可互相替代 ——
+ * 前者的 22.5 格必须是 0.5(既有判据),而后者的曲线在那里是 0.61(21→24 格之间)。
+ */
+export function sprayStrengthAtDistance(distance: number): number {
+  return dyeDecayAt(distance);
 }
 
 /** 单次喷色的染料消耗(格数越多越费) */

@@ -228,47 +228,24 @@ const STALE_PROBES: { doc: string; id: string; claim: RegExp; file: string; prob
    * 里的调用,而不是 physics/world.ts 里的定义。
    * ═══════════════════════════════════════════════════════════════════ */
 
-  /* ── DAMAGE-LOOP.md ── */
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D1',
-    claim: /击退|硬直/,
-    file: 'server/src/sim/world_sim.ts',
-    probe: /applyImpulse\(/,
-    why: '击退写回 PhysicsBody 后,编排层会出现 applyImpulse 调用(定义在 physics/world.ts,但生产调用点为 0)',
-  },
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D2',
-    claim: /不检查视线/,
-    file: 'server/src/sim/world_sim.ts',
-    probe: /lineOfSight|hasLineOfSight|losClear/,
-    why: '结算前加射线遮挡判定后,会出现视线函数;当前全仓无任何 lineOfSight 类符号',
-  },
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D3',
-    claim: /PvP/,
-    file: 'server/src/combat/damage.ts',
-    probe: /\bpvp\b|\bPvp\b|\bPVP\b/,
-    why: 'PvP 分支落地后伤害管线会出现 pvp 标识;当前 damage.ts 无任何 PvP 语义',
-  },
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D4',
-    claim: /元素抗性/,
-    file: 'server/src/combat/vitals.ts',
-    probe: /elementResist|resistMul|resistOf/,
-    why: '生物攻击带元素抗性后,玩家侧结算处会出现抗性系数;当前抗性只在 progression 天赋里出现',
-  },
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D5',
-    claim: /玩家侧无对应状态/,
-    file: 'server/src/combat/vitals.ts',
-    probe: /blindSec|blindUntil|blindedSec/,
-    why: '玩家侧出现致盲状态时会新增 blind 计时字段;当前 blindSec 只存在于 mobs/behaviors.ts 的 rt.mem',
-  },
+  /* ── DAMAGE-LOOP.md —— 2026-11-17 退役(frozen-doc 关闭登记) ──
+   *
+   * D1–D5 / D7 的原探针(`applyImpulse\(` / `lineOfSight` / `pvp` /
+   * `elementResist` / `blindSec` / `savePlayerState`)语义是
+   * 「文档说没做,而代码里已经有了」。本批 D-19 第 8 条「战斗 D1–D7 全做」
+   * 已把这几条落地:受击经 `applyHit` 折算击退并写回 `PhysicsBody`
+   * (`world_sim.ts` 的 `applyKnockback` + `applyImpulse`)、视线遮挡经
+   * `server/src/world/vision.ts` 的 `losBlocked`、PvP 经 `damage.ts` 的
+   * `pvpVerdict`、玩家侧元素抗性经 `vitals.elementResistOf`、玩家侧致盲计时、
+   * 血量经 `worldSaveHost` 落盘。判据:`tests/WS-FND-71-combat-depth.test.ts`。
+   *
+   * **为什么「移出」而不是把文档行划掉**:`docs/DAMAGE-LOOP.md` 的未决表由
+   * 另一条工作流独占编辑(本任务禁改),行内无法加 `~~`。于是这些条目的关闭
+   * 依据改登记在本文件的 `CLOSURE_ANNEX`(见 `collectOpenItems`);源文档一旦
+   * 可写,应把行就地标注并从 annex 移除。
+   *
+   * 反悔哨兵:若击退/视线/PvP/抗性被回退,`tests/WS-FND-71` 会先红 ——
+   * 探针的职责已由判据继承,故这里不再保留「文档说没做」型探针。 */
   {
     doc: 'DAMAGE-LOOP.md',
     id: 'D6',
@@ -277,15 +254,6 @@ const STALE_PROBES: { doc: string; id: string; claim: RegExp; file: string; prob
     probe: /createDowned|touchRevive|featherRevive|flagRevive/,
     why: '复活流程接入编排层后会 import combat/revive.ts;当前该模块只被 tests/WS-10.test.ts 引用',
   },
-  {
-    doc: 'DAMAGE-LOOP.md',
-    id: 'D7',
-    claim: /持久化|满血/,
-    file: 'server/src/sim/world_sim.ts',
-    probe: /savePlayerState|loadPlayerVitals/,
-    why: '血量落盘接入后会调用存档函数;当前 savePlayerState 全仓只有 WS-07 测试调用(零生产调用点)',
-  },
-
   /* ── FLUID-BUDGET.md ── */
   {
     doc: 'FLUID-BUDGET.md',
@@ -415,6 +383,35 @@ const STALE_PROBES: { doc: string; id: string; claim: RegExp; file: string; prob
   },
 ];
 
+/**
+ * 冻结文档关闭登记(closure annex)。
+ *
+ * ## 为什么需要这张表
+ *
+ * 台账的「已关闭」原本只看**源文档行内**的标记(`已解决` / `~~` / …)。
+ * 但 `docs/DAMAGE-LOOP.md` 的未决表由**另一条工作流独占编辑**(本任务禁改),
+ * 无法在行内就地标注。于是这些条目的**关闭依据**登记在这里:它们与
+ * `STALE_PROBES` 同属台账的**数据表**,只是方向相反 —— 探针回答
+ * 「文档说没做、代码却已经有了吗」,本表回答「源文档只读的条目,依据在哪」。
+ *
+ * ## 与源文档的同步义务
+ *
+ * `docs/DAMAGE-LOOP.md` 一旦可写,必须把对应行就地标注
+ * `| **已关闭(2026-11-17)** | <本表 basis> |` 并**从本表删除**。
+ * 保留不删会让「关闭依据」出现两份,日后必然漂移。
+ *
+ * 判据来源:`docs/TASK-96-action-landing-gaps.md` §二之八、
+ * `docs/COMPLETION-CRITERIA.md` ★第二批收口表、`docs/RULINGS-DRAFT.md`。
+ */
+const CLOSURE_ANNEX: { doc: string; id: string; basis: string }[] = [
+  /* D1 / D3 / D4 / D5 自 2026-11-17 起已由另一条工作流在 `docs/DAMAGE-LOOP.md` 行内
+     就地标注(~~…~~ **已关闭**),故按上面「同步义务」从此表移除,避免关闭依据出现两份。
+     仍留在这里的,是源文档尚未就地标注的那几条。 */
+  { doc: 'DAMAGE-LOOP.md', id: 'D2', basis: '由 D-19 落地:world/vision.ts 的 losBlocked 接进 resolveStrikes;判据 tests/WS-FND-71-combat-depth.test.ts FND71-3/4' },
+  { doc: 'DAMAGE-LOOP.md', id: 'D7', basis: '由 D-19 落地:worldSaveHost 一行装配,血量落盘/读回闭环;判据 tests/WS-FND-71-combat-depth.test.ts FND71-13' },
+  { doc: 'DAMAGE-LOOP.md', id: 'D8', basis: '由 D-19 落地(删除无消费者的 blockedKeys 预留入口),见 RULINGS-DRAFT §4.8 DAMAGE-LOOP D8 行' },
+];
+
 /** 抽出所有文档的未决条目。 */
 export function collectOpenItems(): OpenItem[] {
   const docsDir = join(ROOT, 'docs');
@@ -443,12 +440,22 @@ export function collectOpenItems(): OpenItem[] {
          实测踩过:`WS-11` U12 写着「**Lead 已采纳**:不改为冻结计时器」,
          却因为含「阻塞玩家操作」这个词被误判成阻塞项。判据必须排除已裁决。 */
       const decided = /已采纳|已定稿|已裁决|已解决|已删除|已修正诊断|~~/.test(raw);
+      const id = `${m[1]}${m[2]}`;
+      /* 关闭判据 = 行内标记 ∪ 冻结文档关闭登记(`CLOSURE_ANNEX`)。
+         ★ 2026-11-17 把「已关闭 / 已完成」纳入标记词 —— 实测踩过:
+         `docs/ADVERSARIAL-REVIEW-10.md` U5 写着「**已完成**」,却没有一个词命中
+         旧判据(只认 已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~),
+         于是至少 4 条已完成的条目**滞留在未关闭计数里**
+         (见 `docs/BACKLOG-108-TRIAGE.md` §6.5)。这是工具口径缺陷,不是实现缺陷。 */
+      const closed =
+        /已关闭|已完成|已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~/.test(raw) ||
+        CLOSURE_ANNEX.some((c) => c.doc === f && c.id === id);
       items.push({
         doc: f,
-        id: `${m[1]}${m[2]}`,
+        id,
         text: m[3].trim().replace(/\s+/g, ' ').slice(0, 110),
         blocking: !decided && /阻塞|阻断|需 CR|需先定/.test(raw),
-        closed: /已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~/.test(raw),
+        closed,
         line: i + 1,
       });
     }
@@ -508,7 +515,7 @@ export function auditProbes(): ProbeHealth[] {
     const row = findLedgerRow(docText, p.id);
     if (!row) out.push({ doc: p.doc, id: p.id, why: p.why, status: 'row-missing' });
     else if (!p.claim.test(row)) out.push({ doc: p.doc, id: p.id, why: p.why, status: 'claim-drift' });
-    else if (/~~/.test(row)) out.push({ doc: p.doc, id: p.id, why: p.why, status: 'archived' });
+    else if (/~~|已关闭/.test(row)) out.push({ doc: p.doc, id: p.id, why: p.why, status: 'archived' });
     /* 跑在**代码态**文本上 —— 见 `stripToCode` 的说明:
        去注释还不够,字符串内容也必须擦掉,否则 `"US2 仍未接 WorldSim"`
        这种「说明它还没做」的字符串会反过来让探针报「已过时」。 */
@@ -534,8 +541,10 @@ export function detectStale(): { doc: string; id: string; why: string }[] {
     /* 该条目行是否仍在声称那件事 */
     const row = findLedgerRow(docText, p.id);
     if (!row || !p.claim.test(row)) continue;
-    /* 已被划掉(~~)视为已归档,不算过时 */
-    if (/~~/.test(row)) continue;
+    /* 已被划掉(~~)或已就地标注「已关闭」的条目视为已归档,不算过时:
+       关闭的行不再是「文档说没做」;若代码后来真有了,那是越过了已登记的边界,
+       应在文档层重新开行,而不是让探针报一条早已关掉的台账。 */
+    if (/~~|已关闭/.test(row)) continue;
     /* 与 `auditProbes` 同一口径:跑在**代码态**文本上,否则两个函数会
        给出互相矛盾的结论(一个报过时、一个报在岗)。 */
     if (p.probe.test(stripToCode(codeText))) {

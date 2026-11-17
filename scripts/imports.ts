@@ -116,3 +116,99 @@ export function extractRelativeImports(text: string): string[] {
   }
   return out;
 }
+
+/** 一处动态 `import()` 的位置与它是否字面量。 */
+export interface DynamicImportSite {
+  /** 1-based 行号(数的是 `(` 所在行)。 */
+  line: number;
+  /** `true` = 说明符是字符串字面量(已跟踪);`false` = 变量/表达式(**不跟踪**)。 */
+  literal: boolean;
+}
+
+/**
+ * 找出源码里**所有**动态 `import(...)`,并标出说明符是不是字面量。
+ *
+ * ## 为什么需要它与 `extractRelativeImports` 并存
+ *
+ * `extractRelativeImports` 只产出**能跟踪的**边(字面量相对说明符)。
+ * 于是"不跟踪"这种情形在门禁里**完全不可见** —— 它不是"0 命中",
+ * 而是**根本没有这个词**。
+ * `docs/RULINGS-DRAFT.md` §4.5 已裁定把「动态 `import()` 不跟踪」**正式接受**
+ * (影响=零),但接受的前提是**它每次都被打印出来**,而不是靠"没人再提"。
+ * ⇒ 本函数提供计数口径:字面量几处(已跟踪)/ 非字面量几处(已接受边界)。
+ *
+ * ## 覆盖与不覆盖(与 `extractRelativeImports` 完全一致)
+ *
+ * ```
+ * await import('./dyn.ts')   ⇒ 字面量 ✓
+ * await import(`./t.ts`)     ⇒ 字面量 ✓
+ * await import(name)         ⇒ 非字面量(本函数的目的)
+ * import.meta.url / .main    ⇒ 不是导入(`.` 不是 `(`)⇒ 不算
+ * 注释/字符串里的 import(    ⇒ 不算(逐字符扫描,跳过注释与字符串)
+ * ```
+ *
+ * ⚠️ 模板串里的 `${...}` 整段跳过 ⇒ 其中若嵌 `import(x)` 会漏。
+ *   这是**已知且刻意的边界**(与 `stripCommentsAndStrings` 同一取舍):
+ *   宁可漏报嵌套在模板串里的代码,也不要因误解析把后面的代码吞进字符串。
+ */
+export function findDynamicImports(text: string): DynamicImportSite[] {
+  const n = text.length;
+  const lineStarts: number[] = [0];
+  for (let i = 0; i < n; i += 1) if (text[i] === '\n') lineStarts.push(i + 1);
+  const lineOf = (index: number): number => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if ((lineStarts[mid] as number) <= index) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  const isId = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9_$]/.test(c);
+  const out: DynamicImportSite[] = [];
+  let i = 0;
+  while (i < n) {
+    const c = text[i] as string;
+    if (c === '/' && text[i + 1] === '*') { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+    if (c === '/' && text[i + 1] === '/') { const e = text.indexOf('\n', i); i = e < 0 ? n : e; continue; }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c;
+      i += 1;
+      while (i < n) {
+        if (text[i] === '\\') { i += 2; continue; }
+        if (text[i] === q) { i += 1; break; }
+        i += 1;
+      }
+      continue;
+    }
+    if (isId(c) && !isId(text[i - 1])) {
+      let j = i;
+      while (j < n && isId(text[j])) j += 1;
+      if (text.slice(i, j) === 'import') {
+        let k = j;
+        while (k < n && /\s/.test(text[k] as string)) k += 1;
+        if (text[k] === '(') {
+          let m = k + 1;
+          while (m < n && /\s/.test(text[m] as string)) m += 1;
+          const dq = text[m];
+          /* ⚠️ **空实参 `import()` 一律不算**(实测踩到的伪命中):
+             本仓有**消息文本**里写着 `import()` 字样的断言(如
+             `tests/WS-FND-01.test.ts` 的「以动态 import() 引用 baseline.ts」),
+             而扫描器遇到**正则字面量里的引号**(`/import\(\s*['"]…/`)时会把
+             引号当成字符串起止 ⇒ 字符串状态错位 ⇒ 紧随其后的那句 `'…import()…'`
+             被当成**代码态**。`import()` 空实参在 TS 里本来就不合法,
+             所以这条过滤**不会漏掉任何真导入**,只挡掉状态错位的伪命中。
+             ★ 记下它而不是悄悄加:这是本文件第二个"引号状态会被正则骗到"的实例,
+               真修法是给扫描器加正则字面量识别(牵动 `extractRelativeImports`),
+               不属本次范围。 */
+          if (dq !== ')') out.push({ line: lineOf(k), literal: dq === "'" || dq === '"' || dq === '`' });
+        }
+      }
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}

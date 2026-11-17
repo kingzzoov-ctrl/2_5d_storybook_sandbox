@@ -50,6 +50,20 @@ import {
   shaderMaterialFlags,
   uniformTypeKind,
 } from '../stage/assembly_math.ts';
+import { assembleChunkGeometry, assembleTerrainMaterial, setThreeProvider, threeSource } from './compat.ts';
+import { crossCheckExactFaces, exactFaceCount } from './count.ts';
+
+/**
+ * ★ WS-09 U1 的唯一注入点:真 `three` 从这里进相容层。
+ *
+ * 为什么放在模块顶层而不是函数里:装配是本模块每一次调用的前提,
+ * 放到函数里就变成"谁忘了调谁静默退回兜底"—— 那种缺陷只在真机上表现为
+ * 画面空白,单测永远看不见。
+ *
+ * 类型上 `three` 在本仓没有声明文件(基线里 `stage_assembly.ts` 的 TS7016 就是它),
+ * 因此这里是 `unknown` 中转 —— 相容层只认 `ThreeLike` 那 4 个构造器。
+ */
+setThreeProvider(THREE as unknown as Parameters<typeof setThreeProvider>[0]);
 
 /* ───────────────────── 正交相机装配 ───────────────────── */
 
@@ -80,11 +94,17 @@ export function cameraForward(): THREE.Vector3 {
 /* ───────────────────── 分块网格装配 ───────────────────── */
 
 /**
- * 把 `buildChunkQuads` 的面数结果落成真实 BufferGeometry。
+ * 把面数结果落成真实 BufferGeometry(**经相容层装配**)。
  *
  * **本函数曾经只分配缓冲、从不写入** —— position 数组全是 0,地形一个三角形
  * 都画不出来,而 3226 行 WS-09 测试全绿(它们只断言 `vertexCount` 这个数字)。
- * 现在顶点由 `stage/chunk_geometry.emitChunkGeometry` 产出,与计数同源。
+ * 现在顶点与**顶点色**都由 `stage/chunk_geometry.emitChunkGeometry` 产出,与计数同源,
+ * 并由相容层(`three/compat.ts`)塞进引擎 —— 没有 three 时同一段装配走兜底实现。
+ *
+ * 三条硬不变量,任一违反即抛:
+ *   1. 几何自检(含顶点色长度/值域)通过;
+ *   2. `dominantZGrid` 精确面数 == 写出面数(WS-09 U4);
+ *   3. `exactFaces` 与 `buildChunkQuads` 不漂移。
  */
 export function buildChunkGeometry(chunk: ChunkInput, lod: number): THREE.BufferGeometry {
   const emitted = emitChunkGeometry(chunk, lod);
@@ -93,16 +113,30 @@ export function buildChunkGeometry(chunk: ChunkInput, lod: number): THREE.Buffer
     /* 几何与计数不一致是**结构性错误**,不能静默通过 —— 直接抛,让它在开发期就炸出来 */
     throw new Error(`buildChunkGeometry: ${err}`);
   }
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(emitted.positions, 3));
-  geom.setAttribute('uv', new THREE.BufferAttribute(emitted.uvs, 2));
-  geom.setAttribute('normal', new THREE.BufferAttribute(emitted.normals, 3));
-  geom.setAttribute('aLodMerge', new THREE.BufferAttribute(
-    new Float32Array(emitted.vertexCount).fill(lodMergeSize(lod)),
-    1,
-  ));
-  geom.setIndex(new THREE.BufferAttribute(emitted.indices, 1));
-  return geom;
+  const exact = exactFaceCount(chunk, lod);
+  if (exact !== emitted.faceCount) {
+    throw new Error(
+      `buildChunkGeometry: dominantZGrid 精确面数 ${exact} ≠ 写出面数 ${emitted.faceCount}(${chunk.key} LOD${lod})`,
+    );
+  }
+  const drift = crossCheckExactFaces(chunk, lod);
+  if (drift !== null) throw new Error(`buildChunkGeometry: ${drift}`);
+  return assembleChunkGeometry(emitted, lod) as unknown as THREE.BufferGeometry;
+}
+
+/**
+ * 地形材质:顶点色(无纹理图集)。
+ *
+ * 返回的 `vertexColors === true` 且片元源码不含采样器 —— 与
+ * `stage/terrain_vcolor.ts` 的判据同一份源码,不存在"测试查 A、渲染跑 B"。
+ */
+export function buildTerrainMaterial(): THREE.ShaderMaterial {
+  return assembleTerrainMaterial() as unknown as THREE.ShaderMaterial;
+}
+
+/** 当前装配走的是真 three 还是相容层兜底(浏览器自检可读它) */
+export function assemblySource(): 'injected' | 'fallback' {
+  return threeSource();
 }
 
 /* ───────────────────── Shader 材质 ───────────────────── */

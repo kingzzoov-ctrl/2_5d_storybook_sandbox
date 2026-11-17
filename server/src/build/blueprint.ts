@@ -1,37 +1,63 @@
 /**
- * WS-03 / 208 魔法描图卷轴:16×16 框选 → 压缩蓝图码 → 材料清单 → 飞砖接力队列。
+ * WS-03 / 208 魔法描图卷轴:矩形框选 → 压缩蓝图码 → 材料清单 → 飞砖接力队列。
  *
  * 蓝图码格式(纯文本,可贴进聊天框):
  *   "BP1:<w>x<h>:<payload>"
  *   payload = base64( RLE 三元组流 ),三元组 = [value:varint][run:varint]
  *   varint  = 7-bit 小端续位编码,高位 1 表示后续字节继续
+ *   value   = **宽单元值**(`shared/types/tile.ts#wideCellValue`:lo + hi×2^32,
+ *             u16 地砖 + u16 物体 ID,含四色暗线位)
  *
- * 因为 16×16 自建房屋中同质区域极大(整面墙、整片地板),RLE 后的三元组
- * 通常只有 30~120 组,蓝图码长度稳定落在 100~400 字符区间。
+ * 尺寸:**任意 w × h**(下限 16、上限 128)。裁决 2026-11-17 · D-19 起
+ * `BLUEPRINT_SIZE = 16` 只是**默认值**,不再是对尺寸的断言。
+ *
+ * 因为自建房屋中同质区域极大(整面墙、整片地板),RLE 后的三元组通常只有
+ * 30~120 组,16×16 蓝图码长度稳定落在 100~400 字符区间。floor/obj 超出
+ * 32 位字宽时高位字非 0,单个游程值最多 7 字节(旧版 ≤ 5 字节),
+ * 但**同样 ID 范围内的旧码字节不变**。
  *
  * 本文件只依赖 `node:*` 与冻结层符号。
  */
 
 import { ITEM_BY_ID, itemName, itemValue } from '../../../shared/constants/items.ts';
-import { packTile, unpackTile } from '../../../shared/types/tile.ts';
+import {
+  FLOOR_WORD_MASK, OBJ_WORD_MASK, fieldsFromWideValue, packTile, unpackTile, wideCellValue,
+} from '../../../shared/types/tile.ts';
 import { TileGrid, type TileGridLike } from './grid.ts';
 /* 地板槽位 → ID 的唯一事实源(WS-01),不得在本地重写偏移 */
 import { floorIdOfSlot } from '../world/chunk.ts';
 
-/** 描图卷轴 208 的固定框选尺寸。 */
+/**
+ * 208 描图卷轴的**默认**框选边长(格)。
+ * 裁决 2026-11-17 · D-19 解除了「必须恰好 16×16」的定长假设:
+ * 现在支持任意 `w × h`,下限仍是 16(既有判据 WT-03-37 未撤销)。
+ */
 export const BLUEPRINT_SIZE = 16;
+/** 默认 16×16 场景的格数(256)。非默认尺寸用 `blueprintCellCount(bp)`。 */
 export const BLUEPRINT_CELLS = BLUEPRINT_SIZE * BLUEPRINT_SIZE;
+/** 框选下限:单边 16 格。 */
+export const BLUEPRINT_MIN_SIZE = 16;
+/**
+ * 框选上限:单边 128 格(16384 格/张)。
+ *
+ * 为什么不真是「任意」:蓝图码是**贴进聊天框的文本**,接力队列又是**每格一个
+ * `RelayTask`** ⇒ 无上限时一张 512×512 蓝图就是 26 万个任务的数组。上限只挡
+ * 病态输入,不挡玩法(8 人并发铺 128×128 已是极端用例)。
+ */
+export const BLUEPRINT_MAX_SIZE = 128;
+/** 单张蓝图格数上限(16384)。 */
+export const BLUEPRINT_MAX_CELLS = BLUEPRINT_MAX_SIZE * BLUEPRINT_MAX_SIZE;
 /** 蓝图码魔数前缀。 */
 export const BLUEPRINT_MAGIC = 'BP1';
 
 export interface BlueprintCell {
-  /** 物体 ID(Bits 16..27) */
+  /** 物体 ID(**u16**,0 = 空)。落位到 32 位世界格时只保留低 12 位。 */
   obj: number;
-  /** 地砖 ID(Bits 6..11) */
+  /** 地砖 ID(**u16**,0 = 无铺装)。落位到 32 位世界格时只保留低 6 位。 */
   floor: number;
   /** 海拔(Bits 0..1) */
   elev: number;
-  /** 四色暗线位(Bits 12..15) */
+  /** 四色暗线位(Bits 12..15)—— 裁决 4.1 U7:蓝图允许带暗线,原样保留 */
   wire: number;
   /** 运行态 + 朝向(Bits 28..31) */
   meta: number;
@@ -75,27 +101,39 @@ export interface MaterialManifest {
 
 /* ─────────────────── varint + base64 ─────────────────── */
 
+/**
+ * 写一个 varint。
+ *
+ * ⚠️ **不能用 32 位运算实现**(旧版写的是 `n >>>= 7`):宽单元值最大 46 位,
+ * `>>>` 会把它悄悄截成 32 位 ⇒ 大 ID 静默丢高位、蓝图码照样「成功」。
+ * 这里全程整数除法;在 0 .. 2^32−1 上两种写法产生的**字节完全相同**
+ * (7 位分组一致),所以旧蓝图码不受影响。
+ */
 function pushVarint(out: number[], v: number): void {
-  let n = v >>> 0;
-  while (n >= 0x80) {
-    out.push((n & 0x7f) | 0x80);
-    n >>>= 7;
+  if (!Number.isFinite(v) || v < 0 || Math.trunc(v) !== v) {
+    throw new Error(`蓝图码编码失败:非法游程值 ${v}`);
   }
-  out.push(n & 0x7f);
+  let n = Math.trunc(v);
+  while (n >= 0x80) {
+    out.push((n % 0x80) | 0x80);
+    n = Math.floor(n / 0x80);
+  }
+  out.push(n);
 }
 
 interface Cursor { i: number; buf: readonly number[]; }
 
+/** 读一个 varint(与 `pushVarint` 对称,支持到 46 位)。 */
 function readVarint(c: Cursor): number {
   let shift = 0;
   let result = 0;
   for (;;) {
     if (c.i >= c.buf.length) throw new Error('蓝图码截断:varint 不完整');
-    if (shift > 35) throw new Error('蓝图码损坏:varint 过长');
+    if (shift > 42) throw new Error('蓝图码损坏:varint 过长');
     const b = c.buf[c.i];
     c.i += 1;
-    result |= (b & 0x7f) << shift;
-    if ((b & 0x80) === 0) return result >>> 0;
+    result += (b & 0x7f) * Math.pow(2, shift);
+    if ((b & 0x80) === 0) return result;
     shift += 7;
   }
 }
@@ -149,16 +187,29 @@ export function fromBase64(text: string): number[] {
 
 /* ─────────────────── 编码 / 解码 ─────────────────── */
 
+/**
+ * 蓝图格 → 游程值(**宽单元**:u16 地砖 + u16 物体 ID,裁决 2026-11-17 · D-19)。
+ *
+ * 32 位单元格装不下 u16+u16,故用 `shared/types/tile.ts#wideCellValue()`
+ * (lo + hi × 2^32)。当 floor ≤ 63 且 obj ≤ 4095 时高位字为 0,
+ * 该值与旧版 `packTile(...)` 的返回值**完全相同** ⇒ 旧蓝图码仍可解码。
+ */
 function cellToValue(c: BlueprintCell): number {
-  return packTile({ elev: c.elev, base: 0, floor: c.floor, wire: c.wire, obj: c.obj, meta: c.meta });
+  return wideCellValue({ elev: c.elev, base: 0, floor: c.floor, wire: c.wire, obj: c.obj, meta: c.meta });
 }
 
+/** 游程值 → 蓝图格。四色暗线位原样保留(裁决 4.1 U7:蓝图允许带暗线)。 */
 function valueToCell(v: number): BlueprintCell {
-  const f = unpackTile(v);
+  const f = fieldsFromWideValue(v);
   return { obj: f.obj, floor: f.floor, elev: f.elev, wire: f.wire, meta: f.meta };
 }
 
-/** 从世界框选 16×16 生成蓝图(越界部分按空处理)。 */
+/**
+ * 从世界框选 `w × h` 生成蓝图(越界部分按空处理)。
+ *
+ * 尺寸自 D-19 起不再定长:16×16 只是**默认值**。下限 16 保留
+ * (既有判据 WT-03-37 未撤销),上限 `BLUEPRINT_MAX_SIZE`。
+ */
 export function captureBlueprint(
   grid: TileGrid,
   originX: number,
@@ -166,8 +217,14 @@ export function captureBlueprint(
   w: number = BLUEPRINT_SIZE,
   h: number = BLUEPRINT_SIZE,
 ): Blueprint {
-  if (w !== BLUEPRINT_SIZE || h !== BLUEPRINT_SIZE) {
-    throw new Error(`208 描图卷轴只支持 ${BLUEPRINT_SIZE}×${BLUEPRINT_SIZE} 框选,收到 ${w}×${h}`);
+  if (!Number.isInteger(w) || !Number.isInteger(h)
+    || w < BLUEPRINT_MIN_SIZE || h < BLUEPRINT_MIN_SIZE
+    || w > BLUEPRINT_MAX_SIZE || h > BLUEPRINT_MAX_SIZE
+    || w * h > BLUEPRINT_MAX_CELLS) {
+    throw new Error(
+      `208 描图卷轴框选须在 ${BLUEPRINT_MIN_SIZE}×${BLUEPRINT_MIN_SIZE}`
+      + ` ~ ${BLUEPRINT_MAX_SIZE}×${BLUEPRINT_MAX_SIZE} 之间,收到 ${w}×${h}`,
+    );
   }
   const cells: BlueprintCell[] = [];
   for (let y = 0; y < h; y += 1) {
@@ -227,8 +284,14 @@ export function decodeBlueprint(code: string): Blueprint {
   if (!m) throw new Error(`蓝图码尺寸段非法:${size}`);
   const w = Number(m[1]);
   const h = Number(m[2]);
-  if (w !== BLUEPRINT_SIZE || h !== BLUEPRINT_SIZE) {
-    throw new Error(`蓝图尺寸 ${w}×${h} 超出 208 卷轴能力 ${BLUEPRINT_SIZE}×${BLUEPRINT_SIZE}`);
+  if (!Number.isInteger(w) || !Number.isInteger(h)
+    || w < BLUEPRINT_MIN_SIZE || h < BLUEPRINT_MIN_SIZE
+    || w > BLUEPRINT_MAX_SIZE || h > BLUEPRINT_MAX_SIZE
+    || w * h > BLUEPRINT_MAX_CELLS) {
+    throw new Error(
+      `蓝图尺寸 ${w}×${h} 超出 208 卷轴能力`
+      + `(单边 ${BLUEPRINT_MIN_SIZE}..${BLUEPRINT_MAX_SIZE})`,
+    );
   }
   const bytes = fromBase64(payload);
   const cursor: Cursor = { i: 0, buf: bytes };
@@ -572,8 +635,15 @@ export class RelayQueue {
     for (const t of this.tasks) {
       if (t.state !== RelayTaskState.PLACED) continue;
       const f = unpackTile(grid.get(ox + t.lx, oy + t.ly));
-      f.obj = t.obj & 0xfff;
-      f.floor = t.floor & 0x3f;
+      /*
+       * 32 位世界格只能装 ID 的**低位部分**:`FLOOR_WORD_MASK`(6 位)/
+       * `OBJ_WORD_MASK`(12 位)就是「一个世界格装得下的宽度」。u16 高位在
+       * 蓝图码里完整保留,落位到 32 位世界格时按位宽截断 —— 这是**登记过的
+       * 边界**(见 `shared/contracts/FREEZE.md` D-19 条:世界格/存档扩宽
+       * 归 WS-01 / WS-07,不在本批)。
+       */
+      f.obj = t.obj & OBJ_WORD_MASK;
+      f.floor = t.floor & FLOOR_WORD_MASK;
       f.elev = t.elev & 0x3;
       f.wire = t.wire & 0xf;
       f.meta = t.meta & 0xf;
@@ -601,8 +671,16 @@ export function relayWorkload(tasks: readonly RelayTask[]): Map<string, number> 
   return m;
 }
 
-/** 蓝图格数(恒定 256),供 UI 显示。 */
+/**
+ * 默认 16×16 场景的格数(恒定 256),供 UI 显示。
+ * 非默认尺寸请用 `blueprintCellCount(bp)` —— 尺寸自 D-19 起不再是一个常量。
+ */
 export const BLUEPRINT_CELL_COUNT = BLUEPRINT_CELLS;
+
+/** 蓝图实际格数 `w × h`。 */
+export function blueprintCellCount(bp: Blueprint): number {
+  return bp.w * bp.h;
+}
 
 /** 从蓝图取出非空格坐标清单(材料投喂的遍历顺序)。 */
 export function blueprintSolidCells(bp: Blueprint): { lx: number; ly: number; obj: number }[] {

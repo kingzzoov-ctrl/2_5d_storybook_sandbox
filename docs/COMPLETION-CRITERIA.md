@@ -272,6 +272,11 @@ Lead 全局复核(208 文件含 _design/):
     用真 vite 8 + es2022 建对照包证明构建链本身通,而它在**解析阶段**即死
     (`ERR_MODULE_NOT_FOUND`)。见 `docs/MEASUREMENTS-S5.md` §2。
     ⇒ 「兼容」这一半**没有任何证据**,不许当成"已兼容"。
+
+> ★ **2026-11-17 owner 裁决(D-19 第 9 条)**:上面两项(真机 FPS、`colyseus.js`+vite8 兼容)
+> 在本环境**物理不可测**(无真机 / 依赖不在 `node_modules`),现状态改为
+> **「等 owner 提供环境」**——不再是"未决欠账",也不再出现在 `node scripts/backlog.ts` 的未关闭里。
+> 两者一旦拿到环境,判据分别是:`node scripts/fps-probe.ts` 在真机上的读数、以及真 `colyseus.js` 包的构建产物。
 [x] `RoomSchema` 与 `prediction.ts` 的 `Snapshot` **逐字段**对齐 —— 已出**逐字段表**
     (14 字段 × 在 PlayerSchema?/类型一致?/在 Snapshot?/解码覆盖?),判据
     `tests/WS-FND-24-contract-align.test.ts`(7 条)。查出**两条真实不一致**:

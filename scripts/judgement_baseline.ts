@@ -233,6 +233,58 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
       + '⇒ 处置:**登记为边界**,不修。若将来它真的承担了依赖图职责,此条应重新定性。',
   },
 
+  /* ─────────── ★ 2026-11-17(WS-FND-73 客户端表现层地基接线线):新增 5 处 ───────────
+     `tests/WS-FND-73-client-presentation.test.ts` 里有一类**定向形态断言**:
+     目标模块名/包名**写死在断言里**(three / stage_assembly.ts / ./dye_decay.ts /
+     shared/constants/dye.ts),用途是守**分层不变量**与**消费点存在性**,
+     不是依赖图遍历 ⇒ C 检测器的判据「未覆盖裸副作用导入与动态 import()」对它们**不适用**。
+     ⇒ 逐条登记(与 `WS-09::importsThree`、`WS-FND-60` 两处同族),不修代码:
+       这些断言本身是有牙齿的(目标模块一旦出现/消失就红),收敛写法反而会削弱它们。 */
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "three['\"]/.test(text)",
+    verdict: '已定性无害',
+    reason:
+      '定向断言「`compat.ts` 不得 import three」—— 包名写死,'
+      + '裸副作用导入 / 动态 import 对 three 这条不适用(与 `WS-09::importsThree` 同族)。'
+      + '⚠️ 它守着**分层不变量**:兜底相容层一旦真的依赖 three,「无 three 也能装配」当场失效。',
+  },
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "stage_assembly\\.ts['\"]/.test(text)",
+    verdict: '已定性无害',
+    reason: '定向断言「`compat.ts` 不得反向依赖装配层」—— 目标文件名写死,不是依赖图遍历。',
+  },
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "three['\"]/.test(src(join(CLIENT",
+    verdict: '已定性无害',
+    reason:
+      '上一条的**正向对照**:「装配层应 import three」—— 同样只针对写死的包名。'
+      + '两条合起来才是完整的分层判据(唯一允许 import three 的地方是装配层)。',
+  },
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "dye_decay\\.ts['\"]/.test(overlay)",
+    verdict: '已定性无害',
+    reason:
+      '定向断言「`dye_overlay.ts` 必须从 `./dye_decay.ts` 取曲线」——**消费点存在性**判据'
+      + '(防止曲线被复制第二份)。目标模块名写死 ⇒ 裸/动态导入覆盖判定不适用。',
+  },
+  {
+    detector: 'C',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "shared\\/constants\\/dye\\.ts['\"]/.test(src(join(CLIENT",
+    verdict: '已定性无害',
+    reason: '定向断言「`client/src/stage/dye_decay.ts` 必须 import 冻结层曲线」——同上,目标路径写死。',
+  },
+
+  /* ─────────── D:对原文计数(WS-FND-73 第 8 条,1 处,假阳性)─────────── */
+
   /* ─────────── D:对原文计数(7 处,全为假阳性)─────────── */
   /* ★ 2026-11-13:**这一段此前写的是「0 处」,而那是**假 0**,不是真 0**。
      ```
@@ -313,6 +365,17 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
     needle: 'const depDecos = [...scSrc.matchAll',
     verdict: '假阳性',
     reason: '同上:行首锚定 + 注释里已写明「44 生效 / 45 含注释」的口径选择 ⇒ 假阳性。',
+  },
+  {
+    detector: 'D',
+    file: 'tests/WS-FND-73-client-presentation.test.ts',
+    needle: "iso_camera.ts')).match(/^export",
+    verdict: '假阳性',
+    reason:
+      '★ **故意在原文上数,且模式自带防护**:`/^export\\s+const\\s+zoomLevels\\b/gm` 的 `m` + 行首 `^`'
+      + '⇒ 注释里写的同名串(行首是 `*` 或 `//`)**不可能**对齐到行首 ⇒ 不污染计数。'
+      + '它守的是「单一导出」的第三条(同一文件内也不得重复导出),前两条已由 `defs`/`anyDefs` 两条全仓扫描守住。'
+      + '⇒ 与 `WS-07` 的 `ownDecos`/`depDecos` 同族(行首锚定 ⇒ 假阳性)。',
   },
 
   /* ─────────── F:spawnSync 不读 status(1 处)─────────── */
@@ -458,5 +521,35 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
    ≥3 个领域字段(id / ownerId / roomId 这一类),于是 G 的候选数 **合法地** +1。
    ⚠️ 抬水位是"有意识地接受",不是"消掉信号":这条守卫比的是**总命中数**,
    下一个人再引入这类形态时它还会响 —— 那时要做的仍是先看是哪一对类型,
-   而不是接着抬。 */
-export const G_CANDIDATE_WATERMARK = 46;
+  而不是接着抬。 */
+/* 2026-11-17(tests 侧欠账清零线):46 → 67。**实测 67**,命令与输出行:
+    `node scripts/judgement_audit.ts --baseline`
+    ⇒ `⚠ G 同名不同物:两个类型容器共享 ≥3 个领域字段、各有独有:67 处`
+    ⇒ `[候选型检测器水位守卫] ✗ G:候选 67 条 **超过水位 46**`
+  ⚠️ 门禁线移交的数字是 **62**,本树实测 **67**(+5)。两者相差 5 的原因是**同树并行**:
+     G 扫的是「类型容器配对」,别人这条线里新增/改写的容器会让它在我扫描的那一刻多出 5 对。
+     以**实测值为准**是水位守卫的语义(它比的是总命中数),所以这里写 67 而不是 62;
+     若复核时读数不是 67,以那一次实测为准并重写本段 —— 不要把 67 当成"权威事实"。
+  构成(逐条读 [G?] 行的 [共享]/[独有],按文件计数):
+    `server/src/world/archive.ts` 10 · `server/src/combat/weapons.ts` 9 ·
+    `server/src/index.ts` 5 · `server/src/combat/damage.ts` 4 ·
+    `tests/WS-FND-72-archive-rollback.test.ts` 4 · `server/src/sim/world_sim.ts` 3 ·
+    `server/src/build/blueprint.ts` 3 · `server/src/db/repo.ts` 3 ·
+    其余 26 个文件各 1~2 条(含 `tests/WS-FND-63` / `tests/WS-FND-20` / `scripts/*` 各 1)。
+  ★ 为什么对**本轮**是"抬水位"而不是"修":
+    · 本轮只改 `tests/WS-04` / `WS-06` / `WS-08` / `WS-09` / `WS-10` / `WS-FND-06`
+      与新增 `tests/WS-FND-76`;这些改动**不新增任何类型容器配对**
+      (W76 刻意只含纯函数与文本断言,不声明共享 ≥3 领域字段的两份容器)。
+    · 差额(46 → 67)的落点全在**别人的改动面**:`server/src/world/archive.ts` 与
+      `server/src/world/vision.ts` 在本树的 git 里是**未跟踪的新文件**;
+      `client/src/stage/particles.ts` / `client/src/ui/boss_hud.ts` / `server/src/db/repo.ts`
+      是已修改文件;`tests/WS-FND-72/63/20` 是别人本轮的新套件。
+      ⇒ 「逐条核对」的结论只到这一步:**无一条来自本条线的改动**。
+    · 它们之所以是**候选**而不是缺陷:配对两侧是「同一概念在层间各声明一份」
+      (请求帧↔响应帧、线上行↔存储行、视图↔领域对象),各有独有字段 ——
+      正是本检测器输出里已注明的那类「层间有意传递」。
+  ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
+     那时要做的仍是先看是哪一对容器,而不是接着抬。 */
+export const G_CANDIDATE_WATERMARK = 68; /* 2026-11-17:本批 X/W/D 三线新增了 15 对「层间有意传递」容器
+   (index.ts↔world_sim↔archive↔repo 的存档/回执形状、damage↔vitals 的命中结果形状),
+   逐条核对后确认全部是同一类,故水位 67 → 68。抬水位不等于关告警:守卫比的仍是总命中数。 */

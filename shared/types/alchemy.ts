@@ -73,14 +73,63 @@ export interface StatWeights {
   utility_weight: number;
 }
 
+/**
+ * 立牌像素尺寸(冻结层,裁决 2026-11-17 · D-19 / `docs/RULINGS-DRAFT.md` 4.2 U5)。
+ *
+ * 16×16 是**默认值**,不再是硬约束:`icon_size` 缺省时按 16×16 解释,
+ * 显式给出时按 `w × h` 解释(例:32×16 的竖长立牌)。
+ */
+export interface IconSize {
+  w: number;
+  h: number;
+}
+
+/** 缺省立牌尺寸 16×16(设计基线,不是平衡裁决)。 */
+export const DEFAULT_ICON_SIZE: Readonly<IconSize> = Object.freeze({ w: 16, h: 16 });
+
 export interface VisualStyle {
   base_silhouette: BaseSilhouette;
   primary_color_hex: string;
   secondary_color_hex: string;
   outline_color_hex: string;
   particle_aura: ParticleAura;
-  /** 16 行 × 16 列的调色盘字符矩阵 */
+  /**
+   * 立牌调色盘字符矩阵:**行数 = h、每行长度 = w**。
+   * 字段名沿用 `pixel_icon_16x16`(旧名不改:`llm_schema_json` 与存档里都以此键出现)。
+   */
   pixel_icon_16x16: string[];
+  /**
+   * 立牌尺寸;省略 = 16×16(`DEFAULT_ICON_SIZE`)。
+   * 裁决 2026-11-17 · D-19:立牌允许非 16×16(判据:32×16 可放)。
+   */
+  icon_size?: IconSize;
+}
+
+/** 取立牌尺寸(缺省回落 `DEFAULT_ICON_SIZE`,不抛错)。 */
+export function iconSizeOf(style: { icon_size?: IconSize }): IconSize {
+  const s = style.icon_size;
+  if (!s) return DEFAULT_ICON_SIZE;
+  return { w: s.w, h: s.h };
+}
+
+/**
+ * 校验立牌字符矩阵与 `icon_size` 是否自洽;返回空数组 = 通过。
+ *
+ * 返回问题码而不是抛错:LLM 输出先走门禁,一次坏输出不该打断整批。
+ */
+export function iconMatrixProblems(style: VisualStyle): string[] {
+  const { w, h } = iconSizeOf(style);
+  const problems: string[] = [];
+  if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) {
+    problems.push(`ICON_SIZE:非法尺寸 ${w}×${h}`);
+    return problems;
+  }
+  const rows = style.pixel_icon_16x16;
+  if (rows.length !== h) problems.push(`ROW_COUNT:行数 ${rows.length} ≠ ${h}`);
+  for (let y = 0; y < rows.length; y += 1) {
+    if (rows[y].length !== w) problems.push(`ROW_WIDTH:第 ${y} 行 ${rows[y].length} ≠ ${w}`);
+  }
+  return problems;
 }
 
 export interface LLMAlchemyOutputSchema {

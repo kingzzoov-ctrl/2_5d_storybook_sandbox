@@ -121,9 +121,43 @@ export const PLAYER_IFRAME_SEC = 0.35;
  */
 export const PLAYER_REGEN_PER_SEC = 1.0;
 
-/** 上次受伤后多久开始回血(秒)。 */
+/**
+ * 上次受伤后多久开始回血(秒)。
+ */
 export const PLAYER_REGEN_DELAY_SEC = 6.0;
 
+/* ═════════════════ 1b. 元素抗性 / 致盲(D4 / D5)═════════════════ */
+
+/**
+ * **无抗性**时的元素折算系数(乘 1 = 原样)。
+ *
+ * ## 为什么缺省是 1.0 而不是别的
+ *
+ * 抗性表是**逐元素**的乘区:`raw = mobHitDamage(level, mul) × resistMul`。
+ * 缺省 1.0 使「没有登记抗性的玩家」与**修前逐字段相同** —— 这是 D4 接入
+ * 时唯一安全的缺省:否则老玩家凭空吃到一个没被裁决过的减伤。
+ */
+export const ELEMENT_RESIST_NEUTRAL = 1.0;
+
+/**
+ * 元素抗性系数的合法上界(乘区,不是加值)。
+ *
+ * 语义:`0` = 完全免疫该元素,`1` = 无抗性,`>1` = 易伤。
+ * 上界取 2.0(易伤至多翻倍)—— 与 `MAX_CRIT_DMG = 3.0` 同族:给一个宽松的
+ * **设计上界**,让「荒谬值」被夹住而不是流进血量。下界取 0(免疫是合法状态)。
+ */
+export const MAX_ELEMENT_RESIST_MUL = 2.0;
+
+/**
+ * 致盲时**视野半径**的倍率(D5 的「视野」那一半)。
+ *
+ * ## 为什么这个数需要一个名字与出处
+ *
+ * 「致盲要影响视野」是 D5 的要求,但手册没有给倍率。取 0.5 的理由是它
+ * **可被观测**:视野半径恰好减半 ⇒ 断言能用「减半」这个关系而不是某个绝对值
+ * 钉住它(绝对值会随 AOI 半径改动而漂)。改这个数需要一次玩法裁决。
+ */
+export const BLIND_VIEW_MUL = 0.5;
 /* ═══════════════════════ 2. 类型 ═══════════════════════ */
 
 /** 一个玩家的生命状态。 */
@@ -141,6 +175,21 @@ export interface PlayerVitals {
   hitCount: number;
   /** 是否已倒下。 */
   downed: boolean;
+  /**
+   * 致盲**剩余秒数**(D5)。>0 ⇒ 命中与视野按 `vitals.ts` 的两处口径折算。
+   *
+   * 与 `mobs/behaviors.ts` 的 `rt.mem.blindSec` **不是同一份**:那是**生物**
+   * 被致盲(它的 AI 读自己的 mem),这里存**玩家**的状态。两者同名同义、不同主体
+   * ——正是 D5 记录的缺口:此前只有生物那一侧存在。
+   */
+  blindSec: number;
+  /**
+   * 被 Boss 技能**定住**的剩余秒数(D3:冻结/麻痹)。
+   *
+   * 与 `blindSec` 分开的理由与 `blindSec` 和生物 `mem.blindSec` 分开同理:
+   * 「看不见」与「动不了」是两个机制,合成一个字段就再也分不开。
+   */
+  stunnedSec: number;
 }
 
 /** 一次生物攻击的结算结果。 */
@@ -149,7 +198,17 @@ export interface MobHitResult {
   playerId: string;
   /** 攻击者生物 ID。 */
   attackerId: string;
-  /** 原始伤害(按等级算出的)。 */
+  /**
+   * 抗性**折算前**的伤害(= `mobHitDamage(level, mul)`)。
+   *
+   * 保留它是为了让「抗性到底改了多少」可被断言,而不是只能看见折算后的 `rawDamage`。
+   */
+  rawBeforeResist: number;
+  /** 本次结算用的元素(D4)。 */
+  element: string;
+  /** 该元素对该玩家的抗性系数(1.0 = 无抗性)。 */
+  resistMul: number;
+  /** 原始伤害(元素抗性折算**后**)。 */
   rawDamage: number;
   /** 实际扣除的血量(0 表示被无敌/已倒下挡掉)。 */
   applied: number;
@@ -159,6 +218,14 @@ export interface MobHitResult {
   downed: boolean;
   /** 命中时玩家位置与预警中心距离(诊断用)。 */
   distance: number;
+  /**
+   * 本次结算**真的施加**的击退量(格/秒,D1)。
+   *
+   * 0 = 没施加(未命中 / 被无敌帧挡下 / 已倒下 / 上游没给击退量)。
+   * 由编排层据此写回 `PhysicsBody`(`physics.applyImpulse`)——
+   * **本模块不碰物理**:那是编排层的职责(`vitals.ts` 只做生命值)。
+   */
+  knockbackPerSec: number;
 }
 
 /** 一帧的结算统计。 */
@@ -393,6 +460,13 @@ export class VitalsSystem {
   private readonly players = new Map<string, PlayerVitals>();
   /** 一帧内已被结算过的 (attackerId, playerId) 对,防同一攻击多段命中。 */
   private readonly hitThisFrame = new Set<string>();
+  /**
+   * **逐元素**抗性表(D4):playerId → (element → 系数)。
+   *
+   * 缺省键 = 无抗性(1.0)。与 `players` 分开存:它是**装备/天赋派生**的量
+   * (调用方通过 `setElementResist` 写入),不属于「生命状态」本身。
+   */
+  private readonly resists = new Map<string, Map<string, number>>();
   private readonly maxHp: number;
   /** 累计统计。 */
   readonly totals = { hits: 0, blocked: 0, damage: 0, downed: 0, warnsChecked: 0 };
@@ -419,9 +493,135 @@ export class VitalsSystem {
       totalTaken: 0,
       hitCount: 0,
       downed: false,
+      blindSec: 0,
+      stunnedSec: 0,
     };
     this.players.set(id, v);
     return v;
+  }
+
+  /**
+   * 登记/覆盖某玩家对某**元素**的抗性系数(D4)。
+   *
+   * ## 为什么是「逐元素」的一张表,不是构造器参数
+   *
+   * 抗性是**元素 × 玩家**两维的量(火抗 0.5 不代表冰抗 0.5),
+   * 而 `maxHp` 那种构造器参数只能表达「一个数」(与 `syncMaxHp` 的存在理由同族)。
+   *
+   * ## 三档口径(与 `mobHitDamage` / `sanitizeComboMul` 同族)
+   *
+   * ```
+   * 合法 [0, MAX_ELEMENT_RESIST_MUL] ⇒ 原样(夹取)
+   * 非有限(NaN / Infinity / 非数字)  ⇒ 拒绝,返回 false,**不写入**
+   * ```
+   * 「拒绝」而不是「夹取」的理由:一个 NaN 抗性会让 `raw` 变 NaN ⇒ 血量被永久污染
+   * (本仓已踩过两次,见 `mobHitDamage` 的注释)。宁可保持旧值。
+   *
+   * @returns 是否写入(便于调用方/断言区分「拒绝」与「写了个相同的值」)
+   */
+  setElementResist(playerId: string, element: string, mul: number): boolean {
+    if (!Number.isFinite(mul)) return false;
+    const key = String(element);
+    const cur = this.resists.get(playerId);
+    const next = Math.min(MAX_ELEMENT_RESIST_MUL, Math.max(0, mul));
+    if (cur) cur.set(key, next);
+    else this.resists.set(playerId, new Map([[key, next]]));
+    return true;
+  }
+
+  /**
+   * 某玩家对某**元素**的抗性系数(D4 的读口)。
+   *
+   * 未登记 ⇒ `ELEMENT_RESIST_NEUTRAL`(1.0,原样)。**不改任何状态。**
+   */
+  elementResistOf(playerId: string, element: string): number {
+    return this.resists.get(playerId)?.get(String(element)) ?? ELEMENT_RESIST_NEUTRAL;
+  }
+
+  /**
+   * 给玩家施加**致盲**(D5)。
+   *
+   * 语义:取**较大**的剩余秒数(不叠加,不续杯 —— 与 `live_bubble` 的
+   * 「被困期间再打不会重新计时」同一裁决)。非法秒数(NaN / 负 / 非数字)⇒
+   * 不施加,返回 0。
+   *
+   * @returns 施加后的剩余秒数(便于动作层/断言读回)
+   */
+  applyBlind(playerId: string, sec: number): number {
+    const v = this.players.get(playerId);
+    if (!v) return 0;
+    if (!Number.isFinite(sec) || sec <= 0) return v.blindSec;
+    v.blindSec = Math.max(v.blindSec, sec);
+    return v.blindSec;
+  }
+
+  /** 致盲剩余秒数(0 = 未致盲)。**不改任何状态。** */
+  blindOf(playerId: string): number {
+    return this.players.get(playerId)?.blindSec ?? 0;
+  }
+
+  /**
+   * 给玩家施加**定身/冰冻**(D3:Boss 技能对玩家的特殊效果)。
+   *
+   * 语义与 `applyBlind` 逐条同构(取较大值、不续杯、非法值不施加),
+   * 因为它们回答的是同一类问题:「这个状态还要持续多久」。
+   * 分开的只有**字段** —— 谁在读它(`applyPlayerMove` 读 `stunnedSec`,
+   * 攻击/视野读 `blindSec`)决定了两者不能合并。
+   */
+  applyStun(playerId: string, sec: number): number {
+    const v = this.players.get(playerId);
+    if (!v) return 0;
+    if (!Number.isFinite(sec) || sec <= 0) return v.stunnedSec;
+    v.stunnedSec = Math.max(v.stunnedSec, sec);
+    return v.stunnedSec;
+  }
+
+  /** 定身剩余秒数(0 = 能动)。**不改任何状态。** */
+  stunOf(playerId: string): number {
+    return this.players.get(playerId)?.stunnedSec ?? 0;
+  }
+
+  /**
+   * **已算好**的伤害直接落账(D3:PvP 与 Boss 技能)。
+   *
+   * ## 为什么不能复用 `applyHit`
+   *
+   * `applyHit` 的入参是 `(level, mul)` —— 它**自己算**伤害(`mobHitDamage`)。
+   * PvP 的伤害来自八步公式(`computeDamage` 的 `finalDamage`,已含暴击/护甲/元素)。
+   * 若把 `finalDamage` 反解成 `mul` 再喂给 `applyHit`,就是**用一条公式近似另一条**
+   * —— 数字看起来对,实则每次都差一点,而且没人能看出是哪一步差的。
+   *
+   * ⇒ 本方法只负责「扣血的那一段」:同一个 `downed` 闸、同一批字段、同一个无敌帧。
+   */
+  applyDamage(
+    playerId: string,
+    amount: number,
+    opts: { ignoreIframe?: boolean } = {},
+  ): { applied: number; blockedByIframe: boolean; downed: boolean } {
+    const none = { applied: 0, blockedByIframe: false, downed: false };
+    const v = this.players.get(playerId);
+    if (!v) return none;
+    if (v.downed) return none;
+    if (!Number.isFinite(amount) || amount <= 0) return none;
+    if (v.iframeSec > 0 && opts.ignoreIframe !== true) {
+      this.totals.blocked += 1;
+      return { applied: 0, blockedByIframe: true, downed: false };
+    }
+    const applied = Math.round(amount);
+    v.hp = Math.max(0, v.hp - applied);
+    v.iframeSec = PLAYER_IFRAME_SEC;
+    v.sinceHurtSec = 0;
+    v.totalTaken += applied;
+    v.hitCount += 1;
+    let downed = false;
+    if (v.hp === 0) {
+      v.downed = true;
+      downed = true;
+      this.totals.downed += 1;
+    }
+    this.totals.hits += 1;
+    this.totals.damage += applied;
+    return { applied, blockedByIframe: false, downed };
   }
 
   /** 移除一个玩家。 */
@@ -533,6 +733,12 @@ export class VitalsSystem {
     v.downed = false;
     v.iframeSec = Math.max(0, invulnSec);
     v.sinceHurtSec = PLAYER_REGEN_DELAY_SEC;
+    /* ★ D5:复活 = 一次「重新开始」,致盲必须一并清掉。
+       不清的话:在迷雾里被救起来仍然是瞎的(玩家会以为复活没生效),
+       而且 `blindSec` 没有任何其它清零路径 ⇒ 会跟着这个玩家一辈子。 */
+    v.blindSec = 0;
+    /* D3 同源:定身也是「复活后重置」的一部分 —— 否则被救起来还动不了。 */
+    v.stunnedSec = 0;
     return true;
   }
 
@@ -612,6 +818,25 @@ export class VitalsSystem {
    * 只算一次伤害。理由:AI 可能同时产出多个重叠几何(如雷云球的
    * 链接环 + 落雷),叠算会让伤害凭空翻倍。
    * 若确实需要多段伤害,应由 AI 用不同 `kind` 或分帧表达。
+   *
+   * ## 参数扩张(D1 / D4)—— 两个都是**可选**,缺省行为与修前逐字段相同
+   *
+   * ```
+   * knockback = 0         ⇒ 不产生击退(与 D1 之前完全一致)
+   * element   = 'NONE'    ⇒ 抗性系数 1.0 ⇒ raw 与修前逐字段相同
+   * ```
+   *
+   * ★ `knockback` 的单位是**格/秒**(与 `damage.ts` 第 8 步的
+   * `DamageResult.knockbackImpulse` 同量纲),取值由调用方从**内容层**
+   * (`WEAPONS[].knockback` / 无武器缺省)决定 —— 本模块不发明数值,
+   * 只负责「这次到底施加了多少」的**记账**(`MobHitResult.knockbackPerSec`)。
+   * 写回 `PhysicsBody` 的是编排层(`world_sim.resolveMobStrikes` 的
+   * `physics.applyImpulse`):生命值与物理是两个域,本模块不碰物理。
+   *
+   * ★ `element` 走**抗性乘区**:`raw = round(mobHitDamage(level, mul) × resist)`。
+   * 下界取 1 与 `mobHitDamage` 同一口径(一次命中至少 1 点)——
+   * 抗性 0(完全免疫)也能把伤害压到 0 吗?**不能**,那样「免疫」就变成了
+   * 「无敌」;免疫请走 `takenMul` 那条路(`damage.ts` 的语义)。
    */
   applyHit(
     attackerId: string,
@@ -619,17 +844,25 @@ export class VitalsSystem {
     level: number,
     mul = 1.0,
     distance = 0,
+    knockback = 0,
+    element = 'NONE',
   ): MobHitResult {
     const v = this.players.get(playerId);
-    const raw = mobHitDamage(level, mul);
+    const beforeResist = mobHitDamage(level, mul);
+    const resistMul = this.elementResistOf(playerId, element);
+    const raw = Math.max(1, Math.round(beforeResist * resistMul));
     const base: MobHitResult = {
       playerId,
       attackerId,
+      rawBeforeResist: beforeResist,
+      element: String(element),
+      resistMul,
       rawDamage: raw,
       applied: 0,
       blockedByIframe: false,
       downed: false,
       distance,
+      knockbackPerSec: 0,
     };
     if (!v) return base;
     if (v.downed) return base;
@@ -657,7 +890,12 @@ export class VitalsSystem {
     v.totalTaken += raw;                     /* ★ 累计统计:有界(修前吸收 2e9) */
     v.hitCount += 1;
     base.applied = raw;                      /* ★ **对外返回值**:有界(修前外流 2e9) */
-
+    base.applied = raw;                      /* ★ **对外返回值**:有界(修前外流 2e9) */
+    /* ★ D1 击退记账:`0` = 上游没给 / 值非法 ⇒ 不产生击退。
+       `Number.isFinite` 不是为了好看:`knockback` 是公开入参,`NaN` 经
+       `applyImpulse` 会把刚体速度永久污染成 NaN(`ensureFinite` 会复位,
+       但那是一次**静默的**降级)。 */
+    base.knockbackPerSec = Number.isFinite(knockback) && knockback > 0 ? knockback : 0;
     if (v.hp === 0) {
       v.downed = true;
       base.downed = true;
@@ -693,6 +931,10 @@ export class VitalsSystem {
         continue;
       }
       if (v.iframeSec > 0) v.iframeSec = Math.max(0, v.iframeSec - dt);
+      /* ★ D5:致盲倒计时。放在「未倒下」分支里:倒下的玩家**冻结**状态
+         (他被救护后 `revive` 会清零,见那里的注释)。 */
+      if (v.blindSec > 0) v.blindSec = Math.max(0, v.blindSec - dt);
+      if (v.stunnedSec > 0) v.stunnedSec = Math.max(0, v.stunnedSec - dt);
       v.sinceHurtSec += dt;
       if (
         v.sinceHurtSec >= PLAYER_REGEN_DELAY_SEC &&
@@ -755,6 +997,66 @@ export function eventStrikeRule(kind: string): { mul: number; radius: number } |
   for (const r of EVENT_STRIKE_RULES) if (r.kind === kind) return { mul: r.mul, radius: r.radius };
   return null;
 }
+/**
+ * 事件型**致盲**(D5 的生产侧来源)。
+ *
+ * ## 为什么它必须在这里,而不是在玩家输入层
+ *
+ * D5 的原文:「`tanuki_ambush` 的致盲效果只有 `mem.blindSec`,玩家侧无对应状态」。
+ * 修法不是给玩家加一个字段就完 —— 那样字段**永远没有写入者**。
+ * 生产者已经存在:`mobs/behaviors.ts:542` 的 `rt.mem.blindSec = 3` 与
+ * `world.emit('tanuki_ambush')`。缺的是**消费者**:把这条事件结算到玩家身上。
+ *
+ * ## 数值出处(不新造)
+ *
+ * ```
+ * sec    = 3     ← 与 AI 写进 rt.mem 的同一个数(behaviors.ts:542)
+ * radius = 2.0   ← 与既有事件通道 `scorpion_ambush` 同半径(同一张表的既有值)
+ * ```
+ */
+export const EVENT_BLIND_RULES: readonly { kind: string; radius: number; sec: number }[] = [
+  { kind: 'tanuki_ambush', radius: 2.0, sec: 3.0 },
+];
+
+/**
+ * 从一帧的事件里提取「致盲型」事件(与 `collectEventStrikes` 同一形状)。
+ *
+ * 与伤害通道分开的理由:`tanuki_ambush` 是**零伤害**事件,若塞进
+ * `EVENT_STRIKE_RULES` 就会以「0 伤害的命中」形式污染 `hitCount`/`lastHits`
+ * (玩家会看到「被打中 0 点」的反馈)。它是**状态**事件,不是伤害事件。
+ */
+export function collectEventBlinds(
+  events: readonly { source: string; kind: string }[],
+  posOf: (id: string) => { x: number; y: number } | null,
+): { attackerId: string; warn: WarnGeom; sec: number }[] {
+  const out: { attackerId: string; warn: WarnGeom; sec: number }[] = [];
+  for (const e of events) {
+    const rule = EVENT_BLIND_RULES.find((r) => r.kind === e.kind);
+    if (rule === undefined) continue;
+    const pos = posOf(e.source);
+    if (pos === null) continue;
+    out.push({
+      attackerId: e.source,
+      sec: rule.sec,
+      warn: {
+        kind: 'CIRCLE',
+        cx: pos.x,
+        cy: pos.y,
+        radius: rule.radius,
+        innerRadius: 0,
+        centerDeg: 0,
+        halfDeg: 0,
+        halfLen: 0,
+        halfWidth: 0,
+        spinDegPerSec: 0,
+        z: 0,
+        zTolerance: 1.6,
+        warnSec: 0,
+      },
+    });
+  }
+  return out;
+}
 
 /**
  * 从一帧的 `MobTickResult` 里提取「事件型攻击」。
@@ -809,6 +1111,13 @@ export interface PendingStrike {
   warn: WarnGeom;
   /** 伤害倍率(Boss 或精英可调)。 */
   mul?: number;
+  /**
+   * 本次攻击的**元素**(D4)。缺省 `'NONE'` ⇒ 抗性系数 1.0 ⇒ 与修前同值。
+   *
+   * ⚠️ 抗性**不在这里折算**:本函数是**纯几何**判定(它拿不到 `VitalsSystem`),
+   * 折算的唯一落点是 `VitalsSystem.applyHit`。在这里再乘一次 = 两份实现。
+   */
+  element?: string;
 }
 
 /**
@@ -844,11 +1153,16 @@ export function resolveStrikes(
       results.push({
         playerId: p.id,
         attackerId: s.attackerId,
+        rawBeforeResist: raw,
+        element: s.element ?? 'NONE',
+        resistMul: ELEMENT_RESIST_NEUTRAL,
         rawDamage: raw,
         applied: isIframe ? 0 : raw,
         blockedByIframe: isIframe,
         downed: false, /* 由 VitalsSystem 判定 */
         distance: Math.hypot(p.x - s.warn.cx, p.y - s.warn.cy),
+        /* 击退由编排层写回物理 —— 本函数不产生冲量(见 `PendingStrike.element` 的注释)。 */
+        knockbackPerSec: 0,
       });
     }
   }

@@ -261,10 +261,10 @@ node scripts/verify.ts --content  # 内容门禁不受影响
 | # | 事项 | 阻塞什么 |
 | :-- | :--- | :--- |
 | ~~U1~~ | ~~**移动权威**(§3 三方案选哪个)~~ **已裁决并实施(CR-9)** | 选定**方案 D**:FSM 做基础移动(游荡/警戒/追猎),AI 做专属动作;AI 写了位置就以 AI 为准并把 FSM 同步过去。实测依据:启用前 **22/24 生物 60 秒位移为 0**(与玩家在不在场无关)。见 §3 | 已解决 |
-| U2 | 事件是否需要**跨帧队列** | 当前当帧投递。若将来要「延迟 2 秒再响应」,得加调度层 |
+| U2 | 事件是否需要**跨帧队列** | 当前当帧投递。若将来要「延迟 2 秒再响应」,得加调度层 | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):同步投递已够,不另加跨帧调度层;见 RULINGS-DRAFT §4.7 EVENT-BUS U2 |
 | ~~U3~~ | ~~事件是否要**持久化/重放**~~ **前提已证伪,关闭(CR-11)** | 原写「回放系统若要做,需先定事件的可序列化边界(**suppress 闭包**)」。实测三点:**(1)** 全仓没有 `suppress` 闭包(`spawner.ts` 里的 `suppressed` 是刷怪光照抑制,与事件无关);**(2)** 可序列化边界**已经由类型定死** —— `EventPayload = Record<string, number \| string \| boolean>`,33 个 emit 点、32 种事件实测全部可 JSON 往返,无函数/undefined/NaN;**(3)** 确定性成立 —— 同种子两次运行事件序列**逐字节一致**。真正缺的不是「定边界」,而是**事件根本没产生**(见 U7) | 已解决 |
-| U4 | `lastMobTicks` 是否要进 `SimFrameReport` | 观测粒度;当前只在 `WorldSim` 字段上可读 |
+| U4 | `lastMobTicks` 是否要进 `SimFrameReport` | 观测粒度;当前只在 `WorldSim` 字段上可读 | **已关闭(2026-11-17)** | 已登记为边界(D-19 第 1 条):字段已在 `WorldSim` 可直接读,不另进 `SimFrameReport`(避免双份),见 RULINGS-DRAFT §5 |
 | ~~U5~~ | ~~**生物→玩家的伤害闭环**~~ **已解决(CR-7)** | 已定出口:`VitalsSystem.applyHit(attackerId, playerId, level, mul, distance)`。生物不写玩家 `hp`,而是**产出意图**(预警几何 + `frameEmits` 事件),由编排层 `resolveMobStrikes()` 统一结算。这满足「不越权、语义正确」两个要求 | 已解决 |
-| U6 | 事件名的**命名空间** | 当前 29 种全是 snake_case 前缀风格(`boar_*`),无正式规范 |
-| U7 | `unknownMobs` 是否应为**硬失败** | 当前只收集。传错 ID 会让生物「存在但不行为」 |
+| U6 | 事件名的**命名空间** | 当前 29 种全是 snake_case 前缀风格(`boar_*`),无正式规范 | **已关闭(2026-11-17)** | 由 D-19 落地(立事件名命名空间,冻结层解锁),判据 `tests/WS-FND-66-frozen-unlock.test.ts`;见 RULINGS-DRAFT §4.7 EVENT-BUS U6 |
+| U7 | `unknownMobs` 是否应为**硬失败** | 当前只收集。传错 ID 会让生物「存在但不行为」 | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):保持软失败,理由写进注释;见 RULINGS-DRAFT §4.7 EVENT-BUS U7 |
 | ~~U8~~ | ~~**靠交互/受击触发的事件在生产中不产生**~~ **已解决(CR-11)** | 32 种事件里 **9 种靠 `onInteract` / `onDamage` 触发**,而 `MobHost.interact()` / `damage()` 虽完整实现,`world_sim.ts` 里**零调用** —— 这 9 种永不发生。已补编排层入口 `interactMob()` / `damageMob()`;实测事件种类 **9 → 18**(只 tick 时 4 种,接上交互/受击后 13 种)。这是本项目**第四次**「完整实现但编排层不接」 | 已解决 |

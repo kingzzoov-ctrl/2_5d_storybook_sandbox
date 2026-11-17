@@ -4271,7 +4271,7 @@ test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是
     'DROP_ITEM', 'CRAFT', 'USE_ALCHEMY_FURNACE', 'OPEN_CHEST', 'USE_OWN_CHEST', 'SLEEP',
     'START_PARTY', 'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
     'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME',
-    'USE_ITEM'];
+    'USE_ITEM', 'BUY_ITEM'];
   eq(executable.slice().sort(), declared.slice().sort(),
     '逐条枚举必须**逐个等于** RoomAction 的键集,而不只是数量相等(漏登记/写错名/重复都红)');
 });

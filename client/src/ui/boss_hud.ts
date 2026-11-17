@@ -338,8 +338,136 @@ function defaultCharge(shape: TelegraphShape): number {
 }
 
 /**
- * 从冻结层 `BOSS_LIST` 的 `phases[].telegraph` 文本抽形状关键词与半径。
- * 例如「以自身为中心的红色圆环(半径 3.5 格,持续 0.8s)」→ ANNULUS 半径 3.5。
+ * ★ WS-09 U7:**`BossTelegraphRow` ↔ 5 种预警几何的人工对照表**。
+ *
+ * ## 为什么要有这张表(而不是继续靠正则从文案里猜)
+ *
+ * `detectShape()` 是**启发式**:它在 `phases[].telegraph` 的中文里找「环/扇/十字/长条」。
+ * 这类解析有两个致命性质:
+ *   1. **静默降级**:文案一改(哪怕只是把「圆环」写成「圆型」),形状就掉进
+ *      `CIRCLE` 兜底 —— 画面上从「环」变成「实心盘」,而**没有任何东西会红**;
+ *   2. **覆盖不可见**:某个 Boss 少一个阶段、或多出一个阶段,只要正则还能跑,
+ *      表格长度就"看起来正常",没人能一眼看出漏了谁。
+ *
+ * 因此把"每个 Boss 的每个阶段用哪种几何"变成**显式数据**:它是对着手册阶段表
+ * 人工核对后钉下来的,评审可以直接逐行读。正则退化为**兜底**,
+ * 且覆盖判据(`validateBossTelegraphCoverage`)要求「逐 Boss、逐阶段都在表里」——
+ * 少一条就红,而不是悄悄用兜底几何。
+ *
+ * ## 五种几何与文案的对应(审查口径)
+ *
+ * | 几何      | 手册里的典型措辞                                   |
+ * |-----------|----------------------------------------------------|
+ * | `CIRCLE`  | 「圆形小圆」「碰撞预警」「扩散的沼泽区」(实心)      |
+ * | `ANNULUS` | 「圆环」「环状云浪」「指示环」(中空,evenodd 挖洞)  |
+ * | `CONE`    | 「锥形吸附区」「扇形风刃」「扇形吐息」             |
+ * | `LINE`    | 「矩形」「窄长」「射线」「指针」「细长凸起」        |
+ * | `CROSS`   | 「十字」「交叉」(两臂互相垂直,主臂 + 副臂)        |
+ *
+ * ## 维护方式
+ *
+ * 冻结层加了 Boss 阶段 ⇒ 本表必须同步加一行;`validateBossTelegraphCoverage()`
+ * 会点名报出「哪个 Boss 的哪个阶段缺」。**禁止**用"表空了就走正则"来糊过去。
+ */
+export const BOSS_TELEGRAPH_SHAPES: ReadonlyMap<string, readonly TelegraphShape[]> = new Map<
+  string,
+  readonly TelegraphShape[]
+>([
+  /* 果冻国王:环形果冻波 → 6 只小圆的独立预警 → 45° 锥形吸附区 */
+  ['boss_jelly_king', ['ANNULUS', 'CIRCLE', 'CONE']],
+  /* 机甲河狸:横贯战场的窄长矩形 → 掩体区(无方向范围,实心圆域) */
+  ['boss_beaver_mecha', ['LINE', 'CIRCLE']],
+  /* 妖狐:三道弧形扇形风刃 → 4 个分身各自的蓄力圈 */
+  ['boss_fox_kitsune', ['CONE', 'ANNULUS']],
+  /* 巨蟹:两条细长射线 → 高速弹射的圆形碰撞预警 */
+  ['boss_crab_kraken', ['LINE', 'CIRCLE']],
+  /* 法老蝎:向心箭头区(圆形范围)→ 沙下游走的细长凸起 */
+  ['boss_scorpion_pharaoh', ['CIRCLE', 'LINE']],
+  /* 姜饼巨魔:大面积减速沼泽区 → 锁定圈 */
+  ['boss_ginger_troll', ['CIRCLE', 'CIRCLE']],
+  /* 云鲸:环状云浪 → 60° 巨大扇形吐息 */
+  ['boss_sky_whale', ['ANNULUS', 'CONE']],
+  /* 时间巨像:旋转激光指针 → 四角独立指示环 → 全场地砖预闪(圆形兜底) */
+  ['boss_chronos_colossus', ['LINE', 'ANNULUS', 'CIRCLE']],
+]);
+
+/** 取人工钉死几何;未登记返回 `null`(调用方应显式降级并**报红**) */
+export function pinnedTelegraphShape(bossId: string, phaseIndex: number): TelegraphShape | null {
+  const list = BOSS_TELEGRAPH_SHAPES.get(bossId);
+  if (list === undefined) return null;
+  const i = Math.trunc(phaseIndex);
+  if (i < 0 || i >= list.length) return null;
+  return list[i];
+}
+
+/**
+ * **逐 Boss、逐阶段**的覆盖判据。`ok === false` 时 `errors` 会点名缺哪一条。
+ *
+ * 三类错误分别对应三种真实的坏法:
+ *   - 冻结层某 Boss 不在表里 ⇒ 该 Boss 全靠正则兜底(漏了没人知道);
+ *   - 某 Boss 阶段数变了但表没跟着变 ⇒ 多出来的阶段没有钉死几何;
+ *   - 表里出现冻结层没有的 Boss / 多余的阶段 ⇒ 表腐化(删 Boss 时没清表)。
+ */
+export function validateBossTelegraphCoverage(
+  table: ReadonlyMap<string, readonly TelegraphShape[]> = BOSS_TELEGRAPH_SHAPES,
+): { ok: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  for (const b of BOSS_LIST) {
+    seen.add(b.id);
+    const pinned = table.get(b.id);
+    if (pinned === undefined) {
+      errors.push(`${b.id} 未登记预警几何对照表(共 ${b.phases.length} 个阶段全部走正则兜底)`);
+      continue;
+    }
+    if (pinned.length !== b.phases.length) {
+      errors.push(`${b.id} 阶段数 ${b.phases.length} 与对照表 ${pinned.length} 条不一致`);
+    }
+    for (let i = 0; i < b.phases.length; i += 1) {
+      const shape = pinned[i];
+      if (shape === undefined) {
+        errors.push(`${b.id} 阶段 ${i}(${b.phases[i].name})缺少钉死几何`);
+        continue;
+      }
+      if (!TELEGRAPH_SHAPES.includes(shape)) {
+        errors.push(`${b.id} 阶段 ${i} 的几何 ${String(shape)} 不在 5 种之内`);
+      }
+    }
+  }
+  for (const id of table.keys()) {
+    if (!seen.has(id)) errors.push(`对照表里的 ${id} 在冻结层 BOSS_LIST 中不存在`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * 把对照表与手册文案**逐条对齐**:同一个阶段必须得出同一种几何。
+ *
+ * 这条不是"重复实现正则",而是防止「改了文案没改表」/「改了表没改文案」的双向漂移:
+ * 文案是需求,表是实现口径;两者不一致时必须有人看一眼,而不是静默取其中一个。
+ */
+export function validateTelegraphTableAgainstManual(): { ok: boolean; errors: string[] } {
+  const errors: string[] = [];
+  for (const b of BOSS_LIST) {
+    for (let i = 0; i < b.phases.length; i += 1) {
+      const pinned = pinnedTelegraphShape(b.id, i);
+      if (pinned === null) continue; /* 覆盖问题归 validateBossTelegraphCoverage 报 */
+      const text = `${b.phases[i].telegraph} ${b.phases[i].skill}`;
+      const derived = detectShape(text);
+      if (derived !== pinned) {
+        errors.push(`${b.id} 阶段 ${i}:对照表 ${pinned} vs 文案解析 ${derived}(${b.phases[i].telegraph})`);
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+/**
+ * 生成「Boss 阶段 × 预警几何」表。
+ *
+ * **几何取自人工对照表**(WS-09 U7);正则只负责从文案里抽半径数字。
+ * 「形状」这一列再也不是正则猜出来的 —— 文案改动只会影响半径/蓄力等数值,
+ * 不会把「环」静默变成「实心盘」。
+ *
  * 复杂度 O(8 个 Boss × 阶段数)。
  */
 export function buildBossTelegraphTable(): BossTelegraphRow[] {
@@ -348,7 +476,11 @@ export function buildBossTelegraphTable(): BossTelegraphRow[] {
     for (let i = 0; i < b.phases.length; i += 1) {
       const ph = b.phases[i];
       const text = `${ph.telegraph} ${ph.skill}`;
-      const shape = detectShape(text);
+      /*
+       * 兜底仍然保留(未登记的 Boss 走正则),但覆盖判据要求**每个 Boss 每阶段**
+       * 都在 `BOSS_TELEGRAPH_SHAPES` 里 ⇒ 生产路径上不会真走到兜底。
+       */
+      const shape = pinnedTelegraphShape(b.id, i) ?? detectShape(text);
       const rMatch = /(\d+(?:\.\d+)?)\s*格/.exec(text);
       const radius = rMatch ? Number(rMatch[1]) : defaultRadius(shape);
       rows.push({

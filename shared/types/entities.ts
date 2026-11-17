@@ -53,6 +53,22 @@ export interface ItemDef {
   output?: number;
   /** 加工设备物品 ID */
   station?: number;
+  /**
+   * **售价**(D-19 / WS-FND-77 A-4)。
+   *
+   * ⚠️ 与 `value`(**炼金价值分 V**)是两个不同的量纲:
+   *   - `value` 参与炼金 `T_eff` 公式,是「这件东西多值钱」的设计锚;
+   *   - `price` 是**售价**,只被 `systems/depot.ts` 的 `priceOf` 读。
+   *
+   * 把 `value` 当价格用(「V=250 ⇒ 250 金」)会把一个数塞进两个语义,
+   * 而调平衡的人会以为改的是价值分 —— 故本字段**独立声明**,且
+   * **当前内容表一件都没有写它** ⇒ `depot.priceOf` 照实返回「无定价」,
+   * 购买被拒且库存不变(`tests/WS-FND-75` FND75-18 / FND75-21)。
+   *
+   * 内容层哪天给出定价,只需在 `items.ts` 的条目上加 `price: n`,
+   * `contentPriceTable()` 自动就非空,接线一个字都不用改。
+   */
+  price?: number;
   /** 自由文本机制说明(设计手册原句) */
   note: string;
 }

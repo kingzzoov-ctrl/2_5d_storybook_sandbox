@@ -37,10 +37,10 @@ node scripts/verify.ts --all
 
 ```
 2_5d_sandbox/
-├── shared/                     # ── 冻结层,只读 ──
-│   ├── types/{tile,physics,entities,alchemy}.ts
-│   ├── constants/{items,mobs,bosses}.ts
-│   ├── testing/harness.ts
+├── shared/                     # ── 冻结层,只读(D-19 解锁范围见 §5)──
+│   ├── types/{tile,physics,entities,alchemy}.ts   # D-19 追加:cooking.ts / events.ts
+│   ├── constants/{items,mobs,bosses}.ts            # D-19 追加:dye.ts / cooking.ts
+│   ├── testing/harness.ts                          # 永不改
 │   └── contracts/FREEZE.md
 ├── server/src/<子域>/          # 各写手实现代码
 ├── client/src/<子域>/          # 各写手实现代码
@@ -152,3 +152,40 @@ report('WS-01');
 - 冻结层文件被改动 = 全员返工,严禁。
 - 每完成一个原子步骤后跑 `node scripts/verify.ts --only WS-XX`,失败不得提交。
 - 提交给 Lead 的汇报格式:`WS-XX 完成 | 文件清单 | 测试通过数 | 阻塞项`。
+
+---
+
+## 5. D-19 冻结层解锁记录(owner 2026-11-17)
+
+> **授权**:owner 于 **2026-11-17** 授权「冻结层解锁」这一批(`docs/DECISIONS.md`,
+> 编号 **D-19**);逐条落点见 `docs/RULINGS-DRAFT.md` 4.1 U1/U7/U10、4.2 U5、
+> 4.3 U5、4.4 EXTENDING U3、4.7 EVENT-BUS U6。
+>
+> **本节是这次放宽的完整清单。** 除本节列出的条目外,§0–§4 的一切约束**照旧有效**
+> (`shared/testing/harness.ts` 永不改;`shared/types/physics.ts`、`entities.ts` 未动;
+> 32 位单元格的既有位宽与 `CHUNK_BYTES = 1024` 未动)。**没有静默放宽**:任何一条
+> 放宽都必须在这里留一行,`tests/WS-FND-66-frozen-unlock.test.ts` 第 9 组判据会
+> **反向校验本节**(缺关键词即红)。
+
+| # | 放宽了什么 | 为什么 | 授权 | 新的边界(仍然不许做的事) |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 烹饪加 6 个参数槽 `defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul`(`shared/types/cooking.ts` + `shared/constants/cooking.ts`) | `FoodBuff.statMods` 只有加法类字段,倍率类效果(移速 / 重力 / 跳跃 / 采集 / 经验)无处可放,所有料理被迫只能用加法表达 | `RULINGS-DRAFT` 抬头点名 + 4.2 料理线 | **中性默认**(flat=0、mul=1)是**单位元,不是平衡裁决**;手册未给这 6 个槽任何数值 ⇒ 内容表只留中性默认并逐条标「待平衡」,不许在这里发明平衡数字。`combat/cooking.ts` 的 `FoodBuff` 结构**本批未改**(属 WS-10),本层只提供可被采纳的槽与合并律 |
+| 2 | 蓝图尺寸从「必须 16×16」放宽到**任意 w×h**(下限 16,上限 `BLUEPRINT_MAX_SIZE = 128`) | 208 描图卷轴按定长写死 ⇒ 17×17 的屋子根本框不出来 | `RULINGS-DRAFT` 4.1 **U1** | 下限仍是 16(`tests/WS-03.test.ts` WT-03-37 未撤销,8×8 照样抛错);上限 128 单边——蓝图码是贴进聊天框的文本、接力队列又是每格一条,无上限即病态输入。`BLUEPRINT_SIZE = 16` 降级为**默认值**,不是删除 |
+| 3 | 蓝图**允许携带四色暗线** `wire` | 蓝图该是「所见即所得」,暗线是建筑的一半 | `RULINGS-DRAFT` 4.1 **U7** | 只保留 `wire` 4 位原值;不改暗线语义 / 取色 / 通电规则(那是 WS-01 / WS-05) |
+| 4 | 地砖 ID 从 **6 位扩到 u16**(`FLOOR_ID_BITS = 16`、`FLOOR_ID_MASK = 0xffff`) | 地砖表早已超过 64 种,6 位装不下 | `RULINGS-DRAFT` 4.1 **U10** | **32 位单元格一个字不动**(`FLOOR_MASK` 仍 `0xfc0`、`CHUNK_BYTES` 仍 1024)。u16 由「宽单元」承载:`packTileWide` / `unpackTileWide` / `wideCellValue`(lo 32 位 + hi 14 位)。**存档迁移与世界格扩宽不在本批**(WS-01 `world/chunk.ts`、WS-07 存档):`RelayQueue.applyTo` 落到 32 位世界格时按 `FLOOR_WORD_MASK` 截断,这是登记过的边界 |
+| 5 | 立牌支持非 16×16:`VisualStyle.icon_size?`(`shared/types/alchemy.ts`) | 竖长 / 横幅立牌被 16×16 卡死 | `RULINGS-DRAFT` 4.2 **U5** | 字段**可选**,省略 = 16×16(`DEFAULT_ICON_SIZE`),既有 16×16 路径一字未改;`pixel_icon_16x16` 字段名保留(存档与 `llm_schema_json` 里以此键出现);`server/src/alchemy/prompt.ts` 的 LLM schema 本批未改 |
+| 6 | 染色距离衰减曲线进冻结层(`shared/constants/dye.ts`) | 曲线原先散在美术口径里,没有任何可断言的东西 | `RULINGS-DRAFT` 4.3 **U5** | 只钉**形态(线性)与端点(1→0)+ 单调**;**不发明射程**:`range` 由调用方传入 |
+| 7 | 事件名命名空间(`shared/types/events.ts`,29 种) | 29 种事件名只以字符串字面量存在:拼错不报错、订阅方写 `mimic_*` 恒不命中、加第 30 种事件没有任何地方会红 | `RULINGS-DRAFT` 4.7 **EVENT-BUS U6** | 线上的**扁平名字不改**(`boar_wall_stun`);发送侧 `server/src/mobs/behaviors.ts` 本批未改,判据**反向扫它**做双向一致校验。`EventKind` 是唯一事实源,新增事件必须同步登记 |
+| 8 | 双 ID 宽度统一 **u16**(物体 / 物品 ID 12 位 → 16 位) | 线上 `heldItemId` / `weaponId` 是 u16,而格内 OBJ 层只有 12 位 ⇒ 同一个 ID 在两处宽度不同 | `RULINGS-DRAFT` 4.4 **EXTENDING U3** | 同第 4 条:32 位字里的 `OBJ_MASK = 0xfff` **不变**,u16 走宽单元(`OBJ_HI_BITS = 4`);线上协议 `shared/types/wire.ts` 一个字未改 |
+
+**判据**(全部在 `tests/WS-FND-66-frozen-unlock.test.ts`,9 组,`node tests/WS-FND-66-frozen-unlock.test.ts`):
+
+- **1 烹饪**:6 槽齐全;中性值 flat=0 / mul=1;与中性合并恒等于对方;flat 相加、mul 相乘且满足结合律;内容表逐槽与代码中性值一致并标「待平衡」。
+- **2 蓝图**:17×17 可框、可编码(码前缀 `BP1:17x17:`)、可跨中继 289 格全部落地且逐格一致;8×8 与 129×129 仍抛错。
+- **3 暗线**:256 格全组合 `wire` round-trip,16 种取值一个不少。
+- **4 地砖**:0..99(共 100 种 > 64)与 65535 端点 round-trip;并**证明** 32 位字确实装不下 300。
+- **5 双 ID**:4096 / 65535 能过;`heldItemId` 线上位宽 = 16 = 物体 ID 位宽。
+- **6 立牌**:32×16 通过;缺 `icon_size` 时 32 宽矩阵报错;给了尺寸但矩阵不符也报错。
+- **7 染色**:端点 1→0、中点 0.5、0..2R 采样单调不增。
+- **8 事件**:29 种;与 `behaviors.ts` 双向一致;`mob_*` 前缀通配只接前缀化名字;`shared/**` + `server/src/build/**` 裸名 0 命中。
+- **9 本节自校验**:D-19 / 2026-11-17 / RULINGS-DRAFT 与 8 项关键词逐条在场。

@@ -23,8 +23,11 @@ import { createHash } from 'node:crypto';
 import { FluidField } from '../server/src/world/fluid.ts';
 import { collectOpenItems, detectStale } from './backlog.ts';
 import { ENTRY_LOAD_EXEMPT } from './entry_load_exempt.ts';
-import { extractRelativeImports } from './imports.ts';
+import { extractRelativeImports, findDynamicImports } from './imports.ts';
 import { shouldSkipDir, shouldSkipDirAtDepth } from './scan-scope.ts';
+import {
+  diffItemCounts, measureItemCounts, readItemBaseline, ITEMS_BASELINE_PATH,
+} from './items-baseline.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 
@@ -102,6 +105,37 @@ let frozenInvariantCount = 0;
 let reachProdTotal = -1;
 let reachProdReachable = -1;
 let reachDemoOnly = -1;
+
+/**
+ * 生产可达性节算出的**可达文件集**(仓库相对路径)。
+ *
+ * `null` = 该节没跑(`--docs` / `--content` 等局部口径)。
+ * 用途:给 `checkWhitelistCross()` 做「**同一模块不得一边可达一边孤儿**」的交叉检查 ——
+ * 旧实现里这条不变量只有一半(`orphan ⊆ 可达性白名单`),而"可达性白名单"描述的是
+ * **传递可达性**,不是"有没有生产引用"。两个集合差 5~6 条是常态,
+ * 所以只在 `reachableProdFiles` 上判"真可达",才是那条不变量想要的意思。
+ */
+let reachableProdFiles: Set<string> | null = null;
+
+/**
+ * `checkTautology()` 的候选明细(键 `套件::常量名` → 定义模块 / 行号)。
+ *
+ * `null` = 该节没跑。用途:让 `checkWhitelistCross()` 能回答
+ * 「这个同义反复候选的**定义模块**是不是也在不可达白名单里」——
+ * 若在,则同一处欠账**两边都被豁免**(一边"不可达"、一边"断言同义反复"),
+ * 那等于没有任何东西在测它,必须显式报出来。
+ */
+let tautFoundDetail: Map<string, { suite: string; mod: string; lines: number[] }> | null = null;
+
+/**
+ * `checkOrphanList()` 解析出的 `ORPHAN_KNOWN`(路径 → 理由)。
+ *
+ * `null` = 该节没跑或解析失败。用途:给 `checkWhitelistCross()` 做两白名单交叉检查。
+ * ⚠️ 这里**不重新解析一遍** `orphan-audit.ts`:那份解析已经带着
+ *   「解析条数 = 行首 `[` 条数」的真值对账(见 `checkOrphanList`)。
+ *   再写一份 = 两套口径(本仓陷阱 31/41),而两份解析必然漂移。
+ */
+let orphanKnownParsed: Map<string, string> | null = null;
 
 /**
  * `checkFrozen` 是否**真的跑过**。
@@ -922,25 +956,53 @@ async function checkFrozen(): Promise<void> {
   const ent = await import('../shared/types/entities.ts');
   const alc = await import('../shared/types/alchemy.ts');
 
-  /* 物品表:320 项、ID 唯一、十大分表数量与手册一致 */
-  if (items.ITEM_LIST.length !== 320) fail(`物品总数 ${items.ITEM_LIST.length} ≠ 320`);
-  else pass('物品总数 320');
+  /* ── 物品总数:改读**基线文件**(2026-11-14,档2 第 6 组 / EXTENDING U1)──────────
+   *
+   * 旧写法:`if (items.ITEM_LIST.length !== 320) fail('物品总数 N ≠ 320')`。
+   * 台账的自述是「**有意硬编码**,扩容时必须同步」—— 但「必须同步」这句话
+   * **没有判据**,而且它把「内容变更」与「判据变更」压成同一件事:
+   * 加 10 件物品的人被告知要去改**门禁源码**。
+   * ⇒ 判据改读 `scripts/items-baseline.json`(内容来自当时的实测值),
+   *   增量动作变成 `node scripts/items-baseline.ts --update`,而漂移**仍然红**,
+   *   且报的是「基线 X / 实测 Y(差 ±N)」—— 直接给出该改多少。
+   * ⚠️ 基线文件缺失/不可解析 ⇒ **fail**(不是跳过):否则删掉它等于关掉本判据。 */
+  const itemMeasured = measureItemCounts();
+  const itemBaseline = readItemBaseline();
+  if (itemBaseline === null) {
+    fail(
+      `物品计数基线文件缺失或不可解析:${relative(ROOT, ITEMS_BASELINE_PATH).split(sep).join('/')}`
+      + ' —— 判据失效(修法:node scripts/items-baseline.ts --update)',
+    );
+  } else {
+    const itemDiff = diffItemCounts(itemBaseline, itemMeasured);
+    if (itemDiff.length > 0) {
+      fail(
+        `物品计数与基线文件不符(${itemDiff.length} 处)` + ' —— 若是有意扩容,'
+        + '跑 `node scripts/items-baseline.ts --update` 并同步 README/手册;否则先查是谁改了内容:\n'
+        + `      ${itemDiff.slice(0, 8).join('\n      ')}`,
+      );
+    } else {
+      pass(
+        `物品计数与基线文件一致(${itemMeasured.itemCount} 件 / ${itemMeasured.tableCount} 张分表 /`
+        + ` 合计 ${itemMeasured.tableSum};基线 → 实测差 0)`,
+      );
+    }
+  }
 
   const ids = items.ITEM_LIST.map((i: { id: number }) => i.id);
   const uniq = new Set(ids);
   if (uniq.size !== ids.length) fail(`物品 ID 重复:${ids.length - uniq.size} 个`);
   else pass('物品 ID 全局唯一');
 
-  const expected: Record<string, number> = {
-    '3.1': 30, '3.2': 20, '3.3': 18, '3.4': 35, '3.5': 30,
-    '3.6': 35, '3.7': 40, '3.8': 37, '3.9': 30, '3.10': 45,
-  };
-  for (const t of items.ITEM_TABLES) {
-    if (t.ids.length !== expected[t.key]) fail(`分表 ${t.key} 数量 ${t.ids.length} ≠ ${expected[t.key]}`);
-  }
-  const sum = Object.values(expected).reduce((a, b) => a + b, 0);
-  if (items.ITEM_TABLES.length !== 10 || sum !== 320) fail('分表结构不满足 10 表 / 320 项');
-  else pass('十大分表结构 10 表 320 项');
+  /* 分表逐条对账的判据已在上面 `diffItemCounts`(它比 `ids.length` 与 `count` 两个数),
+     这里只保留「分表结构与物品总数自洽」这一条**结构**断言 —— 它不来自基线,
+     是内容自身的恒等式(合计 = 总数),删掉基线也改不了它。 */
+  const sum = items.ITEM_TABLES.reduce((a, t) => a + t.ids.length, 0);
+  if (items.ITEM_TABLES.length !== itemMeasured.tableCount || sum !== items.ITEM_LIST.length) {
+    fail(
+      `分表结构不自洽:分表 ${items.ITEM_TABLES.length} 张 / 条目合计 ${sum} / 物品总数 ${items.ITEM_LIST.length}`,
+    );
+  } else pass(`十大分表结构与物品总数自洽(${items.ITEM_TABLES.length} 张 / 合计 ${sum})`);
 
   const malformed = items.ITEM_LIST.filter(
     (i: { name: string; tags: string[]; value: number; note: string }) =>
@@ -2261,14 +2323,43 @@ function whitelistBreakdown(): {
 }
 
 
-/** 解析一个 TS 文件的相对 import 目标(绝对路径)。 */
-function resolveImport(fromAbs: string, spec: string): string | null {
-  let p = resolve(dirname(fromAbs), spec);
-  if (p.endsWith('.ts')) return existsSync(p) ? p : null;
-  if (existsSync(`${p}.ts`)) return `${p}.ts`;
+/**
+ * 解析一个 TS 文件的相对 import 目标(绝对路径)。
+ *
+ * ## 2026-11-14 复核(BACKLOG-108 §3 第 6 组 / EXTENDING U1 同伴项)
+ *
+ * 旧实现三个洞,逐条列出(都是「判据表述比事实宽」的形态):
+ *
+ * 1. **非相对说明符没有守卫**。`resolve(dirname, 'node:fs')` 得到
+ *    `server/src/node:fs`(Windows 上是 `server\src\node:fs`),它当然不存在
+ *    ⇒ 恰好返回 null,**靠巧合正确**。但 `@shared/x.ts` 这类**别名**会落到
+ *    `server/src/@shared/x.ts`,一旦哪天真的存在同名目录就会被当成真依赖。
+ *    本仓 `tsconfig.json` **没有** `paths`/`baseUrl` ⇒ 别名规则是「不存在」,
+ *    故这里显式把非 `.` 开头的说明符判 null,并让 `checkResolveImport()`
+ *    钉住「tsconfig 仍然没有别名」这件事(加了别名就必须改本函数)。
+ * 2. **`existsSync` 对目录也返回 true**。说明符以 `.ts` 结尾时旧实现直接
+ *    `existsSync(p)` ⇒ 若 `p` 是**目录**(如 `./chunk.ts/` 这种畸形布局),
+ *    会返回一个目录路径当模块 ⇒ 可达性把它当文件算,而读它必失败。
+ * 3. **`.ts` 补全与 `index.ts` 补全没有区分「文件」与「目录」**。
+ *
+ * ⇒ 修法:统一 `isFile()`,并显式拒绝非相对说明符。
+ * 判据表见 `checkResolveImport()`(门禁自检,不是注释)。
+ */
+export function resolveImport(fromAbs: string, spec: string): string | null {
+  /* 别名/包名一律 null —— 本仓无 paths 映射(见 checkResolveImport) */
+  if (!spec.startsWith('.')) return null;
+  const p = resolve(dirname(fromAbs), spec);
+  const isFile = (q: string): boolean => {
+    try {
+      return statSync(q).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (p.endsWith('.ts')) return isFile(p) ? p : null;
+  if (isFile(`${p}.ts`)) return `${p}.ts`;
   const idx = join(p, 'index.ts');
-  if (existsSync(idx)) return idx;
-  return null;
+  return isFile(idx) ? idx : null;
 }
 
 /* ⚠️ `extractRelativeImports` 已抽到 `scripts/imports.ts`(**单一事实来源**)。
@@ -2655,6 +2746,10 @@ function checkReachability(): void {
     .map(relOf)
     .filter((r) => !reach.has(resolve(ROOT, r)))
     .sort();
+  /* ★ 2026-11-14:把"真可达的生产文件"暴露给 `checkWhitelistCross()`。
+     口径与 `demoOnly` 那段一致(prodAll ∩ reach) —— **不要在交叉检查里另算一遍**,
+     否则又是"同一概念写在两处"(本仓陷阱 31/41)。 */
+  reachableProdFiles = new Set(prodAll.map(relOf).filter((r) => reach.has(resolve(ROOT, r))));
 
   const entries = PROD_ENTRIES.filter((e) => existsSync(join(ROOT, e)));
   const missingEntries = PROD_ENTRIES.filter((e) => !existsSync(join(ROOT, e)));
@@ -3046,44 +3141,14 @@ const TAUT_SUSPECT_EXEMPT = new Map<string, string>([
 
 
   /* ── WS-07 ── */
-  /* PROTOCOL_VERSION 已于本批修复(WS-07:861 改为字面量 1)—— 已移出白名单 */
-  /* ── WS-09 ── */
-  ['WS-09::A4_MIDI', '已知:断言右侧取自 audio.ts,待换字面量'],
-  ['WS-09::PITCH_COUNT', '已知:断言右侧取自 audio.ts,待换字面量'],
-  /* ── WS-10 ── */
-  ['WS-10::BASE_CRIT_DMG', '已知:断言右侧取自 weapons.ts,待换字面量'],
-  /* ★ 2026-11-14:以下 2 条**已移出**(原为多行 `+` 拼接形态)。
-     它们的理由文本自己写着「已双重锚定…故本条无区分力缺口」——
-     即作者当时已判定"不是缺口而保留作记录"。但本表的语义是**抑制命中**,
-     已不再命中的条目留在表里 = 让「白名单条数」这个数字**名不副实**,
-     且会掩盖真实的漂移(门禁每次都报「失真 N 处」,久了没人看)。
-     ⇒ 「这是已知且正当的」应当写在**被观察对象附近**(测试文件里),
-       不是写在**抑制表**里。
-     ⚠️ 且它们用的是多行 `+` 拼接形态 —— 正是 `ORPHAN_KNOWN` 解析器
-        曾经**静默丢弃**的那种写法(PROGRESS 已记录)。本表因用 `startsWith` 逐行判
-        而侥幸读到,但**同一族风险**真实存在:登记形态本身也是审计对象。 */
-  /* `WS-10::REFLECT_RADIUS` 已移出:Lead 改成字面量 3 + `eq(REFLECT_RADIUS, 3)` 双重锚定。
-     实证注入 3.0→6.0 ⇒ 44/44 变 43/44(修复前是 44/44 全绿)。 */
-  /* ── WS-11 ── */
-  /* ── WS-FND-01 ── */
-  /* ── WS-FND-02 ── */
-
-  /* ─────────── ★ 2026-11-14 新揭出的 6 条(旧判据假阴性)───────────
-   * 来源:我修 `checkTautology` 的第 2 顶层实参解析后,这 6 条**首次**被报出来。
-   * 为什么旧判据会漏:`/eq|near\(\s*[^,]+,…/` 的 `[^,]+` 遇**第一个**逗号即停,
-   * 于是「第 1 实参本身含调用」的写法下,它读到的要么是**内层实参名**
-   * (如 `dodgy`),要么**一个都读不到** ⇒ 真命中被静默丢弃。
-   * ★ 所以旧判据的错**不只是"多报 74 处"**,还有这一侧:
-   *   「把真命中替换成内层变量名,然后过滤掉」= **静默漏报**。
-   * ⚠️ 这 6 条**尚未修**,故理由写「待修」而非「已知正当」——
-   *    白名单的语义是「已知且已解释」,拿它盖住未处理的欠账就是掩盖。
-   * 归口:WS-09 ×2 → client-stage;WS-10 ×3 → combat-progress;
-   *       WS-FND-07 ×1 → (见该条目内注)。 */
-  ['WS-09::ORTHO_DISTANCE',
-    '★ 待修(2026-11-14 新揭出):旧判据 `[^,]+` 遇逗号即停 ⇒ `near(Math.hypot(pos.x, pos.y, pos.z), ORTHO_DISTANCE, …)` 这种**第 1 实参带嵌套调用**的写法,旧正则**一个名字都读不到** ⇒ 静默漏报。已与 HEAD 逐行比对确认是**既有**缺陷,非本轮引入。'],
-  ['WS-09::TRANSPARENT_INDEX',
-    '★ 待修(2026-11-14 新揭出):同族假阴性(`eq(e.get(0, 0), TRANSPARENT_INDEX)` 第 1 实参含调用 ⇒ 旧正则读不到)。HEAD 已存在。'],
-
+  /* PROTOCOL_VERSION 已改为字面量 1 + 版本 3 锚点 —— 已移出白名单 */
+  /* ── WS-09 / WS-10 ── */
+  /* ★ 2026-11-17(本批):A4_MIDI / PITCH_COUNT / BASE_CRIT_DMG / ORTHO_DISTANCE /
+     TRANSPARENT_INDEX 这 5 条**已全部换成字面量**(并在各自套件里留了常量锚点,
+     例如 `eq(A4_MIDI, 69)`),因此它们不再命中 ⇒ 从抑制表里**删除**。
+     留着会触发「白名单失真」并掩盖真实漂移(本表语义是"抑制命中",不是记账)。
+     判据:`tests/WS-FND-76-test-debt.test.ts` 用**门禁同一个** `detectTautologyHits`
+     对这 5 个套件复算,命中必须为 0;旧写法若回来,反向对照会红。 */
 ]);
 
 /**
@@ -3735,6 +3800,290 @@ function checkClientTrust(): void {
 }
 
 
+/* ═══════════════ 2.8 断言实参全量扫描(2026-11-14,BACKLOG-108 §3 第 6 组)═══════════════
+ *
+ * ## 修的是什么
+ *
+ * 旧判据只读 `eq`/`near` 的**第 2 个顶层实参**(且词法上还错过一次,见
+ * `checkTautology` 里那段「`[^,]+` 遇逗号即停」的长注释)。于是三类真同义反复
+ * **结构上看不见**:
+ *
+ * ```
+ * near(x, EXPECTED, TOL)          ← 第 3 参(容差)取自被测模块 ⇒ 容差跟着实现走
+ * inRange(v, LO, HI)              ← 上下界取自被测模块 ⇒ 区间恒成立
+ * ok(CONST)                       ← 断言「常量本身为真」,与实现零关系
+ * ok(a, ...) 之外的额外实参        ← 未被登记的槽位一律看不见
+ * ```
+ *
+ * ⇒ 改为:**按形态表解析每一个顶层实参**,逐槽位给语义角色,并覆盖 5 种断言形态。
+ *
+ * ## 为什么 actual 侧**不算**候选(这是有意的不对称)
+ *
+ * 本仓推荐的反同义反复写法正是 `eq(CONST, 16, ...)`:常量在**实际值**一侧、
+ * 字面量在**期望值**一侧。若把 actual 侧也算候选,这条**正确写法**会被报成
+ * 缺陷,于是所有人都会去加白名单 —— 闸门被噪声永久占位(本仓踩过,见
+ * `TAUT_SUSPECT_EXEMPT` 里 `WS-09::SLOTS_PER_ROW` 的教训)。
+ * ⇒ actual 侧单独记为**锚点**并打印数量(它证明 `eq(CONST, 16)` 这种双重锚定
+ *   写法存在几处),但**不进候选集**。
+ *
+ * ★ 但有一类 actual 侧必须管:**同一断言的两侧都是本仓常量**
+ *   (`eq(A, B)`,A/B 都是 production 数值导出)⇒ 两侧都会随代码移动
+ *   ⇒ **必然同义反复**。这类标 `bothSides`(强判据),即使 expected 侧
+ *   恰好不在候选集里也要报。
+ *
+ * ## 期望值不许取自被测对象(这条注释是给未来的自己看的)
+ *
+ * 本节的判据表(`ASSERTION_FORMS`)与 `tests/WS-FND-74-gate-hardening.test.ts`
+ * 里的期望用例**都手写**,不 import 被测模块的断言形态表以外的任何东西 ——
+ * 否则「用被测对象验证被测对象」,与本门禁要防的缺陷同形。
+ */
+
+/** 断言实参的语义角色。`msg` 不参与判定(它本来就是字符串)。 */
+export type AssertionRole = 'actual' | 'expected' | 'eps' | 'lo' | 'hi' | 'cond' | 'msg' | 'extra';
+
+/**
+ * 断言形态表:形态 → 逐槽位角色。
+ *
+ * ⚠️ 这份表是**判据来源**,新增断言形态时必须同步(未登记的形态名不会被扫到)。
+ * 守卫见 `checkResolveImport` 同节的形态表自检:`test/ok/eq/near/inRange/includes`
+ * 这 5 个形态必须与 `shared/testing/harness.ts` 的导出**对得上**
+ * —— 少一个 ⇒ 该形态的断言整片不被检查,而门禁仍打印「已检查」。
+ */
+export const ASSERTION_FORMS: Readonly<Record<string, readonly AssertionRole[]>> = {
+  eq: ['actual', 'expected', 'msg'],
+  near: ['actual', 'expected', 'eps', 'msg'],
+  inRange: ['actual', 'lo', 'hi', 'msg'],
+  includes: ['actual', 'expected', 'msg'],
+  ok: ['cond', 'msg'],
+};
+
+/**
+ * 把源码里的注释内容与字符串**内容**抹成空格,**长度与换行不变**。
+ *
+ * 为什么不复用 `stripCommentsAndStrings`:它把整段块注释/字符串替换成 1~2 个
+ * 字符 ⇒ 后续所有字符的**下标偏移**,算出来的行号是错的(实测:一段跨 3 行的块注释
+ * 之后的断言行号全偏)。而本节的输出必须能直接指到 `文件:行`(给后续线修)。
+ * ⇒ 宁可多写 20 行,也不要一个"差不多"的行号。
+ *
+ * 保留引号本身(`'abc'` → `'   '`)是刻意的:消息实参于是**不可能**被误认成
+ * 裸标识符,而字符串里的 `eq(x, Y)` 也不会变成幻影断言。
+ */
+export function maskSource(src: string): string {
+  const n = src.length;
+  const out = src.split('');
+  const blank = (a: number, b: number): void => {
+    for (let k = a; k < b && k < n; k += 1) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < n) {
+    const c = src[i] as string;
+    if (c === '/' && src[i + 1] === '*') {
+      const e = src.indexOf('*/', i + 2);
+      const end = e < 0 ? n : e + 2;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '/') {
+      const e = src.indexOf('\n', i);
+      const end = e < 0 ? n : e;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === c) break;
+        j += 1;
+      }
+      blank(i + 1, j);
+      i = j + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * 切出 `openIdx` 处那个括号内的**全部顶层实参**(括号/中括号/大括号/字符串感知)。
+ *
+ * 与 `checkTautology` 内旧的 `topArgAt` 同一算法 —— 但**返回全部**实参,
+ * 因为「只取第 N 个」正是本节要修的表述错误。旧 `topArgAt` 保留在原地不动:
+ * 它还有 7 条真值表用例钉着(见那里的注释),删掉等于丢掉那份证据。
+ */
+export function splitTopLevelArgs(s: string, openIdx: number): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let cur = '';
+  let inStr: string | null = null;
+  for (let i = openIdx + 1; i < s.length; i += 1) {
+    const c = s[i] as string;
+    const p = s[i - 1];
+    if (inStr !== null) {
+      if (c === inStr && p !== '\\') { inStr = null; cur += c; continue; }
+      cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') { inStr = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') { depth += 1; cur += c; continue; }
+    if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0 && c === ')') { args.push(cur.trim()); return args; }
+      depth -= 1;
+      cur += c;
+      continue;
+    }
+    if (c === ',' && depth === 0) { args.push(cur.trim()); cur = ''; continue; }
+    cur += c;
+  }
+  /* 括号不配平 ⇒ 一个实参都不给(宁可漏报也不要把整段源码当成实参) */
+  return [];
+}
+
+/** 一条断言实参引用(全实参覆盖的产物)。 */
+export interface AssertionArgRef {
+  /** 1-based 行号(掩码后仍与原文件对齐)。 */
+  line: number;
+  form: string;
+  /** 该断言的出现序号(同一行多次调用也能区分)。 */
+  callId: number;
+  /** 0-based 实参序号。 */
+  slot: number;
+  role: AssertionRole;
+  /** 该实参的顶层文本(已 trim)。 */
+  expr: string;
+}
+
+/** 行号定位:二分查找(断言可达数百条,逐条数换行是 O(n²))。 */
+function makeLineLocator(masked: string): (index: number) => number {
+  const starts: number[] = [0];
+  for (let i = 0; i < masked.length; i += 1) if (masked[i] === '\n') starts.push(i + 1);
+  return (index: number): number => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if ((starts[mid] as number) <= index) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+}
+
+/**
+ * 扫出一个测试文件里**所有断言形态的所有顶层实参**,并给每个实参标角色。
+ *
+ * 覆盖 `ASSERTION_FORMS` 登记的全部形态(`eq` / `near` / `inRange` /
+ * `includes` / `ok`),不再只看 `eq`/`near` 的第 2 参。
+ */
+export function scanAssertionArgs(src: string): AssertionArgRef[] {
+  const masked = maskSource(src);
+  const lineOf = makeLineLocator(masked);
+  const out: AssertionArgRef[] = [];
+  let callId = 0;
+  const re = /\b(eq|near|inRange|includes|ok)\s*\(/g;
+  for (const m of masked.matchAll(re)) {
+    const idx = m.index ?? 0;
+    /* 排除 `obj.eq(...)` / `xeq(...)` 这类非本仓形态 */
+    const before = masked[idx - 1];
+    if (before !== undefined && /[A-Za-z0-9_$.]/.test(before)) continue;
+    const openIdx = idx + m[0].length - 1;
+    const args = splitTopLevelArgs(masked, openIdx);
+    if (args.length === 0) continue;
+    const roles = ASSERTION_FORMS[m[1] as string] as readonly AssertionRole[];
+    const line = lineOf(openIdx);
+    const id = callId;
+    callId += 1;
+    args.forEach((expr, slot) => {
+      const role = roles[slot] ?? 'extra';
+      out.push({ line, form: m[1] as string, callId: id, slot, role, expr });
+    });
+  }
+  return out;
+}
+
+/** 一条同义反复命中。 */
+export interface TautologyHit {
+  constName: string;
+  /** 常量**定义**模块(仓库相对路径)。 */
+  mod: string;
+  role: AssertionRole;
+  line: number;
+  expr: string;
+  /** 同一断言的 actual 侧**也**是本仓常量 ⇒ 必然同义反复(强判据)。 */
+  bothSides: boolean;
+}
+
+/** `detectTautologyHits` 的产出。 */
+export interface TautologyScan {
+  /** 期望侧(候选):`expected` / `eps` / `lo` / `hi` / `cond` / `extra`。 */
+  hits: TautologyHit[];
+  /** actual 侧的常量引用 —— 是**正确写法**的特征,只计数不报。 */
+  anchors: TautologyHit[];
+}
+
+/** 裸标识符?(`eq(x, CONST)` 只在这种形态下才可能与实现同源) */
+const BARE_IDENT = /^[A-Za-z_]\w*$/;
+
+/**
+ * 单文件同义反复扫描(纯函数,不读盘 —— 判据可被单独注入验证)。
+ *
+ * @param src 测试文件**原文**
+ * @param nameToMod 局部名 → 常量定义模块(`parseNamedImports` 的产出)
+ * @param numExports `<模块>::<名>` → 数值表达式(`collectNumericExports` 的产出)
+ */
+export function detectTautologyHits(
+  src: string,
+  nameToMod: ReadonlyMap<string, string>,
+  numExports: ReadonlyMap<string, string>,
+): TautologyScan {
+  const refs = scanAssertionArgs(src);
+  const resolveConst = (expr: string): { name: string; mod: string } | null => {
+    if (!BARE_IDENT.test(expr)) return null;
+    const mod = nameToMod.get(expr);
+    if (mod === undefined) return null;
+    if (!numExports.has(`${mod}::${expr}`)) return null;
+    return { name: expr, mod };
+  };
+
+  /* 按 callId 归组:强判据需要「同一断言的 actual 与 expected 两侧都是本仓常量」 */
+  const byCall = new Map<number, AssertionArgRef[]>();
+  for (const r of refs) {
+    const list = byCall.get(r.callId);
+    if (list === undefined) byCall.set(r.callId, [r]);
+    else list.push(r);
+  }
+  const bothSidesCalls = new Set<number>();
+  for (const [id, list] of byCall) {
+    const actual = list.find((r) => r.role === 'actual');
+    const expected = list.find((r) => r.role === 'expected');
+    if (actual === undefined || expected === undefined) continue;
+    if (resolveConst(actual.expr) !== null && resolveConst(expected.expr) !== null) bothSidesCalls.add(id);
+  }
+
+  const hits: TautologyHit[] = [];
+  const anchors: TautologyHit[] = [];
+  for (const r of refs) {
+    const c = resolveConst(r.expr);
+    if (c === null) continue;
+    const hit: TautologyHit = {
+      constName: c.name,
+      mod: c.mod,
+      role: r.role,
+      line: r.line,
+      expr: r.expr,
+      bothSides: bothSidesCalls.has(r.callId),
+    };
+    if (r.role === 'msg') continue;
+    if (r.role === 'actual') anchors.push(hit);
+    else hits.push(hit);
+  }
+  return { hits, anchors };
+}
+
+
 function checkTautology(): void {
   console.log('\n[同义反复候选]');
   const numExports = collectNumericExports();
@@ -3746,165 +4095,94 @@ function checkTautology(): void {
 
   const testsDir = join(ROOT, 'tests');
   const suiteFiles = walk(testsDir, ['.test.ts']);
-  const found = new Map<string, { suite: string; mod: string }>();
+  /** 候选集(键 `套件::常量名`)。**只收 `expected` 槽位命中** —— 与旧口径同键。 */
+  const found = new Map<string, {
+    suite: string; mod: string; roles: Set<AssertionRole>; lines: number[]; bothSides: boolean;
+  }>();
+  /** 候选侧的逐条命中(不去重)—— 输出要能指到 `文件:行`。 */
+  const hitLines: {
+    suite: string; line: number; constName: string; mod: string; role: AssertionRole; bothSides: boolean;
+  }[] = [];
+  /**
+   * **扩展槽位**命中:`eps` / `lo` / `hi` / `cond`(以及未登记槽位)。
+   *
+   * ## 为什么不并进 `found`(这个决定必须写下来)
+   *
+   * README 与 HANDOVER §三 各钉着一个数:`同义反复候选 N 条(白名单 M)`。
+   * 那两个数记的是**旧口径**(只有 `expected` 槽位)。把扩展槽位并进同一个数会:
+   * 1. 让两个**不同定义**的数共用一个名字(陷阱 27:数字的语义要与事实同强度);
+   * 2. 把 README/HANDOVER 变成"必须同步改"的文档 —— 但清零动作在测试侧(后续线),
+   *    文档数会跟着测试改动反复漂,这不是"校验",是"抄写"。
+   * ⇒ **分开记、分开报**:候选数保持旧口径(可对账),扩展槽位逐条列出并每轮告警。
+   *   清零完成后这两个数会一起落到 0,那时可以合并成一个口径(留给收口的人决定)。
+   */
+  const extHitLines: typeof hitLines = [];
+  /** actual 侧的常量引用(正确写法的特征,只计数)。 */
+  let anchorRefs = 0;
 
   for (const tf of suiteFiles) {
     const suite = basename(tf).replace('.test.ts', '');
     const src = readFileSync(tf, 'utf8');
-    const code = stripCommentsAndStrings(src);
-    const lines = code.split('\n');
 
     /* 局部名 → 定义模块相对路径(剥注释 + 沿转发链解析,见 parseNamedImports) */
     const nameToMod = parseNamedImports(src, resolveDef);
 
-    /* import 区行号(跳过)。
-       ⚠️ **退出条件必须覆盖三种 import 形态**,否则 `inImport` 会**永真**
-       ⇒ 其后所有行被 skip ⇒ 本套件的检查**静默失效而门禁仍绿**。
-       实测(2026-11-12,build-wiring 只读审计发现 + Lead 复核):
-       ```
-       正常 named import      跳过  1/5   ✓
-       仅裸副作用导入          跳过  4/4   ✗ **正文全被跳过**
-       裸导入后接 named        跳过  2/5   ✓(第二行的 from 让它退出)
-       动态 import()          跳过  0/3   ✓(它不以 `import` 开头)
-       多行 named import      跳过  4/6   ✓(从 `import {` 到 `} from`)
-       ```
-       ⇒ 触发条件是**顶层裸副作用导入** `import './x.ts';`。
-       **当前全仓 21 个套件触发 0 个**(已逐个实测)⇒ 属**潜伏**缺陷,
-       一旦有人加一行 `import './setup.ts';`,该套件的同义反复检查就无声失效。
-
-       ⚠️ 注意 `lines` 来自 `stripCommentsAndStrings(src)` ——
-       字符串已被替换成 `""`,所以 `/from\s*['"]/` **仍能匹配**
-       (`from './x.ts'` → `from ""`)。我一度以为剥字符串会让引号消失、
-       于是**所有**套件都触发 —— **实测证伪**(21 个套件触发 0 个,不是 21 个)。
-       ⇒ 记录这条是因为:它是我在这一处**唯一一次方向正确的怀疑**,而它被实测否掉了。 */
-    const importLines = new Set<number>();
-    let inImport = false;
-    lines.forEach((l, i) => {
-      if (/^\s*import\b/.test(l)) inImport = true;
-      if (inImport) {
-        importLines.add(i);
-        /* 三种结束形态:named/re-export 的 `from`、裸副作用的整行 `import "…"`、
-           多行 import 的收尾。⚠️ 不要在这里再写第四份 import 正则 ——
-           `parseNamedImports` 已有权威实现;此处只判「本行是否结束 import 语句」。 */
-        if (/from\b/.test(l)
-          || /^\s*import\s*$/.test(l)
-          || /^\s*import\s*["']/.test(l)
-          || /^\s*import\s*\(/.test(l)) {
-          inImport = false;
-        }
+    /* ★★★ 2026-11-14(档2 第 6 组):**全实参覆盖** —— 两件事一次做完。
+     *
+     * ## 1 旧判据的「第 2 个顶层实参」曾经是错的(历史,留档)
+     * 原正则 `/eq|near\(\s*[^,]+,.../` 的 `[^,]+` 遇**第一个**逗号即停
+     * ⇒ 有嵌套调用时它读到的是**内层**实参:
+     * ```
+     * eq(computeSlotLayout(320, SLOTS_PER_ROW, INVENTORY_SPARE_ROWS).rows, 21, '...')
+     *    ↑ 正则以为第 2 参 = SLOTS_PER_ROW,实则 = 字面量 21
+     * ```
+     * 实测假阳性 74/1041(7.1%),并让白名单里 `WS-09::SLOTS_PER_ROW` 那条
+     * **仅为假阳性而存在**。修法是顶层实参切分(现在的 `splitTopLevelArgs`)。
+     * ⚠️ 我的第一版 `secondTopArg` 在遇到**第一个**深度 0 的逗号就 return
+     * ⇒ 返回的是第 1 个实参,对着 7 条手写真值表 **7/7 全错**(命中 4 暴涨到 173)。
+     * ⇒ 教训:凡是「取第 N 个 X」的函数,写之前先列**含嵌套/含字符串逗号**的真值表。
+     *
+     * ## 2 形态与槽位(本轮新增)
+     * `ASSERTION_FORMS` 覆盖 eq / near / inRange / includes / ok,**每一个顶层实参**
+     * 都按槽位给语义角色。旧判据看不见的三类因此首次可见:
+     *   · `near(x, E, TOL)` 的**第 3 参**(容差取自被测模块 ⇒ 容差跟着实现走)
+     *   · `inRange(v, LO, HI)` 的**上下界**
+     *   · `ok(CONST)`(断言「常量本身为真」,与实现零关系)
+     * actual 侧**不算候选**(本仓推荐的反同义反复写法正是 `eq(CONST, 16)`),
+     * 只记锚点;但同一断言**两侧都是本仓常量** ⇒ 标 `bothSides`(必然同义反复)。
+     * 判据真值表在 `tests/WS-FND-74-gate-hardening.test.ts`(期望值手写)。
+     *
+     * ⚠️ 旧脚手架 `importLines` / `bodyRefs` 已删:新扫描器跑在 `maskSource()`
+     * (注释与字符串内容抹成空格、**长度不变** ⇒ 行号不偏)上,import 行不含断言调用,
+     * 字符串里的 `eq(x, Y)` 也不会成为幻影断言。删掉是为了不让两份「跳过 import 行」
+     * 的口径并存(本仓陷阱 31/41)。 */
+    const scan = detectTautologyHits(src, nameToMod, numExports);
+    /* ★ 两种命中**分开记**(理由见下方 `extHitLines` 的声明):
+       `expected` 槽位 = 沿用旧口径的"候选"(README/HANDOVER 钉的就是这个数);
+       其余槽位(eps / lo / hi / cond) = **扩展槽位**,单独罗列并告警。 */
+    for (const h of scan.hits) {
+      const isCandidateRole = h.role === 'expected';
+      const bucket = isCandidateRole ? hitLines : extHitLines;
+      bucket.push({
+        suite, line: h.line, constName: h.constName, mod: h.mod, role: h.role, bothSides: h.bothSides,
+      });
+      if (!isCandidateRole) continue;
+      const key = `${suite}::${h.constName}`;
+      const prev = found.get(key);
+      if (prev === undefined) {
+        found.set(key, {
+          suite, mod: h.mod, roles: new Set<AssertionRole>([h.role]), lines: [h.line], bothSides: h.bothSides,
+        });
+      } else {
+        prev.roles.add(h.role);
+        if (!prev.lines.includes(h.line)) prev.lines.push(h.line);
+        prev.bothSides = prev.bothSides || h.bothSides;
       }
-    });
-
-    /* 正文实际引用到的生产常量名 —— 这一步把范围收窄到「本套件真的在乎」的常量。
-       不做这一步会把其它模块导出的常量全算进来(实测误报率高 34:1,见 REVIEW-4 §3.1)。 */
-    const bodyRefs = new Set<string>();
-    lines.forEach((l, i) => {
-      if (importLines.has(i)) return;
-      for (const m of l.matchAll(/\b([A-Za-z_]\w*)\b/g)) if (nameToMod.has(m[1])) bodyRefs.add(m[1]);
-    });
-
-    /* ★ 2026-11-14 根治(client-stage task-87 报告 + Lead 独立复核):
-       原判据是 `/eq|near\(\s*[^,]+,\s*([A-Za-z_]\w*)\s*[,)]/` ——
-       `[^,]+` **遇到第一个逗号就停** ⇒ 它求的不是「第 2 个**顶层**实参」,
-       而是「**第一个逗号之后紧跟的那个标识符**」。这两者在**有嵌套调用**时不同:
-
-       ```
-       eq(computeSlotLayout(320, SLOTS_PER_ROW, INVENTORY_SPARE_ROWS).rows, 21, '…')
-          ↑ 正则以为第 2 参 = SLOTS_PER_ROW
-          ↑ 实则第 2 参 = 字面量 21(SLOTS_PER_ROW 是内层调用的第 2 个实参)
-       ```
-
-       ## 实测影响(我独立复算,不采信报告)
-
-       ```
-       门禁总命中 1041 处 / 假阳性 74 处 ⇒ **7.1%**
-       按套件:WS-09 20 · WS-03 10 · WS-11 8 · WS-07 7 · WS-08 6 · WS-FND-06 6
-               WS-06 5 · WS-02 4 · WS-10 3 · WS-04 2 · WS-05 2 · WS-13 1
-       ★ 且它**实际造成过噪声**:白名单里 `WS-09::SLOTS_PER_ROW` 这一条,
-         命中的 4 处(L1692-1695)**全部**是假阳性 ⇒
-         该条目**仅为假阳性而存在**(移出后门禁转绿 —— 见该条目处的说明)。
-       ```
-
-       ## 为什么必须修根因而非加白名单
-
-       假阳性是**多报**。多报的直接后果不是"报错",而是
-       **把一个本来不含同义反复的常量推进白名单** ⇒
-       此后该常量**将来**真的出现同义反复时,门禁**不会报** ——
-       闸门被一条错误条目**永久占位**。
-       ⇒ 与本仓形态 4「判据表述对不上它要声称防的东西」同族:
-         「第 2 个参数」这个**表述**对不上它实际在读的东西。
-
-       ## 修法:顶层实参切分(括号/中括号/大括号/字符串感知)
-
-       只认**深度 0** 的逗号 ⇒ 拿到的才是真正的第 2 个顶层实参。
-
-       ⚠️ **我自己在这处犯过同一个错,而且是被门禁读数抓出来的**
-       (本仓陷阱 124b:「读数离谱时,第一嫌疑是自己的测量口径」):
-
-       我的第一版函数名叫 `secondTopArg`,但循环体在遇到**第一个**深度 0 的逗号时
-       就 `return cur.trim()` ⇒ 它返回的是**第 1 个**实参,不是第 2 个。
-       实测后果:门禁命中从 **4 暴涨到 173**,而 `WS-10::BASE_CRIT_DMG`
-       从"命中"翻成"stale"(因为 `eq(edgeLow.critMul, BASE_CRIT_DMG)`
-       被读成第 1 参 `edgeLow.critMul` —— 不是裸标识符 ⇒ 被过滤掉)。
-
-       ★ 我是用**已知答案的真值表**定位到它的(7 个用例,期望值手写):
-
-       | 用例 | 期望第 2 参 | 我的错版 | 正确版 |
-       | :--- | :--- | :--- | :--- |
-       | `eq(a, b)` | `b` | `a` ✗ | `b` ✓ |
-       | `eq(REFLECT_RADIUS, 3)` | `3` | `REFLECT_RADIUS` ✗ | `3` ✓ |
-       | `eq(edgeLow.critMul, BASE_CRIT_DMG, …)` | `BASE_CRIT_DMG` | `edgeLow.critMul` ✗ | `BASE_CRIT_DMG` ✓ |
-
-       ⇒ 错版 **7/7 全错**,正确版 **7/7 全对**。错误率 100% 这个读数本身
-         就是"这不是边界情况、是整体偏移"的信号 —— 与"7.1%"完全不同性质。
-       ⇒ **教训**:凡是"取第 N 个 X"的函数,写之前先列**含嵌套/含字符串逗号**的真值表。 */
-    const topArgAt = (s: string, openIdx: number, n: number): string | null => {
-      let depth = 0;
-      let argIdx = 0;
-      let cur = '';
-      let inStr: string | null = null;
-      for (let i = openIdx + 1; i < s.length; i++) {
-        const c = s[i]!;
-        const p = s[i - 1];
-        if (inStr !== null) {
-          if (c === inStr && p !== '\\') { inStr = null; continue; }
-          cur += c;
-          continue;
-        }
-        if (c === "'" || c === '"' || c === '`') { inStr = c; cur += c; continue; }
-        if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
-        if (c === ')' || c === ']' || c === '}') {
-          if (depth === 0 && c === ')') return argIdx === n ? cur.trim() : null;
-          depth--;
-          cur += c;
-          continue;
-        }
-        if (c === ',' && depth === 0) {
-          if (argIdx === n) return cur.trim();
-          argIdx++;
-          cur = '';
-          continue;
-        }
-        cur += c;
-      }
-      return null;
-    };
-
-    lines.forEach((l, i) => {
-      if (importLines.has(i)) return;
-      for (const m of l.matchAll(/\b(?:eq|near)\s*\(/g)) {
-        const openIdx = (m.index ?? 0) + m[0].length - 1;
-        const arg2 = topArgAt(l, openIdx, 1);   /* ★ 0-based ⇒ 1 = 第 2 个 */
-        if (arg2 === null) continue;
-        if (!/^[A-Za-z_]\w*$/.test(arg2)) continue;   /* ★ 顶层第 2 参必须是裸标识符 */
-        const cn = arg2;
-        if (!bodyRefs.has(cn)) continue;
-        const mod = nameToMod.get(cn)!;
-        if (!numExports.has(`${mod}::${cn}`)) continue;
-        found.set(`${suite}::${cn}`, { suite, mod });
-      }
-    });
+    }
+    anchorRefs += scan.anchors.length;
   }
+  /* 供 `checkWhitelistCross()` 做「同义反复 × 不可达」交叉标注 */
+  tautFoundDetail = found;
 
   /* ── 白名单自检 ── */
   const stale: string[] = [];
@@ -3986,6 +4264,51 @@ function checkTautology(): void {
     }
   }
 
+  /* ── 全实参覆盖的**逐条清单**(2026-11-14 新增)─────────────────────────
+     旧输出只有「命中 N 条」一个数,读者无法知道命中在哪、落在哪个槽位。
+     而本轮任务要求「新发现的真正同义反复」必须**列到 文件:行** ——
+     所以这里无条件打印逐条明细(命中数在个位数,体积可控)。
+     ⚠️ 它**不进** README 校验的那个数(README 只认 `命中 N 条 / 白名单 M 条`),
+        故加明细不会改变 README 数字口径。 */
+  const roleCount = new Map<string, number>();
+  for (const h of [...hitLines, ...extHitLines]) roleCount.set(h.role, (roleCount.get(h.role) ?? 0) + 1);
+  const allHits = [...hitLines, ...extHitLines];
+  const bothSidesHits = allHits.filter((h) => h.bothSides);
+  console.log(
+    `  i 全实参覆盖:断言实参命中 ${allHits.length} 处`
+    + `(候选槽位 ${hitLines.length} / 扩展槽位 ${extHitLines.length})`
+    + ` / actual 侧锚点 ${anchorRefs} 处(锚点 = \`eq(CONST, 16)\` 这类**正确**写法,不算候选)`,
+  );
+  console.log(
+    `  i         └─ 按槽位:${[...roleCount].map(([r, n]) => `${r} ${n}`).join(' · ')}`
+    + ` · 双端同源 ${bothSidesHits.length} 处`,
+  );
+  const fmtHit = (h: typeof allHits[number]): string =>
+    `  i         └─ ${h.suite}  L${h.line}  ${h.constName}  [${h.role}${h.bothSides ? ' · 双端同源' : ''}]  ← ${h.mod}`;
+  for (const h of [...hitLines, ...extHitLines].sort(
+    (a, b) => (a.suite + a.line).localeCompare(b.suite + b.line),
+  )) {
+    console.log(fmtHit(h));
+  }
+  if (bothSidesHits.length > 0) {
+    advise(
+      '同义反复',
+      `双端同源 ${bothSidesHits.length} 处(actual 与 expected **都**取自本仓常量 ⇒ 必然同义反复):`
+      + bothSidesHits.slice(0, 4).map((h) => `${h.suite} L${h.line} ${h.constName}`).join('; '),
+    );
+  }
+  if (extHitLines.length > 0) {
+    /* ⚠️ 这门告警**没有升级开关**(`--strict-taut` 只升级"未登记候选"):
+       扩展槽位命中要先由测试线的清零动作处理(换成字面量),
+       在那之前把它们做成硬门禁只会让人去加白名单 —— 而白名单的语义是"已解释"。 */
+    advise(
+      '同义反复·扩展槽位',
+      `扩展槽位命中 ${extHitLines.length} 处(容差/上下界/ok 表达式取自被测模块;`
+      + '**不进**「同义反复候选」计数口径):'
+      + extHitLines.slice(0, 6).map((h) => `${h.suite} L${h.line} ${h.constName}[${h.role}]`).join('; '),
+    );
+  }
+
   /* 数字**无条件打印** —— 与 R6 同理:失败路径最需要知道命中总数有没有变。
      失败时同时打印「未登记/失真」明细,不再二选一。 */
   const summary =
@@ -4000,6 +4323,453 @@ function checkTautology(): void {
   } else {
     console.log(`  ℹ ${summary}(白名单失真 ${stale.length} 处,见下方)`);
   }
+}
+
+
+/* ═══════════════ 2.9 门禁自身的四道欠账(2026-11-14,档2 第 6 组)═══════════════
+ *
+ * 依据:`docs/BACKLOG-108-TRIAGE.md` §3 第 6 组(REVIEW-5 U3 / REVIEW-7..11 U9 /
+ * REVIEW-8 U11)+ `docs/RULINGS-DRAFT.md` §4.4(PERF U3 / EXTENDING U1)。
+ *
+ * 四道,全部是**门禁自己**的欠账(不是产品代码的):
+ *
+ * | 门禁项 | 修的是 | 判据 |
+ * | :--- | :--- | :--- |
+ * | `checkResolveImport` | import 解析的路径处理从未被复核过 | 真值表 + tsconfig 无别名 |
+ * | `checkWhitelistCross` | 两张白名单各自自检,但**彼此不说话** | 集合关系 + 双方标注 |
+ * | `checkPerfTagDemotions` | 三条 `not-in-manual` 无标签,读者分不清"缺证据"与"不合格" | 标签表双向对账 |
+ * | `checkDynamicImportBoundary` | 动态 `import()` 不跟踪原本是**静默忽略** | 显式登记为**已接受边界**并输出 |
+ *
+ * 判据(真值表 / 注入)在 `tests/WS-FND-74-gate-hardening.test.ts`。
+ */
+
+/* ── 1 import 解析复核 ────────────────────────────────────────────────────────
+ *
+ * ## 为什么这是一道**门禁**而不是一次性的 code review
+ *
+ * `resolveImport` 是整个可达性口径的**最底层**:
+ * `reachableClosure`(可达性)→ `checkReachability` → README 的「生产可达性」数字。
+ * 它错了,上面全部跟着错,而且**错的方向是"少算依赖"**(少算了 ⇒ 模块看起来不可达
+ * ⇒ 被加进白名单 ⇒ 门禁全绿)。这是本仓最贵的一类错误:错在"更宽松"那一侧。
+ *
+ * ⇒ 所以把它**钉成判据**:每条规则一个真值表用例,期望值手写。
+ *
+ * ## 复核出的三个洞(见 `resolveImport` 的注释)
+ *
+ * 1. 非相对说明符没有守卫(靠"恰好不存在"返回 null);
+ * 2. `existsSync` 对**目录**也 true ⇒ 说明符以 `.ts` 结尾时可能返回一个目录;
+ * 3. `.ts` / `index.ts` 补全未区分文件与目录。
+ *
+ * ⚠️ **别名**这一侧:本仓 `tsconfig.json` **没有** `paths` / `baseUrl`
+ *   ⇒ 别名规则是「不存在」,故非相对说明符一律 null 是**当下正确**的行为。
+ *   哪天有人加了别名,下面第 f 类用例会红 —— 那正是要它红的场合。
+ */
+
+/** `resolveImport` 的判据真值表(违反项,空数组 = 全对)。 */
+export function findResolveImportViolations(root: string): string[] {
+  const out: string[] = [];
+  const from = join(root, 'scripts', 'verify.ts');
+  const cases: { label: string; from: string; spec: string; want: string | null }[] = [
+    /* a 显式 `.ts` + 同目录 */
+    { label: 'a 显式 .ts', from, spec: './imports.ts', want: join(root, 'scripts', 'imports.ts') },
+    /* b 省略 `.ts`,靠补全规则 */
+    { label: 'b 补全 .ts', from, spec: './imports', want: join(root, 'scripts', 'imports.ts') },
+    /* c `../` 上溯 + 跨目录 */
+    {
+      label: 'c 上溯 ../',
+      from,
+      spec: '../shared/testing/harness.ts',
+      want: join(root, 'shared', 'testing', 'harness.ts'),
+    },
+    /* d 目录 + index.ts 补全 */
+    {
+      label: 'd 目录 index.ts',
+      from: join(root, 'server', 'src', 'sim', 'world_sim.ts'),
+      spec: '../alchemy',
+      want: join(root, 'server', 'src', 'alchemy', 'index.ts'),
+    },
+    /* e 不存在的文件 ⇒ null(带/不带扩展名两个方向) */
+    { label: 'e 不存在(带扩展名)', from, spec: './no-such-file.ts', want: null },
+    { label: 'e 不存在(无扩展名)', from, spec: './no-such-file', want: null },
+    /* f 非相对说明符 ⇒ null(包名 / 别名 都不归 resolveImport 管) */
+    { label: 'f 包名 node:fs', from, spec: 'node:fs', want: null },
+    { label: 'f 别名 @shared/...', from, spec: '@shared/types/tile.ts', want: null },
+    /* g 裸目录名(既无 .ts 也无 index.ts)⇒ null */
+    { label: 'g 裸目录名', from, spec: '.', want: null },
+  ];
+  /* 夹具存在性是**判据的一部分**:夹具没了这道自检就退化成"永远通过"。 */
+  for (const c of cases) {
+    if (!existsSync(c.from)) {
+      out.push(`${c.label}:夹具文件不存在(${relOfPath(c.from)})⇒ 该用例失去区分力`);
+      continue;
+    }
+    const got = resolveImport(c.from, c.spec);
+    const a = got === null ? null : got.split(sep).join('/');
+    const b = c.want === null ? null : c.want.split(sep).join('/');
+    if (a !== b) out.push(`${c.label}:resolveImport 给出 ${a ?? 'null'},期望 ${b ?? 'null'}`);
+  }
+
+  /* ── 别名规则自检:tsconfig 一旦出现 `paths`/`baseUrl`,`resolveImport` 就不再完整 ── */
+  const tsconfigAbs = join(root, 'tsconfig.json');
+  if (!existsSync(tsconfigAbs)) {
+    out.push('tsconfig.json 不存在 ⇒ 无法确认「本仓没有路径别名」这一前提');
+  } else {
+    let cfg: { compilerOptions?: { paths?: unknown; baseUrl?: unknown } } = {};
+    try {
+      cfg = JSON.parse(readFileSync(tsconfigAbs, 'utf8')) as typeof cfg;
+    } catch {
+      out.push('tsconfig.json 不可解析 ⇒ 无法确认别名前提');
+    }
+    const co = cfg.compilerOptions ?? {};
+    if (co.paths !== undefined) {
+      out.push('tsconfig 新增了 `paths` 别名 —— `resolveImport` 只认相对说明符,可达性口径已失效');
+    }
+    if (co.baseUrl !== undefined) {
+      out.push('tsconfig 新增了 `baseUrl` —— 同上,`resolveImport` 需要先支持它');
+    }
+  }
+  return out;
+}
+
+/** 门禁项:import 解析自检。 */
+function checkResolveImport(): void {
+  console.log('\n[import 解析自检]');
+  const bad = findResolveImportViolations(ROOT);
+  if (bad.length > 0) {
+    fail(`import 解析判据 ${bad.length} 处不符(它是可达性口径的地基):\n      ${bad.join('\n      ')}`);
+    return;
+  }
+  pass(
+    'import 解析判据 9/9(相对 a/b、上溯 c、目录 index d、不存在 e×2、非相对 f×2、裸目录 g);'
+    + 'tsconfig 无 paths/baseUrl(别名规则 = 不存在)',
+  );
+}
+
+/* ── 2 两白名单交叉标注 ────────────────────────────────────────────────────
+ *
+ * ## 修的是什么(REVIEW-7/8/9/10/11 U9)
+ *
+ * 仓里有**三张**豁免表,各自都有「失真即报错」的自检,但**彼此不说话**:
+ *
+ * ```
+ * UNREACHABLE_EXEMPT (可达性白名单)   path → 为什么可以不接入生产
+ * ORPHAN_KNOWN       (生产零引用)     path → 为什么不接(直接引用口径)
+ * TAUT_SUSPECT_EXEMPT(同义反复白名单) 套件::常量 → 为什么可以先不换字面量
+ * ```
+ *
+ * 已有的一条不变量是 `orphan ⊆ UNREACHABLE_EXEMPT`(单向子集)。
+ * 但它**只查了一侧**:它不能发现
+ *
+ * 1. 一条模块**一边说"可达"一边说"孤儿"**(子集不变量对"可达"一无所知:
+ *    只要它同时在白名单里子集就成立 —— 而白名单说它"不可达"、可达闭包说它"可达",
+ *    两个判据直接矛盾,门禁却全绿);
+ * 2. 同一处**两边都豁免**却**两边都不提对方**(读者只看到一张表,以为只有一处欠账)。
+ *
+ * ## 判据(三条,全部可机器判定)
+ *
+ * - **R1 可达 × 孤儿**:`ORPHAN_KNOWN` 的路径不得出现在生产可达闭包里。
+ * - **R2 双向标注**:凡**同时**在两表里的模块,两表各自的理由里都必须有指向对方的
+ *   交叉标记(`〔交叉:生产零引用` / `〔交叉:传递不可达`)。缺一个 = 这一处豁免
+ *   在两张表里各写了一遍而互不知情,人读任何一张都会低估欠账。
+ * - **R3 同义反复 × 不可达**:某候选常量的**定义模块**若在不可达白名单里
+ *   ⇒ 同一处"断言同义反复"也被豁免,而那个模块本身"不可达"
+ *   ⇒ **这一处没有任何东西在测**。这类必须报,不能靠两张表各自"已登记"糊过去。
+ */
+
+/**
+ * **交叉标注表**:同一模块在两张表里都豁免时,把"为什么两边都成立"写在这里。
+ *
+ * ## 为什么单独一张表,而不是往两条理由里各加一句
+ *
+ * 每条理由都已经是 200~600 字的定性说明,各自的读者是**那一张表的读者**。
+ * 往两处各加一句交叉引用,得到的是"两句话各说一半",而**没有一处**能回答
+ * 「这条欠账到底被豁免了几次、豁免的理由是否相容」。
+ * ⇒ 交叉这件事本身需要一个**单一落点**(这张表),而判据(下面 R2)保证:
+ *   凡**同时**在两张表里的模块,这张表里必须有一条;**这张表里的每一条**也必须
+ *   确实同时在两张表里(双向,防"标注了但已经不豁免了"的墓碑)。
+ *
+ * 每条:`路径 → 两句话`。第一句说清两侧豁免**分别**是什么口径,
+ * 第二句说清**为什么两者相容**(而不是"两套判据各说各话")。
+ */
+export const CROSS_ANNOTATION: ReadonlyMap<string, string> = new Map<string, string>([
+  ['server/src/content/baseline.ts',
+    '可达性侧:传递不可达(没有任何生产根能走到它);orphan 侧:生产零引用(直接引用=0)。'
+    + '两者相容的原因:它**只被门禁消费**(gate-only),故既不在生产闭包里,也没有生产 importer —— '
+    + '一条欠账的两个投影,不是两条欠账。'],
+  ['server/src/content/handshake.ts',
+    '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+    + '相容原因:握手校验尚未接入 join 路径,两边都是同一处未接线。'],
+  ['server/src/db/memory_db.ts',
+    '可达性侧:传递不可达(只在测试与门禁里被 import);orphan 侧:生产零引用(生产走 driver.sqlite)。'
+    + '相容原因:它的消费者刻意只在测试侧,故生产既进不了闭包也没有 importer。'],
+  ['server/src/mobs/taming.ts',
+    '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+    + '相容原因:驯服链路等"宠物容器 + 交互"落地,两边同时等同一件事。'],
+  ['server/src/build/wiring_view.ts',
+    '可达性侧:传递不可达;orphan 侧:生产零引用。'
+    + '相容原因:**服务端侧根本不该接**(纯视图计算),客户端侧宿主不存在 —— '
+    + '所以"不可达"与"零引用"在这里都是**正确状态**,不是待办。'],
+  ['server/src/prank/immunity.ts',
+    '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+    + '相容原因:等 `applyPrank` 这个施加端,两边同一处未接线。'],
+]);
+
+/** `findWhitelistCrossViolations` 的入参(全部可注入 ⇒ 判据可被单独验证)。 */
+export interface CrossWhitelistInput {
+  /** 生产可达闭包里的文件(仓库相对路径)。 */
+  reachable: ReadonlySet<string>;
+  /** 可达性白名单:`path → 理由`。 */
+  unreachableExempt: ReadonlyMap<string, string>;
+  /** 生产零引用清单:`path → 理由`。 */
+  orphan: ReadonlyMap<string, string>;
+  /** 同义反复候选:`套件::常量 → { 定义模块, 行号 }`。 */
+  tautCandidates: ReadonlyMap<string, { suite: string; mod: string; lines: number[] }>;
+  /** 交叉标注表:`path → 标注`。 */
+  crossAnnotations: ReadonlyMap<string, string>;
+}
+
+/** 两白名单交叉检查的**纯判据**(违反项,空数组 = 通过)。 */
+export function findWhitelistCrossViolations(input: CrossWhitelistInput): string[] {
+  const out: string[] = [];
+  /* ── R1 同一模块不得一边可达一边孤儿 ── */
+  for (const rel of input.orphan.keys()) {
+    if (input.reachable.has(rel)) {
+      out.push(
+        `${rel}:ORPHAN_KNOWN 说它「生产零引用」,可达闭包却说它**可达** —— 两套判据矛盾(必有一错)`,
+      );
+    }
+  }
+  /* ── R2 同一处两边都豁免 ⇒ 必须在交叉标注表里有一条(双向对账) ── */
+  const bothSides: string[] = [];
+  for (const rel of input.orphan.keys()) {
+    if (input.unreachableExempt.has(rel)) bothSides.push(rel);
+  }
+  for (const rel of bothSides) {
+    const note = input.crossAnnotations.get(rel);
+    if (note === undefined) {
+      out.push(`${rel}:同在两表里豁免,但**没有交叉标注**(应登记进 CROSS_ANNOTATION 并说明两套理由为何相容)`);
+      continue;
+    }
+    if (!note || note.trim().length < 8) {
+      out.push(`${rel}:交叉标注**没写明理由**(应说清两侧口径 + 为什么相容)`);
+    }
+  }
+  for (const rel of input.crossAnnotations.keys()) {
+    if (!input.orphan.has(rel)) {
+      out.push(`${rel}:交叉标注指向的模块已**不在** ORPHAN_KNOWN ⇒ 标注已成墓碑,应删除`);
+    }
+    if (!input.unreachableExempt.has(rel)) {
+      out.push(`${rel}:交叉标注指向的模块已**不在**可达性白名单 ⇒ 标注已成墓碑,应删除`);
+    }
+  }
+  /* ── R3 同义反复 × 不可达 = 两边都豁免 ── */
+  for (const [key, det] of input.tautCandidates) {
+    if (!input.unreachableExempt.has(det.mod)) continue;
+    out.push(
+      `${key}:断言右侧取自 ${det.mod}(L${det.lines.join(',')}),而该模块在**不可达白名单**里`
+      + ' —— 同义反复豁免 × 不可达豁免 ⇒ 这一处没有任何东西在测',
+    );
+  }
+  return out;
+}
+
+/** 门禁项:两白名单交叉标注。 */
+function checkWhitelistCross(): void {
+  console.log('\n[白名单交叉标注]');
+  if (reachableProdFiles === null) {
+    /* 不许静默跳过:没算过可达集,"一边可达一边孤儿"这件事就无从判定。 */
+    fail('可达性节未运行 ⇒ 交叉检查的 R1 无从判定(不许当成通过)');
+    return;
+  }
+  if (orphanKnownParsed === null) {
+    fail('ORPHAN_KNOWN 未解析 ⇒ 交叉检查整体失效(不许当成通过)');
+    return;
+  }
+  const tautCandidates = new Map<string, { suite: string; mod: string; lines: number[] }>();
+  for (const [k, v] of tautFoundDetail ?? new Map<string, { suite: string; mod: string; lines: number[] }>()) {
+    tautCandidates.set(k, v);
+  }
+  const bad = findWhitelistCrossViolations({
+    reachable: reachableProdFiles,
+    unreachableExempt: UNREACHABLE_EXEMPT,
+    orphan: orphanKnownParsed,
+    tautCandidates,
+    crossAnnotations: CROSS_ANNOTATION,
+  });
+  /* 交叉表**无条件打印** —— 这张图此前不存在,人是靠脑内对表在核的。 */
+  const both = [...orphanKnownParsed.keys()].filter((p) => UNREACHABLE_EXEMPT.has(p)).length;
+  console.log(
+    `  i 交叉:孤儿 ${orphanKnownParsed.size} 条 / 不可达白名单 ${UNREACHABLE_EXEMPT.size} 条`
+    + ` / 同时豁免 ${both} 条 / 同义反复候选 ${tautCandidates.size} 条`,
+  );
+  for (const rel of orphanKnownParsed.keys()) {
+    const inWl = UNREACHABLE_EXEMPT.has(rel) ? '在可达性白名单' : '**不在**可达性白名单';
+    const reach = reachableProdFiles.has(rel) ? '可达' : '不可达';
+    const tagged = CROSS_ANNOTATION.has(rel) ? '已交叉标注' : '未交叉标注';
+    console.log(`  i         └─ ${rel}  ${reach} · ${inWl} · ${tagged}`);
+  }
+  if (bad.length > 0) {
+    fail(`两白名单交叉检查 ${bad.length} 处冲突:\n      ${bad.join('\n      ')}`);
+    return;
+  }
+  pass(
+    `两白名单交叉自洽(${both} 条同时豁免者全部有交叉标注、且标注无墓碑;`
+    + '可达×孤儿冲突 0;同义反复×不可达 0)',
+  );
+}
+
+/* ── 3 PERF U3:三条 `not-in-manual` 降级为**标签**(不删)────────────────────
+ *
+ * ## 裁决(RULINGS-DRAFT §4.4)
+ *
+ * > PERF U3 | 三条 `not-in-manual` **降级为标签,不删** | 台账标注 + 判据
+ *
+ * ## 为什么"不删"
+ *
+ * 这三条**不是**"没测":它们各自有真实测量值(`perf-bounds.ts` 里跑出来的中位数),
+ * 只是**手册原文里没有对应的数字**,所以不能用"成立/不成立"去裁它。
+ * 删掉 = 把"手册缺这条"这件事也一起删掉 ⇒ 下一个人会以为这块没人量过。
+ * ⇒ 保留条目 + 打上**标签**,让读者一眼看出"是缺出处,不是不合格"。
+ *
+ * ## 判据
+ *
+ * 标签表在这里(`PERF_TAG_DEMOTED`),源头在 `scripts/perf-bounds.ts`。
+ * 双向对账:表里有而源码没有 ⇒ 条目被删/改名(应同步);源码有而未登记
+ * ⇒ 有人新增了一条 `not-in-manual`(必须显式裁决,不能默默多一条)。
+ */
+
+/** 已降级为标签的三条 `not-in-manual`(id → 标签文字)。 */
+export const PERF_TAG_DEMOTED: ReadonlyArray<readonly [string, string]> = [
+  ['C3', '流体 128×128 单步耗时 —— 候选清单引自 docs/FLUID-BUDGET.md,手册 L20 无数字'],
+  ['C7', '512×512 / 2 万电线格 电路推进 —— 规模出自项目文档,手册 L20 无数字'],
+  ['C8', '16 人稳态带宽 692B / 13.52kB/s —— 出自 docs/WS-07 §4.2,手册 L691 只有字段表'],
+];
+
+/**
+ * 从 `scripts/perf-bounds.ts` 源码里解析出所有 `verdict: 'not-in-manual'` 的条目 id。
+ *
+ * 解析方式:按 `add({` 切开,每块取 `id:` 与 `verdict:`。
+ * ⚠️ 这是**文本解析**,与 `checkOrphanList` 读 `ORPHAN_KNOWN` 同一取舍:
+ *   `perf-bounds.ts` 是要跑基准的顶层脚本,不能 import ⇒ 只能读文本。
+ */
+export function parseNotInManualIds(source: string): string[] {
+  const out: string[] = [];
+  for (const blk of source.split(/\badd\(\{/).slice(1)) {
+    const stop = blk.indexOf('});');
+    const body = stop < 0 ? blk : blk.slice(0, stop);
+    const idm = /id:\s*'([^']+)'/.exec(body);
+    const vm = /verdict:\s*'([^']+)'/.exec(body);
+    if (idm === null || vm === null) continue;
+    if (vm[1] === 'not-in-manual' && !out.includes(idm[1] as string)) out.push(idm[1] as string);
+  }
+  return out;
+}
+
+/** 标签表 × 源码的**纯判据**(违反项,空数组 = 通过)。 */
+export function findPerfTagViolations(source: string): string[] {
+  const out: string[] = [];
+  const inSource = parseNotInManualIds(source);
+  const registered = new Set(PERF_TAG_DEMOTED.map(([id]) => id));
+  for (const id of inSource) {
+    if (!registered.has(id)) {
+      out.push(`源码新增未登记的 \`not-in-manual\` 条目 ${id} —— 需裁决它是不是"降级为标签"`);
+    }
+  }
+  for (const id of registered) {
+    if (!inSource.includes(id)) {
+      out.push(`标签表登记的 ${id} 在源码里已不是 \`not-in-manual\`(被删/改名/升级)⇒ 应从标签表移出`);
+    }
+  }
+  return out;
+}
+
+/** 门禁项:PERF U3 标签降级。 */
+function checkPerfTagDemotions(): void {
+  console.log('\n[PERF U3 标签降级]');
+  const p = join(ROOT, 'scripts', 'perf-bounds.ts');
+  if (!existsSync(p)) {
+    fail('scripts/perf-bounds.ts 不存在 ⇒ PERF U3 的三条标签无从核对');
+    return;
+  }
+  const src = readFileSync(p, 'utf8');
+  const bad = findPerfTagViolations(src);
+  const inSource = parseNotInManualIds(src);
+  /* 三条**无条件逐条打印**:这正是"降级为标签"要的效果 —— 读者一眼看到
+     "这三条是缺手册出处,不是不合格",而不是被算进"无法判断"里。 */
+  for (const [id, label] of PERF_TAG_DEMOTED) {
+    const mark = inSource.includes(id) ? '' : '  ⚠ 源码里已不存在';
+    console.log(`  i ⊘ 标签 ${id}  ${label}${mark}`);
+  }
+  if (bad.length > 0) {
+    fail(`PERF U3 标签表与 perf-bounds.ts 不一致(${bad.length} 处):\n      ${bad.join('\n      ')}`);
+    return;
+  }
+  pass(
+    `PERF U3:三条 not-in-manual 已降级为标签、未删(${PERF_TAG_DEMOTED.map(([id]) => id).join(' / ')};`
+    + '与 perf-bounds.ts 双向一致)',
+  );
+}
+
+/* ── 4 动态 `import()` 不跟踪:显式**接受**的边界 ────────────────────────────
+ *
+ * ## 裁决(RULINGS-DRAFT §4.5)
+ *
+ * > REVIEW-9/10/11 U13 | 「动态 `import()` 不跟踪」**正式接受并关行**(影响=零)
+ *
+ * ## "接受"与"忽略"的区别就是**这道门禁**
+ *
+ * 忽略 = 代码里没有这句话,下一个人以为它被处理了。
+ * 接受 = 有一行输出**每次都告诉你**:这里有一条已知边界,它仍然成立,原因是 X。
+ *
+ * ## 边界到底是什么
+ *
+ * `scripts/imports.ts` 只认**字面量**说明符:
+ * ```
+ * await import('./dyn.ts')      ✓ 跟踪
+ * await import(`./t.ts`)        ✓ 跟踪(模板串无插值)
+ * await import(someExpr)        ✗ **不跟踪** —— 静态不可解析
+ * ```
+ * 影响=零的**理由**:可达性的三个根全是静态 import,本仓没有"只经变量说明符"的
+ * 依赖边。这个理由写在输出里,免得"影响=零"变成一句口号。
+ * ⇒ 一旦真的出现非字面量动态 import,本行会**列出文件:行**,仍然不红(已接受),
+ *   但**看得见** —— 这正是裁决要求的形态。
+ */
+
+/** 门禁项:动态 import 边界(已接受,可见)。 */
+function checkDynamicImportBoundary(): void {
+  console.log('\n[动态 import 边界]');
+  const dirs = ['server/src', 'client/src', 'shared', 'scripts', 'tests'];
+  const sites: { file: string; line: number }[] = [];
+  let literalSites = 0;
+  for (const d of dirs) {
+    const base = join(ROOT, d);
+    if (!existsSync(base)) continue;
+    for (const f of walk(base, ['.ts'])) {
+      const rel = relative(ROOT, f).split(sep).join('/');
+      for (const site of findDynamicImports(readFileSync(f, 'utf8'))) {
+        if (site.literal) literalSites += 1;
+        else sites.push({ file: rel, line: site.line });
+      }
+    }
+  }
+  console.log(
+    `  i 已接受的边界:动态 \`import()\` 的**非字面量**说明符 ${sites.length} 处(静态不可解析 ⇒ 不跟踪);`
+    + `同口径**字面量**动态 import ${literalSites} 处(已跟踪)`,
+  );
+  console.log(
+    '  i         └─ 影响=零的依据:可达性三根全是静态 import;本仓没有"只经变量说明符"的依赖边。'
+    + ' 裁决见 docs/RULINGS-DRAFT.md §4.5(REVIEW-9/10/11 U13,已接受并关行)',
+  );
+  if (sites.length === 0) {
+    pass('动态 import 边界已登记且当前为空(0 处非字面量;边界仍然成立,不属于"忽略")');
+    return;
+  }
+  for (const s of sites.slice(0, 8)) console.log(`  i         └─ ${s.file}:${s.line}`);
+  if (sites.length > 8) console.log(`  i         └─ …另有 ${sites.length - 8} 处`);
+  advise(
+    '动态import',
+    `动态 \`import()\` 非字面量说明符 ${sites.length} 处 —— 已接受(不跟踪),但请确认它不承载依赖边`,
+  );
 }
 
 
@@ -4616,6 +5386,10 @@ function checkOrphanList(): void {
     fail('ORPHAN_KNOWN 解析出 0 条 —— 正则与表格形态不符,本门禁不可信');
     return;
   }
+  /* 暴露给 `checkWhitelistCross()`(两白名单交叉标注)。
+     放在"解析出 0 条"自检之后:0 条时 `checkOrphanList` 已 fail,
+     交叉检查读到 null 也会各自 fail —— 两道都不许静默跳过。 */
+  orphanKnownParsed = orphan;
   /* ═══ ★ 2026-11-14(task-84 复盘):解析条数必须等于**真值条数** ═══
    *
    * 原实现只自检「解析出 0 条」,而那**不足以**发现静默丢条目。
@@ -6507,6 +7281,11 @@ if (!docsOnly && !only && !integrationOnly && !contentOnly) await checkFrozen();
    于是 README 校验静默跳过 —— 门禁假绿。 */
 if (!frozenOnly && !docsOnly && !contentOnly) runTests();
 checkStrippable();
+/* ★ 2026-11-14(档2 第 6 组):**import 解析自检** —— 必须排在生产可达性**之前**。
+   理由:可达性完全建立在 `resolveImport` 上,它的判据错了,后面每一个数字都错,
+   而错的方向恰好是"更宽松"(少算依赖 ⇒ 看起来不可达 ⇒ 进白名单 ⇒ 全绿)。
+   ⇒ 先证地基,再用地基。 */
+checkResolveImport();
 /* 生产可达性:只依赖源码文本,不依赖测试结果,故紧随语法扫描之后。 */
 checkReachability();
 /* 生产零引用(第二套判据)—— 必须紧跟在可达性之后:
@@ -6553,6 +7332,14 @@ checkJudgementAudit();
 checkTempResidue();
 checkTautology();
 checkClientTrust();
+/* ★ 2026-11-14(档2 第 6 组):**两白名单交叉标注** —— 必须排在可达性与
+   `checkTautology` **之后**(它要读 `reachableProdFiles` / `orphanKnownParsed` /
+   `tautFoundDetail` 三份结果)。位置错了会读到 null ⇒ 该道 fail「未运行」而不是假绿。 */
+checkWhitelistCross();
+/* ★ PERF U3:三条 `not-in-manual` 的**标签**降级(纯文本核对,不跑基准)。 */
+checkPerfTagDemotions();
+/* ★ 动态 `import()` 不跟踪 —— **显式接受**的边界(每次输出都说明它仍然成立)。 */
+checkDynamicImportBoundary();
 /* ★ 客户端构建 —— 补「boot.ts 零测试覆盖」这个结构性缺口。
    ⚠️ 只在**全量或客户端相关**模式下跑:它是慢操作(~1.2s)且会写 dist/,
       而 --frozen / --docs / --content 的运行不需要它。

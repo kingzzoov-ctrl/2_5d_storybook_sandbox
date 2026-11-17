@@ -298,7 +298,11 @@ test('W4-13 FSM 三态:IDLE → ALERT → TELEGRAPH → 结算 → 回 ALERT', (
   }
   eq(fsm.state, MobFsmState.TELEGRAPH_ATTACK, '进入预警态');
   ok(fsm.telegraph !== null, '预警几何已创建');
-  inRange(fsm.telegraph!.geom.warnSec, TELEGRAPH_SEC_MIN, TELEGRAPH_SEC_MAX, '预警时长在 [0.8, 1.5]');
+  /* 期望值用**字面量** [0.8, 1.5](手册 §5 预警时长区间),不取被测常量;
+     常量本身由下面两条锚点钉住 ⇒ 改 fsm.ts 的 0.8/1.5 会红。 */
+  inRange(fsm.telegraph!.geom.warnSec, 0.8, 1.5, '预警时长在 [0.8, 1.5]');
+  eq(TELEGRAPH_SEC_MIN, 0.8, '预警时长下界 = 0.8s(手册 §5)');
+  eq(TELEGRAPH_SEC_MAX, 1.5, '预警时长上界 = 1.5s(手册 §5)');
 
   /* 推进预警时间 → 单次预警只结算 1 次。
      预警时长 0.8s = 16 帧;跑 16 帧恰好结算一次。 */
@@ -445,7 +449,10 @@ test('W4-23 野猪:蓄力 1s → 直线冲锋 6 格 → 撞墙自晕 3s', () => 
 
   /* 冲锋:无墙 → 前进到 6 格后停止 */
   for (let i = 0; i < 100 && rt.mem.phase === 2; i += 1) ai.tick(rt, world, DT);
-  inRange(rt.mem.travel, BOAR_CHARGE_TILES, BOAR_CHARGE_TILES + 0.6, '冲锋距离 ≈ 6 格');
+  /* 期望值用**字面量** 6(手册 §5「冲刺 6 格」),上界 6.6 = 6 + 0.6 容差;
+     常量本身由下一行锚点钉住 ⇒ 改 behaviors.ts 的 6 会红。 */
+  inRange(rt.mem.travel, 6, 6.6, '冲锋距离 ≈ 6 格');
+  eq(BOAR_CHARGE_TILES, 6, '冲锋距离 = 6 格(手册 §5)');
   eq(rt.mem.phase, 0, '冲锋结束回 idle');
 
   /* 撞墙 → 自晕 3 秒 */
@@ -1326,11 +1333,12 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
   ok(prod.length > 50,
     `自证:生产源码扫到 ${prod.length} 个 .ts(期望 > 50 —— 否则扫描器坏了会**静默恒过**)`);
 
-  /* 5a 全仓**读** `.tameItem` 的文件 —— 实测 3 个。
-   *    这条正是「tameItem 字段无人消费」的**反证**。 */
+  /* 5a 全仓**读** `.tameItem` 的文件 —— 实测 4 个。这条正是「tameItem 字段无人消费」的**反证**。
+   *    2026-11-17:`server/src/systems/ranch.ts`(牧场日结)成为第 4 个读者(D-19 第 3 条)+
+   *    它的饲料来源就是 `tameItem` —— 所以这条清单**该变长**,不是被放宽。 */
   const tameReaderFiles = prod.filter((p) => /\.tameItem/.test(p.src)).map((p) => p.rel).sort();
   eq(tameReaderFiles,
-    ['server/src/content/registry.ts', 'server/src/mobs/taming.ts', 'shared/constants/mobs.ts'],
+    ['server/src/content/registry.ts', 'server/src/mobs/taming.ts', 'server/src/systems/ranch.ts', 'shared/constants/mobs.ts'],
     `全仓读 .tameItem 的文件共 ${tameReaderFiles.length} 个 ⇒ tameItem **有**消费者(「无人消费」不成立)`);
 
   /* 5b 真正无人消费的是 `feedPet` 这个**函数**:生产侧调用点 0(只 1 处定义)。 */

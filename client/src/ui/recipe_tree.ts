@@ -86,6 +86,24 @@ export interface RecipeNode {
   leafKinds: number;
   /** 深度(根 = 0) */
   depth: number;
+  /**
+   * ★ WS-09 U3:**父节点溯源** —— 直接父节点的 `itemId`;根节点为 −1。
+   *
+   * 为什么必须落在节点上:UI 的虚拟滚动只拿得到 `flattenTree()` 的**扁平数组**,
+   * 一旦某个节点被渲染到屏幕外的缓冲区,还原「它属于哪条分支」就只能靠这两个字段。
+   * 早先的 `flattenTree` 只把 `depth` 带出去,于是同深度、不同分支的两行
+   * (比如两条不同的「任意染料」槽)在 UI 上无法区分 —— 缩进线画错、
+   * 折叠某分支时别的分支跟着消失,都由此而来。
+   */
+  parentId: number;
+  /**
+   * 从根到**父节点**的 `itemId` 链(不含自身)。根节点为 `[]`。
+   *
+   * 与 `parentId` 的区别:`parentId` 只够回答「上一层是谁」,`parentPath` 才能
+   * 回答「这条路径从哪来」—— 环检测(`path.includes(id)`)用的就是同一条链,
+   * 因此这两个字段与环/截断判定**天然同源**,不会出现「树说有环、溯源链说不认识」。
+   */
+  parentPath: readonly number[];
   /** 是否因环被截断 */
   cyclic: boolean;
   /** 是否因超深被截断 */
@@ -213,6 +231,9 @@ export function buildRecipeTree(itemId: number, batches = 1, maxDepth = MAX_DEPT
       subtreeCost: need,
       leafKinds: 0,
       depth,
+      /* 溯源:`path` 就是「根 → 父」的 itemId 链(环检测用的同一条),直接复用不复制 */
+      parentId: path.length > 0 ? path[path.length - 1] : -1,
+      parentPath: path,
       cyclic: false,
       truncated: false,
     };
@@ -284,6 +305,9 @@ export function buildRecipeTree(itemId: number, batches = 1, maxDepth = MAX_DEPT
         subtreeCost: need,
         leafKinds: 1,
         depth: depth + 1,
+        /* 槽节点的父 = 当前节点,溯源链 = 当前路径 + 当前 id(= nextPath) */
+        parentId: id,
+        parentPath: [...path, id],
         cyclic: false,
         truncated: false,
         slotTags: [...slot],
@@ -321,12 +345,26 @@ export function buildRecipeTree(itemId: number, batches = 1, maxDepth = MAX_DEPT
   };
 }
 
-/** 展开为数组(广度优先),便于 UI 虚拟滚动 */
+/**
+ * 展开为数组(广度优先),便于 UI 虚拟滚动。
+ *
+ * ★ WS-09 U3:**必须保留父节点溯源。**
+ *
+ * 两条实现纪律(改坏任何一条,判据立刻红):
+ *   1. **返回的是原节点本身**,不是 `{...node}` 副本 —— 复制会让 `parentId` /
+ *      `parentPath` 与树上真实结构脱钩(`children` 引用也断了),UI 折叠时找不回父;
+ *   2. 节点上的 `parentId` / `parentPath` 由 `build()` 在创建时写入(**构造期即溯源**),
+ *      本函数不得抹掉或重写它们。若有人改成"flatten 时再补一遍 parent",
+ *      一旦折叠/剪枝,补出来的链就会指向被剪掉的节点。
+ *
+ * 复杂度 O(节点数)。
+ */
 export function flattenTree(node: RecipeNode, includeCollapsed = true): RecipeNode[] {
   const out: RecipeNode[] = [];
   const queue: RecipeNode[] = [node];
   while (queue.length > 0) {
     const cur = queue.shift() as RecipeNode;
+    /* 原样入列:溯源字段随节点一起出去,不复制、不覆盖 */
     out.push(cur);
     if (!includeCollapsed && (cur.cyclic || cur.truncated)) continue;
     for (const c of cur.children) queue.push(c);

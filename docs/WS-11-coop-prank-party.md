@@ -810,7 +810,7 @@ node scripts/verify.ts --only WS-11   # 全绿
 
 | # | 最终取值 | 落地位置 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **U2** | 订单单件分改用**望远镜差值** `round(P·dₙ/N) − round(P·dₙ₋₁/N)`(**已裁决:采纳修法**,不做「先乘后除再取整」) | `coop/rush_order.ts` `deliverItem` | 见下方 §10.2a 专节。原「≤2 分可忽略」「需额外余数状态」两条理由经实测**均不成立** |
+| **U2** | 订单单件分改用**望远镜差值** `round(P·dn/N) − round(P·dn−1/N)`(**已裁决:采纳修法**,不做「先乘后除再取整」) | `coop/rush_order.ts` `deliverItem` | 见下方 §10.2a 专节。原「≤2 分可忽略」「需额外余数状态」两条理由经实测**均不成立** | **已关闭(2026-11-17)** | 已过期:望远镜差值已实现(`deliverItem` 的 `awardedBefore`/`awardedAfter`),判据 `tests/WS-11.test.ts` |
 | **U3** | `CHAIN_BREAK_PENALTY = 40`(**Lead 已采纳**:保持固定 40,不做按环递增) | `coop/rush_order.ts` | 单次成功 150 分 / 中断罚 40 分 = 3.75:1,连断 4 次才抵一次成功,惩罚有分量但不劝退;按环递增会让「第 1 环断」几乎无痛、规则难讲解 |
 | **U4** | 河狸偷料 4 秒窗口内**无** `RESCUING` 中间态(**Lead 已采纳**:保持直接扣 `stock[151]`) | `coop/rush_order.ts` `tickBeaver` | 抢救态需 WS-04 提供河狸逐帧位置;当前 `mob_beaver` 的 AI 归 WS-04,跨 WS 同步未定型,先按「4 秒内打断」的简单模型交付 |
 | **U5** | 掉冠冷却与抢冠冷却**共用** `CROWN_PICKUP_COOLDOWN_SEC = 5`(**Lead 已采纳**:不拆分) | `party/modes.ts` | 两个冷却在语义上都是「皇冠不可拾取」,共用常量让调参只有一处;拆分会引入两套计时器的同步问题 |
