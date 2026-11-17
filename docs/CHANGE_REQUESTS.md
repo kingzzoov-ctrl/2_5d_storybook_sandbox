@@ -3273,7 +3273,7 @@ typeof WebSocket = function(Node 24.13.0)
 
 ---
 
-## [CR-28] 2026-11-18 task-84(fixer)— 手册 7 件抽象奖励**真正挂进 Boss 的 `loot`**(748~754)+ 指纹/快照同步
+## [CR-28] 2026-11-17 task-84(fixer)— 手册 7 件抽象奖励**真正挂进 Boss 的 `loot`**(748~754)+ 指纹/快照同步
 
 **触发**:CR-27 把手册的 7 件抽象奖励补录成了物品表条目(`748~754`),但它们**没接进任何 Boss 的
 `loot`** —— `lootAbstract` 里还是纯文字登记(`自动伐木机甲宠物图纸` / `皇家甜点…` / `纯金通关纪念碑`
@@ -3387,3 +3387,114 @@ I6 fingerprint     content.baseline.json restored byte-identical: True  sha256=4
 - 手册行号出处:`docs/DATA-CONFORMANCE.md:216~220`、`docs/ID-CROSSCHECK.md:276~282`、`:314~320`
 - `tests/WS-05.test.ts`(W5-51 冻结快照 / W5-53 抽象奖励登记)· `tests/WS-FND-79-content-expansion.test.ts`(FND79-3)
 - `shared/constants/bosses.ts#normalizeBossLoot`(唯一归一入口)· `server/src/bosses/raid.ts#effectiveLoot`
+
+---
+
+## [CR-29] 2026-11-17 task-84b(fixer)— 751/752/753 从 Boss `loot` **挪回 mob 掉落表**(修正 CR-28 的归属)
+
+**触发**:CR-28 把手册的 7 件抽象奖励一次性挂进 Boss `loot`,其中 3 件的**手册归属其实是 mob**:
+`docs/DATA-CONFORMANCE.md:216~218`、`docs/ID-CROSSCHECK.md:266~282` 逐行登记了「手册写 mob 掉、
+代码用替代物顶替」。CR-28 用「无 Boss 归属 ⇒ 挂通关里程碑 / 最终 Boss」的裁决把它们塞进
+`boss_chronos_colossus`,结果是**同一件奖励挂错了表**(Boss 战利品列里出现手册没写的件)。
+本 CR 按手册把它们挪回 `shared/constants/mobs.ts` **既有的 `drops` 记录**(不发明新结构、不发明概率)。
+
+### 1. 逐件新落点(文件:行 → 手册依据 → 件数)
+
+| 物品 | 新落点 | 手册依据 | 件数 |
+| :--- | :--- | :--- | :--- |
+| `751 稀有甜点食谱` | `shared/constants/mobs.ts:134` `mob_choco_golem.drops = { 105: 5, 603: 1, 751: 1 }` | **L481**「掉 `105 焦糖威化木×5`、**稀有甜点食谱**」 | 1 |
+| `752 蓬松彩羽` | `shared/constants/mobs.ts:101` `mob_chocobo.drops = { 119: 1, 752: 1 }` | **L476**「掉**蓬松彩羽**(驯服后装鞍可骑乘)」 | 1 |
+| `753 稀有树种` | `shared/constants/mobs.ts:40` `mob_squirrel.drops = { 101: 1, 753: 1 }` | **L467**「掉 `101 原木`、**稀有树种**」 | 1 |
+
+**不发明概率、不发明数量**:三件都追加在 `drops` 记录**末尾**(件数 `1`)。
+⚠️ 位置不是随意的 —— `server/src/mobs/taming.ts:141 / :228` 的驯服回赠取 `Object.keys(drops)[0]`,
+追加项保证「特色产出」(101 原木 / 119 云朵棉花 / 105 焦糖威化木)仍是第一项,驯服语义不被顶掉。
+
+### 2. Boss 侧:克洛诺斯退回手册 L502 的三件
+
+`shared/constants/bosses.ts:168~180`:`boss_chronos_colossus.loot` `[708, 723, 750, 751, 752, 753]` → `[708, 723, 750]`
+(`lootQty` `[1,1,1,1,1,1]` → `[1,1,1]`);该 Boss 的注按「手册原文 → CR-27 入表 → CR-28 挂上 →
+**CR-29 三件归 mob**」重写。`lootAbstract: ['纯金通关纪念碑']` **保留**(手册原文登记,WS-05 的 W5-53 钉着它)。
+其余 7 个 Boss 的 `loot` **一位未动**。
+
+⇒ 7 件抽象奖励的最终分布:**4 件在 Boss loot**(748→河狸 / 754·749→姜饼巨魔 / 750→克洛诺斯)、
+**3 件在 mob drops**(751 / 752 / 753),合计在两张表里**各出现一次**、共 7 次。
+
+### 3. 指纹怎么变(命令原文)
+
+```
+$ node scripts/content-lock.ts --update
+══ 内容基线已重新生成 ══
+  指纹     : 4ae9f66f → d4f73c37
+  物品     : 329
+  生物/Boss: 24 / 8
+  本次内容变更:
+    · bosses 指纹 8f50dc95 → 1fb56d39
+```
+
+- `bosses` 分区哈希 `{id,name,baseHp,summonItem,loot}`(`server/src/content/registry.ts:267`)—— 本 CR 删了
+  克洛诺斯 `loot` 的 3 件 ⇒ **`8f50dc95` → `1fb56d39`**。
+- `overall = fnv1a32('v1|items|mobs|bosses|modes')` ⇒ **`4ae9f66f` → `d4f73c37`**。
+- `items`(`6a0d6441`)/ **`mobs`(`624808c4`)** / `modes`(`b854dbfe`)**未变** —— mobs 分区只哈希
+  `{id,name,biome,hp,exp}`(`registry.ts:266`),`drops` 不在其中。这条差异本身是判据(FND84-6)。
+- `server/src/content/content.baseline.json` 已由 `--update` 重写,`slots` / `names` / `counts` 一字未动。
+
+### 4. 改了什么(逐文件)
+
+| 文件 | 改了什么 |
+| :--- | :--- |
+| `shared/constants/mobs.ts` | 三只生物的 `drops` 各追加一件(`mob_squirrel:40` / `mob_chocobo:101` / `mob_choco_golem:134`)+ 三行 CR-29 注;其余 21 种生物一字未动 |
+| `shared/constants/bosses.ts` | `boss_chronos_colossus.loot` / `lootQty` 去掉 751/752/753 + 该 Boss 注改写;`normalizeBossLoot` / `bossLootEntries` 一行未改 |
+| `server/src/content/content.baseline.json` | `--update`:`bosses 8f50dc95 → 1fb56d39`、`overall 4ae9f66f → d4f73c37` |
+| `tests/WS-FND-84-abstract-loot.test.ts` | **判据重写**:7 件拆成 4 件(Boss)/ 3 件(mob)两组;新增「**跨表唯一**」判据 —— 一件奖励同时挂在 Boss 与 mob 上时,只看命中侧是抓不到的(CR-28 的原形态)⇒ 新增「越界」问题串。FND84-1~6 每条仍带负对照,强度不降(逐件断言归属 + 件数 + 唯一性) |
+| `tests/WS-05.test.ts` | **W5-51 冻结快照**:`boss_chronos_colossus` `[708,723,750,751,752,753]` → `[708,723,750]` + 该块头注释追记 CR-29。其余 56 条一字未改 |
+| `tests/WS-FND-79-content-expansion.test.ts` | **FND79-3 的 `bosses` 字面量**(`'8f50dc95'` → `'1fb56d39'`)+ 注释。⚠️ 该文件不在本 CR 写域,但它是「`WS-FND-79` 复跑必须绿」的硬约束下**唯一无法回避**的一处(与 CR-28 同一处理,见 §6) |
+| `scripts/verify.ts` / `server/src/sim/world_sim.ts` / `server/src/world/archive.ts` / `scripts/items-baseline.json` / README / HANDOVER | **未改** |
+
+### 5. 判据与注入证据(8/8「改坏 ⇒ 红 ⇒ 字节写回 ⇒ SHA256 一致」)
+
+| # | 注入 | 目标套件 | 红灯原文(截) | 写回 |
+| :--- | :--- | :--- | :--- | :--- |
+| I1 | `mob_squirrel.drops` 删 753 | WS-FND-84 | `#753 稀有树种 没挂到手册指定的 生物的 drops(mob_squirrel;手册 L467…)` | ✅ True |
+| I2 | `mob_choco_golem.drops[751]` = 3 | WS-FND-84 | `mob_choco_golem.drops[#751] 件数… 期望 1 / 实际 3` | ✅ True |
+| I3 | 克洛诺斯 `loot` 塞回 751 | WS-FND-84 | `#751 稀有甜点食谱 越界:它还出现在 boss_chronos_colossus 的 Boss 的 loot 里` | ✅ True |
+| I3b | 同上 | WS-05 | `W5-51 … boss_chronos_colossus.loot 必须与冻结快照一致 [3] 仅存在于实际值(751)` | ✅ True |
+| I4 | `mob_chocobo.drops` 删 752 | WS-FND-84 | `#752 蓬松彩羽 没挂到手册指定的 生物的 drops(mob_chocobo;手册 L476…)` | ✅ True |
+| I4b | 752 挪到 `mob_squirrel` | WS-FND-84 | `#752 蓬松彩羽 归属错:手册归属 mob_chocobo,实际 mob_squirrel` | ✅ True |
+| I5 | 基线 `bosses` 回写 `8f50dc95` | WS-FND-84 | `基线 bosses 分区必须与当前内容同步 … 期望 "1fb56d39" / 实际 "8f50dc95"` | ✅ True |
+| I6 | FND79 字面量回写 `8f50dc95` | WS-FND-79 | `8 个 Boss 的 loot 快照 = CR-29 之后的值 期望 "8f50dc95" / 实际 "1fb56d39"` | ✅ True |
+
+写回后的 SHA256(全部 `restored=True`):`bosses.ts` `AD7D18FE…07BC5`、`mobs.ts` `9DF94858…FC94C`、
+`content.baseline.json` `52546146…68E911`、`WS-FND-79` `1652BBEF…FFCC97`。
+
+复跑:`[WS-FND-84] 6/6 通过`、`[WS-05] 57/57 通过`、`[WS-FND-79] 11/11 通过`;
+`node scripts/content-lock.ts` ⇒ `✓ 内容与基线一致(v1-d4f73c37)`;
+`node scripts/typecheck.ts` ⇒ 错误行 **261**(不超基线 261/129,本 CR 触及的 4 个文件 **0 条**)。
+
+### 6. **写域外**锚点(本次造成的红与需要的同步值)
+
+| 文件:行 | 现值 → 应改 | 现状 |
+| :--- | :--- | :--- |
+| `tests/WS-FND-01.test.ts:218` | `'4ae9f66f'` → `'d4f73c37'` | 红(A13) |
+| `tests/WS-FND-01.test.ts:222` | `'8f50dc95'` → `'1fb56d39'` | 红(同一条用例,sync 完 218 才会轮到它) |
+| `tests/WS-FND-01.test.ts:230` | `'v1-4ae9f66f'` → `'v1-d4f73c37'` | 红(A14) |
+| `tests/WS-FND-06.test.ts:1001` | `'4ae9f66f'` → `'d4f73c37'` | 红 |
+| `README.md:58` | `v1-4ae9f66f` → `v1-d4f73c37` | 红(文档锚点) |
+| `scripts/data-conformance.ts:185` | `'v1-4ae9f66f(既有锚点)'` → `'v1-d4f73c37(既有锚点)'` | 红(脚本锚点) |
+
+`tests/WS-FND-79-content-expansion.test.ts:146` 的 `bosses` 字面量**本 CR 已同步**(理由同 CR-28 §2:
+它是「WS-FND-79 必须绿」硬约束下唯一必须动的一行)。
+
+### 7. 刻意**没做**的事
+
+- **没给 mob 加概率/权重字段**:3 件都用既有的 `Record<number, number>`(`drops`),件数 1 = 缺省,不发明概率;
+- **没删 `lootAbstract`**:它是手册原文登记(WS-05 的 W5-53 逐字钉住),与 `loot` 里的 ID 并存;
+- **没动 `437` / `440` 的 `lootDeviations`**:它们仍是手册里的可造载具,生产掉落继续过滤;
+- **没改 mob 掉落结算逻辑**:`taming.ts` 的 `drops` 第一项语义保持不变(由 FND84-5 钉住)。
+
+### 8. 关联
+
+- CR-16(`lootQty` / `lootAbstract` / `lootDeviations`)· CR-27(`748~754` 入表)· **CR-28(本 CR 修正其 751/752/753 归属)**
+- 手册行号出处:`docs/DATA-CONFORMANCE.md:216~218`、`docs/ID-CROSSCHECK.md:266~282`
+- `server/src/mobs/taming.ts:141 / :228`(`drops` 第一项 = 驯服回赠)· `server/src/content/registry.ts:266~267`(分区哈希字段)
+- `tests/WS-05.test.ts`(W5-51)· `tests/WS-FND-84-abstract-loot.test.ts`(FND84-1~6)· `tests/WS-FND-79-content-expansion.test.ts`(FND79-3)

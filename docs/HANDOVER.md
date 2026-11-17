@@ -387,11 +387,11 @@ node scripts/count-audit.ts        # 数字自称与实测是否一致
 ### 查验本文是否被篡改(sha256 前 12 位)
 
 ```
-90a0cef1f23f  README.md
+1f171756501b  README.md
 8009b71b0684  docs/PROGRESS.md
 b387930e1082  docs/LEAD-PLAN.md
 db1e4e335354  docs/ARCH-GAPS.md
-1ba6a334f573  docs/CHANGE_REQUESTS.md
+0b9975b618df  docs/CHANGE_REQUESTS.md
 8906f3d83f11  docs/COMPLETION-CRITERIA.md
 6c70cf13ebf7  docs/TASK-83-wasd-three-options.md
 # ★ 本文件(HANDOVER.md)不进表 —— 它自己就是被校验的对象,任何写入都会改变它自己的哈希。

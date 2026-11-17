@@ -1194,6 +1194,9 @@ test('W5-50 生产入口真的存在:WorldSim 暴露 summon/damage/break/snapsho
  *    `loot` ⇒ 本块的 EXPECT 已同步为 CR-28 的值(bosses 分区 `e6bd03cc → 8f50dc95`),
  *    与 `content.baseline.json` 同源。下面每条仍然「前半断言冻结字段的逐字快照、
  *    后半断言手册内容被表达出来」—— 谁再动 `loot`,W5-51 立刻红。
+ * ★ **CR-29**:751/752/753 按手册挪回 **mob 掉落表**(`shared/constants/mobs.ts`)⇒ 本块 EXPECT
+ *    随之同步(bosses 分区 `8f50dc95 → 1fb56d39`,克洛诺斯只剩手册 L502 的 708/723/750)。
+ *    那三件不再由本块管:它们的归属/唯一性由 `tests/WS-FND-84-abstract-loot.test.ts` 钉住。
  */
 
 test('W5-51 CR-16 冻结字段 loot 必须逐字保持原样(修正不得走改 loot 的路)', () => {
@@ -1209,8 +1212,10 @@ test('W5-51 CR-16 冻结字段 loot 必须逐字保持原样(修正不得走改 
     /* ★ CR-28:#754 城堡图纸 / #749 姜饼人随从(手册 L500)接进 `loot`。 */
     boss_ginger_troll: [609, 613, 754, 749],
     boss_sky_whale: [117, 718, 440],
-    /* ★ CR-28:#750 纯金通关纪念碑(手册 L502)+ 3 件无 Boss 归属的 751/752/753(见 bosses.ts 注)。 */
-    boss_chronos_colossus: [708, 723, 750, 751, 752, 753],
+    /* ★ CR-28:#750 纯金通关纪念碑(手册 L502)接进 `loot`。
+       ★ CR-29:751/752/753 已按手册挪回 **mob 掉落表**(`mobs.ts`),本 Boss 只剩 L502 的三件
+       ⇒ bosses 分区 `8f50dc95 → 1fb56d39`。 */
+    boss_chronos_colossus: [708, 723, 750],
   };
   eq(Object.keys(EXPECT).length, TOTAL_BOSS_COUNT, '8 个 Boss 全部登记,防止漏测');
   for (const [id, loot] of Object.entries(EXPECT)) {

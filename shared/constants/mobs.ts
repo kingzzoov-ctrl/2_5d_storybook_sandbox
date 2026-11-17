@@ -36,7 +36,8 @@ export const MOB_LIST: readonly MobDef[] = [
   {
     id: 'mob_squirrel', name: '大尾花栗鼠', biome: V, behavior: MobBehavior.TAMEABLE,
     level: 2, hp: 50, exp: 20, tameItem: 121,
-    drops: { 101: 1 },
+    /* ★ CR-29:手册 L467「掉 `101 原木`、稀有树种」⇒ 753 按手册挂这里(件数缺省 1,不发明概率)。 */
+    drops: { 101: 1, 753: 1 },
     note: '在果树间窜动并往树洞藏松果;喂露水甜莓可驯化为帮玩家自动捡果子的小跟班。',
   },
   {
@@ -96,7 +97,8 @@ export const MOB_LIST: readonly MobDef[] = [
   {
     id: 'mob_chocobo', name: '彩虹陆行鸟', biome: O, behavior: MobBehavior.MOUNT,
     level: 10, hp: 400, exp: 90, tameItem: 123,
-    drops: { 119: 1 },
+    /* ★ CR-29:手册 L476「掉蓬松彩羽」⇒ 752 按手册挂这里(件数缺省 1,不发明概率)。 */
+    drops: { 119: 1, 752: 1 },
     note: '在沙洲极速奔跑;先用粘性蜂蜜罐粘住它的脚,再喂 3 个黄金小麦即可驯服为高速双人坐骑(掉落蓬松彩羽)。',
   },
   {
@@ -128,7 +130,8 @@ export const MOB_LIST: readonly MobDef[] = [
   {
     id: 'mob_choco_golem', name: '巧克力盾卫', biome: D, behavior: MobBehavior.HOSTILE_ELITE,
     level: 18, hp: 1100, exp: 320,
-    drops: { 105: 5, 603: 1 },
+    /* ★ CR-29:手册 L481「掉 `105 焦糖威化木×5`、稀有甜点食谱」⇒ 751 按手册挂这里(件数缺省 1)。 */
+    drops: { 105: 5, 603: 1, 751: 1 },
     note: '体型巨大的巧克力魔像;若玩家用火椒或火把攻击它,它的巧克力护甲会融化变成满地加速巧克力浆(稀有甜点食谱)。',
   },
 

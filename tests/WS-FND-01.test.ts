@@ -215,11 +215,11 @@ test('A13 overall 由四分区与算法版本合成,可独立复现', () => {
   /* 手工按实现公式重算,确认 overall 可复现 —— 而不是「某个神秘数字」。 */
   const expect = fnv1a32(`${f.version}|${f.items}|${f.mobs}|${f.bosses}|${f.modes}`);
   eq(f.overall, expect);
-  eq(f.overall, '4ae9f66f', '当前内容的总体指纹(实测基准)');
+  eq(f.overall, 'd4f73c37', '当前内容的总体指纹(实测基准)');
   /* 分区指纹实测基准。 */
   eq(f.items, '6a0d6441');
   eq(f.mobs, '624808c4');
-  eq(f.bosses, '8f50dc95', 'CR-15 改了 boss_ginger_troll.loot ⇒ bosses 分区指纹随之变化');
+  eq(f.bosses, '1fb56d39', 'CR-15 改了 boss_ginger_troll.loot ⇒ bosses 分区指纹随之变化');
   eq(f.modes, 'b854dbfe');
 });
 
@@ -227,7 +227,7 @@ test('A14 contentFingerprintLine() 形如 v1-xxxxxxxx,8 位 hex', () => {
   const line = contentFingerprintLine();
   ok(/^v1-[0-9a-f]{8}$/.test(line), `格式应为 v1-8hex,实际 ${line}`);
   eq(line, `v1-${contentFingerprints().overall}`);
-  eq(line, 'v1-4ae9f66f');
+  eq(line, 'v1-d4f73c37');
 });
 
 test('A15 指纹只反映内容数据:等价的规范输入得到等价指纹', () => {
