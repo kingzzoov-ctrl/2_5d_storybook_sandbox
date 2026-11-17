@@ -172,6 +172,8 @@ import { createAfkPlayer, tickAfk, type AfkPlayer } from '../social/afk.ts';
  * 未使用变量,反而诱导后人「清理」掉它 —— 那正是这个缺陷会复发的原因。
  */
 import '../wiring/components.ts';
+/* ★ D-07:昼夜边界**只有一处**(`isNight(hour)`,405 感光器也用它)—— 这里只借用,不重写。 */
+import { isNight as isNightAtHour } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
 import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
@@ -2733,6 +2735,38 @@ export class WorldSim {
    */
   private static readonly KNOCKBACK_MAX_CELLS = 2;
 
+  /* ══════════════════ 世界时钟(★ D-07:20 分钟一天,0 帧 = 06:00)══════════════════ */
+
+  /** 游戏内**一天**的秒数 —— D-07 裁决值(20 分钟)。改它需要新裁决。 */
+  static readonly WORLD_DAY_SEC = 1200;
+  /** 世界时间 0 帧对应的**钟点** —— D-07 裁决值(06:00 天亮)。 */
+  static readonly WORLD_START_HOUR = 6;
+  /**
+   * 当前世界**钟点**(0..24,带小数)。
+   *
+   * 换算:`WORLD_START_HOUR + 帧数 × DT / 一天秒 × 24`,再取 24 的模。
+   *
+   * ⚠️ **不另存一个"经过秒"累加器**:累加 0.05(二进制里不精确)几千次之后,
+   * 19:00 会算成 18.99999999999997 ⇒ `isNight(hour)` 在边界上判成"白天"。
+   * 直接用 `frameCount × DT`(乘法一次),把误差压到一个 ULP。
+   */
+  hourOfDay(): number {
+    const sec = this.frameCount * DT;
+    const raw = WorldSim.WORLD_START_HOUR + (sec / WorldSim.WORLD_DAY_SEC) * 24;
+    return ((raw % 24) + 24) % 24;
+  }
+
+  /**
+   * 现在是夜里吗?(★ D-07)
+   *
+   * 边界**不在这里定** —— 直接委托 `wiring/components.ts` 的 `isNight(hour)`,
+   * 那是 405 昼夜感光器用的同一个函数(19:00–06:00 为夜)。
+   * 两处各写一份边界必然漂(本仓已踩过多次)。
+   */
+  isNightNow(): boolean {
+    return isNightAtHour(this.hourOfDay());
+  }
+
   /**
    * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离 `distance` 格。
    *
@@ -3114,6 +3148,36 @@ export class WorldSim {
 
   /** 每个玩家当前的活人泡泡状态(层数 / 剩余困住秒)。**只在这里**存活人泡泡。 */
   private readonly liveBubbles = new Map<string, LiveBubbleState>();
+
+  /**
+   * ★ **D-12**:把每个玩家的「摩擦乘区」推给物理层。
+   *
+   * ## 为什么这里只推、不算
+   * 结算点**只在** `PhysicsWorld`(`b.mu = 地板μ × mul`)。这里多乘一次就是平方
+   * (`WS-FND-54` FND54-2 的 0.9408 会变 0.9047)。所以本方法只做「读 buff → 推乘子」。
+   *
+   * ⚠️ 乘子的中性值是 **1**,而 `FoodBuff.muOverride` 的中性值是 **0**(没意见)。
+   *   两者语义不同,必须显式换算:0 ⇒ `clearMuMul`(恢复地板值),>0 ⇒ `setMuMul`。
+   */
+  private syncFoodFriction(): void {
+    for (const id of this.vitals.ids()) {
+      const mu = mergeFoodBuffs(this.foodBuffs.get(id) ?? []).muOverride;
+      if (mu > 0) this.physics.setMuMul(id, mu);
+      else this.physics.clearMuMul(id);
+    }
+  }
+
+  /**
+   * ★ **D-11**:该玩家是否已解锁高级锻造(= 站在 `FORGE_MASTER` 房间里)。
+   *
+   * **不另算一份房间归属**:`forgeUnlocked` 由 `stepRoomEffects` 每帧写进
+   * `RoomEffectState`(那是房间效果的**唯一**产出点),这里只是把它投影成动作层要的读口。
+   * 没有房间效果记录的玩家 ⇒ `false`(失败即锁)。
+   */
+  forgeUnlockedOf(actorId: string): boolean {
+    const st = this.roomEffects.get(actorId);
+    return st === undefined ? false : st.inForge === true;
+  }
 
   /** 只读:该玩家现在的活人泡泡状态(没记录 ⇒ 初始态,**不建记录**)。 */
   liveBubbleOf(playerId: string): LiveBubbleState {
@@ -4282,7 +4346,20 @@ export class WorldSim {
    */
   startRushRun(roomLevel: number, rng: () => number, stock: Record<number, number> = {}): boolean {
     if (!Number.isFinite(roomLevel) || roomLevel < 1) return false;
-    const s = createRushOrderSession({ clock: this.partyClock, roomLevel, rng, stock });
+    /* ★ D-13:工位补上**世界格**(取真实器件格:506 汤锅 / 508 披萨炉 / 507 切菜台)。
+       不注入就只能用 `rush_order.ts` 里的占位格(0/6/12)——那是布局占位,不是这张图。 */
+    const cells: Partial<Record<'POT' | 'FURNACE' | 'CUTTER', { x: number; y: number }>> = {};
+    const potCell = this.deviceTileOf(SOUP_POT_ID);
+    const furnaceCell = this.deviceTileOf(PIZZA_OVEN_ID);
+    const cutterCell = this.deviceTileOf(KITCHEN_TABLE_ID);
+    if (potCell !== null) cells.POT = potCell;
+    if (furnaceCell !== null) cells.FURNACE = furnaceCell;
+    if (cutterCell !== null) cells.CUTTER = cutterCell;
+    /* ⚠️ 仍未接线的一半:把玩家坐标喂成 `opts.spraying`(= 谁在浇水)需要"喷射意图"窗口,
+       否则站在燃烧工位旁就会自动灭火;那一半留待下一轮(`docs/TASK-96` 二之十已记)。 */
+    const s = createRushOrderSession({
+      clock: this.partyClock, roomLevel, rng, stock, stationCells: cells,
+    });
     startRushOrder(s);
     this.rushRun = s;
     return true;
@@ -4663,7 +4740,7 @@ export class WorldSim {
       floorAt: (x: number, y: number) => this.grid.floorIdAt(x, y),
       blocked: (x: number, y: number) => this.grid.objIdAt(x, y) !== 0,
       townCenter: () => ({ x: (this.sizeCells / 2) | 0, y: (this.sizeCells / 2) | 0 }),
-      isNight: () => false,
+      isNight: () => this.isNightNow(),
       /* ★ 房间号喂给刷怪器:它据此向 provider 问「本房间的安全区半径」
          (此前只有一个常量 `TOWN_SAFE_RADIUS` ⇒ `MODIFY_TOWN` 改了也不生效)。
          没给房间号(空串)⇒ `spawner` 退回默认常量,与历史逐字一致。 */
@@ -4794,6 +4871,7 @@ export class WorldSim {
     this.frameCount += 1;
     const frame = this.frameCount;
     const isSlow = frame % FAST_PER_SLOW === 0;
+    /* ★ D-07:世界时钟按**快帧步长**累加(与物理同一口径),不读系统时钟。 */
 
     let physics: StepReport | null = null;
     let activeMobs = 0;
@@ -4983,6 +5061,8 @@ export class WorldSim {
       /* ── 慢帧 2Hz:料理 buff 计时(`USE_ITEM` 吃下的那一半)──
          放在房间效果之后无依赖;过期即删,所以"吃完过一会儿就没了"是可观察的。 */
       this.tickFoodBuffs();
+      /* ★ D-12:把滑溜料理的 μ 乘区推给物理层(结算点只在 physics,这里只推乘子)。 */
+      this.syncFoodFriction();
       /* ── 慢帧 2Hz:活人泡泡的困住计时(227 的活人半边)── */
       this.tickLiveBubbles();
 

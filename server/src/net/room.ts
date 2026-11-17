@@ -703,6 +703,14 @@ export interface WorldSaveHost {
    */
   resetWorld?(opts: { seed: number }): { applied: boolean; seed: number; reason?: string };
   /**
+   * 该玩家是否已**解锁高级锻造**(★ D-11:站进 `FORGE_MASTER` 房间 ⇒ true)。
+   *
+   * 世界侧把 `rooms/effects.ts` 的 `RoomEffectResult.forgeUnlocked` 投影成这条读口
+   * (不另算一份房间归属)。**可选**(`?`):没有它时 `CRAFT` 对 `station === 505`
+   * 的配方回 `NOT_IMPLEMENTED` —— 显式能力缺失,不是静默放行。
+   */
+  forgeUnlockedOf?(actorId: string): boolean;
+  /**
    * **使用一件道具**(`USE_ITEM` 的唯一世界侧落点)。
    *
    * 为什么是一个**通用**口而不是三个专用方法:道具语义按 `itemId` 分派

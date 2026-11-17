@@ -55,6 +55,17 @@ function makeRoom(asGuest = false): Room {
     rng: mulberry32(11),
   });
   a.runtime.join({ userId: 'p1', asGuest });
+  /* ★ D-11(2026-11-16):本套件的样例 `#245` 是 **505 高级锻造台**出的件 ⇒ 按裁决,
+     未解锁时 `CRAFT` 必须拒。所以夹具要把"已解锁"这个事实**如实**建立起来:
+     解锁的唯一产出点是 room effects(`stepRoomEffects`),这里推一慢帧建记录,再置真
+     —— 不另造第二个开关(那样就成了两份实现)。 */
+  const sim = a.host as unknown as {
+    advance(n: number): void;
+    roomEffectOf(id: string): { inForge: boolean } | null;
+  };
+  sim.advance(60);
+  const roomState = sim.roomEffectOf('p1');
+  if (roomState !== null) roomState.inForge = true;
   return { rt: a.runtime };
 }
 

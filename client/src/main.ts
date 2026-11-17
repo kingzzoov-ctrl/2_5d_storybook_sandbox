@@ -30,6 +30,11 @@ import { ActionEntry } from './net/action_entry.ts';
 import { createActionBinding, entryKeyHints, sessionPorts } from './net/action_binding.ts';
 import { InputSource, attachKeyboard } from './net/input.ts';
 import { LocalPredictor } from './net/predictor.ts';
+/* ★ 2026-11-16(D-08 第一步):虚拟摇杆的**判定**住在这里(零 DOM、可单测)。
+   `main.ts` 只把触屏指针喂进去 —— 判定留在事件回调里就没人测得到。 */
+import {
+  AnalogStick, JOYSTICK_DEAD_ZONE, STICK_RADIUS_PX, mergeCmd,
+} from './net/joystick.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
 import { DT } from '../../shared/types/physics.ts';
 
@@ -267,11 +272,49 @@ function main(): void {
   });
   const input = new InputSource();
   const detachInput = attachKeyboard(window, input);
+  /* ═══ D-08 第一步:虚拟摇杆是**主**输入,WASD 只作桌面/调试兼容 ═══
+     判定(死区 0.19 / 超程按半径截断 / 方向 / 摇杆压键盘)全在 `net/joystick.ts`
+     —— 零 DOM、可单测(`tests/WS-FND-58-joystick-prediction.test.ts` FND58-1…5)。
+     本文件只剩**薄壳**:指针坐标喂给 `AnalogStick`,再用 `mergeCmd` 并进命令。
+     ⚠️ 只跟**触屏/笔**(`pointerType === 'mouse'` 直接 return):
+        鼠标左键仍是攻击(`attackNearest`)—— 一条输入不该同时干两件事。 */
+  const stick = new AnalogStick({ maxRadius: STICK_RADIUS_PX });
+  let stickPointerId: number | null = null;
+  const onStickDown = (ev: PointerEvent): void => {
+    if (ev.pointerType === 'mouse') return;
+    if (stickPointerId !== null) return; /* 只跟第一根手指:第二根按下不该改方向 */
+    stickPointerId = ev.pointerId;
+    stick.begin(ev.clientX, ev.clientY);
+  };
+  const onStickMove = (ev: PointerEvent): void => {
+    if (stickPointerId !== ev.pointerId) return;
+    stick.moveTo(ev.clientX, ev.clientY);
+  };
+  /* `pointercancel` 与 `pointerup` **同一处理**:系统手势 / 来电会发 cancel,
+     漏了它的表现是「角色一直朝最后方向走」(与 `input.clear()` 失焦那个病同形)。 */
+  const onStickEnd = (ev: PointerEvent): void => {
+    if (stickPointerId !== ev.pointerId) return;
+    stickPointerId = null;
+    stick.end();
+  };
+  window.addEventListener('pointerdown', onStickDown);
+  window.addEventListener('pointermove', onStickMove);
+  window.addEventListener('pointerup', onStickEnd);
+  window.addEventListener('pointercancel', onStickEnd);
+  const detachStick = (): void => {
+    window.removeEventListener('pointerdown', onStickDown);
+    window.removeEventListener('pointermove', onStickMove);
+    window.removeEventListener('pointerup', onStickEnd);
+    window.removeEventListener('pointercancel', onStickEnd);
+    stick.end();
+  };
+
   const predictor = new LocalPredictor();
   let localTick = 0;
   let seeded = false;
   const inputLoop: ReturnType<typeof setInterval> = setInterval(() => {
-    const cmd = input.nextCmd();
+    /* 摇杆推了就用摇杆,否则回落到 WASD —— 优先级只写在这一处(`mergeCmd`)。 */
+    const cmd = mergeCmd(input.nextCmd(), stick.vector());
     const p = predictor.step(cmd);
     localTick += 1;
     /* 权威姿态喂回预测器。第一次先**播种** —— 预测器必须从权威值起步,
@@ -286,6 +329,8 @@ function main(): void {
       }
     }
     predictor.absorbVisual(DT);
+    /* ⚠️ `?server=off` ⇒ `session === null` ⇒ **不发包**(单机/截图自检靠这条:
+       没连上却每 tick 调 `sendMove`,表现是控制台刷"还没连上"而画面不动)。 */
     if (session !== null) {
       session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z });
     }
@@ -314,6 +359,14 @@ function main(): void {
     predictedPos: predictor.pos,
     pendingCmds: predictor.pendingCount,
     lastReconcileAction: predictor.lastReconcile?.action ?? null,
+    /* ★ 2026-11-16(D-08):摇杆与 `ackedSeq` 也进自检口径 ——
+       「摇杆推了到底有没有产生方向」「剪枝到底跑没跑」都必须是**读得出来的数**,
+       否则它们只会是代码里一行"看起来接上了"。 */
+    stickActive: stick.active,
+    stickMagnitude: stick.vector().magnitude,
+    joystickDeadZone: JOYSTICK_DEAD_ZONE,
+    ackedSeq: predictor.lastAckedSeq,
+    prunedCmds: predictor.prunedTotal,
     /* ★ 2026-11-15:动作入口也进自检口径。否则「按 N 到底发没发」只能靠肉眼看画面 ——
        而这正是本仓记过一整轮的静默形态(`status` 是一句话,`sent` 是计数,
        两者都由入口给出,**不是**截图脚本自己推断的)。 */
@@ -323,6 +376,7 @@ function main(): void {
   });
   window.addEventListener('beforeunload', () => {
     detachInput();
+    detachStick();
     clearInterval(inputLoop);
     session?.close();
     detachActionKeys();

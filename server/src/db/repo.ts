@@ -56,6 +56,10 @@ export const TABLE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
   ai_alchemy_recipes: ['recipe_hash'],
   ai_item_instances: ['instance_id'],
   room_events: ['id'],
+  /* D-06 世界归档(独立 DDL 文件 `schema_world_archive.sql`,见 §13)。
+     登记在这里的唯一目的是让 `driver.sqlite.ts` 的表名白名单认得它 ——
+     白名单是从本常量表派生的,不登记就写不进真库。 */
+  room_world_archives: ['id'],
 };
 
 /* ═══════════════════════════ 2. DDL 载入与迁移 ═══════════════════════════ */
@@ -868,4 +872,313 @@ export function clampInt(v: number, lo: number, hi: number, label: string): numb
 export function clampIntQuiet(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;
   return Math.max(lo, Math.min(hi, Math.trunc(v)));
+}
+/* ═══════════════ 13. 世界归档(D-06:重置的存档政策 = **归档**) ═══════════════
+ *
+ * 裁决原文:`docs/DECISIONS.md` **D-06** —— 世界按新 seed 在内存重建,
+ * **旧世界存成一份可回滚快照行**(不删、也不原地不管)。
+ *
+ * 本节只做**存储**:表结构(独立 DDL 文件)、迁移、写入、纯读。
+ * 「内存里怎么按新 seed 重建世界」是宿主(`WorldSim.resetWorld`)的事,
+ * 本节不认识 `WorldSim`(与 §11 同一分层)。
+ *
+ * ## 为什么不写进 `schema.sql`
+ * 建表数被 `tests/WS-07.test.ts:200/295/488` 与 `scripts/verify.ts:5553`
+ * 锁死在 **9 张**,外键被 `tests/WS-07.test.ts:269` 锁在 **11 条**。
+ * 加第 10 张表会让那四处立刻红,而那些不是本次改动的判据文件。
+ * ⇒ 走**自己的** DDL 产物 + 自己的迁移版本(见 `schema_world_archive.sql` 文件头)。
+ *
+ * ## 三件事的边界(别当成已实现)
+ * 1 **幂等可查**:每次归档**追加一行**,旧行不覆盖(`seq` 单调,`id` 是稳定句柄);
+ * 2 **可回滚的读口**:`listWorldArchives` / `loadWorldArchive` 是**纯读**,
+ *   给将来"回滚到上一版"用 —— **回滚写入不在本裁决范围**(D-06 只裁了归档);
+ * 3 **配额**:`WORLD_ARCHIVE_KEEP_PER_ROOM` 在**写入事务内**裁剪,表不会无界增长。
+ */
+
+/** 表名(与 DDL 文件里那张表逐字一致)。 */
+export const WORLD_ARCHIVE_TABLE = 'room_world_archives';
+
+/** 归档 DDL 的文件产物名。**独立于 `schema.sql`**,理由见本节头。 */
+export const WORLD_ARCHIVE_SCHEMA_FILE_NAME = 'schema_world_archive.sql';
+
+/** 归档迁移在 `schema_migrations` 里的版本号(`migrate()` 用 1,本节用 2)。 */
+export const WORLD_ARCHIVE_MIGRATION_VERSION = 2;
+export const WORLD_ARCHIVE_MIGRATION_NAME = 'ws_fnd57_world_archive';
+
+/**
+ * 每个房间保留的归档行数上限(配额)。
+ *
+ * ## 为什么是 6,以及为什么**必须**有一个数
+ * * 触发归档的动作是**手工破坏性**动作:`RESET_WORLD` 要 OWNER 权限 + `confirm: true`
+ *   (见 `net/actions/reset_world.ts`),不是每 tick 发生 ⇒ 需求量天然很小;
+ * * 单份快照与房间地形同量级(chunk_radius 4 ⇒ ≤ 9×9 = 81 块 × 1024B ≈ 81KB),
+ *   6 份 ≈ 0.5MB/房间 —— 与"1KB/Chunk 的主动存档"同一个数量级;
+ * * 6 覆盖真实回滚深度(改一版 → 试两个种子 → 再回退两三步),
+ *   再深就没有裁决依据(D-06 只要求"可回滚",没定深度)⇒ 不选无穷;
+ * * **为什么不选 1**:一次内容迭代里连着试两个种子是常事,第一步的回滚点
+ *   会被自己覆盖掉 —— 那等于"只有一次机会",与"可回滚"的字面要求不符。
+ */
+export const WORLD_ARCHIVE_KEEP_PER_ROOM = 6;
+
+/**
+ * 单份快照的字节上限;超出**拒绝**而不是静默截断。
+ *
+ * 截断的快照回滚出去就是一个**坏世界**(地形缺块、静默丢玩家建筑),
+ * 而"拒绝"会让调用方立刻知道归档没成 —— 本仓纪律:不静默改数据。
+ * 1MiB 远高于 radius 4 的全量地形(~81KB),却小到一次误传撑不爆库。
+ */
+export const WORLD_ARCHIVE_MAX_BYTES = 1048576;
+
+/** 归档 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
+export function worldArchiveSqlPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), WORLD_ARCHIVE_SCHEMA_FILE_NAME);
+}
+
+export function readWorldArchiveSql(path: string = worldArchiveSqlPath()): string {
+  return readFileSync(path, 'utf8');
+}
+
+export interface WorldArchiveMigrateResult {
+  applied: boolean;
+  version: number;
+  checksum: string;
+  /** 已存在同版本但 checksum 不一致 = 漂移(调用方决定是否 fail-closed)。 */
+  drift: boolean;
+}
+
+/**
+ * 建归档表 + 登记迁移版本。**幂等**(DDL 全是 `IF NOT EXISTS`)。
+ *
+ * 与 `migrate()` 的关系:`migrate()` 仍然只建 `schema.sql` 那 9 张表,
+ * 本函数是**第二段**迁移。宿主(或装配层)在启动时调一次即可;
+ * **写入侧 `archiveWorldSnapshot` 也会调它** —— 这样"表没建"不会变成静默丢档。
+ */
+export function migrateWorldArchives(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): WorldArchiveMigrateResult {
+  const ddl = readWorldArchiveSql(ddlPath);
+  db.exec(ddl);
+  const checksum = checksumOf(ddl);
+  const existing = db.get('schema_migrations', { version: WORLD_ARCHIVE_MIGRATION_VERSION }) as
+    | MigrationRow
+    | undefined;
+  if (existing) {
+    return {
+      applied: false,
+      version: WORLD_ARCHIVE_MIGRATION_VERSION,
+      checksum,
+      drift: existing.checksum !== checksum,
+    };
+  }
+  db.insert('schema_migrations', {
+    version: WORLD_ARCHIVE_MIGRATION_VERSION,
+    name: WORLD_ARCHIVE_MIGRATION_NAME,
+    checksum,
+    applied_at: nowMs,
+  });
+  return { applied: true, version: WORLD_ARCHIVE_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/**
+ * 一行归档的**摘要**(回滚读口的返回形状)。
+ *
+ * 刻意不带 BLOB:选版本时只需要 `id/seed/时间/字节数`,
+ * 把整份快照拖进列表会让"看一眼有哪些版本"变成读全表存储。
+ * 真要字节时走 `loadWorldArchive(id)`。
+ */
+export interface WorldArchiveSummary {
+  /** 稳定句柄(`<room_id>#<seq>`),回滚读口的钥匙。 */
+  id: string;
+  room_id: string;
+  /** 该房间的第几次归档(1 起,单调)。 */
+  seq: number;
+  /** **旧世界**的种子(不是新世界的)。 */
+  seed: number;
+  world_tick: number;
+  /** `snapshot_blob` 的字节数。 */
+  bytes: number;
+  reason: string;
+  /** Unix 毫秒。 */
+  archived_at: number;
+}
+
+/** 带字节的完整归档行 —— **回滚的原料**(只读;回滚写入不在 D-06 范围)。 */
+export interface WorldArchiveRecord extends WorldArchiveSummary {
+  snapshot_blob: Uint8Array;
+}
+
+export interface WorldArchiveWriteResult {
+  archived: WorldArchiveSummary;
+  /** 本次写入顺手裁掉了几条旧行(配额生效的**可观测**证据,别只靠"表里有几条")。 */
+  pruned: number;
+}
+
+/** 时间倒序(同毫秒用 `seq` 兜底),保证两个后端排序一致。 */
+function newestArchiveFirst(a: Row, b: Row): number {
+  return (
+    (Number(b.archived_at) || 0) - (Number(a.archived_at) || 0)
+    || (Number(b.seq) || 0) - (Number(a.seq) || 0)
+  );
+}
+
+function toWorldArchiveSummary(row: Row): WorldArchiveSummary {
+  return {
+    id: String(row.id),
+    room_id: String(row.room_id),
+    seq: Number(row.seq),
+    seed: Number(row.seed),
+    world_tick: Number(row.world_tick ?? 0),
+    bytes: Number(row.snapshot_bytes ?? 0),
+    reason: typeof row.reason === 'string' ? row.reason : '',
+    archived_at: Number(row.archived_at),
+  };
+}
+
+/**
+ * 按配额裁掉某房间的多余归档行,返回删除条数。
+ *
+ * 裁剪口径 = **保留最近 `keep` 条**(按 `archived_at` 倒序、同毫秒按 `seq` 倒序)。
+ * 老版本被删是**配额**的必然结果,不是"覆盖":在配额内,任何一次重置都不会
+ * 动到已有行(判据 `tests/WS-FND-57` 第 2 条钉的就是这一点)。
+ */
+export function pruneWorldArchives(
+  db: DbLike,
+  roomId: string,
+  keep: number = WORLD_ARCHIVE_KEEP_PER_ROOM,
+): number {
+  const keepN = Number.isFinite(keep) ? Math.max(0, Math.trunc(keep)) : WORLD_ARCHIVE_KEEP_PER_ROOM;
+  const ordered = db.select(WORLD_ARCHIVE_TABLE, { room_id: roomId }).slice().sort(newestArchiveFirst);
+  let removed = 0;
+  for (const row of ordered.slice(keepN)) {
+    removed += db.delete(WORLD_ARCHIVE_TABLE, { id: row.id as string });
+  }
+  return removed;
+}
+
+/**
+ * 归档一份旧世界快照。**一次重置 = 一行**,旧行不覆盖。
+ *
+ * 顺序刻意是「建表 → 事务内 (追加 + 裁剪)」:
+ * 裁剪放在同一事务里,才不会出现"写进去了但没裁"的中间态
+ * (那会让配额在一段窗口内失效,而窗口正好是最坏情况:有人在狂点重置)。
+ *
+ * 返回值带 `pruned`:配额不是"应该有效",而是**每次都报数**。
+ */
+export function archiveWorldSnapshot(
+  db: DbLike,
+  input: {
+    roomId: string;
+    /** 旧世界的种子 —— 不是新种子。 */
+    seed: number;
+    snapshot: Uint8Array;
+    nowMs: number;
+    worldTick?: number;
+    reason?: string;
+  },
+): WorldArchiveWriteResult {
+  if (typeof input.roomId !== 'string' || input.roomId.length === 0) {
+    throw new Error('归档需要 roomId(非空字符串)');
+  }
+  if (!Number.isFinite(input.seed) || !Number.isInteger(input.seed)) {
+    throw new Error(`归档的 seed 必须是有限整数(实得 ${String(input.seed)})`);
+  }
+  if (!Number.isFinite(input.nowMs)) throw new Error('归档需要 nowMs(Unix 毫秒)');
+  if (!(input.snapshot instanceof Uint8Array)) throw new Error('归档快照必须是 Uint8Array');
+  const bytes = input.snapshot.byteLength;
+  if (bytes === 0) throw new Error('归档快照不能是 0 字节(空快照回滚出去就是一个空世界)');
+  if (bytes > WORLD_ARCHIVE_MAX_BYTES) {
+    throw new Error(
+      `归档快照 ${bytes} 字节超出上限 ${WORLD_ARCHIVE_MAX_BYTES}`
+      + '(拒绝而不是截断 —— 截断的快照回滚出去是坏世界)',
+    );
+  }
+  const worldTick = Number.isFinite(input.worldTick)
+    ? Math.max(0, Math.trunc(input.worldTick as number))
+    : 0;
+  const reason = typeof input.reason === 'string' ? input.reason : '';
+
+  migrateWorldArchives(db, input.nowMs);
+  return db.transaction(() => {
+    const existing = db.select(WORLD_ARCHIVE_TABLE, { room_id: input.roomId });
+    /* `seq` 取该房间已有最大值 + 1:**单调**,所以同一毫秒内的两次归档
+       (测试里很常见)也有确定的先后与互不相同的 `id`。 */
+    const seq = existing.reduce((m, r) => Math.max(m, Number(r.seq) || 0), 0) + 1;
+    const row: Row = {
+      id: `${input.roomId}#${seq}`,
+      room_id: input.roomId,
+      seq,
+      seed: input.seed,
+      world_tick: worldTick,
+      snapshot_blob: input.snapshot,
+      snapshot_bytes: bytes,
+      reason,
+      archived_at: input.nowMs,
+    };
+    db.insert(WORLD_ARCHIVE_TABLE, row);
+    const pruned = pruneWorldArchives(db, input.roomId);
+    return { archived: toWorldArchiveSummary(row), pruned };
+  });
+}
+
+/**
+ * **纯读**:某房间的归档摘要列表,按时间倒序。
+ *
+ * 负对照(没归档过)必须返回**空数组**而不是 `undefined`/抛错:
+ * 这个读口会被回滚 UI 与诊断直接消费,"没有可回滚的版本"是一种正常状态。
+ * 真实 SQLite 在表还没建时抛 `no such table` —— 只有**这一种**错误被降级成 `[]`,
+ * 其余错误照旧冒泡(否则一处权限/磁盘故障会被伪装成"没有归档")。
+ */
+export function listWorldArchives(
+  db: DbLike,
+  roomId: string,
+  limit: number = WORLD_ARCHIVE_KEEP_PER_ROOM,
+): WorldArchiveSummary[] {
+  if (typeof roomId !== 'string' || roomId.length === 0) return [];
+  const keepN = Number.isFinite(limit) ? Math.trunc(limit) : WORLD_ARCHIVE_KEEP_PER_ROOM;
+  if (keepN <= 0) return [];
+  let rows: Row[];
+  try {
+    rows = db.select(WORLD_ARCHIVE_TABLE, { room_id: roomId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return [];
+    throw e;
+  }
+  return rows.slice().sort(newestArchiveFirst).slice(0, keepN).map(toWorldArchiveSummary);
+}
+
+/**
+ * **纯读**:按句柄取一整行(含快照字节),给将来"回滚到上一版"用。
+ *
+ * 回滚**写入**刻意不在这里实现:D-06 只裁了"归档",没裁"回滚的语义"
+ * (回滚要不要也先归档当前世界?算不算一次新的 RESET_WORLD?)——
+ * 没有裁决就实现,等于替 owner 决定玩家数据怎么变。
+ *
+ * 读不回字节(行不存在 / BLOB 不是 Uint8Array)⇒ `undefined`:
+ * 归档行是回滚原料,原料不完整就等于**没有这一版**,不能回一个半截对象。
+ */
+export function loadWorldArchive(db: DbLike, archiveId: string): WorldArchiveRecord | undefined {
+  if (typeof archiveId !== 'string' || archiveId.length === 0) return undefined;
+  let row: Row | undefined;
+  try {
+    row = db.get(WORLD_ARCHIVE_TABLE, { id: archiveId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return undefined;
+    throw e;
+  }
+  if (!row) return undefined;
+  const blob = row.snapshot_blob;
+  if (!(blob instanceof Uint8Array)) return undefined;
+  return { ...toWorldArchiveSummary(row), snapshot_blob: blob };
+}
+
+/** 某房间现有归档行数(配额断言的观测口径;`listWorldArchives` 默认被 N 截断)。 */
+export function countWorldArchives(db: DbLike, roomId: string): number {
+  try {
+    return db.select(WORLD_ARCHIVE_TABLE, { room_id: roomId }).length;
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+    throw e;
+  }
 }

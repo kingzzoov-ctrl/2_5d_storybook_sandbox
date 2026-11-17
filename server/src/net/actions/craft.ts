@@ -45,9 +45,31 @@
  *   (`Record<string, string | number | boolean>`),装不下 `consumed` 这份嵌套明细
  *   ⇒ 回执处有一次**显式窄化断言**;运行时它只是一个 `itemId → 数量` 的纯数字字面量,
  *   与客户端读到的 JSON 形状一致(该类型在 `room.ts`,不在本文件的写域内)。
+ *
+ * ## 高级锻造闸(D-11,owner 2026-11-16 裁)
+ *
+ * `rooms/effects.ts` 的 `forgeUnlocked`(= 玩家站在 `FORGE_MASTER` 房间里)此前**没有**
+ * 消费点。裁决:`解锁 = 能用 **505** 工作台出产的配方`(不新增 `tier` 字段,不动冻结内容表)。
+ * ⇒ 本文件按**内容表的 `station`** 判:`station === 505` 的配方要求该玩家已解锁,
+ *   锁着 ⇒ **显式** `PERMISSION`(并点明"未解锁高级锻造"),不是静默失败、也不是"照做但没效果"。
+ *
+ * 事实从**宿主的一个可选方法**取(房间不许自己猜玩家站在哪个房间):
+ *
+ * ```ts
+ * ctx.host.forgeUnlockedOf?(actorId: string): boolean
+ * ```
+ *
+ * 世界侧把 `roomEffects` 的 `forgeUnlocked` 投影成这条读口。宿主**没有**这个方法 ⇒
+ * `NOT_IMPLEMENTED` + 可读理由(与 `material.ts` 的 `materialsOf()`、`reset_world.ts` 的
+ * `resetWorld` 同契约:能力缺失要**如实**回执,不许当成"锁着",也不许当成"解锁")。
+ *
+ * ⚠️ 无方法的形态**不做兜底**:今天生产的 `WorldSim` 若还没有这条读口,505 配方一律
+ *   `NOT_IMPLEMENTED`(而不是"默认放行")—— 默认放行等于裁决没落地。
+ *
+ * ⚠️ **非 505 配方完全不受影响**:闸只在 `def.station === 505` 时进(零回归)。
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
-import type { ActionOutcome, ActionPayload } from '../room.ts';
+import type { ActionOutcome, ActionPayload, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型(见文件头)。 */
@@ -85,6 +107,57 @@ function stockField(v: unknown): Record<number, number> | null {
   return out;
 }
 
+/**
+ * 高级锻造台 = **505**(取 `shared/constants/items.ts` 的 `station` 字段)。
+ *
+ * D-11:「解锁 = 能用 **505** 工作台出产的配方」。本文件**只**读内容表这一个字段,
+ * 不另立"中高级"分档表 —— 那会是第二份内容层(迟早与冻结表漂移)。
+ */
+const ADVANCED_FORGE_STATION = 505;
+
+/**
+ * 宿主的**可选**能力:该玩家是否已解锁高级锻造。
+ *
+ * 世界侧把 `roomEffects` 的 `forgeUnlocked` 投影成这条读口。`?` 是刻意的 ——
+ * 老世界源没有它时,505 配方必须**如实**回 `NOT_IMPLEMENTED`,不许默认放行。
+ */
+type ForgeUnlockedHost = WorldSaveHost & {
+  forgeUnlockedOf?(actorId: string): boolean;
+};
+
+/**
+ * D-11 的闸:`station === 505` 的配方要求该玩家已解锁中高级锻造。
+ *
+ * 返回 `null` = 放行;非 `null` = 失败回执,调用方**原样**返回(不要二次改写 kind)。
+ *
+ *   1 宿主没有这条读口(`ctx.host === null` 或方法不存在)⇒ `NOT_IMPLEMENTED` +
+ *     可读理由(与 `material.ts` 的 `materialsOf()` / `reset_world.ts` 同契约);
+ *   2 读口说"没解锁" ⇒ `PERMISSION`(越权语义:**能力**不够,不是报文/状态不对);
+ *   3 只有明确的 `true` 才放行 —— 不猜默认值,失败即锁。
+ */
+function forgeGate(ctx: ActionContext, itemId: number, name: string): ActionOutcome | null {
+  const host = ctx.host as ForgeUnlockedHost | null;
+  const read = host === null ? undefined : host.forgeUnlockedOf;
+  if (typeof read !== 'function') {
+    return {
+      ok: false,
+      kind: 'NOT_IMPLEMENTED',
+      reason:
+        `${ctx.action} #${itemId}(${name})要 505 高级锻造台,而宿主没有 forgeUnlockedOf`
+        + ' ⇒ 无法判定该玩家是否已解锁高级锻造(D-11,未消耗任何材料)',
+    };
+  }
+  /* `this` 绑回宿主:这是宿主的方法,不是自由函数。 */
+  if (read.call(host, ctx.actorId) === true) return null;
+  return {
+    ok: false,
+    kind: 'PERMISSION',
+    reason:
+      `未解锁高级锻造:#${itemId}(${name})要 505 高级锻造台`
+      + '(站在 FORGE_MASTER 房间里才解锁,见 D-11)⇒ 未消耗任何材料',
+  };
+}
+
 /** `CRAFT`:按内容层配方合成一份;材料不足不扣、产物收不下则退回材料。 */
 export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* 1 权限闸:越权在此返回,且**未产生任何副作用**(背包一个数都没动)。 */
@@ -113,7 +186,15 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     return { ok: false, kind: 'INVALID', reason: `#${itemId}(${def.name})没有配方,不是可合成产物` };
   }
 
-  /* 4 配方匹配**只走内容层那一份**(`matchRecipeByTags`):先确定件、再逐个填留白槽。
+  /* 4 高级锻造闸(D-11):505 工作台的配方要求该玩家已解锁中高级锻造。
+     位置是**契约**:在报文/内容表校验**之后**、配方匹配与扣减**之前** ——
+     ⇒ 越权与报文错仍先被拦(判据不因新闸改顺序),而被拒时**一件材料都没扣**。 */
+  if (def.station === ADVANCED_FORGE_STATION) {
+    const denied = forgeGate(ctx, itemId, def.name);
+    if (denied !== null) return denied;
+  }
+
+  /* 5 配方匹配**只走内容层那一份**(`matchRecipeByTags`):先确定件、再逐个填留白槽。
      别在这里再写一遍配方表或留白语义 —— 那就是本仓反复点名的「两份实现」。 */
   const match = matchRecipeByTags(itemId, stock);
   if (!match.ok) {
@@ -127,7 +208,7 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     .map(([k, n]) => ({ itemId: Number(k), delta: -n }))
     .filter((op) => op.delta !== 0);
 
-  /* 5 **先扣材料**:整批 ops 一次提交 ⇒ 反作弊要么全过要么全拒,不存在「扣了一半」。
+  /* 6 **先扣材料**:整批 ops 一次提交 ⇒ 反作弊要么全过要么全拒,不存在「扣了一半」。
      消耗是负 delta,不需要 source(凭证链只约束产出侧)。 */
   const spend = ctx.applyInventory(ctx.actorId, { ops: spendOps });
   if (!spend.allowed) {
@@ -137,14 +218,14 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     };
   }
 
-  /* 6 **再给产物**:先 `grantItemSource` 再 `applyInventory(+n, source)`,顺序反过来
+  /* 7 **再给产物**:先 `grantItemSource` 再 `applyInventory(+n, source)`,顺序反过来
      会被反作弊按「凭空产出」拒。产出件数取内容表的 `output`(`151` 是 1 材料 → 2 件)。 */
   const made = Math.max(1, Math.trunc(def.output ?? 1));
   const src = `craft:${itemId}`;
   ctx.grantItemSource(ctx.actorId, src);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: made, source: src }] });
   if (!gain.allowed) {
-    /* 7 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
+    /* 8 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
        退回是正 delta ⇒ 同样必须先给凭证。 */
     const refundSrc = `craft-refund:${itemId}`;
     ctx.grantItemSource(ctx.actorId, refundSrc);

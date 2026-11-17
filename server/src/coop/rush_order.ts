@@ -29,6 +29,8 @@ import {
   carrierSpeedMul,
 } from '../../../shared/types/physics.ts';
 import { ITEM_BY_ID } from '../../../shared/constants/items.ts';
+/* D-13:工位喷射半径复用料理站灭火半径(`EXTINGUISH_RADIUS` = 3 格),见 2b 节。 */
+import { EXTINGUISH_RADIUS } from '../combat/cooking.ts';
 
 /** 浮点容差:20Hz 逐帧累加后用于比较阈值。 */
 export const EPS = 1e-9;
@@ -444,6 +446,124 @@ export function isSmoking(s: StationRuntime): boolean {
   return s.state === STATION_STATE.BURNING && s.burningSec >= SMOKE_LEAD_SEC - EPS;
 }
 
+/* ───────────────────────────────────────────────────────────────────
+ * 2b. 工位 id ↔ 世界格(D-13)
+ *
+ * 起因 `docs/DECISIONS.md` **D-13**:工位槽位原先**没有世界坐标**,
+ * 于是玩家「对着正在起火的工位按 227」这件事**无法表达** ——
+ * `tickRushOrder` 的 `opts.spraying` 只有 `StationKind[]` 一种喂法,
+ * 而玩家的动作给不出「种类」,只知道「我站在哪个格、朝哪儿浇」。
+ * ⇒ 缺的不是灭火规则(`STATION_STATE.BURNING` + `EXTINGUISH_SEC` 一律不动),
+ *   而是**坐标 → 工位**这一张映射表。
+ * ─────────────────────────────────────────────────────────────────── */
+
+/** 世界格(只到 xy;z 不在本表内)。`x`/`y` 是**格索引**,与 OBJ 层同一口径。 */
+export interface WorldCell {
+  x: number;
+  y: number;
+}
+
+/**
+ * 227 水枪 / 212 大铁铲对**单个工位**的有效喷射半径(格)。
+ *
+ * ★ 复用内容层既有常量 `combat/cooking.ts` 的 `EXTINGUISH_RADIUS`(= 3 格,
+ *   212/227 三格内灭火)—— **D-13 没有引入任何新数值**。
+ * 工位与料理站本来就是同一套灭火手感;各写一份数会漂移,
+ * 且 `use_item` 那一路(`extinguishDeviceByHand`)用的正是同一个常量。
+ */
+export const STATION_SPRAY_RADIUS = EXTINGUISH_RADIUS;
+
+/** 工位 id ↔ 世界格 的映射表。 */
+export type StationCellBook = Readonly<Record<StationKind, WorldCell>>;
+
+/**
+ * 默认工位格(会话未注入 `stationCells` 时用)。
+ *
+ * 布局规则(确定性,不随机):三个工位沿 **+x** 一字排开,起点 `(0, 0)`,
+ * 相邻间距 = `2 × STATION_SPRAY_RADIUS`。
+ *
+ * 为什么是 **2 倍**而不是 1 倍:半径 3 格时,间距 3 会让相邻工位**恰好落在
+ * 半径边界上**(格中心距 3.0 ≤ 3)⇒ 一枪浇灭两个工位,「对着 A 浇」与
+ * 「对着 B 浇」不可区分。间距 6 才是「一枪一个」的确定窗口。
+ * 该数值由既有半径**派生**,不是新调的参数。
+ */
+export const DEFAULT_STATION_CELLS: StationCellBook = {
+  FURNACE: { x: 0, y: 0 },
+  POT: { x: 2 * STATION_SPRAY_RADIUS, y: 0 },
+  CUTTER: { x: 4 * STATION_SPRAY_RADIUS, y: 0 },
+};
+
+/** 格索引 → 格中心(与玩家坐标同单位)。 */
+export function cellCenterOf(cell: WorldCell): { x: number; y: number } {
+  return { x: cell.x + 0.5, y: cell.y + 0.5 };
+}
+
+/**
+ * 把「只给几个工位」的补丁合到默认表上。
+ *
+ * 逐工位取值并**拷贝**:不持有调用方传入的对象(`world_sim` 之后原地改自己的
+ * 找格结果时,会话里的映射不会跟着变)。非有限坐标视为没给,保留默认格。
+ */
+function resolveStationCells(patch?: Partial<Record<StationKind, WorldCell>>): StationCellBook {
+  const out: Record<StationKind, WorldCell> = {
+    FURNACE: { x: DEFAULT_STATION_CELLS.FURNACE.x, y: DEFAULT_STATION_CELLS.FURNACE.y },
+    POT: { x: DEFAULT_STATION_CELLS.POT.x, y: DEFAULT_STATION_CELLS.POT.y },
+    CUTTER: { x: DEFAULT_STATION_CELLS.CUTTER.x, y: DEFAULT_STATION_CELLS.CUTTER.y },
+  };
+  if (!patch) return out;
+  for (const kind of Object.keys(out) as StationKind[]) {
+    const p = patch[kind];
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    out[kind] = { x: p.x, y: p.y };
+  }
+  return out;
+}
+
+/** 某工位的世界格;会话里没登记该工位 ⇒ `null`(不猜坐标)。 */
+export function stationCellOf(s: RushOrderSession, kind: StationKind): WorldCell | null {
+  return s.stationCells[kind] ?? null;
+}
+
+/**
+ * 「玩家站在 `at`、以 `radiusCells` 为半径浇过去」命中的**燃烧中**工位,按工位表顺序。
+ *
+ * 返回的正是 `tickRushOrder(s, dt, { spraying })` 需要的形状 ——
+ * 它在 `spraying` 里按 `st.kind` 匹配,故这里返回**种类**而不是槽位下标。
+ *
+ * ## 命中口径(写死在这里,别处不再各写一份)
+ *
+ * 1. `at` 是**玩家坐标**(格单位、连续值),判的是到**工位所在格的中心**
+ *    `(x + 0.5, y + 0.5)` 的欧氏距离。判定点必须是格中心:直接用格索引比较
+ *    会让「站在格中心浇水」系统性偏 `Math.SQRT1_2 ≈ 0.707` 格。
+ * 2. 距离 `<= radiusCells + EPS` 即命中(**闭区间**);半径之外不返回。
+ * 3. 只有 `BURNING` 与 `EXTINGUISHING` 算「在烧」:`EXTINGUISHING` 是起火的
+ *    **子状态**(`tickStation` 在灭火计时未满时停在这里)。若把它排除,
+ *    累计 `EXTINGUISH_SEC`(0.5 秒)的规则会在第二步断掉(`dousedSec` 归零)
+ *    ⇒ 永远灭不掉。`IDLE` / `RUNNING` 不返回。
+ * 4. 顺序 = `session.stations` 的**工位表顺序**(不是映射表键序、不是距离排序),
+ *    保证同一局面每次得到同一个数组。
+ * 5. 非法输入(非有限坐标 / 负半径 / NaN)⇒ 返回空数组,不抛错:
+ *    接线层的坐标可能还没同步好,这不该让整场急单崩掉。
+ */
+export function stationsBeingSprayedBy(
+  s: RushOrderSession,
+  at: { x: number; y: number },
+  radiusCells: number = STATION_SPRAY_RADIUS,
+): StationKind[] {
+  const out: StationKind[] = [];
+  if (!Number.isFinite(at.x) || !Number.isFinite(at.y)) return out;
+  if (!Number.isFinite(radiusCells) || radiusCells < 0) return out;
+
+  for (const st of s.stations) {
+    if (st.state !== STATION_STATE.BURNING && st.state !== STATION_STATE.EXTINGUISHING) continue;
+    const cell = stationCellOf(s, st.kind);
+    if (cell === null) continue;
+    const center = cellCenterOf(cell);
+    if (Math.hypot(center.x - at.x, center.y - at.y) <= radiusCells + EPS) out.push(st.kind);
+  }
+  return out;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  * 3. 偷木板河狸事件 + 222 大锤夺回
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -854,6 +974,8 @@ export interface RushOrderSessionOptions {
   /** 注入 rng;省略时用 seed 派生(调用方自行 mulberry32) */
   rng: Rng;
   durationSec?: number;
+  /** D-13:覆盖默认工位格。只给需要挪的工位,其余仍取 `DEFAULT_STATION_CELLS`。 */
+  stationCells?: Partial<Record<StationKind, WorldCell>>;
 }
 
 export interface RushOrderSession {
@@ -866,6 +988,8 @@ export interface RushOrderSession {
   board: RushOrderBoard;
   stock: Record<number, number>;
   stations: StationRuntime[];
+  /** 工位 id ↔ 世界格(D-13)。由 `opts.stationCells` 注入,缺省见 `DEFAULT_STATION_CELLS`。 */
+  stationCells: StationCellBook;
   beavers: BeaverRuntime[];
   chains: RelayChain[];
   events: string[];
@@ -888,6 +1012,9 @@ export function createRushOrderSession(opts: RushOrderSessionOptions): RushOrder
     board: generateOrderBoard(opts.rng, opts.roomLevel, stock, opts.seed ?? 0),
     stock,
     stations: [createStation(STATION_KIND.FURNACE), createStation(STATION_KIND.POT), createStation(STATION_KIND.CUTTER)],
+    /* D-13:工位 ↔ 世界格**在会话创建时定下来**,不是每帧算 ——
+       否则接线层(world_sim / use_item)与测试无法复述同一个坐标。 */
+    stationCells: resolveStationCells(opts.stationCells),
     beavers: [],
     chains: [],
     events: [],

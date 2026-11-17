@@ -28,11 +28,28 @@
  * 5 调它:`applied: true` ⇒ `OK` + `effect`;`applied: false` ⇒ `NOT_IMPLEMENTED` + 宿主给的理由
  *   (「能力在、这次没成」不是客户端的错,也不是成功)。
  *
+ * ## 归档回执(D-06)
+ *
+ * owner 已裁(`docs/DECISIONS.md` **D-06**):重置的存档政策 = **归档**
+ * (世界按新 seed 在内存重建,旧世界存成一份可回滚快照行)。
+ * 归档**写入**发生在宿主/DB 侧(`db/repo.ts:archiveWorldSnapshot`),
+ * 本动作只做一件事:**把"归档发生了没有"如实写进 `effect`**。
+ *
+ * `effect.archive` 是**三态字符串**(刻意不是布尔):
+ *   * `'ARCHIVED'`   —— 宿主报告旧世界已归档,并给出 `archiveId` / `archiveBytes`;
+ *   * `'NOT_ARCHIVED'` —— 宿主**明确**说这次没归档;
+ *   * `'UNREPORTED'` —— 宿主没报告这个字段(老宿主)。
+ * 三者不能合并:把"没报告"写成"没归档"就是**把不确定说成确定**,
+ * 客户端会据此认为"旧世界已经没了"。
+ *
  * ## ⚠️ 本动作**不做**的事(边界,别当成已实现)
  *
  * - **不做客户端重新握手**:换世界之后客户端手里的 chunk / 实体全是旧的,而今天
  *   没有任何「请重新握手 / 重拉快照」的下发路径 ⇒ **即使宿主真的重置了,客户端也留着旧世界**;
- * - **不动存档**:存档政策(丢弃 / 保留 / 归档)尚未裁决(`TASK-97` §4)⇒ 裁决前不许"顺手清";
+ * - **不做归档本身**:归档写入在宿主/DB 侧(D-06 已裁"归档",落地见 `db/repo.ts` §13);
+ *   本文件不 import 任何 DB 模块 —— 动作层不认识存档格式;
+ * - **不做"回滚到上一版"**:读口(`listWorldArchives` / `loadWorldArchive`)已就绪,
+ *   但回滚**写入**没有裁决(回滚要不要先归档当前世界?算不算一次新的 `RESET_WORLD`?);
  * - **不改房间的 `worldSeed`**:它是房间参数(由 `RoomRuntimeOptions` 给);改它等于写
  *   第二份"世界身份",与「谁是权威」冲突。
  */
@@ -57,6 +74,56 @@ function capabilityMissing(ctx: ActionContext): ActionOutcome {
       `${ctx.action} 的宿主不支持世界重置(WorldSaveHost.resetWorld 无实现者`
       + ' —— 见 docs/TASK-97-world-reset-ruling.md)',
   };
+}
+
+/**
+ * 宿主 `resetWorld` 的回执形状 —— **动作层只读这一份**。
+ *
+ * 前三个字段是 TASK-97 R1 的原始契约;`archive` / `archiveError` 是 D-06(归档)加的那一条。
+ * 宿主侧的对应契约(建议写进 `room.ts` 的 `WorldSaveHost`)与此**逐字同形**。
+ */
+type WorldResetHostResult = {
+  applied: boolean;
+  seed: number;
+  reason?: string;
+  /**
+   * 旧世界归档回执(由 `db/repo.ts:archiveWorldSnapshot` 的返回值投影而来):
+   * `{...}` = 已归档;`null` = 明确没归档;缺键 = **没报告**(三种状态,见文件头)。
+   */
+  archive?: { id: string; seed: number; archived_at: number; bytes: number } | null;
+  /** 归档失败的原因(归档没成不该让回执看起来一切正常)。 */
+  archiveError?: string;
+};
+
+/** `effect.archive` 的三种取值。"没报告"与"没归档"必须分开,理由见文件头。 */
+const ARCHIVED = 'ARCHIVED';
+const NOT_ARCHIVED = 'NOT_ARCHIVED';
+const UNREPORTED = 'UNREPORTED';
+
+/**
+ * 宿主的回执 ⇒ `effect`。
+ *
+ * 只**加**归档那几项:`seed` / `applied` 的口径一个字不改
+ * (`tests/WS-FND-34` FND34-1 盯的就是 `effect.seed` 是**实际生效**的种子)。
+ */
+function resetEffect(r: WorldResetHostResult): Record<string, string | number | boolean> {
+  const effect: Record<string, string | number | boolean> = { seed: r.seed, applied: true };
+  const archive = r.archive;
+  if (archive !== null && typeof archive === 'object') {
+    effect.archive = ARCHIVED;
+    effect.archiveId = String(archive.id);
+    effect.archiveSeed = Number(archive.seed);
+    effect.archiveBytes = Number(archive.bytes);
+    effect.archivedAt = Number(archive.archived_at);
+  } else if (archive === null) {
+    effect.archive = NOT_ARCHIVED;
+  } else {
+    effect.archive = UNREPORTED;
+  }
+  if (typeof r.archiveError === 'string' && r.archiveError.length > 0) {
+    effect.archiveError = r.archiveError;
+  }
+  return effect;
 }
 
 export const resetWorld: ActionHandler = (ctx) => {
@@ -95,7 +162,7 @@ export const resetWorld: ActionHandler = (ctx) => {
     return capabilityMissing(ctx);
   }
   /* 5 交给宿主,只如实转述它**实际生效**的语义(`this` 用 call 绑回宿主)。 */
-  const r = reset.call(host, { seed });
+  const r = reset.call(host, { seed }) as WorldResetHostResult;
   if (!r.applied) {
     return {
       ok: false,
@@ -103,5 +170,5 @@ export const resetWorld: ActionHandler = (ctx) => {
       reason: `${ctx.action} 未生效:${r.reason ?? '宿主未说明原因'}`,
     };
   }
-  return { ok: true, kind: 'OK', effect: { seed: r.seed, applied: true } };
+  return { ok: true, kind: 'OK', effect: resetEffect(r) };
 };

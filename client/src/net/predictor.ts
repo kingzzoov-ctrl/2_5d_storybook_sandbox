@@ -58,9 +58,19 @@ export interface AuthoritativePose {
 /**
  * 本地预测器。
  *
- * ⚠️ **`ackedSeq` 目前恒为 `undefined`** —— 协议里还没有这个字段
- * (实测 `client/src/net/session.ts` 与 `shared/net/` 里 `ackedSeq` 各 0 次)。
- * ⇒ 本类在该字段缺席时**不剪队列**,改为保留最近 `MAX_PENDING` 条命令
+ * ## `ackedSeq`:剪枝这条路**本文件已经通了**,缺的是**线上那个字段**
+ *
+ * `onAuthoritative` 收到 `ackedSeq` 就用 `pruneCmds` 剪(第三道门见那里的注释)。
+ * 但**目前没有任何东西会把它喂进来** —— 实测:
+ * ```
+ * client/src/net/session.ts  `ackedSeq` 0 次(下行只分派 welcome / actionResult / 二进制包)
+ * shared/net/delta.ts        `ackedSeq` 0 次(下行快照是 encodeFull/encodeDelta 的字节,
+ *                             decodePacket 的字段表里没有它)
+ * ```
+ * ⇒ 要让它上到线上,得动**冻结层** `shared/net/delta.ts` 的编解码 + `session.ts`/`state_store.ts`
+ * 的解码路径 —— 这条已按裁决 D-08 上报 owner,**本文件不偷偷扩协议**。
+ *
+ * 在该字段缺席期间,本类**不剪队列**,改为保留最近 `MAX_PENDING` 条命令
  * 并给出一条**可断言**的降级行为(见 `pendingTruncated`)。
  * 这条不是"先凑合":若不剪也不截断,队列会随游戏时长无界增长 ——
  * 那是一种**不会报错的内存问题**,而它会先被人当成"卡"。
@@ -69,12 +79,21 @@ export const MAX_PENDING = 120;
 
 export class LocalPredictor {
   private predicted: Vec3;
-  /** 待确认的命令队列(服务端确认后剪掉;无 `ackedSeq` 时按 `MAX_PENDING` 截断)。 */
   private pending: InputCmd[] = [];
   private last: ReconcileResult | null = null;
   /** SMOOTH 时留下的**视觉**偏移(位置早已对齐权威,这个只影响渲染)。 */
   private visualOffset: Vec3 = { x: 0, y: 0, z: 0 };
   private truncated = 0;
+  /**
+   * 已被服务端确认的**最高**序号。`-1` = 还没收到任何 `ackedSeq`。
+   *
+   * ⚠️ 它必须**单调** —— 回执可能乱序(重连后旧帧晚到),而
+   * `pruneCmds` 只是 `seq > acked` 的过滤:喂一个倒退的 ack 不会丢数据,
+   * 但会让"剪枝计数"倒退/重复计数(判据读的就是计数)。
+   */
+  private acked = -1;
+  /** 被 `pruneCmds` 剪掉的命令**累计**条数(证明"剪枝真的发生"的计数器)。 */
+  private pruned = 0;
 
   constructor(spawn: Vec3 = { x: 0, y: 0, z: 0 }) {
     this.predicted = { ...spawn };
@@ -107,6 +126,26 @@ export class LocalPredictor {
     return this.last;
   }
 
+  /**
+   * 已被服务端确认到的序号(`-1` = 服务端一次都没回过这个字段)。
+   *
+   * 判据用它,而不是用 `pendingCount` 单独看:队列长度同时受
+   * `MAX_PENDING` 截断与 `SNAP` 清空影响 ⇒ 只看长度会**把三种原因混成一个数**。
+   */
+  get lastAckedSeq(): number {
+    return this.acked;
+  }
+
+  /**
+   * 因回执被 `pruneCmds` 剪掉的命令**累计**条数 —— 单调不减。
+   *
+   * 为什么需要它:`pendingCount` 从 3 变成 1 也可能是截断或 SNAP 造成的;
+   * 这个计数器只在 ack 推进时增长 ⇒ `> 0` 才真的证明"剪枝跑过"。
+   */
+  get prunedTotal(): number {
+    return this.pruned;
+  }
+
   /** 推进一步。`cmd` 进入待确认队列 —— 服务端确认后由 `onAuthoritative` 剪掉。 */
   step(cmd: InputCmd, params: PredictParams = {}): Vec3 {
     this.pending.push(cmd);
@@ -125,8 +164,17 @@ export class LocalPredictor {
    * 3 用 `reconcile` 给这次校正分类(死区忽略 / 软校正 / 硬对齐)。
    */
   onAuthoritative(pose: AuthoritativePose, params: PredictParams = {}): ReconcileResult {
-    if (pose.ackedSeq !== undefined) {
-      this.pending = pruneCmds(this.pending, pose.ackedSeq);
+    /* ⚠️ 三道门,缺一不可(`ackedSeq` 现在**没有**线上来源,见文件头):
+       1 `Number.isFinite` —— `NaN` 会让 `pruneCmds` 的 `seq > NaN` 全为假
+          ⇒ **整个队列被静默清空**(位置从此只靠权威值,按键位移被抹掉);
+       2 `a > this.acked` —— 倒退/重复的回执不该再剪一次(计数会骗人);
+       3 未给(`undefined`)= 本协议还没有这个字段 ⇒ 交给 `MAX_PENDING` 截断。 */
+    const a = pose.ackedSeq;
+    if (typeof a === 'number' && Number.isFinite(a) && a > this.acked) {
+      const before = this.pending.length;
+      this.pending = pruneCmds(this.pending, a);
+      this.pruned += before - this.pending.length;
+      this.acked = a;
     }
     const before = this.predicted;
     const authoritative: Vec3 = { x: pose.x, y: pose.y, z: pose.z };
@@ -160,12 +208,20 @@ export class LocalPredictor {
     }
   }
 
-  /** 传送 / 重连:位置与队列一起重置。 */
+  /**
+   * 传送 / 重连:位置与队列一起重置。
+   *
+   * `acked` 也回到 `-1`:重连后的命令序号从 1 重新开始(见 `input.ts` 的 `InputSource`),
+   * 留着旧的 ack 会让新会话的第一批命令**一条都进不了队列**(`seq > 旧ack` 恒假)
+   * ⇒ 表现是"重连后角色不动",且不报错。
+   */
   reset(spawn: Vec3): void {
     this.predicted = { ...spawn };
     this.pending = [];
     this.last = null;
     this.visualOffset = { x: 0, y: 0, z: 0 };
     this.truncated = 0;
+    this.acked = -1;
+    this.pruned = 0;
   }
 }

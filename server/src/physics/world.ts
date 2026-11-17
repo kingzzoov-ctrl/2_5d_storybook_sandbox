@@ -140,6 +140,14 @@ export const VORTEX_ACCEL = 2.4;
 /** 圆碰撞的默认恢复系数(手册 §2.2「圆形刚体弹性碰撞」)。 */
 export const COLLISION_RESTITUTION = 1.0;
 
+/**
+ * μ 乘子的**中性值**:1 表示「这次不改变地板摩擦」。
+ *
+ * 表里查不到该刚体 ⇒ 就是 1;显式设回 1 ⇒ 从表里删掉,不留一条等价记录 ——
+ * 否则「回到中性」与「从没设过」在表里分不开,排查时看不出现场。
+ */
+export const MU_MUL_NEUTRAL = 1;
+
 /** 单帧最大子步数,防止实体速度爆表时穿透。 */
 export const MAX_SUBSTEPS = 4;
 
@@ -216,6 +224,22 @@ export class PhysicsWorld {
   private readonly trapTimers: Map<string, number> = new Map();
   /** 已触发的落穴格集合 */
   private readonly openedTraps: Set<string> = new Set();
+  /**
+   * 按刚体的 μ **乘子**(裁决 D-12)。缺省 = 没有记录 = 中性 1。
+   *
+   * **为什么是乘、不是覆盖?** 滑溜料理的 `muOverride = 0.96` 若**覆盖**地板 μ,
+   * 冰面 0.98 会被拉低到 0.96(冰上反而更涩)、湿地 0.40 会被拉高到 0.96
+   * (泥里反而更滑)—— 同一份料理在不同地面上方向相反,和"滑溜"的语义矛盾。
+   * 相乘则方向恒定:冰 0.98×0.96 = 0.9408 更滑、泥 0.40×0.96 = 0.384 更黏。
+   *
+   * **为什么不改冻结层的 `Body`?** `shared/types/physics.ts` 是冻结层,由 `BodyState`
+   * / `integrateHorizontal` 的签名锁死;加字段要改冻结层。因此乘子留在物理层
+   * 自己的一张旁表里,按 body id 索引。
+   *
+   * ⚠️ 结算**只在一处**:`stepBody` 里 `b.mu = 地板μ × mul`。别的地方再乘一次
+   * 会变成 mul 的平方(两份实现也会被门禁抓)。
+   */
+  private readonly muMuls: Map<string, number> = new Map();
   /** 本帧特效队列 */
   readonly fx: PhysFx[] = [];
   /** 上一帧报告 */
@@ -246,6 +270,8 @@ export class PhysicsWorld {
 
   remove(id: string): boolean {
     this.trapTimers.delete(id);
+    /* 乘子必须跟着刚体一起消失:同 id 重生的新实体不得继承上一条命的滑溜状态。 */
+    this.muMuls.delete(id);
     return this.bodies.delete(id);
   }
 
@@ -261,9 +287,47 @@ export class PhysicsWorld {
     this.bodies.clear();
     this.trapTimers.clear();
     this.openedTraps.clear();
+    this.muMuls.clear();
     this.fx.length = 0;
     this.tickCount = 0;
     this.elapsed = 0;
+  }
+
+  /* ── 摩擦乘子(裁决 D-12)── */
+
+  /**
+   * 设置某刚体的 μ **乘子**(最终摩擦 = 地板 μ × mul)。
+   *
+   * 用于滑溜料理:`setMuMul(id, 0.96)` ⇒ 冰面 0.98×0.96、湿地 0.40×0.96,
+   * 两个方向都朝"滑溜"走(见 `muMuls` 的注释)。
+   *
+   * **只接受有限正数**:`NaN` / `±Infinity` / `0` / 负数一律**拒绝并保持原值**。
+   * 为什么不能"夹到 0"就完事:`mu = 0` 在 `integrateHorizontal` 里是
+   * `v' = v*0` ⇒ 每帧速度归零,刚体不会"停",而是**原地定住**、外力也推不动,
+   * 看上去像卡进墙里;负数更会让速度每帧反向并指数增长(直接飞走)。
+   * 于是非法输入必须是 no-op,而不是写一个"看起来夹过了"的值。
+   *
+   * @returns `true` = 已接受;`false` = 被拒(状态未变)。
+   */
+  setMuMul(id: string, mul: number): boolean {
+    if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
+    if (mul === MU_MUL_NEUTRAL) {
+      /* 回到中性 = 删记录,不留一条 1(见 `MU_MUL_NEUTRAL` 的注释)。 */
+      this.muMuls.delete(id);
+      return true;
+    }
+    this.muMuls.set(id, mul);
+    return true;
+  }
+
+  /** 某刚体当前的 μ 乘子;没设过 / 已清回中性 ⇒ 1(`MU_MUL_NEUTRAL`)。 */
+  muMulOf(id: string): number {
+    return this.muMuls.get(id) ?? MU_MUL_NEUTRAL;
+  }
+
+  /** 清掉某刚体的 μ 乘子(等价于 `setMuMul(id, MU_MUL_NEUTRAL)`)。 */
+  clearMuMul(id: string): boolean {
+    return this.muMuls.delete(id);
   }
 
   /* ── 地形查询 ── */
@@ -403,7 +467,16 @@ export class PhysicsWorld {
       b.vy = 0;
     }
     if (b.state === BodyState.SLIPPING) mu = Math.max(mu, 0.98);
-    b.mu = mu;
+    /* ★ μ 乘子的**唯一结算点**(裁决 D-12):最终摩擦 = 地板 μ × 该刚体的乘子。
+       用于滑溜料理(0.96):冰面 0.98 → 0.9408(更滑)、湿地 0.40 → 0.384(更黏)。
+       方向恒定是**相乘**相对**覆盖**的全部意义(见 `muMuls` 的注释):
+       覆盖会把冰面拉低 0.98→0.96、把湿地拉高 0.40→0.96,同一份料理两头相反。
+
+       中性乘子是 1 ⇒ `mu * 1` 在 IEEE 双精度下**逐位不变**,
+       因此没有滑溜 buff 的刚体行为与加这条通道之前完全一致。
+       乘子在这里只出现这一次:别处再乘一次就是 mul 的平方,两份实现也会被门禁抓
+       (`WS-FND-54` FND54-2 用 0.9408 这个字面量把它钉住)。 */
+    b.mu = mu * this.muMulOf(b.id);
 
     /* — 加速带外力 — */
     let beltX = 0;

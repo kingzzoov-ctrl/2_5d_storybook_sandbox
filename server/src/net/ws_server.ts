@@ -332,6 +332,16 @@ export type WsConn = {
    * ```
    */
   urlUserId: string | null;
+  /**
+   * ★ D-08 第二步:本连接**已应用成功的最高命令序号**(`-1` = 还没收到 `seq`)。
+   *
+   * 为什么存在连接上而不是直接进快照:下行快照是**冻结层**编码的字节
+   * (`shared/net/delta.ts` 的 `encodeFull/encodeDelta` → `decodePacket` 的字段表),
+   * 里面没有这个字段 ⇒ 本文件先把它记下来、由 `WsServerHandle.lastAckedSeq()` 暴露;
+   * 进帧那一步等 owner 解锁冻结层。**不偷偷扩协议**
+   * (判据:`tests/WS-FND-58-joystick-prediction.test.ts` 的 FND58-8/9)。
+   */
+  ackedSeq: number;
 };
 
 /** 从 `req.url`(如 `/ws?userId=alice`)取 userId;没有则 null。 */
@@ -359,7 +369,10 @@ export type WsServerOptions = {
  */
 /** `parseMoveIntent` 的结果 —— 判别联合,而不是 `null` + 原因字符串。 */
 export type MoveIntentParse =
-  | { ok: true; intent: { tick: number; x: number; y: number; z: number; speedMul?: number } }
+  | {
+    ok: true;
+    intent: { tick: number; x: number; y: number; z: number; speedMul?: number; seq?: number };
+  }
   | { ok: false; reason: string };
 
 /**
@@ -379,7 +392,7 @@ export type MoveIntentParse =
  * 理由:它是乘数,不是坐标 —— 一个坏乘数不该让整次移动消失。
  */
 export function parseMoveIntent(msg: {
-  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown;
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown; seq?: unknown;
 }): MoveIntentParse {
   const fields: Array<[string, unknown]> = [
     ['tick', msg.tick], ['x', msg.x], ['y', msg.y], ['z', msg.z],
@@ -389,7 +402,9 @@ export function parseMoveIntent(msg: {
       return { ok: false, reason: `${name}=${String(v)}(要求有限数)` };
     }
   }
-  const intent: { tick: number; x: number; y: number; z: number; speedMul?: number } = {
+  const intent: {
+    tick: number; x: number; y: number; z: number; speedMul?: number; seq?: number;
+  } = {
     tick: msg.tick as number,
     x: msg.x as number,
     y: msg.y as number,
@@ -397,6 +412,12 @@ export function parseMoveIntent(msg: {
   };
   if (typeof msg.speedMul === 'number' && Number.isFinite(msg.speedMul)) {
     intent.speedMul = msg.speedMul;
+  }
+  /* `seq` = 客户端命令序号(D-08 第二步,ack 用)。**可选**,且要求**非负整数**:
+     它是"处理到第几条",不是坐标 —— 给 1.5 / NaN / -3 一律当**没给**
+     (与 `speedMul` 同一取舍:坏值不该让整次移动消失,只是这次不带 ack)。 */
+  if (typeof msg.seq === 'number' && Number.isInteger(msg.seq) && msg.seq >= 0) {
+    intent.seq = msg.seq;
   }
   return { ok: true, intent };
 }
@@ -481,6 +502,14 @@ export type WsServerHandle = {
   lastParsedPacket(): DecodedPacket | null;
   /** 最近一次解析失败的原因原文(null = 没失败过)。 */
   lastParseError(): string | null;
+  /**
+   * ★ 服务端**已应用成功的最高客户端命令序号**(`-1` = 还没收到带 `seq` 的移动意图)。
+   *
+   * 这就是下行 `ackedSeq` 的**服务端那一半**(D-08 第二步):客户端拿它剪
+   * `LocalPredictor.pending`。它按"收到**并应用成功**"的 `seq` 单调推进,
+   * 与 `uplinkParsed`(报文解析成功)分开计 —— 两件事,两个数。
+   */
+  lastAckedSeq(): number;
   /**
    * 供测试:**模拟异常掉线** —— 直接 destroy 所有底层 TCP,不发 close 帧。
    *
@@ -567,6 +596,8 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let lastParsedPacket: DecodedPacket | null = null;
   let lastParseError: string | null = null;
   let nextConnSeq = 1;
+  /** ★ D-08 第二步:已应用成功的最高客户端命令序号(`-1` = 还没人带 `seq` 上来)。 */
+  let lastAckedSeq = -1;
 
   const write = (c: WsConn, bytes: Uint8Array): void => {
     if (c.closed || c.socket.destroyed) return;
@@ -612,6 +643,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       /* ★★ userId 从**握手 URL 的 query** 取 —— 实测客户端 hello 里**没有**它。
          见 `WsConn.urlUserId` 的说明。 */
       urlUserId: readUserIdFromUrl(req.url),
+      ackedSeq: -1,
     };
     conns.add(conn);
     log(`upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
@@ -957,6 +989,9 @@ function onMove(c: WsConn, msg: {
   const intent = parsed.intent;
   try {
     apply.call(opts.room, c.userId, intent);
+    /* ack 只在**应用成功之后**推进 —— 抛错那条路径不该被记成"服务端处理过了",
+       否则客户端会把一条从未生效的命令剪掉(那段位移再也补不回来)。 */
+    if (intent.seq !== undefined && intent.seq > lastAckedSeq) lastAckedSeq = intent.seq;
   } catch (e) {
     log(`applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
   }
@@ -1026,6 +1061,12 @@ function onMove(c: WsConn, msg: {
     uplinkRejected: (): number => uplinkRejected,
     lastParsedPacket: (): DecodedPacket | null => lastParsedPacket,
     lastParseError: (): string | null => lastParseError,
+    /* ★ 2026-11-16(D-08 第二步):服务端**已应用成功的最高客户端命令序号**。
+       与 `uplinkParsed`(报文解析成功)分开计 —— 这是"这条命令生效了"。
+       ⚠️ 它**还没上到下行帧**:快照字节由冻结层 `shared/net/delta.ts` 的
+       `encodeFull/encodeDelta` 决定,`decodePacket` 的字段表里没有这个字段
+       ⇒ 真要上线得先解锁冻结层(已上报 owner),本文件不偷偷扩协议。 */
+    lastAckedSeq: (): number => lastAckedSeq,
     /* ★ 模拟异常掉线:destroy 底层 socket(**不发 close 帧**)。
        服务端侧看到的与"客户端掉网"完全一致 ⇒ 走 `disconnect` 分支。 */
     dropConnectionsForTest: async (): Promise<void> => {

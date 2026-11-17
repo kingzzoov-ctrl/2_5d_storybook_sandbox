@@ -3956,11 +3956,16 @@ test('task-40 判定:prediction 是**客户端**模块,已搬到 client/src/net/
       `room.ts 不含 ${fn} ⇒ 服务端不该预测自己已是权威的东西`);
   }
 
-  /* 4. 搬迁后**仍不可达**:客户端尚无网络层,没人调用它。
-   *    所以白名单条目**保留**,只改理由(不是摘除)。 */
+  /* 4. ★ 2026-11-16(**D-08**)重钉:旧结论是「main.ts 不提 prediction ⇒ 搬迁后仍不可达」。
+   *    D-08 裁决要**预测链真的接进输入**(虚拟摇杆与 WASD 都走它)⇒ 可达是**要的**,
+   *    旧断言(`!mainSrc.includes('prediction')`)与裁决相反,已按裁决改写。
+   *    现判据:1 经 `predictor.ts` 用到预测链;2 仍**不直接**依赖 `prediction.ts`
+   *    (实现细节留在 predictor 门面后,main 不认具体实现);3 main 自身无网络原语(下一条)。 */
   const mainSrc = readFileSync(join(ROOT_DIR, 'client', 'src', 'main.ts'), 'utf8');
-  ok(!mainSrc.includes('prediction'),
-    'client/src/main.ts 未 import prediction ⇒ 搬迁后**仍不可达**');
+  ok(mainSrc.includes("./net/predictor.ts"),
+    'client/src/main.ts 经 predictor.ts 用到预测链(D-08:可达是**要的**)');
+  ok(!mainSrc.includes('./net/prediction.ts'),
+    'main.ts 仍不直接依赖 prediction.ts —— 门面在 predictor.ts,实现可换');
   ok(!/WebSocket|colyseus|fetch\(/.test(mainSrc),
     '客户端仍无网络层 ⇒ 它等的是「客户端网络层」,不是「服务端接线」');
 });
