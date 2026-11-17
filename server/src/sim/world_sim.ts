@@ -2141,7 +2141,6 @@ export class WorldSim {
       ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
     });
     return { outcome: 'OK', hit, rejected: null };
-    return { outcome: 'OK', hit, rejected: null };
   }
 
   /**
@@ -3348,7 +3347,6 @@ export class WorldSim {
     b.x = x;
     b.y = y;
     if (z !== undefined) b.z = z;
-    return true;
     return true;
   }
 
