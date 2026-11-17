@@ -2720,6 +2720,20 @@ export class WorldSim {
   private static readonly KNOCKBACK_STEPS = 2;
 
   /**
+   * 受击击退的**换算**:每 20 点伤害推 1 格(★ D-09 裁决,owner 2026-11-16)。
+   *
+   * 为什么不借用 `damage.ts` 的 `knockbackImpulse`:那是**攻方武器**的击退量(谁的武器击退更强),
+   * 而这里要的是"**我**被打中之后被推多远" —— 同一个物理量在两个语义下不是一回事。
+   * 裁决原文给了这条换算,所以数不是发明的;要改这个数需要新裁决。
+   */
+  private static readonly KNOCKBACK_DAMAGE_PER_CELL = 20;
+  /**
+   * 受击击退的上限(格)。**必须有上限**:`applyKnockback` 一次性把位移写进位置,
+   * 没有上限时一次 100 伤害会推 5 格(穿墙/出界由 physics 兜,但观感与救援半径都崩)。
+   */
+  private static readonly KNOCKBACK_MAX_CELLS = 2;
+
+  /**
    * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离 `distance` 格。
    *
    * 距离由调用方给:内容层的击退量(`PRANK_HAMMER_KNOCKBACK`)是既有锚,
@@ -3950,14 +3964,19 @@ export class WorldSim {
       if (res.applied > 0) {
         applied.push(res);
         this.hitCount += 1;
-        /* ⚠️ **没有在这里接击退** —— 这是刻意的,不是漏了。
-           机制(`applyKnockback` + 搬家窗口)已实现并有判据(`WS-FND-49` FND49-6/7/8),
-           但"受击推多远"与"救援者会不会被推出触摸半径"是**玩法数值裁决**:
-           接上 `PRANK_HAMMER_KNOCKBACK`(武器击退量)当受击位移,实测把三条既有判据打红
-           —— `WS-10` task44-6(救援者被推出 0.9 格半径 ⇒ 救不到)、task44-7、
-           T58-2(位置写入后"推 50 帧仍精确不变"不再成立)。
-           `COMPLETION-CRITERIA` 的裁决原文也是"今天它是 no-op,不是谁压住谁"。
-           ⇒ 等 owner 定"受击击退的位移口径";定完在这里加一行即可。 */
+        /* ★ D-09(owner,2026-11-16):受击击退 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**。
+           这里此前是 no-op,注释解释过"为什么不敢接",两种坏法是:
+             · 借 `PRANK_HAMMER_KNOCKBACK`(8 格)当位移 ⇒ 把救援者推出 0.9 格触摸半径,
+               `WS-10` 的 task44-6/7、T58-2 会红;
+             · 写速度 ⇒ 下一帧 `applyPlayerMove` 就把它抹掉(本仓没有速度积分器)。
+           裁决给了数值(伤害折算 + 上限 2 格)⇒ 按它接,且**位移仍走 `applyKnockback`**
+           (慢帧推 + 搬家窗口),不写速度。
+           ⚠️ 若这条把 `WS-10` 的救援判据打红:**按 D-09 重钉那条判据**,不许改回 no-op。 */
+        const pushCells = Math.min(
+          WorldSim.KNOCKBACK_MAX_CELLS,
+          res.applied / WorldSim.KNOCKBACK_DAMAGE_PER_CELL,
+        );
+        if (rt !== null && pushCells > 0) this.applyKnockback(res.playerId, rt.x, rt.y, pushCells);
         /* 事件:UI 与音效靠它播受击反馈,而不用每帧轮询血量 */
         this.bus.emit(
           'player_hit',

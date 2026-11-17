@@ -2344,6 +2344,11 @@ test('task44-5:HP 归零 → 进幽灵泡泡(vitals.downed 是唯一判据)', ()
 test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对照', () => {
   /* ⚠ 反向对照是必须的:若只测「同格能救」,漏了距离判定的实现照样全绿。
      实测边界:TOUCH_RADIUS=0.9,0.85 格能救、0.95 格不能。 */
+  /* ★ D-09(owner,2026-11-16)之后,这条判据必须**先移走伤害源**:
+     受击击退 = min(2, 伤害/20) 格,救人的队友会被推出 `TOUCH_RADIUS`(0.9)⇒ 救不到。
+     **那不是缺陷,是裁决要的机制**(挨打会打断救援)。所以:
+       · 本判据测的是"距离判定",故把熔岩移走 ⇒ 只留距离一个变量;
+       · "挨打会被推开"由 `WS-FND-53` 单独钉(确定性夹具)。 */
   const attempt = (dist: number): { revived: boolean; hp: number } => {
     const s = partyWorld([
       { id: 'p1', x: 24, y: 24 },
@@ -2352,6 +2357,8 @@ test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对
     for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
     /* 前置:此时确实倒地了。 */
     if (!s.vitals.get('p1')!.downed) return { revived: false, hp: -1 };
+    /* ★ 移走伤害源(D-09):否则救援者会被击退推出 0.9 格,这条就变成在测击退 */
+    s.mobHost.removeMob('mob_lava_elem');
     s.setPlayerPos('p2', 24 + dist, 24);   /* 移到指定距离 */
     for (let i = 0; i < 60; i += 1) {
       s.tick();
@@ -2455,6 +2462,10 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
   ], 'mob_lava_elem', [24, 26]);
   for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
   eq(s.vitals.get('p1')!.downed, true, '前置:先倒地');
+  /* ★ D-09:先把伤害源移走 —— 否则救援者会在读条期间被击退推出 `TOUCH_RADIUS`,
+     这条判据就测不到"复活后泡泡清除 / downed 归位"(它会先红在"复活没发生")。
+     挨打会推开救援,是裁决要的机制,由 `WS-FND-53` 单独钉。 */
+  s.mobHost.removeMob('mob_lava_elem');
   s.setPlayerPos('p2', 24.3, 24);
   for (let i = 0; i < 60 && s.lastRevive === null; i += 1) s.tick();
 
@@ -2523,6 +2534,9 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
   ], 'mob_lava_elem', [24, 26]);
   for (let i = 0; i < 600 && !g.vitals.get('p1')!.downed; i += 1) g.tick();
   ok(g.vitals.get('p1')!.downed, 'task-64 前置:先倒地');
+  /* ★ D-09:同 task44-6 —— 读条期间被击退会把救援者推出 0.9 格,复活不会发生。
+     本块测的是「复活宽限无敌」,故先移走伤害源(挨打会推开救援由 `WS-FND-53` 钉)。 */
+  g.mobHost.removeMob('mob_lava_elem');
   g.setPlayerPos('p2', 24.3, 24);
   for (let i = 0; i < 60 && g.lastRevive === null; i += 1) g.tick();
   ok(g.lastRevive !== null, 'task-64 前置:复活发生了');
@@ -3108,14 +3122,16 @@ test('T58-2 位置写入后**无漂移**:积分器不会把它挪回去', () => 
   /* 这是选「位置方案」而非「速度方案」的关键论据之一。
      位置写入绕过积分(`vx` 恒 0),故不经过摩擦衰减;速度写入则会被
      `integrateHorizontal` 先衰减再积分(实测 4.5 → 3.24,一帧只走 0.162)。
-     ⇒ 两侧都测:写入后推 1 帧、推 50 帧,位置都必须**逐位不变**。 */
+     ⇒ 两侧都测:写入后推 1 帧、移走生物后再推 50 帧,位置都必须**逐位不变**。 */
   const s = authWorld();
   s.applyPlayerMove('p1', 12.5, 10);
   s.tick();
   eq(s.playerPosition('p1')!.x, 12.5, '推 1 帧后仍精确等于写入值(无摩擦衰减)');
+  /* ★ D-09 之后:近处的生物会把玩家**击退**(每次命中 min(2, 伤害/20) 格)。
+     那**不是漂移**,是机制 ⇒ 移走生物,让这条只测「积分器会不会把写入值挪回去」。 */
+  s.mobHost.removeMob('mob_sheep');
   for (let i = 0; i < 50; i += 1) s.tick();
   eq(s.playerPosition('p1')!.x, 12.5, '推 50 帧后仍精确不变 ⇒ 位置方案稳定');
-
   /* 对照:速度方案会被摩擦吃掉 —— 证明上面「无漂移」不是恒真。 */
   const b = s.physics.bodies.get('p1')!;
   b.vx = BASE_MOVE_SPEED;

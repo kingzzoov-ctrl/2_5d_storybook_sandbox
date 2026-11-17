@@ -69,6 +69,75 @@
 
 ---
 
+## D-06 `RESET_WORLD` 的存档政策:**归档**(旧世界可回滚)
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:`docs/TASK-97` §4 的存档政策(覆盖 / 保留 / 归档)未定 ⇒ 世界重置的宿主半边一直没实现
+- **裁决**:**归档**。世界按新 seed 在内存重建,**旧世界存成一份可回滚快照行**(不是删掉,也不是原地不管)
+- **影响**:需要新增"世界快照"存储与配额;`WorldSim.resetWorld({seed})` 负责内存重建,归档由宿主/DB 侧做
+- **生效范围**:`server/src/sim/world_sim.ts`、`server/src/net/actions/reset_world.ts`、`server/src/db/**`、`docs/TASK-97`
+
+---
+
+## D-07 世界时钟:**20 分钟一天**,0 帧 = **06:00**
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:世界侧没有时钟 ⇒ `WorldSim.isNight()` 恒 `false`;405 昼夜感光器读的 `hour` 参数**全仓 0 个生产者**
+- **裁决**:游戏内一天 = **1200 秒(20 分钟)**;世界时间 0 帧对应 **06:00**(天亮)。夜 = **19:00–06:00**(沿用 `wiring/components.ts` 的 `isNight(hour)` 边界)
+- **影响**:`isNight()` 改成按世界时间算;`hour` 参数由世界侧喂给组件求值 ⇒ 夜行怪开始按夜晚出没、405 感光器开始有输出
+- **生效范围**:`server/src/sim/world_sim.ts`、`server/src/wiring/components.ts`(只喂参数,不改边界)、`server/src/mobs/spawner.ts`
+
+---
+
+## D-08 输入语义:**镜头跟随角色**;主目标是**手机虚拟摇杆**,WASD 作桌面兼容
+- **状态**:已裁(owner,2026-11-16),取代 `docs/TASK-83-wasd-three-options.md` 的三选一
+- **裁决**:① 镜头**跟随角色**(不是自由平移镜头);② 这是一款**手机游戏**,**主输入是虚拟摇杆**(触屏);③ WASD **可以支持角色移动**,作为桌面/调试兼容,但不是主路径
+- **影响**:`client/src/net/prediction.ts` 那条链要按"角色移动"重接(含下行 `ackedSeq`);新增虚拟摇杆 UI 与输入适配
+- **仍待澄清**:网页 / 微信小游戏(`DECISIONS` P-04)未定 —— 它决定摇杆是 DOM 还是平台 API,不决定"摇杆优先"这件事
+- **生效范围**:`client/src/net/input.ts`、`client/src/net/prediction.ts`、`client/src/main.ts`、`server/src/net/ws_server.ts`(下行 `ackedSeq`)
+
+---
+
+## D-09 受击击退:**按伤害折算**(伤害 ÷ 20 格,上限 2 格)
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:`damage.ts` 算出的 `knockbackImpulse` 是**攻方武器**的数,拿它当"被打飞多远"是错借语义;mob→玩家那条路(`vitals.applyHit`)**根本没有击退参数** ⇒ 一直是 no-op
+- **裁决**:位移 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**
+- **影响**:`WS-10` 的三条既有判据(救援半径 / 位置不变)可能被打红 —— 若红,**按本裁决重钉**,不许为了绿而改回 no-op
+- **生效范围**:`server/src/sim/world_sim.ts`(受击点)、`tests/WS-10.test.ts`(如需要)
+
+---
+
+## D-10 泡泡水枪连击窗口:**5 秒**(复用 `BUBBLE_TRAP_SEC`)
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:`liveBubbles` 的层数**永不衰减** ⇒ 跨任意时长能凑满"连中 3 发"
+- **裁决**:最后一次命中后 **5 秒**内没再命中 ⇒ 层数归零;**不新增数值常量**(5.0 就是 `BUBBLE_TRAP_SEC`)
+- **生效范围**:`server/src/combat/live_bubble.ts`、`server/src/sim/world_sim.ts`(`tickLiveBubbles`)
+
+---
+
+## D-11 `forgeUnlocked`:**以现存 505 工作台为中高级锻造**
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:`rooms/effects.ts` 的 `forgeUnlocked` 无消费点 —— 内容层没有"中高级锻造"的分档
+- **裁决**:解锁 = **能用 505 工作台出产的配方**(不新增 `tier` 字段,不动冻结内容表)
+- **影响**:`craft` 路径要按 `station === 505` 与 `forgeUnlocked` 做闸;锁着时显式拒绝(不是静默失败)
+- **生效范围**:`server/src/net/actions/craft.ts`、`server/src/sim/world_sim.ts`(把 `forgeUnlocked` 投影成可读事实)
+
+---
+
+## D-12 滑溜料理的 `muOverride`:**相乘**在地板 μ 上
+- **状态**:已裁(owner,2026-11-16)
+- **裁决**:最终摩擦 = **地板 μ × `muOverride`**(0.96)⇒ 冰面更滑、湿地更黏,方向一致;**不覆盖**地板值
+- **影响**:物理层需要一条"按玩家的 μ 乘区"通道(不能改冻结层的 `Body` 结构)
+- **生效范围**:`server/src/physics/world.ts`、`server/src/sim/world_sim.ts`
+
+---
+
+## D-13 227 浇灭 coop 工位:**补一张坐标映射表**
+- **状态**:已裁(owner,2026-11-16)
+- **问题**:`rush_order.ts` 的工位槽位**没有世界坐标** ⇒ 玩家的浇水动作无法映射到 `opts.spraying`
+- **裁决**:给工位补"工位 id ↔ 世界格"的映射表,浇水仍按 `STATION_STATE.BURNING` + `EXTINGUISH_SEC` 的既有规则走
+- **生效范围**:`server/src/coop/rush_order.ts`、`server/src/sim/world_sim.ts`、`server/src/net/actions/use_item.ts`
+
+---
+
 ## 待 owner 裁决(尚未定)
 
 | # | 事项 | 影响 | 我的建议 |
