@@ -5,7 +5,7 @@
  * `shared/types/entities.ts#bossScaledHp`。
  */
 
-import { BOSS_BY_ID, BOSS_LIST } from '../../../shared/constants/bosses.ts';
+import { BOSS_BY_ID, BOSS_LIST, normalizeBossLoot } from '../../../shared/constants/bosses.ts';
 import { bossScaledHp } from '../../../shared/types/entities.ts';
 import type { BossDef } from '../../../shared/types/entities.ts';
 import { isInsideSafeRadius } from '../mobs/spawner.ts';
@@ -361,13 +361,17 @@ export function effectiveLoot(def: BossDef): { out: number[]; qty: number[]; abs
   const deviations = new Set((def.lootDeviations ?? []).map((d) => d.itemId));
   const out: number[] = [];
   const qty: number[] = [];
-  for (let i = 0; i < def.loot.length; i += 1) {
-    const itemId = def.loot[i];
+  /* ★ CR-27(P-01):战利品的**形状归一**只在这一处做。
+     `normalizeBossLoot` 同时接受两种形态:
+       · 旧的纯 `number[]` + 逐位 `lootQty` ⇒ `count = lootQty[i] ?? 1`(当前 8 个 Boss 都是这一形态);
+       · 新的 `{ id, count }[]` ⇒ 原样读 `count`。
+     于是「`loot` 能带数量」不需要改冻结字段,旧数据也不必迁移 —— 判据见 `tests/WS-FND-79`
+     的 FND79-5(手册 703×10 / 117×15)/ FND79-6(旧形态 `number[]` 逐位可读)。 */
+  for (const e of normalizeBossLoot(def.loot, def.lootQty)) {
     /* 被标注为「手册里不是战利品」的件不参与掉落 —— 不删 loot,只在生产侧过滤。 */
-    if (deviations.has(itemId)) continue;
-    out.push(itemId);
-    /* `lootQty` 与 `loot` 逐位对应;缺省 1(手册未注数量即 1 件)。 */
-    qty.push(def.lootQty?.[i] ?? 1);
+    if (deviations.has(e.id)) continue;
+    out.push(e.id);
+    qty.push(e.count);
   }
   return { out, qty, abstract: [...(def.lootAbstract ?? [])] };
 }

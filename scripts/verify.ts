@@ -4522,6 +4522,20 @@ export const CROSS_ANNOTATION: ReadonlyMap<string, string> = new Map<string, str
   ['server/src/prank/immunity.ts',
     '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
     + '相容原因:等 `applyPrank` 这个施加端,两边同一处未接线。'],
+  ['shared/testing/harness.ts',
+   '可达性侧:传递不可达(没有任何生产根能走到它);orphan 侧:生产零引用(直接引用=0)。'
+   + '两者相容的原因:它是**测试夹具**(只被 tests/** 消费、生产侧真 importer=0),故既不在生产闭包里、'
+   + '也没有生产 importer —— 这里「不可达」与「零引用」都是**正确状态**,不是待办:'
+   + '它住共享契约目录,若被生产 import 反而会把测试依赖拖进生产闭包。'],
+  ['shared/types/events.ts',
+   '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+   + '相容原因:它是**契约先行**的 29 种事件名 SSoT,只被门禁判据消费(gate-only);'
+   + '生产侧事件名仍是扁平字符串 ⇒ 两边同时等**编排层接线**,不是两条欠账。'],
+  ['shared/constants/cooking.ts',
+   '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+   + '相容原因:它是 gate-only 的中性值表(判据 WS-FND-66 真消费),生产侧只由 '
+   + '`shared/types/cooking.ts` 的合并函数间接消费 ⇒ 不在生产闭包内、也没有生产直接 importer —— '
+   + '同一处契约先行的两个投影。'],
 ]);
 
 /** `findWhitelistCrossViolations` 的入参(全部可注入 ⇒ 判据可被单独验证)。 */
@@ -4536,6 +4550,13 @@ export interface CrossWhitelistInput {
   tautCandidates: ReadonlyMap<string, { suite: string; mod: string; lines: number[] }>;
   /** 交叉标注表:`path → 标注`。 */
   crossAnnotations: ReadonlyMap<string, string>;
+  /**
+   * 入口文件集(`PROD_ENTRIES`)。**R1 对它们不适用**:
+   * 入口是"被登记"而可达的,不是"被 import"而可达的 ⇒
+   * 它同时出现在「生产零引用」(没有 importer)与「可达闭包」(是入口)里**并不矛盾**。
+   * 少了这条豁免,`server/src/net/room.colyseus.ts`(由 `index.ts` 按名实例化)会报假冲突。
+   */
+  entryFiles?: ReadonlySet<string>;
 }
 
 /** 两白名单交叉检查的**纯判据**(违反项,空数组 = 通过)。 */
@@ -4543,7 +4564,7 @@ export function findWhitelistCrossViolations(input: CrossWhitelistInput): string
   const out: string[] = [];
   /* ── R1 同一模块不得一边可达一边孤儿 ── */
   for (const rel of input.orphan.keys()) {
-    if (input.reachable.has(rel)) {
+    if (input.reachable.has(rel) && !(input.entryFiles?.has(rel) ?? false)) {
       out.push(
         `${rel}:ORPHAN_KNOWN 说它「生产零引用」,可达闭包却说它**可达** —— 两套判据矛盾(必有一错)`,
       );
@@ -4605,6 +4626,7 @@ function checkWhitelistCross(): void {
     orphan: orphanKnownParsed,
     tautCandidates,
     crossAnnotations: CROSS_ANNOTATION,
+    entryFiles: new Set(PROD_ENTRIES),
   });
   /* 交叉表**无条件打印** —— 这张图此前不存在,人是靠脑内对表在核的。 */
   const both = [...orphanKnownParsed.keys()].filter((p) => UNREACHABLE_EXEMPT.has(p)).length;
@@ -5434,7 +5456,7 @@ function checkOrphanList(): void {
        若不是,说明某模块「生产零引用」却**不在**不可达清单里 ——
        那意味着两种判定出现**无法调和的**矛盾,两者必有一错。
        这个不变量是本门禁最有价值的部分:它把「两套口径是否自洽」变成可机器检查的。 */
-    else if (!UNREACHABLE_EXEMPT.has(rel)) {
+    else if (!UNREACHABLE_EXEMPT.has(rel) && !PROD_ENTRIES.includes(rel)) {
       bad.push(`${rel}(是 orphan 却不在可达性白名单 —— 两套判据矛盾)`);
     }
   }

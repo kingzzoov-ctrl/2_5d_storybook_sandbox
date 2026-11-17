@@ -21,6 +21,10 @@
  *   再进背包;放块时先扣背包、再写世界。两边都"先加"就会造出复制品。
  */
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
+/* ★ CR-27(P-04):件数放大复用**已有的概率双倍范式** —— `raid.ts` 的 `fnv1a`+`seededRoll`
+   (`rng() < chance ? 翻倍 : 不翻`)与 `bosses/raid.ts:409` 的 35% 数量翻倍同源。
+   **不另写一份 PRNG**(那会是第二份实现,迟早漂移)。 */
+import { fnv1a, seededRoll } from '../../bosses/raid.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -39,6 +43,52 @@ const ITEM_ID_SET: ReadonlySet<number> = new Set(ITEM_LIST.map((i) => i.id));
 /** 从 action payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+/* ═══════════════ 采集乘子的**件数放大规则**(CR-27 / P-04)═══════════════ */
+
+/**
+ * 采集乘子 → **件数翻倍概率**(CR-27 / P-04)。
+ *
+ * 手册 `602 伐木与采矿速度 +20%` 给的是**乘子**(`gatherMul = 1.2`),而一次 `breakBlock`
+ * 只产出 **1** 件 —— 「+20% 采集速度」在没有采集时长的模型里没有可乘的量纲。
+ * 裁决:**按概率翻倍件数**,复用已有的 `dropDoubleChance` 范式
+ * (见 `bosses/raid.ts:409` 的 `rng() < 0.35 ⇒ 数量翻倍`):
+ *
+ *   chance = clamp(gatherMul − 1, 0, 1)   // 1.2 ⇒ 20%;1 ⇒ 0%(**不翻倍**)
+ *   count  = roll < chance ? 2 : 1        // 期望件数 = 1 + chance = gatherMul
+ *
+ * ⇒ 乘子的**期望值**被如实表达(1.2 ⇒ 平均 1.2 件),而单次产出永远是整数件,
+ *   不会出现「1.2 件」这种非整数库存。
+ *
+ * ⚠️ `gatherMul ≤ 1` 一律 0 概率 —— 中性值(1)与非法值(NaN/0/负数)都**不翻倍**;
+ *   这是负对照要钉的那条(`tests/WS-FND-79` FND79-7/8)。
+ */
+export function gatherDoubleChance(gatherMul: number): number {
+  if (!Number.isFinite(gatherMul) || gatherMul <= 1) return 0;
+  return Math.min(1, gatherMul - 1);
+}
+
+/**
+ * 按给定 `roll`(∈[0,1))结算这一次采集的件数:1 或 2。
+ *
+ * `roll` 由调用方**注入**,所以规则本身可被判据逐位钉住,不需要统计采样:
+ * `gatherCountFor(1.2, 0.19) === 2`、`gatherCountFor(1.2, 0.20) === 1`
+ * (边界是**严格小于**,与 `raid.ts:409` 的 `rng() < 0.35` 同口径)。
+ */
+export function gatherCountFor(gatherMul: number, roll: number): number {
+  return roll < gatherDoubleChance(gatherMul) ? 2 : 1;
+}
+
+/**
+ * 生产路径用的 `roll`:由 **(actorId, 格坐标, 拆下来的 objId, 房间 tick)** 确定性导出。
+ *
+ * 为什么不在这里 `Math.random()`:本仓的掉落一律走种子化 PRNG(与
+ * `rollPersonalLoot` 的 `fnv1a(bossId|ownerId)` 同族),于是同一次拆块在重放/重连下
+ * 结果一致;而把 tick 掺进种子又保证「换个格子、换个时刻重拆」会拿到新的 roll
+ * —— 不能靠原地反复放块把 20% 固定成必中。
+ */
+function gatherRollFor(actorId: string, x: number, y: number, objId: number, tick: number): number {
+  return seededRoll(fnv1a(`${actorId}|${x}|${y}|${objId}|${tick}`))();
 }
 
 /** `PLACE_BLOCK`:放块。先扣背包,世界拒绝则**退回**那一件。 */
@@ -97,21 +147,29 @@ export const breakBlock: ActionHandler = (ctx: ActionContext): ActionOutcome => 
      不传时的旧行为由 `MaterialApi.breakBlock` 的可选参数保证(回执不多键)。 */
   const r = mat.breakBlock(x, y, ctx.actorId);
   if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
+  /* ★ CR-27(P-04):件数放大在此结算 —— 世界源只给**乘子**(`gatherMul`,1 = 中性),
+     翻倍与否由本层按概率决定(`dropDoubleChance` 范式,见文件上方
+     `gatherDoubleChance` / `gatherCountFor`)。
+     种子 = (actorId, 格坐标, objId, 房间 tick):同一次拆块可复现,换格/换时刻换 roll。 */
+  const gatherMul = r.gatherMul ?? 1;
+  const tick = ctx.state.meta.tick;
+  const count = gatherCountFor(gatherMul, gatherRollFor(ctx.actorId, x, y, r.objId, tick));
   /* 拆下来的东西先给凭证再入背包;背包满就落回**原地** —— 不凭空销毁。 */
   const src = `break:${x},${y}:${r.objId}`;
   ctx.grantItemSource(ctx.actorId, src);
-  const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: r.objId, delta: 1, source: src }] });
+  const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: r.objId, delta: count, source: src }] });
   /* `gatherMul` **只在世界源给出非中性值**时才进回执(1 = 中性 ⇒ 键缺席,与
      `WorldArchiveReceipt.trim` 同一纪律:键的存在本身是可判定事实)。
      写成可变对象再按需加键:`effect` 的值域是 `string|number|boolean`,
-     用条件展开会把联合类型带进去(TS2322)。 */
+     用条件展开会把联合类型带进去(TS2322)。
+     `gained` / `dropped` 报**实际件数**(1 或 2)—— 旧回执的 1 是它的特例,不是另一个字段。 */
   const effect: Record<string, string | number | boolean> = {
-    x, y, objId: r.objId, gained: gain.allowed ? 1 : 0,
+    x, y, objId: r.objId, gained: gain.allowed ? count : 0,
   };
   if (r.gatherMul !== undefined && r.gatherMul !== 1) effect.gatherMul = r.gatherMul;
   if (gain.allowed) return { ok: true, kind: 'OK', effect };
-  mat.dropItem(x, y, r.objId, 1);
-  effect.dropped = 1;
+  mat.dropItem(x, y, r.objId, count);
+  effect.dropped = count;
   effect.note = `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`;
   return { ok: true, kind: 'OK', effect };
 };

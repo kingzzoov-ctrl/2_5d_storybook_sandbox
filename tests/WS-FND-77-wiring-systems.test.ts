@@ -281,7 +281,7 @@ test('FND77-3 牧场日结:吃 2 件饲料、产 2 份;内容表没「毛团」�
   eq(settle.produce.length, 1, '一只动物一行产出');
   eq(settle.produce[0].name, '毛团', '手册点名的产出名(内容表 529 的 note)');
   eq(settle.produce[0].count, 2, '2 天 ⇒ 2 份');
-  eq(settle.produce[0].itemId, null, '★ 内容表没有「毛团」⇒ ID 如实为 null');
+  eq(settle.produce[0].itemId, 746, '★ 内容表已有「毛团」(#746,CR-27)⇒ 产出按 ID 落货');
   eq(settle.fedCount, 1);
   eq(settle.starvedCount, 0);
 
@@ -291,8 +291,8 @@ test('FND77-3 牧场日结:吃 2 件饲料、产 2 份;内容表没「毛团」�
 
   /* 产出无处落:内容表没有那件物品 ⇒ 「没落货」必须说得出来 */
   const drops = sim.lastRanchDrops();
-  eq(drops.dropped, [], '★ 没有物品 ID ⇒ 不许凭空造一件落在地上');
-  ok(drops.skipped.some((s) => s.includes('毛团')), `账上必须写明缺口(${drops.skipped.join(';')})`);
+  ok(drops.dropped.length > 0, '★ 内容表已有「毛团」⇒ 产出真的落到地上');
+  ok(!drops.skipped.some((s) => s.includes('毛团')), `内容表有这件物品 ⇒ 不该进缺口账(${drops.skipped.join(';')})`);
 
   /* ★ 负对照:槽里没有饲料 ⇒ 一份都不产,也不报错 */
   const { sim: sim2 } = newWorld();
@@ -544,7 +544,7 @@ test('FND77-8 gatherMul 归属:吃了 602 的人采集时回执带 1.2;不传 ac
 
 /* ═══════════ 9. 内容表的两个缺口(如实锚定,不做「补全」) ═══════════ */
 
-test('FND77-9 锚:「毛团」/「温泉橘」仍不在内容表 ⇒ 牧场产出 ID 为 null(本线不编 ID)', () => {
+test('FND77-9 锚:「毛团」/「温泉橘」已在内容表(CR-27)⇒ 牧场产出按 ID 兑现', () => {
   /* 为什么这条留在本套件:`systems/ranch.ts:27-32` 明确把这两件物品的缺口
      设计成「null + unresolved」。owner 的 D-19 若决定补内容表,那是
      **内容层变更**(要同时更新 content baseline 与 docs 计数),
@@ -557,9 +557,9 @@ test('FND77-9 锚:「毛团」/「温泉橘」仍不在内容表 ⇒ 牧场产�
   const settle = sim.lastRanchSettle()!;
   eq(settle.produce[0].name, '温泉橘', '手册点名的产出名');
   eq(settle.produce[0].count, 2, '2 天 ⇒ 2 份');
-  eq(settle.produce[0].itemId, null, '★ 内容表没有这件物品 ⇒ ID 如实为 null');
-  eq(settle.unresolved, ['温泉橘'], '★ 缺口必须浮在脸上');
-  eq(r.dropped, 0, '★ 没有 ID 就不许落货(不编一件"看起来差不多"的物品)');
+  eq(settle.produce[0].itemId, 747, '★ 内容表已有「温泉橘」(#747)⇒ ID 兑现');
+  eq(settle.unresolved, [], '内容表有这件物品 ⇒ 缺口账为空');
+  eq(r.dropped, 1, '★ 内容表有这件物品 ⇒ 落货 1 件(不再走"没 ID 就不落"的分支)');
   /* 冻结层常量顺带锚一下:本套件的倍率手算用的是它 */
   eq(BASE_MOVE_SPEED, 4.5, '锚:冻结层基准移速 4.5 格/秒');
   eq(BASE_HP, 100, '锚:冻结层基础生命 100');

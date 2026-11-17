@@ -139,6 +139,26 @@ export interface BossPhase {
   skill: string;
 }
 
+/**
+ * Boss 战利品条目:**带数量的形状**(CR-27 / P-01)。
+ *
+ * `BossDef.loot` 是**冻结**的纯 `number[]`(它被 `contentFingerprints()` 的 bosses 分区哈希,
+ * 还被 `tests/WS-05` 的冻结快照逐位钉住),所以「数量」不能塞进 `loot` 的元素里。
+ * 本类型是**读取侧**的规范形状:任何形状的战利品数据都先经
+ * `shared/constants/bosses.ts#normalizeBossLoot` 归一到 `BossLootEntry[]`,
+ * 生产掉落路径只认这一种:
+ *
+ *   - 旧形态 `loot: number[]`(+ 可选的逐位 `lootQty`)⇒ `{ id, count: lootQty[i] ?? 1 }`;
+ *   - 新形态 `loot: BossLootEntry[]`(`{ id, count }`)⇒ 原样读 `count`。
+ *
+ * ⇒ 「旧存档/旧调用点仍可读」不是口头承诺,而是**函数的一条分支**(判据见
+ * `tests/WS-FND-79`)。手册 L496 `703×10` / L501 `117×15` 的落地点就是这里。
+ */
+export interface BossLootEntry {
+  id: number;
+  count: number;
+}
+
 export interface BossDef {
   id: string;
   name: string;
@@ -166,15 +186,22 @@ export interface BossDef {
    * `bosses` 分区哈希 `{id,name,baseHp,summonItem,loot}`,改它会让冻结指纹漂移,
    * 并撞红 `WS-FND-01/06`、`data-conformance.ts`、`README.md` 四处**写域外**锚点。
    * ⇒ 手册修正一律走附加字段,`loot` 保持字节级不变。见 docs/CHANGE_REQUESTS.md CR-16。
+   *
+   * ★ CR-27:读取侧统一走 `normalizeBossLoot(loot, lootQty)`(它同时接受
+   *   `number[]` 与 `BossLootEntry[]` 两种形态),生产掉落路径不再各自拼 `?? 1`。
    */
   lootQty?: number[];
   /**
-   * 手册写进「必掉战利品」列、但 320 项物品表内**不存在**对应 ID 的抽象奖励原文。
+   * 手册写进「必掉战利品」列、但物品表内**当时没有**对应 ID 的抽象奖励原文。
    *
    * 例:手册 L496「自动伐木机甲宠物图纸」、L500「皇家甜点主题全套城堡图纸与姜饼人随从」、
-   * L502「纯金通关纪念碑」。这 7 条在 `ITEM_LIST` 里 0 命中 —— 不能凭空塞进物品表
-   * (会破坏 320 件的内容锁),但也不能**静默丢弃**(丢了等于手册那句话从未被实现)。
-   * ⇒ 以文字形式登记,供 UI / 掉落提示消费。
+   * L502「纯金通关纪念碑」。CR-16 时这 7 条在 `ITEM_LIST` 里 0 命中 ⇒ 以文字登记,
+   * 不静默丢弃(丢了等于手册那句话从未被实现),也不破当年的 320 件内容锁。
+   *
+   * ★ CR-27 更新:这 7 条**已经补录为物品 ID**(746~754,见 `items.ts` 的 `APPENDED`),
+   *   但本字段**保留不动** —— 它是「手册原文」的登记,而把新 ID 接进某 Boss 的 `loot`
+   *   要改冻结字段(动 `contentFingerprints().bosses` + `tests/WS-05` 的冻结快照),
+   *   属写域外锚点,不在 CR-27 的写域内。
    */
   lootAbstract?: string[];
   /**

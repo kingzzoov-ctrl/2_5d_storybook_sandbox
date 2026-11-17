@@ -83,9 +83,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
 
 /** 现场推导的实测事实(供多条断言共用,避免重复写死)。 */
-const ITEM_COUNT = ITEM_LIST.length;                                    // 实测 320
+const ITEM_COUNT = ITEM_LIST.length;                                    // 实测 329
 const ITEM_IDS = ITEM_LIST.map((i) => i.id);
-const MAX_ITEM_ID = Math.max(...ITEM_IDS);                              // 实测 745
+const MAX_ITEM_ID = Math.max(...ITEM_IDS);                              // 实测 754
 const MIN_ITEM_ID = Math.min(...ITEM_IDS);                              // 实测 101
 
 /** 写文件,供往返/畸形用例复用。 */
@@ -215,9 +215,9 @@ test('A13 overall 由四分区与算法版本合成,可独立复现', () => {
   /* 手工按实现公式重算,确认 overall 可复现 —— 而不是「某个神秘数字」。 */
   const expect = fnv1a32(`${f.version}|${f.items}|${f.mobs}|${f.bosses}|${f.modes}`);
   eq(f.overall, expect);
-  eq(f.overall, 'eaefa38b', '当前内容的总体指纹(实测基准)');
+  eq(f.overall, '2f352d3d', '当前内容的总体指纹(实测基准)');
   /* 分区指纹实测基准。 */
-  eq(f.items, '0474ce21');
+  eq(f.items, '6a0d6441');
   eq(f.mobs, '624808c4');
   eq(f.bosses, 'e6bd03cc', 'CR-15 改了 boss_ginger_troll.loot ⇒ bosses 分区指纹随之变化');
   eq(f.modes, 'b854dbfe');
@@ -227,7 +227,7 @@ test('A14 contentFingerprintLine() 形如 v1-xxxxxxxx,8 位 hex', () => {
   const line = contentFingerprintLine();
   ok(/^v1-[0-9a-f]{8}$/.test(line), `格式应为 v1-8hex,实际 ${line}`);
   eq(line, `v1-${contentFingerprints().overall}`);
-  eq(line, 'v1-eaefa38b');
+  eq(line, 'v1-2f352d3d');
 });
 
 test('A15 指纹只反映内容数据:等价的规范输入得到等价指纹', () => {
@@ -267,11 +267,11 @@ test('A18 contentCapacity() 返回 6 条,空间名互异', () => {
   eq(new Set(spaces).size, 6, '空间名应互异');
 });
 
-test('A19 物品容量条目:used === 320、capacity === 4095、headroom/freeCount 分离', () => {
+test('A19 物品容量条目:used === 329、capacity === 4095、headroom/freeCount 分离', () => {
   const obj = contentCapacity().find((c) => c.space.includes('OBJ'));
   ok(obj !== undefined, '应有 OBJ 层条目');
   eq(obj.used, ITEM_COUNT, '已用应等于 ITEM_LIST 长度');
-  eq(obj.used, 320);
+  eq(obj.used, 329);
   eq(obj.capacity, FIELD_MAX.OBJ);
   eq(obj.capacity, 4095);
   near(obj.ratio ?? -1, MAX_ITEM_ID / 4095, 1e-9, 'ratio 应为 最大ID/4095');
@@ -279,13 +279,13 @@ test('A19 物品容量条目:used === 320、capacity === 4095、headroom/freeCou
   eq('remaining' in obj, false, '不应再有含义含混的 remaining');
 });
 
-test('A20 物品最大 ID 实测为 745(从 ITEM_LIST 现场算出,不硬编码来源)', () => {
-  eq(MAX_ITEM_ID, 745);
+test('A20 物品最大 ID 实测为 754(从 ITEM_LIST 现场算出,不硬编码来源)', () => {
+  eq(MAX_ITEM_ID, 754);
   eq(MIN_ITEM_ID, 101);
-  eq(ITEM_COUNT, 320);
+  eq(ITEM_COUNT, 329);
   const fromTables = ITEM_TABLES.reduce((s, t) => s + t.count, 0);
   eq(fromTables, ITEM_COUNT, '分表 count 之和应等于 ITEM_LIST 长度');
-  eq(fromTables, 320);
+  eq(fromTables, 329);
 });
 
 test('A21 FLOOR 条目:capacity === 63、used === 30(headroom 与 freeCount 恰好相等)', () => {
@@ -327,19 +327,19 @@ test('A23 headroom 与 freeCount 是**两个不同概念**,不能共用一个字
    *   - `headroom`  = 值域上界 − 最高已用值(值域顶端余量)
    *   - `freeCount` = 真实空闲号数(含中间空档)
    *
-   * 关键证据:OBJ 行两者**必须不等**(3350 vs 3775),差额恰为
+   * 关键证据:OBJ 行两者**必须不等**(3341 vs 3766),差额恰为
    * 「中间空档中高于最大已用 ID 的部分之外」的全部空档 —— 即 425 个号。
    * FLOOR 行两者相等(密集槽位)。
    * 若将来有人把它们合并回一个字段,这条断言会立刻失败。 */
   const cap = contentCapacity();
   const obj = cap.find((c) => c.space.includes('OBJ'));
   ok(obj !== undefined);
-  eq(obj.headroom, 3350, '值域上界 4095 − 最大 ID 745');
+  eq(obj.headroom, 3341, '值域上界 4095 − 最大 ID 754');
   eq(obj.headroom, obj.capacity! - MAX_ITEM_ID);
-  eq(obj.freeCount, 3775, '真实空闲号数(含中间空档)');
+  eq(obj.freeCount, 3766, '真实空闲号数(含中间空档)');
   eq(obj.freeCount, freeIdCount(), '应与 freeIdCount() 一致 —— 单一事实源');
   ok(obj.headroom !== obj.freeCount, 'OBJ 行两者必须不同,否则说明字段又被合并了');
-  eq(obj.freeCount! - obj.headroom!, 425, '差额 = 746 以下未被占用的空档总数');
+  eq(obj.freeCount! - obj.headroom!, 425, '差额 = 755 以下未被占用的空档总数');
 
   /* 逐条字段存在性:不能有 remaining。 */
   for (const c of cap) {
@@ -365,9 +365,9 @@ test('A23 headroom 与 freeCount 是**两个不同概念**,不能共用一个字
 
 /* ═══════════════ A. registry.ts — ID 区间登记 ═══════════════ */
 
-test('A24 idSegments() 返回 10 条,与 ITEM_TABLES 一一对应', () => {
+test('A24 idSegments() 返回 11 条,与 ITEM_TABLES 一一对应', () => {
   const segs = idSegments();
-  eq(segs.length, 10);
+  eq(segs.length, 11);
   eq(segs.length, ITEM_TABLES.length);
   for (let i = 0; i < segs.length; i += 1) {
     eq(segs[i].key, ITEM_TABLES[i].key, `第 ${i} 段 key`);
@@ -433,7 +433,7 @@ test('A28 freeIdSegments() 默认过滤器生效:每段长度 ≥ 8,slackInside 
   }
   const lens = free.map((f) => f.to - f.from + 1);
   eq(Math.min(...lens), 15, '最短空闲段实测 15(386~400)');
-  eq(Math.max(...lens), 3350, '最长空闲段实测 3350(746~4095)');
+  eq(Math.max(...lens), 3341, '最长空闲段实测 3341(755~4095)');
 });
 
 test('A29 空闲段连续、与用段交替、升序,且首尾覆盖 1 与 4095', () => {
@@ -473,14 +473,14 @@ test('A30 minLength 参数:过滤器可调,且短段确实存在于数据中(219
   const total = (n: number): number => freeIdSegments(n).reduce((s, x) => s + (x.to - x.from + 1), 0);
   ok(total(1) >= total(2), '阈值 1 报出的号应不少于阈值 2');
   ok(total(2) >= total(8), '阈值 2 报出的号应不少于阈值 8');
-  eq(total(1), 3775, 'minLength=1 时报出的号数恰为全部空闲数');
-  eq(total(8), 3773, '默认阈值漏掉 219~220 两个号');
+  eq(total(1), 3766, 'minLength=1 时报出的号数恰为全部空闲数');
+  eq(total(8), 3764, '默认阈值漏掉 219~220 两个号');
 });
 
 test('A31 freeIdCount() 给出精确空闲数,不受 minLength 过滤影响', () => {
   /* 这是「看起来精确的偏差」的修复点:早先 CLI 用默认输出求和报了 3773,
-   * 而真实空闲是 3775。差的就是 219~220 —— 数字看着精确,反而更危险。 */
-  eq(freeIdCount(), 3775);
+   * 而真实空闲是 3766。差的就是 219~220 —— 数字看着精确,反而更危险。 */
+  eq(freeIdCount(), 3766);
   eq(freeIdCount(), FIELD_MAX.OBJ - ITEM_COUNT);
   const defSum = freeIdSegments().reduce((s, x) => s + (x.to - x.from + 1), 0);
   ok(freeIdCount() > defSum, '精确值应大于默认输出求和');
@@ -637,7 +637,7 @@ test('A39 capacityReport() 对无上限条目用「—」占位,不打印 null/N
 
 test('B01 buildBaseline() 的 counts 与冻结层内容数量一致', () => {
   const b = buildBaseline();
-  eq(b.counts.items, 320);
+  eq(b.counts.items, 329);
   eq(b.counts.mobs, 24);
   eq(b.counts.bosses, 8);
   eq(b.counts.items, ITEM_LIST.length);
@@ -647,10 +647,10 @@ test('B01 buildBaseline() 的 counts 与冻结层内容数量一致', () => {
   eq(b.counts.rooms, ROOM_RECIPES.length);
 });
 
-test('B02 buildBaseline().slots 有 320 个键;slots["101"] === 0;slots["745"] === 319', () => {
+test('B02 buildBaseline().slots 有 329 个键;slots["101"] === 0;slots["745"] === 319', () => {
   const b = buildBaseline();
   eq(Object.keys(b.slots).length, ITEM_COUNT);
-  eq(Object.keys(b.slots).length, 320);
+  eq(Object.keys(b.slots).length, 329);
   eq(b.slots['101'], 0, '首个物品槽位为 0');
   eq(b.slots[String(MAX_ITEM_ID)], ITEM_COUNT - 1, '末个物品槽位为 count-1');
   eq(b.slots['745'], 319);
@@ -662,7 +662,7 @@ test('B03 slots 是 ITEM_LIST 数组下标(逐项验证,非抽查)', () => {
     eq(b.slots[String(it.id)], i, `物品 ${it.id} 槽位`);
   });
   const vals = Object.values(b.slots).sort((x, y) => x - y);
-  eq(vals, Array.from({ length: ITEM_COUNT }, (_, i) => i), '槽位值域应为 0..319 的排列');
+  eq(vals, Array.from({ length: ITEM_COUNT }, (_, i) => i), '槽位值域应为 0..328 的排列');
 });
 
 test('B04 buildBaseline().names["101"] === "暖松原木"(从 ITEM_LIST 实测)', () => {
@@ -819,8 +819,8 @@ test('B13 【漂移-数量】基线 counts.items 不同 → changes 含「数量
   eq(countChanges.length, 1, `应有 1 条数量差异,实际 ${JSON.stringify(d.changes)}`);
   ok(countChanges[0].includes('items'), '应点名 items');
   ok(countChanges[0].includes('319'), '应含基线值');
-  ok(countChanges[0].includes('320'), '应含当前值');
-  ok(countChanges[0].includes('+1'), '应含增量符号');
+  ok(countChanges[0].includes('329'), '应含当前值');
+  ok(countChanges[0].includes('+10'), '应含增量符号');
   /* 只改 counts、不动物品表 → 增删改名平移都为 0,证明各检查项互不串扰。 */
   eq(d.addedIds.length, 0);
   eq(d.removedIds.length, 0);
@@ -940,7 +940,7 @@ test('B17 漂移检测不修改输入基线(纯函数)', () => {
   diffBaseline(real);
   eq(JSON.stringify(real), realSnapshot);
   /* 再确认真实内容没被污染。 */
-  eq(buildBaseline().counts.items, 320);
+  eq(buildBaseline().counts.items, 329);
 });
 
 /* ═══════════════ B. baseline.ts — 读写往返 ═══════════════ */

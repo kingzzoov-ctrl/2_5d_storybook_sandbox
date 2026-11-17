@@ -202,7 +202,7 @@ export function buildFakeContentSet(targetCount: number): FakeContentSet {
 }
 
 /** 供外部(测试)复用的扩容规模清单 */
-export const DRILL_SCALES: readonly number[] = [320, 330, 400, 4095];
+export const DRILL_SCALES: readonly number[] = [329, 330, 400, 4095];
 
 /* ══════════════════════════════════════════════════════════════
  * 2. 外部事实判据(不取被测代码自己的常量)
@@ -420,7 +420,7 @@ function drillAll(): void {
   });
 
   drill('C3d', '扩容追加区(746+)与既有分表区间不冲突', scalesLabel, () => {
-    if (APPEND_BASE !== 746) return `追加区起点应为 746,实际 ${APPEND_BASE}`;
+    if (APPEND_BASE !== 755) return `追加区起点应为 755,实际 ${APPEND_BASE}`;
     for (const t of ITEM_TABLES) {
       if (t.range[1] >= APPEND_BASE) return `分表 ${t.key} 区间上界 ${t.range[1]} 侵入追加区`;
     }
@@ -582,14 +582,14 @@ function drillAll(): void {
   /* ── 点 10:扩展登记校验 ── */
   drill('C9', '扩展登记:序号连续 / ID 不冲突 / 迁移提示齐备', scalesLabel, () => {
     const good: ContentExtension[] = [
-      { seq: 1, summary: '演练:追加预留区物品', ids: [746, 747], needsMigration: true, migrationNote: '旧存档无此 ID,按空处理' },
+      { seq: 1, summary: '演练:追加预留区物品', ids: [755, 756], needsMigration: true, migrationNote: '旧存档无此 ID,按空处理' },
     ];
     const problems = auditExtensions(good);
     if (problems.length > 0) return `合法登记竟报错:${problems.join(' / ')}`;
 
     /* 反向:漏写迁移提示必须被捕获 —— 证明校验有区分力 */
     const bad: ContentExtension[] = [
-      { seq: 1, summary: '演练:缺迁移提示', ids: [746], needsMigration: true, migrationNote: '' },
+      { seq: 1, summary: '演练:缺迁移提示', ids: [755], needsMigration: true, migrationNote: '' },
     ];
     const badProblems = auditExtensions(bad);
     if (badProblems.length === 0) return '缺迁移提示竟通过 —— 校验无区分力';

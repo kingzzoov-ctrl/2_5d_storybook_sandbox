@@ -1,8 +1,9 @@
 /**
- * 冻结层:320 项全量物品配表(设计手册 §3.1 ~ §3.10 逐行落地)。
+ * 冻结层:329 项全量物品配表(设计手册 §3.1 ~ §3.10 逐行落地 + §3.11 手册补录 9 项)。
  *
  * 这是全仓库唯一的 ID 事实源。任何模块引用物品一律通过 `ITEM_BY_ID` / `ITEM_LIST`,
- * 不得自行硬编码名称。表格 ID 与手册完全对齐(101~745,共 320 项)。
+ * 不得自行硬编码名称。表格 ID 与手册完全对齐(101~745,共 320 项),
+ * 另加 §3.11 补录 746~754(9 项,见 `APPENDED` 的说明)。
  *
  * 价值分 V 的标定规则(手册 §5.3 只给了少量锚点,其余按锚点插值):
  *   锚点:寒铁金属锭 V=45  ·  秘银魔导锭 V=85  ·  Boss 遗物 V=250
@@ -404,18 +405,55 @@ const COMBAT: ItemDef[] = [
   { id: 745, name: '怪物生态诱捕笼', category: C, tags: ['沙盒机关', '金属', '木材', '捕捉'], value: 160, recipe: { 156: 4, 151: 4 }, station: 504, note: '放在地上装入甜莓诱饵;野生小怪走进笼子吃果子时自动落锁将其活捉,可连笼子一起抱回自建动物园展示。' },
 ];
 
+/* ─────────── §3.11 手册补录:牧场产出 + 无 ID 抽象奖励 746 ~ 754 (9 项) ─────────── */
+
+/**
+ * 这 9 件**不在手册 §3.1~§3.10 的表格里**,而是「手册别处写了、内容表却没有 ID」的两类东西:
+ *
+ *   1. **牧场产出(2 件)** —— `docs/WS-04-mob-ai.md:559` 与
+ *      `shared/constants/bosses.ts` 的 `ECO_RANCH` bonus 都写「圈养动物每日产出**毛团/温泉橘**」。
+ *      `server/src/systems/ranch.ts` 按**名字**查表(`resolveItemByName`):名字查不到就
+ *      如实返回 `itemId: null` 并进 `unresolved`(它**不编 ID**)。本表给出这两个名字之后,
+ *      `settleRanchDay` 的 `dropped` 自动非空 —— 牧场端一个字都不用改。
+ *   2. **7 件抽象奖励** —— 手册 Boss 战利品列里没有对应 ID 的那 7 条:
+ *      自动伐木机甲图纸 / 姜饼人随从 / 纯金通关纪念碑 / 稀有甜点食谱 /
+ *      蓬松彩羽 / 稀有树种 / 城堡图纸。它们此前只以文字登记在
+ *      `BossDef.lootAbstract`(CR-16)。现在补成**有 ID 的物品**,
+ *      但**不改任何 Boss 的 `loot`**(那会动内容指纹与写域外的冻结快照)——
+ *      详见 `docs/CHANGE_REQUESTS.md` [CR-27]。
+ *
+ * ⚠️ **数值一律中性/留空(数值待平衡)**:`value` 是 `ItemDef` 的**必填**字段,
+ *   所以只能写 `0`(与 `218 工程安全帽` 同款的「零价值功能件」,炼金门禁按
+ *   `NON_ALCHEMABLE` 拒);`recipe` / `output` / `station` / `price` 一律**不写** ——
+ *   不发明平衡数字(D-19 / CR-27)。
+ */
+const APPENDED: ItemDef[] = [
+  /* 牧场产出(名字必须与 `systems/ranch.ts:RANCH_PRODUCE_BY_SPECIES` 逐字相同) */
+  { id: 746, name: '毛团', category: N, tags: ['纤维', '蓬松'], value: 0, note: '生态牧场每日产出(手册 `docs/WS-04-mob-ai.md` L559「圈养动物自动进食并每日产出毛团/温泉橘」)。用途与数值待平衡。' },
+  { id: 747, name: '温泉橘', category: N, tags: ['水果', '保温'], value: 0, note: '生态牧场每日产出(手册 `docs/WS-04-mob-ai.md` L559)。用途与数值待平衡。' },
+  /* 7 件抽象奖励(CR-16 的 lootAbstract 原文 → 内容表 ID) */
+  { id: 748, name: '自动伐木机甲图纸', category: T, tags: ['机关', '载具'], value: 0, note: '手册 L496 河谷 Boss 战利品列的抽象奖励(CR-16 的 lootAbstract「自动伐木机甲宠物图纸」)。数值待平衡。' },
+  { id: 749, name: '姜饼人随从', category: P, tags: ['甜食', '邀宠'], value: 0, note: '手册 L500 甜点 Boss 战利品列的抽象奖励(CR-16 的 lootAbstract「姜饼人随从」)。数值待平衡。' },
+  { id: 750, name: '纯金通关纪念碑', category: B, tags: ['金属', '坚硬'], value: 0, note: '手册 L502 终极 Boss 战利品列的抽象奖励(CR-16 的 lootAbstract「纯金通关纪念碑」)。数值待平衡。' },
+  { id: 751, name: '稀有甜点食谱', category: T, tags: ['甜食', '芳香'], value: 0, note: '手册 L500「皇家甜点主题」的抽象奖励之一。数值待平衡(是否可学、学什么,待玩法裁决)。' },
+  { id: 752, name: '蓬松彩羽', category: N, tags: ['纤维', '蓬松'], value: 0, note: '手册写「彩虹陆行鸟掉蓬松彩羽」,此前 320 表内 0 命中(见 `scripts/data-conformance.ts` 的已知偏差表)。数值待平衡。' },
+  { id: 753, name: '稀有树种', category: N, tags: ['木材', '催熟'], value: 0, note: '手册写园艺嫁接「结出稀有变异种子/树种」,此前 320 表内 0 命中。数值待平衡。' },
+  { id: 754, name: '城堡图纸', category: T, tags: ['墙体', '屋顶'], value: 0, note: '手册 L500 甜点 Boss 战利品列的抽象奖励「皇家甜点主题全套城堡图纸」。数值待平衡。' },
+];
+
 /* ─────────────────────────── 汇总与查询索引 ─────────────────────────── */
 
 export const ITEM_LIST: readonly ItemDef[] = [
   ...NATURAL, ...REFINED, ...TOOLS, ...PRANKS, ...FLOORS,
   ...BUILDINGS, ...AUTOMATION, ...FURNITURE, ...FOODS, ...COMBAT,
+  ...APPENDED,
 ];
 
 export const ITEM_BY_ID: ReadonlyMap<number, ItemDef> = new Map(ITEM_LIST.map((i) => [i.id, i]));
 
-export const TOTAL_ITEM_COUNT = 320;
+export const TOTAL_ITEM_COUNT = 329;
 
-/** 十大分表的结构化清单,供 §3 手册章节与验证脚本核对。 */
+/** 十一张分表的结构化清单(§3.1~§3.10 手册 + §3.11 补录),供验证脚本核对。 */
 export const ITEM_TABLES: readonly { key: string; title: string; range: [number, number]; count: number; ids: readonly number[] }[] = [
   { key: '3.1', title: '自然采集与奇幻矿物资源表', range: [101, 130], count: 30, ids: NATURAL.map((i) => i.id) },
   { key: '3.2', title: '半成品加工材料与工业元件表', range: [151, 170], count: 20, ids: REFINED.map((i) => i.id) },
@@ -427,6 +465,10 @@ export const ITEM_TABLES: readonly { key: string; title: string; range: [number,
   { key: '3.8', title: '工坊设备家具与动态房间核心件表', range: [501, 537], count: 37, ids: FURNITURE.map((i) => i.id) },
   { key: '3.9', title: '欢聚料理与搞怪时装头饰表', range: [601, 630], count: 30, ids: FOODS.map((i) => i.id) },
   { key: '3.10', title: '战利品武器护甲与Boss召唤祭品表', range: [701, 745], count: 45, ids: COMBAT.map((i) => i.id) },
+  /* CR-27:§3.11 **不是手册章节**,而是「手册别处写了、§3 表内没有 ID」的 9 件补录(见 `APPENDED`)。
+     单独成表而不是塞进 §3.10,是为了不篡改手册 §3.1~§3.10 的区间号段与项数
+     (那两份字面量是 `scripts/data-conformance.ts` / `tests/WS-FND-06` 的对照锚点)。 */
+  { key: '3.11', title: '手册补录:牧场产出与无 ID 抽象奖励表', range: [746, 754], count: 9, ids: APPENDED.map((i) => i.id) },
 ];
 
 export function itemName(id: number): string {

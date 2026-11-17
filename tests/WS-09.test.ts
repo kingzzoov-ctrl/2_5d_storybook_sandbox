@@ -1566,10 +1566,10 @@ test('背包拖拽控制器:拿起/悬停/放下/取消与非法操作', () => {
   eq(dc.drop(9), null, '未拖拽时 drop 返回 null');
 });
 
-/* ══════════════════ 16. 背包 320 格分类 ══════════════════ */
+/* ══════════════════ 16. 背包 329 格分类 ══════════════════ */
 
 test('背包:容量与内容解耦、12 分类计数闭合、格位↔物品双射', () => {
-  eq(TOTAL_ITEM_COUNT, 320, '冻结层物品总数 320');
+  eq(TOTAL_ITEM_COUNT, 329, '冻结层物品总数 329');
   eq(SLOTS_PER_ROW, 16, '每行 16 格');
 
   /*
@@ -1578,25 +1578,25 @@ test('背包:容量与内容解耦、12 分类计数闭合、格位↔物品双�
    * 现在容量由「行数 × 每行格数」反推,行数 = ceil(内容/每行) + 余量。
    */
   eq(INVENTORY_SPARE_ROWS, 1, '固定余量 1 行');
-  eq(INVENTORY_ROWS, 21, '行数 = ceil(320/16) + 1 = 21');
-  eq(INVENTORY_SLOTS, 336, '容量 = 21 × 16 = 336');
+  eq(INVENTORY_ROWS, 22, '行数 = ceil(329/16) + 1 = 22');
+  eq(INVENTORY_SLOTS, 352, '容量 = 22 × 16 = 352');
   eq(INVENTORY_SLOTS % SLOTS_PER_ROW, 0, '容量恒为每行格数整数倍(永不半行)');
   eq(INVENTORY_SLOTS / SLOTS_PER_ROW, INVENTORY_ROWS, '容量行数自洽');
   ok(Number.isInteger(INVENTORY_SLOTS / SLOTS_PER_ROW), '行数为整数');
   ok(INVENTORY_SLOTS >= TOTAL_ITEM_COUNT, '容量装得下全部内容');
   ok(INVENTORY_SLOTS > TOTAL_ITEM_COUNT, '容量严格大于内容数(留出扩容余量)');
-  eq(INVENTORY_SLOTS - TOTAL_ITEM_COUNT, 16, '余量恰好 1 整行');
+  eq(INVENTORY_SLOTS - TOTAL_ITEM_COUNT, 23, '余量 = 352 − 329 = 23(1 整行 + 7 格)');
   ok(INVENTORY_SLOTS !== TOTAL_ITEM_COUNT, '容量已与内容数量解耦');
 
   /* 分页非退化:每页明显小于总容量,分页路径日常即被走到 */
   eq(SLOTS_PER_PAGE_ROWS, 10, '每页 10 行');
   eq(SLOTS_PER_PAGE, 160, '每页 160 格');
   ok(SLOTS_PER_PAGE < INVENTORY_SLOTS, '每页容量严格小于总容量(分页非退化)');
-  eq(INVENTORY_PAGE_COUNT, 3, '总页数 = ceil(336/160) = 3');
+  eq(INVENTORY_PAGE_COUNT, 3, '总页数 = ceil(352/160) = 3');
   ok(INVENTORY_PAGE_COUNT >= 2, '页数 ≥ 2,分页代码路径不会潜伏到扩容时才首次执行');
   ok(INVENTORY_PAGE_COUNT * SLOTS_PER_PAGE >= INVENTORY_SLOTS, '页数 × 每页 ≥ 总容量');
   ok((INVENTORY_PAGE_COUNT - 1) * SLOTS_PER_PAGE < INVENTORY_SLOTS, '页数为最小值(少一页即装不下)');
-  /* 容量页数是上界:内容页数(2)≤ 容量页数(3) */
+  /* 容量页数是上界:内容页数(3)≤ 容量页数(3) */
   ok(Math.ceil(TOTAL_ITEM_COUNT / SLOTS_PER_PAGE) <= INVENTORY_PAGE_COUNT, '内容页数 ≤ 容量页数');
 
   eq(CATEGORY_ORDER.length, 12, '12 个分类');
@@ -1626,7 +1626,7 @@ test('背包:容量与内容解耦、12 分类计数闭合、格位↔物品双�
     if (n > 0) ok((b?.firstSlot ?? -1) >= 0, `${c} firstSlot 有效`);
     else eq(b?.firstSlot, -1, `空桶 ${c} 的 firstSlot 应为 −1`);
   }
-  eq(sum, 320, 'Σ 分类 = 320');
+  eq(sum, 329, 'Σ 分类 = 329');
 
   /* 双射:槽位是 ITEM_LIST 下标,与容量扩容无关 */
   let checked = 0;
@@ -1636,10 +1636,10 @@ test('背包:容量与内容解耦、12 分类计数闭合、格位↔物品双�
     eq(itemAt(i)?.id, it.id, `格位 ${i} 的物品 ID`);
     checked += 1;
   }
-  eq(checked, 320, '320 组双射校验');
+  eq(checked, 329, '329 组双射校验');
   eq(slotOf(-1), -1, '未知 ID 返回 −1');
 
-  /* 容量内的空格:320..335 共 16 格是扩容余量,合法存在但无物品 */
+  /* 容量内的空格:329..351 共 23 格是扩容余量,合法存在但无物品 */
   eq(itemAt(TOTAL_ITEM_COUNT), null, '内容之后的余量格无物品');
   eq(itemAt(INVENTORY_SLOTS - 1), null, '最后一格余量格无物品');
   for (let s = TOTAL_ITEM_COUNT; s < INVENTORY_SLOTS; s += 1) {
@@ -1765,8 +1765,8 @@ test('背包过滤/排序/分页:查询命中、分页边界、排序稳定', ()
   ok(matchesQuery(ITEM_LIST[slotOf(101)], '木材'), '词条命中');
   ok(!matchesQuery(ITEM_LIST[slotOf(101)], '绝不可能出现的词'), '不命中');
 
-  eq(filterItems({ category: 'ALL' }).length, 320, 'ALL 返回全部');
-  eq(filterItems({ category: null }).length, 320, 'null 返回全部');
+  eq(filterItems({ category: 'ALL' }).length, 329, 'ALL 返回全部');
+  eq(filterItems({ category: null }).length, 329, 'null 返回全部');
   eq(filterItems({ category: ItemCategory.FLOOR }).length, 30, '地砖 30');
   eq(filterItems({ query: '像素' }).length > 0, true, '关键词「像素」有命中');
   /*
@@ -1797,21 +1797,21 @@ test('背包过滤/排序/分页:查询命中、分页边界、排序稳定', ()
 
   const v = buildView({});
   eq(v.page, 0, '默认第 0 页');
-  eq(v.pageCount, Math.ceil(320 / SLOTS_PER_PAGE), '页数 = ceil(内容/每页)');
-  eq(v.pageCount, 2, '320 件内容分 2 页(分页路径被真正走到)');
+  eq(v.pageCount, Math.ceil(329 / SLOTS_PER_PAGE), '页数 = ceil(内容/每页)');
+  eq(v.pageCount, 3, '329 件内容分 3 页(分页路径被真正走到)');
   ok(v.pageCount >= 2, '分页非退化');
-  eq(v.visibleCount, 320, '可见 320');
+  eq(v.visibleCount, 329, '可见 329');
   ok(v.slots.length <= SLOTS_PER_PAGE, '页内不超页容量');
-  eq(v.slots.length, SLOTS_PER_PAGE, '首页被填满(320 > 160)');
+  eq(v.slots.length, SLOTS_PER_PAGE, '首页被填满(329 > 160)');
   eq(v.buckets.length, 12, '视图携带 12 桶');
   const lastPage = buildView({ page: 999 });
   eq(lastPage.page, v.pageCount - 1, '超界页夹到最后一页');
-  eq(lastPage.slots.length, 320 - SLOTS_PER_PAGE, '末页只剩余数 160 格');
+  eq(lastPage.slots.length, 329 - 2 * SLOTS_PER_PAGE, '末页只剩余数 9 格(329 − 2×160)');
   const secondPage = buildView({ page: 1 });
   eq(secondPage.page, 1, '第 2 页可取');
   eq(secondPage.slots.length, 320 - SLOTS_PER_PAGE, '第 2 页格数');
   eq(secondPage.slots[0].slot, SLOTS_PER_PAGE, '第 2 页首格 = 第 1 页末格 + 1');
-  /* 两页并起来恰好是全部 320 件,不重不漏 */
+  /* 前两页并起来恰好 320 格,不重不漏 */
   const allSlots = [...v.slots, ...secondPage.slots].map((s) => s.slot).sort((a, b) => a - b);
   eq(allSlots.length, 320, '两页合计 320 格');
   eq(new Set(allSlots).size, 320, '两页无重叠');
@@ -2800,7 +2800,7 @@ test('与 WS-06 炼金契约同构:16×16 像素矩阵直接可用', () => {
 
 test('冻结层只读性:所有导入符号存在且类型符合预期', () => {
   eq(typeof packTile, 'function', 'packTile 可导入');
-  eq(ITEM_LIST.length, 320, '物品表 320');
+  eq(ITEM_LIST.length, 329, '物品表 329');
   eq(BOSS_LIST.length, 8, 'Boss 表 8');
   eq(typeof itemName, 'function', 'itemName 可调用');
   /* 分类常量齐全 */
@@ -3183,13 +3183,13 @@ test('背包辅助:tooltip、占用比例、分类查询', () => {
   ok(t.includes('§3.6'), 'tooltip 含手册分表号');
   eq(slotTooltip(99999), '未知物品#99999', '未知 ID 的 tooltip');
 
-  /* 占用比例:以解耦后的容量 336 为分母 */
+  /* 占用比例:以解耦后的容量 352 为分母 */
   near(usedSlotRatio(0), 0, 1e-12, '0 件 → 0');
-  near(usedSlotRatio(336), 1, 1e-12, '满容量 → 1');
-  near(usedSlotRatio(168), 0.5, 1e-12, '半容量 → 0.5');
+  near(usedSlotRatio(352), 1, 1e-12, '满容量 → 1');
+  near(usedSlotRatio(176), 0.5, 1e-12, '半容量 → 0.5');
   near(usedSlotRatio(400), 1, 1e-12, '超容量夹到 1');
   near(usedSlotRatio(-5), 0, 1e-12, '负数夹到 0');
-  near(usedSlotRatio(160), 160 / 336, 1e-12, '分母是 336 而非 320');
+  near(usedSlotRatio(160), 160 / 352, 1e-12, '分母是 352 而非 320');
 
   eq(categoryOf(101), 'NATURAL', '101 属自然矿物');
   eq(categoryOf(301), 'FLOOR', '301 属地表铺装');
@@ -3553,7 +3553,7 @@ test('拖拽层与背包容量解耦:hoverSlot 不与 INVENTORY_SLOTS 耦合', (
    * task-15 复核结论(原被标记为「可能耦合」):
    * `state_machine.DragController.hoverSlot` 只是一个「悬停在哪一格」的整数,
    * 初值 −1 = 无悬停;它**不读** `INVENTORY_SLOTS`,也不校验格位上界。
-   * 因此改容量(320 → 336)不需要动拖拽层,注释里的「320 格」是过期表述。
+   * 因此改容量(329 → 352)不需要动拖拽层,注释里的「320 格」是过期表述。
    * 这条断言把该结论钉住:悬停一个远超容量的格位仍被如实记录(不做上界校验)。
    */
   const dc = new DragController();
@@ -3567,7 +3567,7 @@ test('拖拽层与背包容量解耦:hoverSlot 不与 INVENTORY_SLOTS 耦合', (
   dc.hoverAt(5);
   eq(dc.hover, 5, '悬停如实记录');
 
-  /* 远超容量(336)的格位也被如实记录 ⇒ 本层不做容量校验 */
+  /* 远超容量(352)的格位也被如实记录 ⇒ 本层不做容量校验 */
   dc.hoverAt(100000);
   eq(dc.hover, 100000, '本层不校验容量上界(解耦证据)');
   dc.hoverAt(-2);
@@ -3946,8 +3946,8 @@ test('面板布局:配方面板高度随节点数增长但有上限', () => {
 test('面板布局:背包页数与总容量一致', () => {
   const L = layoutInventoryPanel(VW, VH);
   eq(L.rows * L.cols, 160, '每页 160 格');
-  /* 21 行 336 格 → 3 页,与 inventory.ts 的常量必须吻合(两处不一致会错位) */
-  eq(INVENTORY_TOTAL_ROWS, 21, '总行数 21');
+  /* 22 行 352 格 → 3 页,与 inventory.ts 的常量必须吻合(两处不一致会错位) */
+  eq(INVENTORY_TOTAL_ROWS, 22, '总行数 22');
 });
 
 test('面板布局:Boss 血条带宽度随视口收窄,标签在窄屏隐藏', () => {

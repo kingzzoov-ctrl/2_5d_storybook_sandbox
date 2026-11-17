@@ -3165,3 +3165,108 @@ typeof WebSocket = function(Node 24.13.0)
   ⇒ ★ `inject()` 有 no-op 陷阱(`finally` 里还原 ⇒ `inject(F,a,b); runSuite()` 跑的是**原文**),
     lint 已警示;**新代码一律用 `withInjection`**
 - `docs/PROGRESS.md` 陷阱 133(工具拦不住手 —— `Remove-Item` 绕过所有仓内守卫)
+
+---
+
+## [CR-27] 2026-11-17 build-wiring — 内容表 320 → **329**(§3.11 补录 9 件)+ P-01 战利品数量归一 / P-02 任意染料 / P-04 `gatherMul` 概率双倍
+
+**触发**:owner 裁 D-19「最后一批」——(a) 内容表扩编,P-03 的 7 个抽象奖励**入表**;
+(b) P-01 战利品数量;(c) P-02 任意染料;(d) `gatherMul` 件数放大规则采用「概率双倍」。
+(P-05 真机 FPS 不在本 CR,等 owner 环境。)
+
+### 1. 改了什么(逐文件)
+
+| 文件 | 改了什么 |
+| :--- | :--- |
+| `shared/constants/items.ts` | 新增 `APPENDED` 9 件 = **746~754**:牧场产出 `746 毛团` / `747 温泉橘`(名字与 `systems/ranch.ts` 的 `RANCH_PRODUCE_BY_SPECIES` 逐字相同)+ 手册 7 件抽象奖励 `748 自动伐木机甲图纸` / `749 姜饼人随从` / `750 纯金通关纪念碑` / `751 稀有甜点食谱` / `752 蓬松彩羽` / `753 稀有树种` / `754 城堡图纸`。`TOTAL_ITEM_COUNT` 320 → 329;`ITEM_TABLES` 新增 `3.11`(range `[746,754]`,count 9) |
+| `scripts/items-baseline.json` | `node scripts/items-baseline.ts --update` → `329 件 / 11 张分表 / 合计 329` |
+| `server/src/content/content.baseline.json` | `node scripts/content-lock.ts --update` → `items 0474ce21 → 6a0d6441`、`overall eaefa38b → 2f352d3d`;**`bosses` 分区仍是 `e6bd03cc`(本 CR 一个字都没动 `loot`)** |
+| `shared/types/entities.ts` | 新增 `BossLootEntry { id, count }`(读取侧的规范形状)+ `lootQty` / `lootAbstract` 的 CR-27 注 |
+| `shared/constants/bosses.ts` | 新增 `normalizeBossLoot(loot, qty)`(同时接受旧 `number[]` + 逐位 `lootQty` 与新 `{id,count}[]`;0/负数/NaN 一律归 1)与 `bossLootEntries(bossId)`。**`BOSS_LIST` 的 `loot` / `lootQty` 数据不变** |
+| `server/src/bosses/raid.ts` | `effectiveLoot()` 改为经 `normalizeBossLoot` 归一后再过滤 `lootDeviations`(形状归一只有这一处) |
+| `server/src/net/actions/material.ts` | 新增 `gatherDoubleChance` / `gatherCountFor` / `gatherRollFor`;`breakBlock` 处理器把世界回的 `gatherMul` 结算成**件数 1 或 2**,`gained` / `dropped` 报实际件数 |
+| `tests/WS-FND-79-content-expansion.test.ts` | 新建,11 条判据(FND79-1 ~ 11),每条带负对照 |
+
+### 2. 四件事的落点与理由
+
+**(a) 内容表 320 → 329(owner 已接受「320 计数被破」)**
+
+- 牧场:`systems/ranch.ts` **按名字**查表(`resolveItemByName`),查不到就如实 `itemId: null` 并进
+  `unresolved`(它不编 ID)。给出这两个名字之后 `settleRanchDay` 的 `produce[*].itemId` 变成
+  `746/747`、`unresolved` 变空 —— **`server/src/systems/**` 一个字都没改**。
+- 7 件抽象奖励此前只以文字登记在 `BossDef.lootAbstract`(CR-16)。现在它们**有 ID 了**。
+- 数值:**不发明平衡数字**。`value` 是 `ItemDef` 的必填字段 ⇒ 只能写 `0`
+  (与 `218 工程安全帽` 同款的「零价值功能件」,炼金门禁按 `NON_ALCHEMABLE` 拒),
+  `recipe` / `output` / `station` / `price` 一概不写,注释与 `note` 写「数值待平衡」。
+- **为什么不把 9 件塞进 §3.10**:手册 §3.1~§3.10 的号段与项数是 `scripts/data-conformance.ts`
+  与 `tests/WS-FND-06` 的对照锚点,扩 §3.10 等于篡改手册事实。新增单独成 `3.11`
+  (且**不是**手册章节 —— 表名已注明「手册补录」)。
+
+**(b) P-01 战利品数量**
+
+- 数量落地点:`boss_beaver_mecha` 703 = **10**(手册 L496)、`boss_sky_whale` 117 = **15**(手册 L501),
+  其余 Boss / 其余件 = 1 —— 这一份数据是 CR-16 落的 `lootQty`,本 CR **没有改数据**,
+  只把「读取侧形状」一次归一(`normalizeBossLoot`)并补判据(8 条:两个手册数 + 全表=1 + 生产侧 ≥ 手册)。
+- 旧形态仍可读 = `normalizeBossLoot` 的一条分支,判据 FND79-6 逐条覆盖
+  (`[703,437]+lootQty` / 无 `lootQty` / 新形态 / 0、负数、NaN)。
+- **存档迁移**:不需要 —— 全仓没有任何落库/序列化点写 `loot`
+  (`grep '\.loot'` 在 `server/src/db/**`、`server/src/world/archive.ts` 里 0 命中;
+  它只被 `contentFingerprints()`、`registry.auditContent()`、`raid.ts`、`verify.ts` 与测试读)。
+  若将来 `loot` 真要改成 `{id,count}[]`,归一入口只有一处,迁移成本是一行。
+- **刻意不做**:把 746~754 接进某个 Boss 的 `loot`。那会改 `contentFingerprints().bosses`
+  与 `tests/WS-05` 的冻结快照(写域外),`lootAbstract` 保留为「手册原文」登记。
+
+**(c) P-02 任意染料**
+
+- 生产路径**早就只调** `matchRecipeByTags`(`net/actions/craft.ts:199`),所以 CR-17 之后
+  `#237` / `#245` 用 167/168/169 都能做出来。本 CR 补的是**判据**:四色染料 × 两条配方 = 8 条
+  (FND79-7),外加三条负对照(不放染料 ⇒ 拒、非染料 `209` 顶不上、`#356` 要 2 个染料给 1 个 ⇒ 拒)。
+- 另有一条边界判据(FND79-8):留白槽**不放宽固有件** —— `#244` 仍专指 `168`,用 `167`/`166` 做不出来。
+
+**(d) P-04 `gatherMul` 件数放大 = 概率双倍**
+
+- 复用范式:`bosses/raid.ts:409` 的 `rng() < 0.35 ⇒ 数量翻倍`(与 603 烘焙派的 `dropDoubleChance`
+  同源概率)。`chance = clamp(gatherMul − 1, 0, 1)`、`count = roll < chance ? 2 : 1`
+  ⇒ 期望件数 = `gatherMul`(1.2 ⇒ 平均 1.2 件),单次产出永远是整数件。
+- `roll` 由 `seededRoll(fnv1a('actorId|x|y|objId|tick'))` 导出(**复用** `raid.ts` 已有的 PRNG,
+  不另写一份):同一次拆块可复现;换格/换时刻换 roll(不能原地反复放块把 20% 固定成必中)。
+- 负对照:`gatherMul = 1`(中性)在同样的 1000 个 roll 下**一次都不翻**;NaN / < 1 也一律 0 概率。
+
+### 3. 判据与注入证据
+
+- 新套件 `tests/WS-FND-79-content-expansion.test.ts`:**11/11 通过**(FND79-1 ~ FND79-11)。
+- 注入:每条判据都做过「改坏 ⇒ 该条红 ⇒ 原始字节写回 + SHA256 前后一致」,备份留在
+  `$env:PI_SCRATCH_DIR`(注入矩阵见 `docs/INJECTION-COVERAGE.md` 的待补条目 —— 该文件的写域不在本 CR)。
+
+### 4. **写域外**锚点:本 CR 造成的红与需要的同步值
+
+内容计数与指纹一改,下列**不在本 CR 写域**的字面量必然红(值已实测,供派工直接改):
+
+| 文件:行 | 现值 → 应改 |
+| :--- | :--- |
+| `tests/WS-FND-01.test.ts:218` | `'eaefa38b'` → `'2f352d3d'` |
+| `tests/WS-FND-01.test.ts:220` | `'0474ce21'` → `'6a0d6441'` |
+| `tests/WS-FND-01.test.ts:230` | `'v1-eaefa38b'` → `'v1-2f352d3d'` |
+| `tests/WS-FND-01.test.ts:274 / 283 / 285 / 288` | `320 → 329`、`745 → 754` |
+| `tests/WS-FND-01.test.ts:337 / 339 / 436 / 476 / 483` | `3350 → 3341`、`3775 → 3766` |
+| `tests/WS-FND-01.test.ts:368(标题)`、`:640 / :653 / :656 / :943` | `10 张 → 11 张`;`counts.items 320 → 329`;`slots 键 320 → 329`、`slots['754'] = 328`(`slots['745']` 仍是 319) |
+| `tests/WS-FND-04.test.ts:118 / 119` | `320 → 329`、`10 → 11`(它自己的注释已写「若内容已扩容,本套件需同步」) |
+| `tests/WS-FND-04.test.ts:207 / 208` | `APPEND_BASE 746 → 755`、`CONTIGUOUS_APPEND_CEILING 3670 → 3679` |
+| `tests/WS-FND-04.test.ts:446 / 451 / 463 / 470 / 520` | 演练用的「预留区 ID」`746/747` 已被真实内容占用 ⇒ 换成 `755` 之后的号 |
+| `tests/WS-FND-06.test.ts:100 / 105 / 117 / 122 / 1001` | `320 → 329`、`745 → 754`、`10 → 11`、`320 → 329`、`'eaefa38b' → '2f352d3d'` |
+| `tests/WS-09.test.ts:1572 / 1581 / 1582 / 1588 / 1595 / 2803` | `320 → 329`、`21 → 22`、`336 → 352`、`16 → 23`、`3 → 3`(352/160 ⇒ 仍是 3)、`320 → 329` |
+| `tests/WS-06.test.ts:1079`(K1) | 零价值功能件的白名单 `[218]` 需扩到 10 件(218 + 746~754);**这是本 CR 的刻意选择**:`value` 是必填字段而平衡数值不在本 CR 的裁决范围内 |
+| `scripts/data-conformance.ts:149 / 151 / 185 / 190-202` | 手册锚点:`物品总数 320 → 329`、`最大 ID 745 → 754`、`overall eaefa38b → 2f352d3d`、`freeCount 3775 → 3766`、`headroom 3350 → 3341`;`:466` 的已知偏差「蓬松彩羽在 320 项里无对应 ID」**已过期**(现为 `752`) |
+| `README.md` / `docs/HANDOVER.md` / `shared/contracts/FREEZE.md` | 件数 320 → 329、指纹 `v1-eaefa38b → v1-2f352d3d`、`自由号 3775 → 3766` |
+
+> 这些红**不是**本 CR 的缺陷而是「内容真的变了」的如实回执 —— 本 CR 写域只到
+> `shared/**`、`server/src/bosses/**`、`server/src/alchemy/**`、`server/src/sim/world_sim.ts`、
+> `server/src/net/actions/material.ts`、`scripts/items-baseline.*`、`scripts/content-lock.ts`、
+> `docs/CHANGE_REQUESTS.md` 与新建的 `tests/WS-FND-79`。
+
+### 5. 关联
+
+- D-19(本批授权)· CR-16(战利品表达力 / `lootQty` / `lootDeviations`)· CR-17(`recipeAnyTag`)
+- `docs/WS-04-mob-ai.md:554~559`(牧场产出「毛团/温泉橘」的出处)
+- `server/src/systems/ranch.ts:71~85`(`RANCH_PRODUCE_BY_SPECIES` / `resolveItemByName`)
+- `server/src/systems/wiring.ts:404~409`(`gatherMulOf`;件数放大规则此前**明确留白**等 owner 裁)

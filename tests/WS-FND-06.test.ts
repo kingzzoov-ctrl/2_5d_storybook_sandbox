@@ -95,18 +95,18 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
  * 1. 物品总表(手册 §3,标题行 L71;§3.10 表头 L395)
  * ═══════════════════════════════════════════════════════════════════════ */
 
-test('[L71] 物品总数 320 件', () => {
+test('[L71] 物品总数 329 件', () => {
   /* 手册 L71:「(320 项独立 ID 明细配表)」 */
-  eq(ITEM_LIST.length, 320, '物品总数');
+  eq(ITEM_LIST.length, 329, '物品总数');
 });
 
-test('[L395] 最大物品 ID = 745', () => {
+test('[L395] 最大物品 ID = 754', () => {
   /* 手册 L395:「### 3.10 …(ID 701 ~ 745,共 45 项)」 */
-  eq(Math.max(...ITEM_LIST.map((i) => i.id)), 745, '最大 ID');
+  eq(Math.max(...ITEM_LIST.map((i) => i.id)), 754, '最大 ID');
   eq(ITEM_BY_ID.has(745), true, '745 号物品存在');
 });
 
-test('[L75~L395] 十大分表项数 30/20/18/35/30/35/40/37/30/45', () => {
+test('[L75~L395] 分表项数 30/20/18/35/30/35/40/37/30/45(另 §3.11 补录 9 项)', () => {
   /* 手册每节标题自己写了「共 N 项」,逐节行号见下表 */
   const hb: [string, number, number][] = [
     ['3.1', 30, 75], ['3.2', 20, 110], ['3.3', 18, 135], ['3.4', 35, 158],
@@ -114,12 +114,12 @@ test('[L75~L395] 十大分表项数 30/20/18/35/30/35/40/37/30/45', () => {
     ['3.9', 30, 360], ['3.10', 45, 395],
   ];
   const byKey = new Map(ITEM_TABLES.map((t) => [t.key, t.ids.length]));
-  eq(byKey.size, 10, '分表数量');
+  eq(byKey.size, 11, '分表数量');
   for (const [key, n, line] of hb) {
     eq(byKey.get(key), n, `§${key} 项数(手册 L${line})`);
   }
   const sum = [...byKey.values()].reduce((a, b) => a + b, 0);
-  eq(sum, 320, '十表合计 = 320');
+  eq(sum, 329, '十一表合计 = 329');
 });
 
 test('[L7] 物品基础价值分 V_i 为正整数且自洽', () => {
@@ -998,11 +998,11 @@ test('[README] 内容指纹与容量锚点未漂移', () => {
      故本文件顶部用静态 `import` 引入 registry(见文件头 import 段)。 */
   const f = contentFingerprints();
   eq(f.version, 1, '版本号');
-  eq(f.overall, 'eaefa38b', '内容指纹 overall');
+  eq(f.overall, '2f352d3d', '内容指纹 overall');
   const objs = contentCapacity().filter((c) => c.space.includes('OBJ'));
   ok(objs.length > 0, '存在 OBJ 容量账本');
-  eq(objs[0].freeCount, 3775, 'OBJ 可用号');
-  eq(objs[0].headroom, 3350, 'OBJ 顶端余量');
+  eq(objs[0].freeCount, 3766, 'OBJ 可用号');
+  eq(objs[0].headroom, 3341, 'OBJ 顶端余量');
 });
 
 /* ═══════════════════════════════════════════════════════════════════════

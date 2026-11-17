@@ -1071,13 +1071,14 @@ test('J3 MemoryRecipeStore 与 MemoryDewLedger 的语义', () => {
  * 十一、跨层一致性(2 条)
  * ══════════════════════════════════════════════════════════════ */
 
-test('K1 全 320 项物品都能被门禁与算法正确处理(不崩、不越界)', () => {
+test('K1 全 329 项物品都能被门禁与算法正确处理(不崩、不越界)', () => {
   let carrierCount = 0;
   let mechanicCount = 0;
-  /* 唯一的例外:#218 工程安全帽是初始背包常驻开关,value=0,按契约不进炉 */
+  /* 例外:#218 工程安全帽是初始背包常驻开关,value=0;CR-27 补录 746~754 亦为 value=0,按契约都进不了炉 */
   const nonAlchemable = ITEM_LIST.filter((it) => it.value <= 0);
-  eq(nonAlchemable.length, 1, '按契约只允许 #218 一件零价值功能件');
+  eq(nonAlchemable.length, 10, '按契约只允许 #218 + CR-27 补录 9 件零价值功能件');
   eq(nonAlchemable[0].id, 218, '零价值功能件应为工程安全帽(和平盾)');
+  eq(nonAlchemable.map((it) => it.id), [218, 746, 747, 748, 749, 750, 751, 752, 753, 754], '零价值功能件应恰为 #218 与 CR-27 补录的 746~754');
 
   for (const it of ITEM_LIST) {
     const c = carrierTagsOf(it.id);

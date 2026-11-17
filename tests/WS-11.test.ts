@@ -1575,7 +1575,7 @@ test('J7 性能:35 玩具表 O(1) 索引 + 一次全表扫描足够便宜', () =
 });
 
 test('J8 冻结层未被改动:物品总数 / Boss 模式数 / 物理常数稳定', () => {
-  eq(ITEM_BY_ID.size, 320, '物品 320 项');
+  eq(ITEM_BY_ID.size, 329, '物品 329 项(2026-11-17 CR-27 扩容:320 + 9 件)');
   eq(PARTY_MODES.length, 4, 'PARTY_MODES 4 项');
   eq(CARRY_Z_STEP, 0.85, 'CARRY_Z_STEP 未漂移');
   eq(CATCH_RADIUS, 0.8, 'CATCH_RADIUS 未漂移');

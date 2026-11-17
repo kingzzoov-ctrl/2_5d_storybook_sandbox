@@ -158,6 +158,35 @@ export const ORPHAN_KNOWN = new Map<string, string>([
    * **留作教训**:这张表自检抓出过我 **5 次**误登记(把已可达的写进来)。
    * 若没有那道自检,白名单会越积越宽而门禁全程绿色 ——
    * 与 `UNREACHABLE_EXEMPT` 的「理由过时」是同一个病。 */
+  /* ── 2026-11-17:4 条「新增未登记」—— 全部是**登记缺失**,不是新缺陷 ──
+   *
+   * `--strict` 报的这 4 条一直是 orphan,只是**从未登记**。逐条定性:
+   *   · `shared/` 三条(harness / types/events / constants/cooking)—— 属 **gate-only 家族**:
+   *     门禁/判据真消费、生产 0 引用。理由与 `verify.ts` 的 `UNREACHABLE_EXEMPT`
+   *     里那三条**逐句对齐**(否则同一处欠账会有两套措辞,而事后**没人对得起来**)。
+   *   · `server/src/net/room.colyseus.ts` —— 属 **colyseus 入口家族**:它是
+   *     `verify.ts` 的 `PROD_ENTRIES` 第 3 项(由 `server/src/index.ts` 装配层实例化),
+   *     按构造不会被任何**相对 import** 引用 ⇒ 本扫描器**天生**把它判成孤儿。
+   *     ⚠️ 这正是「两套判据口径不同」:可达性侧按 `PROD_ENTRIES` 做根 ⇒ 说它可达;
+   *     本侧按直接引用 ⇒ 说它零引用。两边都对,含义不同。
+   *
+   * ⚠️⚠️ **已知跨门禁后果(修复不在本文件写域,verify.ts 是 Lead 的)**:
+   *   这 4 条一登记,`verify.ts` 的 `checkOrphanList` 与 `checkWhitelistCross` 会红 ——
+   *     1) `orphan ⊆ UNREACHABLE_EXEMPT` 对 `room.colyseus.ts` **不成立**
+   *        (它是可达根,而那张白名单只收「传递不可达」);
+   *     2) **R1**(可达 × 孤儿)同因触发:可达闭包以 `PROD_ENTRIES` 为根,入口必然在内;
+   *     3) **R2**(双向标注):harness / events / cooking 三条**同在两表**,
+   *        而 `CROSS_ANNOTATION` 里没有它们 ⇒ 报「同在两表却无交叉标注」。
+   *   ⇒ 正确修法全在 `verify.ts` 侧:(a) 把 `PROD_ENTRIES` 的成员从 R1 与子集判据里排除
+   *     (入口按构造零相对引用,这不是欠账),(b) 给那三条补 `CROSS_ANNOTATION`。
+   *     本文件只负责「登记 + 写明理由」,**不重复实现**那两条判据(同族错误见上方注释)。
+   *
+   * ⚠️ 措辞必须与 `UNREACHABLE_EXEMPT` 一致 —— 「理由过时」是那两张表共同的病,
+   *   而**两条理由不一致**会让读者以为这是两处欠账。 */
+  ['shared/testing/harness.ts', '测试夹具(`ok`/`eq`/`test`/`results` 与汇总打印);生产侧真 importer = 0 —— 它只被 tests/** 消费(78 个测试文件的公共 harness)。属「gate-only」家族:与 `server/src/content/baseline.ts` 同判据(门禁真消费它,生产不消费)⇒ **不是欠账**。接线条件是「两侧都不该接」,不是「等谁接线」:它住 `shared/`(跨层契约目录),若被生产 import 反而是缺陷(会把测试依赖拖进生产闭包)。措辞与 `verify.ts` 的 UNREACHABLE_EXEMPT 同条一致(2026-11-17 登记)。'],
+  ['shared/types/events.ts', '契约先行(D-19 第 2 条 / RULINGS-DRAFT EVENT-BUS U6):29 种事件名的命名空间 SSoT。属 gate-only 家族:判据反向扫生产文本防过期(WS-FND-66 第 7 组);生产侧事件名仍是扁平字符串 ⇒ **等编排层接线**,不是缺文件。措辞与 `verify.ts` 的 UNREACHABLE_EXEMPT 同条一致(2026-11-17 登记)。'],
+  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。属 gate-only 家族:判据真消费(WS-FND-66),生产侧由 `shared/types/cooking.ts` 的合并函数间接消费 ⇒ **不是欠账**。措辞与 `verify.ts` 的 UNREACHABLE_EXEMPT 同条一致(2026-11-17 登记)。'],
+  ['server/src/net/room.colyseus.ts', 'colyseus 入口家族:Colyseus 房间,由 server 装配层(`server/src/index.ts` 的 `createHost`/`assemble`)实例化,**不靠相对 import 引用** ⇒ 本扫描器按构造判它孤儿。同一文件在可达性侧是 `verify.ts` 的 `PROD_ENTRIES` 第 3 项(口径:从入口做 import 闭包)⇒ 两侧结论都对但含义不同,见上方跨门禁注释。接入条件:**不接** —— 给它加一个相对 importer 才是缺陷(把入口塞进闭包 = 假可达)。'],
 ]);
 
 function walk(dir: string, out: string[] = []): string[] {

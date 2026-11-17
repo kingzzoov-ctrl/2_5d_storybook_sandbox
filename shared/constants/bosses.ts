@@ -4,7 +4,7 @@
  * 血量缩放 HP(N) = HP_base × (1 + 0.65(N-1)) 见 `shared/types/entities.ts#bossScaledHp`。
  */
 
-import { Biome, type BossDef } from '../types/entities.ts';
+import { Biome, type BossDef, type BossLootEntry } from '../types/entities.ts';
 
 export type { BossDef };
 
@@ -36,7 +36,9 @@ export const BOSS_LIST: readonly BossDef[] = [
     /* ⚠️ CR-16:`loot` 保持字节级不变(它被 contentFingerprints 的 bosses 分区哈希)。
        手册 L496 的战利品列是「703 河狸钢牙×10 + 自动伐木机甲宠物图纸」:
         · 数量 10 → `lootQty`(缺省 1,故必须显式给,且与 loot 等长);
-        · 「自动伐木机甲宠物图纸」→ 320 表内 0 命中,登记为 `lootAbstract`;
+        · 「自动伐木机甲宠物图纸」→ CR-16 时 320 表内 0 命中,登记为 `lootAbstract`;
+          **CR-27**:它已补录为物品 #748(`items.ts` 的 `APPENDED`),但本 Boss 的 `loot`
+          仍**不动**(加 ID 会动 `contentFingerprints().bosses` 与 `tests/WS-05` 冻结快照);
         · `437 叮当蒸汽小火车头` → 手册 L313 是**可造载具**,不是战利品 ⇒ 记 `lootDeviations`,
           由 rollPersonalLoot 在生产掉落里过滤掉(不删 loot,删了会动指纹)。 */
     loot: [703, 437],
@@ -111,12 +113,14 @@ export const BOSS_LIST: readonly BossDef[] = [
      *
      * 替换件 613(庆典三层奶油蛋糕,V=260,tags['料理','宴会','经验','团队'])
      * 取甜点系且高价值,契合手册 L500 说的「皇家甜点主题」;
-     * 手册原文的两件(城堡图纸、姜饼人随从)在 320 项表内不存在,
-     * 按「抽象奖励」处理、不塞进物品表(否则破坏 320 件的内容锁)。
+     * 手册原文的两件(城堡图纸、姜饼人随从)在 CR-15 时的 320 项表内不存在,
+     * 按「抽象奖励」处理、不塞进物品表(否则破坏当时的内容锁)。
+     * ★ CR-27:两件已补录为 #754 城堡图纸 / #749 姜饼人随从,`loot` 仍按冻结纪律不动。
      */
     loot: [609, 613],
     /* CR-16:手册 L500 的战利品列是「皇家甜点主题全套城堡图纸与姜饼人随从」——
-       两件在 320 表内均 0 命中 ⇒ 登记为 `lootAbstract`(CR-15 已判明它们不属物品表)。
+       CR-16 时两件在 320 表内均 0 命中 ⇒ 登记为 `lootAbstract`(CR-15 已判明它们不属物品表)。
+       ★ CR-27:两件现已是 #754 / #749,但 `lootAbstract` 保留为**手册原文**登记。
        `609 庆典三层奶油蛋糕` 是 CR-15 给 739 自反馈换上的替代件,手册没写数量 ⇒ 1。 */
     lootQty: [1, 1],
     lootAbstract: ['皇家甜点主题全套城堡图纸', '姜饼人随从'],
@@ -158,8 +162,9 @@ export const BOSS_LIST: readonly BossDef[] = [
     summonItem: 741,
     exp: 25000,
     /* ⚠️ CR-16:手册 L502 战利品列是「708 永动发条太阳核 + 723 克洛诺斯磁暴齿轮炮
-       + 纯金通关纪念碑」。前两件 loot 已有;「纯金通关纪念碑」在 320 表内 0 命中
-       ⇒ 登记为 `lootAbstract`(不塞物品表,否则破坏 320 件内容锁)。 */
+       + 纯金通关纪念碑」。前两件 loot 已有;「纯金通关纪念碑」CR-16 时在 320 表内 0 命中
+       ⇒ 登记为 `lootAbstract`(不塞物品表,否则破坏当时的内容锁)。
+       ★ CR-27:它已补录为 #750,`loot` 仍不动(冻结纪律,见 CR-16 实施记录)。 */
     loot: [708, 723],
     lootQty: [1, 1],
     lootAbstract: ['纯金通关纪念碑'],
@@ -173,6 +178,57 @@ export const BOSS_LIST: readonly BossDef[] = [
 ];
 
 export const BOSS_BY_ID: ReadonlyMap<string, BossDef> = new Map(BOSS_LIST.map((b) => [b.id, b]));
+
+/**
+ * 把**任意形态**的 Boss 战利品数据归一到 `BossLootEntry[]`(带数量)—— CR-27 / P-01。
+ *
+ * ## 为什么需要它
+ *
+ * 手册的「必掉史诗战利品」列同时表达 ID 与**数量**(L496 `703×10`、L501 `117×15`),
+ * 而 `BossDef.loot` 是**冻结**的纯 `number[]`:它被 `contentFingerprints()` 的 bosses 分区
+ * 哈希,还被 `tests/WS-05` 的冻结快照逐位钉住 ⇒ 往里塞 `{id, count}` 会让指纹漂移、
+ * 撞红四处**写域外**锚点(见 CR-16)。
+ *
+ * ⇒ 修法:**数据不动,读取侧统一**。本函数是唯一的归一入口,生产掉落路径
+ *   (`server/src/bosses/raid.ts#effectiveLoot` → `rollPersonalLoot`)只认它的输出。
+ *
+ * ## 两种形态都要能读(旧形态**不是**兼容分支的摆设,是当前生产形态)
+ *
+ * ```ts
+ * normalizeBossLoot([703, 437], [10, 1])        // 旧形态:逐位取 lootQty,缺省 1
+ *   ⇒ [{ id: 703, count: 10 }, { id: 437, count: 1 }]
+ * normalizeBossLoot([{ id: 703, count: 10 }])   // 新形态:原样读 count
+ *   ⇒ [{ id: 703, count: 10 }]
+ * ```
+ *
+ * ⚠️ 数量守规矩:**0 / 负数 / 非整数一律归 1**,不静默产出 0 件
+ * (「必掉」列写了就是至少 1 件);`count` 是小数时截断。
+ */
+export function normalizeBossLoot(
+  loot: readonly (number | BossLootEntry)[] | undefined,
+  qty?: readonly number[],
+): BossLootEntry[] {
+  const out: BossLootEntry[] = [];
+  if (loot === undefined) return out;
+  const sane = (n: unknown): number =>
+    typeof n === 'number' && Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 1;
+  for (let i = 0; i < loot.length; i += 1) {
+    const raw = loot[i];
+    if (typeof raw === 'number') {
+      out.push({ id: raw, count: sane(qty === undefined ? undefined : qty[i]) });
+    } else {
+      out.push({ id: raw.id, count: sane(raw.count) });
+    }
+  }
+  return out;
+}
+
+/** Boss 战利品(归一后的 `{id, count}[]`);未知 Boss ⇒ 空数组,与 `loot: []` 同义。 */
+export function bossLootEntries(bossId: string): BossLootEntry[] {
+  const def = BOSS_BY_ID.get(bossId);
+  if (def === undefined) return [];
+  return normalizeBossLoot(def.loot, def.lootQty);
+}
 
 export const TOTAL_BOSS_COUNT = 8;
 

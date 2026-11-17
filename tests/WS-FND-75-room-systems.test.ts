@@ -191,17 +191,17 @@ test('FND75-6 ★负对照:亲和不足 ⇒ 跳过(不进食、不产出);不是
   eq(unknown.skippedCount, 1, '内容表里没有的物种一律跳过');
 });
 
-test('FND75-7 自动进食判定 + 产出缺口照实暴露(内容表还没有「毛团」/「温泉橘」)', () => {
+test('FND75-7 自动进食判定 + 产出按内容表兑现(CR-27 后「毛团」/「温泉橘」已在表里)', () => {
   /* 怎么变红:给产出编一个物品 ID(比如拿 119 云朵棉花顶替毛团)⇒ 第 1/3 条;
      canAutoFeed 与 settleRanchDay 走两套判定 ⇒ 第 4/5 条对不上。 */
-  ok(!ITEM_LIST.some((i) => i.name === '毛团'), '内容表目前没有「毛团」这件物品(锚:缺口是真的)');
-  ok(!ITEM_LIST.some((i) => i.name === '温泉橘'), '内容表目前没有「温泉橘」这件物品');
+  ok(ITEM_LIST.some((i) => i.name === '毛团'), '内容表已有「毛团」(CR-27 补录;锚:内容真的在表里)');
+  ok(ITEM_LIST.some((i) => i.name === '温泉橘'), '内容表已有「温泉橘」');
 
   const r = settleRanchDay({ animals: [{ speciesId: 'mob_capybara', affinity: 0.8 }], feed: { 122: 3 }, days: 2 });
   eq(r.produce[0].name, '温泉橘', '水豚的产出名来自手册');
   eq(r.produce[0].count, 2, '2 天 ⇒ 2 份');
-  eq(r.produce[0].itemId, null, '★ 内容表没有这件物品 ⇒ 如实返回 null,不编 ID');
-  eq(r.unresolved, ['温泉橘'], '缺口必须浮在脸上(而不是悄悄换成别的物品)');
+  eq(r.produce[0].itemId, 747, '★ 内容表已有这件物品(#747)⇒ 产出按 ID 兑现');
+  eq(r.unresolved, [], '内容表有这件物品 ⇒ 缺口账为空(不许再浮一个假缺口)');
 
   /* 自动进食 = 亲和达标 ∧ 物种在牧场 ∧ 槽里至少一天饲料 */
   eq(canAutoFeed({ speciesId: 'mob_sheep', affinity: 0.9 }, { 123: 1 }), true);

@@ -113,10 +113,10 @@ test('A3 判据来源:布局对齐取算术事实,不取实现声明的对齐', 
 
 /* ═══════════════ 1. 内存假内容集(不触碰冻结层) ═══════════════ */
 
-test('B1 假内容集不改动冻结层:真实内容仍是 320 件', () => {
+test('B1 假内容集不改动冻结层:真实内容仍是 329 件', () => {
   eq(ITEM_LIST.length, TOTAL_ITEM_COUNT, '真实内容件数应与 TOTAL_ITEM_COUNT 一致');
-  eq(TOTAL_ITEM_COUNT, 320, '真实基线应为 320 件(若内容已扩容,本套件需同步)');
-  eq(ITEM_TABLES.length, 10, '应为 10 张分表');
+  eq(TOTAL_ITEM_COUNT, 329, '真实基线应为 329 件(若内容已扩容,本套件需同步)');
+  eq(ITEM_TABLES.length, 11, '应为 11 张分表');
 });
 
 test('B2 假内容集规模与标签正确,且全部落在 12 位值域内', () => {
@@ -204,8 +204,8 @@ test('C1-4 半行回归:330 件这一历史触发点必须仍然对齐', () => {
 /* ═══════════════ 3. 耦合点 C2:12 位 obj 值域 ═══════════════ */
 
 test('C2-1 两条容量天花板:纯追加 3670,含空档全填 4095', () => {
-  eq(APPEND_BASE, 746, '追加区起点应为既有分表最大上界 + 1 = 746');
-  eq(CONTIGUOUS_APPEND_CEILING, 3670, '纯末尾追加上限应为 320 + 3350 = 3670');
+  eq(APPEND_BASE, 755, '追加区起点应为既有分表最大上界 + 1 = 755');
+  eq(CONTIGUOUS_APPEND_CEILING, 3670, '纯末尾追加上限应为 329 + 3341 = 3670');
   eq(ABSOLUTE_ITEM_CEILING, 4095, '值域绝对上限应为 4095');
   /* 两者之差必须等于内部空档数 —— 由 freeIdCount 独立算出 */
   eq(ABSOLUTE_ITEM_CEILING - CONTIGUOUS_APPEND_CEILING, 425,
@@ -387,7 +387,7 @@ test('C6-3 容量是外部输入:扩容只需改传参,不改反作弊代码', (
   ok(roomy.allowed, `容量 ${held + 64} 时应通过 —— 否则容量未被当作外部输入`);
 });
 
-test('C6-4 背包容量(336)严格大于真实内容件数(320)', () => {
+test('C6-4 背包容量(352)严格大于真实内容件数(329)', () => {
   const layout = computeSlotLayout(TOTAL_ITEM_COUNT, SLOTS_PER_ROW, INVENTORY_SPARE_ROWS);
   ok(layout.slots > TOTAL_ITEM_COUNT, `背包容量 ${layout.slots} 应大于内容件数 ${TOTAL_ITEM_COUNT}`);
   /* 这也是反作弊 capacity 参数的合理取值依据:它必须 ≥ 内容件数,否则新物品无法进背包 */
@@ -443,12 +443,12 @@ test('C8-1 扩容不改变既有分表结构', () => {
 
 test('C9-1 扩展登记:合法登记通过,缺迁移提示报错', () => {
   const good: ContentExtension[] = [
-    { seq: 1, summary: 'FND-04 演练:追加预留区物品', ids: [746, 747], needsMigration: true, migrationNote: '旧存档无此 ID,按空处理' },
+    { seq: 1, summary: 'FND-04 演练:追加预留区物品', ids: [755, 756], needsMigration: true, migrationNote: '旧存档无此 ID,按空处理' },
   ];
   eq(auditExtensions(good).length, 0, '合法扩展登记不应报错');
 
   const noNote: ContentExtension[] = [
-    { seq: 1, summary: '缺迁移提示', ids: [746], needsMigration: true, migrationNote: '' },
+    { seq: 1, summary: '缺迁移提示', ids: [755], needsMigration: true, migrationNote: '' },
   ];
   ok(auditExtensions(noNote).length > 0, '需要迁移却缺提示时应报错');
 });
@@ -460,14 +460,14 @@ test('C9-2 扩展登记的 ID 与既有内容冲突时必须报错', () => {
   ok(auditExtensions(clash).length > 0, 'ID 与既有内容冲突时应报错');
   /* 反向:用预留区 ID 则不应因冲突报错 */
   const okIds: ContentExtension[] = [
-    { seq: 1, summary: 'FND-04 演练:合法追加', ids: [746, 747], needsMigration: false, migrationNote: '' },
+    { seq: 1, summary: 'FND-04 演练:合法追加', ids: [755, 756], needsMigration: false, migrationNote: '' },
   ];
   eq(auditExtensions(okIds).filter((p) => p.includes('冲突')).length, 0, '预留区 ID 不应报冲突');
 });
 
 test('C9-3 扩展登记序号必须连续', () => {
   const bad: ContentExtension[] = [
-    { seq: 2, summary: '序号跳号', ids: [746], needsMigration: false, migrationNote: '' },
+    { seq: 2, summary: '序号跳号', ids: [755], needsMigration: false, migrationNote: '' },
   ];
   ok(auditExtensions(bad).some((p) => p.includes('序号')), '序号不连续时应报错');
 });
@@ -517,7 +517,7 @@ test('S3 判据区分力自检(构造式):漏掉迁移提示校验的坏审计�
     return problems;
   };
   const needsNote: ContentExtension[] = [
-    { seq: 1, summary: '需要迁移但没写提示', ids: [746], needsMigration: true, migrationNote: '' },
+    { seq: 1, summary: '需要迁移但没写提示', ids: [755], needsMigration: true, migrationNote: '' },
   ];
   eq(badAudit(needsNote).length, 0, '坏校验必须漏掉这个问题 —— 否则本次自检无效');
   ok(auditExtensions(needsNote).length > 0, '真实校验必须抓住它(C9-1 的判据有区分力)');

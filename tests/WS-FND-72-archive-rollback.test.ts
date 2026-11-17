@@ -213,7 +213,7 @@ const decodedReal: DecodedWorldArchive = decodeWorldArchive(real.snapshot);
 
 test('FND72-1 真实写入侧的快照 → 解码 → 逐字段相等,且重新编码逐字节回到原文', () => {
   /* ── 世界世代:身份 + 时钟 ── */
-  eq(decodedReal.version, 1, '格式版本 = 1');
+  eq(decodedReal.version, 2, '格式版本 = 2(2026-11-17:v2 带玩家 hp 与流体水位)');
   eq(decodedReal.world.roomId, real.roomId, 'roomId');
   eq(decodedReal.world.seed, 4242, '★ seed 是**旧世界**的种子(重置前那个)');
   eq(decodedReal.world.sizeCells, 32, 'sizeCells');
@@ -260,6 +260,8 @@ test('FND72-1 真实写入侧的快照 → 解码 → 逐字段相等,且重新�
 
   /* ── 往返:encode(decode(x)) 必须逐字节回到 x ── */
   const again = encodeWorldArchive({
+    version: decodedReal.version,
+    fluid: decodedReal.fluid,
     world: decodedReal.world,
     players: decodedReal.players,
     mobs: decodedReal.mobs,
@@ -278,7 +280,7 @@ test('FND72-2 解码器对坏字节**抛错并说清哪儿坏**,不是尽力而�
   );
 
   const version = real.snapshot.slice();
-  new DataView(version.buffer).setUint32(4, 2, true);
+  new DataView(version.buffer).setUint32(4, 3, true);
   ok(
     throwsWith(() => decodeWorldArchive(version), '版本改掉').includes('版本'),
     '不认识的版本 ⇒ 点名版本',
@@ -411,11 +413,12 @@ test('FND72-6 回滚计划:按计划应用到空世界 ⟷ 归档前的描述逐
     '★ 地形 chunk 内容逐字节还回去了',
   );
 
-  /* 计划形状:一条 world + 每个玩家/块/生物/掉落各一条。 */
+  /* 计划形状:一条 world + 每个玩家/块/生物/掉落各一条 + v2 的流体水位一条。 */
   eq(
     plan.ops.length,
     1 + decodedReal.players.length + decodedReal.chunks.length
-      + decodedReal.mobs.length + decodedReal.ground.length,
+      + decodedReal.mobs.length + decodedReal.ground.length
+      + (decodedReal.fluid === null ? 0 : 1),
     'ops 恰好覆盖全部字段(多一条/少一条都要红)',
   );
   eq(plan.ops[0].kind, 'world', '第一条 op 是 world');
@@ -423,10 +426,11 @@ test('FND72-6 回滚计划:按计划应用到空世界 ⟷ 归档前的描述逐
   eq(plan.source.frame, real.frame, 'source.frame');
   eq(plan.source.trimmed, false, '这份没裁过');
 
-  /* ★ 格式里没有的东西**不许编**:玩家血量进 unavailable。 */
+  /* ★ 格式里没有的东西**不许编**:v2 里 hp **有值** ⇒ 不该进 unavailable;
+     真正不可用的只有"这个版本没带"的项(v1 才有 hp 不可用,v2 的判据在 WS-FND-80/81)。 */
   ok(
-    plan.unavailable.some((s) => s.includes('hp')),
-    `★ 归档里没有玩家血量 ⇒ 必须进 unavailable(实得 ${plan.unavailable.join(' / ')})`,
+    !plan.unavailable.some((s) => s.includes('hp')),
+    `★ v2 归档里有玩家血量 ⇒ **不该**进 unavailable(实得 ${plan.unavailable.join(' / ')})`,
   );
 
   /* 纯函数:同一份计划应用两次结果相同;没有 current 也自足。 */

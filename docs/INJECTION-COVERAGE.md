@@ -505,3 +505,149 @@ console.log('DONE');
 
 (共 25 个。它们是「同一类欠账」的剩余部分,不在本批 34 个目标内;若要补,
 可直接用附录 A 的驱动 —— 命令 `node <driver>.mjs WS-FND-34,...`,机制与上表完全一致。)
+
+---
+
+## 附录 C:B 批 —— 附录 B 的 25 个欠账套件(补齐,25/25)
+
+> 承接本文件附录 B:「目标之外、按同一启发式仍无注入记录的 25 个套件」。机制与第三节(A 批)完全一致:
+> 每个套件选**一条**断言 → 改坏它依赖的生产常量/分支 → `node tests/<套件>` 必须 exit≠0 且出现该判据名 →
+> 用**注入前的字节** `Copy-Item`/`writeFileSync` 写回 → SHA-256 前后一致 → 复跑恢复绿。
+> 只临时改过 `server/**` `client/**` `shared/**`;未碰 `tests/**`、`scripts/**`、其它 `docs/**`、`README.md`,
+> 未用 `git checkout/reset`、未通配删除、未跑 `verify.ts --all`、未 commit。日期:与 A 批同日(同一次会话的续批)。
+
+### C.1 逐条记录(25/25)
+
+| 套件 | 判据名(注入后变红的用例) | 改的文件:行 | 改前 → 改后 | 注入后 exit / 失败摘要 / 复跑 | 还原后 SHA256 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `WS-13` | [WS-13] WS13-6-1 ★★ 判据一:真起服务 → 真连接 → hello → welcome → 二进制帧 → 真解码 — welcome.protocolVersion 期望 24 / 实际 3 | `shared/net/delta.ts:70` | `export const PROTOCOL_VERSION = 3;` → `export const PROTOCOL_VERSION = 24;` | exit=1([WS-13] 19/20 通过),复跑 exit=0 [WS-13] 20/20 通过 | `45c15e75a96d22e6…` 前=后=true |
+| `WS-FND-34` | [WS-FND-34] FND34-1 宿主有能力 + 显式确认 + 合法种子 ⇒ OK,且宿主**真的被调过** — 应成功(kind=INVALID reason=RESET_WORLD 需要显式确认(confirm: true)—— 这是破坏性动作) 期望 true / 实际 false(+另 3 条同批红) | `server/src/net/actions/reset_world.ts:198` | `if (p.confirm !== true) {` → `if (p.confirm === true) {` | exit=1([WS-FND-34] 2/6 通过),复跑 exit=0 [WS-FND-34] 6/6 通过 | `9dc838de315d6dbc…` 前=后=true |
+| `WS-FND-35` | [WS-FND-35-client-entry] FND35-1 五个动作产出**逐字正确**的 { action, payload } — CRAFT 的载荷是 { itemId, have }(服务端 craft.ts 的两个键) ok:期望 true / 实际 false(+另 3 条同批红) | `client/src/net/action_entry.ts:181` | `return true;` → `return false;` | exit=1([WS-FND-35-client-entry] 10/14 通过),复跑 exit=0 [WS-FND-35-client-entry] 14/14 通过 | `d0c97c9c085fea6b…` 前=后=true |
+| `WS-FND-37` | [WS-FND-37] FND37-4 显式给了库 ⇒ B 路用它(不被解析覆盖) — ★ B 路必须原样返回调用方给的库,不许换成自己开的那个(+另 1 条同批红) | `server/src/net/room.colyseus.ts:210` | `return deps.db ?? null;` → `return resolveAssembly().db; /* injected: 忽略调用方显式给的库 */` | exit=1([WS-FND-37] 6/8 通过),复跑 exit=0 [WS-FND-37] 8/8 通过 | `a327880333fb0301…` 前=后=true |
+| `WS-FND-38` | [WS-FND-38] FND38-3 刻意不接:MOVE / ATTACK 在 unwired 里,且 CRAFT **不**在 — MOVE 应在 unwired 里(刻意不接;实得 wired 里有它:true)(+另 3 条同批红) | `server/src/net/actions/move.ts:15` | `export const move: ActionHandler = (ctx) => notImplemented(ctx.action);` → `export const move: ActionHandler = (ctx) => { const injected = 1; return injected > 0 ? notImplemented(ctx.action) : not…` | exit=1([WS-FND-38] 5/9 通过),复跑 exit=0 [WS-FND-38] 9/9 通过 | `3567b87c665600e2…` 前=后=true |
+| `WS-FND-40` | [WS-FND-40] FND40-1 未装 provider ⇒ 半径仍是默认 24(字面量锚) — ★ `TOWN_SAFE_RADIUS` 应仍为 24(不许被改成别的) 期望 24 / 实际 171(+另 3 条同批红) | `server/src/mobs/spawner.ts:48` | `export const TOWN_SAFE_RADIUS = 24;` → `export const TOWN_SAFE_RADIUS = 171;` | exit=1([WS-FND-40] 2/8 通过),复跑 exit=0 [WS-FND-40] 8/8 通过 | `ae28b2593eef41d7…` 前=后=true |
+| `WS-FND-41` | [WS-FND-41] FND41-1 驯服成功 ⇒ tameOwnerOf 读到主人(世界侧那一行的数据源) — 前置:喂 pet:a 第 4 口应成功(kind=INVALID reason=背包里没有可投喂的 123(ITEM_NEGATIVE)⇒ 好感未变)(+另 3 条同批红) | `server/src/net/actions/breed_tame.ts:144` | `export const AFFECTION_REQUIRED = 3;` → `export const AFFECTION_REQUIRED = 24;` | exit=1([WS-FND-41] 1/7 通过),复跑 exit=0 [WS-FND-41] 7/7 通过 | `176f61ab958ce109…` 前=后=true |
+| `WS-FND-42` | [WS-FND-42] FND42-2 两个模式给分必须不同,且都大于 0 — 夺旗 = 100 分(BRIDGE_SCORE_PER_FLAG,modes.ts:212) 期望 100 / 实际 424242(+另 2 条同批红) | `server/src/party/scoring.ts:530` | `BRIDGE_CTF: 100,` → `BRIDGE_CTF: 424242,` | exit=1([WS-FND-42] 6/9 通过),复跑 exit=0 [WS-FND-42] 9/9 通过 | `62d34f24df075258…` 前=后=true |
+| `WS-FND-44` | [WS-FND-44] FND44-2 ★★ 改造半径到 8 之后:原本"24 内、8 外"的点**不再**算安全区 — ★ 读取口应立刻变成 8 期望 8 / 实际 24(+另 1 条同批红) | `server/src/net/actions/modify_town.ts:355` | `TOWNS.set(roomId, after);` → `TOWNS.set('__injected__' + roomId, after); /* injected: 配置写进别的桶 */` | exit=1([WS-FND-44] 2/4 通过),复跑 exit=0 [WS-FND-44] 4/4 通过 | `d214ee4d9529727c…` 前=后=true |
+| `WS-FND-45` | [WS-FND-45] FND45-1 开局后击杀生物 ⇒ 分数真的涨了(世界事件 → 规则 → addScore) — 前置:应刷出至少一只生物并可击杀(+另 1 条同批红) | `server/src/mobs/spawner.ts:48` | `export const TOWN_SAFE_RADIUS = 24;` → `export const TOWN_SAFE_RADIUS = 171;` | exit=1([WS-FND-45] 3/5 通过),复跑 exit=0 [WS-FND-45] 5/5 通过 | `ae28b2593eef41d7…` 前=后=true |
+| `WS-FND-46` | [WS-FND-46] FND46-1 ★ 驯服之后投影里真的有主人(wire 那一格不再恒为空串) — ★★ 投影必须写出主人(此前恒为空串 ⇒ 世界/AI 以为它野生) 期望 "p1" / 实际 "" | `server/src/net/room.ts:2150` | `tameOwnerId: tameOwnerOf(this.state.roomId, w.id) ?? '',` → `tameOwnerId: '', /* injected: 投影不再查归属 */` | exit=1([WS-FND-46] 2/3 通过),复跑 exit=0 [WS-FND-46] 3/3 通过 | `65837c998b4d1555…` 前=后=true |
+| `WS-FND-47` | [WS-FND-47] FND47-1 食堂 **且** 带料理 buff ⇒ 1.4(手册 §3.8 的 +40%) — 食堂 + 带料理 buff ⇒ 大餐乘区生效 期望 1.4 / 实际 2.4(+另 3 条同批红) | `server/src/rooms/effects.ts:156` | `export const CANTEEN_MEAL_MUL = 1.4;` → `export const CANTEEN_MEAL_MUL = 2.4;` | exit=1([WS-FND-47] 4/8 通过),复跑 exit=0 [WS-FND-47] 8/8 通过 | `af133cd132691722…` 前=后=true |
+| `WS-FND-51` | [WS-FND-51-client-z-camera-smooth] FND51-3 反复推进 900 帧(15 秒)⇒ 与 target 误差 < 1e-3,且不越过 target — 900 帧(15 秒)后必须收敛到 1(实际 0.7941088679053581)(+另 3 条同批红) | `client/src/net/height_placement.ts:130` | `export const CAMERA_HEIGHT_FOLLOW_RATIO = 0.5;` → `export const CAMERA_HEIGHT_FOLLOW_RATIO = 0.1;` | exit=1([WS-FND-51-client-z-camera-smooth] 3/7 通过),复跑 exit=0 [WS-FND-51-client-z-camera-smooth] 7/7 通过 | `5178ecd964a97272…` 前=后=true |
+| `WS-FND-53` | [WS-FND-53-knockback-and-bubble-window] FND53-1 ★ 受击位移 = min(2, 实际伤害 / 20) 格(D-09 的公式本身) — 位移应精确等于 min(2, 50/20) = 2(实测 1.0000) 期望 2(±0.000001) / 实际 1(+另 1 条同批红) | `shared/types/physics.ts:8` | `export const TICK_HZ = 20;` → `export const TICK_HZ = 143;` | exit=1([WS-FND-53-knockback-and-bubble-window] 4/6 通过),复跑 exit=0 [WS-FND-53-knockback-and-bubble-window] 6/6 通过 | `154d111f9d8f7af0…` 前=后=true |
+| `WS-FND-54` | [WS-FND-54] FND54-4 ★ 清回中性(1)⇒ 恢复地板原值(逐位) — 前置:设回中性应被接受 期望 true / 实际 false | `server/src/physics/world.ts:324` | `return true;` → `return false;` | exit=1([WS-FND-54] 5/6 通过),复跑 exit=0 [WS-FND-54] 6/6 通过 | `1151c5376f217932…` 前=后=true |
+| `WS-FND-55` | [WS-FND-55] FND55-1 ★ 505 配方 + 未解锁 ⇒ PERMISSION,且**一件材料都不扣** — 未解锁时 505 配方不能合成 期望 false / 实际 true(+另 1 条同批红) | `server/src/net/actions/craft.ts:116` | `const ADVANCED_FORGE_STATION = 505;` → `const ADVANCED_FORGE_STATION = 9999;` | exit=1([WS-FND-55] 4/6 通过),复跑 exit=0 [WS-FND-55] 6/6 通过 | `ad43e097dc55541c…` 前=后=true |
+| `WS-FND-56` | [WS-FND-56] FND56-5 ★ 端到端:返回的列表喂 tickRushOrder ⇒ 累计 0.5 秒 BURNING → RUNNING — 过热规则未动 = 12 秒连续运转 期望 12 / 实际 87 | `server/src/coop/rush_order.ts:339` | `export const OVERHEAT_SEC = 12;` → `export const OVERHEAT_SEC = 87;` | exit=1([WS-FND-56] 5/6 通过),复跑 exit=0 [WS-FND-56] 6/6 通过 | `08db0bfab1fd9788…` 前=后=true |
+| `WS-FND-57` | [WS-FND-57] FND57-3 listWorldArchives 按时间**倒序**(乱序写入也一样) — 按 roomId 隔离 [0] 仅存在于实际值({ id: "r3#1", room_id: "r3", seq: 1, seed: 300, world_tick: 0, bytes: 16, reason: "", archived_at: 3000 })(+另 2 条同批红) | `server/src/db/memory_db.ts:522` | `return false;` → `return true;` | exit=1([WS-FND-57] 6/9 通过),复跑 exit=0 [WS-FND-57] 9/9 通过 | `48c8776e5f975fe7…` 前=后=true |
+| `WS-FND-58` | [WS-FND-58] FND58-1 死区 0.19:内侧与边界给零向量,外侧给方向(边界取"死"侧) — D-08 的死区常量 期望 0.19 / 实际 3.967(+另 3 条同批红) | `client/src/net/joystick.ts:43` | `export const JOYSTICK_DEAD_ZONE = 0.19;` → `export const JOYSTICK_DEAD_ZONE = 3.967;` | exit=1([WS-FND-58] 5/9 通过),复跑 exit=0 [WS-FND-58] 9/9 通过 | `51f72ca63ba25152…` 前=后=true |
+| `WS-FND-59` | [WS-FND-59-world-clock] FND59-2 ★ 时间真的在走:1000 帧后到 07:00(1 小时) — 1000 帧应正好 1 小时(实测 6.1399) 期望 7(±0.000001) / 实际 6.13986013986014(+另 3 条同批红) | `shared/types/physics.ts:8` | `export const TICK_HZ = 20;` → `export const TICK_HZ = 143;` | exit=1([WS-FND-59-world-clock] 2/6 通过),复跑 exit=0 [WS-FND-59-world-clock] 6/6 通过 | `154d111f9d8f7af0…` 前=后=true |
+| `WS-FND-60` | [WS-FND-60] FND60-2 超程 ⇒ 方向保持、幅值**恰为** radius(夹取,不是归一化丢弃) — r=50 < 64 ⇒ 原样 x:期望 30 / 实际 0 | `client/src/net/joystick.ts:43` | `export const JOYSTICK_DEAD_ZONE = 0.19;` → `export const JOYSTICK_DEAD_ZONE = 3.967;` | exit=1([WS-FND-60] 6/7 通过),复跑 exit=0 [WS-FND-60] 7/7 通过 | `51f72ca63ba25152…` 前=后=true |
+| `WS-FND-61` | [WS-FND-61] FND61-1 前置:508 成为 FURNACE 工位格 (6,6);推 240 帧(= 12.00 秒)后工位 BURNING — ★★ 第 240 帧进入 BURNING 期望 "BURNING" / 实际 "RUNNING"(+另 3 条同批红) | `server/src/coop/rush_order.ts:339` | `export const OVERHEAT_SEC = 12;` → `export const OVERHEAT_SEC = 87;` | exit=1([WS-FND-61] 0/6 通过),复跑 exit=0 [WS-FND-61] 6/6 通过 | `08db0bfab1fd9788…` 前=后=true |
+| `WS-FND-62` | [WS-FND-62-world-reset-rebuild] FND62-3 ★ 旧世界被归档:真库里有 1 行、id 非空、seed 是**旧**种子 — 房主不存在:p1 | `server/src/db/memory_db.ts:523` | `return true;` → `return false;` | exit=1([WS-FND-62-world-reset-rebuild] 6/7 通过),复跑 exit=0 [WS-FND-62-world-reset-rebuild] 7/7 通过 | `48c8776e5f975fe7…` 前=后=true |
+| `WS-FND-63` | [WS-FND-63] FND63-1 ★ 版本 = 3;encodeFull/encodeDelta/decodePacket 自洽(byte6..9 = ack) — 报文头版本号 = 3(字面量锚定) 期望 3 / 实际 24(+另 3 条同批红) | `shared/net/delta.ts:70` | `export const PROTOCOL_VERSION = 3;` → `export const PROTOCOL_VERSION = 24;` | exit=1([WS-FND-63] 1/5 通过),复跑 exit=0 [WS-FND-63] 5/5 通过 | `45c15e75a96d22e6…` 前=后=true |
+| `WS-FND-64` | [WS-FND-64] FND64-2 ★ WorldSim 挂上的就是世界钟(hour 与 night 两个键) — 240 帧后 = 06:14:24(世界时间 12.00 秒) 期望 6.24(±1e-9) / 实际 6.033566433566435(+另 1 条同批红) | `shared/types/physics.ts:8` | `export const TICK_HZ = 20;` → `export const TICK_HZ = 143;` | exit=1([WS-FND-64] 3/5 通过),复跑 exit=0 [WS-FND-64] 5/5 通过 | `154d111f9d8f7af0…` 前=后=true |
+
+- **完成数:25 / 25**;每个套件都做到「改坏 ⇒ 红(exit≠0 且该判据名出现在 ✗ 行)⇒ 原始字节写回 ⇒ SHA256 前=后 ⇒ 复跑绿」。
+- 注入后**红行合计 68 条**(多数套件一次注入会连带多条判据变红;每套件只做一次注入,上表只记首条)。
+- 未完成清单:**无**;跳过清单:**无**(没有套件因「只能用 `world_sim.ts` 才能注入」而被跳过 —— 见 C.3)。
+
+### C.2 与 A 批的三点不同(如实说明)
+
+1. **锚点选择:先自动、后人工**。前 16 个套件由启发式(直接 import 的生产常量 → 深度 1 导出常量 → 字面量 `return X;` 分支)找到红点;
+   余下 9 个套件(WS-FND-34/37/38/42/44/46/47/51/55)的启发式候选**全部 `green(no red)`**(这些套件的断言打的是
+   动作层闸口 / 派生口径 / 投影格 / 校验窗口,不落在被测模块的导出常量上),改用**人工指定的单行锚点**,机制与附录 A 的 `manual.json` 用法相同,
+   仍是「一条锚点、注入前后的哈希比对」。9 条人工锚点见下表 C.4。
+2. **`world_sim.ts` 全程未被改过**。本批锚点挑选规则里把 `server/src/sim/world_sim.ts` 列入 **AVOID**:
+   自动候选**先过滤**掉该文件(6 个套件因此各丢掉 12 个候选,见 C.3),之后所有注入都落在此文件之外。
+3. **并发写检测**。每次写回前额外比对「注入态字节 == 现在盘上的字节」,25 次全部 `concurrent=false`
+   (即注入窗口内没有别的线改过同一个文件),故没有一次写回覆盖他人改动。
+
+### C.3 AVOID(world_sim.ts)的实际影响
+
+| 套件 | 被过滤掉的候选数 | 结果 |
+| :--- | :--- | :--- |
+| `WS-FND-46` | 12 | 改用 `server/src/net/room.ts` 的投影格(见 C.4) |
+| `WS-FND-62` | 12 | 自动路径已找到红点(`db/memory_db.ts`) |
+| `WS-FND-53` / `WS-FND-59` / `WS-FND-61` / `WS-FND-64` | 各 12 | 自动路径已找到红点 |
+
+⇒ 没有套件因为「只能靠 `world_sim.ts`」而失败或跳过。
+
+### C.4 人工锚点明细(9 个套件)
+
+| 套件 | 文件 | 锚点(改前) | 改后 | 为什么这条锚点能打中该套件 |
+| :--- | :--- | :--- | :--- | :--- |
+| `WS-FND-34` | `server/src/net/actions/reset_world.ts:198` | `if (p.confirm !== true) {` | `if (p.confirm === true) {` | 破坏性动作的确认闸取反 ⇒ FND34-1「带 confirm 应 OK」红 |
+| `WS-FND-37` | `server/src/net/room.colyseus.ts:210` | `return deps.db ?? null;` | `return resolveAssembly().db;` | B 路不再回显式 `db` ⇒ FND37-4「B 路必须原样返回调用方给的库」红 |
+| `WS-FND-38` | `server/src/net/actions/move.ts:15` | `export const move: ActionHandler = (ctx) => notImplemented(ctx.action);` | 改成带一条前置语句的块体(不再是「整段只有一句转发」) | 派生口径把 MOVE 归为**已接线** ⇒ FND38-3「MOVE 应在 unwired 里」红 |
+| `WS-FND-42` | `server/src/party/scoring.ts:530` | `BRIDGE_CTF: 100,`(`PARTY_REACH_TARGET_POINTS`) | `BRIDGE_CTF: 424242,` | 夺旗主目标件分数改坏 ⇒ FND42-2「flag = 100」红 |
+| `WS-FND-44` | `server/src/net/actions/modify_town.ts:355` | `TOWNS.set(roomId, after);` | `TOWNS.set('__injected__' + roomId, after);` | 改造结果不按本房间号落库 ⇒ FND44-2「读取口应立刻变成 8」红 |
+| `WS-FND-46` | `server/src/net/room.ts:2150` | `tameOwnerId: tameOwnerOf(this.state.roomId, w.id) ?? '',` | `tameOwnerId: '',` | 投影恒空串 ⇒ FND46-1「投影必须写出主人」红(同批 FND46-2/3 仍绿) |
+| `WS-FND-47` | `server/src/rooms/effects.ts` | `export const CANTEEN_MEAL_MUL = 1.4;` | `export const CANTEEN_MEAL_MUL = 2.4;` | 大餐乘区偏离手册的 1.4 ⇒ FND47-1/6/7/8 红 |
+| `WS-FND-51` | `client/src/net/height_placement.ts` | `export const CAMERA_HEIGHT_FOLLOW_RATIO = 0.5;` | `export const CAMERA_HEIGHT_FOLLOW_RATIO = 0.1;` | 每秒闭合比改坏 ⇒ 收敛窗口/一帧窗口失效(FND51-3/6/7 红) |
+| `WS-FND-55` | `server/src/net/actions/craft.ts` | `const ADVANCED_FORGE_STATION = 505;` | `const ADVANCED_FORGE_STATION = 9999;` | 高级锻造闸认错工作台 ⇒ FND55-1「未解锁应 PERMISSION」红 |
+
+### C.5 残留自检(本次注入涉及的全部文件,注入前 SHA-256 vs 现在的字节)
+
+```
+HASH-OK   shared/net/delta.ts                                  suites=WS-13/WS-FND-63
+HASH-OK   server/src/net/actions/reset_world.ts                suites=WS-FND-34
+HASH-OK   client/src/net/action_entry.ts                       suites=WS-FND-35
+HASH-OK   server/src/net/room.colyseus.ts                      suites=WS-FND-37
+HASH-OK   server/src/net/actions/move.ts                       suites=WS-FND-38
+HASH-OK   server/src/mobs/spawner.ts                           suites=WS-FND-40/WS-FND-45
+HASH-OK   server/src/net/actions/breed_tame.ts                 suites=WS-FND-41
+HASH-OK   server/src/party/scoring.ts                          suites=WS-FND-42
+HASH-OK   server/src/net/actions/modify_town.ts                suites=WS-FND-44
+HASH-OK   server/src/net/room.ts                               suites=WS-FND-46
+HASH-OK   server/src/rooms/effects.ts                          suites=WS-FND-47
+HASH-OK   client/src/net/height_placement.ts                   suites=WS-FND-51
+HASH-OK   shared/types/physics.ts                              suites=WS-FND-53/WS-FND-59/WS-FND-64
+HASH-OK   server/src/physics/world.ts                          suites=WS-FND-54
+HASH-OK   server/src/net/actions/craft.ts                      suites=WS-FND-55
+HASH-OK   server/src/coop/rush_order.ts                        suites=WS-FND-56/WS-FND-61
+HASH-OK   server/src/db/memory_db.ts                           suites=WS-FND-57/WS-FND-62
+HASH-OK   client/src/net/joystick.ts                           suites=WS-FND-58/WS-FND-60
+modules=18 hashSame=18 diff=[]
+```
+
+⇒ `hashSame=18/18`,差异清单 `[]`。
+
+### C.6 B 批合计
+
+- 目标 **25** / 完成 **25** / 未完成 **0**;跳过 **0**。
+- 注入覆盖的**文件数:18**(全部还原;逐文件哈希见 C.5)。
+- 每套件只注入 **1** 次(共 25 次),人工锚点 9 条、自动锚点 16 条;所有 25 次都是 exit≠0 且带该判据名的 ✗ 行。
+- 复跑:25/25 全部 exit=0 且恢复为注入前的通过数(见 C.1 最后一列前的「复跑」字段)。
+
+### C.7 全量复跑(25 个套件一起重跑,还原完成后)
+
+```
+GREEN WS-13       WS-13.test.ts                            [WS-13] 20/20 通过
+GREEN WS-FND-34   WS-FND-34-world-reset.test.ts            [WS-FND-34] 6/6 通过
+GREEN WS-FND-35   WS-FND-35-client-entry.test.ts           [WS-FND-35-client-entry] 14/14 通过
+GREEN WS-FND-37   WS-FND-37-assembly-parity.test.ts        [WS-FND-37] 8/8 通过
+GREEN WS-FND-38   WS-FND-38-action-coverage.test.ts        [WS-FND-38] 9/9 通过
+GREEN WS-FND-40   WS-FND-40-town-spawner.test.ts           [WS-FND-40] 8/8 通过
+GREEN WS-FND-41   WS-FND-41-tame-world.test.ts             [WS-FND-41] 7/7 通过
+GREEN WS-FND-42   WS-FND-42-party-scoring.test.ts          [WS-FND-42] 9/9 通过
+GREEN WS-FND-44   WS-FND-44-town-e2e.test.ts               [WS-FND-44] 4/4 通过
+GREEN WS-FND-45   WS-FND-45-party-score-wired.test.ts      [WS-FND-45] 5/5 通过
+GREEN WS-FND-46   WS-FND-46-tame-projection.test.ts        [WS-FND-46] 3/3 通过
+GREEN WS-FND-47   WS-FND-47-meal-mul.test.ts               [WS-FND-47] 8/8 通过
+GREEN WS-FND-51   WS-FND-51-client-z-camera-smooth.test.ts [WS-FND-51-client-z-camera-smooth] 7/7 通过
+GREEN WS-FND-53   WS-FND-53-knockback-and-bubble-window.test.ts [WS-FND-53-knockback-and-bubble-window] 6/6 通过
+GREEN WS-FND-54   WS-FND-54-mu-multiplier.test.ts          [WS-FND-54] 6/6 通过
+GREEN WS-FND-55   WS-FND-55-forge-gate.test.ts             [WS-FND-55] 6/6 通过
+GREEN WS-FND-56   WS-FND-56-coop-station-coords.test.ts    [WS-FND-56] 6/6 通过
+GREEN WS-FND-57   WS-FND-57-reset-archive.test.ts          [WS-FND-57] 9/9 通过
+GREEN WS-FND-58   WS-FND-58-joystick-prediction.test.ts    [WS-FND-58] 9/9 通过
+GREEN WS-FND-59   WS-FND-59-world-clock.test.ts            [WS-FND-59-world-clock] 6/6 通过
+GREEN WS-FND-60   WS-FND-60-joystick-ui.test.ts            [WS-FND-60] 7/7 通过
+GREEN WS-FND-61   WS-FND-61-coop-spray-e2e.test.ts         [WS-FND-61] 6/6 通过
+GREEN WS-FND-62   WS-FND-62-world-reset-rebuild.test.ts    [WS-FND-62-world-reset-rebuild] 7/7 通过
+GREEN WS-FND-63   WS-FND-63-acked-seq-e2e.test.ts          [WS-FND-63] 5/5 通过
+GREEN WS-FND-64   WS-FND-64-world-clock-wiring.test.ts     [WS-FND-64] 5/5 通过
+TOTAL green=25/25 red=[]
+```
+
+⇒ 25 个套件在还原后**全部 exit=0**;表中各套件的通过数即注入前基线(合计 186 条断言)。
+本次收尾时又整体复跑一遍(逐个 `node tests/<套件>`,25/25 exit=0),注入痕迹为零。

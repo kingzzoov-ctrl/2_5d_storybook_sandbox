@@ -4387,13 +4387,34 @@ export class WorldSim {
    *
    * ```
    * [0,4)              magic 'WSA1'          —— 认出"这是我们自己的快照"
-   * [4,8)              uint32 LE 版本 = 1
+   * [4,8)              uint32 LE 版本 = 2
    * [8,12)             uint32 LE headerLen
    * [12, 12+headerLen) header JSON(UTF-8)
    * [12+headerLen, +4) uint32 LE chunkCount
    * 之后               chunkCount 段 `Chunk.serializeSnapshot()` 原始字节,
    *                    长度/坐标在 header 的 `chunks[]` 里(顺序 = 按 (cy,cx) 升序)
    * ```
+   *
+   * ## v2 头的**键序**(它本身就是判据的一部分)
+   *
+   * ```
+   * version, roomId, seed, sizeCells, biome, frame, hourOfDay,
+   * players, fluid, mobs, ground, chunks
+   * ```
+   *
+   * - `players[]`:每项 `id, x, y, z, level, hp` —— **`hp` 在最后**,取玩家当前
+   *   血量(`VitalsSystem` 的权威值)。v2 里 `hp` 是**必填语义**:解码器对缺 `hp`
+   *   的 v2 头抛错(不拿等级/满血值凑一个 —— 那会让「回滚」变成「顺手改血量」)。
+   * - `fluid`(**紧跟 `players` 之后**):`{ width, height, levels }`。
+   *   `levels` 是**稀疏水位表**,只收 `amount > 0` 的格,按 `(y, x)` **升序**、
+   *   不重复、整数(`FluidField.amount` 的原值)。升序/唯一是**判据**:同一份世界
+   *   归档两次必须得到逐字节相同的字节(见 `archive.ts` 的 `ArchiveFluidField`)。
+   *   干旱世界 ⇒ `levels: []`(空表,而不是省略这个键)。
+   *
+   * 其余键(世界身份 / 时钟 / 生物 / 掉落)与 v1 同义。
+   * ⚠️ **键序死守**不是风格问题:v2 的 `fluid` 键或玩家里的 `hp` 一旦挪位,
+   *   「同一份世界」的两次归档就会出两种字节,而「逐字节可比」正是回滚判据的
+   *   基础 ⇒ 写入侧的键序必须与 `encodeWorldArchive` **逐键一致**。
    *
    * ## 为什么用 `Chunk.serializeSnapshot()` 而不是自己造一份地形编码
    *
@@ -4405,14 +4426,14 @@ export class WorldSim {
    * ## 内容裁到「重建得起来」为止
    *
    * header 里有:世界身份(`roomId` / `seed` / `sizeCells` / `biome`)、时钟
-   * (`frame` / `hourOfDay`)、玩家(位置)、生物(种类/位置/血量)、地面掉落。
+   * (`frame` / `hourOfDay`)、玩家(位置 + 等级 + **血量**)、流体水位、
+   * 生物(种类/位置/血量)、地面掉落。
    * 地形是主体(字节数占 99%),所以走二进制段而不是塞进 JSON。
    *
    * ⚠️ **有大小上限**:`repo.ts` 的 `WORLD_ARCHIVE_MAX_BYTES`(1 MiB)。一个
    *    完全建满的 512×512 世界,光地形就 ~1 MiB(1024 chunk × 1144 B);
-   *    超限时归档口会**抛错**(它拒绝截断),于是重置回
-   *    `archive: null` + `archiveError`,而**世界照样重建** —— 这是如实失败,
-   *    不是静默丢档。要归档那种世界需要先裁"哪些 chunk 值得留",那是新裁决。
+   *    超限时归档口会按 `world/archive.ts` 的规则**裁地形块**(它拒绝截断),
+   *    而玩家血量与流体水位在「固定开销」里、不参与裁剪(见 `fitWorldArchive`)。
    */
   private describeWorldForArchive(): Uint8Array {
     const chunks = [...this.grid.chunks.values()]
@@ -4424,7 +4445,10 @@ export class WorldSim {
 
     const players = [...this.playerIds].slice().sort().map((id) => {
       const b = this.physics.bodies.get(id);
-      return { id, x: b?.x ?? 0, y: b?.y ?? 0, z: b?.z ?? 0, level: this.levelOf(id) };
+      /* ★ v2:每项**最后**加 `hp`(玩家当前血量)。键序是逐字节可比的一部分,
+         所以它必须排在 `level` 之后 —— 见方法头那段键序说明。 */
+      const hp = this.vitals.get(id)?.hp ?? 0;
+      return { id, x: b?.x ?? 0, y: b?.y ?? 0, z: b?.z ?? 0, level: this.levelOf(id), hp };
     });
     const mobs = this.mobHost.runtimes().map((rt) => ({
       id: rt.id, mobId: rt.def.id, x: rt.x, y: rt.y, z: rt.z, hp: rt.hp, maxHp: rt.maxHp,
@@ -4433,8 +4457,19 @@ export class WorldSim {
       itemId: groundItemId(g), count: g.count, x: g.x, y: g.y,
     }));
 
+    /* ★ v2 的稀疏水位表:只收 `amount > 0` 的格,按 `(y, x)` **升序**。
+       双重循环写死 y 为外层 —— 这就是「升序」的实现,不是巧合。
+       不收 0 水位:它与「不在表里」是同一件事,却白吃 1 MiB 的预算。 */
+    const levels: [number, number, number][] = [];
+    for (let y = 0; y < this.fluid.height; y += 1) {
+      for (let x = 0; x < this.fluid.width; x += 1) {
+        const amount = this.fluid.amountAt(x, y);
+        if (amount > 0) levels.push([x, y, amount]);
+      }
+    }
+
     const header = {
-      version: 1,
+      version: 2,
       roomId: this.roomId,
       /* ★ **旧世界**的种子:它决定"回滚到这一版"重放出来的是不是同一个世界。 */
       seed: this.worldSeed,
@@ -4443,6 +4478,8 @@ export class WorldSim {
       frame: this.frameCount,
       hourOfDay: this.hourOfDay(),
       players,
+      /* `fluid` **紧跟 `players`**(键序是逐字节可比的一部分,见方法头)。 */
+      fluid: { width: this.fluid.width, height: this.fluid.height, levels },
       mobs,
       ground,
       chunks: chunks.map((c, i) => ({ cx: c.cx, cy: c.cy, bytes: blobs[i].byteLength })),
@@ -4457,7 +4494,7 @@ export class WorldSim {
     out[1] = 0x53; /* S */
     out[2] = 0x41; /* A */
     out[3] = 0x31; /* 1 */
-    dv.setUint32(4, 1, true);
+    dv.setUint32(4, 2, true);
     dv.setUint32(8, headerBytes.byteLength, true);
     out.set(headerBytes, 12);
     let off = 12 + headerBytes.byteLength;
@@ -6494,19 +6531,22 @@ export class WorldSim {
    *   ⇒ 再归档一次,两份解码结果**逐字段相等**(地形块字节 / 玩家 / seed / 帧号)
    * ```
    *
-   * ## 刻意不做的三件(如实记账,不假装)
+   * ## 「刻意不做」的边界(随 v2 收窄,如实记账,不假装)
    * 1 **`sizeCells` 不还原**:网格 / 流体场 / 物理边界都是按它构造的,换尺寸 =
    *    换世界实例。尺寸不同 ⇒ 本方法**拒绝**(返回 `ok:false`),不改一半。
-   * 2 **流体场不还原**:chunk 快照里带 `wet/lava` 位图(地形格上的水流记号),
-   *    但 `FluidField` 自己的水位数组不在这份快照里 ⇒ 只还原「记号」,
-   *    液面高度按重建后的空地重新开始。
-   * 3 **玩家血量不还原**:WSA1 v1 的头里没有 hp(见 `archive.ts` 边界 3),
-   *    重建后的玩家是满血 —— 编一个 100 出来会让「回滚」变成「顺手改血量」。
+   *    ★ v2 的流体场尺寸走**同一条闸**:不符就**在任何改动之前**拒绝(见方法内注释)。
+   * 2 **流体水位:v1 归档没有 ⇒ 按不可用处理;v2 有则还原**。v1 头里没有
+   *    `fluid` ⇒ 计划里没有 `fluid` op ⇒ 液面按 `rebuildWorld` 后的空地重新开始;
+   *    v2 有 ⇒ 逐格 `fluid.setCell({ amount })` 铺回去(未列出的格保持重建值,
+   *    **不清零** —— 清零会把「归档里没有的水」也一并抹掉)。
+   * 3 **玩家血量:v1 归档没有 ⇒ 按不可用处理;v2 有则还原**。v1 头里没有 `hp`
+   *    ⇒ 玩家保持 `addPlayer` 登记后的满血(**不许**填一个 100);v2 有 ⇒ 写回
+   *    `vitals.hp` 并**自己重算 `downed`**(hp ≤ 0 ⇒ 倒地,避免「血量 0 不倒地」)。
    */
   applyRestore(plan: RestorePlan): {
     ok: boolean;
     reason?: string;
-    applied?: { chunks: number; players: number; mobs: number; ground: number; seed: number; frame: number };
+    applied?: { chunks: number; players: number; mobs: number; ground: number; fluid: number; seed: number; frame: number };
   } {
     if (plan === null || typeof plan !== 'object' || !Array.isArray(plan.ops)) {
       return { ok: false, reason: '回滚计划形状不对(需要一个带 ops 数组的对象)' };
@@ -6520,6 +6560,21 @@ export class WorldSim {
         ok: false,
         reason: `世界边长不可回滚(归档 ${worldOp.sizeCells} 格 vs 当前 ${this.sizeCells} 格)`
           + ' —— 网格/流体/物理边界都按这个数构造',
+      };
+    }
+
+    /* ★ v2 的流体场尺寸:**任何改动之前**校验(与上一条同处一道闸)。
+       水位场的边界按世界边长构造 ⇒ 尺寸不符就只能拒绝;若挪到重建之后才发现,
+       `WS-FND-78` 的「拒绝时世界一字未改」就已经破了(那时地形/玩家都动过了)。 */
+    const fluidOp = plan.ops.find((o) => o.kind === 'fluid');
+    if (
+      fluidOp !== undefined && fluidOp.kind === 'fluid'
+      && (fluidOp.width !== this.fluid.width || fluidOp.height !== this.fluid.height)
+    ) {
+      return {
+        ok: false,
+        reason: `流体场尺寸不可回滚(归档 ${fluidOp.width}×${fluidOp.height} vs 当前 `
+          + `${this.fluid.width}×${this.fluid.height}) —— 水位场边界按世界边长构造`,
       };
     }
 
@@ -6551,7 +6606,29 @@ export class WorldSim {
       const b = this.physics.bodies.get(op.id);
       if (b !== undefined) b.z = op.z;
       if (Number.isFinite(op.level)) this.progressOf(op.id).level = Math.trunc(op.level);
+      /* ★ v2 的玩家血量:`hp` **缺键 = 不可用**(v1 头里没有它)⇒ 保持
+         `addPlayer` 登记后的满血,**不许**在这里填一个 100。
+         有值才写回,并**自己重算 `downed`** —— `revive` 恒清 `downed`,
+         若把「hp ≤ 0 ⇒ 倒地」留给它就永远不成立(血量 0 却不倒地)。 */
+      if (op.hp !== undefined) {
+        this.vitals.revive(op.id, op.hp);
+        const v = this.vitals.get(op.id);
+        if (v !== null) v.downed = v.hp <= 0;
+      }
       players += 1;
+    }
+
+    /* 4.5 ★ v2 的流体水位:逐格 `setCell({ amount })` 铺回去。
+       ⚠️ **不直接写 `amount[]`** —— 那会绕过活跃集合(`markActive`),这些水位
+       下一帧**不会被推进**(表现成「水面不流动」而不报错,且没有任何异常)。
+       未列出的格**保持 `rebuildWorld` 后的值**(空场 = 0),不主动清零。 */
+    let fluid = 0;
+    for (const op of plan.ops) {
+      if (op.kind !== 'fluid') continue;
+      for (const l of op.levels) {
+        if (this.fluid.inBounds(l.x, l.y)) this.fluid.setCell(l.x, l.y, { amount: l.amount });
+      }
+      fluid += 1;
     }
 
     /* 5 生物:重新注册(位置来自归档),血量按归档写回宿主运行时。 */
@@ -6583,7 +6660,7 @@ export class WorldSim {
     this.roomsDirty = true;
     return {
       ok: true,
-      applied: { chunks, players, mobs, ground, seed: this.worldSeed, frame: this.frameCount },
+      applied: { chunks, players, mobs, ground, fluid, seed: this.worldSeed, frame: this.frameCount },
     };
   }
 

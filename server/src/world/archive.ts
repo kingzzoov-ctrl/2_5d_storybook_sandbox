@@ -39,6 +39,17 @@
  * | 2 | 小世界 **全部保留**;超预算世界 ⇒ 裁剪后字节数 ≤ 上限、被裁列表非空、原因可读 | 裁了但没用预算 / 静默截断 / 裁掉玩家建造 |
  * | 3 | 归档 → 解码 → 计划 → **应用到空世界** ⟷ 归档前的描述逐字段相等 | 计划漏字段 / 把 `current` 混进 ops |
  *
+ * ## 头有**两个版本**,解码器两个都收(判据见 `tests/WS-FND-80`)
+ *
+ * | 版本 | 头里多什么 | 读不到时怎么办 |
+ * | :--- | :--- | :--- |
+ * | **v1** | 玩家只有 `id/x/y/z/level`;没有流体水位 | 这两项按**不可用**处理:`ArchivePlayer.hp === undefined` / `fluid === null`;回滚计划把它们列进 `unavailable`,**不抛错、不编值** |
+ * | **v2**(本文件默认写出的) | `players[].hp` + `fluid`(非零水位格) | `hp` 在 v2 里是**必填语义**:缺 ⇒ 抛错(拿等级或满血值凑 = 「回滚」变成「顺手改血量」)。`fluid` 允许缺席(干旱世界 ⇒ 解码得 `null`) |
+ *
+ * `encode(decode(x)) === x` 对**两个版本**都逐字节成立 —— 为此编码器写哪个
+ * 版本由**入参形状**决定(见 `resolveWriteVersion`):入参本身是 v1 形状就写
+ * v1。否则「对一个 v1 解码结果重新编码」会凭空升版,往返当场不成立。
+ *
  * ## 三处**刻意不做**的(边界,别当成已实现)
  *
  * 1 **不碰 `world_sim.ts`**:回滚只做到**计划层**(`RestorePlan` 是一份纯数据),
@@ -46,9 +57,11 @@
  *    世界?)且那个文件是别人的。
  * 2 **不写库**:本文件不认识 `DbLike`。裁剪成字节之后**谁**去写由
  *    `db/repo.ts:archiveWorldSnapshot` 决定(它拿本文件的 `fitWorldArchive`)。
- * 3 **不补格式里没有的字段**:WSA1 v1 的头里**没有玩家血量**(只有
- *    `id/x/y/z/level`),所以回滚计划把 `players[].hp` 列进 `unavailable`
- *    而不是编一个 100 出来 —— 编出来会让「回滚」变成「顺手改玩家血量」。
+ * 3 **不为「缺字段」编值**:v1 头里没有 `hp` / `fluid` ⇒ 解码如实给
+ *    `undefined` / `null`,回滚计划把缺口列进 `unavailable`。编一个 100 出来
+ *    会让「回滚」变成「顺手改玩家血量」。写入侧**不许**反过来:声明 v2 却缺
+ *    `hp`,或声明 v1 却带着 `hp`/`fluid`,`encodeWorldArchive` 一律抛错
+ *    (默默丢掉调用方给的数据比抛错更糟)。
  */
 
 import { Chunk, DIRTY_WORDS, popcount32, toBytes } from './chunk.ts';
@@ -59,8 +72,21 @@ import { CHUNK_BYTES, unpackTile } from '../../../shared/types/tile.ts';
 /** magic `'WSA1'`(逐字节,不经 UTF-8 —— 理由见写入侧那行注释)。 */
 export const WORLD_ARCHIVE_MAGIC = 'WSA1';
 
-/** 格式版本。裁剪**不升版**:`trim` 是头里一个可选扩展键(见 `encodeWorldArchive`)。 */
-export const WORLD_ARCHIVE_FORMAT_VERSION = 1;
+/**
+ * **本文件默认写出**的格式版本:
+ *   v2 = 头里多了 `players[].hp`(玩家血量)与 `fluid`(流体场水位)。
+ * 裁剪**不升版**:`trim` 是头里一个可选扩展键(见 `encodeWorldArchive`)。
+ */
+export const WORLD_ARCHIVE_FORMAT_VERSION = 2;
+
+/**
+ * 仍然**可读**的最低版本。
+ *
+ * v1 的头里没有 `hp` / `fluid` ⇒ 这两项按「不可用」处理(`undefined` / `null`),
+ * **不抛错、不编值**。这条常量存在的意义是把「读得回旧字节」写成可判的边界:
+ * 版本区间之外(0 / 3 / …)一律抛错,而不是尽力猜。
+ */
+export const WORLD_ARCHIVE_MIN_READABLE_VERSION = 1;
 
 /** `magic[4) + version[4) + headerLen[4)`,见写入侧 docblock 的 `[0,12)`。 */
 const PREFIX_BYTES = 12;
@@ -96,13 +122,58 @@ export interface ArchiveWorldMeta {
   hourOfDay: number;
 }
 
-/** 玩家世代:位置 + 等级。**没有 hp**(格式里就没有,见文件头边界 3)。 */
+/**
+ * 玩家世代:位置 + 等级(+ **v2 才有的血量**)。
+ *
+ * `hp` 是**可选**字段,这件事本身就是判据的一部分:
+ *   - v2 头里有它 ⇒ 回滚还原血量;
+ *   - v1 头里没有 ⇒ `undefined` = **不可用**,回滚计划把 `players[].hp` 写进
+ *     `unavailable`,由宿主按登记重置 —— **不编一个 100**(编出来会让
+ *     「回滚」变成「顺手改玩家血量」)。
+ */
 export interface ArchivePlayer {
   id: string;
   x: number;
   y: number;
   z: number;
   level: number;
+  /** v2:玩家血量(毫点级实数;v1 头里没有 ⇒ `undefined`)。 */
+  hp?: number;
+}
+
+/**
+ * 一格**水位**(毫格,`FluidField.amount` 的原值)。
+ *
+ * 只有**非零**的格才进表:「0 水位」与「不在表里」是同一件事(解码 = 未列出
+ * 的格全 0),而干旱世界占了真实世界的大多数格 ⇒ 稀疏表几乎不花字节。
+ */
+export interface ArchiveFluidLevel {
+  x: number;
+  y: number;
+  /** 毫格(正整数;1 满格 = 1000 毫格,见 `world/fluid.ts:CAP`)。 */
+  amount: number;
+}
+
+/**
+ * v2 头里的**流体场水位**(`WorldSim.fluid` 的 `amount` 数组)。
+ *
+ * ## 为什么是稀疏表而不是密度数组
+ *
+ * 512×512 的密度数组是 262144 个数(JSON 里 ~2MB),而归档的字节上限是
+ * 1 MiB(`db/repo.ts:WORLD_ARCHIVE_MAX_BYTES`)—— 密集表会把「归档」变成
+ * 「必然超限再被裁」,即水位永远存不下来。稀疏表 + **全序** = 同样的信息、
+ * 可判定的字节。
+ *
+ * ## 键序/表序都是判据的一部分
+ *
+ * `levels` 必须按 `(y, x)` 升序且不重复(解码时校验):这样「同一份世界归档
+ * 两次」得到逐字节相同的水位段,`encode(decode(x)) === x` 才有意义。
+ */
+export interface ArchiveFluidField {
+  width: number;
+  height: number;
+  /** 非零水位格,**按 `(y, x)` 升序、不重复**。 */
+  levels: ArchiveFluidLevel[];
 }
 
 export interface ArchiveMob {
@@ -200,6 +271,8 @@ export interface DecodedWorldArchive {
   bodyBytes: number;
   world: ArchiveWorldMeta;
   players: ArchivePlayer[];
+  /** v2 的流体场水位(v1 头里没有 ⇒ `null` = **不可用**,回滚不铺水位)。 */
+  fluid: ArchiveFluidField | null;
   mobs: ArchiveMob[];
   ground: ArchiveGroundItem[];
   /** 地形 chunk 列表(**头里声明的顺序**;写入侧按 `(cy, cx)` 升序)。 */
@@ -321,6 +394,76 @@ function decodeTrimNote(v: unknown): ArchiveTrimReport | null {
 }
 
 /**
+ * 头里的 `fluid` 扩展键(v2)。`undefined` / `null` ⇒ `null`(**不可用**,
+ * 不编一个全零密度场)。
+ *
+ * ## 为什么要逐条校验,而且规则是**可判定的**
+ *
+ * 水位表的用途是「把液面还回去」,所以它必须是**全序、无重复、坐标在界内**:
+ *   - 乱序 / 重复 ⇒ 「同一份世界归档两次」的字节可能不同(逐字节可比就废了);
+ *   - 坐标越界 ⇒ 铺水位时静默写不进去(或写到别的格上);
+ *   - `amount <= 0` ⇒ 与「不在表里」重复表达同一件事,白吃字节。
+ * 这三条都在这里抛错(说清第几条),而不是「尽力读一部分」。
+ */
+function decodeFluidField(v: unknown): ArchiveFluidField | null {
+  if (v === undefined || v === null) return null;
+  const o = recordField(v, 'header.fluid');
+  const width = intField(o.width, 'header.fluid.width');
+  const height = intField(o.height, 'header.fluid.height');
+  if (width <= 0 || height <= 0) {
+    throw new Error(
+      `WSA1 解码失败:header.fluid 的尺寸 ${width}×${height} 不是正数(水位场必须有界)`,
+    );
+  }
+  const rows = arrayField(o.levels, 'header.fluid.levels');
+  const levels: ArchiveFluidLevel[] = [];
+  /* 上一个格的 `y * width + x`:用它判「升序且不重复」,不必造一张集合。 */
+  let prevKey = -1;
+  for (let i = 0; i < rows.length; i += 1) {
+    const where = `header.fluid.levels[${i}]`;
+    const row = arrayField(rows[i], where);
+    if (row.length !== 3) {
+      throw new Error(
+        `WSA1 解码失败:${where} 必须是 [x, y, amount] 三元组(实得 ${row.length} 项)`,
+      );
+    }
+    const x = intField(row[0], `${where}[0](x)`);
+    const y = intField(row[1], `${where}[1](y)`);
+    const amount = intField(row[2], `${where}[2](amount)`);
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+      throw new Error(
+        `WSA1 解码失败:${where} 的坐标 (${x},${y}) 在 ${width}×${height} 水位场之外`,
+      );
+    }
+    if (amount <= 0) {
+      throw new Error(
+        `WSA1 解码失败:${where} 的水位 ${amount} 不是正数`
+        + '(0 水位与「不在表里」是同一件事,不该进表)',
+      );
+    }
+    const key = y * width + x;
+    if (key <= prevKey) {
+      throw new Error(
+        `WSA1 解码失败:${where} 的坐标 (${x},${y}) 破坏了 (y, x) 升序/唯一性`
+        + `(前一格 key=${prevKey},本格 key=${key})—— 水位表必须是全序`,
+      );
+    }
+    prevKey = key;
+    levels.push({ x, y, amount });
+  }
+  return { width, height, levels };
+}
+
+/** 水位场的**深拷贝**(回滚计划/世界描述不许与解码结果共用同一批数组)。 */
+function copyFluidField(f: ArchiveFluidField | null): ArchiveFluidField | null {
+  if (f === null) return null;
+  return {
+    width: f.width,
+    height: f.height,
+    levels: f.levels.map((l) => ({ x: l.x, y: l.y, amount: l.amount })),
+  };
+}
+/**
  * `WSA1` 字节 → 结构化对象。**纯函数**,坏数据一律抛错(说清是哪个位置/字段)。
  *
  * 为什么坏数据必须抛而不是「尽力而为」:这份字节的唯一用途是**回滚**,
@@ -345,8 +488,18 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
   }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const version = dv.getUint32(4, true);
-  if (version !== WORLD_ARCHIVE_FORMAT_VERSION) {
-    throw new Error(`WSA1 解码失败:版本 ${version} 不认识(本文件只认 ${WORLD_ARCHIVE_FORMAT_VERSION})`);
+  /* ★ 版本区间而不是「等于当前版本」:v1 的字节必须**仍然读得回**
+     (老归档、老测试夹具里都是 v1)。区间外的版本才是坏数据。 */
+  if (
+    !Number.isInteger(version)
+    || version < WORLD_ARCHIVE_MIN_READABLE_VERSION
+    || version > WORLD_ARCHIVE_FORMAT_VERSION
+  ) {
+    throw new Error(
+      `WSA1 解码失败:版本 ${version} 不认识(本文件读 `
+      + `${WORLD_ARCHIVE_MIN_READABLE_VERSION}~${WORLD_ARCHIVE_FORMAT_VERSION},`
+      + `写 ${WORLD_ARCHIVE_FORMAT_VERSION})`,
+    );
   }
   const headerLen = dv.getUint32(8, true);
   const headerEnd = HEADER_START + headerLen;
@@ -363,10 +516,11 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
     throw new Error(`WSA1 解码失败:头不是合法 JSON(${e instanceof Error ? e.message : String(e)})`);
   }
   const header = recordField(headerRaw, 'header');
-  if (intField(header.version, 'header.version') !== version) {
+  const headerVersion = intField(header.version, 'header.version');
+  if (headerVersion !== version) {
     throw new Error(
-      `WSA1 解码失败:头里的 version(${String(header.version)})与 `
-      + `[4,8) 的 uint32(${version})不一致 —— 这份字节是拼出来的`,
+      `WSA1 解码失败:头里的 version(${headerVersion})与 [4,8) 的 uint32 版本号`
+      + `(${version})不一致 —— 这份字节是拼出来的`,
     );
   }
 
@@ -379,16 +533,40 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
     hourOfDay: numField(header.hourOfDay, 'header.hourOfDay'),
   };
 
-  const players = arrayField(header.players, 'header.players').map((raw, i) => {
+  /* 告警收集器必须在**玩家**之前声明:v1 头里出现 v2 才有的字段(hp / fluid)
+     是非致命异常,要报出来(语义见 `DecodedWorldArchive.warnings`)。 */
+  const warnings: string[] = [];
+  const players: ArchivePlayer[] = arrayField(header.players, 'header.players').map((raw, i) => {
     const p = recordField(raw, `header.players[${i}]`);
-    return {
+    const out: ArchivePlayer = {
       id: strField(p.id, `header.players[${i}].id`),
       x: numField(p.x, `header.players[${i}].x`),
       y: numField(p.y, `header.players[${i}].y`),
       z: numField(p.z, `header.players[${i}].z`),
       level: intField(p.level, `header.players[${i}].level`),
     };
+    if (version >= 2) {
+      /* ★ v2 里 `hp` 是**必填语义**:缺席就抛错 —— 不拿等级或满血值凑一个,
+         那会把「回滚」变成「顺手改玩家血量」(见文件头 §1 表格)。 */
+      out.hp = numField(p.hp, `header.players[${i}].hp(v2 头里必填)`);
+      if (out.hp < 0) {
+        throw new Error(
+          `WSA1 解码失败:header.players[${i}].hp 是 ${out.hp} —— 血量不能是负数`,
+        );
+      }
+    } else if (p.hp !== undefined) {
+      warnings.push(
+        `header.players[${i}].hp 是 v2 才有的字段,但头版本是 v1 ⇒ 按**不可用**处理(不读它)`,
+      );
+    }
+    return out;
   });
+  /* ★ v2 的流体水位:v1 头里没有 ⇒ `null`;v2 也允许缺席(干旱世界 ⇒ `null`)。
+     两种情况都不编一个全零密度场 —— 那会让「不可用」看起来像「已还原」。 */
+  const fluid = version >= 2 ? decodeFluidField(header.fluid) : null;
+  if (version < 2 && header.fluid !== undefined && header.fluid !== null) {
+    warnings.push('header.fluid 是 v2 才有的字段,但头版本是 v1 ⇒ 按**不可用**处理(不读它)');
+  }
   const mobs = arrayField(header.mobs, 'header.mobs').map((raw, i) => {
     const m = recordField(raw, `header.mobs[${i}]`);
     return {
@@ -419,7 +597,6 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
     );
   }
 
-  const warnings: string[] = [];
   const chunks: ArchiveChunk[] = [];
   let pos = headerEnd + CHUNK_COUNT_BYTES;
   for (let i = 0; i < chunkCount; i += 1) {
@@ -455,6 +632,7 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
     bodyBytes,
     world,
     players,
+    fluid,
     mobs,
     ground,
     chunks,
@@ -473,8 +651,20 @@ export interface WorldArchiveChunkPayload {
 }
 
 export interface EncodeWorldArchiveInput {
+  /**
+   * 头版本(1 或 2)。**省略时按入参形状推断**(见 `resolveWriteVersion`):
+   *   - 给了 `fluid`,或任一玩家带 `hp` ⇒ 写 **v2**(= 本文件默认方向);
+   *   - 入参本身就是 v1 形状(无 `fluid`、玩家无 `hp`)⇒ 写 **v1**。
+   *
+   * 为什么不写成一个永远 v2 的默认值:「`encode(decode(x)) === x` 对**两个
+   * 版本**都逐字节成立」是回滚判据的基础,而对一个 v1 解码结果重新编码时,
+   * 写 v2 会凭空升版(前缀 4 字节 + 头里的 version 都变),往返当场不成立。
+   */
+  version?: number;
   world: ArchiveWorldMeta;
   players: readonly ArchivePlayer[];
+  /** v2:流体场水位。`undefined` / `null` ⇒ **不写这个键**(v1 头里没有它)。 */
+  fluid?: ArchiveFluidField | null;
   mobs: readonly ArchiveMob[];
   ground: readonly ArchiveGroundItem[];
   chunks: readonly WorldArchiveChunkPayload[];
@@ -483,28 +673,120 @@ export interface EncodeWorldArchiveInput {
 }
 
 /**
+ * 水位表写成**全序**(按 `(y, x)` 升序,与解码器的校验同一把尺子),并挡住
+ * 三种坏入参(非整数 / 非正数 / 同一格两次)。
+ *
+ * 为什么编码侧要**排序**而不是「调用方自己按序给」:排序让「同一份水位」只有
+ * 一种字节形态(两次归档逐字节可比);而不校验非正整数会让
+ * `amount: 0` 这类「等价于缺席」的行白吃预算 —— 归档的字节上限是 1 MiB,
+ * 每一行的意义都必须能说清。
+ */
+function canonicalLevels(levels: readonly ArchiveFluidLevel[]): ArchiveFluidLevel[] {
+  const rows = levels.slice();
+  for (const l of rows) {
+    if (!Number.isInteger(l.amount) || l.amount <= 0) {
+      throw new Error(
+        `WSA1 编码失败:水位 (${l.x},${l.y}) 的 amount 必须是正整数(实得 ${String(l.amount)})`
+        + ' —— 0 水位与「不在表里」是同一件事,不该进表',
+      );
+    }
+  }
+  rows.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+  for (let i = 1; i < rows.length; i += 1) {
+    if (rows[i].y === rows[i - 1].y && rows[i].x === rows[i - 1].x) {
+      throw new Error(
+        `WSA1 编码失败:水位表里 (${rows[i].x},${rows[i].y}) 出现了两次(一格只有一个水位)`,
+      );
+    }
+  }
+  return rows;
+}
+
+/**
+ * **写出哪个版本**:显式给 `version` 就用它;否则按「入参里有没有 v2 载荷」定。
+ *
+ * 两条**不许**的写法(与「不编值」同源,都在调用方那一侧):声明 v2 却缺
+ * `hp`,或声明 v1 却带着 `hp` / `fluid` —— 两者都抛错而不是「凑一个」/「默默
+ * 丢掉」。见 `encodeWorldArchive` 里的落实。
+ */
+function resolveWriteVersion(input: EncodeWorldArchiveInput): number {
+  const declared = input.version;
+  if (declared !== undefined) {
+    if (declared !== 1 && declared !== 2) {
+      throw new Error(
+        `WSA1 编码失败:版本 ${String(declared)} 不是本文件支持的 1 / 2`
+        + `(读得回的是 ${WORLD_ARCHIVE_MIN_READABLE_VERSION}~${WORLD_ARCHIVE_FORMAT_VERSION})`,
+      );
+    }
+    return declared;
+  }
+  const hasFluid = input.fluid !== undefined && input.fluid !== null;
+  const hasHp = input.players.some((p) => p.hp !== undefined);
+  return hasFluid || hasHp ? 2 : 1;
+}
+
+/**
  * 结构化对象 → `WSA1` 字节。**与写入侧逐键同序**,所以对同一份解码结果
- * `encode(decode(x)) === x`(判据 1 的第二半)。
+ * `encode(decode(x)) === x`(判据 1 的第二半;**两个版本**都成立)。
  *
  * 为什么键序要死守:那不是「风格」—— 逐字节可比是「归档前后是不是同一份世界」
  * 的判据基础(见 `describeWorldForArchive` 里那段对 `Map` 插入顺序的说明)。
+ *
+ * v2 的键序(写入侧必须同序):
+ * `version, roomId, seed, sizeCells, biome, frame, hourOfDay, players,
+ *  fluid, mobs, ground, chunks, [trim]`;玩家对象内是 `id, x, y, z, level, hp`。
  */
 export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
+  const version = resolveWriteVersion(input);
+  const fluid = input.fluid === undefined ? null : input.fluid;
+  if (version === 1 && (fluid !== null || input.players.some((p) => p.hp !== undefined))) {
+    throw new Error(
+      'WSA1 编码失败:版本 1 的头里没有 players[].hp / fluid'
+      + '(要带上它们就把 version 写成 2,或省略 version 让入参形状决定)'
+      + ' —— 默默丢掉调用方给的数据比抛错更糟',
+    );
+  }
+  if (version >= 2) {
+    for (const p of input.players) {
+      if (p.hp === undefined) {
+        throw new Error(
+          `WSA1 编码失败:v2 头里玩家 ${p.id} 没有 hp(v2 的 hp 是必填语义,不编值)`,
+        );
+      }
+      if (!Number.isFinite(p.hp) || p.hp < 0) {
+        throw new Error(
+          `WSA1 编码失败:v2 头里玩家 ${p.id} 的 hp 必须是 ≥ 0 的有限数(实得 ${String(p.hp)})`,
+        );
+      }
+    }
+  }
   const header: Record<string, unknown> = {
-    version: WORLD_ARCHIVE_FORMAT_VERSION,
+    version,
     roomId: input.world.roomId,
     seed: input.world.seed,
     sizeCells: input.world.sizeCells,
     biome: input.world.biome,
     frame: input.world.frame,
     hourOfDay: input.world.hourOfDay,
-    players: input.players.map((p) => ({ id: p.id, x: p.x, y: p.y, z: p.z, level: p.level })),
-    mobs: input.mobs.map((m) => ({
-      id: m.id, mobId: m.mobId, x: m.x, y: m.y, z: m.z, hp: m.hp, maxHp: m.maxHp,
-    })),
-    ground: input.ground.map((g) => ({ itemId: g.itemId, count: g.count, x: g.x, y: g.y })),
-    chunks: input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength })),
+    players: input.players.map((p) => (version >= 2
+      ? { id: p.id, x: p.x, y: p.y, z: p.z, level: p.level, hp: p.hp }
+      : { id: p.id, x: p.x, y: p.y, z: p.z, level: p.level })),
   };
+  /* ★ `fluid` **紧跟** `players`(键序是逐字节可比的一部分)。
+     用赋值而不是写进上面的字面量:键**缺席**与「写一个 null」在字节层是两回事,
+     而 v1 头里根本没有这个键。 */
+  if (fluid !== null) {
+    header.fluid = {
+      width: fluid.width,
+      height: fluid.height,
+      levels: canonicalLevels(fluid.levels).map((l) => [l.x, l.y, l.amount]),
+    };
+  }
+  header.mobs = input.mobs.map((m) => ({
+    id: m.id, mobId: m.mobId, x: m.x, y: m.y, z: m.z, hp: m.hp, maxHp: m.maxHp,
+  }));
+  header.ground = input.ground.map((g) => ({ itemId: g.itemId, count: g.count, x: g.x, y: g.y }));
+  header.chunks = input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength }));
   if (input.trim !== undefined && input.trim !== null) {
     header.trim = {
       budgetBytes: input.trim.budgetBytes,
@@ -529,7 +811,7 @@ export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
   );
   const dv = new DataView(out.buffer);
   for (let i = 0; i < MAGIC_BYTES.length; i += 1) out[i] = MAGIC_BYTES[i];
-  dv.setUint32(4, WORLD_ARCHIVE_FORMAT_VERSION, true);
+  dv.setUint32(4, version, true);
   dv.setUint32(8, headerBytes.byteLength, true);
   out.set(headerBytes, HEADER_START);
   let off = HEADER_START + headerBytes.byteLength;
@@ -739,11 +1021,19 @@ export interface FitWorldArchiveResult {
   report: ArchiveTrimReport | null;
 }
 
-/** 把「块表」换成空的再编码一次 = 不含地形的固定开销。 */
+/**
+ * 把「块表」换成空的再编码一次 = 不含地形的固定开销。
+ *
+ * ⚠️ 必须按**原版本**与**原水位**量(v2 的两项也在固定开销里):漏掉 `fluid`
+ * 会让量出来的开销偏小,于是最后一步编码超出上限、被迫再让一块 —— 「水位把
+ * 地形挤掉」这种数字上的因果关系在本文件里不该出现。
+ */
 function fixedOverheadBytes(decoded: DecodedWorldArchive): number {
   return encodeWorldArchive({
+    version: decoded.version,
     world: decoded.world,
     players: decoded.players,
+    fluid: decoded.fluid,
     mobs: decoded.mobs,
     ground: decoded.ground,
     chunks: [],
@@ -763,6 +1053,15 @@ function lowestPriorityAmong(kept: readonly ArchiveChunk[]): ArchiveChunk {
  * **把一份快照装进字节上限**:够小就原样返回;超了就按 §5 的规则裁块并重新
  * 装回去。纯函数(不碰库、不碰世界)。
  *
+ * ## 裁剪**只裁地形**
+ *
+ * 玩家血量 / 流体水位 / 世界世代 / 生物 / 掉落都在头里,裁块不动它们
+ * (预算里先扣掉固定开销,见 `fixedOverheadBytes`)。所以「裁过的归档」与
+ * 「裁过之后回滚」仍然能还回玩家的血与液面 —— 只是缺了那几块地形。
+ *
+ * 重编码时显式带上 `version` / `fluid`:不显式给就会**按形状推断**,
+ * 而一份「v2 但没有水位」的入参推断出来的仍不是原版本 —— 逐字节可比会当场破掉。
+ *
  * @param maxBytes 硬上限(生产是 `repo.ts:WORLD_ARCHIVE_MAX_BYTES` = 1 MiB)
  * @throws 解码失败(不是 `WSA1`)/ 连零块地形都装不下(如实失败,不写半截世界)
  */
@@ -776,8 +1075,9 @@ export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorl
   const fixed = fixedOverheadBytes(decoded);
   if (fixed > max) {
     throw new Error(
-      `WSA1 裁剪失败:即使一块地形都不留,固定部分(头/玩家/生物/掉落)仍 ${fixed} 字节`
-      + ` > 上限 ${max} 字节 —— 缩短玩家/生物列表才能归档(不在这里替 owner 决定丢谁)`,
+      `WSA1 裁剪失败:即使一块地形都不留,固定部分(头/玩家(含血量)/生物/掉落/水位)仍 ${fixed} 字节`
+      + ` > 上限 ${max} 字节 —— 只有缩短玩家/生物列表、或减少非零水位格才能归档`
+      + '(不在这里替 owner 决定丢谁)',
     );
   }
   const plan = planChunkTrim(decoded.chunks, max - fixed);
@@ -802,8 +1102,10 @@ export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorl
       dropped: dropped.slice(),
     };
     const out = encodeWorldArchive({
+      version: decoded.version,
       world: decoded.world,
       players: decoded.players,
+      fluid: decoded.fluid,
       mobs: decoded.mobs,
       ground: decoded.ground,
       chunks: kept,
@@ -815,7 +1117,7 @@ export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorl
     if (kept.length === 0) {
       throw new Error(
         `WSA1 裁剪失败:裁掉全部 ${decoded.chunks.length} 块地形后仍 ${out.byteLength} 字节`
-        + ` > 上限 ${max} 字节(头里的玩家/生物/掉落太长)`,
+        + ` > 上限 ${max} 字节(头里的玩家(含血量)/生物/掉落/水位太长)`,
       );
     }
     /* `trim` 摘要自己也要占字节:让掉优先级最低的一块再量一次。 */
@@ -841,8 +1143,8 @@ export function fitWorldArchive(snapshot: Uint8Array, maxBytes: number): FitWorl
  * 2 `RestorePlan.ops` **自足**:只靠 ops 就能从「空世界」重建出旧世界
  *   (`current` 只影响 `changes` 里那几句可读的差异叙述,**不**影响 ops ——
  *    否则「重建」就依赖当前状态,回滚不再是纯函数);
- * 3 归档里**没有**的东西进 `unavailable`(玩家血量)或 `missingChunks`
- *    (被裁掉的地形块),**不许**编值。
+ * 3 归档里**没有**的东西进 `unavailable`(玩家血量 / 流体水位)或
+ *    `missingChunks`(被裁掉的地形块),**不许**编值。
  *
  * ## 为什么先出「计划」而不是直接改世界
  *
@@ -874,6 +1176,8 @@ export interface RestoreWorldState {
   frame: number;
   hourOfDay: number;
   players: ArchivePlayer[];
+  /** v2 的流体水位(`null` = 归档里没有这一项 ⇒ 不可用,回滚不铺水位)。 */
+  fluid: ArchiveFluidField | null;
   mobs: ArchiveMob[];
   ground: ArchiveGroundItem[];
   chunks: RestoreChunk[];
@@ -889,6 +1193,7 @@ export function emptyWorldState(): RestoreWorldState {
     frame: 0,
     hourOfDay: 0,
     players: [],
+    fluid: null,
     mobs: [],
     ground: [],
     chunks: [],
@@ -909,7 +1214,12 @@ export function describeDecodedWorld(decoded: DecodedWorldArchive): RestoreWorld
     biome: decoded.world.biome,
     frame: decoded.world.frame,
     hourOfDay: decoded.world.hourOfDay,
-    players: decoded.players.map((p) => ({ id: p.id, x: p.x, y: p.y, z: p.z, level: p.level })),
+    players: decoded.players.map((p) => (p.hp === undefined
+      ? { id: p.id, x: p.x, y: p.y, z: p.z, level: p.level }
+      : { id: p.id, x: p.x, y: p.y, z: p.z, level: p.level, hp: p.hp })),
+    /* ★ 水位走**深拷贝**:描述/计划不许与解码结果共用同一批数组 ——
+       共享会让「同一份计划应用两次」在字面上互相影响。 */
+    fluid: copyFluidField(decoded.fluid),
     mobs: decoded.mobs.map((m) => ({
       id: m.id, mobId: m.mobId, x: m.x, y: m.y, z: m.z, hp: m.hp, maxHp: m.maxHp,
     })),
@@ -939,6 +1249,30 @@ export interface RestorePlayerOp {
   y: number;
   z: number;
   level: number;
+  /**
+   * 归档里**有**血量才带这个键。
+   *
+   * v1 头里没有 `hp` ⇒ 键**缺席** = 不可用:应用侧按「重建后满血」处理,
+   * 不许在这里填一个 100(v2 头里则有,且由解码器保证是有限非负数)。
+   */
+  hp?: number;
+}
+
+/**
+ * 一条「把**流体水位**铺回去」的 op —— **v2 才有**。
+ *
+ * v1 的归档里没有水位(`fluid === null`)⇒ 这条 op **不产生**(见 `planRestore`)。
+ * 「缺水位」是缺口,不是「水位全 0」:编一个全零密度场会让回滚**静默把水抽干**,
+ * 而回执上看不出这件事。
+ *
+ * `levels` 是全序(按 `(y, x)` 升序)的非零水位表;没被列出的格保持宿主重建后
+ * 的值(应用侧不负责把它清零)。
+ */
+export interface RestoreFluidOp {
+  kind: 'fluid';
+  width: number;
+  height: number;
+  levels: ArchiveFluidLevel[];
 }
 
 export interface RestoreChunkOp {
@@ -970,6 +1304,7 @@ export interface RestoreGroundOp {
 export type RestoreOp =
   | RestoreWorldOp
   | RestorePlayerOp
+  | RestoreFluidOp
   | RestoreChunkOp
   | RestoreMobOp
   | RestoreGroundOp;
@@ -1021,7 +1356,23 @@ export function planRestore(
     hourOfDay: snapshot.world.hourOfDay,
   });
   for (const p of snapshot.players) {
-    ops.push({ kind: 'player', id: p.id, x: p.x, y: p.y, z: p.z, level: p.level });
+    /* `hp` **只在归档里有的时候**才带上:v1 头里没有 ⇒ 键缺席 = 不可用,
+       ops 也就不许凭空填一个 100(见 `RestorePlayerOp.hp`)。 */
+    const op: RestorePlayerOp = {
+      kind: 'player', id: p.id, x: p.x, y: p.y, z: p.z, level: p.level,
+    };
+    if (p.hp !== undefined) op.hp = p.hp;
+    ops.push(op);
+  }
+  /* ★ v2 的流体水位(v1 里 `fluid === null` ⇒ **不产生这条 op**,
+     否则「回滚」会顺手把水抽干 —— 见 `RestoreFluidOp`)。 */
+  if (snapshot.fluid !== null) {
+    ops.push({
+      kind: 'fluid',
+      width: snapshot.fluid.width,
+      height: snapshot.fluid.height,
+      levels: snapshot.fluid.levels.map((l) => ({ x: l.x, y: l.y, amount: l.amount })),
+    });
   }
   for (const c of snapshot.chunks.slice().sort(byCoords)) {
     ops.push({ kind: 'chunk', cx: c.cx, cy: c.cy, bytes: c.bytes });
@@ -1064,6 +1415,10 @@ export function planRestore(
         changes.push(`玩家 ${p.id} 位置:(${now.x}, ${now.y}, ${now.z}) → (${p.x}, ${p.y}, ${p.z})`);
       }
       if (now.level !== p.level) changes.push(`玩家 ${p.id} 等级:${now.level} → ${p.level}`);
+      /* 血量只在一侧也报得出来的时候才叙述(v1 的两侧都没有 ⇒ 不编)。 */
+      if (now.hp !== undefined && p.hp !== undefined && now.hp !== p.hp) {
+        changes.push(`玩家 ${p.id} 血量:${now.hp} → ${p.hp}`);
+      }
     }
     const nowChunks = new Set(current.chunks.map((c) => `${c.cy}:${c.cx}`));
     let overwrite = 0;
@@ -1085,15 +1440,40 @@ export function planRestore(
     if (current.ground.length !== snapshot.ground.length) {
       changes.push(`地面掉落:${current.ground.length} → ${snapshot.ground.length}`);
     }
+    const nowFluid = current.fluid;
+    if (snapshot.fluid === null) {
+      if (nowFluid !== null) {
+        changes.push(
+          `流体水位:归档里**没有**这一项(v${snapshot.version} 头)⇒ 液面不还原`
+          + `(当前描述里有 ${nowFluid.levels.length} 格非零水位)`,
+        );
+      }
+    } else if (
+      nowFluid === null
+      || nowFluid.width !== snapshot.fluid.width
+      || nowFluid.height !== snapshot.fluid.height
+      || nowFluid.levels.length !== snapshot.fluid.levels.length
+    ) {
+      const from = nowFluid === null ? '不可用' : `${nowFluid.levels.length} 格非零`;
+      changes.push(`流体水位:${from} → ${snapshot.fluid.levels.length} 格非零`);
+    }
   }
 
   const trim = snapshot.trim;
   const missingChunks = trim === null ? 0 : Math.max(0, Math.trunc(trim.droppedChunks));
   const unavailable: string[] = [];
-  if (snapshot.players.length > 0) {
+  const playersWithoutHp = snapshot.players.filter((p) => p.hp === undefined).length;
+  if (playersWithoutHp > 0) {
     unavailable.push(
-      'players[].hp:WSA1 v1 的头里**没有血量**(只有 id/x/y/z/level)⇒ 计划只还原位置与等级,'
+      `players[].hp:v${snapshot.version} 的归档头里**没有血量**(只有 id/x/y/z/level;`
+      + `${playersWithoutHp} 个玩家受影响)⇒ 计划只还原位置与等级,`
       + '血量由宿主按登记重置(不在这里编一个 100)',
+    );
+  }
+  if (snapshot.fluid === null) {
+    unavailable.push(
+      `fluid:v${snapshot.version} 的归档头里**没有流体水位** ⇒ 计划不铺液面,`
+      + '水位按宿主重建后的空地重新开始(不编一个全零密度场 —— 那和「已还原」看不出区别)',
     );
   }
   if (trim !== null && missingChunks > 0) {
@@ -1127,6 +1507,10 @@ export function planRestore(
  * 刻意**不**接受「往现有状态上叠加」:叠加会让「归档里没有的块」留着,而那
  * 正好是回滚要清掉的东西。每次从 `emptyWorldState()` 起,所以同一份计划应用
  * 两次得到同样的结果。
+ *
+ * 没有对应 op 的字段保持空世界的值(`fluid: null` / 玩家对象里**没有** `hp` 键):
+ * 那是「归档里没有这一项」的表达,不是「值等于 0」。调用方(宿主)据此判断
+ * 「血量 / 液面要不要自己兜底」,而不是被一个编出来的 0 骗过去。
  */
 export function applyRestorePlan(plan: RestorePlan): RestoreWorldState {
   const out = emptyWorldState();
@@ -1141,7 +1525,16 @@ export function applyRestorePlan(plan: RestorePlan): RestoreWorldState {
       continue;
     }
     if (op.kind === 'player') {
-      out.players.push({ id: op.id, x: op.x, y: op.y, z: op.z, level: op.level });
+      const p: ArchivePlayer = { id: op.id, x: op.x, y: op.y, z: op.z, level: op.level };
+      /* 只在 op 带 `hp` 时才建这个键(v1 的计划里没有它 ⇒ 键缺席 ≠ `hp: undefined`)。
+         逐字段比较与 `Object.keys` 都要分得清这两者。 */
+      if (op.hp !== undefined) p.hp = op.hp;
+      out.players.push(p);
+      continue;
+    }
+    if (op.kind === 'fluid') {
+      /* 深拷贝:同一份计划应用两次不许共享同一批数组(纯函数的前提)。 */
+      out.fluid = copyFluidField({ width: op.width, height: op.height, levels: op.levels });
       continue;
     }
     if (op.kind === 'chunk') {
@@ -1183,6 +1576,7 @@ export function diffWorldState(a: RestoreWorldState, b: RestoreWorldState): stri
       const q = b.players[i];
       if (
         p.id !== q.id || p.x !== q.x || p.y !== q.y || p.z !== q.z || p.level !== q.level
+        || p.hp !== q.hp
       ) {
         out.push(`players[${i}]:${JSON.stringify(p)}≠${JSON.stringify(q)}`);
       }
@@ -1203,6 +1597,31 @@ export function diffWorldState(a: RestoreWorldState, b: RestoreWorldState): stri
     for (let i = 0; i < a.ground.length; i += 1) {
       if (JSON.stringify(a.ground[i]) !== JSON.stringify(b.ground[i])) {
         out.push(`ground[${i}]:${JSON.stringify(a.ground[i])}≠${JSON.stringify(b.ground[i])}`);
+      }
+    }
+  }
+  /* 水位:v2 里是稀疏表,所以逐格点名 —— 比 `JSON.stringify` 更容易看出差在哪一格。 */
+  if ((a.fluid === null) !== (b.fluid === null)) {
+    out.push(
+      `fluid:${a.fluid === null ? '不可用(null)' : `${a.fluid.levels.length} 格非零`}`
+      + `≠${b.fluid === null ? '不可用(null)' : `${b.fluid.levels.length} 格非零`}`,
+    );
+  } else if (a.fluid !== null && b.fluid !== null) {
+    const fa = a.fluid;
+    const fb = b.fluid;
+    if (fa.width !== fb.width) out.push(`fluid.width:${fa.width}≠${fb.width}`);
+    if (fa.height !== fb.height) out.push(`fluid.height:${fa.height}≠${fb.height}`);
+    if (fa.levels.length !== fb.levels.length) {
+      out.push(`fluid.levels.length:${fa.levels.length}≠${fb.levels.length}`);
+    } else {
+      for (let i = 0; i < fa.levels.length; i += 1) {
+        const l = fa.levels[i];
+        const m = fb.levels[i];
+        if (l.x !== m.x || l.y !== m.y || l.amount !== m.amount) {
+          out.push(
+            `fluid.levels[${i}]:(${l.x},${l.y})水位 ${l.amount}≠(${m.x},${m.y})水位 ${m.amount}`,
+          );
+        }
       }
     }
   }

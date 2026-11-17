@@ -28,6 +28,30 @@
  * `tests/WS-FND-17` 逐条检查(a)它们仍在冻结内容表里、(b)在这里有裁决。
  * ⇒ 谁哪天真的实现了某件,会把对应条目改成 `implemented: true` 并补消费点;
  *   谁哪天顺手删了内容表条目,会**当场红**。
+ *
+ * ## 用法(2026-11-17 补:此处**曾经是空输出**)
+ *
+ * ```
+ * node scripts/dead_items.ts                                 # 打印三件死道具现状 + 自检
+ * import { DEAD_ITEMS } from '../scripts/dead_items.ts';     # 判据用法(tests/WS-FND-17)
+ * ```
+ *
+ * ⚠️ **它不是 `verify.ts` 的消费对象**:`verify.ts` 里没有任何一处 import 本文件。
+ *    真实的消费者只有一个 —— `tests/WS-FND-17-room-c-and-dead-items.test.ts`(FND17-6)。
+ *
+ * ⚠️ 2026-11-17 之前的症状:`node scripts/dead_items.ts` **一个字符都不打印**。
+ *    原因是文件里只有 export、没有入口块 ——
+ *    于是「跑它看看这三件现在什么状态」这件事**静默返回空**,
+ *    而空输出既可以被读成「三件都已实装」、也可以被读成「脚本坏了」:
+ *    两种读法都不会红。**这正是本仓反复记的那类静默失败。**
+ *
+ * ⇒ 现在文件末尾有 `import.meta.main` 守卫的入口块(与 `verify.ts:7266` 同一写法):
+ *    直接跑 ⇒ 逐条打印 + 自检,登记表自相矛盾时 **exit code 1**;
+ *    被 import(tests/WS-FND-17)⇒ **一行都不打印**,不污染测试输出。
+ *    ⚠️ 不要改用 `process.argv[1]` 比对:`verify.ts:7263` 已记过原因。
+ *
+ * ⚠️ 接口**未变**:`DEAD_ITEMS` / `DEAD_ITEM_BY_ID` 两个 export 名字与形状都不动
+ *    (FND17-6 直接 import 它们)。本批只**加**入口块,不改登记表内容。
  */
 
 /**
@@ -78,3 +102,45 @@ export const DEAD_ITEMS: readonly {
 /** 按 id 索引,便于断言与将来的消费点查表。 */
 export const DEAD_ITEM_BY_ID: ReadonlyMap<number, (typeof DEAD_ITEMS)[number]> =
   new Map(DEAD_ITEMS.map((d) => [d.id, d]));
+
+/* ══════════════════ 入口:打印现状 + 自检 ══════════════════
+ *
+ * 为什么需要它:`node scripts/dead_items.ts` 此前是**空输出** ——
+ * 文件里只有 export、没有 main ⇒ 跑它等于什么都没发生,
+ * 而「空输出」与「三件都已实装」在肉眼上**不可区分**。这就是要消灭的静默。
+ *
+ * ⚠️ 守卫必须是 `import.meta.main`(Node 24 实测为 boolean;`node -e` 形态下
+ *    `process.argv[1]` 是 `[eval]`,比对会抛错 —— 见 `verify.ts:7263`):
+ *    `tests/WS-FND-17` import 本文件时 `main === false` ⇒ 这段一次都不执行。
+ */
+if (import.meta.main) {
+  const rule = '─'.repeat(74);
+  const bad: string[] = [];
+  console.log('\n══ 三件死道具现状(冻结内容表里的 733 / 435 / 227)══\n');
+  for (const d of DEAD_ITEMS) {
+    /* 自检,与 `tests/WS-FND-17` FND17-6 同一判据:
+       声称已实装却没写消费点 = 过度声称;未实装却有消费点 = 自相矛盾。 */
+    if (d.implemented && (d.consumer === null || d.consumer.trim().length === 0)) {
+      bad.push(`${d.id} ${d.name}:implemented true 但 consumer 为空(过度声称)`);
+    } else if (!d.implemented && d.consumer !== null) {
+      bad.push(`${d.id} ${d.name}:implemented false 但 consumer 非 null(自相矛盾)`);
+    }
+    console.log(`  【${d.implemented ? '已实装' : '未实装'}】${d.id} ${d.name}`);
+    console.log(`      消费点:${d.consumer ?? '(无 —— 未实装时按约定必为 null)'}`);
+    console.log(`      仍缺什么:${d.reason}`);
+    console.log(`  ${rule}`);
+  }
+  const done = DEAD_ITEMS.filter((d) => d.implemented).length;
+  console.log(`  统计:${done} / ${DEAD_ITEMS.length} 已实装;其余**未实装**,不是**不存在**。`);
+  console.log('  裁决(外部审计 U2,2026-11-14):保留定义 + 显式标记未实装,**不删内容表** ——');
+  console.log('    删条目会打红 `content-lock` 指纹、破坏配方 ID 引用、让存档失效。');
+  console.log('  钉住它的判据:tests/WS-FND-17-room-c-and-dead-items.test.ts 的 FND17-6。');
+  console.log('  接口:本文件导出 DEAD_ITEMS / DEAD_ITEM_BY_ID(上面那个测试消费)—— 未变。');
+  if (bad.length > 0) {
+    console.log(`\n  ✗ 登记表自相矛盾(${bad.length} 处):`);
+    for (const b of bad) console.log(`      ${b}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`\n  ✓ 登记表自洽(${DEAD_ITEMS.length} 条 implemented / consumer 一一对应)\n`);
+  }
+}
