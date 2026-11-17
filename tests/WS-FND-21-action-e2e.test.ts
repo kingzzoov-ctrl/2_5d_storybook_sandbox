@@ -87,7 +87,11 @@ async function wire(roomId: string, userId: string) {
   const store = new ClientStateStore();
   const box: { reply: ActionResultFrame | null } = { reply: null };
   const session = createSession({
-    url: `ws://127.0.0.1:${srv.port}/ws?userId=${userId}`,
+    /* ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=`(HMAC 凭证)才是证据。
+       token 由**生产的签发入口** `runtime.issueJoinToken` 现签(与 `join` 里验签的
+       同一把密钥),不硬编码、也不跳过鉴权。 */
+    url: `ws://127.0.0.1:${srv.port}/ws?userId=${encodeURIComponent(userId)}`
+      + `&token=${encodeURIComponent(a.runtime.issueJoinToken(userId))}`,
     store,
     events: {
       onFrame: () => undefined,

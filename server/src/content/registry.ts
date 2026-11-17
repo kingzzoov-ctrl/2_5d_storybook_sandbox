@@ -192,8 +192,49 @@ export function contentCapacity(): CapacityEntry[] {
  *
  * 指纹本身会随算法演进而变;把版本一并记入指纹,使「同一份内容、
  * 不同算法」也能区分开,避免升级算法后误判成「内容变了」。
+ *
+ * ★ 2026-11-18 → **2**:各分区改为「整字段投影」(见 `FINGERPRINT_EXCLUDED`)。
+ *   版本 1 对各分区是**手挑字段**的 —— items 只取 id/name/category/tags/value、
+ *   mobs 只取 id/name/biome/hp/exp ⇒ 改 `recipe`(配方)、`station`(设备)、
+ *   `output`(产出)、`drops`(掉落)时**指纹一个字符都不变**,内容锁照绿。
+ *   字段集就是算法的一部分,改了字段集却不改版本号,等于让两个不同算法
+ *   共用同一个版本前缀 —— 那正是这个字段存在的理由。
  */
-export const CONTENT_FINGERPRINT_VERSION = 1;
+export const CONTENT_FINGERPRINT_VERSION = 2;
+
+/**
+ * **不进指纹**的字段。只允许「文档性」字段进这张表。
+ *
+ * 判据:**任何能被算进平衡/契约的字段都必须进指纹**。理由是外层的:
+ * 内容锁的全部价值在于「平衡数据一改就红」,而手挑字段的写法会在扩容时
+ * **静默失效**(实测:上面版本说明里的 4 个字段)。所以这里反过来写 ——
+ * 默认**全取**,只有显式登记在此的文档字段才剔除。
+ * ⇒ 将来给 `ItemDef` 加一个新字段,**不需要**记得来改这里。
+ *
+ * `note` 是自由文本机制说明(设计手册原句),改它不改变任何运行时行为。
+ */
+export const FINGERPRINT_EXCLUDED: Readonly<Record<'items' | 'mobs' | 'bosses', readonly string[]>> =
+  Object.freeze({
+    items: Object.freeze(['note']),
+    mobs: Object.freeze(['note']),
+    bosses: Object.freeze(['note']),
+  });
+
+/**
+ * 把一条内容行投影成指纹输入:取**全部**字段,剔除 `excluded` 里登记的文档字段。
+ *
+ * 键序无关(`canonicalize` 会排序),故此处不必排;显式排序只为让
+ * 调试时打印出的中间串稳定可读。
+ */
+function projectRow(row: object, excluded: readonly string[]): Record<string, unknown> {
+  const src = row as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(src).sort()) {
+    if (excluded.includes(k)) continue;
+    out[k] = src[k];
+  }
+  return out;
+}
 
 /** FNV-1a 32 位,十六进制 8 字符。与 WS-07 的迁移 checksum 同族。 */
 export function fnv1a32(s: string): string {
@@ -262,9 +303,13 @@ export interface ContentFingerprints {
  * 指纹应当不变,这正是它有用的原因 —— 它隔离了「数据变更」这一个变量。
  */
 export function contentFingerprints(): ContentFingerprints {
-  const items = canonicalize(ITEM_LIST.map((i) => ({ id: i.id, name: i.name, category: i.category, tags: i.tags, value: i.value })));
-  const mobs = canonicalize(MOB_LIST.map((m) => ({ id: m.id, name: m.name, biome: m.biome, hp: m.hp, exp: m.exp })));
-  const bosses = canonicalize(BOSS_LIST.map((b) => ({ id: b.id, name: b.name, baseHp: b.baseHp, summonItem: b.summonItem, loot: b.loot })));
+  /* ⚠️ **不要**改回手挑字段。见 `CONTENT_FINGERPRINT_VERSION` 与
+     `FINGERPRINT_EXCLUDED` 的说明:手挑字段会让平衡改动绕过内容锁
+     (实测 items 缺 recipe/station/output、mobs 缺 drops、bosses 缺 phases)。
+     判据由 `tests/WS-FND-90-gate-truth.test.ts` 钉住(注入一条配方改动 ⇒ 指纹必须变)。 */
+  const items = canonicalize(ITEM_LIST.map((i) => projectRow(i, FINGERPRINT_EXCLUDED.items)));
+  const mobs = canonicalize(MOB_LIST.map((m) => projectRow(m, FINGERPRINT_EXCLUDED.mobs)));
+  const bosses = canonicalize(BOSS_LIST.map((b) => projectRow(b, FINGERPRINT_EXCLUDED.bosses)));
   const modes = canonicalize({ modes: PARTY_MODES, rooms: ROOM_RECIPES });
 
   const fi = fnv1a32(items);

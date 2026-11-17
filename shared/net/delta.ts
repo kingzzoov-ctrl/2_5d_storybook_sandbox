@@ -22,9 +22,23 @@
  *     u16 removedCount   × { u8 kind, str id }                ← 删除
  *     u16 upsertCount    × { u8 kind, str id, u32 mask, ... } ← 新增/变更
  *         mask 为 0 表示「实体存在但本帧所有字段无变化」,不写任何字段值。
- *         变长字段(STR/HASH)前缀 1 字节长度;定长字段按 FIELD_TYPE_BYTES。
+ *         变长字段(STR/HASH)按下面的 `str` 编码;定长字段按 FIELD_TYPE_BYTES。
  * ```
- * `str` = u8 长度前缀 + UTF-8 字节。空串编码为 `00`。
+ * `str` = **分段** u8 长度前缀 + UTF-8 字节:
+ *   · 长度 < 255 ⇒ `u8 len` + payload(与 1 字节前缀的老格式**逐字节相同**);
+ *   · 长度 ≥ 255 ⇒ 每 255 字节一段、段前缀写哨兵 `255`,最后补一段 `u8 (<255)`
+ *     (可能为 0 的收尾段)。读出时循环到「段长 < 255」为止。
+ *   空串仍编码为 `00`。
+ *
+ *   ⚠️ 为什么必须分段(审计 P1-1,2026-11):房间级 `chunkVersions` 是**变长拼接串**,
+ *   一个 16×16 世界跨 40 个 chunk 就 > 255 字节 ⇒ 旧实现直接抛「字符串超长」,
+ *   全量快照根本发不出去。分段保持 ≤255 的老包**一字不变**(无需协议 bump),
+ *   同时上限从 255 抬到 255×256 = 65025 字节(≈ 5000 个 chunk)。
+ *
+ *   ⚠️ 字段取值**一律不钳位**(审计 P1-2):u8/u16/u32 越界、非有限、非数值
+ *   ⇒ **抛错**,不静默截断/回绕。u8 与 u16/u32 同用 `Math.round`(旧实现 u8 是
+ *   trunc,同一个 3.6 在两种字段上给出 3 与 4 两种结果)。
+ *   解码侧要求**恰好消耗完**输入(尾部有垃圾 ⇒ 抛错,不再"解析成功")。
  */
 
 import {
@@ -80,6 +94,14 @@ export type PacketOp = (typeof PacketOp)[keyof typeof PacketOp];
 const TE = new TextEncoder();
 const TD = new TextDecoder();
 
+/**
+ * `str` 编码的长度上限(字节):255 字节/段 × 最多 256 段 = 65280。
+ * 超过即抛错。取这个上限的理由:房间级 `chunkVersions` 串在 16×16 世界里
+ * 40 个 chunk 约 300 字节,极端(数百 chunk)也只有几 KB —— 65KB 是宽松上界,
+ * 同时把「伪造超长串」的病态输入挡在解码前。
+ */
+const MAX_STR_BYTES = 255 * 256;
+
 class ByteWriter {
   private buf: Uint8Array;
   private len = 0;
@@ -123,13 +145,32 @@ class ByteWriter {
     this.buf[this.len++] = (x >>> 8) & 0xff;
   }
 
+  /**
+   * 写变长串:**分段** u8 前缀。
+   *
+   *   len < 255  ⇒ `u8 len` + payload —— 与旧格式逐字节相同(≤255 的包不变);
+   *   len ≥ 255  ⇒ 每 255 字节一段、段前缀 `255`(哨兵),末尾补一段 `<255`
+   *                 (串长恰为 255 的整数倍时补一个 0 长收尾段)。
+   *
+   * 上限 `MAX_STR_BYTES` = 255 × 256 = 65280 字节。超过即抛错(不是静默截断)。
+   */
   str(s: string): void {
     const bytes = TE.encode(s);
-    if (bytes.length > 255) throw new Error(`字符串超长(${bytes.length} > 255):${s.slice(0, 24)}`);
-    this.u8(bytes.length);
-    this.ensure(bytes.length);
-    this.buf.set(bytes, this.len);
-    this.len += bytes.length;
+    if (bytes.length > MAX_STR_BYTES) {
+      throw new Error(`字符串超长(${bytes.length} > ${MAX_STR_BYTES} 字节):${s.slice(0, 24)}`);
+    }
+    let off = 0;
+    while (bytes.length - off >= 255) {
+      this.u8(255);
+      this.ensure(255);
+      this.buf.set(bytes.subarray(off, off + 255), this.len);
+      this.len += 255;
+      off += 255;
+    }
+    this.u8(bytes.length - off);
+    this.ensure(bytes.length - off);
+    this.buf.set(bytes.subarray(off), this.len);
+    this.len += bytes.length - off;
   }
 
   get size(): number { return this.len; }
@@ -160,12 +201,32 @@ class ByteReader {
 
   i16(): number { this.need(2); const v = this.view.getInt16(this.pos, true); this.pos += 2; return v; }
 
+  /**
+   * 读变长串:`str` 的逆运算。段前缀 = 255 ⇒ 后面还有一段;
+   * `< 255` ⇒ 本段是最后一段(含 0 长收尾段)。
+   *
+   * ⚠️ 段数/总长都受 `MAX_STR_BYTES` 约束,并有 `need()` 兜住截断 ——
+   * 一段伪造的「255, 255, 255, …」不会让解码器无限读下去。
+   */
   str(): string {
-    const n = this.u8();
-    this.need(n);
-    const s = TD.decode(this.buf.subarray(this.pos, this.pos + n));
-    this.pos += n;
-    return s;
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const n = this.u8();
+      this.need(n);
+      parts.push(this.buf.subarray(this.pos, this.pos + n));
+      this.pos += n;
+      total += n;
+      if (total > MAX_STR_BYTES) {
+        throw new Error(`字符串超长(> ${MAX_STR_BYTES} 字节,疑似伪造分段)`);
+      }
+      if (n < 255) break;
+    }
+    if (parts.length === 1) return TD.decode(parts[0]);
+    const joined = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { joined.set(p, off); off += p.length; }
+    return TD.decode(joined);
   }
 
   get remaining(): number { return this.buf.length - this.pos; }
@@ -185,13 +246,13 @@ function writeField(w: ByteWriter, spec: FieldSpec, value: unknown): void {
       w.i32(typeof value === 'number' ? quantizePos(value) : 0);
       return;
     case FieldType.U8:
-      w.u8(clampU8(value));
+      w.u8(toUint(spec, value));
       return;
     case FieldType.U16:
-      w.u16(clampU16(value));
+      w.u16(toUint(spec, value));
       return;
     case FieldType.U32:
-      w.u32(clampU32(value));
+      w.u32(toUint(spec, value));
       return;
     case FieldType.I16:
       w.i16(typeof value === 'number' ? value | 0 : 0);
@@ -218,19 +279,38 @@ function readField(r: ByteReader, spec: FieldSpec): unknown {
   }
 }
 
-function clampU8(v: unknown): number {
-  const n = typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : 0;
-  return Math.max(0, Math.min(255, n));
-}
+/** 无符号字段类型 → 线上上限。i8/u16/u32 只有这三种(u16 两个端点仍各算一个 key)。 */
+const UINT_MAX: Readonly<Record<string, number>> = {
+  [FieldType.U8]: 255,
+  [FieldType.U16]: 65535,
+  [FieldType.U32]: 4294967295,
+};
 
-function clampU16(v: unknown): number {
-  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : 0;
-  return Math.max(0, Math.min(65535, n));
-}
-
-function clampU32(v: unknown): number {
-  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : 0;
-  return Math.max(0, Math.min(4294967295, n));
+/**
+ * 无符号字段取值的**唯一**转换口(编码与 diff 比较共用):非法就**抛错**。
+ *
+ * 审计 P1-2 的实测缺陷(改前):越界值被**静默钳位**
+ *   `hp = weaponId = 70000 ⇒ 65535`;`u8` 用 `Math.trunc` 而 `u16/u32` 用
+ *   `Math.round` ⇒ 同一个 `3.6` 在 `level` 上是 3、在 `hp` 上是 4;
+ *   负值/`NaN` 被悄悄写成 0 —— 三类静默错值在解码侧完全看不出来。
+ *
+ * 改后口径:**非数值 / 非有限 / 负数 / 超上限 ⇒ 抛错**(带字段名与原值),
+ * 三种宽度统一 `Math.round`。
+ */
+function toUint(spec: FieldSpec, value: unknown): number {
+  const max = UINT_MAX[spec.type];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(
+      `字段 ${spec.key} 非法取值:${String(value)}(${spec.type} 只接受 0..${max} 的有限数值)`,
+    );
+  }
+  const n = Math.round(value);
+  if (n < 0 || n > max) {
+    throw new Error(
+      `字段 ${spec.key} 越界:${value} 不在 0..${max}(${spec.type})—— 协议不做静默钳位`,
+    );
+  }
+  return n;
 }
 
 /** 量化的字段取值(比较用),保证「量化后相同即等于没变」,避免浮点抖动刷帧。 */
@@ -241,8 +321,9 @@ function normalized(kind: EntityKind, spec: FieldSpec, value: unknown): unknown 
     case FieldType.U8:
     case FieldType.U16:
     case FieldType.U32:
-      return spec.type === FieldType.U8 ? clampU8(value)
-        : spec.type === FieldType.U16 ? clampU16(value) : clampU32(value);
+      /* 与 writeField 走**同一个** toUint:比较口径 = 上线口径 ⇒ 不会出现
+         「本帧判为没变、真要写时却抛错」这种半截状态。 */
+      return toUint(spec, value);
     case FieldType.I16:
       return typeof value === 'number' ? value | 0 : 0;
     case FieldType.STR:
@@ -389,9 +470,17 @@ export function encodeDelta(
     }
   }
 
+  /* 两级计数是 u16:数量越界同样**不许静默截断**(> 65535 个实体 ⇒ 抛错)。
+     否则报文里写 65535、实际 70000 个 ⇒ 解码侧静默少 4465 个,与审计 P1-2 同形态。 */
+  if (removed.length > 65535) {
+    throw new Error(`删除条目过多:${removed.length} > 65535(u16 计数越界)`);
+  }
   w.u16(removed.length);
   for (const r of removed) { w.u8(r.kind); w.str(r.id); }
 
+  if (plans.length > 65535) {
+    throw new Error(`变更条目过多:${plans.length} > 65535(u16 计数越界)`);
+  }
   w.u16(plans.length);
   for (const p of plans) {
     w.u8(p.kind);
@@ -475,6 +564,17 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
       fields[spec.key] = readField(r, spec);
     }
     upserts.push({ kind, id, mask, fields });
+  }
+  /* ★ 审计 P1-2:解码必须**恰好消耗完**输入。
+     改前:尾部多余字节被**静默接受** —— `new Uint8Array(70000)` 首字节置 3、
+     次字节置 0 时 `decodePacket` 不抛,返回 `bytesConsumed = 10`,
+     69990 字节垃圾无人过问(实测)。那让"解析成功"变成可灌水的假判据。
+     改后:尾部有剩余 ⇒ **抛错**,且错误文案点明「尾部/未消耗」,
+     与 `server/src/net/ws_server.ts` 的计数口径一致(它据此记 rejected)。 */
+  if (r.pos !== bytes.length) {
+    throw new Error(
+      `报文尾部有 ${bytes.length - r.pos} 字节未消耗(解出 ${r.pos}/${bytes.length}B)`,
+    );
   }
   return { version, op, tick, ackedSeq, removed, upserts, bytesConsumed: r.pos };
 }

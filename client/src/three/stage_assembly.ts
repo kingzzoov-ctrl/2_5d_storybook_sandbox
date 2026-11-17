@@ -127,11 +127,37 @@ export function buildChunkGeometry(chunk: ChunkInput, lod: number): THREE.Buffer
 /**
  * 地形材质:顶点色(无纹理图集)。
  *
- * 返回的 `vertexColors === true` 且片元源码不含采样器 —— 与
- * `stage/terrain_vcolor.ts` 的判据同一份源码,不存在"测试查 A、渲染跑 B"。
+ * 返回的 `vertexColors === true`、**是 raw 材料**(three 不注入内建 `attribute`,
+ * 源码自带宽高)且片元源码不含采样器 —— 与 `stage/terrain_vcolor.ts` 的判据同一份
+ * 源码,不存在"测试查 A、渲染跑 B"。
+ *
+ * ★ WS-FND-89:这个函数此前**零生产调用点**(`boot.ts` 直接 `new MeshLambertMaterial`),
+ *   于是几何上的 `color` 属性没有任何读者、真机恒为一块单色,而所有顶点色判据全绿。
+ *   现在 `boot.ts` 的地形材质就是它(见 `boot.ts` 里 `buildTerrainMaterial()` 那行)。
  */
 export function buildTerrainMaterial(): THREE.ShaderMaterial {
   return assembleTerrainMaterial() as unknown as THREE.ShaderMaterial;
+}
+
+/**
+ * 把相机的 `projectionMatrix` / `matrixWorldInverse` 喂给地形顶点色材质。
+ *
+ * ★ 为什么必须**每帧**调用:材质是 `RawShaderMaterial`,three **不会**注入
+ *   `projectionMatrix` / `modelViewMatrix`,矩阵只能由我们上传。漏掉这一步的表现是
+ *   「地形整片消失或塌成一个点」,而不是报错 —— 又是那种只靠眼睛才能发现的缺陷。
+ *
+ * `uModel` 保持单位矩阵:世界顶点已经是绝对格坐标(见 `stage/chunk_geometry.ts`)。
+ */
+export function syncTerrainCamera(
+  material: THREE.ShaderMaterial,
+  camera: THREE.OrthographicCamera,
+): void {
+  camera.updateMatrixWorld();
+  const u = material.uniforms;
+  if (!u || !u.uProjection || !u.uView || !u.uModel) return;
+  (u.uProjection.value as THREE.Matrix4).copy(camera.projectionMatrix);
+  (u.uView.value as THREE.Matrix4).copy(camera.matrixWorldInverse);
+  (u.uModel.value as THREE.Matrix4).identity();
 }
 
 /** 当前装配走的是真 three 还是相容层兜底(浏览器自检可读它) */
@@ -141,7 +167,22 @@ export function assemblySource(): 'injected' | 'fallback' {
 
 /* ───────────────────── Shader 材质 ───────────────────── */
 
-/** 由 shader 契约表生成 three 材质(不硬编码任何 uniform 名) */
+/**
+ * 由 shader 契约表生成 three 材质(不硬编码任何 uniform 名)。
+ *
+ * ★ WS-FND-89:`stage/shaders.ts` 的顶点源码**自己声明** `attribute vec3 position;`
+ *   (水面/草木/熔岩/染色)与 `attribute vec2 uv;`,还有 `normal`。这与
+ *   `ShaderMaterial` 天生冲突:three 会**再注入一遍**同名声明 ⇒ GLSL 重定义 ⇒
+ *   材质编译失败(对象整块不显示,且不抛异常)。
+ *
+ *   所以这里用 `RawShaderMaterial`(three 不注入任何东西),并在顶点源码前补一行
+ *   `precision highp float;`(raw 连默认精度都没有;片元源码自己已经写了)。
+ *   源码常量本身**不动** —— `tests/WS-09` 逐条断言它们声明了 `position` / `normal` /
+ *   `aWindWeight` 等属性,那是对的:属性该由源码声明,只是不该由 three 再声明一次。
+ *
+ * ⚠️ raw 材料不注入 `projectionMatrix`/`modelViewMatrix`:矩阵必须由调用方从
+ *   `uProjection`/`uView`/`uModel` 上传(与地形同一条约束,见 `syncTerrainCamera`)。
+ */
 export function buildShaderMaterial(name: ShaderName): THREE.ShaderMaterial {
   const prog = SHADER_PROGRAMS[name];
   const uniforms: Record<string, THREE.IUniform> = {};
@@ -149,10 +190,10 @@ export function buildShaderMaterial(name: ShaderName): THREE.ShaderMaterial {
     uniforms[spec.name] = { value: defaultValueFor(spec.type) };
   }
   const flags = shaderMaterialFlags(name);
-  return new THREE.ShaderMaterial({
+  return new THREE.RawShaderMaterial({
     name,
     uniforms,
-    vertexShader: prog.vertex,
+    vertexShader: `precision highp float;\n${prog.vertex}`,
     fragmentShader: prog.fragment,
     transparent: flags.transparent,
     depthWrite: flags.depthWrite,

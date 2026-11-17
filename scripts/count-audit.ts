@@ -31,6 +31,7 @@
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const ROOT = process.cwd();
 
@@ -64,6 +65,115 @@ const EXPECTED_TRUTH_KEYS = ['可达性白名单', 'orphan', '同义反复白名
   if (taut !== null) TRUTH['同义反复白名单'] = taut;
 }
 
+/* ══════════════ 正解的另一半:登记 ↔ 实测 互校(审计 P1-3)══════════════
+ *
+ * ## 缺口(实测)
+ *
+ * 上面 `TRUTH['orphan']` 是**字面条数**(从 `ORPHAN_KNOWN` 的源码文本数出来的),
+ * 而 `orphan-audit.ts` 报的是**实测条数**。2026-11-18 实测这两个数**不相等**:
+ * ```
+ *   字面/登记 10   实测 9     ← 差 1 条,而没有任何东西比较它们
+ * ```
+ * 更糟的是 `orphan-audit` 的摘要行**硬写**「…/ **0 处失真**」:
+ * 「0」是常量,不是算出来的 ⇒ 无论差额多大都印 0,读的人以为两个数对上了。
+ * ⇒ 这正是「自己比自己」的形态:**两个数被分别印出来,却从不互相校验。**
+ *   (那一轮的差额根因是遍历口径 —— `server/src/build/` 整棵被跳过。
+ *    见 `orphan-audit.ts` 的 `walk()` 注释。)
+ *
+ * ## 处置
+ *
+ * 让 `orphan-audit.ts` 同时输出一行机读结果(`__ORPHAN_AUDIT_JSON__{...}`),
+ * 本脚本据此做**三方互校**:
+ * ```
+ *   ① 字面条数(本文件自己数)      == 运行时 Map.size(orphan-audit 报)
+ *   ② 登记条数                     == 实测 orphan + 死文件(两边都 0)
+ *   ③ 无「登记了但实测归不进任何一类」的条目
+ * ```
+ * 任一不成立 ⇒ `★ 登记失真`,并置非零退出码。
+ *
+ * ⚠️ 「解析不到机读行」**不能当通过**:那与「没有失真」不可区分 ——
+ *    本仓反复点名的陷阱 126(对「坏掉」与「报红」不可区分)。
+ */
+interface OrphanAuditJson {
+  measured: number;
+  measuredLines: number;
+  dead: number;
+  deadFiles: string[];
+  registered: number;
+  unlisted: number;
+  unlistedDead: number;
+  registeredNotMeasured: string[];
+  stale: number;
+}
+
+/** 跑一次 orphan-audit 并取出机读行;跑不起来 / 解析失败返回 null(不是"0 失真")。 */
+function readOrphanAudit(): OrphanAuditJson | null {
+  const script = join(ROOT, 'scripts', 'orphan-audit.ts');
+  if (!existsSync(script)) return null;
+  const r = spawnSync(process.execPath, ['scripts/orphan-audit.ts'], {
+    cwd: ROOT, encoding: 'utf8', timeout: 120_000,
+  });
+  /* ★ 退出码**就地**读掉(判据形态审计 F 的实质:spawnSync **从不抛** ——
+     崩溃 / 超时被杀时 `status ≠ 0` 且 stdout 为空。不读它就等于
+     「子进程崩了」与「没有失真」不可区分 = 静默假绿(陷阱 126)。
+     ⚠️ 这里**不**把非零当通过:返回 null ⇒ 调用方把整道互校判成
+     「★ 登记失真」,而不是印一行绿。 */
+  const spawnStatus = r.status;
+  const spawnError = r.error;
+  if (spawnError !== undefined || spawnStatus === null || spawnStatus !== 0) return null;
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  const m = /__ORPHAN_AUDIT_JSON__(\{[^\n]*\})/.exec(out);
+  if (m === null) return null;
+  try {
+    return JSON.parse(m[1]!) as OrphanAuditJson;
+  } catch {
+    return null;
+  }
+}
+
+const ORPHAN_AUDIT = readOrphanAudit();
+/** 互校问题清单(空 = 两个数确实对上了)。 */
+const CROSS_PROBLEMS: string[] = [];
+if (ORPHAN_AUDIT === null) {
+  CROSS_PROBLEMS.push(
+    'orphan-audit 未产出机读行(`__ORPHAN_AUDIT_JSON__`)⇒ 无法互校'
+    + ' ⇒ 与「没有失真」不可区分(崩溃 / 超时 / 格式变了都会走到这里)',
+  );
+} else {
+  /* ① 同一张表的两个独立解析器:源码文本 vs 运行时 Map */
+  const literal = TRUTH['orphan'];
+  if (literal === undefined) {
+    CROSS_PROBLEMS.push('本文件解析不出 `ORPHAN_KNOWN` 字面条数 ⇒ ① 无法互校');
+  } else if (literal !== ORPHAN_AUDIT.registered) {
+    CROSS_PROBLEMS.push(
+      `同一张表两个解析器不一致:字面条数 ${literal} vs 运行时 Map.size ${ORPHAN_AUDIT.registered}`
+      + '(多行写法 / 重复键 / 锚点漂移)',
+    );
+  }
+  /* ② 登记 ⊇ 实测 ∪ 死文件,且不许多 */
+  if (ORPHAN_AUDIT.measured + ORPHAN_AUDIT.dead !== ORPHAN_AUDIT.registered) {
+    CROSS_PROBLEMS.push(
+      `登记 ${ORPHAN_AUDIT.registered} ≠ 实测 orphan ${ORPHAN_AUDIT.measured}`
+      + ` + 死文件 ${ORPHAN_AUDIT.dead} = ${ORPHAN_AUDIT.measured + ORPHAN_AUDIT.dead}`
+      + ' ⇒ 有登记项在实测里找不到对应,或有实测项没登记',
+    );
+  }
+  /* ③ 归不进任何一类的登记项 */
+  if (ORPHAN_AUDIT.registeredNotMeasured.length > 0) {
+    CROSS_PROBLEMS.push(
+      `${ORPHAN_AUDIT.registeredNotMeasured.length} 条登记项既不被生产引用、`
+      + `也不在实测 orphan/死文件里:${ORPHAN_AUDIT.registeredNotMeasured.slice(0, 5).join(', ')}`,
+    );
+  }
+  if (ORPHAN_AUDIT.unlisted > 0 || ORPHAN_AUDIT.unlistedDead > 0) {
+    CROSS_PROBLEMS.push(
+      `实测有未登记项:orphan ${ORPHAN_AUDIT.unlisted} 个 / 死文件 ${ORPHAN_AUDIT.unlistedDead} 个`,
+    );
+  }
+  if (ORPHAN_AUDIT.stale > 0) {
+    CROSS_PROBLEMS.push(`orphan-audit 自报登记清单失真 ${ORPHAN_AUDIT.stale} 处`);
+  }
+}
 console.log('══ 0 正解(由代码算出,不是抄的)══');
 for (const [k, v] of Object.entries(TRUTH)) console.log(`   ${k} = ${v}`);
 if (TRUTH['可达性白名单'] !== undefined && TRUTH['orphan'] !== undefined) {
@@ -188,6 +298,30 @@ console.log(`
       ⇒ 唯一防线就是这个逐条清单:每次运行都看得见豁免了哪几行。
       ⇒ 判据:豁免机制的目标不是"少报",而是"让每一次豁免都可见"。
 `);
+/* ══ 3 登记 ↔ 实测 互校 ══
+ * 这一节回答的是**上一节回答不了的问题**:「正解本身对不对?」
+ * 自称与正解一致,只证明了两处文字同步;正解与**实测**一致,才证明台账在说真话。 */
+console.log('\n══ 3 登记 ↔ 实测 互校(orphan 台账)══');
+if (ORPHAN_AUDIT === null) {
+  console.log('   ★ 解析不到 orphan-audit 的机读行 ⇒ 本道**没有比对**');
+} else {
+  console.log(`   orphan-audit 实测:orphan ${ORPHAN_AUDIT.measured} 个 / ${ORPHAN_AUDIT.measuredLines} 行`);
+  /* 「两边都 0」必须单列 —— 它们既不是「已接线」也不是「测试专用」,是**死代码**。 */
+  if (ORPHAN_AUDIT.dead > 0) {
+    console.log(`   ★ 两边都 0(生产 0 **且** 测试 0)的条目 ${ORPHAN_AUDIT.dead} 个:`);
+    for (const f of ORPHAN_AUDIT.deadFiles) console.log(`       ${f}`);
+  } else {
+    console.log('   两边都 0(生产 0 且 测试 0)的条目:0 个');
+  }
+  console.log(`   字面/登记 ${TRUTH['orphan'] ?? '?'} · 运行时 Map ${ORPHAN_AUDIT.registered}`
+    + ` · 实测 ${ORPHAN_AUDIT.measured} + 死文件 ${ORPHAN_AUDIT.dead}`
+    + ` ⇒ ${CROSS_PROBLEMS.length === 0 ? '✓ 三方一致' : '★ 登记失真'}`);
+}
+if (CROSS_PROBLEMS.length > 0) {
+  console.log(`   ★ 登记失真:${CROSS_PROBLEMS.length} 处`);
+  for (const p of CROSS_PROBLEMS) console.log(`       · ${p}`);
+  console.log('      ⇒ 台账的条数与实测对不上 ⇒ 台账不能作为「还剩多少欠账」的依据');
+}
 console.log(`
    ⇒ 本检测器只覆盖**语义唯一**的三类(白名单/本表/ORPHAN_KNOWN)。
      其余「N 条」型自称需要**推断它指向哪个量** —— 按本仓的分水岭
@@ -214,11 +348,15 @@ console.log(`
  *   而它同时**关掉了**这个检测器唯一的价值(比对)。
  *   ⇒ 故必须同时断言:**每个应有的 TRUTH 键都解析成功**。
  *
- * ## 两组分别是
+ * ## 三组分别是
  * ```
- * #1  stale > 0        ⇒ 非零   (过时条目必须报错)
- * #2  每个 TRUTH 键解析成功 ⇒ 非零 (否则"拆掉真值来源"即可恒绿)
+ * #1  stale > 0                    ⇒ 非零 (过时条目必须报错)
+ * #2  每个 TRUTH 键解析成功         ⇒ 非零 (否则"拆掉真值来源"即可恒绿)
+ * #3  登记 ↔ 实测 互校不通过        ⇒ 非零 (2026-11-18 审计 P1-3:此前**从不互校**)
  * ```
+ * 第 3 组与前面两组是**不同性质**:#1/#2 比的是「文字 vs 正解」,
+ * #3 比的是「正解 vs 实测」。少了它,正解可以是 10、实测可以是 9,
+ * 两行都印出来、都没人红 —— 那就是「自己比自己」。
  * ★ 施加顺序无所谓(两者各自独立置位),但**验证顺序必须**:
  *   先证明"改前是绿的",再证明"改后是红的" ——
  *   否则无法区分"我修好了"与"它本来就会红"。
@@ -239,6 +377,12 @@ let assertFailed = false;
     }
     console.log('      ⇒ 引用它的自称会被判 \'?\'(既不 ✓ 也不 ★)⇒ **本检测器静默失效**');
     console.log('      ⇒ 不是"没有陈旧",是**没有比对** —— 两者必须可区分');
+    assertFailed = true;
+  }
+  /* #3 登记 ↔ 实测 */
+  if (CROSS_PROBLEMS.length > 0) {
+    console.log(`\n   ★ 登记失真:${CROSS_PROBLEMS.length} 处(见上面「3 登记 ↔ 实测 互校」)`);
+    console.log('      ⇒ 台账条数与实测对不上 ⇒ 它不能作为「还剩多少欠账」的依据');
     assertFailed = true;
   }
   /* #1 */

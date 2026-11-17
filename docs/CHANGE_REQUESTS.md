@@ -3498,3 +3498,146 @@ $ node scripts/content-lock.ts --update
 - 手册行号出处:`docs/DATA-CONFORMANCE.md:216~218`、`docs/ID-CROSSCHECK.md:266~282`
 - `server/src/mobs/taming.ts:141 / :228`(`drops` 第一项 = 驯服回赠)· `server/src/content/registry.ts:266~267`(分区哈希字段)
 - `tests/WS-05.test.ts`(W5-51)· `tests/WS-FND-84-abstract-loot.test.ts`(FND84-1~6)· `tests/WS-FND-79-content-expansion.test.ts`(FND79-3)
+
+---
+
+## [CR-30] 2026-11-18 task-84c(fixer)— 内容指纹改「整字段投影」(算法 v1 → v2)+ 台账关闭判据收紧 + 鉴权/凭证令牌化
+
+**触发**(三条独立的判据缺陷,同一批收口):
+
+1. **指纹口径**:版本 1 的分区哈希是**手挑字段**的(items 只取 `id/name/category/tags/value`、
+   mobs 只取 `id/name/biome/hp/exp`、bosses 只取 `id/name/baseHp/summonItem/loot`)⇒ 改
+   `recipe`(配方)/ `station`(设备)/ `output`(产出)/ `drops`(掉落)时**指纹一个字符都不变**,
+   `content-lock` 照绿。字段集就是算法的一部分,**改了字段集却不改版本号 = 两个算法共用同一版本前缀**。
+2. **台账关闭判据**:`scripts/backlog.ts` 过去把「已关闭 / 已完成」两个**词**当关闭依据 ⇒
+   `133 条全部判关`,其中 37 条的关闭状态**只由标记词决定**,没有任何可核对锚点。
+3. **鉴权**:角色只由 `input.userId === this.ownerId`(`room.ts:1264`)决定,而 `?userId=` 是客户端串;
+   `mintToken()` 产出的串全仓 **0 处校验**(`ws_server.ts:873` 的 join 入参连 `token` 字段都没有)
+   ⇒ **带 `?userId=u_owner` 即成房主**。
+
+### 1. 指纹口径变更(三处分区 + overall;算法版本 1 → 2)
+
+**依据**:`server/src/content/registry.ts:196~237` —— `CONTENT_FINGERPRINT_VERSION = 2`、
+`FINGERPRINT_EXCLUDED`(只剔除文档字段 `note`)、`projectRow()` **默认全取**再剔排除项
+(⇒ 将来给 `ItemDef` 加字段**不需要**记得改这里)。v1 的「手挑字段」写法被删。
+
+| 落点 | v1 | v2(实测) |
+| :--- | :--- | :--- |
+| `items` | `6a0d6441` | **`a008a5e6`** |
+| `mobs` | `624808c4` | **`0e39b653`**(`drops` 现在进分区哈希) |
+| `bosses` | `1fb56d39` | **`cf4bd9dc`**(`phases` 等字段进哈希) |
+| `modes` | `b854dbfe` | `b854dbfe`(未变) |
+| `overall` | `d4f73c37` | **`76694a25`**(`fnv1a32('2|items|mobs|bosses|modes')`) |
+| 指纹串 | `v1-d4f73c37` | **`v2-76694a25`** |
+
+命令原文:
+
+```
+$ node scripts/content-lock.ts
+  当前指纹 : v2-76694a25
+  基线指纹 : 76694a25
+  ✓ 内容与基线一致
+    物品 329  生物 24  Boss 8
+```
+
+`server/src/content/content.baseline.json` 已由 `node scripts/content-lock.ts --update` 重写;
+`counts` / `slots` / `names` / `mobIds` / `bossIds` **一字未动**(件数与槽位未变)。
+
+**落点逐条**(每个落点都用 `node scripts/content-lock.ts` 的实测值核对过,不盲改):
+
+| 文件:行 | 旧 → 新 |
+| :--- | :--- |
+| `tests/WS-FND-01.test.ts:211` | `eq(f.version, 1, …)` → `eq(f.version, 2, …)` |
+| `tests/WS-FND-01.test.ts:212` | `eq(CONTENT_FINGERPRINT_VERSION, 1)` → `2` |
+| `tests/WS-FND-01.test.ts:216` | `eq(f.overall, 'd4f73c37')` → `'76694a25'` |
+| `tests/WS-FND-01.test.ts:218/219/220` | `items 6a0d6441→a008a5e6` / `mobs 624808c4→0e39b653` / `bosses 1fb56d39→cf4bd9dc` |
+| `tests/WS-FND-01.test.ts:224~228` | A14 标题/正则/模板/字面量 `v1-` → `v2-`、`v1-d4f73c37` → `v2-76694a25` |
+| `tests/WS-FND-06.test.ts:1000` | `eq(f.version, 1, …)` → `2`(同一用例的第一条,不改它下一条永远轮不到) |
+| `tests/WS-FND-06.test.ts:1001` | `'d4f73c37'` → `'76694a25'` |
+| `tests/WS-FND-79-content-expansion.test.ts:147` | `'1fb56d39'` → `'cf4bd9dc'` |
+| `tests/WS-FND-84-abstract-loot.test.ts:538/545/546/551` | 标题 `bosses = cf4bd9dc、overall = 76694a25`;`1fb56d39→cf4bd9dc`、`d4f73c37→76694a25`、`624808c4→0e39b653`;负对照新增「不得等于 CR-29 的 `1fb56d39`」 |
+| `README.md:58` | `指纹 v1-d4f73c37` → `v2-76694a25` |
+| `scripts/data-conformance.ts:185/187` | `'v1-d4f73c37(既有锚点)'` → `'v2-76694a25(既有锚点)'`;verdict 判据 `overall === 'eaefa38b' && version === 1` → `'76694a25' && version === 2` |
+
+**判据名**:`WS-FND-01::A13`(overall 可复现 + 四字面量)、`WS-FND-01::A14`(指纹串形如 `v2-8hex`)、
+`WS-FND-06::[README] 内容指纹与容量锚点未漂移`、`WS-FND-79::FND79-3`、`WS-FND-84::FND84-6`、
+`WS-FND-90::FND90-3`(改 `recipe/station/output` ⇒ items 指纹必须变)、
+`FND90-4`(改 `drops` / `phases` ⇒ mobs / bosses 必须变)、
+`FND90-5`(文档字段不进指纹 + 排除表不许出现平衡字段 + `CONTENT_FINGERPRINT_VERSION >= 2`)。
+
+### 2. 台账关闭判据收紧(37 条退回未关闭)
+
+**依据**:关闭 = **标记 ∧ 可查证据**。证据 = 行内含 `判据` / `CR-<n>` / `tests/<x>.ts` / `§<n>`
+(只写「已关闭 / 已完成」不算)。`scripts/backlog.ts` 同时把三类(有据关闭 / 仅标记无据 / 普通未关闭)
+做成**互斥穷尽**的划分,并单列「仅标记、无判据证据」清单。
+
+命令原文:
+
+```
+$ node scripts/backlog.ts
+总计 133 条 / 未关闭 37 条 / 阻塞 0 条 / 已关闭 96 条
+  其中「仅标记、无判据证据」37 条 ⇒ 按未关闭计
+```
+
+| 落点 | 旧 → 新 |
+| :--- | :--- |
+| `README.md:65` | `133 条 ✅(0 未关闭 / **0 阻塞** / 133 已关闭)` → `(37 未关闭 / **0 阻塞** / 96 已关闭)` |
+| `docs/HANDOVER.md:103` | `133 条(0 未关闭 / 0 阻塞 / 133 已关闭)` → `(37 未关闭 / 0 阻塞 / 96 已关闭)` + 判据说明 |
+| `docs/HANDOVER.md:381` | 命令行注释 `133 条 / 108 未关闭 / 0 阻塞` → `133 条 / 37 未关闭 / 0 阻塞`(原值**早已陈旧**) |
+
+**判据名**:`WS-FND-90::FND90-1`(为「已关闭」的条目必须带可查证据,三类之和 == 总数)、
+`FND90-2`(注入:决定结果的是证据不是标记词 —— 删掉证据行 ⇒ 该条退回未关闭);
+`verify.ts` 的 `未决台账` 行四方约束(总/未关闭/阻塞/已关闭一次全验,README 多处出现即红)。
+
+### 3. 鉴权与凭证令牌化
+
+**依据**:`server/src/net/room.ts` 新增 `issueJoinToken()`(`:2876`,HMAC-SHA256,载荷含
+`userId / roomId / expiresAtMs`,默认 TTL `JOIN_TOKEN_TTL_MS`)与 `verifyRoomToken()`(`:343`);
+`join()` 的认证门在 `:1410`(且 `requireToken` 是**服务端**声明,`:1392~1406`);
+`ws_server.ts` 从 `?token=` 取凭证、`requireToken` 默认 **true**(`:702`),删掉只写日志的 `mintToken()`;
+`room.colyseus.ts` 同步一个入口。**凭证与校验共用同一份实现**(避免 CR-20 那种「两份签名实现必然漂移」)。
+
+**判据名**:`WS-FND-86::FND86-1~7` —— 无 token 拒 / 伪造拒 / 过期拒 / 合法放行 /
+房主不可被 `?userId=` 冒充 / 重连沿用同一校验 / 凭证与本房绑定(跨房重放拒)。
+同一批还登记:`WS-FND-87`(物品来源)、`WS-FND-88`(线上边界)、`WS-FND-89`(客户端顶点色)。
+
+### 4. 数字同步(新增 5 个套件)
+
+`WS-FND-86..90` 实测 **8 / 10 / 9 / 7 / 7 = 41 条**(逐套件直跑取 `report()` 输出)。
+
+| 落点 | 旧 → 新 |
+| :--- | :--- |
+| `README.md:62` | `94/94 ✅ 共 2070 个用例` → `99/99 ✅ 共 2111 个用例` |
+| `README.md:64` | `基座(FND-01..84) 1056 条 / 80 套件` → `基座(FND-01..90) 1097 条 / 85 套件` |
+| `docs/HANDOVER.md:27` | `tests/*.test.ts` **94** → **99** |
+| `docs/HANDOVER.md:96` | `2070 条 / 94 套件 … FND 1056 条 / 80 套件,号段 78` → `2111 / 99 … 1097 / 85,号段 90` |
+| `docs/HANDOVER.md:§九 sha256 表` | 7 个哈希按 LF 归一重算(`rehash_table_w17.mjs` 口径,README / CHANGE_REQUESTS 因本 CR 变动) |
+
+### 5. 写域外仍**未同步**的点(本 CR 不动,留给对应 owner)
+
+| 文件:行 | 现状 | 说明 |
+| :--- | :--- | :--- |
+| `tests/WS-FND-07.test.ts:64` | 注释仍写「内容基线锁 `v1-eaefa38b`」 | 注释,不影响判据;但它是**过期的指纹锚点** |
+| `server/src/content/handshake.ts:295` | 注释示例 `v1-fa111d71-0474ce21.…` | 同上(格式示例用 v1 前缀) |
+| `docs/DATA-CONFORMANCE.md:265` | 「指纹 v1-eaefa38b」 | 文档里的历史指纹,未随 CR-30 更新 |
+| `README.md:304` | 「**66** 份测试套件」 | 自由文本、**无门禁**保护,已与实测 99 不符(同类静默口袋) |
+
+### 6. 刻意**没做**的事
+
+- **没跑** `node scripts/verify.ts --all`(硬约束);本次只用 `--docs` + 逐套件直跑
+  (`WS-FND-01` / `06` / `79` / `84` / `86..90`)取证;
+- **没改**别人的测试文件(`WS-FND-13/14/15/21/25/55/63/65/86..90` 的**新建**由对应组负责,本 CR 只动
+  §1/§2 列出的落点);
+- **没 commit、没碰 `.pi/`**;
+- **没把 `v1` 从协议层抹掉**:`shared/net` 的 `contentClaim` 形如 `v{n}-{hex}`,版本前缀随内容算法走,
+  故 `WS-FND-03` 里以 `v1-…` 为例的**解析/拒绝**用例仍然成立(它们测的是格式,不是当前值)。
+
+### 7. 关联
+
+- CR-27(`748~754` 入表)· CR-28 / CR-29(`loot` / `drops` 归属)——
+  ⚠️ **CR-29 §3 的「`mobs` 未变」结论已作废**:v2 起 `drops` 进 mobs 分区哈希 ⇒ `624808c4 → 0e39b653`。
+  该条本身不改(历史记录),以本 CR §1 为准。
+- `server/src/content/registry.ts:196~237`(投影与排除表)· `scripts/content-lock.ts`(基线比对/`--update`)
+- `scripts/backlog.ts`(关闭判据)· `tests/WS-FND-90-gate-truth.test.ts`(门禁真话)
+- `server/src/net/room.ts`(`issueJoinToken` / `verifyRoomToken` / join 认证门)· `server/src/net/ws_server.ts`(`?token=` / `requireToken`)
+- `tests/WS-FND-86-auth-token.test.ts` · `tests/WS-FND-87-item-source.test.ts` · `tests/WS-FND-88-wire-bounds.test.ts` · `tests/WS-FND-89-client-vertexcolor.test.ts`

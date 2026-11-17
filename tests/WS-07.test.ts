@@ -1052,12 +1052,67 @@ test('C10 报文截断应抛错而不是静默返回半份状态', () => {
   ok(threw, '截断报文应抛错');
 });
 
-test('C11 超长字符串(id > 255 字节)必须拒绝而非截断', () => {
-  const s = buildRoom(1);
-  s.players[0].name = 'x'.repeat(300);
+test('C11 超长字符串(> 255 字节)走 255 哨兵分段:完整 round-trip,不丢字节', () => {
+  /* ★ 这是**语义升级**(F3 审计修复),不是放宽判据。
+   *
+   * 修前:`str` 是「单字节长度前缀 + 原样 payload」⇒ 任何 > 255 字节的串直接抛
+   *   「字符串超长」。而房间级 `chunkVersions` 是**变长拼接串**(16×16 世界跨 40
+   *   个 chunk 就 > 255 字节)⇒ 全量快照根本发不出去。本条原来断言
+   *   「超长 should throw」,钉的正是这个缺陷。
+   * 修后:`shared/net/delta.ts` 的 `ByteWriter.str` / `ByteReader.str` 改成**分段**
+   *   —— 每 255 字节一段、段前缀写哨兵 `255`,末尾补一段 `<255`;解码侧循环拼回。
+   *   ⇒ 判据由「必须拒绝」升级为「必须**完整解码回来**」,并同时保留两端的边界:
+   *     1 长串(255 / 300 / 1023 字节)逐字符 round-trip;
+   *     2 ≤255 的旧包**逐字节不变**(单字节长度 + 原样 payload,故无需协议 bump);
+   *     3 上限仍在(255 × 256 = 65280 字节,再长照样抛错)。
+   * 若有人把分段退化成「截断」或「丢尾段」,下面的 eq 立刻变红。 */
+
+  /* 1 长串:255(恰为整段 ⇒ 末尾一个 0 长收尾段)/ 300(跨 2 段)/ 1023(4 满段 + 3)。 */
+  for (const n of [255, 300, 1023]) {
+    const longName = 'abcdefghij'.repeat(Math.ceil(n / 10)).slice(0, n);
+    const s = buildRoom(1);
+    s.players[0].name = longName;
+
+    const wire = encodeFull(s, 100).bytes;
+    const pkt = decodePacket(wire);
+    eq(pkt.bytesConsumed, wire.length, `${n} 字节串的报文应恰好读完(分段不得留尾部残留)`);
+
+    const up = pkt.upserts.find((u) => u.id === 'p0');
+    ok(up !== undefined, `${n} 字节串:应能解出 p0`);
+    eq(up?.fields.name, longName, `${n} 字节的 name 必须逐字符解码回来(分段不得丢字节)`);
+
+    const rebuilt = applyPacket(buildRoom(1), pkt);
+    eq(rebuilt.players.find((p) => p.id === 'p0')?.name, longName,
+      `${n} 字节串:重建后的状态里 name 仍是原串`);
+  }
+
+  /* 2 正对照 —— 「≤255 的旧包字节不变」:200 字节的串必须仍是
+   *   `u8 200` + 200 字节原样 payload(**单段**,没有 255 哨兵、没有额外分段头),
+   *   这正是修前的老格式,也是这次改动不需要 bump `PROTOCOL_VERSION` 的依据。 */
+  const shortRoom = buildRoom(1);
+  shortRoom.players[0].name = 'x'.repeat(200);
+  const shortBytes = encodeFull(shortRoom, 100).bytes;
+  let payloadAt = -1;
+  for (let i = 1; i + 200 <= shortBytes.length && payloadAt < 0; i += 1) {
+    if (shortBytes[i - 1] !== 200) continue;
+    let run = true;
+    for (let k = 0; k < 200; k += 1) if (shortBytes[i + k] !== 0x78) { run = false; break; }
+    if (run) payloadAt = i;
+  }
+  ok(payloadAt > 0,
+    '200 字节的 name 应以「u8 200 + 200 字节原样 payload」出现(旧包逐字节不变,不进分段)');
+
+  /* 串头恒为 1 字节 ⇒ 200 → 201 字节只让报文长 +1(分段不向老包掺税)。 */
+  shortRoom.players[0].name = 'x'.repeat(201);
+  const bytes201 = encodeFull(shortRoom, 100).bytes;
+  eq(bytes201.length - shortBytes.length, 1, '201 vs 200 字节:串头恒 1 字节,总长只差 1');
+
+  /* 3 上界仍在:分段把上限从 255 抬到 255×256 = 65280,再长**照样抛错**(不静默截断)。 */
+  const huge = buildRoom(1);
+  huge.players[0].name = 'x'.repeat(255 * 256 + 1);
   let threw = false;
-  try { encodeFull(s, 1); } catch { threw = true; }
-  ok(threw, '超长 should throw');
+  try { encodeFull(huge, 100); } catch { threw = true; }
+  ok(threw, '超过 255×256 字节仍必须抛错(分段不是取消上限)');
 });
 
 test('C12 带宽:4/8/16 人三档实测,单玩家边际成本 29 字节恒定', () => {

@@ -2,12 +2,12 @@
   "_comment": "内容基线锁。生成:`node scripts/content-lock.ts --update`。内容更改后必须重新生成并在 docs/CHANGE_REQUESTS.md 记一笔,否则验证会报出差异。",
   "baselineFormat": 1,
   "fingerprints": {
-    "version": 1,
-    "items": "6a0d6441",
-    "mobs": "624808c4",
-    "bosses": "1fb56d39",
+    "version": 2,
+    "items": "a008a5e6",
+    "mobs": "0e39b653",
+    "bosses": "cf4bd9dc",
     "modes": "b854dbfe",
-    "overall": "d4f73c37"
+    "overall": "76694a25"
   },
   "counts": {
     "items": 329,

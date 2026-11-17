@@ -21,7 +21,12 @@
 
 import * as THREE from 'three';
 import { createCamera, type IsoCamera, Z_Y_PER_LEVEL } from '../stage/iso_camera.ts';
-import { buildChunkGeometry, buildOrthographicCamera } from './stage_assembly.ts';
+import {
+  buildChunkGeometry,
+  buildOrthographicCamera,
+  buildTerrainMaterial,
+  syncTerrainCamera,
+} from './stage_assembly.ts';
 import { makeDemoWorld, WORLD_CELLS, WORLD_CHUNKS } from '../stage/demo_world.ts';
 import { CHUNK_SIZE, ELEV_TO_Z } from '../stage/tile_mesh.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
@@ -208,8 +213,18 @@ export function boot(container: HTMLElement): BootHandle {
   let totalVerts = 0;
   let totalFaces = 0;
 
-  /* 单一材质:所有 chunk 共用,是减少 draw call 的前提 */
-  const mat = new THREE.MeshLambertMaterial({ color: 0x9fd6a0 });
+  /* 单一材质:所有 chunk 共用,是减少 draw call 的前提。
+   *
+   * ★ WS-FND-89:这里曾经是 `new THREE.MeshLambertMaterial({ color: 0x9fd6a0 })` ——
+   *   `vertexColors` 默认 `false`,于是几何上那份 `color` 属性**没有任何读者**,
+   *   真机地形恒为一块单色,而 `stage/terrain_vcolor` 的全部判据(长度、值域、
+   *   没有采样器)照样全绿:它们查的是几何与常量,不是「谁在读它」。
+   *
+   *   现在材质来自装配层的 `buildTerrainMaterial()`(顶点色 + 无纹理),并且
+   *   **每帧**把相机矩阵喂给它(见 tick 里的 `syncTerrainCamera`)——
+   *   raw 材料 three 不注入矩阵,漏掉那一行地形会整片消失。
+   */
+  const mat = buildTerrainMaterial();
 
   for (const chunk of chunks) {
     /* 顶点由纯逻辑层 `stage/chunk_geometry` 产出,与计数同源 */
@@ -1384,6 +1399,13 @@ export function boot(container: HTMLElement): BootHandle {
       bossHp = Math.max(boss.baseHp * 0.18, bossHp - (dt / 1000) * boss.baseHp * 0.035);
     }
 
+    /* ── ★ WS-FND-89:地形顶点色材质的矩阵上传 ──
+     *
+     * `syncCamera()` 只在相机**真的动了**时跑,但 uniform 是**每帧**都要最新的:
+     * 放到 syncCamera 里会让「相机动了的第一帧」用上一帧的矩阵(表现为地形抖一下)。
+     * 因此这里无条件调一次 —— O(1),与 `renderer.render` 同一帧、紧挨着它。
+     */
+    syncTerrainCamera(mat, camera);
     renderer.render(scene, camera);
 
     /* ── 覆盖层:把上面各模块的状态画出来 ── */

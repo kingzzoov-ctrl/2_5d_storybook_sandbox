@@ -129,7 +129,11 @@ async function connectReal(roomId: string, userId: string): Promise<RealClient> 
   const welcomeArrived = new Promise<WelcomeFrame>((res) => { resolveWelcome = res; });
 
   const session = createSession({
-    url: `ws://127.0.0.1:${srv.port}/ws?userId=${userId}`,
+    /* ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=` 才是证据。
+       token 由**生产的签发入口** `runtime.issueJoinToken` 现签(与 `join` 里验签的
+       同一把密钥),不硬编码、也不跳过鉴权。 */
+    url: `ws://127.0.0.1:${srv.port}/ws?userId=${encodeURIComponent(userId)}`
+      + `&token=${encodeURIComponent(a.runtime.issueJoinToken(userId))}`,
     store,
     events: {
       onWelcome: (w) => { resolveWelcome(w); },
@@ -157,7 +161,14 @@ type RawClient = {
   done: Promise<void>;
 };
 
-function rawConnect(port: number, userId: string): RawClient {
+/**
+ * 裸 WebSocket。
+ *
+ * `token` 可选:**真房间**必须给(鉴权上线后 `?userId=` 只是声明),
+ * **替身房间**(`makeStubRoom`)的 `join` 是一句 `{ ok: true }` ⇒ 它没有认证门,
+ * 那条判据(FND63-5 的 ack 因果)也不该因为夹具没有签发入口而改命题。
+ */
+function rawConnect(port: number, userId: string, token?: string): RawClient {
   const bin: Uint8Array[] = [];
   const out: RawClient = {
     ws: null as unknown as WebSocket,
@@ -166,7 +177,10 @@ function rawConnect(port: number, userId: string): RawClient {
     opened: null as unknown as Promise<void>,
     done: null as unknown as Promise<void>,
   };
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?userId=${userId}`);
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${port}/ws?userId=${encodeURIComponent(userId)}`
+    + (token === undefined ? '' : `&token=${encodeURIComponent(token)}`),
+  );
   out.ws = ws;
   ws.binaryType = 'arraybuffer';
   let markOpened: () => void = () => undefined;
@@ -366,8 +380,9 @@ async function main(): Promise<void> {
   await atest('FND63-4 ★★ 多连接:A 的 ack 是 A 的 5,B 的是 -1(不互相冒充)', async () => {
     const a = assemble({ roomId: 'r63multi', ownerId: 'o', sizeCells: 64 });
     const srv = await startWsServer({ port: 0, room: a.runtime as never, frameMs: 20 });
-    const A = rawConnect(srv.port, 'alice63');
-    const B = rawConnect(srv.port, 'bob63');
+    /* ★ 真房间 ⇒ 必须带生产的签发凭证(`?userId=` 只是声明,见 `rawConnect`)。 */
+    const A = rawConnect(srv.port, 'alice63', a.runtime.issueJoinToken('alice63'));
+    const B = rawConnect(srv.port, 'bob63', a.runtime.issueJoinToken('bob63'));
     try {
       await withTimeout(Promise.all([A.opened, B.opened]), WS_HANDSHAKE_BUDGET_MS, '两条连接都打开');
       await waitUntil(() => srv.connCount() >= 2, 5000, '服务端握手完成 2 条', () => srv.connCount());

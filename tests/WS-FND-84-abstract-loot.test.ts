@@ -25,7 +25,7 @@
  * | 3 | 既有 Boss 的原有战利品**一个不丢、一位不挪**(逐 Boss 与 CR-28 前快照比);新增只允许是 748~754,总数 = 4 | 假表删掉 703 ⇒ 红;把 748 插到队首 ⇒ 红 |
  * | 4 | 归属与手册逐条一致(748→河狸 / 754·749→姜饼巨魔 / 750→克洛诺斯 / 751→golem / 752→chocobo / 753→squirrel);`lootAbstract` 的手册原文保留 | 假表把 748 挪到克洛诺斯 / 把 751 挂到松鼠 / 把 751 又塞回 Boss loot ⇒ 报「挂错」 |
  * | 5 | 生产路径真发:Boss 侧 4 件的 `rollPersonalLoot` 光球都含该件;mob 侧 3 件在 `drops` 里且**不是首项**(`taming.ts` 的驯服回赠取 `drops` 第一项,新件不得顶掉特色产出) | 被标 `lootDeviations` 的 `437` / `440` 仍被过滤;mob 掉落引用闭合(`auditContent`) |
- * | 6 | 指纹与基线同步:`bosses = 1fb56d39`、`overall = d4f73c37`、`mobs = 624808c4`(mob 表只改 `drops`,不进 mobs 分区哈希),且与 `content.baseline.json` 一致 | 断言 `bosses ∉ {8f50dc95, e6bd03cc}`(否则「什么都没改也能过」) |
+ * | 6 | 指纹与基线同步:`bosses = cf4bd9dc`、`overall = 76694a25`、`mobs = 0e39b653`(CR-30 起整字段投影,mob 的 `drops` 也进 mobs 分区哈希),且与 `content.baseline.json` 一致 | 断言 `bosses ∉ {1fb56d39, 8f50dc95, e6bd03cc}`(否则「什么都没改也能过」) |
  *
  * ## 期望值来源
  *
@@ -535,24 +535,25 @@ test('FND84-5 生产路径:4 件由 Boss 光球真发、3 件落在 mob drops(�
 
 /* ═════════════════ 6. 指纹与基线同步 ═════════════════ */
 
-test('FND84-6 指纹/基线同步:bosses = 1fb56d39、overall = d4f73c37(负对照:不许等于 CR-28 旧值)', () => {
+test('FND84-6 指纹/基线同步:bosses = cf4bd9dc、overall = 76694a25(负对照:不许等于 CR-29 旧值)', () => {
   const f = contentFingerprints();
   const raw = JSON.parse(readFileSync(join(ROOT, 'server/src/content/content.baseline.json'), 'utf8')) as {
     fingerprints: Record<string, unknown>;
   };
   eq(raw.fingerprints.bosses, f.bosses, '基线 bosses 分区必须与当前内容同步(node scripts/content-lock.ts --update)');
   eq(raw.fingerprints.overall, f.overall, '基线的 overall 分区同理');
-  eq(f.bosses, '1fb56d39', '★ CR-29 之后 bosses 分区的字面值');
-  eq(f.overall, 'd4f73c37', '★ CR-29 之后 overall 的字面值');
+  eq(f.bosses, 'cf4bd9dc', '★ CR-30(v2 整字段投影)之后 bosses 分区的字面值');
+  eq(f.overall, '76694a25', '★ CR-30(v2 整字段投影)之后 overall 的字面值');
 
-  /* mob 表只改了 `drops`,而 mobs 分区哈希的是 `{id,name,biome,hp,exp}`
-     (`server/src/content/registry.ts:266`)⇒ mobs 指纹**不该**变。这条同时证明
-     「3 件落到 mob」确实改了数据,却没有把 mobs 分区的字面值混淆成别的变更。 */
-  eq(f.mobs, '624808c4', 'mobs 分区哈希不含 drops ⇒ 仍是 CR-27 的值');
+  /* CR-30 起投影改成**整字段**:mob 记录里连 `drops` 一起进 mobs 分区哈希
+     (`server/src/content/registry.ts` 的 `contentFingerprints`)⇒ mobs 的分区值也从
+     CR-29 的 624808c4 漂到 0e39b653。这条同时证明「3 件落到 mob」确实改了数据。 */
+  eq(f.mobs, '0e39b653', 'CR-30(v2 整字段投影)之后 mobs 分区的字面值');
 
   /* 负对照:`loot` 真的变了 —— 若谁把 751/752/753 又塞回 Boss,指纹会退回 CR-28 的值,这条立刻红。
      这也证明上面两个字面量不是「什么都没改也能过」的同义反复。 */
   ok(f.bosses !== '8f50dc95', 'bosses 分区不得再是 CR-28 的值(否则说明 3 件根本没挪回 mob)');
+  ok(f.bosses !== '1fb56d39', 'bosses 分区不得再是 CR-29(v1 投影)的值');
   ok(f.bosses !== 'e6bd03cc', 'bosses 分区也不得退回 CR-27 的值');
 });
 

@@ -39,6 +39,8 @@ node scripts/verify.ts --all
 2_5d_sandbox/
 ├── shared/                     # ── 冻结层,只读(D-19 解锁范围见 §5)──
 │   ├── types/{tile,physics,entities,alchemy}.ts   # D-19 追加:cooking.ts / events.ts
+│   ├── types/wire.ts                               # 线上格式唯一定义处(字段表/定点/状态结构)
+│   ├── net/delta.ts                                # 20Hz 差量编解码 + Chunk 版本差量
 │   ├── constants/{items,mobs,bosses}.ts            # D-19 追加:dye.ts / cooking.ts
 │   ├── testing/harness.ts                          # 永不改
 │   └── contracts/FREEZE.md
@@ -67,6 +69,10 @@ node scripts/verify.ts --all
 | `metaState(v): number` / `faceDir(v): number` | — | 运行态低 2 位 / 朝向高 2 位 |
 | `CHUNK_SIZE=16` `CHUNK_CELLS=256` `CHUNK_BYTES=1024` | — | 1KB/Chunk |
 | `Elevation` `BaseFluid` `WireColor` | `as const` 对象 | 枚举替代 |
+| `packTileWide(f: TileFields): TileCellWide` | `{ lo, hi }` | 宽单元:u16 地砖 + u16 物体 ID(D-19)。`floor`/`obj` 非整数 / 负 / > u16 ⇒ **归 0**,绝不回绕(审计 P1-3) |
+| `unpackTileWide(c: TileCellWide): TileFields` / `wideCellValue(f)` / `fieldsFromWideValue(v)` | — | 宽单元 ↔ `TileFields` ↔ 单个 46 位数值 |
+| `isValidFloorId(id)` / `isValidObjId(id): boolean` | `boolean` | u16 ID 口径的**唯一定义处**;`packTileWide` 生产调用它们 |
+| `FLOOR_ID_BITS=16` `OBJ_ID_BITS=16` `FLOOR_WORD_BITS=6` `OBJ_WORD_BITS=12` `WIDE_HI_BITS=14` | `number` | 位宽常量 |
 
 ### 2.2 `shared/types/physics.ts` — 2.5D 伪三维质点物理
 
@@ -98,12 +104,13 @@ node scripts/verify.ts --all
 `AlchemyCategory`(7)· `PrimaryMechanic`(10)· `SecondaryElement`(8)· `BaseSilhouette`(9)· `ParticleAura`(7)·
 `StatWeights` · `VisualStyle` · `LLMAlchemyOutputSchema` · `RarityTier` + `RARITY_LABEL`(四档阈值 1.00 / 1.25 / 1.55)· `RolledStats` · `ItemInstanceStats` · `AlchemyRecipeRow` · `recipeHash()` · `DEW_ITEM_ID=130` `ALCHEMY_FURNACE_ID=536` `BETA_DEW=0.15`。
 
-### 2.5 `shared/constants/items.ts` — 320 项配表
+### 2.5 `shared/constants/items.ts` — 329 项配表
 
-`ITEM_LIST: readonly ItemDef[]`(320 条)· `ITEM_BY_ID: ReadonlyMap<number, ItemDef>` · `TOTAL_ITEM_COUNT=320` · `ITEM_TABLES`(十大分表 key/range/count)· `itemName(id)` `itemValue(id)` `itemTags(id)` `expandRecipe()`。
+`ITEM_LIST: readonly ItemDef[]`(329 条)· `ITEM_BY_ID: ReadonlyMap<number, ItemDef>` · `TOTAL_ITEM_COUNT=329` · `ITEM_TABLES`(十一分表 key/range/count)· `itemName(id)` `itemValue(id)` `itemTags(id)` `expandRecipe()`。
 
 ID 分段(与手册 §3 完全一致,**任何写手不得新增或改号**):
-`101-130` 自然(30) · `151-170` 半成品(20) · `201-218` 工具(18) · `221-255` 整蛊玩具(35) · `301-330` 地砖(30) · `351-385` 建筑构件(35) · `401-440` 电路物流竞技(40) · `501-537` 家具设备(37) · `601-630` 料理时装(30) · `701-745` 战利品武器护甲祭品(45)。
+`101-130` 自然(30) · `151-170` 半成品(20) · `201-218` 工具(18) · `221-255` 整蛊玩具(35) · `301-330` 地砖(30) · `351-385` 建筑构件(35) · `401-440` 电路物流竞技(40) · `501-537` 家具设备(37) · `601-630` 料理时装(30) · `701-745` 战利品武器护甲祭品(45) · **`746-754` 3.11 手册补录:牧场产出 2 + 无 ID 抽象奖励 7(9)**。
+合计 **329 项 / 11 张分表**(320 原有 + 9 扩编,由 `tests/WS-FND-79-content-expansion.test.ts` 钉住)。
 
 ### 2.6 `shared/constants/mobs.ts` / `bosses.ts`
 
@@ -126,6 +133,38 @@ test('最高位不产生符号位污染', () => {
 
 report('WS-01');
 ```
+
+### 2.8 `shared/types/wire.ts` — 线上格式唯一定义处
+
+| 常量/函数/类型 | 签名 | 语义 |
+| :--- | :--- | :--- |
+| `PROTOCOL_VERSION`(值在 `net/delta.ts`) | `3` | 包头版本字节;**任何线格式改动必须 bump** |
+| `FieldType` | `as const` 对象(7 种:`pos/u8/u16/u32/i16/str/hash`) | 字段类型词表,禁止 enum |
+| `FIELD_TYPE_BYTES` | `Readonly<Record<string, number>>` | 定长类型的线上字节数(变长类型不在表内) |
+| `POS_SCALE=1024` · `quantizePos(v)` · `dequantizePos(q)` | — | 坐标 1/1024 格定点(超 int32 钳到端点) |
+| `FieldSpec` · `FIELD_TABLE`(14)· `WILDLIFE_FIELD_TABLE`(9)· `BOSS_FIELD_TABLE`(10)· `ROOM_FIELD_TABLE`(5) | `readonly FieldSpec[]` | 四张字段表:**唯一事实源**,顺序即编码顺序 |
+| `tableFor(kind)` · `EntityKind` · `ENTITY_KIND_LABEL` | — | 实体种类判别(0 保留为非法) |
+| `PlayerState` / `WildlifeState` / `BossState` / `RoomMetaState` / `RoomState` · `cloneRoomState(s)` | TS 接口 / 函数 | 状态结构(客户端必须装得下) |
+| `StateFlagIndex` / `STATE_FLAG_NAMES` · `FsmIndex` / `FSM_NAMES` · `TelegraphShape` | `as const` 派生 | 位压缩 u8 → 语义的词表 |
+| `chunkKey(cx, cy)` · `serializeChunkVersions(map)` · `parseChunkVersions(text)` | — | Chunk 版本号拍平成**键排序**的确定性串 |
+
+线格式要点:`str` = 分段 u8 长度前缀(`< 255` 时与原 1 字节前缀**逐字节相同**;
+≥ 255 时每 255 字节一段、段前缀写哨兵 `255`),上限 65280 字节
+⇒ 房间级 `chunkVersions`(40 个 chunk ≈ 300 字节)不再触发「字符串超长」。
+`u8/u16/u32` 字段**越界即抛错**,不做静默钳位;`u8` 与 `u16/u32` 统一 `Math.round`。
+
+### 2.9 `shared/net/delta.ts` — 20Hz 差量编解码
+
+| 常量/函数 | 签名 | 语义 |
+| :--- | :--- | :--- |
+| `PROTOCOL_VERSION` | `3` | 协议版本(**v3** = 包头 `tick` 后多加 4 字节 `ackedSeq`;跳过 2 因为 `FRAME_BINARY===0x02` 会撞值) |
+| `PacketOp` | `{ FULL: 0, DELTA: 1 }` | 报文 op |
+| `encodeDelta(prev, next, tick?)` / `encodeFull(state, tick?)` | `→ { bytes, stats }` | 字段级 diff;`prev===null` 退化为全量 |
+| `decodePacket(bytes)` | `→ DecodedPacket` | 版本/op 门 + **恰好消耗完**(尾部有剩余 ⇒ 抛错) |
+| `applyPacket(base, pkt)` | `→ RoomState` | 解码结果套回状态(round-trip 断言用) |
+| `roomToFlat(s)` · `estimateBandwidth(players, tickHz?)` · `bandwidthTable(tickHz?)` | — | 房间拍平 / 带宽估算模型 |
+| `diffChunkVersions(prev, next)` · `chunkWireBytes()` · `makeChunkVersionKey(cx, cy)` | — | Chunk 地形增量 |
+| 再导出:`POS_SCALE` `quantizePos` `dequantizePos` | — | 调用方只 import `delta.ts` 即可 |
 
 ---
 

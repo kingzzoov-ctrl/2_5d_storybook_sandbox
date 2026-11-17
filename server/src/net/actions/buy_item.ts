@@ -36,6 +36,8 @@
  * 背包与库存必须**要么都变、要么都不变**。
  */
 import { ITEM_BY_ID } from '../../../../shared/constants/items.ts';
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { bindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -93,9 +95,8 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     return { ok: false, kind: 'INVALID', reason: quote.reason };
   }
 
-  /* 6 先收进背包(产出侧必须先给凭证再 `applyInventory`,否则按「凭空产出」拒)。 */
-  const src = `depot-buy:${itemId}x${qty}`;
-  ctx.grantItemSource(ctx.actorId, src);
+  /* 6 先收进背包(产出侧必须先铸**绑定凭证**再 `applyInventory`,否则按「凭空产出」拒)。 */
+  const src = bindItemSource(ctx, itemId, ItemSourcePurpose.PURCHASE);
   const gain = ctx.applyInventory(ctx.actorId, {
     ops: [{ itemId, delta: qty, source: src }],
   });
@@ -110,10 +111,11 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* 7 提交:成交才写库存。被拒 ⇒ 把刚收进来的东西退回去(不吞)。 */
   const commit = host.purchaseCommit(itemId, qty);
   if (!commit.ok) {
-    const refundSrc = `depot-buy-refund:${itemId}x${qty}`;
-    ctx.grantItemSource(ctx.actorId, refundSrc);
+    /* ★ 审计 P0-2:退回是**负 delta**(把这 qty 件拿回去),不是产出 ⇒
+       **不发凭证**。修前这里 `grantItemSource(refundSrc)` ⇒ 一张退款凭证凭空多出来,
+       而且和正向那条一样不绑 itemId。负 delta 也不需要 source(凭证链只约束产出侧)。 */
     const refund = ctx.applyInventory(ctx.actorId, {
-      ops: [{ itemId, delta: -qty, source: refundSrc }],
+      ops: [{ itemId, delta: -qty }],
     });
     return {
       ok: false, kind: 'INVALID',

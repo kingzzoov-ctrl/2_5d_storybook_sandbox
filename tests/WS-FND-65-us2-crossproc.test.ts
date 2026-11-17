@@ -102,7 +102,11 @@ async function rawConnect(roomId: string, userId: string): Promise<Raw> {
   const a = assemble({ roomId, ownerId: 'o', sizeCells: 64 });
   const sim = a.host as unknown as WorldSim;
   const srv = await startWsServer({ port: 0, room: a.runtime as never, frameMs: 20 });
-  const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws?userId=${userId}`);
+  /* ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=`(HMAC 凭证)才是证据。
+     token 由**生产的签发入口** `runtime.issueJoinToken` 现签(与 `join` 里验签的
+     是同一把密钥 `authSecret`):不硬编码、也不跳过鉴权(跳过就不是端到端了)。 */
+  const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws?userId=${encodeURIComponent(userId)}`
+    + `&token=${encodeURIComponent(a.runtime.issueJoinToken(userId))}`);
   ws.binaryType = 'arraybuffer';
   const out: Raw = {
     srv, sim, rt: a.runtime, ws,
@@ -253,7 +257,9 @@ async function main(): Promise<void> {
     let resolveWelcome: (w: WelcomeFrame) => void = () => undefined;
     const welcome = new Promise<WelcomeFrame>((res) => { resolveWelcome = res; });
     const session = createSession({
-      url: `ws://127.0.0.1:${srv.port}/ws?userId=s65`,
+      /* ★ token 用**生产的签发入口**现签(见 `rawConnect` 的注释:鉴权已上线) */
+      url: `ws://127.0.0.1:${srv.port}/ws?userId=s65`
+        + `&token=${encodeURIComponent(a.runtime.issueJoinToken('s65'))}`,
       store,
       events: {
         onWelcome: (w) => { resolved = w; resolveWelcome(w); },

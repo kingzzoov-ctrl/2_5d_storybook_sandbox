@@ -142,12 +142,20 @@ function uplink(tag: number, body: Uint8Array): Uint8Array {
 
 type Collected = { welcome: Record<string, unknown> | null; bin: Uint8Array[]; sentHello: boolean };
 
-/** 真 WS 客户端(同 `client/src/net/session.ts:266` 的写法:开连即发 hello)。 */
-function connect(url: string, userId: string): {
+/**
+ * 真 WS 客户端(同 `client/src/net/session.ts:266` 的写法:开连即发 hello)。
+ *
+ * ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=`(HMAC 凭证)才是证据。
+ * 缺 token ⇒ `room.join({requireToken:true})` 拒 + 1008 关连接 ⇒ 本套件会变成
+ * 「一条上行都发不出去」。token 由**生产的签发入口** `room.issueJoinToken` 现签
+ * (与验签同一把密钥),不硬编码、也不跳过鉴权。
+ */
+function connect(url: string, userId: string, token: string): {
   ws: WebSocket; got: Collected; done: Promise<void>; opened: Promise<void>;
 } {
   const got: Collected = { welcome: null, bin: [], sentHello: false };
-  const ws = new WebSocket(`${url}?userId=${userId}`);
+  const ws = new WebSocket(`${url}?userId=${encodeURIComponent(userId)}`
+    + `&token=${encodeURIComponent(token)}`);
   ws.binaryType = 'arraybuffer';
   /* ★ `opened` —— 把「连接真的开了」做成**可 await 的状态**,而不是
    *   「sleep 了大概够长的一段时间」。负载下后者会直接**同步抛**
@@ -217,7 +225,7 @@ async function main(): Promise<void> {
     const room = makeRoom();
     const pktBytes = legitPacket(room, 'alice');
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'bob');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'bob', room.issueJoinToken('bob'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F1 前置:服务端握手完成(connCount ≥ 1)',
@@ -269,7 +277,7 @@ async function main(): Promise<void> {
      *   (b) 把失败也塞进 uplinkParsed ⇒ 下面的 eq(rejected, +1) 红 */
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'carol');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'carol', room.issueJoinToken('carol'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F2 服务端握手完成(connCount ≥ 1)',
@@ -308,7 +316,7 @@ async function main(): Promise<void> {
     const p1 = legitPacket(room, 'p1');
     const p2 = legitPacket(room, 'p2');
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'dan');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'dan', room.issueJoinToken('dan'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F3 服务端握手完成(connCount ≥ 1)',
@@ -371,7 +379,7 @@ async function main(): Promise<void> {
     };
     /* 模拟"旧实现收到一个合法包":它只会记录 —— 我们**不**调用 decodePacket */
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'eve');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'eve', room.issueJoinToken('eve'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F4 服务端握手完成(connCount ≥ 1)',
@@ -413,30 +421,38 @@ async function main(): Promise<void> {
     /* ★ 这条钉的是一个**真实陷阱**,不是假想:
      *
      * ```
-     * new Uint8Array(70000); big[0]=1;
-     * decodePacket(big) ⇒ **不抛**,返回 { op:0, tick:0, ..., bytesConsumed:10 }
-     * ⇒ 69990 字节是尾部垃圾,而它会被算成"解析成功"。
+     * new Uint8Array(70000); big[0]=1; big[1]=0;
+     * 改前的 decodePacket(big) ⇒ **不抛**,返回 { op:0, … bytesConsumed:10 }
+     *   ⇒ 69990 字节是尾部垃圾,而它会被算成「解析成功」。
+     * 改后(审计 P1-2):decodePacket 自己判「恰好消耗完」⇒ 同一个包**抛错**。
      * ```
      * 若判据写成 `try { decodePacket(x); 成功++ } catch { 失败++ }`,
      * 那么 `uplinkParsed` 可以被**任意垃圾**灌水 —— 它就成了假判据。
      *
-     * 变红条件:把 `bytesConsumed === byteLength` 那条检查删掉
+     * 变红条件:把「恰好消耗完」那条判据删掉(`shared/net/delta.ts` 的
+     *   `r.pos !== bytes.length`,服务端侧对应的是解析失败分支)
      *   ⇒ 本断言会看到 uplinkParsed 增加、rejected 不增加 ⇒ 红。 */
     const junk = new Uint8Array(70000);
     junk[0] = PROTOCOL_VERSION;      /* 版本合法 */
     junk[1] = PacketOp.FULL;         /* op 合法 */
-    /* 前置:证明这个包**确实不抛**(否则本断言测的是另一件事) */
+    /* 前置(★ 2026-11-17 翻面):该垃圾包现在**抛错** —— 见下。
+       改前:尾部未消耗是**服务端**那条 `bytesConsumed !== byteLength` 分支在判,
+             `decodePacket` 自己不抛 ⇒ 前置只能断言「不抛」。
+       改后:`decodePacket` 自己在 `r.pos !== bytes.length` 时抛
+             (`shared/net/delta.ts`,审计 P1-2)⇒ 前置必须跟着翻面,
+             否则它测的是「另一件事」而不是本条的命题。 */
     let threw = false;
     let consumed = -1;
     let totalLen = junk.byteLength;
     try { consumed = decodePacket(junk).bytesConsumed; } catch { threw = true; }
-    ok(!threw, '前置:该垃圾包**不抛**(它版本/op 合法)—— 若抛了则本断言测错对象');
+    ok(threw, '前置:该垃圾包**现在抛错**(decodePacket 自己判「尾部未消耗」)'
+      + ' —— 若它又不抛了,说明那条判据被挪走/删掉了');
     ok(consumed < totalLen,
       `前置:它只消耗 ${consumed}/${totalLen}B ⇒ 尾部有垃圾 ⇒ 这正是陷阱所在`);
 
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'frank');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'frank', room.issueJoinToken('frank'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F5 服务端握手完成(connCount ≥ 1)',
@@ -472,7 +488,7 @@ async function main(): Promise<void> {
     const room = makeRoom();
     const bytes = legitPacket(room, 'grace');
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'heidi');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'heidi', room.issueJoinToken('heidi'));
     try {
       await c.opened;
       await waitUntil(() => srv.connCount() >= 1, 5000, 'F6 服务端握手完成(connCount ≥ 1)',
@@ -514,7 +530,7 @@ async function main(): Promise<void> {
     /* 真链路上:hello(文本)不该被计成"协议包解析失败" */
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 50 });
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'ivan');
+    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'ivan', room.issueJoinToken('ivan'));
     try {
       /* ★ 等的是**状态**(hello 的回执 welcome 到了),不是「150ms 大概够了」。 */
       await waitUntil(() => c.got.welcome !== null, 5000, 'F7 握手回执(welcome)已下发',

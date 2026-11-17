@@ -334,6 +334,16 @@ export type WsConn = {
    */
   urlUserId: string | null;
   /**
+   * ★★ 握手 URL 里 `?token=` 的**加入凭证**(审计 P0-1)。
+   *
+   * 它是本连接**唯一**可被采纳的身份证据:`urlUserId` 只是"客户端声称自己是谁",
+   * 而 `token` 是服务端签的(`signRoomToken`)、只在本房本人生效、且会过期。
+   * ⚠️ 位置在 `WsConn`(而不是每次 `onHello` 现取)是有意的:
+   * 一条连接开两次 hello 也必须用**第一次那个**凭证 —— 否则客户端可以
+   * 先用"无 token"完成一次握手、再用另一个身份重发 hello。
+   */
+  urlToken: string | null;
+  /**
    * ★ D-14(owner 2026-11-17 裁决,方案 A):本连接**已应用成功的最高命令序号**
    * (`-1` = 还没收到 `seq`)。
    *
@@ -354,14 +364,42 @@ export type WsConn = {
   ackedSeq: number;
 };
 
-/** 从 `req.url`(如 `/ws?userId=alice`)取 userId;没有则 null。 */
-export function readUserIdFromUrl(url: string | undefined): string | null {
+/**
+ * 从 `req.url`(如 `/ws?userId=alice&token=...`)取任意 query 参数;没有/空值 ⇒ `null`。
+ *
+ * ⚠️ 空值必须归 `null`(而不是 `''`):两个调用方(`readUserIdFromUrl` /
+ * `readTokenFromUrl`)都要把"参数在、值为空"当成**没给** —— 否则空 token 会
+ * 被当成"给了 token"送去验签,而报出来的原因会是"签名不符"而不是"缺少 token",
+ * 负对照就指认错了对象。WS-13 §10 对 `readUserIdFromUrl` 已有这条断言。
+ */
+export function readQueryParam(url: string | undefined, name: string): string | null {
   if (url === undefined) return null;
   const q = url.indexOf('?');
   if (q < 0) return null;
   const params = new URLSearchParams(url.slice(q + 1));
-  const v = params.get('userId');
+  const v = params.get(name);
   return v !== null && v.length > 0 ? v : null;
+}
+
+/** 从 `req.url` 取 userId;没有则 null。(行为与重构前逐字一致,WS-13 §10 钉着它。) */
+export function readUserIdFromUrl(url: string | undefined): string | null {
+  return readQueryParam(url, 'userId');
+}
+
+/**
+ * 从 `req.url` 取**加入凭证**;没有则 null。
+ *
+ * ## 为什么凭证走 query,而不是塞进 hello JSON
+ * ``` 1 客户端的 `HelloFrame` 只有 { t, protocolVersion, contentClaim, passwordHash?, asGuest? },
+ *    而 WS-13 §5b-1 会**逐字段双向比对**两端接口 —— 服务端镜像里多一个 `token`
+ *    就会红(它的判据没错:一个客户端从不发的字段,只会让下一个人以为"已经有这条路了")。
+ *  2 凭证在**连接建立**时就该到位:Upgrade 之后立刻能判,不必等上行帧;
+ *    而握手 URL 本来就是客户端可控的传输细节,不构成"协议字段"。 ```
+ * ⚠️ 客户端当前**不**带它(`session.ts` 拼的 URL 只有 `?userId=`)⇒ 那一路会被拒,
+ * 这是审计 P0-1 的**预期结果**(见本文件 `onHello` 的注释)。
+ */
+export function readTokenFromUrl(url: string | undefined): string | null {
+  return readQueryParam(url, 'token');
 }
 
 export type WsServerOptions = {
@@ -371,6 +409,19 @@ export type WsServerOptions = {
   /** 每帧间隔 ms(默认 50 = 20Hz,与 room.step 外部驱动对齐)。 */
   frameMs?: number;
   onLog?: (msg: string) => void;
+
+  /**
+   * **加入凭证是否必须**(默认 `true`)。
+   *
+   * ## 为什么默认必须,而不是"可选开启"
+   * 旧实现:身份 = 握手 URL 的 `?userId=` ⇒ `?userId=u_owner` 直接成房主。
+   * 一个"默认关闭"的鉴权开关等于**没修**:攻击者不会去帮你打开它。
+   * ⇒ 默认 `true`;要放宽必须**显式**写 `false`(留给将来的回放/压测夹具,
+   *   那种场景必须写在调用点、看得见)。
+   * ⚠️ 即便传 `false`,只要连接带了 `?token=` 就**一定**会验(`onHello` 里
+   *   `token !== null` 分支)——"不强制"不等于"伪造也放行"。
+   */
+  requireToken?: boolean;
 };
 
 /**
@@ -436,11 +487,29 @@ export type WsRoomLike = {
   readonly id: string;
   step(prevSnapshot: unknown): Uint8Array;
   snapshotFor(userId: string): Uint8Array;
-  join(input: { userId: string; passwordHash?: string | null; asGuest?: boolean }): {
+  /**
+   * 加入房间。**凭证必传**(`token`),房间负责验签 —— 运输层不自己造一份校验实现
+   * ("不造第二份口径"):密钥在房间里,运输层没有它也**不该**有。
+   *
+   * `requireToken: true` 是"这条路径来自网络"的表态;`RoomRuntime.join` 据此
+   * 把「缺 token」也判死(`token?: string` 只是为了让可信的进程内调用点少写一个字段)。
+   */
+  join(input: {
+    userId: string;
+    passwordHash?: string | null;
+    asGuest?: boolean;
+    token?: string;
+    requireToken?: boolean;
+  }): {
     ok: boolean;
     reason?: string;
     resumed?: boolean;
   };
+  /**
+   * 签发一张加入凭证。**可选**(结构化最小接口):没有它的房间无法鉴权,
+   * `WsServerHandle.issueToken` 会**显式**报错而不是返回一个假凭证。
+   */
+  issueJoinToken?(userId: string, ttlMs?: number): string;
   leave(userId: string): boolean;
   disconnect(userId: string): boolean;
   /**
@@ -528,6 +597,19 @@ export type WsServerHandle = {
    */
   lastAckedSeqFor(userId: string): number;
   /**
+   * ★ 签发一张加入凭证(**鉴权入口的服务端半**)。
+   *
+   * 生产里由"登录 / 大厅"在**用户身份已经确认**之后调用(比如校验完密码/会话),
+   * 再把凭证交给客户端,客户端带 `?token=` 连上来。它**不是**给客户端调的 HTTP 接口 ——
+   * 它只是把房间的签名能力暴露给装配层,因为密钥在房间里。
+   *
+   * ## 为什么不是"运输层自己签"
+   * 两份签名实现必然漂移(CR-20 同形)⇒ 签发与校验**共用** `room.issueJoinToken`
+   * / `room.join` 这一对。房间没实现它 ⇒ **抛错**:一个鉴权端点返回假凭证
+   * 比不可用更糟(它会让人以为身份已经验过了)。
+   */
+  issueToken(userId: string, ttlMs?: number): string;
+  /**
    * 供测试:**模拟异常掉线** —— 直接 destroy 所有底层 TCP,不发 close 帧。
    *
    * ## 为什么需要它(而不是让测试用 `ws.close()`)
@@ -612,7 +694,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let uplinkRejected = 0;
   let lastParsedPacket: DecodedPacket | null = null;
   let lastParseError: string | null = null;
-  let nextConnSeq = 1;
+  /* ★ 审计 P0-1:`nextConnSeq` 已删除。
+     旧代码在"既没有 hello.userId 也没有 ?userId="时退化为 `c${nextConnSeq++}` ——
+     那是**服务端替客户端编一个身份**;现在这条路整段不存在(没凭证 ⇒ 拒),
+     所以它没有读者。留着它就等于留着一个"随手能捡回来用"的身份来源。 */
+  /** 加入凭证是否必须(默认 true,理由见 `WsServerOptions.requireToken`)。 */
+  const requireToken = opts.requireToken ?? true;
   /* ★ 旧的闭包级 `lastAckedSeq` 已删除(D-14):ack 是**每连接**的量,
      全局那一份正是"多连接互相冒充"的成因。见 `WsConn.ackedSeq`。 */
 
@@ -690,6 +777,8 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       /* ★★ userId 从**握手 URL 的 query** 取 —— 实测客户端 hello 里**没有**它。
          见 `WsConn.urlUserId` 的说明。 */
       urlUserId: readUserIdFromUrl(req.url),
+      /* ★ 凭证在**建连接时**取一次(见 `WsConn.urlToken`:重复 hello 不得换证据)。 */
+      urlToken: readTokenFromUrl(req.url),
       ackedSeq: -1,
     };
     conns.add(conn);
@@ -827,8 +916,9 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
        *   返回 { op:0, tick:0, removed:0, upserts:0, bytesConsumed:10 }
        * ⇒ 69990 字节是**尾部垃圾**,而它被算成"解析成功"。
        * ```
-       * ⇒ 故本实现要求**恰好消耗完**才算成功:
-       *   `bytesConsumed === byteLength`。有剩余 ⇒ 记为失败(理由写明剩余字节数)。
+      * ⇒ 故**解码器**要求**恰好消耗完**才算成功(`shared/net/delta.ts`:
+      *   `r.pos !== bytes.length` ⇒ 抛)。运输层只需把它记成失败
+      *   —— 自己**不再重复判一次**(那条分支 2026-11-17 已删,见下面 `decodePacket` 那行)。
        * ⇒ 这样"成功计数"不会被垃圾包灌水 ——
        *   否则我自己的 `uplinkParsed` 就是又一个"能变绿的假判据"。 */
       /* ⚠️ `lastUplink` 仍然无条件记录 —— 它的语义是"最近收到的、已剥 tag 的原始载荷",
@@ -838,13 +928,17 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       lastUplink = u.payload;
       try {
         const pkt = decodePacket(u.payload);
-        if (pkt.bytesConsumed !== u.payload.byteLength) {
-          uplinkRejected += 1;
-          lastParseError = `报文尾部有 ${u.payload.byteLength - pkt.bytesConsumed} 字节未消耗`
-            + `(解出 ${pkt.bytesConsumed}/${u.payload.byteLength}B)`;
-          log(`上行协议包解析失败:${lastParseError}`);
-          return;
-        }
+        /* ★ 2026-11-17:**删掉**了原来的
+           `if (pkt.bytesConsumed !== u.payload.byteLength) { …uplinkRejected++… }`
+           分支 —— 它已经是**死代码**:
+           `decodePacket` 自己在 `r.pos !== bytes.length` 时抛
+           (`shared/net/delta.ts`,审计 P1-2),所以能走到这一行时
+           `bytesConsumed === byteLength` **必然**成立。
+           ⚠️ 保留它 = 第二份「尾部有没有垃圾」的口径(迟早与解码器分叉),
+             还会让那条判据看起来有两个来源。
+           ★ 判据没丢:`tests/WS-FND-14` 的 F5(70000B 大垃圾包)仍钉着同一件事,
+             现在由下面的 catch 分支记账(失败原因文案也来自 `decodePacket`)。
+           ⚠️ 也不要把它改成 `if (…) throw`:那是把一条**永假**条件写成"防线"。 */
         uplinkParsed += 1;
         lastParsedPacket = pkt;
         lastParseError = null;
@@ -868,23 +962,56 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   }
 
   function onHello(c: WsConn, hello: HelloFrame): void {
-    /* ★★★ userId 跨连接稳定:两个来源,按**稳定性**排序(契约 §12.2)。
-       ⚠️ **绝不随机** —— 随机会让重连变成「同一玩家出现两个」,且不报错。 */
+    /* ═══ ★★★ 审计 P0-1:身份 = 服务端签发的**凭证**,不是客户端串 ═══
+     *
+     * ## 改前的攻击面(实测)
+     * ```
+     * ws://host/ws?userId=u_owner   + 任意 hello
+     * ⇒ declared = 'u_owner' ⇒ room.join({userId:'u_owner'})
+     * ⇒ room.ts 的角色判据 input.userId === this.ownerId ⇒ **OWNER**
+     * ```
+     * 全仓 `token` 被校验 **0** 次(`mintToken` 产出的串只是日志装饰)。
+     *
+     * ## 改后:三个来源分成"证据"与"声明"两档
+     * ```
+     * 证据 = ?token=(或 hello.token,若将来客户端带上)  ← 服务端签的,含 userId/roomId/过期
+     * 声明 = hello.userId / ?userId=                     ← 客户端自己写的,**只用来与证据比对**
+     * ⇒ 声明必须有(否则无从校验),但**声明单独没有任何效力**:
+     *   room.join({requireToken:true}) 会先验签,并要求 claims.userId === 声明。
+     * ```
+     * ## 两个"顺序"是有意的
+     * 1 **凭证校验在 join 里,不在本文件** —— 密钥在房间里,运输层没有也不该有
+     *   (再造一份校验 = CR-20 的第二份口径)。
+     * 2 `c.userId` 只在校验**通过之后**才写 —— 否则被拒的连接在 socket close 时
+     *   会带着 `c.userId='u_owner'` 去跑 `room.disconnect('u_owner')`,
+     *   那等于给未认证的人一个"踢掉房主"的按钮(同一类缺陷换个门进来)。
+     */
     const fromHello = typeof hello.userId === 'string' && hello.userId.length > 0
       ? hello.userId : null;
-    const declared = fromHello ?? c.urlUserId;
-    const userId = declared ?? `c${nextConnSeq++}`;
-    if (declared === null) {
-      /* ⚠️ 拿不到稳定 id ⇒ 重连在裸 WS 层**做不到**。
-         不许静默:`log` 出来让操作者知道这条连接没有重连能力。 */
-      log(`⚠️ 无稳定 userId(hello 与 URL 都没有)⇒ 退化为 ${userId},该连接**无法重连**`);
+    const claimed = fromHello ?? c.urlUserId;
+    /* ⚠️ `HelloFrame` **不声明** `token`(理由见 `readTokenFromUrl`:WS-13 §5b-1
+       逐字段双向比对)。这里按结构化窄化读:客户端将来真带了就生效,**不宣称**它有。 */
+    const helloToken = typeof (hello as { token?: unknown }).token === 'string'
+      ? (hello as { token: string }).token : null;
+    const token = helloToken ?? c.urlToken;
+    if (claimed === null) {
+      /* 没有声明就无从比对 ⇒ 拒(旧代码在这里**替客户端编**一个 `c1` 身份,
+         那正是"身份由服务端凭空产生"的另一面:编出来的身份也能占席位)。 */
+      const reason = '缺少 userId(身份无从校验)';
+      log(`hello 被拒:${reason}`);
+      sendJson(c, { t: 'reject', reason });
+      write(c, encodeClose(1008, reason));
+      c.closed = true;
+      return;
     }
-    c.userId = userId;
-    c.declaredUserId = declared;
     const res = opts.room.join({
-      userId,
+      userId: claimed,
       passwordHash: hello.passwordHash ?? null,
       asGuest: hello.asGuest === true,
+      /* `undefined`(而非 null)⇒ 与 "客户端给了空串" 区分开;
+         `requireToken` 让「缺」与「伪造」都落在 join 的同一条拒绝分支里。 */
+      token: token ?? undefined,
+      requireToken,
     });
     if (!res.ok) {
       sendJson(c, { t: 'reject', reason: res.reason ?? 'join 失败' });
@@ -892,11 +1019,17 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       c.closed = true;
       return;
     }
+    /* ★ 身份**此刻**才落到连接上:join 返回 ok ⇒ 凭证已验过、且 claims.userId === claimed
+       (`RoomRuntime.verifyJoinToken` 保证)。在此之前 `c.userId` 保持 null ⇒
+       未认证连接的 socket close 不会去 `room.disconnect(声称的 id)`。 */
+    c.userId = claimed;
+    c.declaredUserId = claimed;
     c.helloDone = true;
     /* welcome:字段与客户端 WelcomeFrame 对齐(契约 §12.4) */
     sendJson(c, {
       t: 'welcome',
-      playerId: userId,
+      /* `playerId` = **已认证**的身份(= 凭证里的 userId),不是客户端声明的那个串。 */
+      playerId: claimed,
       roomId: opts.room.id,
       protocolVersion: PROTOCOL_VERSION,
       /* ⚠️ 服务端指纹:阶段 3 的对应物是"只发不校验"。
@@ -908,7 +1041,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1) */
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1)。
        包头那 4 字节 ack 也按**本连接**填(此刻通常 = 0 ⇒ 「还没有 ack」)。 */
-    sendBinary(c, withAckedSeq(opts.room.snapshotFor(userId), c.ackedSeq));
+    sendBinary(c, withAckedSeq(opts.room.snapshotFor(claimed), c.ackedSeq));
   }
 
 /**
@@ -1121,7 +1254,19 @@ function onMove(c: WsConn, msg: {
       for (const c of conns) if (c.userId === userId) return c.ackedSeq;
       return -1;
     },
+    /* ★ 鉴权入口的服务端半:转调房间的签发能力(见 `WsServerHandle.issueToken`)。 */
+    issueToken: (userId: string, ttlMs?: number): string => {
+      const issuer = opts.room.issueJoinToken;
+      if (typeof issuer !== 'function') {
+        /* 显式失败:返回一个假凭证会让人以为身份已经验过了 —— 比不可用更糟。 */
+        throw new Error('本房间没有 issueJoinToken ⇒ 无法签发加入凭证(鉴权不可用)');
+      }
+      return ttlMs === undefined
+        ? issuer.call(opts.room, userId)
+        : issuer.call(opts.room, userId, ttlMs);
+    },
     /* ★ 模拟异常掉线:destroy 底层 socket(**不发 close 帧**)。
+       (原注释见下方:`dropConnectionsForTest` 让"异常断开"与"主动退房"可分别构造。)
        服务端侧看到的与"客户端掉网"完全一致 ⇒ 走 `disconnect` 分支。 */
     dropConnectionsForTest: async (): Promise<void> => {
       for (const c of [...conns]) {

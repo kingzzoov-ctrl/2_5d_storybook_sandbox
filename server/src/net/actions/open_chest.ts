@@ -38,6 +38,8 @@
  * 任一步失败都直接返回,另一侧一个字都不动 —— 这是「半步事务」的对照面。
  */
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { bindItemSource, missingItemReadPort, ownedItemCount } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -266,6 +268,17 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
         reason: `箱子已满(${CHEST_SLOTS} 格)⇒ 放不下新的一档 ${itemId}`,
       };
     }
+    /* ★ 按件权威读口(审计 P1):`itemId` 是报文里**客户端自报**的,总量守恒挡不住
+       「存入一件自己没有的 id」—— 存进去之后取出来就是另一件东西了。
+       缺读口 ⇒ 显式 NOT_IMPLEMENTED;不够件 ⇒ INVALID。两条都**零副作用**。 */
+    const owned = ownedItemCount(ctx, itemId);
+    if (owned === null) return missingItemReadPort(ctx);
+    if (owned < count) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `背包里不够 ${count} 个 ${itemId}(服务端账面 ${owned} 件)`,
+      };
+    }
     /* 扣背包:这一个动作**先扣背包**(与放置块同向)。被拒 ⇒ 容器一个字都没动。 */
     const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -count }] });
     if (!spend.allowed) {
@@ -292,9 +305,9 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
      反过来先加背包、再扣容器,中途失败就会造出复制品。 */
   const live = containers.writable(roomId, x, y);
   removeFromStacks(live, itemId, take);
-  const src = `chest:${roomId}:${x},${y}:${itemId}`;
-  /* 产出侧凭证必须早于正向 `applyInventory`,否则会被反作弊按「凭空产出」拒。 */
-  ctx.grantItemSource(ctx.actorId, src);
+  /* 产出侧凭证必须早于正向 `applyInventory`,否则会被反作弊按「凭空产出」拒。
+     ★ 绑定:令牌绑的就是**从这一格取出的这一件**(`itemId` 已由容器账本核过件数)。 */
+  const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CHEST_TAKE);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: take, source: src }] });
   if (!gain.allowed) {
     /* 背包收不下 ⇒ **放回容器**(否则东西被吞)。 */

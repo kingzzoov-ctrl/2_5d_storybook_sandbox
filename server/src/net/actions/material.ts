@@ -14,8 +14,10 @@
  *     都在那条路上,绕过它 = 绕过了本仓唯一的物品真值来源;
  *   3 世界侧**真的**变了;失败时必须**退回**背包那一件(不做"扣了东西却没放下")。
  *
- * 产出侧(破坏掉落 / 拾取)必须先 `ctx.grantItemSource`,否则 `checkInventory` 会按
- * "凭空产出"拒(`FROM_NOTHING`)—— 那是设计好的闸,不是障碍。
+ * 产出侧(破坏掉落 / 拾取 / 退回)必须先 `bindItemSource(…, itemId, purpose)`,否则
+ * `checkInventory` 会按「凭空产出」拒(`FROM_NOTHING`)—— 那是设计好的闸,不是障碍。
+ * 扣减侧(放置 / 丢弃)必须先问**按件权威读口**(`ownedItemCount`):`itemId` 是报文里
+ * 客户端自报的,只靠总量守恒挡不住「丢一件任意 id 再捡起来」。
  *
  * ⚠️ 顺序纪律:**先动世界、再动背包**至少要有一侧是"先扣"的 —— 拾取时先扣地面、
  *   再进背包;放块时先扣背包、再写世界。两边都"先加"就会造出复制品。
@@ -25,6 +27,10 @@ import { ITEM_LIST } from '../../../../shared/constants/items.ts';
    (`rng() < chance ? 翻倍 : 不翻`)与 `bosses/raid.ts:409` 的 35% 数量翻倍同源。
    **不另写一份 PRNG**(那会是第二份实现,迟早漂移)。 */
 import { fnv1a, seededRoll } from '../../bosses/raid.ts';
+/* ★ 审计 P0-2 + P1 的两道口:产出侧铸**绑定令牌**,扣减侧读**按件权威账**。
+   见 `item_source.ts` 的文件头 —— 那里是"为什么",这里是"用在哪"。 */
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { bindItemSource, missingItemReadPort, ownedItemCount } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -108,6 +114,14 @@ export const placeBlock: ActionHandler = (ctx: ActionContext) => {
   if (mat === null) {
     return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层 ⇒ 没有世界可放块' };
   }
+  /* ★ 按件权威读口(审计 P1):`itemId` 是**客户端自报**的,总量守恒兜不住它
+     —— 「有没有这一件」只能由服务端账本回答。缺读口 ⇒ 显式 NOT_IMPLEMENTED,
+     不退回「信客户端」。到这里**世界与背包都还没动**(零副作用)。 */
+  const owned = ownedItemCount(ctx, itemId);
+  if (owned === null) return missingItemReadPort(ctx);
+  if (owned < 1) {
+    return { ok: false, kind: 'INVALID', reason: `背包里没有 ${itemId}(服务端账面 ${owned} 件)` };
+  }
   /* 先扣背包:没这一件会被反作弊按 NEGATIVE 拒 ⇒ 不可能"凭空空投一个块"。 */
   const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -1 }] });
   if (!spend.allowed) {
@@ -118,9 +132,9 @@ export const placeBlock: ActionHandler = (ctx: ActionContext) => {
   }
   const r = mat.placeBlock(x, y, itemId);
   if (!r.ok) {
-    /* 扣了东西却没放下 ⇒ **退回**(带凭证,见本文件开头)。 */
-    const src = `place-refund:${x},${y}`;
-    ctx.grantItemSource(ctx.actorId, src);
+    /* 扣了东西却没放下 ⇒ **退回**。退回是正 delta ⇒ 必须先铸**绑定**凭证
+       (绑定 itemId:它只换回这一件,不能拿去铸别的)。 */
+    const src = bindItemSource(ctx, itemId, ItemSourcePurpose.PLACE_REFUND);
     ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
     return { ok: false, kind: 'INVALID', reason: r.reason };
   }
@@ -154,9 +168,9 @@ export const breakBlock: ActionHandler = (ctx: ActionContext): ActionOutcome => 
   const gatherMul = r.gatherMul ?? 1;
   const tick = ctx.state.meta.tick;
   const count = gatherCountFor(gatherMul, gatherRollFor(ctx.actorId, x, y, r.objId, tick));
-  /* 拆下来的东西先给凭证再入背包;背包满就落回**原地** —— 不凭空销毁。 */
-  const src = `break:${x},${y}:${r.objId}`;
-  ctx.grantItemSource(ctx.actorId, src);
+  /* 拆下来的东西先铸**绑定**凭证再入背包;背包满就落回**原地** —— 不凭空销毁。
+     `r.objId` 来自物质层(服务端权威),不是报文里的值 ⇒ 令牌绑的就是这一件。 */
+  const src = bindItemSource(ctx, r.objId, ItemSourcePurpose.GATHER);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: r.objId, delta: count, source: src }] });
   /* `gatherMul` **只在世界源给出非中性值**时才进回执(1 = 中性 ⇒ 键缺席,与
      `WorldArchiveReceipt.trim` 同一纪律:键的存在本身是可判定事实)。
@@ -191,6 +205,17 @@ export const dropItem: ActionHandler = (ctx: ActionContext) => {
   /* ⚠️ 落点取**权威位置**,不取客户端报的坐标:否则玩家可以把东西丢到地图另一头。 */
   const at = ctx.hostPositionOf(ctx.actorId);
   if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
+  /* ★ 按件权威读口(审计 P1 的另一半):丢的是**哪一件**由服务端账本回答。
+     修前只做总量守恒 ⇒ 「丢一件任意 id」再捡起来 = 背包任意换 id。
+     拒绝时**世界与背包都没动**。 */
+  const owned = ownedItemCount(ctx, itemId);
+  if (owned === null) return missingItemReadPort(ctx);
+  if (owned < count) {
+    return {
+      ok: false, kind: 'INVALID',
+      reason: `背包里不够 ${count} 个 ${itemId}(服务端账面 ${owned} 件)`,
+    };
+  }
   const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -count }] });
   if (!spend.allowed) {
     return {
@@ -222,8 +247,8 @@ export const pickupItem: ActionHandler = (ctx: ActionContext) => {
       reason: `附近 ${PICKUP_RADIUS} 格内没有 ${itemId}(地上那件可能已被别人捡走)`,
     };
   }
-  const src = `pickup:${at.x},${at.y}:${itemId}`;
-  ctx.grantItemSource(ctx.actorId, src);
+  /* 地上那件是**物质层**给的(`takeGroundItemNear` 已先扣掉它),凭证绑的就是它。 */
+  const src = bindItemSource(ctx, itemId, ItemSourcePurpose.PICKUP);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
   if (!gain.allowed) {
     /* 背包满了 ⇒ **放回去**(不能把玩家已经捡起来的东西吞掉)。 */

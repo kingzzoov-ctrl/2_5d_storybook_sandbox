@@ -139,9 +139,88 @@ export interface OpenItem {
   text: string;
   /** 是否被标注为阻塞 */
   blocking: boolean;
-  /** 是否已标注为已定稿/已采纳/已解决 */
+  /**
+   * 是否**有据地**已关闭 = 关闭标记 **且** 可查证据。
+   *
+   * ⚠️ 2026-11-18 收紧:此前只要行内出现「已关闭 / 已完成 / ~~」就算关闭。
+   * 实测 133 条**全部**判关,其中 100 条的关闭状态只由新增的
+   * 「已关闭 / 已完成」两个词决定 —— 那不是「已关闭」,那只是「有人写了一个词」。
+   * 词本身不是证据,能查的东西才是。
+   */
   closed: boolean;
+  /** 行内(或关闭登记)出现了可查证据(判据 / CR-n / tests/x.ts / doc §n)。 */
+  evidence: boolean;
+  /** 有标记、**无**证据 ⇒ 按未关闭计,并在输出里单列(`bareClose`)。 */
+  bareClose: boolean;
   line: number;
+}
+
+/**
+ * 关闭标记词:行内出现即「**声称**已关闭」。
+ *
+ * 注意它只是**声称**。要与 `hasClosureEvidence` 同时成立才算关闭 ——
+ * 见 `classifyClosure`。
+ */
+export const CLOSURE_MARKERS = /已关闭|已完成|已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~/;
+
+/**
+ * 「已关闭」必须带**可查证据**:一个能被人点开核对的东西。
+ *
+ * ## 为什么不能只用标记词(实测)
+ *
+ * 台账曾把「已关闭 / 已完成」直接当关闭判据:加词之后 133 条**全部**判关,
+ * 也就是说 100 条的关闭状态完全由那两个词决定 —— 后果不是「多算了几条关」,
+ * 而是**台账从「账」退化成「词频表」**:谁把某个词写进某一格,
+ * 那一条就从账上消失,而且没有任何东西会怀疑它。
+ *
+ * ⇒ 判据:**闭项必须留痕**。「我做完了」不是留痕,「判据 tests/x.ts FND90-3」才是。
+ *
+ * ## 证据的四种合法形态(全部**可在仓内打开核对**)
+ *
+ * ```
+ *   判据 ……        → 指名断言,如「判据 tests/WS-FND-71-combat-depth.test.ts FND71-3」
+ *   CR-<n>         → docs/CHANGE_REQUESTS.md 的编号条目
+ *   tests/<x>.ts   → 测试文件本身(点开即读)
+ *   §<n>           → 文档章节锚点(可带文件名,如 RULINGS-DRAFT §4.8)
+ * ```
+ *
+ * ⚠️ 刻意**不**接受「已修」「已办」「见上文」这类无法核对的措辞:
+ * 放进来任何一条,就有人用它把整张表重新写软。
+ */
+export const CLOSURE_EVIDENCE_PATTERNS: readonly RegExp[] = [
+  /判据/,
+  /CR-\d+/,
+  /tests\/[\w.-]+\.ts/,
+  /(?:[\w.-]+\.md\s*)?§\s*\d/,
+];
+
+/** 行/登记里是否含可查证据。 */
+export function hasClosureEvidence(text: string): boolean {
+  return CLOSURE_EVIDENCE_PATTERNS.some((re) => re.test(text));
+}
+
+/** 一条台账行的关闭判定结果。 */
+export interface ClosureVerdict {
+  /** 出现关闭标记(或命中 `CLOSURE_ANNEX` 登记)。 */
+  marked: boolean;
+  /** 出现可查证据。 */
+  evidence: boolean;
+  /** 只有 `closed` 为真才算已关闭。 */
+  closed: boolean;
+}
+
+/**
+ * 关闭判定:**标记 ∧ 证据**。
+ *
+ * `annexBasis` = `CLOSURE_ANNEX` 里为该条登记的「关闭依据」。
+ * 登记本身算一个标记(它明说「这条关了」),但它**同样要过证据关** ——
+ * 否则登记表就成了「换个地方写一个词」的后门。
+ */
+export function classifyClosure(raw: string, annexBasis?: string): ClosureVerdict {
+  const marked = CLOSURE_MARKERS.test(raw) || annexBasis !== undefined;
+  const evidence =
+    hasClosureEvidence(raw) || (annexBasis !== undefined && hasClosureEvidence(annexBasis));
+  return { marked, evidence, closed: marked && evidence };
 }
 
 /**
@@ -400,10 +479,15 @@ const STALE_PROBES: { doc: string; id: string; claim: RegExp; file: string; prob
  * `| **已关闭(2026-11-17)** | <本表 basis> |` 并**从本表删除**。
  * 保留不删会让「关闭依据」出现两份,日后必然漂移。
  *
+ * ⚠️ 登记**不是后门**:本表的 `basis` 与行内标记一样要过证据关
+ * (`hasClosureEvidence`)。否则「把行内标记搬进一张表」就成了绕开判据的捷径 ——
+ * 而这张表恰好是**最容易被随手加一条**的地方。
+ * 判据见 `tests/WS-FND-90-gate-truth.test.ts` FND90-2。
+ *
  * 判据来源:`docs/TASK-96-action-landing-gaps.md` §二之八、
  * `docs/COMPLETION-CRITERIA.md` ★第二批收口表、`docs/RULINGS-DRAFT.md`。
  */
-const CLOSURE_ANNEX: { doc: string; id: string; basis: string }[] = [
+export const CLOSURE_ANNEX: { doc: string; id: string; basis: string }[] = [
   /* D1 / D3 / D4 / D5 自 2026-11-17 起已由另一条工作流在 `docs/DAMAGE-LOOP.md` 行内
      就地标注(~~…~~ **已关闭**),故按上面「同步义务」从此表移除,避免关闭依据出现两份。
      仍留在这里的,是源文档尚未就地标注的那几条。 */
@@ -441,21 +525,26 @@ export function collectOpenItems(): OpenItem[] {
          却因为含「阻塞玩家操作」这个词被误判成阻塞项。判据必须排除已裁决。 */
       const decided = /已采纳|已定稿|已裁决|已解决|已删除|已修正诊断|~~/.test(raw);
       const id = `${m[1]}${m[2]}`;
-      /* 关闭判据 = 行内标记 ∪ 冻结文档关闭登记(`CLOSURE_ANNEX`)。
-         ★ 2026-11-17 把「已关闭 / 已完成」纳入标记词 —— 实测踩过:
-         `docs/ADVERSARIAL-REVIEW-10.md` U5 写着「**已完成**」,却没有一个词命中
-         旧判据(只认 已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~),
-         于是至少 4 条已完成的条目**滞留在未关闭计数里**
-         (见 `docs/BACKLOG-108-TRIAGE.md` §6.5)。这是工具口径缺陷,不是实现缺陷。 */
-      const closed =
-        /已关闭|已完成|已删除|已解决|已定稿|已采纳|已实现|已修正诊断|~~/.test(raw) ||
-        CLOSURE_ANNEX.some((c) => c.doc === f && c.id === id);
+      /* 关闭 = **标记 ∧ 可查证据**(见 `classifyClosure`)。
+         ★ 2026-11-17 曾把「已关闭 / 已完成」纳入标记词 —— 当时是对的:
+         `docs/ADVERSARIAL-REVIEW-10.md` U5 写着「**已完成**」却一个词都不命中,
+         于是已完成条目滞留在未关闭计数里(见 `docs/BACKLOG-108-TRIAGE.md` §6.5)。
+         ★★ 2026-11-18 补上**另一半**:加词后 133 条**全部**判关,其中 100 条的
+         关闭状态只由那两个词决定。词能进门禁,就等于谁写谁关 ——
+         现在要求同一行(或 `CLOSURE_ANNEX` 的依据)里出现**能点开核对**的锚点:
+         `判据` / `CR-<n>` / `tests/<x>.ts` / `§<n>`。
+         无锚点的条目**按未关闭计**,并在输出里单列为「仅标记无判据」——
+         它们的正确处置是补证据或重新开张,而不是把标记词改得更好看。 */
+      const annex = CLOSURE_ANNEX.find((c) => c.doc === f && c.id === id);
+      const closure = classifyClosure(raw, annex?.basis);
       items.push({
         doc: f,
         id,
         text: m[3].trim().replace(/\s+/g, ' ').slice(0, 110),
         blocking: !decided && /阻塞|阻断|需 CR|需先定/.test(raw),
-        closed,
+        closed: closure.closed,
+        evidence: closure.evidence,
+        bareClose: closure.marked && !closure.closed,
         line: i + 1,
       });
     }
@@ -566,24 +655,53 @@ function main(): void {
   if (docArg >= 0) list = list.filter((i) => i.doc === args[docArg + 1]);
 
   const open = items.filter((i) => !i.closed);
+  /* 「仅标记无判据」= 有人写了已关闭/已完成/~~,但同一行找不到能核对的锚点。
+     它们是**未关闭**的一个子集,必须单列 —— 否则读的人只会看到「未关闭 N 条」,
+     不知道 N 条里有多少是「真没做」、多少是「声称做了但没留痕」。 */
+  const bareClose = items.filter((i) => i.bareClose);
   console.log('══ 未决台账 ══');
   console.log(
     `总计 ${items.length} 条 / 未关闭 ${open.length} 条 / 阻塞 ${items.filter((i) => i.blocking && !i.closed).length} 条` +
-      ` / 已关闭 ${items.length - open.length} 条\n`,
+      ` / 已关闭 ${items.length - open.length} 条`,
   );
+  console.log(
+    `  其中「仅标记、无判据证据」${bareClose.length} 条 ⇒ 按未关闭计`
+      + `(证据 = 行内含 判据 / CR-<n> / tests/<x>.ts / §<n>;只有标记词不算关闭)`,
+  );
+  console.log('');
 
   const byDoc = new Map<string, OpenItem[]>();
   for (const it of list) {
     if (!byDoc.has(it.doc)) byDoc.set(it.doc, []);
     byDoc.get(it.doc)!.push(it);
   }
+
   for (const [doc, rows] of byDoc) {
     console.log(`${doc}  (${rows.length} 条)`);
     for (const r of rows) {
-      const mark = staleKeys.has(`${doc}|${r.id}`) ? '⚠过时' : r.blocking ? '🚧阻塞' : r.closed ? ' 已闭' : '     ';
+      const mark = staleKeys.has(`${doc}|${r.id}`)
+        ? '⚠过时'
+        : r.blocking
+          ? '🚧阻塞'
+          : r.closed
+            ? ' 已闭'
+            : r.bareClose
+              ? '⚠无据'
+              : '     ';
       console.log(`  ${mark} ${r.id.padEnd(4)} ${r.text}`);
     }
     console.log('');
+  }
+
+  if (bareClose.length > 0) {
+    console.log(`══ ⚠ 仅标记、无判据证据(${bareClose.length} 条 —— 按未关闭计,需补证据或重新开张)══`);
+    for (const r of bareClose) {
+      console.log(`  ${r.doc}:${r.line}  ${r.id}  ${r.text}`);
+    }
+    console.log(
+      '\n  → 若确实已完成,请在同一行补上可核对锚点(如 `判据 tests/xxx.test.ts FNDnn-n` / `CR-<n>`);'
+      + '\n    若只是有人写了个词,那它从未真正关闭过。\n',
+    );
   }
 
   if (stale.length > 0) {

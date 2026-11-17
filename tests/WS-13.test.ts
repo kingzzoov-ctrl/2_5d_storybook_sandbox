@@ -622,7 +622,21 @@ test('WS13-5b-2 ★★ welcome 的字段集必须**覆盖**客户端 `WelcomeFra
         ⇒ 捕获从 `t:` **之后**开始 ⇒ `t` 恒被判成"漏发"(误报)。
      ⇒ 这是**解析器 bug,不是服务端缺陷**。改成从 `{` 之后整体捕获。 */
   const serverSrc = readFileSync(WS_SERVER_SRC, 'utf8');
-  const m = /sendJson\(c,\s*\{([\s\S]*?)\n\s*\}\);/.exec(serverSrc);
+  /* ★ 2026-11-17:锚点必须钉在 **welcome 自己那个** `sendJson(c, {` 上。
+     原写法对**全文**跑 `/sendJson\(c,\s*\{([\s\S]*?)\n\s*\}\);/` ——
+     非贪婪只保证"最短",**不保证"是 welcome"**:鉴权上线后 `onHello` 里
+     第一个 `sendJson` 变成了 `reject`(缺声明那一支),而它的闭合 `});`
+     落在 `room.join({…})` 那行 ⇒ 捕获块 = reject + join,里面没有 `t: 'welcome'`
+     ⇒ 本断言红。这是**解析器脆弱**,不是服务端漏发(welcome 的字段一个没少,
+     下面仍逐字段比对)。
+     ⇒ 改成:先定位 `t: 'welcome'`,再回到它**前面最近的** `sendJson(c, {` 起捕。 */
+  const welcomeAt = serverSrc.indexOf("t: 'welcome'");
+  ok(welcomeAt >= 0, '应能定位服务端发出 welcome 的那句话');
+  const openAt = welcomeAt < 0 ? -1 : serverSrc.lastIndexOf('sendJson(c, {', welcomeAt);
+  ok(openAt >= 0, '应能定位服务端构造 welcome 的那段源码');
+  const m = openAt < 0
+    ? null
+    : /sendJson\(c,\s*\{([\s\S]*?)\n\s*\}\);/.exec(serverSrc.slice(openAt));
   ok(m !== null, '应能定位服务端构造 welcome 的那段源码');
   const body = m![1]!;
   ok(/t:\s*'welcome'/.test(body), '捕获到的应是 welcome 那个对象(w含 t)');
@@ -745,6 +759,23 @@ function connect(url: string, userId?: string): {
   return { ws, got, done };
 }
 
+/**
+ * ★ 2026-11-17:鉴权上线后的连接 URL。
+ *
+ * 改前:`?userId=` 既是"声明"又是"身份" ⇒ 本套件直接拼 `?userId=xxx` 就能进房。
+ * 改后(`room.ts` 的 HMAC 凭证 + `ws_server.onHello`):`?userId=` **只是声明**,
+ * 证据是 `?token=`,缺它 ⇒ 1008 关连接 ⇒ 本套件所有端到端判据都变成"测空气"。
+ *
+ * ⇒ token 一律用**生产的签发入口** `room.issueJoinToken` 现签:
+ *   · 硬编码一张 ⇒ 换房间/换密钥/过期就整片红,且测的不再是生产路径;
+ *   · 干脆跳过鉴权 ⇒ 端到端判据失去意义(那就不是 e2e 了)。
+ * 签发的密钥(`room.authSecret`)与验签的密钥是**同一把**,故这里不需要任何新夹具。
+ */
+function wsUrl(srv: { port: number }, room: RoomRuntime, userId: string): string {
+  return `ws://127.0.0.1:${srv.port}/ws?userId=${encodeURIComponent(userId)}`
+    + `&token=${encodeURIComponent(room.issueJoinToken(userId))}`;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
 /* ═══════════════ 6.0 ★ 具名等待上限(2026-11-17:修时抖)═══════════════
@@ -855,7 +886,7 @@ async function main(): Promise<void> {
   await atest('WS13-6-1 ★★ 判据一:真起服务 → 真连接 → hello → welcome → 二进制帧 → 真解码', async () => {
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
-    const { ws, got, done } = connect(`ws://127.0.0.1:${srv.port}/ws`, 'alice');
+    const { ws, got, done } = connect(wsUrl(srv, room, 'alice'));
     /* ⚠️ 进 try **之前**只允许"获取资源",不放断言 ——
        断言写在 try 外时一旦抛,finally 不执行 ⇒ srv 不关 ⇒ 进程不退。 */
     try {
@@ -939,7 +970,7 @@ async function main(): Promise<void> {
        负向对照**不会**红。 */
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
-    const { ws, got, done } = connect(`ws://127.0.0.1:${srv.port}/ws`, 'bob');
+    const { ws, got, done } = connect(wsUrl(srv, room, 'bob'));
     try {
       /* ★ 旧:`await sleep(300); ok(got.bin.length > 0)` —— 与 6-1 同一个根因(固定预算)。
          ⇒ 等条件成立;到点仍 0 帧 ⇒ 下面这条 `ok` 照旧红。 */
@@ -965,9 +996,9 @@ async function main(): Promise<void> {
   await atest('WS13-6-3 ★ 判据三:≥2 客户端**同时**收到同一份快照', async () => {
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
-    const a = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p1');
-    const b = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p2');
-    const c = connect(`ws://127.0.0.1:${srv.port}/ws`, 'p3');
+    const a = connect(wsUrl(srv, room, 'p1'));
+    const b = connect(wsUrl(srv, room, 'p2'));
+    const c = connect(wsUrl(srv, room, 'p3'));
     try {
       /* ⚠️ 这里原来是固定 `await sleep(400)` 再断言成员数 —— 单跑没问题,
          但门禁**串行跑套件**时机器更忙,3 个 WebSocket 握手可能来不及
@@ -1082,7 +1113,7 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
     const clients: { ws: WebSocket; done: Promise<void> }[] = [];
     try {
-      const url = `ws://127.0.0.1:${srv.port}/ws?userId=carol`;
+      const url = wsUrl(srv, room, 'carol');
 
       /* 第一次:正常加入,然后**异常断开**(destroy 底层 TCP,不发 close 帧) */
       const first = connect(url);
@@ -1143,7 +1174,7 @@ async function main(): Promise<void> {
        (纯函数对了但 socket 层分片/截断,只有这一条能查到)。 */
     const room = makeRoom();
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
-    const { ws, got, done } = connect(`ws://127.0.0.1:${srv.port}/ws`, 'dave');
+    const { ws, got, done } = connect(wsUrl(srv, room, 'dave'));
     try {
       /* ★ 旧:`await sleep(300); ok(got.bin.length > 0)` —— 与 6-1 同一根因(固定预算)。 */
       const tFrame = await waitConn(() => got.bin.length > 0, got, WS_BIN_FRAMES_BUDGET_MS);

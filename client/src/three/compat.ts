@@ -35,6 +35,7 @@ import {
   TERRAIN_COLOR_COMPONENTS,
   TERRAIN_VCOLOR_FRAG,
   TERRAIN_VCOLOR_VERT,
+  TERRAIN_VCOLOR_VERT_MANAGED,
 } from '../stage/terrain_vcolor.ts';
 import { lodMergeSize } from '../stage/assembly_math.ts';
 
@@ -63,6 +64,15 @@ export interface CompatMaterialLike {
   readonly uniforms: Record<string, { value: unknown }>;
   readonly vertexShader: string;
   readonly fragmentShader: string;
+  /**
+   * 真 `THREE.RawShaderMaterial` 为 `true`。
+   *
+   * ★ 这个字段是「着色器会不会被重定义」的**可测开关**:raw 材料 three **不注入**
+   *   任何前缀(内建 `attribute` / `precision` 全都得自己写),非 raw 材料 three
+   *   会注入 `attribute vec3 position/normal/uv`(+ `color`,开了 `vertexColors`)。
+   *   配错组合的后果是同名重定义 ⇒ 编译失败 ⇒ 整块不显示,且没有任何异常抛出。
+   */
+  readonly isRawShaderMaterial?: boolean;
 }
 
 /** 可注入的 three 表面(最小集) */
@@ -71,6 +81,14 @@ export interface ThreeLike {
   BufferGeometry: new () => CompatGeometryLike;
   ShaderMaterial: new (params: Record<string, unknown>) => CompatMaterialLike;
   Matrix4: new () => unknown;
+  /**
+   * 可选:真 three 有;**极简替身可以没有**。
+   *
+   * 没有它时 `assembleTerrainMaterial()` 退回 `ShaderMaterial` + **剥掉内建声明的**
+   * 顶点源码(见 `TERRAIN_VCOLOR_VERT_MANAGED`)—— 两条路都不产生重定义,
+   * 不存在「替身环境绿、真机红」的落差。
+   */
+  RawShaderMaterial?: new (params: Record<string, unknown>) => CompatMaterialLike;
 }
 
 /* ───────────────────────── 兜底实现(无 three) ───────────────────────── */
@@ -111,12 +129,14 @@ class FallbackBufferGeometry implements CompatGeometryLike {
   }
 }
 
+/** 兜底材质:`ShaderMaterial` 语义(非 raw) */
 class FallbackShaderMaterial implements CompatMaterialLike {
   readonly name: string;
   readonly vertexColors: boolean;
   readonly uniforms: Record<string, { value: unknown }>;
   readonly vertexShader: string;
   readonly fragmentShader: string;
+  readonly isRawShaderMaterial: boolean = false;
 
   constructor(params: Record<string, unknown>) {
     this.name = typeof params.name === 'string' ? params.name : '';
@@ -125,6 +145,17 @@ class FallbackShaderMaterial implements CompatMaterialLike {
     this.vertexShader = typeof params.vertexShader === 'string' ? params.vertexShader : '';
     this.fragmentShader = typeof params.fragmentShader === 'string' ? params.fragmentShader : '';
   }
+}
+
+/**
+ * 兜底 `RawShaderMaterial`:与真 three 同语义 —— **不注入**任何前缀。
+ *
+ * ★ 为什么兜底也要区分 raw / 非 raw:地形走的是 raw(`precision` 与三个 `attribute`
+ *   都写在源码里)。若兜底把它当成非 raw,判据在「没有 three」的环境里就会以为
+ *   three 会注入内建 ⇒ 悄悄放过重定义。`isRawShaderMaterial` 让这条差异**可断言**。
+ */
+class FallbackRawShaderMaterial extends FallbackShaderMaterial {
+  override readonly isRawShaderMaterial: boolean = true;
 }
 
 const IDENTITY4: readonly number[] = [
@@ -142,6 +173,7 @@ class FallbackMatrix4 {
     return [...IDENTITY4];
   }
 }
+
 /**
  * 兜底 three:接口相同、行为是「记账」。
  *
@@ -153,6 +185,8 @@ export const FALLBACK_THREE: ThreeLike = {
   BufferGeometry: FallbackBufferGeometry,
   ShaderMaterial: FallbackShaderMaterial,
   Matrix4: FallbackMatrix4,
+  /* raw 也要有:地形顶点色材质走 raw(否则会被当成会注入内建的 ShaderMaterial) */
+  RawShaderMaterial: FallbackRawShaderMaterial,
 };
 
 /* ───────────────────────── 注入点 ───────────────────────── */
@@ -235,14 +269,40 @@ function matrixUniforms(three: ThreeLike): Record<string, { value: unknown }> {
  *
  * 判据(与 `stage/terrain_vcolor.ts` 的 `terrainShaderSamplesTexture()` 呼应):
  * 片元源码里不出现 `sampler2D`/`texture2D` —— 一旦有人把图集塞回来,判据立刻红。
+ *
+ * ## ★ WS-FND-89:为什么优先 `RawShaderMaterial`
+ *
+ * `TERRAIN_VCOLOR_VERT` 自带 `precision` 与 `attribute vec3 position/normal/color`。
+ * 这些声明配 raw 材料是**必需**的(raw 不做任何注入);配 `ShaderMaterial` 却是
+ * **同名重定义** —— three 会先注入 `position`/`normal`/`uv`(开了 `vertexColors`
+ * 还注入 `color`),GLSL 编译直接失败 ⇒ 地形整块不画,且**不抛异常**。
+ *
+ * 所以:
+ *   · 有 `RawShaderMaterial`(真 three / 兜底)→ raw + 自包含源码;
+ *   · 没有(极简替身)→ `ShaderMaterial` + `TERRAIN_VCOLOR_VERT_MANAGED`(内建声明已剥离)。
+ *
+ * 两条路都**不可能**出现重定义,因此不存在「测试环境绿、真机红」的落差。
  */
 export function assembleTerrainMaterial(): CompatMaterialLike {
   const three = compatThree();
   if (provider !== null) injectedCalls += 1;
+  const uniforms = matrixUniforms(three);
+  const Raw = three.RawShaderMaterial;
+  if (Raw !== undefined) {
+    return new Raw({
+      name: 'terrain_vcolor',
+      uniforms,
+      vertexShader: TERRAIN_VCOLOR_VERT,
+      fragmentShader: TERRAIN_VCOLOR_FRAG,
+      vertexColors: true,
+      transparent: false,
+      depthWrite: true,
+    });
+  }
   return new three.ShaderMaterial({
     name: 'terrain_vcolor',
-    uniforms: matrixUniforms(three),
-    vertexShader: TERRAIN_VCOLOR_VERT,
+    uniforms,
+    vertexShader: TERRAIN_VCOLOR_VERT_MANAGED,
     fragmentShader: TERRAIN_VCOLOR_FRAG,
     vertexColors: true,
     transparent: false,

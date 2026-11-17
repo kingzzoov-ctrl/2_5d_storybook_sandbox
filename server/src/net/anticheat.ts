@@ -16,6 +16,7 @@
  * 重则**累计违规分**触发 kick。所有裁决写 `room_events`。
  */
 
+import { createHmac, randomBytes } from 'node:crypto';
 import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../../../shared/types/physics.ts';
 
 /* ═══════════════════════════ 1. 阈值表 ═══════════════════════════ */
@@ -332,6 +333,16 @@ export interface PlayerAntiCheatState {
   score: number;
   violations: Violation[];
   kicked: boolean;
+  /**
+   * 本 tick 内**已用掉**的产出凭证令牌(见 `checkInventory` 的一次性判据)。
+   *
+   * 记在这里而不是 `grantedSources` 里:后者是「授予」,这里是「消费」——
+   * 两个事实分开存,才能同时回答「铸它的那次动作还在本 tick 吗」与
+   * 「用过没有」。`usedSourceTick` 与它配对,换 tick 即整体作废。
+   */
+  usedSourceTokens: Set<string>;
+  /** `usedSourceTokens` 所属的 tick;`-1` = 从未用过任何凭证。 */
+  usedSourceTick: number;
 }
 
 export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): PlayerAntiCheatState {
@@ -348,6 +359,8 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
     score: 0,
     violations: [],
     kicked: false,
+    usedSourceTokens: new Set<string>(),
+    usedSourceTick: -1,
   };
 }
 
@@ -713,25 +726,142 @@ export function checkAttack(
 }
 
 /* ═══════════════════════════ 5. 物品栏一致性 ═══════════════════════════ */
+/* ─── 5.0 产出凭证(source):绑定 (actor, itemId, 用途) + 一次性 ───
+ *
+ * ## 修前(审计 P0-2,实测)
+ * `checkInventory` 只判 `allowedSources.has(source)`,集合里装的是**裸字符串**。
+ * 产出侧登记 `break:${x},${y}:${objId}`,而扣减侧照抄客户端报的 `itemId`
+ * ⇒ 那个串**客户端完全可推算**(它刚在 (x,y) 拆了块),于是
+ *   `{ itemId: 733, delta: 999, source: 'break:3,4:101' }`
+ * 一路放行 —— 一张凭证铸任意物品。第二个洞:`grantItemSource` 从不失效
+ * (`expireItemSources()` 全仓零调用),凭证跨 tick 累积、可无限复用。
+ *
+ * ## 修法:凭证是**绑定令牌**,不是名字
+ *   1 服务端铸:`mintItemSourceToken({ actorId, itemId, purpose, tick })`;
+ *   2 令牌**自述**绑定,并由进程内随机密钥做 MAC —— 客户端改任何一位
+ *     (换 itemId / 换行为人 / 换 tick / 换用途)都是伪造,猜不出也算不来;
+ *   3 `checkInventory` 校验四元组 + **一次性**(同一 tick 内同一令牌只用一次);
+ *   4 令牌带 tick ⇒ 「过期」是**判据**保证的,不依赖谁记得去调清理函数。
+ *     `RoomRuntime.expireItemSources()` 仍应在动作/tick 边界调用,理由是内存
+ *     (未消费的令牌会留到房间销毁),**安全性不依赖它** —— 见 `tests/WS-FND-87`。
+ *
+ * ⚠️ 兼容口:非令牌形态的 source(测试夹具 `seed:101:1` 这类)仍走旧口径
+ *   —— 它只能由**服务端自己** `grantItemSource` 注入;生产产出点已全部改为
+ *   `bindItemSource`(裸调用 **0 处**,由 `tests/WS-FND-87` 的静态判据钉住)。
+ */
+export const ItemSourcePurpose = {
+  /** 百货店成交 */
+  PURCHASE: 'purchase',
+  /** 合成产物 */
+  CRAFT: 'craft',
+  /** 拆块掉落 */
+  GATHER: 'gather',
+  /** 捡地面那件 */
+  PICKUP: 'pickup',
+  /** 从箱子里取出 */
+  CHEST_TAKE: 'chest-take',
+  /** 使用道具未生效时的退回 */
+  USE_REFUND: 'use-refund',
+  /** 放块失败时的退回 */
+  PLACE_REFUND: 'place-refund',
+  /** 产物收不下时退回材料 */
+  CRAFT_REFUND: 'craft-refund',
+} as const;
+export type ItemSourcePurpose = (typeof ItemSourcePurpose)[keyof typeof ItemSourcePurpose];
+
+/** 令牌头。改它等于让在途令牌全部失效(它们本就只活一个 tick)。 */
+const ITEM_SOURCE_PREFIX = 'rsi1';
+/** 进程内随机密钥:令牌因此**不可推算**;重启换钥(在途令牌只活一 tick)。 */
+const ITEM_SOURCE_SECRET = randomBytes(32);
+const ITEM_SOURCE_PURPOSES: ReadonlySet<string> = new Set(Object.values(ItemSourcePurpose));
+
+/** 一张产出凭证的**绑定**内容。 */
+export interface ItemSourceGrant {
+  actorId: string;
+  itemId: number;
+  purpose: ItemSourcePurpose;
+  tick: number;
+}
+
+function macOf(plain: string): string {
+  return createHmac('sha256', ITEM_SOURCE_SECRET).update(plain).digest('hex').slice(0, 32);
+}
+
+function plainOf(g: ItemSourceGrant): string {
+  return `${g.actorId}\u0001${Math.trunc(g.itemId)}\u0001${g.purpose}\u0001${Math.trunc(g.tick)}`;
+}
+
+/**
+ * (`actions/item_source.ts` 的 `bindItemSource` 是唯一入口)。
+ *
+ * ⚠️ 令牌里带一个**随机 nonce**(也进 MAC):同一 tick 内同一 (actor,item,purpose)
+ *   可以合法地铸**多张**(连捡两件同类道具)。少了它,第二次铸会得到**同一个串**,
+ *   而一次性判据会把第二次使用当成重放 —— 那是**假阳性**,不是安全。
+ */
+export function mintItemSourceToken(grant: ItemSourceGrant): string {
+  const actor = Buffer.from(grant.actorId, 'utf8').toString('base64url');
+  const nonce = randomBytes(8).toString('hex');
+  return [
+    ITEM_SOURCE_PREFIX,
+    actor,
+    Math.trunc(grant.itemId),
+    grant.purpose,
+    Math.trunc(grant.tick),
+    nonce,
+    macOf(`${plainOf(grant)}\u0001${nonce}`),
+  ].join('.');
+}
+
+/** 令牌形态(不验签)。用于把「伪造」与「旧口径字符串」分开归因。 */
+export function looksLikeItemSourceToken(source: string): boolean {
+  return source.startsWith(`${ITEM_SOURCE_PREFIX}.`);
+}
+
+/**
+ * 解析并**验签**;不是令牌形态 / 被改过 ⇒ `null`。
+ *
+ * 两种 `null` 由调用方区分:不是令牌形态 ⇒ 旧口径(兼容夹具);
+ * 令牌形态却验签失败 ⇒ **伪造**(`ITEM_SOURCE_FORGED`)。
+ */
+export function parseItemSourceToken(source: string): ItemSourceGrant | null {
+  if (!looksLikeItemSourceToken(source)) return null;
+  const parts = source.split('.');
+  if (parts.length !== 7) return null;
+  const itemId = Number(parts[2]);
+  const purpose = parts[3];
+  const tick = Number(parts[4]);
+  if (!Number.isInteger(itemId) || !Number.isInteger(tick)) return null;
+  if (!ITEM_SOURCE_PURPOSES.has(purpose)) return null;
+  const grant: ItemSourceGrant = {
+    actorId: Buffer.from(parts[1], 'base64url').toString('utf8'),
+    itemId,
+    purpose: purpose as ItemSourcePurpose,
+    tick,
+  };
+  if (macOf(`${plainOf(grant)}\u0001${parts[5]}`) !== parts[6]) return null;
+  return grant;
+}
 
 export interface InventoryOp {
   itemId: number;
   /** 正数 = 获得,负数 = 消耗。 */
   delta: number;
-  /** 来源凭证:合成配方哈希 / 掉落实体 id / 采集点 id。无凭证的产出直接拒。 */
+  /**
+   * 产出凭证(`mintItemSourceToken` 铸的绑定令牌)。无凭证的产出直接拒。
+   * 负 delta **不需要**凭证 —— 消耗不是产出。
+   */
   source?: string;
 }
 
 export interface InventoryCheckInput {
   tick: number;
   ops: readonly InventoryOp[];
-  /** 服务端认可的「可产出集合」:本次 tick 内合法的掉落/合成产物 id。 */
+  /** 服务端认可的「可产出集合」:本 tick 内登记过的凭证(客户端无法自行扩集)。 */
   allowedSources: ReadonlySet<string>;
   /** 当前背包总量(用于总量守恒)。 */
   beforeTotal: number;
   capacity: number;
 }
-
 /**
  * 拒因码。每个码对应一条**可判定的守恒律**,便于把违规流水做成指标。
  */
@@ -751,6 +881,20 @@ export const InventoryReject = {
    * 而 TS 的 `readonly InventoryOp[]` 只是**编译期声明**,运行时不做任何检查。
    */
   MALFORMED: 'ITEM_MALFORMED',
+  /**
+   * 令牌形态但**验签失败** —— 客户端自己拼了一个 `rsi1.…` 串(推算/伪造)。
+   * 与 `FROM_NOTHING`(压根没凭证)分开归因:这一条是**伪造尝试**。
+   */
+  SOURCE_FORGED: 'ITEM_SOURCE_FORGED',
+  /**
+   * 凭证与这次 `op` **不相干**:令牌绑的 `itemId` / `actorId` 与本次操作不符
+   * —— 审计 P0-2 的核心:「一张掉落凭证铸任意物品」。
+   */
+  SOURCE_BINDING: 'ITEM_SOURCE_BINDING',
+  /** 令牌属于别的 tick —— 过期(凭证**不跨 tick**)。 */
+  SOURCE_EXPIRED: 'ITEM_SOURCE_EXPIRED',
+  /** 同一 tick 内同一令牌第二次使用 —— 凭证是**一次性**的。 */
+  SOURCE_REUSED: 'ITEM_SOURCE_REUSED',
 } as const;
 export type InventoryReject = (typeof InventoryReject)[keyof typeof InventoryReject];
 
@@ -761,6 +905,10 @@ const INVENTORY_REJECT_LABEL: Readonly<Record<string, string>> = {
   ITEM_OVERFLOW: '容量溢出',
   ITEM_FRACTIONAL: '非整数增量',
   ITEM_MALFORMED: '操作数组格式非法',
+  ITEM_SOURCE_FORGED: '凭证验签失败',
+  ITEM_SOURCE_BINDING: '凭证与本次操作不符',
+  ITEM_SOURCE_EXPIRED: '凭证已过期',
+  ITEM_SOURCE_REUSED: '凭证重复使用',
 };
 
 export interface InventoryCheckResult {
@@ -771,13 +919,19 @@ export interface InventoryCheckResult {
 }
 
 /**
- * 物品栏一致性:
+ * 物品栏一致性(逐条 ops):
  *  a) 单帧净变化量绝对值 ≤ MAX_ITEM_DELTA_PER_TICK;
- *  b) 任何**产出**(delta > 0)必须带服务端认可的 source;
- *  c) 消耗后的总量不得为负,且不得超过容量 —— 即「总和守恒」。
+ *  b) 任何**产出**(delta > 0)必须带服务端登记过的凭证;
+ *  c) 凭证若是**绑定令牌**,必须属于**这个人、这一件、这个 tick,且只用一次**;
+ *  d) 消耗后的总量不得为负,且不得超过容量 —— 即「总和守恒」。
  *
  * 检查顺序刻意把**凭证**放在最前:凭空产出是最严重的一类,不应被
  * 后面的量级检查抢先命中而失去归因。
+ *
+ * 同 tick 内是否用过记在 `PlayerAntiCheatState` 上(而不是入参)——
+ * 一次性是**跨调用**的性质:两次 `applyInventory` 是两次调用。
+ * 提交时机是**整批通过之后**:批内任一条被拒 ⇒ 一个令牌都不标记为已用
+ * (调用方可以原样重试,不会因为「前两条验过了」而白丢凭证)。
  */
 export function checkInventory(
   s: PlayerAntiCheatState,
@@ -802,6 +956,15 @@ export function checkInventory(
     return rejectInv(s, input, InventoryReject.MALFORMED,
       `ops 不是数组:${typeof input.ops} ${String(input.ops)}`);
   }
+  /* ⚠️ 老/手搓的 `PlayerAntiCheatState`(WS-FND-04 的 `mkState`)没有这两个字段 ——
+     缺就补齐,而不是让判据在 `undefined.clear()` 上抛。fail-closed 方向不变:
+     补出来的空集只会**放行第一次**使用,重复使用仍被拦。 */
+  if (!(s.usedSourceTokens instanceof Set)) s.usedSourceTokens = new Set<string>();
+  if (typeof s.usedSourceTick !== 'number') s.usedSourceTick = -1;
+  /** 本 tick 已用掉的令牌;**换 tick 即视为空集**(凭证不跨 tick)。 */
+  const used = s.usedSourceTick === input.tick ? s.usedSourceTokens : null;
+  /** 本批次要提交的一次性标记(整批通过后才落账)。 */
+  const fresh: string[] = [];
   let net = 0;
   for (const op of input.ops) {
     if (!op || typeof op !== 'object' || !Number.isFinite(op.itemId)) {
@@ -812,9 +975,39 @@ export function checkInventory(
       return rejectInv(s, input, InventoryReject.FRACTIONAL,
         `非整数增量 item=${op.itemId} delta=${op.delta}`);
     }
-    if (op.delta > 0 && (!op.source || !input.allowedSources.has(op.source))) {
-      return rejectInv(s, input, InventoryReject.FROM_NOTHING,
-        `物品 ${op.itemId} 凭空产出(source=${op.source ?? '∅'} 未被服务端认可)`);
+    if (op.delta > 0) {
+      const source = op.source;
+      if (!source || !input.allowedSources.has(source)) {
+        return rejectInv(s, input, InventoryReject.FROM_NOTHING,
+          `物品 ${op.itemId} 凭空产出(source=${source ?? '∅'} 未被服务端认可)`);
+      }
+      const token = parseItemSourceToken(source);
+      if (token === null) {
+        if (looksLikeItemSourceToken(source)) {
+          return rejectInv(s, input, InventoryReject.SOURCE_FORGED,
+            `物品 ${op.itemId} 的凭证验签失败(source=${source})—— 服务端从未铸过它`);
+        }
+        /* 旧口径(非令牌)字符串:只可能由服务端 `grantItemSource` 注入
+           (生产产出点已全部走 `bindItemSource`)⇒ 不是客户端可达面。 */
+      } else {
+        if (token.actorId !== s.id) {
+          return rejectInv(s, input, InventoryReject.SOURCE_BINDING,
+            `凭证绑的玩家是 ${token.actorId},本次行为人 ${s.id}`);
+        }
+        if (token.itemId !== Math.trunc(op.itemId)) {
+          return rejectInv(s, input, InventoryReject.SOURCE_BINDING,
+            `凭证绑的物品 ${token.itemId},本次申报 ${op.itemId}(一张凭证只铸它绑定的那件)`);
+        }
+        if (token.tick !== input.tick) {
+          return rejectInv(s, input, InventoryReject.SOURCE_EXPIRED,
+            `凭证来自 tick ${token.tick},当前 tick ${input.tick}(凭证不跨 tick)`);
+        }
+        if (used !== null && used.has(source)) {
+          return rejectInv(s, input, InventoryReject.SOURCE_REUSED,
+            `物品 ${op.itemId} 的凭证在本 tick 内已用过(凭证是一次性的)`);
+        }
+        if (!fresh.includes(source)) fresh.push(source);
+      }
     }
     net += op.delta;
   }
@@ -831,6 +1024,12 @@ export function checkInventory(
     return rejectInv(s, input, InventoryReject.OVERFLOW,
       `总量 ${after} 超容量 ${input.capacity}`);
   }
+  /* ★ 整批通过 ⇒ 才把本批用掉的令牌记成「已用」。 */
+  if (s.usedSourceTick !== input.tick) {
+    s.usedSourceTokens.clear();
+    s.usedSourceTick = input.tick;
+  }
+  for (const src of fresh) s.usedSourceTokens.add(src);
   return { allowed: true, afterTotal: after };
 }
 

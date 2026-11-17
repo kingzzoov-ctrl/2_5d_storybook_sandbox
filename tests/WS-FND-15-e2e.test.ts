@@ -98,9 +98,14 @@ async function connectReal(
   let resolveWelcome: (w: WelcomeFrame) => void = () => undefined;
   const welcomeArrived = new Promise<WelcomeFrame>((res) => { resolveWelcome = res; });
 
+  /* ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=`(HMAC 凭证)才是证据。
+     token 由**生产的签发入口** `runtime.issueJoinToken` 现签(与 `join` 里验签的
+     是同一把密钥 `authSecret`):不硬编码、也不跳过鉴权(跳过就不是 e2e 了)。
+     ⚠️ E2E-3 那条负对照**不走这里**(它指向端口 1,连不上正是被测点)。 */
   const url = userId === null
     ? `ws://127.0.0.1:${srv.port}/ws`
-    : `ws://127.0.0.1:${srv.port}/ws?userId=${userId}`;
+    : `ws://127.0.0.1:${srv.port}/ws?userId=${encodeURIComponent(userId)}`
+      + `&token=${encodeURIComponent(a.runtime.issueJoinToken(userId))}`;
 
   const session = createSession({
     url,

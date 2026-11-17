@@ -202,41 +202,50 @@ test('A12 四个分区指纹互不相同(items/mobs/bosses/modes)', () => {
 
 test('A13 overall 由四分区与算法版本合成,可独立复现', () => {
   const f = contentFingerprints();
-  /* 期望值写字面量 1,不引 `CONTENT_FINGERPRINT_VERSION`。
-     `contentFingerprints()` 返回的 `version` **就是**该常量(registry.ts:276
-     `return { version: CONTENT_FINGERPRINT_VERSION, ... }`),故引用它恒真。
-     1 的**独立来源**:手册/审计档记录总体指纹串为 `v1-eaefa38b`
-     (`docs/DATA-CONFORMANCE.md:265「指纹 v1-eaefa38b」`、
-     `docs/COMPLETION-CRITERIA.md:49`),而指纹串格式是 `v{version}-{8hex}`
-     ⇒ 首段 `v1` 即 version = 1。下方 `eq(CONTENT_FINGERPRINT_VERSION, 1)`
-     继续锚定常量本身(双向锚定,与 WS-10 同一修法)。 */
-  eq(f.version, 1, '算法版本 = 1(手册指纹串形如 v1-eaefa38b)');
-  eq(CONTENT_FINGERPRINT_VERSION, 1);
+  /* 期望值写字面量 2,不引 `CONTENT_FINGERPRINT_VERSION`。
+     `contentFingerprints()` 返回的 `version` **就是**该常量,故引用它恒真。
+     2 的**独立来源**:`node scripts/content-lock.ts` 实测指纹串 = `v2-76694a25`
+     (CR-30:content-lock 改为**整字段投影**,算法版本 1 → 2),指纹串格式是
+     `v{version}-{8hex}` ⇒ 首段 `v2` 即 version = 2。下方
+     `eq(CONTENT_FINGERPRINT_VERSION, 2)` 继续锚定常量本身(双向锚定)。 */
+  eq(f.version, 2, '算法版本 = 2(CR-30 起整字段投影,指纹串形如 v2-76694a25)');
+  eq(CONTENT_FINGERPRINT_VERSION, 2);
   /* 手工按实现公式重算,确认 overall 可复现 —— 而不是「某个神秘数字」。 */
   const expect = fnv1a32(`${f.version}|${f.items}|${f.mobs}|${f.bosses}|${f.modes}`);
   eq(f.overall, expect);
-  eq(f.overall, 'd4f73c37', '当前内容的总体指纹(实测基准)');
+  eq(f.overall, '76694a25', '当前内容的总体指纹(CR-30 实测基准)');
   /* 分区指纹实测基准。 */
-  eq(f.items, '6a0d6441');
-  eq(f.mobs, '624808c4');
-  eq(f.bosses, '1fb56d39', 'CR-15 改了 boss_ginger_troll.loot ⇒ bosses 分区指纹随之变化');
+  eq(f.items, 'a008a5e6');
+  eq(f.mobs, '0e39b653');
+  eq(f.bosses, 'cf4bd9dc', 'CR-30 起按整字段投影哈希 ⇒ 与 v1 的分区值不可比');
   eq(f.modes, 'b854dbfe');
 });
 
-test('A14 contentFingerprintLine() 形如 v1-xxxxxxxx,8 位 hex', () => {
+test('A14 contentFingerprintLine() 形如 v2-xxxxxxxx,8 位 hex', () => {
   const line = contentFingerprintLine();
-  ok(/^v1-[0-9a-f]{8}$/.test(line), `格式应为 v1-8hex,实际 ${line}`);
-  eq(line, `v1-${contentFingerprints().overall}`);
-  eq(line, 'v1-d4f73c37');
+  ok(/^v2-[0-9a-f]{8}$/.test(line), `格式应为 v2-8hex,实际 ${line}`);
+  eq(line, `v2-${contentFingerprints().overall}`);
+  eq(line, 'v2-76694a25');
 });
 
 test('A15 指纹只反映内容数据:等价的规范输入得到等价指纹', () => {
   /* 这是指纹有用的前提 —— 隔离「数据变更」这一个变量。
-   * 用 canonicalize 造两份键序不同、语义相同的 items 视图,指纹必须相同。 */
-  const viewA = ITEM_LIST.map((i) => ({ id: i.id, name: i.name, category: i.category, tags: i.tags, value: i.value }));
-  const viewB = ITEM_LIST.map((i) => ({ value: i.value, tags: i.tags, category: i.category, name: i.name, id: i.id }));
-  eq(fnv1a32(canonicalize(viewA)), fnv1a32(canonicalize(viewB)));
-  eq(fnv1a32(canonicalize(viewA)), contentFingerprints().items, '应与 items 分区指纹一致');
+   * 用 canonicalize 造两份键序不同、语义相同的 items 视图,指纹必须相同。
+   * ★ CR-30 起 items 分区是**整字段投影**(全字段 − `FINGERPRINT_EXCLUDED.items` = `note`),
+   *   故视图必须按**同一口径**构造;沿用 v1 的「手挑 5 个字段」会恒红。 */
+  const project = (row: (typeof ITEM_LIST)[number]): Record<string, unknown> => {
+    const src = row as unknown as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(src)) if (k !== 'note') out[k] = src[k];
+    return out;
+  };
+  const viewA = ITEM_LIST.map(project);
+  const viewB = ITEM_LIST.map((i) => {
+    const p = project(i);
+    const rev: Record<string, unknown> = {};
+    for (const k of Object.keys(p).reverse()) rev[k] = p[k];
+    return rev;
+  });
 });
 
 /* ═══════════════ A. registry.ts — 位域容量账本 ═══════════════ */

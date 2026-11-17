@@ -43,7 +43,7 @@
  *     且**不产生任何副作用**。本文件不发明额外规则。
  *   2 材料扣减与产物入包**都**走 `ctx.applyInventory` —— 反作弊的总量守恒与
  *     凭证链都在那条路上,绕过它 = 绕过了本仓唯一的物品真值来源;
- *     产出侧必须**先** `ctx.grantItemSource` **再** `applyInventory(+n, source)`,
+ *     产出侧必须**先** `bindItemSource(…, itemId, CRAFT)` **再** `applyInventory(+n, source)`,
  *     否则 `checkInventory` 会按「凭空产出」拒(`ITEM_FROM_NOTHING`)。
  *   3 事务性:**产物收不下就把材料退回去**(带 source 的 +delta),不吞材料。
  *
@@ -53,21 +53,21 @@
  * 留白槽逐槽扣减),与 `CRAFT` **同一份**匹配器。这里**不新增配方表**、
  * 不复述留白语义 —— 两份实现今天一致、迟早漂移(`#245` 的「任意染料」)。
  *
- * ⚠️ 报文里的 `have`(背包明细)只能由客户端给:**本仓当前没有服务端按物品明细
- *   的读口**(`RoomRuntime.authoritativeItemTotal()` 只给**总量**;
- *   `WorldSim.inventoryDetailOf()` 按契约返回 `null`;`ActionContext` 既不暴露
- *   `db` 也不暴露那个读口)。⇒ 客户端只说「我有什么」,**扣什么、扣几件仍全由
- *   内容层决定**;能扣多少由权威总量兜底(扣减整批走 `applyInventory`,
- *   声明得比实际多会被反作弊整批拒)。
+ * ⚠️ 材料明细**只认服务端按件账**(审计 P1):报文里的 `have` 不再参与结算
+ *   —— 修前它既是**唯一**的配方输入,又只有「总量」兜底 ⇒ 总量够就能拿别的
+ *   道具冒充配方材料。现在读 `RoomRuntime.authoritativeItemCount`(与
+ *   `use_item.ts:145` 同一口径);缺读口 ⇒ `NOT_IMPLEMENTED`,不退回信客户端。
  *
  * ## 报文契约
  *
  * ```ts
- * { itemId: number, have: Record<number, number> }
+ * { itemId: number }
  * ```
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
-import type { ActionOutcome, ActionPayload } from '../room.ts';
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { authoritativeStock, bindItemSource, missingItemReadPort } from './item_source.ts';
+import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /**
@@ -89,35 +89,13 @@ type AlchemyLabReadPort = {
 /** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型。 */
 type EffectRecord = NonNullable<ActionOutcome['effect']>;
 
-/**
- * 本动作的报文键。`ActionPayload`(`room.ts`)只声明了别的动作用到的字段,
- * 而这条通道本就是泛型的(`ws_server.ts` 把客户端 JSON 原样递进来)
- * ⇒ 在**本文件**局部读取自己的键,`room.ts` 一个字不用动。
- */
-type AlchemyPayload = ActionPayload & { have?: unknown };
-
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-/**
- * 取出「背包明细」(`物品 id → 数量`)。
- *
- * 形状不对就返回 `null`,由调用方给出可读的 `INVALID` —— 不猜默认值
- * (把缺失当成空背包会把「报文写错」与「真的没材料」混成同一个原因)。
- */
-function stockField(v: unknown): Record<number, number> | null {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
-  const out: Record<number, number> = {};
-  for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
-    const id = Number(k);
-    if (!Number.isInteger(id)) return null;
-    if (typeof n !== 'number' || !Number.isFinite(n)) return null;
-    out[id] = n;
-  }
-  return out;
-}
+/* ⚠️ 修前这里有 `AlchemyPayload` / `stockField`:材料明细取自报文里的 `have`
+   (客户端自报)。审计 P1 之后材料只从**按件权威账**读,两个符号已删。 */
 
 /**
  * `USE_ALCHEMY_FURNACE`:站上炼金台,按内容层配方炼一份。
@@ -177,13 +155,10 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
   if (itemId === null || !Number.isInteger(itemId)) {
     return { ok: false, kind: 'INVALID', reason: '需要 itemId(整数,内容表里的产物)' };
   }
-  const stock = stockField((ctx.payload as AlchemyPayload).have);
-  if (stock === null) {
-    return {
-      ok: false, kind: 'INVALID',
-      reason: '需要 have(背包明细:{ "物品id": 数量 })—— 服务端没有按物品明细的读口,见本文件头',
-    };
-  }
+  /* ★ 材料明细只认**服务端按件账**(审计 P1):报文里的 `have` 不再参与结算。
+     缺读口 ⇒ 显式 NOT_IMPLEMENTED(不退回"信客户端")。 */
+  const stock = authoritativeStock(ctx);
+  if (stock === null) return missingItemReadPort(ctx);
 
   /* 5' 产物必须在冻结内容表里、且有配方 —— 「编号空投」与「无配方产物」都拒。 */
   const def = ITEM_BY_ID.get(itemId);
@@ -217,19 +192,20 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     };
   }
 
-  /* 8 **再给产物**:先 `grantItemSource` 再 `applyInventory(+n, source)`,顺序反过来
+  /* 8 **再给产物**:先铸**绑定**凭证再 `applyInventory(+n, source)`,顺序反过来
      会被反作弊按「凭空产出」拒。产出件数取内容表的 `output`(`165` 是 1 → 3 件)。 */
   const made = Math.max(1, Math.trunc(def.output ?? 1));
-  const src = `alchemy:${itemId}`;
-  ctx.grantItemSource(ctx.actorId, src);
+  const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CRAFT);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: made, source: src }] });
   if (!gain.allowed) {
     /* 9 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
-       退回是正 delta ⇒ 同样必须先给凭证。 */
-    const refundSrc = `alchemy-refund:${itemId}`;
-    ctx.grantItemSource(ctx.actorId, refundSrc);
+       退回是正 delta ⇒ **每一件**都要自己的绑定令牌(令牌绑 itemId,不能串用)。 */
     const refund = ctx.applyInventory(ctx.actorId, {
-      ops: spendOps.map((op) => ({ itemId: op.itemId, delta: -op.delta, source: refundSrc })),
+      ops: spendOps.map((op) => ({
+        itemId: op.itemId,
+        delta: -op.delta,
+        source: bindItemSource(ctx, op.itemId, ItemSourcePurpose.CRAFT_REFUND),
+      })),
     });
     return {
       ok: false, kind: 'INVALID',

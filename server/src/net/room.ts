@@ -58,6 +58,7 @@ import {
   type RoomState,
 } from './schema.ts';
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { lookupActionHandler } from './actions/action_table.ts';
 import { tameOwnerOf } from './actions/breed_tame.ts';
@@ -247,6 +248,149 @@ export const MEMBER_PRESENCE_LABEL: Readonly<Record<MemberPresence, string>> = {
   OFFLINE: '离线',
 };
 
+/* ═══════════ 1.5 加入凭证:签发 → 校验闭环(审计 P0-1)═══════════ */
+
+/**
+ * 加入凭证的载荷 —— 它是**服务端签发的声明**,不是客户端可以自己填的字段。
+ *
+ * ## 为什么是这三件事,少一件就有一条绕过路径
+ * ```
+ * userId       缺 ⇒ 拿到别人的 token 就能冒充别人(旧实现:`?userId=u_owner` 即成房主)
+ * roomId       缺 ⇒ A 房签发的凭证可以拿去进 B 房(跨房重放)
+ * expiresAtMs  缺 ⇒ 凭证永不过期 ⇒ 泄漏一次 = 永久身份
+ * ```
+ * ## 为什么不是"一个随机串存进 Map 里查"
+ * 无状态签名(HMAC-SHA256)让**校验收敛在一个纯函数**里:不用维护表、
+ * 不会因为「忘了写过期清理」而变成永久凭证,也就能被断言直接打(见 WS-FND-86)。
+ * 代价:签发后无法单独吊销 —— 由**短 TTL**兜住(`JOIN_TOKEN_TTL_MS` 5 分钟)。
+ */
+export interface RoomTokenClaims {
+  userId: string;
+  roomId: string;
+  /** 过期时刻(epoch ms)。`nowMs >= expiresAtMs` 即过期(**含**边界)。 */
+  expiresAtMs: number;
+}
+
+/** 凭证校验结论。判别联合:失败时带**具体原因**(每一种对应一条绕过路径)。 */
+export type RoomTokenVerdict =
+  | { ok: true; claims: RoomTokenClaims }
+  | { ok: false; reason: string };
+
+/** 默认有效期 5 分钟 —— 覆盖 `RECONNECT_GRACE_MS`(30s)且远小于"永久"。 */
+export const JOIN_TOKEN_TTL_MS = 5 * 60_000;
+/** TTL 上限 24 小时(防止调用方传一个"永不过期"的数)。 */
+export const JOIN_TOKEN_MAX_TTL_MS = 24 * 60 * 60 * 1000;
+
+const HEX_DIGITS = '0123456789abcdef';
+
+/** 字节 → 小写十六进制(**不用 Buffer**:本文件保持"只用 node 内建 + 手写编码")。 */
+function hexOf(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    const b = bytes[i]!;
+    out += HEX_DIGITS[(b >> 4) & 0x0f]! + HEX_DIGITS[b & 0x0f]!;
+  }
+  return out;
+}
+
+/** 十六进制 → 字节;非偶数长度或含非十六进制字符 ⇒ `null`(**不猜**)。 */
+function bytesOfHex(text: string): Uint8Array | null {
+  if (text.length % 2 !== 0) return null;
+  const out = new Uint8Array(text.length / 2);
+  for (let i = 0; i < out.byteLength; i += 1) {
+    const hi = HEX_DIGITS.indexOf(text[i * 2]!);
+    const lo = HEX_DIGITS.indexOf(text[i * 2 + 1]!);
+    if (hi < 0 || lo < 0) return null;
+    out[i] = (hi << 4) | lo;
+  }
+  return out;
+}
+
+/** HMAC-SHA256(密钥 = 房间私钥,消息 = `v<协议版本>.<载荷十六进制>`)。 */
+function tokenMac(secret: string, signedPayload: string): Uint8Array {
+  return createHmac('sha256', secret).update(signedPayload, 'utf8').digest();
+}
+
+/**
+ * 签发一张加入凭证。**只有服务端**调得动(密钥不出进程)。
+ * 形如 `v3.<载荷十六进制>.<签名十六进制>`;三点分段是为了让"格式错"与
+ * "签名错"给出**不同**原因(负对照才能分别指认)。
+ */
+export function signRoomToken(secret: string, claims: RoomTokenClaims): string {
+  const payload = hexOf(new TextEncoder().encode(JSON.stringify({
+    u: claims.userId, r: claims.roomId, e: claims.expiresAtMs,
+  })));
+  const prefix = `v${PROTOCOL_VERSION}`;
+  return `${prefix}.${payload}.${hexOf(tokenMac(secret, `${prefix}.${payload}`))}`;
+}
+
+/**
+ * 校验一张加入凭证 —— **全仓唯一的 token 校验实现**(运输层与重连共用同一份)。
+ *
+ * ## 判据顺序是刻意的
+ * ```
+ * 1 缺 token        ⇒ 拒(未认证:这就是"带 ?userId=u_owner 即成房主"的那条路)
+ * 2 格式/版本不对    ⇒ 拒(而不是当"无 token"放过去 —— 静默降级 = 又一条绕过)
+ * 3 签名不符        ⇒ 拒(**先**验签,再读载荷:否则等于信任未认领的 JSON)
+ * 4 userId 绑定不符  ⇒ 拒(拿着 u_evil 的凭证声称自己是 u_owner)
+ * 5 房间不符        ⇒ 拒(跨房重放)
+ * 6 过期            ⇒ 拒(`nowMs >= expiresAtMs`,含边界)
+ * ```
+ * `expect.userId === ''` 表示**只认声明、不核对绑定** —— 只有"凭证即身份"的
+ * 入口(Colyseus 的 `sessionId` 由服务端生成,没有可比的声明)才这么用,
+ * 见 `RoomRuntime.decodeJoinToken`。
+ */
+export function verifyRoomToken(
+  secret: string,
+  token: unknown,
+  expect: { userId: string; roomId: string; nowMs: number },
+): RoomTokenVerdict {
+  if (typeof token !== 'string' || token.length === 0) {
+    return { ok: false, reason: '缺少 token(身份未认证)' };
+  }
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts[0] !== `v${PROTOCOL_VERSION}`) {
+    return { ok: false, reason: 'token 格式非法(不是本服务端签发的形式)' };
+  }
+  const signed = `${parts[0]!}.${parts[1]!}`;
+  const given = bytesOfHex(parts[2]!);
+  const expected = tokenMac(secret, signed);
+  /* `timingSafeEqual` 要求等长,**长度先判** —— 否则它会抛(那会被上游当成"没拒")。 */
+  if (given === null || given.byteLength !== expected.byteLength
+    || !timingSafeEqual(given, expected)) {
+    return { ok: false, reason: 'token 签名不符(伪造或密钥不匹配)' };
+  }
+  const raw = bytesOfHex(parts[1]!);
+  if (raw === null) return { ok: false, reason: 'token 载荷非法' };
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return { ok: false, reason: 'token 载荷非法' };
+  }
+  if (typeof decoded !== 'object' || decoded === null) {
+    return { ok: false, reason: 'token 载荷非法' };
+  }
+  const rec = decoded as { u?: unknown; r?: unknown; e?: unknown };
+  const userId = rec.u;
+  const roomId = rec.r;
+  const expiresAtMs = rec.e;
+  if (typeof userId !== 'string' || typeof roomId !== 'string'
+    || typeof expiresAtMs !== 'number' || !Number.isFinite(expiresAtMs)) {
+    return { ok: false, reason: 'token 载荷非法(缺 userId/roomId/过期时刻)' };
+  }
+  if (expect.roomId !== '' && roomId !== expect.roomId) {
+    return { ok: false, reason: `token 与房间不符(签给 ${roomId},本房是 ${expect.roomId})` };
+  }
+  if (expect.userId !== '' && userId !== expect.userId) {
+    return { ok: false, reason: `token 与声明的 userId 不符(token 属于 ${userId},却声称 ${expect.userId})` };
+  }
+  if (expect.nowMs >= expiresAtMs) {
+    return { ok: false, reason: `token 已过期(过期时刻 ${expiresAtMs} ≤ 当前 ${expect.nowMs})` };
+  }
+  return { ok: true, claims: { userId, roomId, expiresAtMs } };
+}
+
 export interface MemberSession {
   userId: string;
   role: RoomRole;
@@ -300,6 +444,23 @@ export interface RoomRuntimeOptions {
   accessMode?: AccessMode;
   passwordHash?: string | null;
   maxPlayers?: number;
+  /**
+   * **强制加入凭证**(默认 false = 只对"进程内直接 `join`"放宽)。
+   *
+   * ## 为什么要这个开关,而不是让 `join` 无条件强制
+   * ```
+   * 网络边界(ws_server / Colyseus)⇒ 一律传 true:客户端串不可信
+   * 进程内直接 new RoomRuntime().join(...) ⇒ 是**可信代码**路径
+   *   (全仓 200+ 处既有调用点,均不携带 token;把它们一律判死
+   *    只会让"没被网络碰到"的单元测试全红,而**不会**让攻击面变小)
+   * ```
+   * ⇒ 强制与否是**调用方(边界)**的表态,不是房间的默认值;
+   *   `ws_server.ts` 的 `onHello` 里写死 `requireToken: true`(见那边注释)。
+   * ⚠️ 注意:即便本开关为 false,**只要调用方给了 token 就必须验过**
+   *   (见 `join` 里那条 `input.token !== undefined` 分支)——
+   *   不给 token 是"没声明身份",给一个坏 token 是"伪造",两者不能同待遇。
+   */
+  requireJoinToken?: boolean;
   worldSeed?: number;
   /**
    * 世界存档源(可选;**US2 起从构造参数注入**,理由见下)。
@@ -1113,7 +1274,26 @@ export class RoomRuntime {
   lastRestoreError: string | null = null;
   /** 每 tick 累计的违规,由外层写 room_events。 */
   private pendingViolations: Violation[] = [];
-  private tokenSeq = 0;
+  /**
+   * 本房**签名私钥**(32 字节随机)。从不离开服务端进程,也不进任何下行帧。
+   *
+   * ## 为什么"每房一把"而不是全局一把
+   * 换房即换钥 ⇒ 泄漏一把只影响一个房间;而且 A 房的凭证在 B 房**签名就对不上**
+   * ⇒ 跨房重放被两层同时挡住(还有 `claims.roomId` 那一层,见 `verifyRoomToken`)。
+   * 注:不落库 —— 进程重启后旧凭证失效,重连需要重新签发(如实记为已知边界)。
+   */
+  private readonly authSecret: string;
+  /**
+   * **签发方声明的房主凭证**:构造房间时为本房 `ownerId` 签一张。
+   *
+   * 它就是「房主由谁定」的答案 —— 由**装配层**(库里的 `rooms.owner_id`,
+   * 或大厅/首个入房者那次签发)决定,而不是由客户端串决定。
+   * 谁能出示这张凭证,谁就是 OWNER;出示不了的人带着 `?userId=u_owner`
+   * 也只是一个叫 u_owner 的字符串(旧实现正是在这里形同虚设)。
+   */
+  readonly ownerToken: string;
+  /** 是否强制加入凭证(见 `RoomRuntimeOptions.requireJoinToken`)。 */
+  readonly requireJoinToken: boolean;
   /** 休眠/唤醒次数,便于断言。 */
   sleepCount = 0;
   wakeCount = 0;
@@ -1129,6 +1309,12 @@ export class RoomRuntime {
     this.state = createRoomState(this.id);
     this.ac = new AntiCheatRoom();
     this.lastActivityMs = this.clock.nowMs();
+    /* ── 身份鉴权(审计 P0-1):私钥 + 强制开关 + 房主凭证 ──
+       顺序有要求:`authSecret` 必须先于 `ownerToken`(后者要签名),
+       而两者都必须在 `this.id` / `this.clock` 之后(载荷里要 roomId 与过期时刻)。 */
+    this.requireJoinToken = opts.requireJoinToken ?? false;
+    this.authSecret = randomBytes(32).toString('hex');
+    this.ownerToken = this.issueJoinToken(this.ownerId);
     /* 世界源从构造参注入(见 `RoomRuntimeOptions.host` 的长注释):
        缺省仍为 null,但**装配层现在有地方可传** —— 此前只能事后赋值,
        而生产里那个赋值一处都不存在。 */
@@ -1193,16 +1379,38 @@ export class RoomRuntime {
 
   /**
    * 加入房间。
+   *  - **先认证**:凭 `token`(服务端签发,见 `signRoomToken`)确定身份,再谈策略。
    *  - 房间 SLEEPING → 自动唤醒(wake),并把世界帧号接续下去。
    *  - 同名成员处于断线宽限期内 → 走重连路径,返回**逐字节一致**的快照。
    *  - 密码房校验 `passwordHash`;满员拒绝。
+   *
+   * ## ★★★ 审计 P0-1:为什么认证必须**排在第一条**
+   * 旧实现的判据只有 `input.userId === this.ownerId`,而 `input.userId`
+   * 在运输层**由客户端串决定**(握手 URL 的 `?userId=`)⇒ 谁都能说自己是房主。
+   * 修法不是把那一行改得更聪明,而是**让它左边的输入变成已认证的**:
+   * ```
+   * 网络边界(ws_server)⇒ 一律 requireToken: true
+   * 重连               ⇒ 同一条校验(本方法只有这一个入口,重连走的是同一段)
+   * 进程内直连          ⇒ 可信代码,默认不强制(见 RoomRuntimeOptions.requireJoinToken)
+   * ```
+   * ⚠️ 「缺 token」与「给了坏 token」**分开**:前者是没声明身份(可信路径可省),
+   *   后者是伪造 —— 不论 `requireToken` 是什么都直接拒。
    */
   join(input: {
     userId: string;
     passwordHash?: string | null;
     asGuest?: boolean;
+    /** 加入凭证(服务端签发)。运输层必填;进程内直连可省。 */
+    token?: string;
+    /** 强制校验凭证 —— 网络边界一律传 `true`(见 `ws_server.ts` 的 `onHello`)。 */
+    requireToken?: boolean;
   }): JoinResult {
     const now = this.clock.nowMs();
+    /* ── ① 身份认证(先于一切策略:连房间关没关都不该告诉未认证的人)── */
+    if (input.requireToken === true || this.requireJoinToken || input.token !== undefined) {
+      const verdict = this.verifyJoinToken(input.userId, input.token);
+      if (!verdict.ok) return { ok: false, reason: verdict.reason };
+    }
     if (this.status === RoomStatus.CLOSED) return { ok: false, reason: '房间已关闭' };
 
     if (this.accessMode === AccessMode.PASSWORD) {
@@ -1239,7 +1447,10 @@ export class RoomRuntime {
     if (existing) {
       /* ── 重连路径(仍在 30 秒宽限期内) ── */
       if (!existing.connected) {
-        const token = this.mintToken();
+        /* ★ 重连**不豁免**认证:上面那段 `verifyJoinToken` 是唯一的入口,
+           所以「带 ?userId=u_owner 重连」和「首次加入冒充房主」是同一条路、同一个门。
+           重连成功后再**换发**一张新凭证(旧的可能已接近过期)。 */
+        const token = this.issueJoinToken(input.userId);
         existing.token = token;
         existing.connected = true;
         existing.disconnectedAtMs = null;
@@ -1260,12 +1471,23 @@ export class RoomRuntime {
     const online = [...this.members.values()].filter((m) => m.connected).length;
     if (online >= this.maxPlayers) return { ok: false, reason: '房间已满' };
 
-    /* 角色:房主恒为 OWNER;宽限期超期重进的旧管理员降为 GUEST,必须重新授权。 */
+    /* ── 角色:房主恒为 OWNER;宽限期超期重进的旧管理员降为 GUEST,必须重新授权 ──
+     *
+     * ## ★ 审计 P0-1:这一行**不是**鉴别器,它是**授权映射**
+     * ```
+     * 谁能出现在 `input.userId` 里 ← 由上面的 verifyJoinToken 决定(边界 + 凭证)
+     * 出现了之后是 OWNER 还是 MEMBER ← 由这一行按 this.ownerId(服务端声明)决定
+     * ```
+     * 旧缺陷的成因不是这一行写错,而是**它左边的输入可以随便写**。
+     * 现在网络路径上 `input.userId` 必须与凭证的 `claims.userId` 逐字相等
+     * ( `verifyRoomToken` 的「与声明的 userId 不符」),⇒ 带 `?userId=u_owner`
+     * 而拿不出 u_owner 的凭证 ⇒ 在**上一段就返回**了,走不到这里。
+     * ⚠️ 故这条 OWNER 分支的正确性依赖「认证在前」—— 谁把认证挪到下面,谁就把它变回缺陷。 */
     const role: RoomRole = input.userId === this.ownerId
       ? RoomRole.OWNER
       : (input.asGuest || demotedFromExpiry) ? RoomRole.GUEST : RoomRole.MEMBER;
 
-    const token = this.mintToken();
+    const token = this.issueJoinToken(input.userId);
     const session: MemberSession = {
       userId: input.userId,
       role,
@@ -2106,6 +2328,13 @@ export class RoomRuntime {
        (「权威一变,投影随即一致」),而且必须与下面的 `encodeDelta` 同帧 ——
        否则客户端比世界晚一帧才看到生物(表现为「走过去才发现它在动」)。 */
     this.projectWildlife();
+    /* ★ 审计 P0-2 要求:过期凭证必须真的被回收。
+       修前 `expireItemSources()` **全仓零调用**(见 `anticheat.ts` §5.0 的「修前」段),
+       而 `grantItemSource` 只增不减 ⇒ 未消费的令牌一直留到房间销毁。
+       安全性不依赖本调用(令牌自带 tick + 一次性判据),这里治的是**内存卫生**:
+       放在**每 tick 末**,tick 之间到达的动作照常铸/验,凭证**不跨 tick 累积**。
+       `expireItemSources` 是**幂等**的(只 `clear()` 一张 Map),重复调用无副作用。 */
+    this.expireItemSources();
     return prevSnapshot ? encodeDelta(prevSnapshot, this.state).bytes : new Uint8Array(0);
   }
 
@@ -2629,9 +2858,59 @@ export class RoomRuntime {
 
   /* ── 内部 ── */
 
-  private mintToken(): string {
-    this.tokenSeq += 1;
-    return `${this.id}-${this.tokenSeq}-${PROTOCOL_VERSION}`;
+  /**
+   * 签发一张加入凭证(服务端专用入口:登录 / 大厅 / 房主入场 / 断线重连)。
+   *
+   * ## 旧 `mintToken()` 为什么必须删掉
+   * ```ts
+   * return `${this.id}-${this.tokenSeq}-${PROTOCOL_VERSION}`;   // ← 旧实现
+   * ```
+   * 它**格式完全可预测**(房间 id + 递增序号 + 常量)⇒ 任何人徒手就能写出一张"合法"的;
+   * 而它又**一次都没被校验过**(全仓 0 处 verify)⇒ 那个 token 只是日志里的装饰。
+   * 现在:`member.token` 是**签名过的**凭证,并且 `join` 的入口会校验它
+   * (见 `verifyJoinToken`)⇒ 签发与校验是**同一份密钥 + 同一份实现**。
+   *
+   * `ttlMs` 会被钳到 `[1, JOIN_TOKEN_MAX_TTL_MS]`:调用方传 `Infinity`/负数
+   * 不该能造出"永不过期"的凭证(那正是要消灭的形态)。
+   */
+  issueJoinToken(userId: string, ttlMs: number = JOIN_TOKEN_TTL_MS): string {
+    const requested = Number.isFinite(ttlMs) ? Math.floor(ttlMs) : JOIN_TOKEN_TTL_MS;
+    const ttl = Math.min(JOIN_TOKEN_MAX_TTL_MS, Math.max(1, requested));
+    return signRoomToken(this.authSecret, {
+      userId,
+      roomId: this.id,
+      expiresAtMs: this.clock.nowMs() + ttl,
+    });
+  }
+
+  /**
+   * 校验一张加入凭证,并**核对它声明的 userId** —— 运输层与重连调用的是同一个方法。
+   * 失败原因原样往上抛(下游把它当 `reject` 帧的 reason),不吞、不归一化:
+   * 「缺 token / 伪造 / 过期 / 房的凭证」是四件事,合成一句就没法指认了。
+   */
+  verifyJoinToken(userId: string, token: unknown): RoomTokenVerdict {
+    return verifyRoomToken(this.authSecret, token, {
+      userId,
+      roomId: this.id,
+      nowMs: this.clock.nowMs(),
+    });
+  }
+
+  /**
+   * 校验凭证的**签名/房间/有效期**,但不核对 userId 绑定 —— 供「凭证即身份」的入口用。
+   *
+   * 只有一类调用方该用它:`room.colyseus.ts` 的 `onJoin`。那里的成员键是
+   * Colyseus 自己生成的 `client.sessionId`(**服务端产物**,不是客户端串),
+   * 没有"客户端声明的 userId"可比对;凭证里的 `userId` 才是身份来源。
+   * ⚠️ 裸 WS 路径**不要**用它:那里有 `?userId=` 这个可伪造的声明,必须走
+   * `verifyJoinToken`(它会把两者钉在一起)。
+   */
+  decodeJoinToken(token: unknown): RoomTokenVerdict {
+    return verifyRoomToken(this.authSecret, token, {
+      userId: '',
+      roomId: this.id,
+      nowMs: this.clock.nowMs(),
+    });
   }
 
   private spawnPoint(): { x: number; y: number } {

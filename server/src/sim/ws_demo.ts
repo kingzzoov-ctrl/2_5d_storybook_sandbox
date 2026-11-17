@@ -142,7 +142,10 @@ async function serve(): Promise<void> {
   });
 
   console.log('══ 阶段 3 端到端演示(常驻)══');
-  console.log(`  WS 地址:  ws://127.0.0.1:${srv.port}/ws?userId=<任意 id>`);
+  /* ★ 凭证必须带(审计 P0-1):`?userId=` 只是声明,证据是 `room.issueJoinToken`
+     签的 token。展示**一条可用地址**比展示一个会被拒的模板有用。 */
+  console.log(`  WS 地址:  ws://127.0.0.1:${srv.port}/ws?userId=alice`
+    + `&token=${encodeURIComponent(room.issueJoinToken('alice'))}`);
   console.log(`  房间:     ${room.id} · 成员 ${room.members.size} · 在线 ${room.onlineCount()}`);
   console.log(`  推进:     ${SELF_ADVANCE
     ? '★ 本入口**自推**(--advance)—— 注意 room.step 里那条仍会推,可能双倍'
@@ -265,7 +268,26 @@ async function selfCheck(): Promise<void> {
   const got: { welcome: Record<string, unknown> | null; frames: Uint8Array[] } = {
     welcome: null, frames: [],
   };
-  const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws?userId=selfcheck`);
+  /* ★★ 加入凭证(审计 P0-1 之后**必须**带;实测根因就在这里)
+   *
+   * 鉴权改动后,`?userId=` 只是**声明**,证据是服务端签发的 token:
+   * `ws_server.onHello` 用 `requireToken: true` 调 `room.join`,
+   * 而 `RoomRuntime.join` 第一条就是 `verifyJoinToken` ⇒ 缺 token 直接拒。
+   *
+   * 实测症状(不是猜的):只带 `?userId=selfcheck` 时服务端回
+   *   `{ t: 'reject', reason: '缺少加入凭证…' }` 并立刻 1008 关闭连接
+   * ⇒ 自检的三条断言同时红,而且**看起来像三个独立缺陷**:
+   *   `welcome.protocolVersion=undefined` / `playerId=undefined`
+   *   / 「未收到任何二进制帧 ⇒ 引导期死锁」
+   * ⇒ ★ 一条根因伪装成三条症状。真正坏的是**连接参数**,不是握手协议、
+   *   不是 playerId 推导、也不是广播循环。
+   *
+   * 修法:用**生产签发入口** `room.issueJoinToken` 现签(与 `join` 里验签
+   * 共用同一把 `authSecret`,不自己造第二份签名实现 —— CR-20)。 */
+  const joinToken = room.issueJoinToken('selfcheck');
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${srv.port}/ws?userId=selfcheck&token=${encodeURIComponent(joinToken)}`,
+  );
   ws.binaryType = 'arraybuffer';
 
   const done = new Promise<void>((resolve) => {

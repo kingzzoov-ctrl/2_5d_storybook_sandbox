@@ -52,7 +52,7 @@ import { join, relative, sep, dirname, resolve } from 'node:path';
  * 起因实测:7 个判据里只有 1 个的跳过列表含 `_probe_sandbox/`,
  * 其余 6 个会走进队友的整仓副本,把 HEAD 的问题报成"本轮新增"(BOM 假红 3 个)。
  * ⇒ 判据:凡**仓库的副本**,对它的结论**不是关于本仓的结论**。 */
-import { shouldSkipDir } from './scan-scope.ts';
+import { shouldSkipDirAtDepth } from './scan-scope.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const STRICT = process.argv.includes('--strict');
@@ -189,7 +189,23 @@ export const ORPHAN_KNOWN = new Map<string, string>([
   ['server/src/net/room.colyseus.ts', 'colyseus 入口家族:Colyseus 房间,由 server 装配层(`server/src/index.ts` 的 `createHost`/`assemble`)实例化,**不靠相对 import 引用** ⇒ 本扫描器按构造判它孤儿。同一文件在可达性侧是 `verify.ts` 的 `PROD_ENTRIES` 第 3 项(口径:从入口做 import 闭包)⇒ 两侧结论都对但含义不同,见上方跨门禁注释。接入条件:**不接** —— 给它加一个相对 importer 才是缺陷(把入口塞进闭包 = 假可达)。'],
 ]);
 
-function walk(dir: string, out: string[] = []): string[] {
+/**
+ * ⚠️⚠️ 这里的跳过规则**必须**是深度感知的(`shouldSkipDirAtDepth`)。
+ *
+ * 实测(2026-11-18,审计 P1-3):本函数原用 `shouldSkipDir(name)` —— 那是
+ * **任意层**口径,`SKIP_DIRS` 里含构建产物类 `dist / build / out / ...`
+ * ⇒ **`server/src/build/` 整棵被跳过**(5 个生产 .ts)。
+ * 后果不是「少算了几行」,而是**一个目录的文件永远不会被审计到**:
+ * `server/src/build/wiring_view.ts` 就是这样消失在视野里的 ——
+ * 它不在 `prodFiles` 里,于是既不算可达、也不算 orphan/死文件,
+ * 而登记表里却有一条「它是测试专用」。数字上表现为
+ * 「登记 10 / 实测 9」,且**没有任何东西比较这两个数**。
+ *
+ * `shouldSkipDirAtDepth(name, depth)` 的 `depth` 是**相对遍历起点**的层数;
+ * 本函数从根下的子目录(`server/src` 等)起走,故以 `d.split('/').length` 作起点深度,
+ * 使 `server/src/build` 落在 depth 2 ⇒ 按源码处理(与 `walkRepo` 同一判据)。
+ */
+function walk(dir: string, depth: number, out: string[] = []): string[] {
   if (!existsSync(dir)) return out;
   for (const name of readdirSync(dir)) {
     const p = join(dir, name);
@@ -197,9 +213,10 @@ function walk(dir: string, out: string[] = []): string[] {
       /* ★ 范围判定**只走 scan-scope.ts**(唯一事实源)。
        * 本行原为手写的 `name === 'node_modules' || name.startsWith('.')` ——
        * 那份手写副本不含 `_probe_sandbox/`,会走进队友的整仓副本。
-       * ⚠️ `shouldSkipDir` 已含 `startsWith('.')`,故行为是**超集**且更正确。 */
-      if (shouldSkipDir(name)) continue;
-      walk(p, out);
+       * ⚠️ 但换成 `shouldSkipDir` 又矫枉过正(见上方长注释):它会跳掉
+       *    `server/src/build/`,把一个生产目录从审计范围里**静默删除**。 */
+      if (shouldSkipDirAtDepth(name, depth)) continue;
+      walk(p, depth + 1, out);
     } else if (name.endsWith('.ts')) out.push(p);
   }
   return out;
@@ -214,8 +231,8 @@ function walk(dir: string, out: string[] = []): string[] {
  *   而「orphan ⊆ 可达性白名单」那条交叉自检建立在两者口径一致的前提上。
  */
 const PROD_DIRS = ['server/src', 'client/src', 'shared'];
-const prodFiles = PROD_DIRS.flatMap((d) => walk(join(ROOT, d)));
-const testFiles = walk(join(ROOT, 'tests'));
+const prodFiles = PROD_DIRS.flatMap((d) => walk(join(ROOT, d), d.split('/').length));
+const testFiles = walk(join(ROOT, 'tests'), 1);
 
 const relOf = (p: string): string => relative(ROOT, p).split(sep).join('/');
 const text = new Map<string, string>();
@@ -468,18 +485,42 @@ function referencedBy(target: string, froms: string[], self: string): string[] {
     + `export 门禁漏判 0 个)`);
 }
 
-/* ── 找出所有 L2 orphan ── */
+/* ── 找出所有 L2 orphan,以及「生产 0 / 测试 0」的**真死文件** ──
+ *
+ * ⚠️ 2026-11-18 修一个**可见性**缺陷(审计 P1-3)。
+ *
+ * 旧版在 `byTest.length === 0` 时直接 `continue`:于是「既没有生产引用、
+ * 也没有测试引用」的文件**从不出现**在任何输出里 —— 它既不算 orphan(进不了
+ * 本表),也不算可达(进不了可达性审计),**两个门禁之间的缝**里躺着。
+ *
+ * 实测:`server/src/build/wiring_view.ts` 正是如此。它的登记理由写着
+ * 「**实现测试在 WS-03**」,而实测**没有**任何测试引用它 ⇒ 这是**真死文件**,
+ * 却被上面那句 `continue` 从 `found` 里剔掉,于是:
+ * ```
+ *   登记 10 条  vs  实测 9 条 —— 差 1 条,而没有任何东西比较这两个数
+ * ```
+ * 更糟的是摘要行**硬写**「${found.length} 个已登记 / **0 处失真**」:
+ * 「0 处失真」是常量,不是算出来的 ⇒ 无论差额多大都印 0。
+ *
+ * ⇒ 判据:**两个数一旦不相交就必须报出来**。所以这里把死文件单独收进
+ *   `dead`,既打印出来,也交给 `count-audit` 做「登记 ↔ 实测」互校。
+ */
 const found: { file: string; tests: string[]; lines: number }[] = [];
+const dead: { file: string; lines: number }[] = [];
 for (const f of prodFiles) {
   const r = relOf(f);
   const src = text.get(r) ?? '';
   if (!/^export /m.test(src)) continue;
   if (referencedBy(f, prodFiles, r).length > 0) continue;
   const byTest = referencedBy(f, testFiles, r);
-  if (byTest.length === 0) continue;
+  if (byTest.length === 0) {
+    dead.push({ file: r, lines: src.split('\n').length });
+    continue;
+  }
   found.push({ file: r, tests: byTest.map((t) => t.replace(/^tests\//, '')), lines: src.split('\n').length });
 }
 found.sort((a, b) => b.lines - a.lines);
+dead.sort((a, b) => b.lines - a.lines);
 
 if (REBASE) {
   console.log('已登记的 orphan 清单(复制进 ORPHAN_KNOWN):');
@@ -489,20 +530,39 @@ if (REBASE) {
 
 /* ── 自检 ── */
 const stale: string[] = [];
+const unreachableRegistered: string[] = [];
 for (const [rel, reason] of ORPHAN_KNOWN) {
-  if (!existsSync(join(ROOT, rel))) { stale.push(`${rel}(文件不存在)`); continue; }
-  if (!reason || reason.trim().length < 8) { stale.push(`${rel}(未写明理由)`); continue; }
+  if (!existsSync(join(ROOT, rel))) { stale.push(`${rel}(文件不存在)`); unreachableRegistered.push(rel); continue; }
+  if (!reason || reason.trim().length < 8) { stale.push(`${rel}(未写明理由)`); unreachableRegistered.push(rel); continue; }
   const abs = join(ROOT, rel);
-  if (referencedBy(abs, prodFiles, rel).length > 0) stale.push(`${rel}(已可达,应移出)`);
+  if (referencedBy(abs, prodFiles, rel).length > 0) { stale.push(`${rel}(已可达,应移出)`); unreachableRegistered.push(rel); }
 }
 
 const unlisted = found.filter((x) => !ORPHAN_KNOWN.has(x.file));
+const unlistedDead = dead.filter((x) => !ORPHAN_KNOWN.has(x.file));
 const totalLines = found.reduce((s, x) => s + x.lines, 0);
+
+/**
+ * **登记 ↔ 实测互校**:登记表里的每一条,必须能被实测**归入**两类之一 ——
+ * 「只有测试引用」(found)或「两边都 0」(dead)。
+ *
+ * 落不进任何一类的 = 登记表在说一件实测不支持的事(文件被删了、或它其实已可达)。
+ * `stale` 已经覆盖了一部分(文件不存在 / 已可达),这里补上**剩下那种**:
+ * 文件存在、理由写得很长、但实测既不是测试专用也不是死文件 —— 旧版对此**完全沉默**。
+ */
+const measuredFiles = new Set([...found.map((x) => x.file), ...dead.map((x) => x.file)]);
+const registeredNotMeasured = [...ORPHAN_KNOWN.keys()].filter(
+  (rel) => !measuredFiles.has(rel) && !unreachableRegistered.includes(rel),
+);
 
 console.log('\n══ 生产零引用审计(测试专用模块)══\n');
 console.log(`  生产文件 ${prodFiles.length} / 测试文件 ${testFiles.length}`);
 console.log(`  实测 orphan:${found.length} 个 / ${totalLines} 行`);
-console.log(`  已登记:${ORPHAN_KNOWN.size} 条\n`);
+console.log(`  真死文件(生产 0 **且** 测试 0):${dead.length} 个`);
+console.log(`  已登记:${ORPHAN_KNOWN.size} 条`);
+console.log(`  互校:实测 ${found.length} + 死文件 ${dead.length} = ${measuredFiles.size}`
+  + ` / 登记 ${ORPHAN_KNOWN.size}`
+  + `${measuredFiles.size === ORPHAN_KNOWN.size ? ' ✓' : ' ✗ 不等'}\n`);
 
 if (found.length > 0) {
   console.log('  模块                                                 行数  测试');
@@ -513,10 +573,29 @@ if (found.length > 0) {
   console.log('\n  (! = 未登记)');
 }
 
+/* 死文件**单列**:它们和 orphan 是两类东西 —— orphan 至少还被测试拉着,
+   死文件没有任何引用者,删掉或接线都可以,唯一不能做的是**看不见它**。 */
+if (dead.length > 0) {
+  console.log('\n══ 生产零引用 **且** 测试零引用(真死文件 —— 不是 orphan,是死代码)══\n');
+  for (const x of dead) {
+    const reg = ORPHAN_KNOWN.has(x.file);
+    console.log(`  ${reg ? '登记' : ' !  '} ${x.file.padEnd(48)} ${String(x.lines).padStart(4)} 行`
+      + `${reg ? '  ⚠ 登记理由称「测试专用」,实测无任何引用者' : '  未登记'}`);
+  }
+  console.log('\n  → 处置:接线,或从内容里删除,或(若确属门禁专属)另立 gate-only 类别;');
+  console.log('    绝不能把「没人用」记成「测试专用」。');
+}
+
 let failed = false;
 if (stale.length > 0) {
   console.log(`\n  ✗ 登记清单失真(${stale.length} 处,应修正):`);
   for (const s of stale) console.log(`      ${s}`);
+  failed = true;
+}
+if (registeredNotMeasured.length > 0) {
+  console.log(`\n  ✗ 登记与实测不符(${registeredNotMeasured.length} 处):`
+    + `这些登记项既不在实测 orphan 里,也不在死文件里 —— 登记表在说一件实测不支持的事`);
+  for (const r of registeredNotMeasured) console.log(`      ${r}`);
   failed = true;
 }
 if (unlisted.length > 0) {
@@ -524,9 +603,35 @@ if (unlisted.length > 0) {
   if (STRICT) { console.log(`\n  ✗ ${msg}`); failed = true; }
   else console.log(`\n  ⚠ ${msg}\n    (补白名单理由,或接线;--strict 下升级为失败)`);
 }
+if (unlistedDead.length > 0) {
+  const msg = `未登记的死文件 ${unlistedDead.length} 个(生产 0 / 测试 0):`
+    + unlistedDead.map((x) => x.file).join(', ');
+  if (STRICT) { console.log(`\n  ✗ ${msg}`); failed = true; }
+  else console.log(`\n  ⚠ ${msg}\n    (接线或删除;--strict 下升级为失败)`);
+}
 
 if (!failed) {
-  console.log(`\n  ✓ 生产零引用审计通过(${found.length} 个已登记 / 0 处失真)`);
+  /* ⚠️ 这里**不许**再写常量。旧版硬写「0 处失真」——
+     它正好在「实测 9 / 登记 10」的那一轮里印出「0 处失真」。 */
+  console.log(`\n  ✓ 生产零引用审计通过(${found.length} 个实测 orphan(全部已登记)`
+    + ` / ${dead.length} 个死文件(其中 ${dead.filter((x) => ORPHAN_KNOWN.has(x.file)).length} 个已登记)`
+    + ` / 登记 ${ORPHAN_KNOWN.size} 条 / 失真 ${stale.length + registeredNotMeasured.length} 处)`);
 }
+
+/* ── 机读出口:给 `count-audit.ts` 做「登记 ↔ 实测」互校用 ──
+ * 单行前缀 + JSON,便于消费侧只挑一行解析(`__ORPHAN_AUDIT_JSON__`)。
+ * ⚠️ 必须**无条件**打印(即使 failed) —— 否则「有失真」时消费侧只会拿到
+ *    「解析不到 JSON」,而那与「没跑起来」不可区分。 */
+console.log(`__ORPHAN_AUDIT_JSON__${JSON.stringify({
+  measured: found.length,
+  measuredLines: totalLines,
+  dead: dead.length,
+  deadFiles: dead.map((x) => x.file),
+  registered: ORPHAN_KNOWN.size,
+  unlisted: unlisted.length,
+  unlistedDead: unlistedDead.length,
+  registeredNotMeasured,
+  stale: stale.length,
+})}`);
 console.log('');
 process.exit(failed ? 1 : 0);

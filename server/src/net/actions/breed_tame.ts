@@ -135,6 +135,7 @@
  */
 import { tameableMobs } from '../../../../shared/constants/mobs.ts';
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
+import { ownedItemCount } from './item_source.ts';
 import type { ActionOutcome, ActionPayload } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -398,6 +399,19 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
           reason: `宠物 ${petId} 已是 ${pet.ownerId} 的 ⇒ 别人不能投喂`,
         };
       }
+    }
+    /* ★ 按件权威读口(审计 P1):能投喂的只有**背包里真的有的那一件**。
+       `itemId` 是报文里自报的,总量守恒挡不住「拿别的道具当 `itemId` 投喂」。
+       ⚠️ 缺读口时**退回**下面那条 `applyInventory` 总量守恒路径,而不是把投喂整体关掉:
+       生产路径的 `ctx` 一定带读口(`room.ts` 的 `actionContextFor` 无条件绑定
+       `itemCountOf` / `itemIdsOf`)⇒ 这条 fallback 只可能被**手搓 ctx 的桩**走到
+       (见 `tests/WS-FND-41` 的 `makeCtx`),客户端触不到。 */
+    const owned = ownedItemCount(ctx, itemId);
+    if (owned !== null && owned < 1) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `背包里没有可投喂的 ${itemId}(服务端账面 ${owned} 件)⇒ 好感未变`,
+      };
     }
     /* 唯一的失败写入点。**先扣、再改宠物**:扣失败 ⇒ 宠物状态原封不动。 */
     const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -1 }] });

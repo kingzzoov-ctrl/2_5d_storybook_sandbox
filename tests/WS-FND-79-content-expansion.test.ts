@@ -142,9 +142,11 @@ test('FND79-3 内容指纹与 content-lock 基线一致,且 bosses 分区未被�
      CR-27 时它仍是 e6bd03cc(746~754 只补进物品表,一件都没接进 Boss 的 `loot`)。
      ★ CR-28 把这 7 件真接进了 `loot`(手册归属见 `shared/constants/bosses.ts` 的逐 Boss 注)。
      ★ CR-29 又把手册写给 mob 的 751/752/753 挪回 `shared/constants/mobs.ts` 的 `drops`
-     ⇒ bosses 分区 8f50dc95 → 1fb56d39,本行按 CR-29 同步(与 `content.baseline.json`、
-     `tests/WS-05` 的 W5-51 冻结快照同源)。守卫仍然有效:再往 `loot` 塞/删任何一件,这里立刻红。 */
-  eq(f.bosses, '1fb56d39', '8 个 Boss 的 loot 快照 = CR-29 之后的值(再动即红)');
+     ⇒ bosses 分区 8f50dc95 → 1fb56d39。★ CR-30 把投影改成**整字段**(算法版本 1 → 2)
+     ⇒ bosses 1fb56d39 → cf4bd9dc(v2 与 v1 的分区值不可比),本行按 CR-30 同步(与
+     `content.baseline.json`、`tests/WS-05` 的 W5-51 冻结快照同源)。
+     守卫仍然有效:再往 `loot` 塞/删任何一件,这里立刻红。 */
+  eq(f.bosses, 'cf4bd9dc', '8 个 Boss 的 loot 快照 = CR-30(v2 整字段投影)之后的值(再动即红)');
 });
 
 /* ═════════════════ 4. 牧场产出可解析 ═════════════════ */

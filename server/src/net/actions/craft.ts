@@ -6,22 +6,23 @@
  * 材料扣减 → 产物」的事务性写入」)。本文件就是那条写入,**只改本文件** ——
  * `action_table.ts` / `room.ts` 一个字都不用动(尚未接线的动作各占一个模块)。
  *
- * ## 报文契约(与 `ActionPayload` 的既有字段并列)
+ * ## 报文契约
  *
  * ```ts
- * { itemId: number, have: Record<number, number> }
+ * { itemId: number }
  * ```
  *
  *   · `itemId` = 要合成的**产物**(必须在冻结内容表里、且有配方);
- *   · `have`   = 客户端**背包明细**(`物品 id → 数量`)。
+ *   · 材料明细**不再由客户端提供**(审计 P1)。
  *
- * ⚠️ `have` 只能由客户端给:**本仓当前没有服务端按物品明细的读口**。
- *   `RoomRuntime.authoritativeItemTotal()` 只给**总量**(读 db 的 `totalItemsOf`),
- *   `WorldSim.inventoryDetailOf()` 如实返回 `null`(模拟层不持有背包明细),
- *   而 `ActionContext` 既不暴露 `db` 也不暴露该读口。⇒ 客户端只说「我有什么」,
- *   **配方怎么扣、扣几件仍全由内容层决定**(见下);能扣多少则由权威总量兜底:
- *   扣减整批走 `ctx.applyInventory`,它按 `beforeTotal` 量守恒,声明得比实际多
- *   会被反作弊按 `ITEM_NEGATIVE` 整批拒(`tests/WS-FND-25` FND25-7 钉这一条)。
+ * ## ★ 材料明细的权威读口(这次修的洞)
+ *
+ * 修前报文里的 `have`(客户端自报 `物品 id → 数量`)是**唯一**的配方输入,
+ * 服务端只有「总量」兜底 ⇒ 只要总量够,就能用**别的道具**冒充配方材料;
+ * 配合 `DROP_ITEM` 的可丢任意 id,背包可以整体「换 id」。
+ * 现在改成读 `RoomRuntime.authoritativeItemCount`(按件账,唯一写入口是
+ * `applyInventory`)—— 与 `use_item.ts:145` 同一口径;**缺读口 ⇒
+ * `NOT_IMPLEMENTED`,不退回信客户端**。报文里带不带 `have` 都不再影响结算。
  *
  * ## 三件必须**在同一处**做的事(照 `material.ts` 的纪律)
  *
@@ -32,8 +33,8 @@
  *     凭证链都在那条路上,绕过它 = 绕过了本仓唯一的物品真值来源;
  *   3 事务性:**产物收不下就把材料退回去**(带 source 的 +delta),不吞材料。
  *
- * 产出侧必须**先** `ctx.grantItemSource` **再** `applyInventory(+n, source)`,
- * 否则 `checkInventory` 会按「凭空产出」拒(`FROM_NOTHING`)—— 那是设计好的闸。
+ * 产出侧必须**先** `bindItemSource(…, itemId, CRAFT)` **再** `applyInventory(+n, source)`:
+ * 令牌绑产物 id,只有这一件能凭它入包(`checkInventory` 会核绑定、tick 与一次性)。
  *
  * ## 配方的唯一出处是内容层
  *
@@ -69,43 +70,22 @@
  * ⚠️ **非 505 配方完全不受影响**:闸只在 `def.station === 505` 时进(零回归)。
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
-import type { ActionOutcome, ActionPayload, WorldSaveHost } from '../room.ts';
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { authoritativeStock, bindItemSource, missingItemReadPort } from './item_source.ts';
+import type { ActionOutcome, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型(见文件头)。 */
 type EffectRecord = NonNullable<ActionOutcome['effect']>;
-
-/**
- * 本动作的报文键。
- *
- * `ActionPayload`(`room.ts`)只声明了**别的**动作用到的字段(`x` / `y` / `itemId` /
- * `count` / ...),而这条通道本就是泛型的:`ws_server.ts` 把客户端 JSON 原样递进来。
- * ⇒ 在**本文件**局部读取自己的键,`room.ts` 一个字不用动(它不在本文件的写域内)。
- */
-type CraftPayload = ActionPayload & { have?: unknown };
 
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-/**
- * 取出「背包明细」(`物品 id → 数量`)。
- *
- * 形状不对就返回 `null`,由调用方给出可读的 `INVALID` —— 不猜默认值
- * (把缺失当成空背包会把「报文写错」与「真的没材料」混成同一个原因)。
- */
-function stockField(v: unknown): Record<number, number> | null {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
-  const out: Record<number, number> = {};
-  for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
-    const id = Number(k);
-    if (!Number.isInteger(id)) return null;
-    if (typeof n !== 'number' || !Number.isFinite(n)) return null;
-    out[id] = n;
-  }
-  return out;
-}
+/* ⚠️ 修前这里还有 `CraftPayload` / `stockField`:它们把报文里的 `have`
+   当成**唯一**的材料明细。审计 P1 之后材料只从按件权威账读,两个符号已删 ——
+   留着它们就是留一条"客户端还能决定扣什么"的死路。 */
 
 /**
  * 高级锻造台 = **505**(取 `shared/constants/items.ts` 的 `station` 字段)。
@@ -169,13 +149,10 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   if (itemId === null || !Number.isInteger(itemId)) {
     return { ok: false, kind: 'INVALID', reason: '需要 itemId(整数,内容表里的产物)' };
   }
-  const stock = stockField((ctx.payload as CraftPayload).have);
-  if (stock === null) {
-    return {
-      ok: false, kind: 'INVALID',
-      reason: '需要 have(背包明细:{ "物品id": 数量 })—— 服务端没有按物品明细的读口,见本文件头',
-    };
-  }
+  /* ★ 材料明细只认**服务端按件账**(审计 P1):报文里的 `have` 不再参与结算。
+     缺读口 ⇒ 显式 NOT_IMPLEMENTED(不退回"信客户端")。 */
+  const stock = authoritativeStock(ctx);
+  if (stock === null) return missingItemReadPort(ctx);
 
   /* 3 产物必须在冻结内容表里、且有配方 —— 「编号空投」与「无配方产物」都拒。 */
   const def = ITEM_BY_ID.get(itemId);
@@ -218,19 +195,20 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     };
   }
 
-  /* 7 **再给产物**:先 `grantItemSource` 再 `applyInventory(+n, source)`,顺序反过来
+  /* 7 **再给产物**:先铸**绑定**凭证再 `applyInventory(+n, source)`,顺序反过来
      会被反作弊按「凭空产出」拒。产出件数取内容表的 `output`(`151` 是 1 材料 → 2 件)。 */
   const made = Math.max(1, Math.trunc(def.output ?? 1));
-  const src = `craft:${itemId}`;
-  ctx.grantItemSource(ctx.actorId, src);
+  const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CRAFT);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: made, source: src }] });
   if (!gain.allowed) {
     /* 8 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
-       退回是正 delta ⇒ 同样必须先给凭证。 */
-    const refundSrc = `craft-refund:${itemId}`;
-    ctx.grantItemSource(ctx.actorId, refundSrc);
+       退回是正 delta ⇒ **每一件**都要自己的绑定令牌(令牌绑 itemId,不能串用)。 */
     const refund = ctx.applyInventory(ctx.actorId, {
-      ops: spendOps.map((op) => ({ itemId: op.itemId, delta: -op.delta, source: refundSrc })),
+      ops: spendOps.map((op) => ({
+        itemId: op.itemId,
+        delta: -op.delta,
+        source: bindItemSource(ctx, op.itemId, ItemSourcePurpose.CRAFT_REFUND),
+      })),
     });
     return {
       ok: false, kind: 'INVALID',

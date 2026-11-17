@@ -171,11 +171,24 @@ export interface TileCellWide {
 /**
  * `TileFields` → 宽单元。`floor`/`obj` 超出 u16 时按 u16 截断
  * (与 `packTile` 的截断语义一致,不抛错 —— 高频路径不能因一个坏 ID 断帧)。
+ *
+ * ⚠️ 审计 P1-3 实测缺陷(改前):`floor`/`obj` = `-1` 会**回绕成 65535**。
+ *    原因:`-1 & 0x3f` 给 `lo` 写 63,而 `(-1 >>> 6) & 0x3ff` 给高位字写 **1023**
+ *    (JS 的 `>>>` 先 ToUint32 ⇒ `-1` 变成 4294967295)⇒ 合成 `63 | 1023<<6 = 65535`。
+ *    `obj = -1` 同形:`(-1 >>> 12) & 0xf = 15` ⇒ `65535`。`-1` 是「无铺装/空格」的
+ *    常用哨兵值 ⇒ 一个哨兵就把格子里写成「第 65535 号地砖 + 第 65535 号物体」,
+ *    而且**不报错**。
+ *
+ * 改后:**非整数 / 负数 / 超 u16 ⇒ 归 0(空)**。判定用 `isValidFloorId` /
+ * `isValidObjId` —— 它们是 u16 口径的唯一定义处,此前**生产代码 0 次调用**
+ * (只有测试用),于是「口径写在这里、执行写在别处」。
  */
 export function packTileWide(f: TileFields): TileCellWide {
-  const lo = packTile({ ...f, floor: f.floor & FLOOR_WORD_MASK, obj: f.obj & OBJ_WORD_MASK });
-  const floorHi = (Math.trunc(f.floor) >>> FLOOR_WORD_BITS) & 0x3ff;
-  const objHi = (Math.trunc(f.obj) >>> OBJ_WORD_BITS) & 0x0f;
+  const floor = isValidFloorId(f.floor) ? f.floor : 0;
+  const obj = isValidObjId(f.obj) ? f.obj : 0;
+  const lo = packTile({ ...f, floor: floor & FLOOR_WORD_MASK, obj: obj & OBJ_WORD_MASK });
+  const floorHi = (floor >>> FLOOR_WORD_BITS) & 0x3ff;
+  const objHi = (obj >>> OBJ_WORD_BITS) & 0x0f;
   return { lo, hi: (floorHi | (objHi << FLOOR_HI_BITS)) >>> 0 };
 }
 

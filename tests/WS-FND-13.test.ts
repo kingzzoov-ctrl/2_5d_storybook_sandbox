@@ -105,9 +105,20 @@ const hostOf = (rt: RoomRuntime): HostProbe => (rt.worldSaveHost ?? {}) as unkno
 
 /** 连一个真客户端并收集收到的帧(与 `session.ts:266` 同形:发 `[0x01][JSON]`)。 */
 type Collected = { welcome: Record<string, unknown> | null; bin: Uint8Array[]; sentHello: boolean };
-function connect(url: string, userId: string): { ws: WebSocket; got: Collected; done: Promise<void> } {
+/**
+ * ★ 2026-11-17:鉴权上线 —— `?userId=` 只是**声明**,`?token=`(HMAC 凭证)才是证据。
+ *
+ * 缺 token 的连接一律被 `room.join({requireToken:true})` 拒掉并 1008 关闭
+ * ⇒ 本套件「世界帧单调增长」那几条会变成「客户端一帧也收不到」。
+ * ⇒ token 由**生产的签发入口** `room.issueJoinToken` 现签(与验签同一把密钥),
+ *   不硬编码、也不跳过鉴权(跳过就不是端到端了)。
+ */
+function connect(url: string, userId: string, token: string): {
+  ws: WebSocket; got: Collected; done: Promise<void>;
+} {
   const got: Collected = { welcome: null, bin: [], sentHello: false };
-  const ws = new WebSocket(`${url}?userId=${userId}`);
+  const ws = new WebSocket(`${url}?userId=${encodeURIComponent(userId)}`
+    + `&token=${encodeURIComponent(token)}`);
   ws.binaryType = 'arraybuffer';
   const done = new Promise<void>((resolve) => {
     ws.addEventListener('open', () => {
@@ -154,7 +165,8 @@ async function observe(room: RoomRuntime, withWorld: boolean): Promise<{
   samples: number[]; frames: Uint8Array[]; hostFrameReadable: boolean;
 }> {
   const srv = await startWsServer({ port: 0, room: room as never, frameMs: FRAME_MS });
-  const client = connect(`ws://127.0.0.1:${srv.port}/ws`, 'alice');
+  /* ★ token 用**生产的签发入口**现签(见 `connect` 的注释) */
+  const client = connect(`ws://127.0.0.1:${srv.port}/ws`, 'alice', room.issueJoinToken('alice'));
   /* ⚠️ 断言写在 try 之外时一旦抛,finally 不执行 ⇒ srv 不关 ⇒ 进程不退 */
   try {
     /* 世界侧要有个玩家,否则快照无内容(host 为 null 时这步无效,正是对照点) */

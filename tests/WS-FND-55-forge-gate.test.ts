@@ -243,12 +243,6 @@ test('FND55-6 ★ 报文非法 + 505 配方 ⇒ 仍先 INVALID(顺序不因新�
   withForge(s.a.host, true);
   seed(s.rt, GLUE, 2);
 
-  /* 缺 `have`(服务端没有按物品明细的读口 ⇒ 客户端必须给)。 */
-  const noStock = disp(s.rt, { itemId: FORGE_PRODUCT });
-  eq(noStock.ok, false, '没有 have 不能合成');
-  eq(noStock.kind, 'INVALID', '报文缺失是 INVALID');
-  ok(!why(noStock).includes('未解锁高级锻造'),
-    `★ 报文校验先于锻造闸(实测:${why(noStock)})`);
 
   /* `itemId` 不是整数。 */
   const badId = disp(s.rt, { itemId: 318.5, have: { [GLUE]: 2 } });

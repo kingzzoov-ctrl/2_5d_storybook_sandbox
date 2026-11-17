@@ -62,7 +62,13 @@ export interface ActionContext {
     input: { ops: readonly InventoryOp[] },
   ): InventoryCheckResult;
 
-  /** 授予一个合法产出凭证(必须早于对应的正向 `applyInventory`)。 */
+  /**
+   * 授予一个合法产出凭证(**登记**这一步,不产生令牌)。
+   *
+   * ⚠️ 动作层**不要**直接传裸字符串:用 `actions/item_source.ts` 的
+   *   `bindItemSource(ctx, itemId, purpose)` —— 它铸的令牌绑定
+   *   `(actorId, itemId, 用途, tick)` 且一次性;裸字符串只留给测试夹具。
+   */
   grantItemSource(userId: string, source: string): void;
 
   /** 角色变更;宿主方法**自带**权限闸。 */

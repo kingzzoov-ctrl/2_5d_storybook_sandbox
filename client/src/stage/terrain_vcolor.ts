@@ -124,10 +124,31 @@ export function validateVertexColors(colors: Float32Array, vertexCount: number):
 /* ───────────────────────── 顶点色着色器(无纹理) ───────────────────────── */
 
 /**
- * 顶点着色器:只用 `position` / `normal` / `color` 三个属性。
- * 矩阵 uniform 与仓内既有 shader 保持一致(`uProjection` / `uView` / `uModel`)。
+ * three 在**非 raw**(`ShaderMaterial`)路径里**自动注入**的顶点属性。
+ *
+ * `position` / `normal` / `uv` 是无条件注入的;`color` 在 `material.vertexColors === true`
+ * (`#define USE_COLOR`)时注入。
+ *
+ * ★ WS-FND-89:这份表存在的唯一理由是**判据能查重** —— 自定义源码里再声明一次
+ *   这些名字,GLSL 就是「redefinition of 'position'」,编译失败 ⇒ 整个地形画不出来,
+ *   而 node 侧的判据(长度、值域、没有采样器)照样全绿。实测就发生过。
+ */
+export const THREE_MANAGED_ATTRIBUTES: readonly string[] = ['position', 'normal', 'uv', 'color'];
+
+/**
+ * 顶点着色器(**自包含**版:配 `RawShaderMaterial`)。
+ *
+ * 只用 `position` / `normal` / `color` 三个属性;矩阵 uniform 与仓内既有 shader
+ * 保持一致(`uProjection` / `uView` / `uModel`)。
+ *
+ * ★ 为什么 `precision` 与三个 `attribute` 都必须写在这里:`RawShaderMaterial`
+ *   **不做任何注入**(连默认浮点精度都没有)。three 只在 `ShaderMaterial` 路径上
+ *   注入 `attribute vec3 position/normal/uv`(开 `vertexColors` 还注入 `color`),
+ *   所以同一份源码**绝不能**再喂给 `ShaderMaterial` —— 那就是同名重定义。
+ *   非 raw 路径请用 `TERRAIN_VCOLOR_VERT_MANAGED`(内建声明已剥离,见文件末尾)。
  */
 export const TERRAIN_VCOLOR_VERT = `
+precision highp float;
 attribute vec3 position;
 attribute vec3 normal;
 attribute vec3 color;
@@ -148,8 +169,13 @@ void main() {
  *
  * ★ 硬约束:**不出现任何采样器**。写了 `uAlbedo` 就等于回到纹理图集,
  *   而 U2 裁决的全部收益(加地砖不改图集、不重传纹理)会当场消失。
+ *
+ * `precision` 显式写出:配 `RawShaderMaterial` 时 three 不注入默认精度。
+ * 非 raw 路径上 three 也会注入一行同样的声明 —— 重复设定默认精度是**合法**的
+ * (与重复声明 `attribute` 不同),所以两条路径可以共用同一份片元源码。
  */
 export const TERRAIN_VCOLOR_FRAG = `
+precision highp float;
 uniform float uAmbient;
 varying vec3 vColor;
 varying vec3 vNormal;
@@ -170,14 +196,66 @@ export function terrainShaderSamplesTexture(): boolean {
   return /sampler2D|samplerCube|texture2D|textureCube/.test(both);
 }
 
-/** 顶点色着色器声明的属性名(判据用:必须含 color,且不含 uv) */
-export function terrainShaderAttributes(): string[] {
+/**
+ * 从 GLSL 源码里按出现顺序抽取 `attribute <type> <name>;` 的名字(**可重复**)。
+ *
+ * 保留重复是有意的:「同一属性声明了两次」本身就是要抓的缺陷,去重会把它吃掉。
+ */
+export function parseAttributeDeclarations(src: string): string[] {
   const out: string[] = [];
   const re = /attribute\s+\w+\s+(\w+)\s*;/g;
-  let m: RegExpExecArray | null = re.exec(TERRAIN_VCOLOR_VERT);
+  let m: RegExpExecArray | null = re.exec(src);
   while (m !== null) {
     out.push(m[1]);
-    m = re.exec(TERRAIN_VCOLOR_VERT);
+    m = re.exec(src);
   }
   return out;
+}
+
+/**
+ * 源码里**与 three 注入重名**的属性声明(去重)。
+ *
+ * 返回非空 ⇒ 这份源码**不能**配 `ShaderMaterial`(GLSL 重定义 ⇒ 编译失败 ⇒
+ * 对象整块不显示)。它是 `TERRAIN_VCOLOR_VERT` / `TERRAIN_VCOLOR_VERT_MANAGED`
+ * 两条路径的共用判据。
+ */
+export function duplicatedManagedAttributes(src: string): string[] {
+  const managed = new Set(THREE_MANAGED_ATTRIBUTES);
+  const hit = new Set<string>();
+  for (const name of parseAttributeDeclarations(src)) {
+    if (managed.has(name)) hit.add(name);
+  }
+  return [...hit];
+}
+
+/**
+ * 剥掉指定名字的 `attribute` 声明行(其余原样保留)。
+ *
+ * 用途:把自包含源码变成 `ShaderMaterial` 版本 —— three 已经注入了那些声明,
+ * 我们再声明一次就是重定义。**只删声明行**,不碰任何使用点,因此两条路径
+ * 的计算逻辑必然同源(不存在「raw 版改了、managed 版忘了改」)。
+ */
+export function stripAttributeDeclarations(src: string, names: readonly string[]): string {
+  const drop = new Set(names);
+  const kept: string[] = [];
+  for (const line of src.split('\n')) {
+    const m = /^\s*attribute\s+\w+\s+(\w+)\s*;\s*$/.exec(line);
+    if (m !== null && drop.has(m[1])) continue;
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/**
+ * `ShaderMaterial`(非 raw)专用顶点源码:three 注入的内建声明已剥离。
+ *
+ * ★ 它不是「另一份实现」—— 由 `TERRAIN_VCOLOR_VERT` 机械派生,唯一差异是少了
+ *   三行 `attribute`(three 会注入)。判据:`duplicatedManagedAttributes(THIS) === []`。
+ */
+export const TERRAIN_VCOLOR_VERT_MANAGED: string =
+  stripAttributeDeclarations(TERRAIN_VCOLOR_VERT, THREE_MANAGED_ATTRIBUTES);
+
+/** 顶点色着色器声明的属性名(判据用:必须含 color,且不含 uv) */
+export function terrainShaderAttributes(): string[] {
+  return parseAttributeDeclarations(TERRAIN_VCOLOR_VERT);
 }

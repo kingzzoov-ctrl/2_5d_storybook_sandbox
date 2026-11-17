@@ -148,6 +148,17 @@ export interface NetPersistRoomOptions {
    *   只能等有人真的去把能力接上。
    */
   host?: WorldSaveHost | null;
+  /**
+   * **部署层显式收紧**:为 `true` 时 `onJoin` 不接受"没有凭证"的入场
+   * (默认 `false` = 沿用 Colyseus 的服务端 `sessionId`,理由见 `onJoin`)。
+   *
+   * ⚠️ 刻意**不**写进 `onCreate` 的 `rtOpts` 字面量:那里有一份与
+   * `index.ts` 的 `assemble()` **逐键比对**的断言(`WS-FND-09` FND9-9),
+   * 而 A 路这次不改 ⇒ 往 B 路的 rtOpts 加一个 A 路没有的键会让那条断言红
+   * (它抓的是"两份装配分叉",这里并不分叉 —— 强制与否是**入口**的事,
+   *  不是房间运行时的事,故它停在 `onJoin` 这一层)。
+   */
+  requireJoinToken?: boolean;
 }
 
 /**
@@ -322,11 +333,51 @@ export class NetPersistRoom extends Room<RoomSchema> {
     return this;
   }
 
-  override onJoin(client: Client, options: { passwordHash?: string; asGuest?: boolean }): void {
+  /**
+   * 入场。**身份与鉴权(审计 P0-1)**:
+   *
+   * ## 这一条路径的威胁模型与裸 WS **不同**,必须明说
+   * ```
+   * 裸 WS(ws_server.ts):成员键来自握手 URL 的 ?userId= ⇒ **客户端可控**
+   *                       ⇒ 必须强制凭证(那里已经强制了)
+   * Colyseus(client.sessionId):键由**服务端**生成 ⇒ 客户端冒充不了任何人
+   *                       ⇒ 问题是反的:房主(u_owner)反而**永远进不来**
+   * ```
+   * ⇒ 这里的修法不是"也强制一张凭证"(那只会把 `WS-FND-50` 那套真网关夹具全部判死,
+   *   而它测的是装配层,不是鉴权),而是:**给了凭证就必须验过,并按凭证认人**。
+   * ```
+   * 无 token            ⇒ 行为不变(成员键 = client.sessionId)         ← 存量兼容
+   * 有 token 且验签通过 ⇒ 成员键 = **凭证里的 userId**(于是房主能是房主了)
+   * 有 token 但验签失败 ⇒ client.leave(4001) + 不上席位                ← 不静默降级
+   * deps.requireJoinToken === true ⇒ 无 token 也拒(部署层可显式收紧)
+   * ```
+   * ⚠️ 那条"不静默降级"是关键:伪造的凭证如果被当成"没给凭证"放过去,
+   *   就等于"客户端决定服务端怎么解读它的输入"(CR-14 U1 同形)。
+   */
+  override onJoin(client: Client, options: { passwordHash?: string; asGuest?: boolean; token?: string }): void {
+    const token = typeof options?.token === 'string' && options.token.length > 0
+      ? options.token : undefined;
+    /* 默认身份 = Colyseus 的服务端 sessionId(不可被客户端指定)。 */
+    let userId = client.sessionId;
+    if (token !== undefined) {
+      const verdict = this.runtime.decodeJoinToken(token);
+      if (!verdict.ok) {
+        client.leave(4001, verdict.reason);
+        return;
+      }
+      userId = verdict.claims.userId;
+    } else if (this.deps?.requireJoinToken === true) {
+      client.leave(4001, '缺少 token(本房要求加入凭证)');
+      return;
+    }
     const res = this.runtime.join({
-      userId: client.sessionId,
-      passwordHash: options.passwordHash ?? null,
-      asGuest: options.asGuest ?? false,
+      userId,
+      passwordHash: options?.passwordHash ?? null,
+      asGuest: options?.asGuest ?? false,
+      /* 有凭证 ⇒ 让房间**再验一次**(同一份实现、同一把密钥:签发与校验收敛在一处);
+         无凭证 ⇒ 不强制(见上面的威胁模型说明)。 */
+      token,
+      requireToken: token !== undefined,
     });
     if (!res.ok) {
       client.leave(4000, res.reason ?? 'join rejected');

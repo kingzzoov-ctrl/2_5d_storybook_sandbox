@@ -50,6 +50,8 @@
  * 改成先扣之后,白嫖被堵在门口;反过来(扣成功而世界侧未生效 / 无需扣)⇒ **退回**,
  * 补偿走本仓既定的 `grantItemSource` + 正向 ops 机制,不是就地撤销。
  */
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { bindItemSource } from './item_source.ts';
 import type { ActionOutcome, ActionPayload, ItemReadPort } from '../room.ts';
 import type { ActionHandler } from './types.ts';
 
@@ -187,8 +189,8 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
 
   /** 把刚扣掉的那一件退回去(扣成功但本次不该扣 / 世界侧没生效)。 */
   const refund = (): void => {
-    const src = `use-item-refund:${ctx.actorId}`;
-    ctx.grantItemSource(ctx.actorId, src); /* 必须先授予凭证,再做正向 ops */
+    /* 退回是正 delta ⇒ 必须先铸**绑定**凭证(绑 itemId:只换回这一件)。 */
+    const src = bindItemSource(ctx, itemId, ItemSourcePurpose.USE_REFUND);
     ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
   };
 
