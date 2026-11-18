@@ -153,6 +153,23 @@ export function clearPlacementRegistry(): void {
   PLACEMENTS.clear();
 }
 
+/**
+ * 丢弃**某一个房间**的放置登记(保留别的房间)。
+ *
+ * ## 为什么必须有它(审计 P2:三个侧账无回收)
+ *
+ * `PLACEMENTS` 是模块级 Map,修前**全仓 0 个回收调用点** ⇒ `RESET_WORLD` 之后
+ * 「这一格已经有自动化件 XXX」仍然成立:世界已经按新种子重建(那一格可能成了
+ * 水/墙/空地),而登记表还把旧件钉在那儿 —— 既挡住重新放置,又让**放下去的那一件
+ * 实物**在账面上继续「存在着」。⇒ 世界重置成功时按 `roomId` 丢掉这一桶。
+ *
+ * ⚠️ **只删本房间那一桶**:`clearPlacementRegistry` 是测试用的全清,两者不互换 ——
+ * 一个房间的重置不许动到另一个房间的登记。
+ */
+export function forgetPlacements(roomId: string): void {
+  PLACEMENTS.delete(roomId);
+}
+
 /** 格子键。⚠️ 格式是对外契约的一部分:`` `${x},${y}` ``(整数格号)。 */
 function cellKey(x: number, y: number): string {
   return `${x},${y}`;

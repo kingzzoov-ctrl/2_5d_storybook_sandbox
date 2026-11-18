@@ -21,13 +21,18 @@
  *
  *
  * 用法:
- *   node scripts/gate-selfcheck.ts              # 全部用例
+ *   node scripts/gate-selfcheck.ts              # 全部用例(默认 `min(8, CPU−1)` 路并发)
  *   node scripts/gate-selfcheck.ts --only D1    # 只跑某组
+ *   node scripts/gate-selfcheck.ts --jobs 4     # 指定并发路数(上限 16)
  *
- * 期望耗时:每组约 0.2s(只跑 `--frozen`),D4 组需跑全套测试故较慢。
+ * 期望耗时:单组约 0.2~6s(多数只跑 `--frozen`);D3/D4 必须跑 `runTests` 故较慢
+ * (D3 18s / D4 6s,口径已收窄,见各自用例上的注释)。
+ * ⚠️ 30 个用例**并发**跑:每条用例独占一份整树副本(`makeLab`),彼此无共享可写状态。
+ *    串行版本实测 163s,且默认口径改成「自检真跑」之后会因副本里递归 spawn 门禁自检
+ *    而突破外层超时(表现为 `门禁自检失败(exit=null)`)。
  */
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, cpSync, rmSync, readdirSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, cpSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { join, relative, sep, dirname, resolve } from 'node:path';
 /* ★ 2026-11-14(接手者):跳过规则走唯一事实源(`scripts/scan-scope.ts`)。
    ⚠️ 这与本文件「独立复算」的原则**不冲突**:独立性要求的是**算法**独立
@@ -48,16 +53,20 @@ import { shouldSkipDirAtDepth } from './scan-scope.ts';
  */
 function extractRelImports(src: string): string[] {
   const out: string[] = [];
-  /* 静态 `from '...'` */
-  for (const m of src.matchAll(/from\s+'(\.[^']+)'/g)) out.push(m[1]!);
+  /* 静态 `from '...'` —— 含 `export ... from` 与 `import type ... from`(都是同一条边) */
+  for (const m of src.matchAll(/\bfrom\s*['"](\.[^'"]+)['"]/g)) out.push(m[1]!);
   /* 裸副作用导入 `import '...'` */
-  for (const m of src.matchAll(/(?:^|\n)\s*import\s+'(\.[^']+)'/g)) out.push(m[1]!);
-  /* 动态 `await import('...')` —— ⚠️ 排除 `typeof import(`(类型查询不产生运行时边) */
-  for (const m of src.matchAll(/await\s+import\(\s*'(\.[^']+)'/g)) out.push(m[1]!);
+  for (const m of src.matchAll(/(?:^|\n)\s*import\s*['"](\.[^'"]+)['"]/g)) out.push(m[1]!);
+  /* **字面量**动态导入:`import('./x.ts')` / `await import('./x.ts')` / 无插值模板串。
+   * ⚠️ 与 `scripts/imports.ts` 的真值表**同一口径**:非字面量 `import(expr)` 不跟踪
+   *    (静态不可解析,已作为接受边界登记在 `verify.ts` 的 `checkDynamicImportBoundary()`)。
+   * ⚠️ 2026-11-18:此前这条只认 `await import('...')`(单引号),而真正的口径来源
+   *    (`scripts/imports.ts`)三种形态都认 ⇒ 两份实现会在「`import('./x.ts').then()`」
+   *    这类写法上分叉。分叉的表现是**差集条数不等**,而不是报错。 */
+  for (const m of src.matchAll(/(?<![\w.])import\s*\(\s*['"`](\.[^'"`]+)['"`]\s*\)/g)) out.push(m[1]!);
   return out;
 }
-import { tmpdir } from 'node:os';
-
+import { cpus, tmpdir } from 'node:os';
 const ROOT = process.cwd();
 
 /** 变异用例。 */
@@ -111,6 +120,13 @@ interface Case {
    * 这个坑本轮已踩过两次(T32 的理由锚点 + Lead 注入时用错缩进)。
    */
   mark?: string;
+  /**
+   * 用例自带的**副本改造**(可选,在变异之前对该用例的整树副本执行一次)。
+   *
+   * 目前只有 D3 用:`它必须跑默认口径(全量 `runTests`),而默认口径会再 spawn
+   * 一次门禁自检 ⇒ 副本里递归复制整棵树`。理由与实测证据见 D3 用例上的注释。
+   */
+  labSetup?: (labRoot: string) => void;
 }
 
 /**
@@ -412,13 +428,47 @@ const CASES: Case[] = [
     to: '| WS-01 | 地形位压缩与分片 | 50 |\n| WS-01 | 地形位压缩与分片 | 999999 |',
     expect: 'red',
     wantMsg: /WS-01 在 README 表格里出现 2 次/,
+    /* ★ 本用例是**唯一**必须跑默认口径(全量 `runTests`)的一条:
+       被测判据(`verify.ts:7315` 的 `matchAll` + 唯一性)只在 `!frozenOnly && !only`
+       时执行,而且它读的是 `runTests` 填进 `suiteCounts` 的**实测**值。
+       两处**口径等价**的降本(实测 66s → 18.4s,且不再递归):
+       ① 副本里的 `tests/` 只留 README 那张表的**取值域**(`WS-NN` 套件):
+          判据只遍历 `suiteCounts` 里 `/^WS-\d+$/` 的键 ⇒ 其余 100 个套件既不进判据、
+          又占掉约 48s。影子行判据是**逐键**的,少测别的键不会让它变松。
+       ② 把副本里的 `scripts/gate-selfcheck.ts` 换成**桩**(只打印 `30 通过 / 30 合计`):
+          默认口径会**再 spawn 一次门禁自检**,而门禁自检又会复制整棵树、
+          再跑一遍默认口径 ⇒ **无限递归**。实测(2026-11-18)旧实现的进程树里
+          能直接看到嵌套的 `gate-selfcheck.ts` —— 那正是 `verify --all` 报
+          `门禁自检失败(exit=null)`(子进程被 kill)的根因之一。
+          ⚠️ 桩只让**本副本**的这一道变绿,本条的判定与它无关(`expect: 'red'` 由
+          上面那条 README 影子行消息给出)。 */
+    labSetup: (lab) => {
+      for (const f of readdirSync(join(lab, 'tests'), { withFileTypes: true })) {
+        if (!f.isFile()) continue;
+        if (/^WS-\d+\.test\.ts$/.test(f.name)) continue;
+        rmSync(join(lab, 'tests', f.name), { force: true });
+      }
+      writeFileSync(
+        join(lab, 'scripts', 'gate-selfcheck.ts'),
+        "console.log('  30 通过 / 30 合计');\n",
+        'utf8',
+      );
+    },
   },
-
   /* ═══ D4:断言数取自被测套件自身的输出,可被伪造 ═══
      旧实现取**末匹配**,于是在套件末尾多打一行 `999/999 通过` 就能让门禁
      把 999 当成「实测」断言数(并报 ✓ 用例汇总 1964 条,真值 1015)。
      现在要求恰好 1 处,多一处即 fail。
-     注:此用例必须跑 `runTests`,故不能带 `--frozen`(它会跳过 runTests)。 */
+     ⚠️ 必须跑 `runTests`,故不能带 `--frozen`(它会跳过 runTests)。
+     ★ 口径收窄成 `--only WS-01`(**只**跑这一个套件),而不是默认口径:
+       ① `runTests` 在 `--only` 下**照跑**(`verify.ts:7893` 的守卫只排除
+          `frozen/docs/content`),本用例要断言的正是 `runTests` 里那条
+          「每套件恰好 1 处 N/N」判据 ⇒ 口径等价;
+       ② 默认口径约 66s(全量 109 个套件),而它还会 **再 spawn 一次门禁自检**
+          ⇒ 在副本里递归复制整棵树。实测(2026-11-18)进程树里能直接看到
+          嵌套的 `gate-selfcheck.ts`,这正是老 `verify --all` 报
+          `门禁自检失败(exit=null)`(子进程被 kill)的根因之一。
+       实测:默认口径 66s / `--only WS-01` 6.2s,两者**都**红在那条消息上。 */
   {
     group: 'D4',
     name: '在 WS-01 末尾伪造一行 999/999 通过',
@@ -427,6 +477,7 @@ const CASES: Case[] = [
     to: "report('WS-01');\nconsole.log('[WS-01] 999/999 通过');",
     expect: 'red',
     wantMsg: /处「N\/N 通过」/,
+    args: ['--only', 'WS-01'],
   },
   {
     group: 'D5',
@@ -744,12 +795,82 @@ const CASES: Case[] = [
           + '(2026-11-14 实测过这个 bug:skip 表里有裸目录名 build)',
         );
       }
-      /* 入口闭包:与 verify.ts 的 PROD_ENTRIES 同口径(4 个入口已登记) */
-      const ENTRIES2 = ['server/src/net/room.colyseus.ts', 'client/src/main.ts', 'server/src/sim/demo.ts', 'server/src/index.ts']
-        .map((p) => resolve(ROOT2, p)).filter((p) => existsSync(p));
+      /* ── 入口闭包:入口清单**从 verify.ts 源码解析**,不硬编码 ──────────────
+       *
+       * ★ 2026-11-18(本轮):此前这里硬编码 4 个入口,而 `verify.ts` 的
+       *   `PROD_ENTRIES` 因 task-69 已是 **5** 个(加了 `server/src/sim/ws_demo.ts`)。
+       *   ⇒ 镜像闭包比真闭包少 2 个文件(ws_demo 与它带进来的 ws_server),
+       *     镜像复算与门禁打印因此**必然对不上**,而症状看起来像「判据写错了」。
+       *   ★ 教训:硬编码**别人的清单**= 两份事实绑在一起、却没有任何东西检查它们一致。
+       *     本文件已反复吃这一口(见上方 T32 那条「入口 N 个」的手工数字)。
+       *   ⇒ 修法不是「把 4 改成 5」(下一轮照样漂),而是**从源码解析**:入口数永远跟随。
+       *   ⇒ 三条**互校**(解析不可靠时立刻红,并**点名**差哪几条):
+       *     1 解析条数 == 数组字面量里的**全部**字符串条数(漏认就会不等);
+       *     2 每条都必须真存在于磁盘(否则说明把非条目文本当成了入口);
+       *     3 解析结果必须含客户端入口(它由 `client/index.html` 的 script 路径钉住,
+       *       是本文件之外的另一份事实 —— 解析若只吃到前半段,这条会红)。
+       */
+      const PROD_ENTRY_PATHS = (() => {
+        const at = src.indexOf('const PROD_ENTRIES = [');
+        if (at < 0) {
+          throw new Error('gate-selfcheck: verify.ts 里找不到 `const PROD_ENTRIES = [`'
+            + ' —— 入口清单无法同源(镜像必然与门禁漂移,不许静默继续)');
+        }
+        const rest = src.slice(at);
+        const endRel = rest.search(/^];/m);
+        if (endRel < 0) {
+          throw new Error('gate-selfcheck: PROD_ENTRIES 数组字面量没有行首 `];` 收尾 —— 解析锚点已失效');
+        }
+        /* 剥注释时**保留换行**(否则行下标前移 —— 与上面白名单解析同一纪律) */
+        const body = rest.slice(0, endRel)
+          .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''))
+          .replace(/\/\/.*$/gm, '');
+        const parsed = [...body.matchAll(/^\s*'([^']+)',?\s*$/gm)].map((m) => m[1]!);
+        /* 互校 1:与「字面量里的全部字符串」对账 —— 不等就点名差哪几条 */
+        const literals = [...body.matchAll(/'([^']+)'/g)].map((m) => m[1]!);
+        const missed = literals.filter((x) => !parsed.some((y) => y === x));
+        if (parsed.length !== literals.length || missed.length > 0) {
+          throw new Error(
+            `gate-selfcheck: PROD_ENTRIES 解析条数(${parsed.length})≠ 数组字面量字符串条数(${literals.length})`
+            + ` —— 未被认出的条目:${missed.length > 0 ? missed.join(', ') : '(内容一致但条数不符,疑重复项)'}`
+            + '(入口清单的解析锚点失效 ⇒ 镜像不能再当真)',
+          );
+        }
+        /* 互校 2:每条都必须真存在于磁盘 */
+        const missing = parsed.filter((p) => !existsSync(resolve(ROOT2, p)));
+        if (missing.length > 0) {
+          throw new Error(
+            `gate-selfcheck: PROD_ENTRIES 里有 ${missing.length} 条在磁盘上不存在:${missing.join(', ')}`
+            + '(解析可能把非条目文本当成入口;也可能入口文件被删 —— 两种都要人看)',
+          );
+        }
+        /* 互校 3:客户端入口必在其中(`client/index.html` 的 script 路径 = 另一份事实) */
+        if (!parsed.includes('client/src/main.ts')) {
+          throw new Error('gate-selfcheck: 解析出的 PROD_ENTRIES 里没有 `client/src/main.ts`'
+            + ' —— 而 client/index.html 的 script 指向它 ⇒ 解析只吃到了一部分');
+        }
+        return parsed;
+      })();
+      console.log(`      · 入口清单(从 verify.ts **解析**,不硬编码):${PROD_ENTRY_PATHS.length} 个`
+        + ` — ${PROD_ENTRY_PATHS.join(', ')}`);
+      const ENTRIES2 = PROD_ENTRY_PATHS.map((p) => resolve(ROOT2, p)).filter((p) => existsSync(p));
       if (ENTRIES2.length === 0) {
         throw new Error('gate-selfcheck: 一个生产入口都不存在(闭包必然是空的,不许静默继续)');
       }
+      /* 说明符 → 绝对路径。**与 `verify.ts:resolveImport()` 同一语义**
+         (`./x` → `./x.ts` → `./x/index.ts`;非相对说明符一律 null),
+         因为闭包与 importer 两侧都必须用它,否则「引用者全不可达」会依赖两侧的偏差。 */
+      const resolveSpec2 = (fromAbs: string, spec: string): string | null => {
+        if (!spec.startsWith('.')) return null;
+        const p = resolve(join(dirname(fromAbs), spec));
+        const isFile2 = (q: string): boolean => {
+          try { return statSync(q).isFile(); } catch { return false; }
+        };
+        if (p.endsWith('.ts')) return isFile2(p) ? p : null;
+        if (isFile2(`${p}.ts`)) return `${p}.ts`;
+        const idx = join(p, 'index.ts');
+        return isFile2(idx) ? idx : null;
+      };
       const reach2 = new Set<string>();
       {
         const stack = [...ENTRIES2];
@@ -758,8 +879,8 @@ const CASES: Case[] = [
           if (reach2.has(cur)) continue;
           reach2.add(cur);
           for (const spec of extractRelImports(readFileSync(cur, 'utf8'))) {
-            const dep = resolve(join(dirname(cur), spec));
-            if (existsSync(dep) && !reach2.has(dep)) stack.push(dep);
+            const dep = resolveSpec2(cur, spec);
+            if (dep !== null && !reach2.has(dep)) stack.push(dep);
           }
         }
       }
@@ -768,14 +889,26 @@ const CASES: Case[] = [
          那取的是 `e[0]`(整段匹配文本),于是 base 提取不到、importer 恒为 0
          ⇒ 差集算成 0 条而**看起来完全正常**。
          我第一次就是 `for (const [rel] of entries)` ⇒ 独立复算报「差集 0 条」,
-         与 verify.ts 的 4 条**矛盾** —— 那个矛盾正是这条 bug 的信号。 */
+        与 verify.ts 的 4 条**矛盾** —— 那个矛盾正是这条 bug 的信号。 */
+      /* ══ 差集判据:**与 verify.ts 的 `isDiffSet()` 同口径** ══
+       * ★ 2026-11-18:此前这里按 **basename 正则** (`from '...x.ts'`) 找 importer,
+       *   而 `verify.ts` 用的是同一套 basename 正则 —— 于是两边都犯同一个错:
+       *   `server/src/combat/cooking.ts` 的 importer 被算到 `shared/{types,constants}/cooking.ts` 头上。
+       *   现在两侧都改成「**解析到绝对路径再比较**」,并且都用
+       *   「静态 `from` / 裸副作用 / `export ... from` / **字面量**动态 `import()`」这一套提取口径
+       *   (口径来源 = `scripts/imports.ts` 头部的真值表;非字面量 `import(expr)` **两侧都不跟踪**,
+       *    已作为接受边界登记在 verify.ts 的 `checkDynamicImportBoundary()`)。
+       * ⚠️ 本文件仍**自己实现**提取与解析(不 import imports.ts / verify.ts):
+       *   独立复算的价值在于用另一份实现算出同一个集合;若两侧结果不同,那是**发现**。
+       */
       for (const e of entries) {
         const rel = e[1]!;
-        const base = rel.split('/').pop()!.replace(/\.ts$/, '');
-        const esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const importers = prodAll2.filter((f) => f !== rel
-          && new RegExp(`from '[^']*${esc}\\.ts'`).test(readFileSync(resolve(ROOT2, f), 'utf8')));
-        if (importers.length > 0 && importers.every((f) => !reach2.has(resolve(ROOT2, f)))) {
+        const target = resolve(ROOT2, rel);
+        const importers = prodAll2
+          .map((f) => resolve(ROOT2, f))
+          .filter((abs) => abs !== target
+            && extractRelImports(readFileSync(abs, 'utf8')).some((s) => resolveSpec2(abs, s) === target));
+        if (importers.length > 0 && importers.every((abs) => !reach2.has(abs))) {
           diffSetPaths.push(rel);
         }
       }
@@ -927,32 +1060,86 @@ resolveAnchors();
 
 /* ═══════════════════════ 执行 ═══════════════════════ */
 
-let lab: string | null = null;
+/**
+ * 一份**新的**整树副本(`%TEMP%/cp_selfcheck_*`),跑完由调用方 `dropLab` 删除。
+ *
+ * ## 为什么不再用「全局单例 lab」
+ * 原实现是 `let lab: string | null` 单例 + 无参 `dropLab()`,等价于**串行**:
+ * 同一时刻只有一份副本可用。串行 × 30 个用例 × (副本 ~1.0s + `verify --frozen` ~5.4s)
+ * ⇒ 实测 163s;机器一有负载就突破 `checkGateSelfcheck` 那一侧的超时(表现为
+ * `门禁自检失败(exit=null)`:子进程被 kill)。
+ * ⇒ 改成**每用例一份**,于是用例可以并发(见文件末的 worker 池)。
+ */
 function makeLab(): string {
-  if (lab) return lab;
   const d = mkdtempSync(join(tmpdir(), 'cp_selfcheck_'));
   cpSync(ROOT, d, {
     recursive: true,
     filter: (s) => !/[/\\](\.git|node_modules|_shots|_design|_cdp_profile)([/\\]|$)/.test(s),
   });
-  lab = d;
   return d;
 }
-function dropLab(): void {
-  if (lab) { rmSync(lab, { recursive: true, force: true }); lab = null; }
+function dropLab(dir: string): void {
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* 副本删不掉不影响结论 */ }
 }
 
 interface RunResult { exit: number; fails: string[]; out: string }
-function runVerify(args: string[]): RunResult {
-  const r = spawnSync(process.execPath, ['scripts/verify.ts', ...args], {
-    cwd: makeLab(), encoding: 'utf8', maxBuffer: 128 * 1024 * 1024,
+
+/** 单次 `verify` 的墙钟预算(卡死时明确报「超时」,而不是静默等到外层超时)。 */
+const VERIFY_TIMEOUT_MS = 600_000;
+
+/**
+ * 在 `labRoot` 里跑 `verify.ts` —— **异步** spawn(并发的前提)。
+ * ⚠️ 不能用 `spawnSync`:`--jobs` 并发时它会把事件循环钉住,退化成串行。
+ */
+function runVerifyIn(labRoot: string, args: string[]): Promise<RunResult> {
+  return new Promise<RunResult>((done) => {
+    const ch = spawn(process.execPath, ['scripts/verify.ts', ...args], {
+      cwd: labRoot, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ch.kill('SIGKILL'); }, VERIFY_TIMEOUT_MS);
+    ch.stdout?.setEncoding('utf8');
+    ch.stderr?.setEncoding('utf8');
+    ch.stdout?.on('data', (s: string) => { out += s; });
+    ch.stderr?.on('data', (s: string) => { out += s; });
+    ch.on('error', (e: Error) => { out += `\n[spawn error] ${e.message}\n`; });
+    ch.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(timer);
+      if (timedOut) out += `\n[超时] verify 超过 ${VERIFY_TIMEOUT_MS} ms 被 kill\n`;
+      else if (signal !== null) out += `\n[被信号 ${signal} 终止]\n`;
+      done({
+        exit: code ?? -1,
+        fails: out.split('\n').filter((l) => l.includes('✗')).map((l) => l.trim()),
+        out,
+      });
+    });
   });
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-  return {
-    exit: r.status ?? -1,
-    fails: out.split('\n').filter((l) => l.includes('✗')).map((l) => l.trim()),
-    out,
-  };
+}
+
+/** 一次性用例(基线):自建一份副本,跑完即删。 */
+async function runVerify(args: string[]): Promise<RunResult> {
+  const d = makeLab();
+  try {
+    return await runVerifyIn(d, args);
+  } finally {
+    dropLab(d);
+  }
+}
+
+/**
+ * 并发路数:`--jobs N`;不传则 `min(8, CPU−1)`。
+ * 上限 16 —— 再高只是让 8 个 `verify` 互相抢 CPU,而每个 `verify` 自己已经是串行。
+ */
+function resolveJobs(): number {
+  const auto = Math.min(8, Math.max(2, cpus().length - 1));
+  const i = process.argv.indexOf('--jobs');
+  if (i < 0) return auto;
+  const n = Number(process.argv[i + 1]);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`gate-selfcheck: --jobs 需要正整数(收到 ${String(process.argv[i + 1])})`);
+  }
+  return Math.min(n, 16);
 }
 
 /**
@@ -1014,7 +1201,6 @@ let passed = 0;
  */
 {
   console.log('\n[T33] `import verify.ts` 不得执行门禁(防无限递归的守卫还在吗)');
-  dropLab();
   /* ⚠️ 必须用**子进程 + 硬超时**:若守卫已失效,这个 import 会跑整个门禁
      (含 spawn 全部测试),`-e` 里直接 await 会把自检本身卡死。 */
   const probe
@@ -1040,7 +1226,6 @@ let passed = 0;
     console.log('     一旦失效,任何 import verify.ts 的模块都会**无限递归 spawn**(超时拦不住)');
     failures += 1;
   }
-  dropLab();
 }
 
 /* ⚠️ T33 **不得在这里打印汇总** —— 用例表(下方)还没跑。
@@ -1163,14 +1348,13 @@ let passed = 0;
     console.log(`  还原:临时副本已清=${restored ? '✓' : '✗✗'}  真仓库未被污染=${realClean ? '✓' : '✗✗ **污染了真仓库!**'}`);
     if (!restored || !realClean) failures += 1;
   }
-  dropLab();
+  dropLab(labRoot);
 }
 
 /* ── 基线:干净副本 ──
    若基线有红(通常是队友在飞的改动),**不中止**,而是把它当作差值基准 ——
    见 `deltaFails` 的说明。这样本脚本在多人并行时依然能给出有效结论。 */
-dropLab();
-const base = runVerify(['--frozen']);
+const base = await runVerify(['--frozen']);
 console.log('[自检基线] 干净副本 --frozen');
 if (base.fails.length > 0) {
   console.log(`  · 基线有 ${base.fails.length} 条红(可能是队友在飞的改动)—— 后续判定改用**差值**:`);
@@ -1178,97 +1362,186 @@ if (base.fails.length > 0) {
 } else {
   console.log(`  ✓ 基线绿(${base.exit === 0 ? 'exit 0' : `exit ${base.exit}`})`);
 }
-dropLab();
 
-/* ── 逐条用例 ── */
-for (const c of CASES) {
-  if (only && c.group !== only) continue;
-  dropLab();
-  const p = join(makeLab(), c.file);
-  let probeOk = true;
-  if (!existsSync(p)) {
-    console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:${c.file} 不存在`);
-    failures += 1; dropLab(); continue;
-  }
-  const src = readFileSync(p, 'utf8');
-  /* `from` 可为函数:从当前文件内容里**自取**锚点,避免写死的锚点随
-     白名单收缩而失效(见接口注释)。
-     ⚠ 必须区分两种"空":
-       · `from: ''`(字面空串)= **有意不改**,合法(有些用例只断言消息)
-       · `from` 是函数却返回空 = **解析器失效**,必须报错,否则会退化成
-         「跑了个空操作还判通过」的假证据。
-     初版把两者混为一谈,于是 3 个 `from: ''` 的用例被误报"探针失效" ——
-     这正是本脚本自身最该防的那类错误。 */
-  const isDerived = typeof c.from === 'function';
-  const fromText = isDerived ? (c.from as (s: string) => string)(src) : (c.from as string);
-  if (isDerived && fromText === '') {
-    console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:锚点解析器返回空串(清单可能已空)`);
-    failures += 1; dropLab(); continue;
-  }
-  if (fromText !== '') {
-    const { n, normalized } = countAnchor(src, fromText);
-    if (n !== 1) {
-      /* 区分两种成因 —— 这是本脚本存在的理由(「探针失效」不等于「门禁失职」)。
-         0 命中时明说"是不是换行不一致",否则读者会按"锚点过期"去修错地方。 */
-      const diag = n === 0
-        ? (normalized
-          ? '\n    ⚠ 归一化换行后仍命中 0 ⇒ 锚点**真的**不在了(不是 CRLF 问题)'
-          : '\n    ⚠ 但归一化换行后命中 >0 ⇒ 这是**换行不一致**(core.autocrlf=true),不是锚点过期')
-        : '';
-      console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:锚点命中 ${n} 次(需恰好 1 次)${diag}`);
-      failures += 1; dropLab(); continue;
+/* ── 逐条用例:并发执行(`--jobs`,默认 `min(8, CPU−1)`)──
+ *
+ * ## 为什么必须并发(2026-11-18 实测)
+ * ```
+ * 串行(旧实现):30 个用例 × (整树副本 ~1.0s + `verify --frozen` ~5.4s)
+ *   ⇒ 实测 163s;而**默认口径改成「自检真跑」之后**,两个「必须跑全量口径」的用例
+ *     还会在副本里再 spawn 一次门禁自检 ⇒ 递归(见 `Case.labSetup`)。
+ *   ⇒ 机器一有负载就突破 `checkGateSelfcheck` 那一侧的超时,表现是
+ *     `门禁自检失败(exit=null)` —— 子进程被 kill,而不是自检报红。
+ * ```
+ * ⇒ 每条用例本来就跑在**自己的整树副本**里(见 `makeLab`),用例之间没有共享可写状态
+ *   ⇒ 并发是**语义等价**的加速:墙钟从 Σ 变成 max。
+ * ⚠️ 不能用 `spawnSync`:它会把事件循环钉住,并发随即退化成串行(见 `runVerifyIn`)。
+ */
+interface CaseOutcome { failed: boolean; lines: string[] }
+
+/** 跑一条用例:独占一份副本,跑完即删。 */
+async function runCase(c: Case, baseFails: string[]): Promise<CaseOutcome> {
+  const lines: string[] = [];
+  const labRoot = makeLab();
+  try {
+    /* 用例可自带**副本改造**(见 `Case.labSetup`)。 */
+    if (c.labSetup !== undefined) c.labSetup(labRoot);
+    const p = join(labRoot, c.file);
+    if (!existsSync(p)) {
+      lines.push(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:${c.file} 不存在`);
+      return { failed: true, lines };
     }
-    /* ★ 用 findAnchor 定位后按**下标**替换 —— 不再用 src.replace(fromText, ...),
-       因为锚点在 CRLF 文件里可能是归一化后才命中的,那时 replace 会找不到。 */
-    const hit = findAnchor(src, fromText);
-    if (!hit) {
-      console.log(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:定位到锚点但无法切回原文本(换行映射错)`);
-      failures += 1; dropLab(); continue;
+    const src = readFileSync(p, 'utf8');
+    /* `from` 可为函数:从当前文件内容里**自取**锚点,避免写死的锚点随
+       白名单收缩而失效(见接口注释)。
+       ⚠ 必须区分两种"空":
+         · `from: ''`(字面空串)= **有意不改**,合法(有些用例只断言消息)
+         · `from` 是函数却返回空 = **解析器失效**,必须报错,否则会退化成
+           「跑了个空操作还判通过」的假证据。
+       初版把两者混为一谈,于是 3 个 `from: ''` 的用例被误报"探针失效" ——
+       这正是本脚本自身最该防的那类错误。 */
+    const isDerived = typeof c.from === 'function';
+    const fromText = isDerived ? (c.from as (s: string) => string)(src) : (c.from as string);
+    if (isDerived && fromText === '') {
+      lines.push(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:锚点解析器返回空串(清单可能已空)`);
+      return { failed: true, lines };
     }
-    /* ★ 注入文本也要**跟随目标文件的换行风格** —— 否则往 CRLF 文件里塞一段 LF,
-       副本就成了混行文件。副本随后要跑真门禁,混行会让 `\n` 锚点类检查
-       时灵时不灵(正是本函数要修的那个坑的同族)。 */
-    const crlfFile = (src.match(/\r\n/g) ?? []).length > (src.match(/(?<!\r)\n/g) ?? []).length;
-    const toText = crlfFile ? c.to.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n') : c.to.replace(/\r\n/g, '\n');
-    writeFileSync(p, src.slice(0, hit.at) + toText + src.slice(hit.at + hit.len), 'utf8');
-    /* 自证:读回确认内容真的变了 —— 防「空操作探针」假证据 */
-    if (readFileSync(p, 'utf8') === src) probeOk = false;
-  }
-
-  const args = c.args ?? [];
-  const r = runVerify(args);
-  /* **差值判定**:只看本用例新引入的 ✗,忽略基线就有的(队友在飞的改动)。
-     见 `deltaFails` 的说明 —— 用绝对红绿会在多人并行时给出错误结论。 */
-  const newFails = deltaFails(r.fails, base.fails);
-  const isRed = newFails.length > 0;
-  const verdictOk = c.expect === 'any' ? true : (c.expect === 'red') === isRed;
-  const msgOk = c.wantMsg === undefined || c.wantMsg.test(r.out);
-  const notOk = c.notMsg === undefined || !c.notMsg.test(r.out);
-  /* expect:'any' 的用例必须至少给一个消息断言,否则它什么也没测。 */
-  const anyHasMsg = c.expect !== 'any' || c.wantMsg !== undefined || c.notMsg !== undefined;
-
-  console.log(`\n[${c.group}] ${c.name}`);
-  console.log(`  探针:${c.from === '' ? '(无需变异)' : probeOk ? '✓ 内容已变' : '✗ 空操作!'}`);
-  console.log(`  verify ${args.join(' ') || '(无 flag)'} → exit ${r.exit},`
-    + `fail ${r.fails.length}${base.fails.length > 0 ? `(基线 ${base.fails.length} ⇒ 新增 ${newFails.length})` : ''}`);
-  console.log(`  期望 ${c.expect === 'any' ? '只断言消息' : c.expect === 'red' ? '红' : '绿'}`
-    + ` ⇒ ${verdictOk ? '✓ 符合' : '✗✗ 不符'}${
-      c.wantMsg ? msgOk ? ';命中预期消息 ✓' : ';消息未命中 ✗' : ''}${
-      c.notMsg ? notOk ? ';已消失预期消息 ✓' : ';不该出现的消息仍在 ✗' : ''}`);
-
-  if (verdictOk && msgOk && notOk && probeOk && anyHasMsg) {
-    passed += 1;
-    /* 红的时候把**新增的**那条打印出来,作为「有牙齿」的证据 */
-    if (c.expect === 'red') newFails.slice(0, 2).forEach((f) => console.log(`      ${f.slice(0, 165)}`));
-  } else {
-    failures += 1;
-    newFails.slice(0, 5).forEach((f) => console.log(`      新增: ${f.slice(0, 165)}`));
-    if (c.expect === 'red' && newFails.length === 0) {
-      console.log('      ⚠️ 门禁没有**新增**红 —— 这条检查是恒真的(或探针打偏了)');
+    let probeOk = true;
+    if (fromText !== '') {
+      const { n, normalized } = countAnchor(src, fromText);
+      if (n !== 1) {
+        /* 区分两种成因 —— 这是本脚本存在的理由(「探针失效」不等于「门禁失职」)。
+           0 命中时明说"是不是换行不一致",否则读者会按"锚点过期"去修错地方。 */
+        const diag = n === 0
+          ? (normalized
+            ? '\n    ⚠ 归一化换行后仍命中 0 ⇒ 锚点**真的**不在了(不是 CRLF 问题)'
+            : '\n    ⚠ 但归一化换行后命中 >0 ⇒ 这是**换行不一致**(core.autocrlf=true),不是锚点过期')
+          : '';
+        lines.push(`\n[${c.group}] ${c.name}\n  ✗ 探针无效:锚点命中 ${n} 次(需恰好 1 次)${diag}`);
+        return { failed: true, lines };
+      }
+      /* ★ 用 findAnchor 定位后按**下标**替换 —— 不再用 src.replace(fromText, ...),
+         因为锚点在 CRLF 文件里可能是归一化后才命中的,那时 replace 会找不到。 */
+      const hit = findAnchor(src, fromText);
+      if (!hit) {
+        lines.push(`\n[${c.group}] ${c.name}\n  ✗ 探针失效:定位到锚点但无法切回原文本(换行映射错)`);
+        return { failed: true, lines };
+      }
+      /* ★ 注入文本也要**跟随目标文件的换行风格** —— 否则往 CRLF 文件里塞一段 LF,
+         副本就成了混行文件。副本随后要跑真门禁,混行会让 `\n` 锚点类检查
+         时灵时不灵(正是本函数要修的那个坑的同族)。 */
+      const crlfFile = (src.match(/\r\n/g) ?? []).length > (src.match(/(?<!\r)\n/g) ?? []).length;
+      const toText = crlfFile ? c.to.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n') : c.to.replace(/\r\n/g, '\n');
+      writeFileSync(p, src.slice(0, hit.at) + toText + src.slice(hit.at + hit.len), 'utf8');
+      /* 自证:读回确认内容真的变了 —— 防「空操作探针」假证据 */
+      if (readFileSync(p, 'utf8') === src) probeOk = false;
     }
-    if (!notOk) console.log(`      ⚠️ 出现不该出现的消息:${c.notMsg}`);
+
+    const args = c.args ?? [];
+    const r = await runVerifyIn(labRoot, args);
+    /* **差值判定**:只看本用例新引入的 ✗,忽略基线就有的(队友在飞的改动)。
+       见 `deltaFails` 的说明 —— 用绝对红绿会在多人并行时给出错误结论。 */
+    const newFails = deltaFails(r.fails, baseFails);
+    const isRed = newFails.length > 0;
+    const verdictOk = c.expect === 'any' ? true : (c.expect === 'red') === isRed;
+    const msgOk = c.wantMsg === undefined || c.wantMsg.test(r.out);
+    const notOk = c.notMsg === undefined || !c.notMsg.test(r.out);
+    /* expect:'any' 的用例必须至少给一个消息断言,否则它什么也没测。 */
+    const anyHasMsg = c.expect !== 'any' || c.wantMsg !== undefined || c.notMsg !== undefined;
+
+    lines.push(`\n[${c.group}] ${c.name}`);
+    lines.push(`  探针:${c.from === '' ? '(无需变异)' : probeOk ? '✓ 内容已变' : '✗ 空操作!'}`);
+    lines.push(`  verify ${args.join(' ') || '(无 flag)'} → exit ${r.exit},`
+      + `fail ${r.fails.length}${baseFails.length > 0 ? `(基线 ${baseFails.length} ⇒ 新增 ${newFails.length})` : ''}`);
+    lines.push(`  期望 ${c.expect === 'any' ? '只断言消息' : c.expect === 'red' ? '红' : '绿'}`
+      + ` ⇒ ${verdictOk ? '✓ 符合' : '✗✗ 不符'}${
+        c.wantMsg ? msgOk ? ';命中预期消息 ✓' : ';消息未命中 ✗' : ''}${
+        c.notMsg ? notOk ? ';已消失预期消息 ✓' : ';不该出现的消息仍在 ✗' : ''}`);
+
+    const okAll = verdictOk && msgOk && notOk && probeOk && anyHasMsg;
+    if (okAll) {
+      /* 红的时候把**新增的**那条打印出来,作为「有牙齿」的证据 */
+      if (c.expect === 'red') newFails.slice(0, 2).forEach((f) => lines.push(`      ${f.slice(0, 165)}`));
+    } else {
+      newFails.slice(0, 5).forEach((f) => lines.push(`      新增: ${f.slice(0, 165)}`));
+      if (c.expect === 'red' && newFails.length === 0) {
+        lines.push('      ⚠️ 门禁没有**新增**红 —— 这条检查是恒真的(或探针打偏了)');
+      }
+      if (!notOk) lines.push(`      ⚠️ 出现不该出现的消息:${String(c.notMsg)}`);
+    }
+    return { failed: !okAll, lines };
+  } finally {
+    dropLab(labRoot);
   }
-  dropLab();
+}
+
+const active: Case[] = only === undefined ? CASES : CASES.filter((c) => c.group === only);
+
+/**
+ * 一条用例的**口径成本**(只作调度键,不影响判定)。
+ *
+ * ## 为什么需要它(2026-11-18 实测)
+ * 并发路数固定时,墙钟 ≈ 「轮数 × 每轮最慢的那一条」。而本表的成本差一个数量级:
+ * ```
+ * --frozen         ~8s   (20 条)
+ * --only WS-01    ~13s   (D4)
+ * --docs          ~18s   (T38 两条)
+ * --content       ~22s   (D5)
+ * 默认口径         ~26s   (D3,全量 runTests)
+ * --all --frozen   ~0s   (N2:参数冲突,立即退出)
+ * ```
+ * 按用例表顺序发车 ⇒ 慢用例排在后面、每轮都被它拖住:实测 28 条 / 8 路 = **100s**。
+ * ⇒ **长作业优先**(LPT):按成本降序发车,墙钟由「最后一条长的」决定。
+ * ⚠️ 它只是**排序键**:判据、期望值、明细的打印顺序都不受影响。
+ */
+function caseCost(c: Case): number {
+  const a = (c.args ?? []).join(' ');
+  if (a === '') return 5;                  /* 默认口径(D3:全量 runTests) */
+  if (a.includes('--all')) return 0;       /* N2:参数冲突 ⇒ 立即退出 */
+  if (a.includes('--only')) return 4;      /* 单套件(D4) */
+  if (a.includes('--content')) return 4;   /* 内容锁(D5) */
+  if (a.includes('--docs')) return 3;      /* 文档(T38) */
+  if (a.includes('--integration')) return 3;
+  return 1;                                /* --frozen(大多数) */
+}
+
+const jobs = resolveJobs();
+/* 发车顺序(元素是 `active` 的下标);明细仍按 `active` 原顺序打印。 */
+const order: number[] = [...active.keys()]
+  .sort((x, y) => caseCost(active[y] as Case) - caseCost(active[x] as Case));
+console.log(`\n[并发] ${active.length} 个用例 / ${jobs} 路(每用例一份独立副本;长作业优先)`);
+const outcomes: CaseOutcome[] = new Array(active.length);
+const spent: number[] = new Array(active.length).fill(0);
+const startedAt = Date.now();
+let cursor = 0;
+const worker = async (): Promise<void> => {
+  for (;;) {
+    const k = cursor;
+    cursor += 1;
+    if (k >= order.length) return;
+    const i = order[k] as number;
+    const c = active[i] as Case;
+    const at = Date.now();
+    /* 串行 await 是**有意**的:一路 worker 一次只占用一份副本。 */
+    const oc = await runCase(c, base.fails);
+    outcomes[i] = oc;
+    spent[i] = Date.now() - at;
+    console.log(`  · [${String(k + 1).padStart(2, ' ')}/${order.length}] `
+      + `${oc.failed ? '✗' : '✓'} ${((spent[i] as number) / 1000).toFixed(1)}s ${c.group} — ${c.name}`);
+  }
+};
+await Promise.all(
+  Array.from({ length: Math.min(jobs, Math.max(1, order.length)) }, () => worker()),
+);
+console.log(`  并发总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+
+/* 明细按**用例表顺序**打印 —— 并发只改墙钟,不改结论的确定性。 */
+console.log('\n═══ 逐条明细(按用例表顺序)═══');
+for (let i = 0; i < active.length; i += 1) {
+  const oc = outcomes[i] as CaseOutcome;
+  for (const l of oc.lines) console.log(l);
+  if (oc.failed) failures += 1;
+  else passed += 1;
 }
 
 console.log(`\n${failures === 0 ? '✓ 门禁自检全部通过' : `✗ 门禁自检 ${failures} 项未通过`}`

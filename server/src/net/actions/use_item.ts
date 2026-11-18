@@ -51,7 +51,7 @@
  * 补偿走本仓既定的 `grantItemSource` + 正向 ops 机制,不是就地撤销。
  */
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { bindItemSource } from './item_source.ts';
+import { bindItemSource, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome, ActionPayload, ItemReadPort } from '../room.ts';
 import type { ActionHandler } from './types.ts';
 
@@ -187,11 +187,21 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     };
   }
 
-  /** 把刚扣掉的那一件退回去(扣成功但本次不该扣 / 世界侧没生效)。 */
-  const refund = (): void => {
+  /**
+   * 把刚扣掉的那一件退回去(扣成功但本次不该扣 / 世界侧没生效)。
+   *
+   * @returns `null` = 退回**成功**;非空字符串 = 退回**被拒**的人读说明 ——
+   *   调用方必须把它写进回执(审计 P3:修前返回值被丢 ⇒ 退回失败时物品静默消失,
+   *   而回执写着「已退回」)。口径与 `craft.ts:206` 的退款分支一致。
+   */
+  const refund = (): string | null => {
     /* 退回是正 delta ⇒ 必须先铸**绑定**凭证(绑 itemId:只换回这一件)。 */
     const src = bindItemSource(ctx, itemId, ItemSourcePurpose.USE_REFUND);
-    ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
+    const back = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
+    if (back.allowed) return null;
+    /* 退回都没成 ⇒ 这张凭证同样没被用掉 ⇒ 显式撤销(不留到 tick 末当来源)。 */
+    unbindItemSource(ctx, src);
+    return `退回也被拒:${back.rejectCode ?? '被拒'} ⇒ 这一件没能回到背包`;
   };
 
   /* 缺省字段**不塞 `undefined`**:世界侧用 `in` 语义判"这次有没有给器件目标"。 */
@@ -200,19 +210,26 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
   if (targetDeviceId !== undefined && targetDeviceId !== null) req.targetDeviceId = targetDeviceId;
   const out = host.useItem(ctx.actorId, req);
   if (!out.applied) {
-    /* 世界侧说"没生效" ⇒ 退回刚才那一扣。733 超距走的就是这条。 */
-    refund();
-    return { ok: false, kind: 'INVALID', reason: `${ctx.action} 未生效:${out.reason}(道具已退回)` };
+    /* 世界侧说"没生效" ⇒ 退回刚才那一扣。733 超距走的就是这条。
+       ★ 审计 P3:退回的**结果**必须进回执 —— 退回失败时东西真的没了,
+       不能再写「(道具已退回)」骗读回执的人(与 `craft.ts:206` 同口径)。 */
+    const refundNote = refund();
+    return {
+      ok: false,
+      kind: 'INVALID',
+      reason: `${ctx.action} 未生效:${out.reason}`
+        + (refundNote === null ? '(道具已退回)' : `(${refundNote})`),
+    };
   }
 
   if (!out.consume) {
-    /* 世界侧承认生效但**不需要扣** ⇒ 同样退回。 */
-    refund();
-    return {
-      ok: true,
-      kind: 'OK',
-      effect: { ...(out.effect ?? {}), itemId, consumed: 0 },
+    /* 世界侧承认生效但**不需要扣** ⇒ 同样退回;退回被拒同样写进 `effect`。 */
+    const refundNote = refund();
+    const effect: Record<string, string | number | boolean> = {
+      ...(out.effect ?? {}), itemId, consumed: 0,
     };
+    if (refundNote !== null) effect.refundRejected = refundNote;
+    return { ok: true, kind: 'OK', effect };
   }
 
   return {

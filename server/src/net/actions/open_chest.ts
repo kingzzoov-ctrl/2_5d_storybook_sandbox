@@ -57,7 +57,7 @@
  */
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { bindItemSource, missingItemReadPort, ownedItemCount } from './item_source.ts';
+import { bindItemSource, missingItemReadPort, ownedItemCount, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -142,6 +142,25 @@ export function registerChest(roomId: string, x: number, y: number): void {
   if (!room.has(cellKey(x, y))) {
     room.set(cellKey(x, y), { public: [], own: new Map<string, ItemStack[]>() });
   }
+}
+
+/**
+ * 丢弃**某一个房间**的全部箱子(容器模型 + 私有抽屉)。
+ *
+ * ## 为什么必须有它(审计 P2:三个侧账无回收)
+ *
+ * `chestsByRoom` 是模块级 Map,修前**全仓 0 个回收调用点** ⇒ `RESET_WORLD` 之后
+ * 旧箱子里的东西还在:世界已经按新种子重建,而「箱子里那 12 件 733」成了
+ * 一份**不需要产出**的来源 —— 取出来就是净产出(+1 真值),这正是物品真值层
+ * 要防的形态。⇒ 世界重置成功时按 `roomId` 把这一格账一起丢掉。
+ *
+ * ⚠️ **只清本房间**:键就是 `roomId`,不遍历、不 `clear()` 全表 —— 另一个房间的
+ * 箱子与这次重置无关(判据里那条隔离钉的就是它)。
+ * ⚠️ 连带丢掉**登记**(哪一格是箱子):世界重建后那面墙/那件器物都不在了,
+ * 保留登记等于让旧世界的格子继续可存取。要箱子就重新 `registerChest`。
+ */
+export function forgetChests(roomId: string): void {
+  chestsByRoom.delete(roomId);
 }
 
 /** 取一格箱子;`null` = 这一格**不是**箱子。 */
@@ -377,8 +396,12 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
   const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CHEST_TAKE);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: take, source: src }] });
   if (!gain.allowed) {
-    /* 背包收不下 ⇒ **放回容器**(否则东西被吞)。 */
+    /* 背包收不下 ⇒ **放回容器**(否则东西被吞)。
+       ★ 审计 P3:这张凭证已经登记、却没有被用掉 ⇒ **显式撤销**。修前它留到 tick 末,
+       本 tick 内任何另一条分支拿同一张串铸 +delta 都会被「登记过」放行
+       (靠「消耗侧不读」兜是巧合,不是判据)。放回容器与撤销凭证都必须发生。 */
     addToStacks(live, itemId, take);
+    unbindItemSource(ctx, src);
     return {
       ok: false, kind: 'INVALID',
       reason: `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 已放回箱子`,

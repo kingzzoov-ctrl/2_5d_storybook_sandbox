@@ -352,7 +352,22 @@ export interface DecodedWorldArchive {
   ground: ArchiveGroundItem[];
   /** 地形 chunk 列表(**头里声明的顺序**;写入侧按 `(cy, cx)` 升序)。 */
   chunks: ArchiveChunk[];
-  /** 裁剪摘要(没裁过 ⇒ `null`)。 */
+  /**
+   * 头里声明的「**裁剪前**总块数」(=`chunks.length + trim.droppedChunks`)。
+   *
+   * 旧字节(本字段出现之前写的)没有这个键 ⇒ 退化成 `chunks.length`
+   * (那是**唯一**还能诚实说的话:再往下就只能信 `trim` 的自述了)。
+   * 它不是装饰:`planRestore` 用它和 `chunks.length` **交叉核对**,
+   * 于是「删掉几块 + 删掉 `trim` 键」不能再伪装成「一份完整的归档」。
+   */
+  chunksTotal: number;
+  /**
+   * 头里那条地形表校验和的核对结果:
+   *   * `true` = 校验和存在且对得上;
+   *   * `null` = 旧字节里没有校验和(**不可判**,不是「通过」)。
+   * 对不上时解码直接抛错(fail-closed),所以 `false` 到不了这里。
+   */
+  chunksChecksumOk: boolean | null;
   trim: ArchiveTrimReport | null;
   /** 解码时发现的**非致命**异常(坐标不一致 / 未知扩展键)。空数组 = 干净。 */
   warnings: string[];
@@ -488,6 +503,41 @@ function decodeTrimNote(v: unknown): ArchiveTrimReport | null {
     /* 逐块清单不持久化(见 `ArchiveTrimReport.dropped`)。 */
     dropped: [],
   };
+}
+
+/**
+ * 地形表的**校验和**(FNV-1a 32 位,`fnv1a:xxxxxxxx`)。
+ *
+ * ## 为什么要它(审计 P1:摘要可自证清白)
+ *
+ * `trim` 是一段**自述**摘要 —— 它说「我裁了几块」。如果它是唯一口径,那么
+ * 「删掉几块 + 顺手把 `trim` 键删掉」的字节看起来就是「一份从没裁过的完整归档」:
+ * 摘要自己证明自己清白,`planRestore` 的 `missingChunks` 恒为 0。
+ * 校验和把**头里那张块表**(`cx/cy/bytes` + `chunkCount`)**绑在一起**:
+ * 表被改过 / 块被删过而校验和没跟着改 ⇒ `decodeWorldArchive` 当场抛错。
+ *
+ * 它挡的是**漂移 / 手改 / 半截写**,不是恶意伪造(没有密钥,能改字节的人
+ * 也能重算校验和)。所以 `planRestore` 还有第二道:拿头里声明的
+ * `chunksTotal` 与**实际块数**交叉核对(见 `planRestore` 的缺口计算)。
+ */
+export function archiveChunksChecksum(
+  rows: readonly { cx: number; cy: number; bytes: number }[],
+  count: number,
+  /** 头里那条 `chunksTotal`(**裁剪前**的总块数)。 */
+  total: number,
+): string {
+  /* 规范文本:总块数 + 实际块数 + 每块 `cx,cy,字节数`(顺序**就是**头里的顺序 ——
+     写入侧按 `(cy, cx)` 升序,所以同一份世界只有一种规范文本)。
+     `total` 也进规范文本:否则「改小 `chunksTotal` + 删掉几块」就能让缺口归零,
+     而校验和还认为一切正常。 */
+  let text = `${total}|${count}|`;
+  for (const r of rows) text += `${r.cx},${r.cy},${r.bytes};`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `fnv1a:${h.toString(16).padStart(8, '0')}`;
 }
 
 /**
@@ -693,14 +743,51 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
       `WSA1 解码失败:头里列了 ${table.length} 块,但 chunkCount 写的是 ${chunkCount}`,
     );
   }
+  /* ★ 第二道防线(审计 P1):头里声明的**裁剪前总块数** + 地形表校验和。
+     两者都不是「正文之外的一句自述」—— 前者与 `chunks.length` 交叉核对,
+     后者把头里那张块表与 `chunkCount` 绑死。拦的是「删块 + 删摘要」这种
+     看起来像「未裁剪完整归档」的字节(见 `archiveChunksChecksum`)。 */
+  const descriptors = table.map((raw, i) => {
+    const row = recordField(raw, `header.chunks[${i}]`);
+    return {
+      cx: intField(row.cx, `header.chunks[${i}].cx`),
+      cy: intField(row.cy, `header.chunks[${i}].cy`),
+      bytes: intField(row.bytes, `header.chunks[${i}].bytes`),
+    };
+  });
+  const declaredTotal = optionalIntField(header.chunksTotal, 'header.chunksTotal');
+  const chunksTotal = declaredTotal === undefined ? chunkCount : declaredTotal;
+  if (chunksTotal < chunkCount) {
+    throw new Error(
+      `WSA1 解码失败:头里声明的总块数 ${chunksTotal} 比实际块数 ${chunkCount} 还少`
+      + ' —— 头自相矛盾(总块数不可能小于留下的块数)',
+    );
+  }
+  /* 校验和:有就核对(对不上 ⇒ 抛),没有(旧字节)⇒ `null` = **不可判**。
+     「不可判」与「通过」在 `DecodedWorldArchive` 里是两个值,不合并。 */
+  let chunksChecksumOk: boolean | null = null;
+  const rawChecksum = header.chunksChecksum;
+  if (typeof rawChecksum === 'string' && rawChecksum.length > 0) {
+    if (declaredTotal === undefined) {
+      throw new Error(
+        'WSA1 解码失败:头里有地形表校验和,却没有 `chunksTotal` —— '
+        + '两者必须同时存在(只留一个,等于把「校验的是谁」这件事留白)',
+      );
+    }
+    const expected = archiveChunksChecksum(descriptors, chunkCount, chunksTotal);
+    if (rawChecksum !== expected) {
+      throw new Error(
+        `WSA1 解码失败:地形表校验和对不上(头里 ${rawChecksum},`
+        + `按块表+总块数算出 ${expected})—— 块表 / 总块数被改过,这份归档不能用来回滚`,
+      );
+    }
+    chunksChecksumOk = true;
+  }
 
   const chunks: ArchiveChunk[] = [];
   let pos = headerEnd + CHUNK_COUNT_BYTES;
   for (let i = 0; i < chunkCount; i += 1) {
-    const row = recordField(table[i], `header.chunks[${i}]`);
-    const cx = intField(row.cx, `header.chunks[${i}].cx`);
-    const cy = intField(row.cy, `header.chunks[${i}].cy`);
-    const len = intField(row.bytes, `header.chunks[${i}].bytes`);
+    const { cx, cy, bytes: len } = descriptors[i];
     if (len <= 0) throw new Error(`WSA1 解码失败:第 ${i} 块 (${cx},${cy}) 声明 ${len} 字节`);
     if (pos + len > bytes.byteLength) {
       throw new Error(
@@ -733,6 +820,10 @@ export function decodeWorldArchive(input: Uint8Array | ArrayBuffer): DecodedWorl
     mobs,
     ground,
     chunks,
+    /* ★ 交叉核对用的两个口径(见 `DecodedWorldArchive.chunksTotal`)。
+       `chunksTotal` 缺席(旧字节)时等于实际块数 —— 那是能说出的**最保守**的话。 */
+    chunksTotal,
+    chunksChecksumOk,
     trim: decodeTrimNote(header.trim),
     warnings,
   };
@@ -884,6 +975,26 @@ export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
   }));
   header.ground = input.ground.map((g) => ({ itemId: g.itemId, count: g.count, x: g.x, y: g.y }));
   header.chunks = input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength }));
+  /* ★ 第二道防线的两个键(键序接在 `chunks` 之后;既有判据的键序断言
+     `tests/WS-FND-80` / `-81` 只钉到 `chunks` 为止)。
+       · `chunksTotal` = **裁剪前**的总块数。`trim` 自述「裁了几块」时,这个数是
+         **另一份**口径:`planRestore` 拿它与**实际块数**交叉核对,于是「删块 + 删
+         `trim`」不能再伪装成「从没裁过的完整归档」(审计 P1)。
+       · `chunksChecksum` = 头里那张块表 + `chunkCount` 的校验和,改表不重算就抛。
+     ⚠️ 两个键**只在写了 `trim` 时才写**:`trim` 是「这份快照被裁过」的唯一标记,
+     也只有带着它的字节才可能被「删摘要」伪装。没裁过的快照必须与写入侧
+     (`world_sim.ts:describeWorldForArchive`)**逐字节一致**(`encode(decode(x)) === x`
+     是既有判据),凭空多两个键会当场把那条判据打红。
+     两者都按**实际写入的块**算,不抄调用方的说法。 */
+  if (input.trim !== undefined && input.trim !== null) {
+    const chunksTotal = input.chunks.length + Math.max(0, Math.trunc(input.trim.droppedChunks));
+    header.chunksTotal = chunksTotal;
+    header.chunksChecksum = archiveChunksChecksum(
+      input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength })),
+      input.chunks.length,
+      chunksTotal,
+    );
+  }
   if (input.trim !== undefined && input.trim !== null) {
     const trim: Record<string, unknown> = {
       budgetBytes: input.trim.budgetBytes,
@@ -1654,8 +1765,19 @@ export interface RestorePlan {
   ops: RestoreOp[];
   /** 归档里**没有**、因此计划不会伪造的字段(说明到具体字段名)。 */
   unavailable: string[];
-  /** 归档时被裁掉的地形块**数量**(取自快照头里的 `trim`;没裁过 = 0)。 */
+  /**
+   * 归档里**少了**几块地形。两个口径取 max(见 `planRestore` 的缺口计算):
+   * 摘要自述的 `trim.droppedChunks`,与「头声明的总块数 − 实际块数」。
+   * 所以「删掉 `trim` 键」不再能把缺口变成 0。
+   */
   missingChunks: number;
+  /**
+   * 归档里**实际**带的块数(与 `chunksDeclaredTotal` 的差额就是缺口)。
+   * 审阅时把这两个数与 `missingChunks` 摆在一起,缺口就不是一句自述了。
+   */
+  chunksInArchive?: number;
+  /** 头里声明的**裁剪前**总块数(`DecodedWorldArchive.chunksTotal`)。 */
+  chunksDeclaredTotal?: number;
   /** 被裁块的逐块清单(只在「刚裁完」的那份对象里非空;从库里读回时为空)。 */
   missing: ArchiveTrimDroppedChunk[];
   /** 与 `current` 的差异叙述(只影响可读性,**不**影响 ops)。 */
@@ -1789,7 +1911,21 @@ export function planRestore(
   }
 
   const trim = snapshot.trim;
-  const missingChunks = trim === null ? 0 : Math.max(0, Math.trunc(trim.droppedChunks));
+  /* ★ 缺口 = 「摘要自述的」与「实际块数算出来的」两个口径取 **max**(审计 P1)。
+   *
+   * 改前只有第一个:`trim === null` ⇒ `missingChunks = 0`。于是一份**裁过**
+   * 的归档只要把 `trim` 键删掉(再顺手删掉几块),`planRestore` 就报「没裁过、
+   * 缺口 0」—— 摘要自己证明自己清白,回滚静默少几块地形。现在:
+   *   · 实际块数 `actualChunks`;
+   *   · 头里声明的裁剪前总块数 `snapshot.chunksTotal`(旧字节 ⇒ = 实际块数);
+   *   · `shortfall = chunksTotal - actualChunks` —— **不依赖 `trim` 是否存在**;
+   *   · `missingChunks = max(trim?.droppedChunks ?? 0, shortfall)`。
+   * 两个来源任意一个说得更大,就按大的报 —— 缺口宁可多说,不肯少说。 */
+  const actualChunks = snapshot.chunks.length;
+  const declaredTotalChunks = snapshot.chunksTotal;
+  const shortfall = Math.max(0, declaredTotalChunks - actualChunks);
+  const trimDropped = trim === null ? 0 : Math.max(0, Math.trunc(trim.droppedChunks));
+  const missingChunks = Math.max(trimDropped, shortfall);
   const unavailable: string[] = [];
   const playersWithoutHp = snapshot.players.filter((p) => p.hp === undefined).length;
   if (playersWithoutHp > 0) {
@@ -1805,8 +1941,24 @@ export function planRestore(
       + '水位按宿主重建后的空地重新开始(不编一个全零密度场 —— 那和「已还原」看不出区别)',
     );
   }
-  if (trim !== null && missingChunks > 0) {
-    const avg = Math.round(trim.droppedBytes / missingChunks);
+  /* (a) `trim` 缺席但**头声明的总块数 > 实际块数** ⇒ 这就是「摘要被删/缺失,
+     而块确实少了」。不写成「已裁掉 N 块」:那份摘要不在头里,不能替它编原因。 */
+  if (trim === null && shortfall > 0) {
+    unavailable.push(
+      `chunks:归档头声明共 ${declaredTotalChunks} 块,实际只带 ${actualChunks} 块`
+      + ` ⇒ 缺 ${shortfall} 块,而头里**没有**裁剪摘要(被删或从未写下)`
+      + ' —— 这不能当成「未裁剪」:缺口照报,计划不会伪造这些块',
+    );
+  }
+  /* (b) 摘要说留下的块数与实际块数对不上 ⇒ 摘要本身不可信,两个数都报出来。 */
+  if (trim !== null && trim.keptChunks !== actualChunks) {
+    unavailable.push(
+      `chunks:裁剪摘要自称保留 ${trim.keptChunks} 块,归档里实际只有 ${actualChunks} 块`
+      + `(缺口按 ${missingChunks} 块计)⇒ 摘要与实际块数不一致,计划只按实际块数重建`,
+    );
+  }
+  if (trim !== null && trimDropped > 0) {
+    const avg = Math.round(trim.droppedBytes / trimDropped);
     unavailable.push(
       `chunks:归档时已裁掉 ${missingChunks} 块(合计 ${trim.droppedBytes} 字节,平均 ${avg} 字节/块)`
       + ' ⇒ 这些块**没有**字节,计划不会伪造;原始地形可由 seed 重建,玩家建造部分不可回滚',
@@ -1848,6 +2000,8 @@ export function planRestore(
     ops,
     unavailable,
     missingChunks,
+    chunksInArchive: actualChunks,
+    chunksDeclaredTotal: declaredTotalChunks,
     missing: trim === null ? [] : trim.dropped.slice(),
     changes,
   };

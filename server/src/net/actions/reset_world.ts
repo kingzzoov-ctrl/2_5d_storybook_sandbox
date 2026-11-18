@@ -74,6 +74,11 @@
  */
 import type { ActionOutcome, ActionPayload } from '../room.ts';
 import { notImplemented } from './not-implemented.ts';
+/* ★ 三本模块级侧账 + 炼金订单预占的回收口(见 `forgetRoomSideLedgers`)。 */
+import { forgetChests } from './open_chest.ts';
+import { forgetPlacements } from './place_automation.ts';
+import { forgetRoom } from './breed_tame.ts';
+import { forgetFurnaceClaims } from './use_alchemy_furnace.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /** 本动作的报文(`seed` / `confirm` 尚未写进 `ActionPayload` ⇒ 局部窄化)。 */
@@ -186,6 +191,49 @@ function resetEffect(r: WorldResetHostResult): Record<string, string | number | 
   return effect;
 }
 
+/** 侧账名(回执里逐项列出;字符串常量避免把名字散在文案里)。 */
+const LEDGER_CHESTS = 'chests';
+const LEDGER_PLACEMENTS = 'placements';
+const LEDGER_PETS = 'pets';
+const LEDGER_FURNACE_ORDERS = 'furnaceOrders';
+
+/**
+ * ## ★ 旧世界的**侧账**回收(审计 P2:三个模块级 Map 修前全仓 0 个回收点)
+ *
+ * 这三本账住在动作层的模块级 Map 里(`chestsByRoom` / `PLACEMENTS` / `ROOM_PETS`),
+ * 而 `RESET_WORLD` 修前**只**重建世界:箱子里那 12 件、那一格放置的自动化件、
+ * 那一只宠物的归属全都还停在**已被换掉的旧世界**上。前两者尤其严重 ——
+ * 「旧箱里的物品」在重置后取出来就是一份**不需要产出**的来源(箱子账本说它存在,
+ * 而世界里它从未被生产过)。
+ *
+ * ⇒ 宿主回执说 `applied: true` 之后,按 **本房间** 把这几本账丢掉:
+ *   · `forgetChests` / `forgetPlacements` / `forgetRoom` 都只 `delete(roomId)`
+ *     —— 另一个房间的箱子/登记/宠物与这次重置无关(判据里那条隔离钉的就是它);
+ *   · `forgetFurnaceClaims` 清的是**本房间实例**的订单预占(`ctx.state` 身份),
+ *     世界侧 `roomSystemsState.settled` 已随重建换掉,留着它就等于让新世界继续
+ *     拒掉旧世界用过的单号。
+ *
+ * ⚠️ 这是**回收**,不是「重置的回滚」:清掉的侧账**不可恢复**,与归档快照无关
+ *   (归档只存世界本体,见 `db/repo.ts` §13)。
+ *
+ * @returns 真的清了哪几本(回执用;`roomId` 拿不到时只有订单预占那一本)
+ */
+function forgetRoomSideLedgers(ctx: ActionContext): string[] {
+  const state = ctx.state as unknown as { roomId?: unknown } | null | undefined;
+  const raw = state?.roomId;
+  const roomId = typeof raw === 'string' ? raw.trim() : '';
+  const cleared: string[] = [];
+  if (roomId !== '') {
+    forgetChests(roomId);
+    forgetPlacements(roomId);
+    forgetRoom(roomId);
+    cleared.push(LEDGER_CHESTS, LEDGER_PLACEMENTS, LEDGER_PETS);
+  }
+  forgetFurnaceClaims(ctx.state);
+  cleared.push(LEDGER_FURNACE_ORDERS);
+  return cleared;
+}
+
 export const resetWorld: ActionHandler = (ctx) => {
   /* 1 权限闸:**第一行**,拒绝路径零副作用。 */
   const verdict = ctx.authorize(ctx.actorId, ctx.action);
@@ -230,5 +278,13 @@ export const resetWorld: ActionHandler = (ctx) => {
       reason: `${ctx.action} 未生效:${r.reason ?? '宿主未说明原因'}`,
     };
   }
-  return { ok: true, kind: 'OK', effect: resetEffect(r) };
+  /* 6 ★ **旧世界的侧账一起丢掉**(审计 P2:三个模块级 Map 修前全仓 0 个回收点)。
+     世界已经按新种子重建,而箱子里的东西 / 放置登记 / 宠物归属还停在旧世界 ——
+     那会让「重置后从箱子里取出 12 件」变成一份**不需要产出**的来源。
+     只清**本房间**(判据里那条「另一个房间的箱子仍在」钉的就是它)。 */
+  const cleared = forgetRoomSideLedgers(ctx);
+  const effect = resetEffect(r);
+  /* 回执如实带上「清了哪几本侧账」:清没清是可判定事实,不该只活在服务端内存里。 */
+  if (cleared.length > 0) effect.sideLedgersCleared = cleared.join(',');
+  return { ok: true, kind: 'OK', effect };
 };

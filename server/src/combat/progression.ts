@@ -275,17 +275,62 @@ export interface ShareResult {
   outOfRangeCount: number;
 }
 
-/** 击杀去重账本:同一怪实例只允许结算一次 */
+/**
+ * 击杀账本的**容量上限**(条)。
+ *
+ * 为什么需要一个数:旧实现只有 `add` —— 世界跑得越久 `claimed` 越长,进程生命期内
+ * **无界增长**(一只怪一条字符串)。一只怪一条看起来很小,但这是 24h 常驻房间。
+ *
+ * 取值口径:它**不是**玩法调参,只是「远大于同帧/同一次战斗里可能被二次结算的实例数」。
+ * 1000 帧(≈50 秒)内全图 200 只怪连续刷死也才 200 条 ⇒ 4096 有 20 倍余量;
+ * 而 4096 条 `string` 的常驻成本是几十 KB 量级,可以忽略。
+ */
+export const KILL_LEDGER_CAPACITY = 4096;
+
+/**
+ * 击杀去重账本:同一怪实例只允许结算一次。
+ *
+ * ## 有界淘汰(按最老)
+ *
+ * 打满 `KILL_LEDGER_CAPACITY` 之后,按**入账顺序**淘汰最老的一条(FIFO)。
+ * 为什么不按"随机 / 按 id 排序"淘汰:`claim` 的抖动只可能发生在"最近"这一端
+ * —— 越老的账越不需要记 —— 而 FIFO 是唯一不引入额外比较规则、也不用重排的取法。
+ *
+ * ## 为什么淘汰最老的**不会**破「已死实例不被复用」这条不变量
+ *
+ *   1 **窗口是最近这一端**:同一实例被二次结算的路径(`addMob` 同 id 覆盖 /
+ *     姜饼小人复活 / 多路径补刀)都是**本帧附近**发生的事;要二次结算第 N 条
+ *     之前的账,必须先造出 N 条更新的击杀 —— 那早已不在窗口内。
+ *   2 **实例 id 永不复用**:序号来自世界侧 `mobOrdinals` 的**单调计数器**
+ *     (`mobs/spawner.ts` 的 id 两层规则),新怪永远拿一个更大的号 ⇒
+ *     被淘汰的那个 id **不会被一只新怪重新拿去**,淘汰只丢"旧账",
+ *     不存在"新怪继承旧账"。
+ *   3 **换代靠 `reset()`**:`world_sim.ts` 的 `rebuildWorld` 把序号清零时
+ *     同步 `reset()` 账本(两件事必须成对,那里的注释写了漏一条的后果)。
+ *     ⇒ 淘汰只发生在**同一世代内部**,不承担"跨世代清账"的职责。
+ */
 export class KillLedger {
   private claimed: Set<string>;
+  /**
+   * 入账顺序(FIFO)。长度恒 ≤ `KILL_LEDGER_CAPACITY`。
+   * 与 `claimed` **必须同步增删** —— 只有 `claimed` 是判据,`order` 只决定淘汰谁。
+   */
+  private order: string[];
 
   constructor() {
     this.claimed = new Set<string>();
+    this.order = [];
   }
 
   claim(id: string): boolean {
     if (this.claimed.has(id)) return false;
     this.claimed.add(id);
+    this.order.push(id);
+    /* 有界淘汰:见类 docblock(按最老 / 不破"已死实例不被复用")。 */
+    while (this.order.length > KILL_LEDGER_CAPACITY) {
+      const oldest = this.order.shift();
+      if (oldest !== undefined) this.claimed.delete(oldest);
+    }
     return true;
   }
 
@@ -299,6 +344,7 @@ export class KillLedger {
 
   reset(): void {
     this.claimed.clear();
+    this.order.length = 0;
   }
 }
 

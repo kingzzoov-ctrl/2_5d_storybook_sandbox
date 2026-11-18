@@ -46,10 +46,13 @@ import type { Database } from 'better-sqlite3';
 import {
   TABLE_PRIMARY_KEYS,
   migrate,
+  migrateWorldArchives,
+  migrateWorldArchivesIfInstalled,
   schemaSqlPath,
   type DbLike,
   type KeyParts,
   type Row,
+  type WorldArchiveBootCheck,
 } from './repo.ts';
 
 /** 允许出现的表名白名单 —— 表名不能被绑参,只能白名单。 */
@@ -139,11 +142,51 @@ export class SqliteDb implements DbLike {
     return this.conn.all(sql, params) as T[];
   }
 
-  /** 建表 + 迁移登记。`failClosed` 时 checksum 漂移直接抛错。 */
+  /**
+   * 建表 + 迁移登记。`failClosed` 时 checksum 漂移直接抛错。
+   *
+   * ## 归档迁移也在这里(审计 P1:归档 drift 必须 fail-closed)
+   *
+   * 改前 `bootstrap()` 只调 `migrate()`:归档那一段 `schema_world_archive.sql`
+   * 的 checksum 漂移**只有写归档时**才会碰到,于是「库里的归档表是老 DDL 建的」
+   * 这件事可以一直不被发现,直到某次重置。
+   *
+   * 现在启动就核对一次(`migrateWorldArchivesIfInstalled`):
+   *   * 装过归档的库 ⇒ 幂等 DDL + 漂移判定,漂移 ⇒ 拒绝启动;
+   *   * 全新的库 ⇒ **不建**那第 10 张表(建表数被既有判据锁在 9 张,见
+   *     `schema_world_archive.sql` 文件头);需要「启动即有归档表」的宿主显式调
+   *     `bootstrapWorldArchives()`。
+   */
   bootstrap(nowMs: number, failClosed = true): void {
     const r = migrate(this, nowMs, schemaSqlPath());
     if (r.drift && failClosed) {
       throw new Error('schema_migrations checksum 漂移,拒绝启动(fail-closed)');
+    }
+    const a = this.checkWorldArchives(nowMs);
+    if (a.drift && failClosed) {
+      throw new Error(
+        'room_world_archives 的迁移 checksum 漂移(schema_world_archive.sql 被改过,'
+        + '而库里的表没跟着改)⇒ 拒绝启动(fail-closed):'
+        + '归档是回滚原料,带着不确定的结构跑起来,回滚出去的就是坏世界。'
+        + '见 docs/WS-07-net-persist.md 的迁移段',
+      );
+    }
+  }
+
+  /** 归档迁移的启动检查(装过才查;返回值可观测,便于装配层记录/判定)。 */
+  checkWorldArchives(nowMs: number): WorldArchiveBootCheck {
+    return migrateWorldArchivesIfInstalled(this, nowMs);
+  }
+
+  /**
+   * 无条件把归档表建起来(幂等),`failClosed` 时漂移直接抛。
+   * 需要「启动即有归档表」的宿主调这个;全新的探针库**不要**调 ——
+   * 会多出一张表,把「9 张表」的既有判据打红。
+   */
+  bootstrapWorldArchives(nowMs: number, failClosed = true): void {
+    const r = migrateWorldArchives(this, nowMs);
+    if (r.drift && failClosed) {
+      throw new Error('room_world_archives 迁移 checksum 漂移,拒绝启动(fail-closed)');
     }
   }
 

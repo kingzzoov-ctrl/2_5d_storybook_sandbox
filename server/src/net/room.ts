@@ -1848,6 +1848,7 @@ export class RoomRuntime {
       hostPositionOf: (userId) => rt.hostPositionOf(userId),
       applyInventory: (userId, input) => rt.applyInventory(userId, input),
       grantItemSource: (userId, source) => rt.grantItemSource(userId, source),
+      revokeItemSource: (userId, source) => rt.revokeItemSource(userId, source),
       setMemberRole: (id, targetId, role) => rt.setMemberRole(id, targetId, role),
       kick: (id, targetId) => rt.kick(id, targetId),
       setAccess: (id, mode, passwordHash) => rt.setAccess(id, mode, passwordHash),
@@ -2121,6 +2122,21 @@ export class RoomRuntime {
   /** 清掉所有产出凭证。每 tick 末调用 —— 凭证**不跨 tick 累积**。 */
   expireItemSources(): void {
     this.grantedSources.clear();
+  }
+
+  /**
+   * **撤销**一张已登记的产出凭证(审计 P3:先登记后正向失败必须回撤)。
+   *
+   * 修前这里只有「授予」(单调增)与「tick 末清空」两档,于是**发放被拒**的令牌
+   * 会留在集合里到 tick 末 —— 同一 tick 内任何另一条分支拿同一张串去铸 +delta,
+   * `checkInventory` 都会按「服务端登记过」放行。那条口径正是凭证链要堵的洞。
+   *
+   * 幂等:串不在集合里 ⇒ 什么都不做(重复撤销安全,`expireItemSources` 之后也安全)。
+   * 唯一的生产调用点是 `actions/item_source.ts` 的 `unbindItemSource`(它拿的是
+   * `bindItemSource` 铸出来的那张),不开放给动作层裸调。
+   */
+  revokeItemSource(userId: string, source: string): void {
+    this.grantedSources.get(userId)?.delete(source);
   }
 
   /**

@@ -9,10 +9,9 @@
  *   node scripts/verify.ts --docs          # 只检查文档结构完整性
  *   node scripts/verify.ts --content       # 只做内容基线一致性检查
  *   node scripts/verify.ts --integration   # 只做跨 WS 集成检查
- *   node scripts/verify.ts --lenient       # 把「可达性缺口 / 同义反复候选 / 入口执行层失真」降级为只告警
- *   (上面这三道**默认就拦**;旧参数 --strict-reach / --strict-taut / --strict-inert 保留为 no-op)
- *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(用例数与耗时见其自身输出)
- *   node scripts/verify.ts --strict-selfcheck # 真跑 gate-selfcheck(用例数与耗时见其自身输出)
+ *   node scripts/verify.ts --lenient       # 把「可达性缺口 / 同义反复候选 / 入口执行层失真 / 门禁自检失败」降级为只告警
+ *   (上面这几道**默认就拦**;旧参数 --strict-reach / --strict-taut / --strict-inert / --strict-selfcheck 保留为 no-op)
+ *   ⚠️ `gate-selfcheck` **默认真跑**(约 163s;见 `checkGateSelfcheck` 的长注释):`--lenient` 只降级严重性,**不跳过**它。
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
@@ -860,7 +859,7 @@ const ADVISE_UPGRADE: Record<string, string> = {
   入口执行层: '--strict-inert',
   同义反复·双端同源: '--lenient(默认已拦)',
   双端同源·结构化: '--lenient(默认已拦)',
-  '门禁自检': '--strict-selfcheck',
+  '门禁自检': '--lenient(默认已拦)',
 };
 
 /**
@@ -878,17 +877,108 @@ const ADVISE_UPGRADE: Record<string, string> = {
  *   它不对任何交付物产生后果,只在有人手动 `npm run verify:selfcheck` 时说话。
  *   ⇒ 与陷阱 82「不拦门禁的自检脚本,它的红没有代价」**同一条**,只是这次是主门禁漏接。
  *
- * ## 为什么默认是**告警**而不是失败
+ * ## 默认口径:2026-11-18 审计 P1 —— **默认真跑**(不再"加 --strict-selfcheck 才跑")
  *
- * 163s 的耗时不能塞进每次 `--all` 的关键路径(全量才 14s,它会变成 12 倍)。
- * ⇒ 默认只跑**一次轻量探测**,确认它「存在且可执行」,并把「本道门禁未纳入默认口径」
- *   这件事**打印在汇总行里**(而不是假装没有它)。
- * ⇒ 要真跑它:`--strict-selfcheck`(失败);或 `npm run verify:selfcheck`。
- *
- * ★ 为什么不在默认下就"什么都不做":那样汇总行的「全部通过」会**再次变成一个
- *   不完整的绝对断言** —— 正是上面 `advise()` 那段长注释在防的事。
- *   故本道门禁**必须**出现在汇总行里,哪怕它默认不跑。
+ * 旧口径是「默认只 advise,加 `--strict-selfcheck` 才真跑」,辩解是耗时(163s vs 全量 14s)。
+ * 但那正是本仓反复点名的陷阱 82:
+ * ```
+ * 门禁自检只证明一件事:各道门禁「改坏 ⇒ 变红」。
+ * 若它默认只 advise ⇒ 它自己失败也没有代价 ⇒
+ * 「唯一证明各门有牙」的东西自身无牙 —— 链条在最根上断了。
+ * 而漏带一个参数就能让这件事全绿,只在 stderr 印一句警告。
+ * ```
+ * ⇒ 现在与三道 strict **完全一致**(口径是 `selfcheckPolicy`,纯函数、可单测):
+ * ```
+ *   默认 / --all / 显式 --strict-selfcheck ⇒ block(真跑,失败即 fail)
+ *   --lenient                              ⇒ advise(仍然真跑,只降级严重性)
+ *   局部口径(--docs/--content/--integration/--frozen/--only)⇒ 不跑(调用点跳过)
+ * ```
+ * ★ 耗时代价**如实记账**:默认口径因此从 ~14s 变成 ~180s(gate-selfcheck 自身 ~163s)。
+ *   这不是能藏起来的事 —— 必须写在汇总行/文档里,而不是靠「记得加参数」来掩盖。
  */
+/**
+ * ★ 审计 P1(2026-11-18):门禁自检的**拦截口径**(纯函数 ⇒ tests 可直接驱动)。
+ *
+ * 默认 `block` —— 与 `--strict-reach/--strict-taut/--strict-inert` 同口径
+ * (那三道 2026-11-17 就是这么改的,本道当时被漏下)。
+ * `--lenient` 才降级;显式 `--strict-selfcheck` 仍为 block(旧参数保留,不再是"唯一开关")。
+ */
+export function selfcheckPolicy(args: readonly string[]): 'block' | 'advise' {
+  if (args.includes('--strict-selfcheck')) return 'block';
+  return args.includes('--lenient') ? 'advise' : 'block';
+}
+
+/**
+ * ★ 审计 P1:自检进程的结果 ⇒ 该调 `pass` / `fail` / `advise` 哪一个(纯函数)。
+ *
+ * ⚠️ 「退出码 0 但解析不出 `N 通过 / M 合计`」**不能当通过**:
+ *    那个数会被 `verifyHandoverNumbers()` 拿去比对 HANDOVER §三 的「门禁自检 30/30」,
+ *    解析失败 ⇒ 该行静默变成「未校验」⇒ 又一处「没有比对」被印成「没问题」。
+ */
+export function selfcheckOutcome(
+  mode: 'block' | 'advise', exitStatus: number | null, out: string, diag?: string,
+): { action: 'pass' | 'fail' | 'advise'; message: string } {
+  const m = /(\d+)\s*通过\s*\/\s*(\d+)\s*合计/.exec(out);
+  if (exitStatus !== 0) {
+    /* 先给**失败的那几条**让位:`gate-selfcheck` 的输出里绝大多数 ✗ 行是**注入探针
+       本该打出的证据**(每个变异用例都会红一次),按出现顺序取前 10 行 ⇒ 报出来的
+       全是噪音,真正失败的那条排在末尾、被截断。实测(2026-11-18):
+       `verify --all` 的失败消息里前 10 条 ✗ 全是注入证据,读者无从知道是哪条用例挂了。
+       ⇒ 优先取 `✗✗`(用例自身判据不符)与 `✗ 门禁自检 N 项未通过`(结论行),
+       其余 ✗ 行只作补充。 */
+    const all = out.split('\n');
+    const prio = all.filter((l) => l.includes('✗✗') || /✗\s*门禁自检/.test(l)
+      /* 并发版的进度行 `· [12/28] ✗ 8.1s T32 — …` 是唯一点名「哪条用例挂了」的地方,
+         必须优先保留(见 `scripts/gate-selfcheck.ts` 的 worker 池)。 */
+      || /·\s*\[[^\]]*\]\s*✗/.test(l));
+    const seen = new Set(prio);
+    const bad = [...prio, ...all.filter((l) => l.includes('✗') && !seen.has(l))].slice(0, 10);
+    const lines: string[] = [`门禁自检失败(exit=${String(exitStatus)}):`];
+    if (bad.length > 0) lines.push(...bad.map((l) => `      ${l}`));
+    /* ⚠️ 「被 kill」(`status === null`)与「自己崩」必须可区分 —— 而前者的 stdout
+       很可能是**空**的(自检进程被 SIGKILL 时缓冲还没刷)。那种情况下唯一能说明
+       发生了什么的就是 `diag`(spawn error / stderr 尾部)。
+       ⇒ 不带它,报出来就只有一句 `exit=null`(2026-11-18 实测的形态:
+       一线索都没有,读者只能猜是被超时杀了还是自己崩了)。 */
+    const tail = (diag ?? '').split('\n').filter((l) => l.trim() !== '').slice(-8);
+    if (tail.length > 0) {
+      lines.push(`      ── 子进程 stderr 尾部(${tail.length} 行)──`);
+      lines.push(...tail.map((l) => `      ${l.slice(0, 300)}`));
+    } else {
+      lines.push('      ── 子进程没有 stderr ──(典型是被 kill:看 exit 是否为 null / spawn error)');
+    }
+    const detail = lines.join('\n');
+    return mode === 'block'
+      ? { action: 'fail', message: detail }
+      : { action: 'advise', message: `${detail}(--lenient:已降级为告警,未拦截)` };
+  }
+  if (m === null) {
+    return {
+      action: 'fail',
+      message: 'gate-selfcheck 退出码 0 但**未打印 `N 通过 / M 合计`** ⇒ 用例数无法核对'
+        + '(不许当成通过:HANDOVER §三 那一行会静默退化成「未校验」)',
+    };
+  }
+  return { action: 'pass', message: `门禁自检全部通过(${m[1]}/${m[2]})` };
+}
+
+/**
+ * 门禁自检的墙钟预算(**具名** —— 不再散落在 `spawnSync` 的选项字面量里)。
+ *
+ * ## 为什么必须长,而且必须能被诊断(2026-11-18 实测)
+ * `gate-selfcheck` 是**变异测试**:30 个用例,每个都复制整棵树再跑一次 `verify`。
+ * 串行版本实测 163s;而「默认真跑」之后,两个必须跑全量口径的用例还会在副本里
+ * **递归** spawn 门禁自检 ⇒ 机器一有负载就不可能在上限内结束。
+ *
+ * ⚠️ 老实现把 600000 直接写在选项里,超时后 `status === null`,
+ * 与「脚本自己崩了」**不可区分**,报出来只有一句 `门禁自检失败(exit=null)` ——
+ * 一行 stderr、一个信号、一个 ETIMEDOUT 都没有,读者只能猜。
+ * ⇒ 本轮两件事一起做:
+ *   ① 预算提到 900s(并发版自检实测 ≈35s,见 `scripts/gate-selfcheck.ts` 文件头);
+ *   ② 结果分派把 `r.error` / `stderr` 尾部一起带进消息(见 `selfcheckOutcome`)。
+ */
+const SELFCHECK_TIMEOUT_MS = 900_000;
+
 async function checkGateSelfcheck(): Promise<void> {
   console.log('\n[门禁自检]');
   const script = join(ROOT, 'scripts', 'gate-selfcheck.ts');
@@ -896,24 +986,32 @@ async function checkGateSelfcheck(): Promise<void> {
     fail('scripts/gate-selfcheck.ts 不存在 —— 门禁自检这道防线整体缺失');
     return;
   }
-  const strict = argv.includes('--strict-selfcheck');
-  if (!strict) {
-    /* 默认:只确认"它在",并把"未纳入默认口径"这件事说清。
-       ⚠️ 不打印 pass() —— 那会让"它跑过了"看起来像事实。 */
-    advise('门禁自检',
-      'scripts/gate-selfcheck.ts(用例数见其自身输出)**未纳入默认口径** —— '
-      + '它的红目前没有代价。加 --strict-selfcheck 才跑它并纳入退出码');
+  /* ⚠️ 这里**没有**「非 strict 就 advise 并 return」的分支 —— 见上面审计 P1 的说明。
+     口径只由 `selfcheckPolicy` 决定,且两种口径都**真跑**(lenient 只降级严重性)。 */
+  const mode = selfcheckPolicy(argv);
+  const r = spawnSync(process.execPath, [script], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    /* ⚠️ 显式给 maxBuffer:自检的输出会随用例数增长,默认 1 MB 撞满时
+       `spawnSync` 报 ENOBUFS 且 `status === null` —— 又是一个「看起来像崩溃」的陷阱。 */
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: SELFCHECK_TIMEOUT_MS,
+  });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  /* 「被 kill」与「自己崩」必须可区分:`status === null` 时唯一能说明发生了什么的是
+     `r.error`(ETIMEDOUT / ENOBUFS)与 stderr 尾部 ⇒ 一起交给分派函数。 */
+  const diag = `${r.error === undefined ? '' : `[spawn error] ${r.error.message}\n`}${r.stderr ?? ''}`;
+  const v = selfcheckOutcome(mode, r.status, out, diag);
+  if (v.action === 'fail') {
+    fail(v.message);
     return;
   }
-  const r = spawnSync(process.execPath, [script], { cwd: ROOT, encoding: 'utf8', timeout: 600_000 });
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-  if (r.status !== 0) {
-    const bad = out.split('\n').filter((l) => l.includes('✗')).slice(0, 10);
-    fail(`门禁自检失败(exit=${r.status}):\n      ${bad.join('\n      ')}`);
+  if (v.action === 'advise') {
+    advise('门禁自检', v.message);
     return;
   }
   const m = /(\d+)\s*通过\s*\/\s*(\d+)\s*合计/.exec(out);
-  pass(`门禁自检全部通过(${m ? `${m[1]}/${m[2]}` : '?'})`);
+  pass(v.message);
   selfcheckCounts = m === null ? null : { passed: Number(m[1]), total: Number(m[2]) };
 }
 
@@ -921,12 +1019,14 @@ async function checkGateSelfcheck(): Promise<void> {
 /**
  * ★ task-79:BOM 守卫(**硬门禁**,不是告警)。
  *
- * ## 为什么它是硬门禁,而不是像 gate-selfcheck 那样默认只告警
+ * ## 为什么它是硬门禁,而不是像 gate-selfcheck 那样"告警 + 汇总行披露"
  *
  * ```
  * 判据:**该缺陷会让门禁给出错误的通过**吗?
  *   · gate-selfcheck 未跑 ⇒ 本道门禁的结论**不完整**(少测了一整批变异用例)
- *     ⇒ 但已经测的部分是真的 ⇒ 可接受"告警 + 汇总行披露"
+ *     ⇒ 2026-11-18 审计 P1 已经把这条例外**撤掉了**:它现在也默认真跑/失败即 fail
+ *       (见 `checkGateSelfcheck`)。当时允许"告警 + 披露"的代价就是
+ *       ——它的红没有代价,而它正是"证明各门有牙"的那一件东西。
  *   · BOM ⇒ `JSON.parse` 抛错 ⇒ 模块**加载不了** ⇒ 下游全线红
  *     ⇒ 这是"门禁本身坏了",不是"门禁少测了"
  *     ⇒ 必须硬拦:一旦放过,门禁的红会出现在**与修改点无关的地方**
@@ -2040,8 +2140,8 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   // ⇒ 与 shared/testing/harness.ts 同族(门禁/判据真消费、生产暂不消费),**不是欠账**;
   // ⚠️ 这里刻意用行注释而不是块注释:上面 harness 条目的理由里含 `tests/**`(星号斜杠序列),
   //    任何紧随其后出现的「块注释结束符」都会与它凑成假配对,把本表剩下条目整段吞掉
-  ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。**差集条目**:生产侧唯一 importer 是 shared/constants/cooking.ts,而它自己也不可达;计算式按 basename 匹配,还会把 server/src/combat/cooking.ts 的 importer 一并算进来 ⇒ 归入非欠账、不是缺接线动作。判据真消费(WS-FND-66 9 条);生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线。'],
-  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。**差集条目**:生产侧无直接 importer,仅被 shared/types/cooking.ts 反向类型引用且两者均不可达(basename cooking 撞上 server/src/combat/cooking.ts,计算式据此判差集)⇒ 非欠账。判据真消费(WS-FND-66)。'],
+  ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。**差集条目**:生产侧 importer 只有 shared/constants/cooking.ts,而它自己也不可达 ⇒ 归入非欠账、不是缺接线动作。(2026-11-18 订正:旧文本说「按 basename 匹配还会算进 server/src/combat/cooking.ts 的 importer」—— 判据已改成**解析后的绝对路径**,那条撞名不再发生;本条判据结果不变,理由按新口径重写。)判据真消费(WS-FND-66 9 条);生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线。'],
+  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。属 **gate-only 型**:生产侧真 importer = **0**(它只被 shared/types/cooking.ts 反向类型引用 —— 那是**别人 import 它**,方向相反),门禁/判据真消费、生产暂不消费,**不是欠账**。(2026-11-18 订正:旧理由把本条归入「非欠账」的依据是 basename 撞名;判据改成解析后的绝对路径后该依据不再成立,`isDiffSet()` 对本条返回 false ⇒ 按新口径重写为 gate-only 型,分类结果不变。)判据真消费(WS-FND-66)。'],
   ['shared/types/events.ts', '契约先行(D-19 第 2 条 / RULINGS-DRAFT EVENT-BUS U6):29 种事件名的命名空间 SSoT。属 gate-only 家族:判据反向扫生产文本防过期(WS-FND-66 第 7 组);生产侧事件名仍是扁平字符串 ⇒ 等编排层接线。'],
 ]);
 
@@ -2170,17 +2270,22 @@ const WL_NON_DEBT_GATE = /gate-only/;
 ```
 
 独立复算(不依赖本文件的任何打印,直接数每条白名单路径的生产 importer,
-并检查那些 importer 自己是否也在白名单里)得出的**真差集是 4 条**:
+并用 `resolveImport()` 判「这个 importer 真指向它」,再检查那些 importer 是否可达)
+得出的**真差集是 3 条**(2026-11-18 实测,判据已改为解析后的绝对路径 +
+`extractRelativeImports()`,与闭包同一口径):
 
 ```
 server/src/content/registry.ts    生产 2 引用(baseline, handshake)   全部不可达
-server/src/coop/rush_order.ts     生产 3 引用(modes, scoring, afk)     全部不可达
-server/src/party/scoring.ts       生产 2 引用(modes, afk)              全部不可达
-server/src/prank/toys.ts          生产 1 引用(immunity)                全部不可达
+server/src/prank/toys.ts          生产 1 引用(immunity)               全部不可达
+shared/types/cooking.ts           生产 1 引用(constants/cooking)      全部不可达
 ```
 
-⇒ 其中**只有 registry.ts 的理由里写了「差集」二字**,另外 3 条结构与它**完全相同**,
-  却因为没写那两个字被算成**欠账** ⇒ 欠账分母虚高 3 条。
+(历史:此处曾写 4 条 —— registry / rush_order / scoring / toys。其中 rush_order 与
+ scoring 后来已接线摘除;而 `shared/types/cooking.ts` 之前**没被算进来**,是因为
+ 旧 importer 扫描按 basename 匹配,把 `server/src/combat/cooking.ts` 的可达 importer
+ 记在了它头上。)
+⇒ 其中**只有 registry.ts 的理由里写了「差集」二字**,另外 2 条结构与它**完全相同**,
+  却因为没写那两个字曾被算成**欠账** ⇒ 欠账分母虚高 2 条。
 ⇒ ★ 这是**假阴性** —— 与"任务书假设的『假的非欠账』"方向相反:
   真正发生的是「真的非欠账被漏判成欠账」。
 
@@ -2239,15 +2344,60 @@ function diffSetData(): { prodAll: string[]; reach: Set<string> } {
   return { prodAll: __diffProdAll, reach: __diffReach };
 }
 
+/* ══════════════ 差集判据:两侧**必须同一套**导入口径 ══════════════
+ *
+ * ★ 2026-11-18 修两条(都是「判据表述比它实际做的事宽」):
+ *
+ * (1) **路径空间不一致** —— `diffSetData().prodAll` 是**相对**路径
+ *     (`server/src/...`),而 `reachableClosure()` 的产物是**绝对**路径。
+ *     旧实现写 `reach.has(f)` ⇒ **恒 false** ⇒ 判据退化成
+ *     「有生产 importer 就是差集」,后半句「引用者全不可达」**从未生效**。
+ *     ⚠️ 而它**不会自己报错**:算出的 4 条看着完全正常,且总数仍等于
+ *        「另 7 条非欠账」(gate-only 3 + 差集 4 与 gate-only 4 + 差集 3 都等于 7)
+ *        ⇒ 这个 bug 是**被另一个数正好抵消**才长期存活的。
+ *     发现途径:`scripts/gate-selfcheck.ts` T32-d 用**另一份实现**复算同一集合,
+ *     它按绝对路径比较 ⇒ 报 2 条,与这里 4 条矛盾。**矛盾即信号**。
+ *
+ * (2) **提取口径不一致** —— 闭包走 `extractRelativeImports()`
+ *     (`scripts/imports.ts`:静态 `from` / 裸副作用 / `export ... from` /
+ *     **字面量** `import()`),而 importer 扫描用的是**只看 `from` 的正则**。
+ *     ⇒ 一个「只被 `await import('./x.ts')` 引用」的文件,闭包侧看得到、
+ *       importer 侧看不见 ⇒ 「引用者全不可达」取决于**哪一侧漏得多**。
+ *     ⇒ 现两侧**都**走 `extractRelativeImports()` + `resolveImport()`:
+ *       **字面量动态 `import()` 两侧都跟踪;非字面量 `import(expr)` 两侧都不跟踪**
+ *       (已接受边界,见 `checkDynamicImportBoundary()`)。
+ *     口径来源 = `scripts/imports.ts` 头部的真值表(唯一的导入提取事实源)。
+ *
+ * (3) 顺带去掉 basename 撞名:旧正则按 basename 匹配,
+ *     `server/src/combat/cooking.ts` 的 importer 会被算到 `shared/{types,constants}/cooking.ts` 头上。
+ *     ⇒ 白名单里两条 `cooking` 条目的理由曾以「basename 匹配」为依据,
+ *       该依据现已不成立,理由已同步订正(见 UNREACHABLE_EXEMPT 那两条)。
+ */
+
+/** 每文件相对说明符的缓存:`isDiffSet()` 会按「白名单条数 × 生产文件数」被调用,
+ *  不缓存就是上千次全量提取(且 `extractRelativeImports` 是逐字符扫描)。 */
+let __diffSpecs: Map<string, string[]> | null = null;
+function diffSpecsOf(abs: string): string[] {
+  if (__diffSpecs === null) __diffSpecs = new Map<string, string[]>();
+  const hit = __diffSpecs.get(abs);
+  if (hit !== undefined) return hit;
+  const specs = extractRelativeImports(readFileSync(abs, 'utf8'));
+  __diffSpecs.set(abs, specs);
+  return specs;
+}
+
 function isDiffSet(path: string): boolean {
   const { prodAll, reach } = diffSetData();
-  const base = path.split('/').pop()!.replace(/\.ts$/, '');
-  const importers = prodAll.filter((f) => f !== path
-    && new RegExp(`from '[^']*${escapeRe(base)}\\.ts'`).test(readFileSync(resolve(ROOT, f), 'utf8')));
-  if (importers.length === 0) return false;                       /* 无生产引用 ⇒ gate-only 型,不是差集 */
-  return importers.every((f) => !reach.has(f));                   /* 有引用但引用者全不可达 ⇒ 差集 */
+  const target = resolve(ROOT, path);
+  /* 两侧同一口径:提取用 `extractRelativeImports()`,解析用 `resolveImport()`
+     —— 与 `reachableClosure()` 逐字相同(见上方长注释)。 */
+  const importers = prodAll
+    .map((f) => resolve(ROOT, f))
+    .filter((abs) => abs !== target
+      && diffSpecsOf(abs).some((spec) => resolveImport(abs, spec) === target));
+  if (importers.length === 0) return false;              /* 无生产引用 ⇒ gate-only 型,不是差集 */
+  return importers.every((abs) => !reach.has(abs));      /* 有引用但引用者全不可达 ⇒ 差集 */
 }
-function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 /** ⚠️ 保留字面正则**仅供自检**:用来发现「理由写了『差集』但计算式不成立」的**反向**不一致。
  *  它**不再**用于分类 —— 分类走 `isDiffSet()`。 */
@@ -3074,11 +3224,13 @@ function checkReachability(): void {
  * ```
  * 减法   UNREACHABLE_EXEMPT.size - orphan.size            ⇒ 5（混入 gate-only）
  * 字面   /差集/ 正则读理由文本                              ⇒ 1（只认写了那两个字的）
- * 计算   isDiffSet()（= 本文现在用的）                      ⇒ 4（真定义）
+ * 计算   isDiffSet()(= 本文现在用的)                      ⇒ 3(真定义)
  * ```
- * 实测差集 4 条：`registry` / `rush_order` / `scoring` / `toys` ——
- * 其中**只有 registry 的理由里写了「差集」二字**，
- * 另外 3 条结构完全相同，却因为没写那两个字被算成**欠账**（分母虚高 3）。
+ * 实测差集 3 条:`registry` / `toys` / `shared/types/cooking` ——
+ * 其中**只有 registry 的理由里写了「差集」二字**,
+ * (历史:此处曾写 4 条 = registry/rush_order/scoring/toys;前两条后来已接线摘除,
+ *  另见 `isDiffSet()` 上方 2026-11-18 的订正说明。)
+ * 另外 2 条结构完全相同,却因为没写那两个字曾被算成**欠账**(分母虚高 2)。
  *
  * ⇒ 这就是**假阴性**：真的非欠账被漏判成欠账，而它**不会红**——
  *   因为分母大一点看起来完全正常。
@@ -5553,17 +5705,26 @@ function checkJudgementAudit(): void {
  * ```
  * ★ 若给它一个默认关闭的开关,它就会重演本仓反复点名的陷阱 82
  *   ——「**不拦门禁的自检脚本,它的红没有代价**」。
- *   那正是 `gate-selfcheck.ts` 到今天还要靠 `--strict-selfcheck` 才生效的原因。
+ *   那正是 `gate-selfcheck.ts` 在 2026-11-18 之前还要靠 `--strict-selfcheck` 才生效的原因
+ *   (审计 P1 已把它改成默认真跑:同一个判据,同一个处置)。
  * ⇒ 判据:**一个"声明与事实不符"的检测器,不该由记得开开关的人来决定它有没有代价。**
  *
- * ## 消费侧必须同时看四件事
+ * ## 消费侧必须同时看六件事
  *
  * ```
  * 1 汇总行解析不到            ⇒ 崩溃 / 超时 / 格式变了 ⇒ **不能当绿**
  * 2 ★ 陈旧 > 0                ⇒ fail(文档里的数 ≠ 代码正解)
  * 3 ★ 正解缺失                ⇒ fail(真值来源被拆掉 ⇒ 检测器静默失效)
  * 4 ★ 登记失真                ⇒ fail(正解 ≠ 实测;2026-11-18 审计 P1-3 新增)
+ * 5 ★ 命中数低于下限          ⇒ fail(检测面被改没了;2026-11-18 审计 P1 新增)
+ * 6 ★ 扫描文件缺失            ⇒ fail(被扫文件被删 ⇒ 里面的自称一起消失;同上新增)
  * ```
+ * ⚠️ 5/6 与 2 是**相反**的:2 查「比过了且对上了没有」,5/6 查「**还比得上吗**」。
+ *   少了它们:把文档那句话改个词 ⇒ 命中 0 ⇒ 2/3/4 全部成立 ⇒ 整道门印「一致 0」而绿。
+ * ⚠️ 第 1 条(解析不到汇总行)为什么不够:那时输出格式没变、进程也正常退出,
+ *   只是**没有东西可命中** —— 与「全部一致」逐字相同。
+ * ⚠️ 「count-audit.ts 不存在」此前是 `advise()`(只是警告)⇒ 删掉那个文件等于
+ *   关掉整道比对而门禁全绿。2026-11-18 审计 P1 起改成 **fail**。
  * ⚠️ 第 4 条与 2/3 不同性质:2/3 比的是「文字 ↔ 正解」,4 比的是「正解 ↔ 实测」。
  *   少了它,定值可以是 10、实测可以是 9,两行都印出来而**没有任何东西红** ——
  *   那正是「自己比自己」:门禁读的是同一份登记,永远自洽。
@@ -5576,7 +5737,13 @@ function checkCountAudit(): void {
   console.log('\n[计数对账]');
   const script = join(ROOT, 'scripts', 'count-audit.ts');
   if (!existsSync(script)) {
-    advise('计数对账', 'count-audit.ts 不存在 ⇒ 「文档自称 vs 代码正解」这道比对未运行');
+    /* ★ 审计 P1(2026-11-18):**不再 advise** —— 删掉这个文件就等于关掉整道比对,
+       而"提醒一句"不会让任何人停下。判据与第 4 条同:声明与事实不符的检测器,
+       不能由「记不记得看警告」来决定它有没有代价。 */
+    fail(
+      'scripts/count-audit.ts 不存在 ⇒ 「文档自称 vs 代码正解」这道比对**整体缺失**'
+      + '(不是"没跑",是判据被删掉了)',
+    );
     return;
   }
   const r = spawnSync(process.execPath, ['scripts/count-audit.ts'], {
@@ -5606,6 +5773,30 @@ function checkCountAudit(): void {
     fail(
       `计数对账:登记与实测不符 ${crossFail[1]} 处(见 count-audit「3 登记 ↔ 实测 互校」)`
       + ` ⇒ 台账条数不是实测条数,不能作为「还剩多少欠账」的依据`,
+    );
+    return;
+  }
+  /* ★ 第 5/6 条(2026-11-18 审计 P1):两道「**还比得上吗**」的断言。
+     上游 `count-audit` 已断言它们(#4 命中数下限 / #5 扫描文件缺失)并置非零退出码;
+     接线侧必须**再看一次并给出与"陈旧"不同的理由** ——
+     否则真因会被后面那句「退回码与判据不一致」盖住(报错指错地方 ⇒ 修错地方)。 */
+  const belowFloor = /★ 命中数低于下限:(\d+) 项/.exec(out);
+  if (belowFloor !== null) {
+    const detail = out.split('\n')
+      .filter((l) => /命中\s*\d+\s*<\s*下限/.test(l))
+      .slice(0, 6).map((l) => `      ${l.trim()}`);
+    fail(
+      `计数对账:${belowFloor[1]} 项命中数低于具名下限 ⇒ **不是"没有陈旧",是没有比对**`
+      + '(措辞被改 / 那一行被删 ⇒ 正则再也匹配不到;见 count-audit 的 CLAIM_FLOORS)'
+      + (detail.length > 0 ? `\n${detail.join('\n')}` : ''),
+    );
+    return;
+  }
+  const scannedMissing = /★ 扫描文件缺失:(\d+) 个/.exec(out);
+  if (scannedMissing !== null) {
+    fail(
+      `计数对账:${scannedMissing[1]} 个**被扫文件缺失** ⇒ 它里面的自称一起消失`
+      + '(删掉被扫文件 = 关掉检测面,不是"没有自称")',
     );
     return;
   }
@@ -5910,7 +6101,7 @@ function checkOrphanList(): void {
      * ```
      * 此处减法            ⇒ 5   (混入了 gate-only)
      * /差集/ 字面分类器    ⇒ 1   (只认写了那两个字的)
-     * 计算式(真定义)      ⇒ 4   (registry / rush_order / scoring / toys)
+     * 计算式(真定义)      ⇒ 3   (registry / toys / shared/types/cooking)
      * ```
      * ⇒ 同一个词、三个数,而它决定**该条进不进欠账分母**。
      * ⇒ 现统一走 `isDiffSet()`(计算式),它统计的是**真差集**。 */
@@ -7529,11 +7720,11 @@ async function checkContent(): Promise<void> {
  * 1. **恰好 1 处** 才算数。>1 处 = 输出被污染(套件多打印了计数行,或被注入),
  *    直接判失败而不是"挑一个信"。
  * 2. 取**首次**出现 —— 与 `report()` 的位置无关,但至少不再偏爱末行。
- * 3. 出现 0 处 ⇒ null(由调用方决定怎么处理)。
+ * 3. 出现 0 处 ⇒ null ⇒ **调用方必须 fail**(见 `assertionCountVerdict`)。
  *
  * 各套件的 `report()` 只打印一行 `[NAME] N/M 通过`,故「1 处」是正常态的精确刻画。
  */
-function parseAssertionCounts(out: string): { passed: number; total: number } | null {
+export function parseAssertionCounts(out: string): { passed: number; total: number } | null {
   const all = [...out.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)];
   if (all.length === 0) return null;
   if (all.length > 1) {
@@ -7545,17 +7736,71 @@ function parseAssertionCounts(out: string): { passed: number; total: number } | 
   return { passed: Number(m[1]), total: Number(m[2]) };
 }
 
+/**
+ * ★ 审计 P1(2026-11-18):测试门的**前置条件**判据(纯函数 ⇒ 可单测)。
+ *
+ * ## 修的是什么(实测)
+ *
+ * ```
+ * mv tests/ tests.bak; node scripts/verify.ts --all     ⇒ 全绿,exit 0
+ * node scripts/verify.ts --only __NOMATCH__            ⇒ 全绿,exit 0(实测 5.3s)
+ * ```
+ * 两条都在 `runTests` 里只走 `console.log('  · 暂无 tests/ 目录')` / `console.log('  · 无匹配测试')`
+ * 然后 `return` —— **不 fail**。⇒ 删掉/改名一个目录、或把一个 `--only` 拼错,
+ * 测试整道门就**结构性消失**,而门禁打「全部通过」。
+ *
+ * ⇒ 判据:0 套件不是「没有要跑的」,而是「这道门没有判据」——
+ *   与「所有套件都通过」**必须可区分**(陷阱 126)。
+ */
+export function suiteSetVerdict(
+  state: { hasTestsDir: boolean; suiteCount: number; only?: string },
+): { ok: boolean; message: string } {
+  if (!state.hasTestsDir) {
+    return {
+      ok: false,
+      message: 'tests/ 目录不存在 ⇒ 测试门整体失效(不是"暂无测试",是这道判据没了)',
+    };
+  }
+  if (state.suiteCount === 0) {
+    return {
+      ok: false,
+      message: state.only === undefined
+        ? 'tests/ 下 0 个 *.test.ts 套件 ⇒ 测试门无事可做,与「全部通过」不可区分'
+        : `--only ${state.only} 匹配 0 个套件 ⇒ 收窄口径不能退化成「没有要跑的」`,
+    };
+  }
+  return { ok: true, message: `${state.suiteCount} 个套件` };
+}
+
+/**
+ * ★ 审计 P1(2026-11-18):单个套件的「N/M 通过」判据(纯函数)。
+ *
+ * 旧代码写成 `if (c) { ...累加... }` —— **`c === null` 时静默跳过**:
+ * 套件只要不打印那一行(改掉 `report()` / 输出被截断 / 换了 harness),
+ * 它的断言数就凭空消失,而总账照样「通过」。⇒ 现在 null 一律 fail。
+ */
+export function assertionCountVerdict(
+  c: { passed: number; total: number } | null,
+): { ok: boolean; message: string } {
+  if (c === null) {
+    return { ok: false, message: '未打印「N/M 通过」⇒ 该套件断言数无法核对(不许静默跳过)' };
+  }
+  if (Number.isNaN(c.passed) || Number.isNaN(c.total)) {
+    return { ok: false, message: '输出含多处「N/M 通过」⇒ 实测数字可被套件自己伪造' };
+  }
+  return { ok: true, message: `${c.passed}/${c.total}` };
+}
+
 function runTests(): void {
   console.log('\n[测试执行]');
   const dir = join(ROOT, 'tests');
-  if (!existsSync(dir)) {
-    console.log('  · 暂无 tests/ 目录');
-    return;
-  }
-  let files = walk(dir, ['.test.ts']).sort();
+  const hasTestsDir = existsSync(dir);
+  let files = hasTestsDir ? walk(dir, ['.test.ts']).sort() : [];
   if (only) files = files.filter((f) => f.includes(only));
-  if (files.length === 0) {
-    console.log(`  · 无匹配测试${only ? `(--only ${only})` : ''}`);
+  /* ⚠️ 0 套件必须 fail(见 `suiteSetVerdict` 的注释):这**不是**"跳过",是判据没了。 */
+  const pre = suiteSetVerdict({ hasTestsDir, suiteCount: files.length, only });
+  if (!pre.ok) {
+    fail(pre.message);
     return;
   }
 
@@ -7582,20 +7827,27 @@ function runTests(): void {
     } else {
       pass(`${rel} — ${out.split('\n').pop() ?? ''}`);
       const c = parseAssertionCounts(out);
-      if (c) {
-        /* D4:NaN = 计数行出现 >1 次 ⇒ 输出被污染。
-           不能"挑一个信" —— 那正是旧版取末匹配被骗走的路。 */
-        if (Number.isNaN(c.passed) || Number.isNaN(c.total)) {
+      /* ★ 审计 P1(2026-11-18):「没打印 N/M 通过」不再静默跳过 —— 一律 fail。
+         旧代码是 `if (c) { ... }`:null 时什么都不做 ⇒ 套件换掉 `report()`
+         就能把自己的断言数从总账里抹掉,而门禁仍「全部通过」。 */
+      const av = assertionCountVerdict(c);
+      if (c === null || !av.ok) {
+        if (c !== null) {
           const n = [...out.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)].length;
           fail(
             `${rel} 输出含 ${n} 处「N/N 通过」—— 每套件应恰好 1 处。`
             + '多处会让门禁的「实测数字」可被伪造(在套件末尾多打一行即可)',
           );
-          continue;
+        } else {
+          fail(`${rel} ${av.message}`);
         }
-        sumPassed += c.passed;
-        sumTotal += c.total;
-        counted += 1;
+        /* 该套件断言数**不计入** sumTotal ⇒ 汇总数不完整 ⇒ README 那一栏**不比** */
+        suiteHadFailure = true;
+        continue;
+      }
+      sumPassed += c.passed;
+      sumTotal += c.total;
+      counted += 1;
         /* `WS-01.test.ts` → `WS-01`;`WS-FND-01.test.ts` → `WS-FND-01`;
            `WS-FND-09-wiring.test.ts` → `WS-FND-09-wiring`。
 
@@ -7617,10 +7869,9 @@ function runTests(): void {
            修法两层:① 字符类放宽到 `[A-Za-z0-9-]`(认小写);
            ② 加一条**自洽断言**(见下方 `sumOf(main) + sumOf(fnd) !== sumTotal`),
            这样将来任何套件名再落在两个桶之外,门禁自己就红,而不是打印一行矛盾的字。 */
-        const g = /(WS-[A-Za-z0-9-]+?)\.test\.ts$/.exec(rel)?.[1] ?? rel;
-        const prev = byGroup.get(g) ?? { passed: 0, total: 0 };
-        byGroup.set(g, { passed: prev.passed + c.passed, total: prev.total + c.total });
-      }
+      const g = /(WS-[A-Za-z0-9-]+?)\.test\.ts$/.exec(rel)?.[1] ?? rel;
+      const prev = byGroup.get(g) ?? { passed: 0, total: 0 };
+      byGroup.set(g, { passed: prev.passed + c.passed, total: prev.total + c.total });
     }
   }
 
@@ -7847,7 +8098,7 @@ if (!frozenOnly && !only) verifyHandoverHashes();
 if (!frozenOnly && !only) checkCountAudit();
 
 /* ★ task-75:门禁自检(见 `checkGateSelfcheck` 的长注释)。
-   ⚠️ 位置在 `verifyReadmeNumbers()` **之后**:它默认只 `advise()`,
+   ⚠️ 位置在 `verifyReadmeNumbers()` **之后**:`--lenient` 下它会 `advise()`,
       而那行汇总要统计 `advises` ⇒ 必须排在汇总行之前。
    ⚠️ `--only` / `--frozen` / `--docs` / `--content` / `--integration` 时跳过:
       那些是**局部口径**,而"门禁自检是否纳入默认口径"是**整体**问题

@@ -71,7 +71,7 @@
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { authoritativeStock, bindItemSource, missingItemReadPort } from './item_source.ts';
+import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -201,6 +201,11 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CRAFT);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: made, source: src }] });
   if (!gain.allowed) {
+    /* ★ 审计 P3:产物这张凭证已经登记、却没有被用掉 ⇒ **显式撤销**。
+       修前它留到 tick 末 `expireItemSources` 才消失,期间一直是「服务端认可过的
+       来源」—— 本 tick 内另一条分支拿同一张串铸 +delta 会被「登记过」放行。
+       (撤销与退回是两件事:退回救玩家那批材料,撤销收回这张没用掉的凭证。) */
+    unbindItemSource(ctx, src);
     /* 8 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
        退回是正 delta ⇒ **每一件**都要自己的绑定令牌(令牌绑 itemId,不能串用)。 */
     const refund = ctx.applyInventory(ctx.actorId, {

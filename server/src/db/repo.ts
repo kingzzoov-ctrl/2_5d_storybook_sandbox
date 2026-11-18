@@ -106,6 +106,77 @@ export const MIGRATION_BASELINE_VERSION = 1;
 export const MIGRATION_BASELINE_NAME = 'ws07_baseline_net_persist';
 
 /**
+ * 本程序认识的 `schema_migrations.version` 全集。
+ *
+ * 惰性函数而不是模块级常量:归档迁移的版本号在 §13 才声明,
+ * 顶层常量在这里读它会踩 TDZ(`export const` 的初始化顺序按文件顺序)。
+ */
+export function knownMigrationVersions(): number[] {
+  return [MIGRATION_BASELINE_VERSION, WORLD_ARCHIVE_MIGRATION_VERSION];
+}
+
+/**
+ * **版本护栏**(审计 P1:旧库没有升级路径)。
+ *
+ * ## 为什么必须在 `db.exec(ddl)` **之前**判
+ *
+ * 改前 `migrate()` 的顺序是「先 exec 整份 DDL,再读 `schema_migrations` 判漂移」。
+ * 对一个**旧库**来说这个顺序是致命的:旧库的表是 `CREATE TABLE` 建出来的,
+ * `IF NOT EXISTS` 不会补列、本文件里也一条 `ALTER` 都没有 ⇒ 结构停在旧版本;
+ * 而 DDL 已经执行过了,等到发现「版本不认识 / checksum 对不上」时,**库已经
+ * 被动过**,既没法回退也说不清是改之前还是改之后坏的。
+ *
+ * ⇒ 顺序改成「先读版本 → 判护栏 → 判漂移 → 再 exec DDL」:
+ *   * 读到**更旧**的版本 ⇒ 拒绝 + 给升级指引(不许拿新程序改旧库);
+ *   * 读到**不认识**的版本 ⇒ 拒绝 + 给降级/恢复指引;
+ *   * 同版本但 checksum 不一致 ⇒ `drift`(调用方 fail-closed,DDL 不执行)。
+ */
+export function assertMigrationVersionSupported(versions: readonly unknown[]): void {
+  const known = knownMigrationVersions();
+  const supported = known.slice().sort((a, b) => a - b).join(' / ');
+  for (const raw of versions) {
+    const v = Number(raw);
+    if (!Number.isInteger(v)) {
+      throw new Error(
+        `schema_migrations.version 不是整数(实得 ${String(raw)})—— 迁移表被写坏,`
+        + '拒绝在任何结构判断之前动库;请从备份恢复或人工核对 schema_migrations',
+      );
+    }
+    if (v < MIGRATION_BASELINE_VERSION) {
+      throw new Error(
+        `库里的 schema 版本 ${v} 比本程序支持的最旧版本 ${MIGRATION_BASELINE_VERSION} 还旧`
+        + `(本程序认识:${supported})—— 旧库没有「就地补列」这条路径(本文件里没有 ALTER)。`
+        + '请先用对应旧版本的程序把库导出/重建,再按 docs/WS-07-net-persist.md 的迁移段升级;'
+        + '本程序拒绝在旧库上执行 DDL',
+      );
+    }
+    if (!known.includes(v)) {
+      throw new Error(
+        `库里的 schema 版本 ${v} 本程序不认识(认识的是 ${supported})`
+        + ' —— 这份库大概是**更新的程序**建的。请升级程序后重试(不要手改 schema_migrations:'
+        + '那会让「结构 ↔ 登记」永久对不上);确需降级请从备份恢复,'
+        + '见 docs/WS-07-net-persist.md 的迁移段。本程序拒绝在没判清的库上执行 DDL'
+      );
+    }
+  }
+}
+
+/**
+ * 读出 `schema_migrations` 的全部登记行。
+ *
+ * 表还不存在(全新库 / 内存夹具)⇒ 空数组:那是「还没迁移过」,**不是**故障。
+ * 其余错误照旧冒泡(否则一次磁盘/权限故障会被伪装成「新库」)。
+ */
+export function readMigrationRows(db: DbLike): MigrationRow[] {
+  try {
+    return db.select('schema_migrations') as unknown as MigrationRow[];
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return [];
+    throw e;
+  }
+}
+
+/**
  * 极简 checksum:FNV-1a 32 位(十六进制 8 字符)。
  * 只用于「同一版本 DDL 被偷偷改动」的漂移检测,不做安全用途。
  */
@@ -128,19 +199,34 @@ export interface MigrateResult {
 
 /**
  * 建表 + 登记迁移版本。
- * 已登记版本且 checksum 一致 -> 跳过 DDL(applied=false),但仍执行幂等 DDL 以保证
- * 探针库/内存库结构与 schema.sql 一致。
+ *
+ * ## 顺序是判据的一部分(审计 P1:旧库不能「先改库再发现不兼容」)
+ *
+ * ``` 
+ * 1 读 schema_migrations
+ * 2 ★ 版本护栏(更旧 / 不认识 ⇒ 抛,库一个字节都还没动)
+ * 3 ★ 同版本 checksum 不一致 ⇒ 返回 drift(不执行 DDL)
+ * 4 执行幂等 DDL(与 schema.sql 对齐)
+ * 5 没登记过才登记
+ * ```
+ *
+ * 改前是 4 在 1 之前:旧库(缺列)会先被 DDL「无害地」跳过,再在 drift 判定处
+ * 抛错 —— 此时库里已经是新旧混合状态。现在 2/3 都在 `db.exec(ddl)` **之前**。
  */
 export function migrate(db: DbLike, nowMs: number, ddlPath?: string): MigrateResult {
   const ddl = readSchemaSql(ddlPath);
-  db.exec(ddl);
   const checksum = checksumOf(ddl);
-  const existing = db.get('schema_migrations', { version: MIGRATION_BASELINE_VERSION }) as
+  const rows = readMigrationRows(db);
+  /* ★ 步 2:版本护栏。`Number.isInteger` 之外的形状由护栏自己抛。 */
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find((r) => Number((r as MigrationRow).version) === MIGRATION_BASELINE_VERSION) as
     | MigrationRow
     | undefined;
+  /* ★ 步 3:漂移 ⇒ DDL 一个字都不执行(改前的顺序会把库先改一遍)。 */
   if (existing && existing.checksum !== checksum) {
     return { applied: false, version: MIGRATION_BASELINE_VERSION, checksum, drift: true };
   }
+  db.exec(ddl);
   if (existing) {
     return { applied: false, version: MIGRATION_BASELINE_VERSION, checksum, drift: false };
   }
@@ -1007,6 +1093,12 @@ export interface WorldArchiveMigrateResult {
  * 与 `migrate()` 的关系:`migrate()` 仍然只建 `schema.sql` 那 9 张表,
  * 本函数是**第二段**迁移。宿主(或装配层)在启动时调一次即可;
  * **写入侧 `archiveWorldSnapshot` 也会调它** —— 这样"表没建"不会变成静默丢档。
+ *
+ * ## 顺序与 `migrate()` 同一条判据(审计 P1)
+ *
+ * 「先读版本 → 护栏 → 漂移 → 才 exec DDL」。改前是 `exec` 在最前:一份
+ * 旧版 `schema_world_archive.sql` 建出来的库会先被 DDL 跳过,再在 drift 处
+ * 发现不一致 —— 库已经被动过。
  */
 export function migrateWorldArchives(
   db: DbLike,
@@ -1014,18 +1106,18 @@ export function migrateWorldArchives(
   ddlPath?: string,
 ): WorldArchiveMigrateResult {
   const ddl = readWorldArchiveSql(ddlPath);
-  db.exec(ddl);
   const checksum = checksumOf(ddl);
-  const existing = db.get('schema_migrations', { version: WORLD_ARCHIVE_MIGRATION_VERSION }) as
-    | MigrationRow
-    | undefined;
+  const rows = readMigrationRows(db);
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find(
+    (r) => Number((r as MigrationRow).version) === WORLD_ARCHIVE_MIGRATION_VERSION,
+  ) as MigrationRow | undefined;
+  if (existing && existing.checksum !== checksum) {
+    return { applied: false, version: WORLD_ARCHIVE_MIGRATION_VERSION, checksum, drift: true };
+  }
+  db.exec(ddl);
   if (existing) {
-    return {
-      applied: false,
-      version: WORLD_ARCHIVE_MIGRATION_VERSION,
-      checksum,
-      drift: existing.checksum !== checksum,
-    };
+    return { applied: false, version: WORLD_ARCHIVE_MIGRATION_VERSION, checksum, drift: false };
   }
   db.insert('schema_migrations', {
     version: WORLD_ARCHIVE_MIGRATION_VERSION,
@@ -1034,6 +1126,51 @@ export function migrateWorldArchives(
     applied_at: nowMs,
   });
   return { applied: true, version: WORLD_ARCHIVE_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/** 这个库里**装过**归档迁移吗(登记行在 ⇒ 装过)。 */
+export function worldArchiveMigrationInstalled(db: DbLike): boolean {
+  const rows = readMigrationRows(db);
+  return rows.some((r) => Number((r as MigrationRow).version) === WORLD_ARCHIVE_MIGRATION_VERSION);
+}
+
+/** `migrateWorldArchivesIfInstalled` 的结果(比迁移结果多一个 `installed`)。 */
+export interface WorldArchiveBootCheck extends WorldArchiveMigrateResult {
+  /** `false` = 这个库从没装过归档表 ⇒ 本轮**没有**建它(见函数注释)。 */
+  installed: boolean;
+}
+
+/**
+ * **启动检查**:装过归档迁移的库 ⇒ 跑一遍(幂等 DDL + checksum 漂移检测);
+ * 没装过的库 ⇒ 什么都不做。
+ *
+ * ## 为什么全新的库不在这里建归档表
+ *
+ * 建表数被四处既有判据锁死在 **9 张**(`tests/WS-07.test.ts:200/295/488`、
+ * `scripts/verify.ts`:`bootstrap()` 后 `tableNames().length === 9`)。
+ * 启动就给新库建第 10 张表会当场把那些门禁打红 —— 而那**不是**本次改动的判据。
+ * 归档表在**第一次归档**时由 `archiveWorldSnapshot` 建(同一个 `migrateWorldArchives`)。
+ *
+ * 但「装过的库」必须在这里核对:那种库里的归档字节是**已经在用的**回滚原料,
+ * checksum 漂移说明「DDL 被改过而库里的表没跟着改」⇒ 必须 fail-closed,
+ * 不能等到下一次写入才发现。需要「启动就有归档表」的宿主显式调
+ * `migrateWorldArchives()` 即可。
+ */
+export function migrateWorldArchivesIfInstalled(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): WorldArchiveBootCheck {
+  if (!worldArchiveMigrationInstalled(db)) {
+    return {
+      applied: false,
+      version: WORLD_ARCHIVE_MIGRATION_VERSION,
+      checksum: '',
+      drift: false,
+      installed: false,
+    };
+  }
+  return { ...migrateWorldArchives(db, nowMs, ddlPath), installed: true };
 }
 
 /**
@@ -1195,7 +1332,19 @@ export function archiveWorldSnapshot(
     : 0;
   const reason = typeof input.reason === 'string' ? input.reason : '';
 
-  migrateWorldArchives(db, input.nowMs);
+  /* ★ 归档迁移的 checksum 漂移 ⇒ **fail-closed**(审计 P1)。
+     改前这一行把返回值丢了:DDL 被改过(或库里的表与 DDL 对不上)时
+     这里静默继续,写进去的归档字节属于哪一版结构没人说得清 —— 等真回滚时
+     才发现原料是坏的。现在:漂移 ⇒ 一行都不写,直接抛。 */
+  const migration = migrateWorldArchives(db, input.nowMs);
+  if (migration.drift) {
+    throw new Error(
+      `归档迁移 checksum 漂移(schema_migrations.version=${WORLD_ARCHIVE_MIGRATION_VERSION} 的登记与 `
+      + `schema_world_archive.sql 对不上)⇒ 拒绝写入(不静默降级)。`
+      + '归档是回滚原料:结构没判清就写进去,将来回滚出去的是坏世界;'
+      + '请先按 docs/WS-07-net-persist.md 的迁移段核对/重建 room_world_archives',
+    );
+  }
   return db.transaction(() => {
     const existing = db.select(WORLD_ARCHIVE_TABLE, { room_id: input.roomId });
     /* `seq` 取该房间已有最大值 + 1:**单调**,所以同一毫秒内的两次归档
@@ -1255,6 +1404,14 @@ export function listWorldArchives(
  *
  * 读不回字节(行不存在 / BLOB 不是 Uint8Array)⇒ `undefined`:
  * 归档行是回滚原料,原料不完整就等于**没有这一版**,不能回一个半截对象。
+ *
+ * ## `snapshot_bytes` 必须与 BLOB 长度一致(审计 P2)
+ *
+ * DDL 里 `snapshot_blob` 有 `CHECK (length(...) <= 1048576)`(防绕过本模块直插),
+ * 但 `snapshot_bytes` 是**另一列**,跨列等式在 SQLite 里要写成跨列 CHECK,
+ * 而 `MemoryDb` 不认那种形态(会进 `unsupportedChecks()`,等于一条假装存在的
+ * 约束)。⇒ 一致性在这一层钉住:摘要说多少字节,blob 就必须是多少字节,
+ * 否则这一行**不是**可用原料(返回 `undefined`,不是把两个矛盾的数都交出去)。
  */
 export function loadWorldArchive(db: DbLike, archiveId: string): WorldArchiveRecord | undefined {
   if (typeof archiveId !== 'string' || archiveId.length === 0) return undefined;
@@ -1268,7 +1425,11 @@ export function loadWorldArchive(db: DbLike, archiveId: string): WorldArchiveRec
   if (!row) return undefined;
   const blob = row.snapshot_blob;
   if (!(blob instanceof Uint8Array)) return undefined;
-  return { ...toWorldArchiveSummary(row), snapshot_blob: blob };
+  const summary = toWorldArchiveSummary(row);
+  /* ★ 摘要与字节必须互相说得清:对不上 ⇒ 这一版**不完整**(不能回滚半份世界)。 */
+  if (summary.bytes !== blob.byteLength) return undefined;
+  if (blob.byteLength > WORLD_ARCHIVE_MAX_BYTES) return undefined;
+  return { ...summary, snapshot_blob: blob };
 }
 
 /** 某房间现有归档行数(配额断言的观测口径;`listWorldArchives` 默认被 N 截断)。 */

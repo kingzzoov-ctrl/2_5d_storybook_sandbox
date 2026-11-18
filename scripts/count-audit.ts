@@ -237,6 +237,15 @@ const SCAN_FILES = ['README.md', 'scripts/verify.ts', 'scripts/orphan-audit.ts']
 const files: string[] = [...SCAN_FILES];
 void join; /* 保留 import,供将来扩展目录扫描 */
 
+/* ★★ 审计 P1(2026-11-18):**扫描范围本身也会静默缩水**
+ *
+ * 旧代码:`if (!existsSync(...)) continue;` —— 把一个被扫文件删掉/改名,
+ * 它里面的自称就**一起消失**,而本脚本照样打印「一致 0」。
+ * ⇒ 与「改词后 hits=0」是同一类洞:证据被移除 ≠ 证据不存在。
+ * ⇒ 判据:清单里点名要扫的文件必须都在,缺一个就 fail(而不是悄悄削范围)。
+ */
+const missingFiles = files.filter((f) => !existsSync(join(ROOT, f)));
+
 /* 自称模式 → 它指向的真值键(定义见上方说明:必须带区分词,否则两个"白名单"会互相误报) */
 
 interface Hit { file: string; line: number; text: string; claim: number; key: string; desc: string }
@@ -274,7 +283,32 @@ for (const f of files) {
   });
 }
 
-console.log(`\n══ 1 扫到 ${hits.length} 处「N 条」型自称 ══`);
+/* ★★ 审计 P1(2026-11-18):**命中数的具名下限**
+ *
+ * ## 缺口(实测)
+ *
+ * 本脚本只认 4 条**固定措辞**正则。把那句话改个词
+ * (「白名单 14 条」→「白名单共 14 个」),`hits` 立刻变成 0,
+ * 而输出是 `自称总数 0;与正解一致 0;★ 陈旧 0` + **exit 0** ——
+ * 与「所有自称都对上了」**逐字相同**。⇒ 检测面被改没了,而它报绿。
+ * ⇒ 这正是本仓的形态:判据消失时,输出与"判据通过"不可区分(陷阱 126)。
+ *
+ * ## 为什么下限是"具名常量"而不是"与上次运行比较"
+ *
+ * 与上次比较需要一份基线文件,而基线自己也会跟着一起变(自己比自己)。
+ * 具名常量迫使**改文档的人**显式来这里把下限改小 ——
+ * 那一刻他必须回答「我是不是把一条自称改没了」。
+ * ⚠️ 下限 = 2026-11-18 的实测值(`同义反复白名单` 1 条;其余两类今天
+ *    的命中全被 〔引用〕 标注或压根没写 ⇒ 下限 0,**这不代表它们有保护**)。
+ *    **降低任何一项都必须写明理由**,不许顺手改。
+ */
+const CLAIM_FLOORS: Record<string, number> = {
+  可达性白名单: 0,
+  orphan: 0,
+  同义反复白名单: 1,
+};
+const CLAIM_FLOOR_TOTAL = 1;
+console.log(`\n══ 1 扫到 ${hits.length} 处「N 条」型自称(合计下限 ${CLAIM_FLOOR_TOTAL},低于即 fail)══`);
 let stale = 0;
 let match = 0;
 for (const h of hits) {
@@ -391,13 +425,43 @@ let assertFailed = false;
     console.log('      ⇒ 文档里的数与代码算出的正解不一致,应更新文档或代码');
     assertFailed = true;
   }
+  /* ★ #4 命中数下限(2026-11-18 审计 P1)——
+     与 #1 相反:上面查「对上了没有」,这条查「**还看得见几只**」。
+     少了它:把措辞改掉 ⇒ hits=0 ⇒ 上面所有断言**都成立**(0 条陈旧),
+     而检测面已经消失。⚠️ 报错文案**不得**包含「正解缺失」——
+     否则与 #2 不可区分,WS-FND-90 的注入 B 也会跟着误报。 */
+  const belowFloor: string[] = [];
+  for (const [k, floor] of Object.entries(CLAIM_FLOORS)) {
+    const got = hits.filter((h) => h.key === k).length;
+    if (got < floor) belowFloor.push(`${k}:命中 ${got} < 下限 ${floor}`);
+  }
+  if (hits.length < CLAIM_FLOOR_TOTAL) {
+    belowFloor.push(`合计:命中 ${hits.length} < 下限 ${CLAIM_FLOOR_TOTAL}`);
+  }
+  if (belowFloor.length > 0) {
+    console.log(`\n   ★ 命中数低于下限:${belowFloor.length} 项`);
+    for (const b of belowFloor) console.log(`      · ${b}`);
+    console.log('      ⇒ 不是"没有陈旧",是**没有比对** —— 措辞改了 / 那一行被删了');
+    console.log('      ⇒ 修法:恢复自称写法;若确属有意,改小 `CLAIM_FLOORS` 并写明理由');
+    assertFailed = true;
+  }
+  /* ★ #5 扫描文件缺失(2026-11-18 审计 P1)——
+     删掉被扫文件与"那一行没有自称"在输出上完全一样 ⇒ 必须单列。 */
+  if (missingFiles.length > 0) {
+    console.log(`\n   ★ 扫描文件缺失:${missingFiles.length} 个`);
+    for (const f of missingFiles) console.log(`      · ${f} —— 本脚本点名要扫它,它不在了`);
+    console.log('      ⇒ 删掉被扫文件 = 让它里面的自称一起消失,而不是"没有自称"');
+    assertFailed = true;
+  }
 }
 
 /* 退出码策略(与 --selftest 的分工):
- *   默认运行 = **报告 + 断言**。加这两个断言后,默认运行已经**可进链**:
- *   它不再只是"打印 N 处陈旧",而是"陈旧/真值缺失 ⇒ 非零"。
+ *   默认运行 = **报告 + 五组断言**(陈旧 / 真值缺失 / 登记失真 / 命中数低于下限 / 扫描文件缺失)。
+ *   默认运行因此**可进链**:它不是"打印 N 处陈旧",而是任何一种"没比对成"都非零。
  *   ⚠️ 定位变化必须写下来 —— 本文件原来的 docblock 说"不是门禁",
- *      那是**加断言之前**的事实;加完之后那句就不再成立(陷阱 125:说明会过期)。 */
+ *      那是**加断言之前**的事实;加完之后那句就不再成立(陷阱 125:说明会过期)。
+ *   ⚠️ 「没比对成」(#2/#4/#5)必须与「比对了且都对上」**在退出码上分开** ——
+ *      否则删掉一句话、改一个词、删一个被扫文件,都能让本检测器静默变成恒绿。 */
 if (assertFailed) process.exitCode = 1;
 
 /* ─────── selftest ───────

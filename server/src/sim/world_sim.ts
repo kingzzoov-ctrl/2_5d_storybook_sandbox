@@ -76,7 +76,7 @@ import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
-import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, mobSpeciesId, MOB_INSTANCE_SEP, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { rollMobDrops, type MobDropResult } from '../mobs/drops.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
 import { SignalGraph } from '../wiring/graph.ts';
@@ -2870,7 +2870,21 @@ export class WorldSim {
        判据可复现(`rollMobDrops` 是 (seed, mobId, itemId) 的纯函数,见 `mobs/drops.ts`)。
        ⚠️ `deduped`(= 同一实例被二次结算)时清空:经验/积分都去重,掉落也不能给第二份
        (姜饼小人复活 / `addMob` 替换旧条目都会走到这条)。 */
-    this.lastMobDrops = result.deduped ? [] : rollMobDrops(def.id, this.worldSeed);
+    const drops = result.deduped ? [] : rollMobDrops(def.id, this.worldSeed);
+    /* ── ★ WS-FND-102:掉落**真的落到地面** ──
+       修前这一行只赋给诊断字段 `lastMobDrops`,而它在全仓**没有生产读者**:
+       击杀路径从不调 `dropItem` ⇒ 打死怪的地面永远是空的(审计实测)。
+       现在走既有的 `dropItem`(**地面唯一写入点**,容器仍是 `mobGround`)⇒
+       玩家的 `groundItemsNear` / `takeGroundItemNear`、生物 AI 的
+       `mobWorldAdapter().groundItems()`、`materials().take(x,y)` 看到的是
+       **同一批**货(不存在"两个地面")。`lastMobDrops` 保留为诊断镜像。
+       ⚠️ 坐标取**击杀点**(`settleKill` 的入参来自 `after.x/after.y`),不取玩家位置:
+       手册判据是"掉在怪倒下的地方"。非有限坐标**不落地**(否则地面会出现
+       一件 `x=NaN` 的货:玩家永远拾不到、也永远删不掉)。 */
+    if (drops.length > 0 && Number.isFinite(x) && Number.isFinite(y)) {
+      for (const d of drops) this.dropItem(x, y, d.itemId, d.count);
+    }
+    this.lastMobDrops = drops;
 
     this.lastKillSettle = result;
     this.killSettleCount += 1;
@@ -3651,11 +3665,35 @@ export class WorldSim {
     return count;
   }
 
-  /** 移除玩家(生命值一并清掉)。 */
+  /**
+   * 移除玩家(生命值一并清掉)。
+   *
+   * ## ★ WS-FND-102:瞬态与物理旁表必须一起清(审计实测)
+   *
+   * 修前这里只清 `playerIds` / `vitals` / `aoi` / `roomEffects` / `forge`
+   * / `afk` / `spawnPoints`,**漏了四张按 id 索引的瞬态表**:
+   * ```
+   * foodBuffs   料理 buff(602 最大生命 +30 就住在这)—— 漏清 ⇒ 同名重连**继承上轮料理**,
+   *             且 `maxHpForLevel` 会把 `hpFlat` 并进上限(上限凭空 +30,不报错)
+   * liveBubbles 活人泡泡状态机(227)      —— 漏清 ⇒ 重连时一进场就可能被判"被困在泡泡里"
+   * sprayUntil  喷射意图窗口(慢帧时效)  —— 漏清 ⇒ 重连后的一帧窗口对上轮残留依然成立
+   * knockbacks  击退位移窗口               —— 漏清 ⇒ 重连后还会被上轮那次击退继续推两格
+   * ```
+   * 四张表本就都按**玩家 id** 索引 ⇒ 生命周期必须跟着玩家 id 走(`rebuildWorld` 的
+   * 那段注释里也是同一纪律)。这里逐项点名删除,不做"清空一切"。
+   *
+   * ## 物理刚体走 `PhysicsWorld.remove` 而不是 `bodies.delete`
+   *
+   * `bodies.delete` 只摘掉主表,`trapTimers / muMuls / speedCaps / gravityMuls /
+   * jumpMuls` 五张旁表里那条 id **留在原地**:同名重连会继承上一轮的速度上限 /
+   * 料理滑溜 / 陷阱计时(`remove()` 与 `spawn()` 共用 `reclaimSideTables`,
+   * 见 `physics/world.ts` 的注释)。
+   */
   removePlayer(id: string): boolean {
     const had = this.playerIds.delete(id);
     this.vitals.unregister(id);
-    this.physics.bodies.delete(id);
+    /* ★ 走 `remove()`:主表 + 五张旁表一起回收(见 docblock)。 */
+    this.physics.remove(id);
     this.aoi.unregisterMob(id);
     /* 房间效果状态一并清掉:留着会让重新加入的同名玩家**继承上一轮的温泉计时**
        (表现为「刚上线就带着 20 分钟上限加成」)。 */
@@ -3668,6 +3706,11 @@ export class WorldSim {
     /* 出生点一并清掉:留着会让**重新加入**的同名玩家被重置送到上一局的出生点
        (房间把出生点按席位排开,席位是会变的)。与上面两条是同一类残留。 */
     this.spawnPoints.delete(id);
+    /* ★ 四张按 id 索引的瞬态表(见 docblock):漏任何一张都是"重连继承上一轮"。 */
+    this.foodBuffs.delete(id);
+    this.liveBubbles.delete(id);
+    this.sprayUntil.delete(id);
+    this.knockbacks.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -5001,6 +5044,51 @@ export class WorldSim {
     const def = mobDefOf(id);
     if (def) this.mobHost.addMob(id, def, x, y, { anchorX: x, anchorY: y });
     else this.unknownMobs.push(id);
+  }
+
+  /**
+   * 某物种的实例序号**水位**(已经发到几号;从没发过 = 0)。
+   *
+   * 为什么必须有一个读口:序号是「新实例**永不复用**旧 id」的唯一保证
+   * (`mobs/spawner.ts` 的 id 两层规则 + 本类的 `mobOrdinals`),而这条保证是
+   * 「击杀账不会被新怪继承」的前提。恢复世界那条路上水位是**补写**的
+   * (`bumpMobOrdinalForRestored`),没有读口就没法判定补写是否发生
+   * —— 判据见 `tests/WS-FND-102`(修前读到的恒为 0)。
+   */
+  mobOrdinalWatermark(speciesId: string): number {
+    return this.mobOrdinals.get(speciesId) ?? 0;
+  }
+
+  /**
+   * 把 `mobOrdinals` 的水位**推进**到某个已恢复实例的序号(只进不退)。
+   *
+   * ## 为什么需要它(`applyRestore` 专用)
+   *
+   * `applyRestore` 先跑 `rebuildWorld`,而它把 `mobOrdinals` 清成空
+   * (新世界的序号"从 #1 重来",见那里的注释);接着第 5 步按**归档 id** 把生物
+   * 放回来。两者叠在一起就是:世界里明明有 `mob_boar#3`,计数器却是 0
+   * ⇒ 下一次刷怪发的号是 `#1`…`#3` —— 撞上已恢复的实例。
+   *
+   * 撞号的后果**不抛错、不告警**:`addMob` 用同一个 id 再注册一次,`physics.spawn`
+   * 覆盖刚体、`mobHost.addMob` 换一条**满血、FSM 归零**的运行时;而 `killLedger`
+   * 按实例 id 去重 ⇒ 新那只(以及后面同号的)击杀**不再结算经验**。
+   *
+   * ## 为什么用回环校验而不是直接切字符串
+   *
+   * id 的生成规则全仓只有一处(`mobInstanceId`)。这里先按分隔符取尾段数字,
+   * 再用 `mobInstanceId(species, n) === id` **回环**确认 —— 只有恰好还原成同一个
+   * id 才认。于是「物种 id 里自带 `#`」「尾段不是正整数」「`#0`」这些脏输入
+   * 都**不会**把水位推到别处(推错水位同样会撞号,而且更隐蔽)。
+   */
+  private bumpMobOrdinalForRestored(instanceId: string): void {
+    const sep = instanceId.lastIndexOf(MOB_INSTANCE_SEP);
+    if (sep < 0) return;
+    const ordinal = Number(instanceId.slice(sep + 1));
+    if (!Number.isInteger(ordinal) || ordinal < 1) return;
+    const species = mobSpeciesId(instanceId);
+    if (mobInstanceId(species, ordinal) !== instanceId) return;
+    const cur = this.mobOrdinals.get(species) ?? 0;
+    if (ordinal > cur) this.mobOrdinals.set(species, ordinal);
   }
 
   /**
@@ -7056,11 +7144,17 @@ export class WorldSim {
       fluid += 1;
     }
 
-    /* 5 生物:重新注册(位置来自归档),血量按归档写回宿主运行时。 */
+    /* 5 生物:重新注册(位置来自归档),血量按归档写回宿主运行时。
+       ★ WS-FND-102:**同时把实例序号水位推进到已恢复的最大序号**(见 `bumpMobOrdinalForRestored`)。
+       修前 `rebuildWorld` 已把它清空(那里写着"实例序号从 #1 重来"),而恢复按归档 id 重建 ⇒
+       后续发号从 `#1` 起重来,**撞上刚恢复的实例**:`addMob` 同 id 不会报错、只是
+       整只替换(满血 + 丢 FSM),而 `killLedger` 又按实例 id 去重 ⇒ 新那只的击杀被
+       静默吞掉(经验不到账、不报错)。 */
     let mobs = 0;
     for (const op of plan.ops) {
       if (op.kind !== 'mob') continue;
       this.addMob(op.id, this.biomeName, op.x, op.y);
+      this.bumpMobOrdinalForRestored(op.id);
       const rt = this.mobHost.runtimes().find((r) => r.id === op.id);
       if (rt !== undefined) {
         if (Number.isFinite(op.hp)) rt.hp = op.hp;

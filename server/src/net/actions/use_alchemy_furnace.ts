@@ -67,10 +67,16 @@
  * ★ `orderId` 是**请求号**(WS-FND-96 幂等键的一维):同一单号重发 ⇒ 世界侧按
  * 「已结算」拒掉,`craftCount` / 冠名 / 537 陈列一位不动。缺省(老客户端没这个
  * 字段)由世界侧退化成 `(actorId, 材料, 帧)` 派生键 —— 本文件**不发明**订单号。
+ *
+ * ★ **判重前移**(审计 P2,修前判重在发放之后):`orderId` 现在**先预占**再扣料/发放,
+ *   见第 7 步的「订单预占」与 `claimFurnaceOrder`。修前的顺序是
+ *   `spend → gain → brewAtFurnace(orderId)` ⇒ 同一单重放会**真的炼出第二炉**,
+ *   只有 537 陈列被世界侧拒掉;现在预占失败 ⇒ 直接拒且**零副作用**。
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
+import { SETTLEMENT_ROOMS, settleKeyOf } from '../../systems/idempotency.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { authoritativeStock, bindItemSource, missingItemReadPort } from './item_source.ts';
+import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -107,6 +113,98 @@ type FurnaceBrewWithOrder = (
   opts?: { affinity?: number; suggestedSLogic?: number; at?: number; orderId?: string },
 ) => ReturnType<NonNullable<WorldSaveHost['brewAtFurnace']>>;
 
+/* ═══════════════ 1'. 订单预占(pre-claim):判重前移的落点 ═══════════════ */
+
+/** 一次预占的结果:`ok:false` ⇒ 这张单**已经结算过**,调用方必须整笔拒绝且零副作用。 */
+export type FurnaceClaim =
+  | { ok: true; key: string; at: number }
+  | { ok: false; key: string; seenAt: number; reason: string };
+
+/**
+ * 每个**房间实例**一份预占表(`WeakMap` 的键是 `ctx.state` 的对象身份)。
+ *
+ * 为什么按实例身份而不是按 `roomId`:它只是「这一单在本房间里有没有结算过」的
+ * 在线索引,随房间销毁一起消失即可;按 `roomId` 会让**重建的同 id 房间**继承
+ * 上一个世界的订单(判据夹具里同 id 的两个房间会互相污染)。`WeakMap` 同时
+ * 保证它不随创建过的房间数增长。
+ */
+const FURNACE_CLAIMS = new WeakMap<object, Map<string, number>>();
+/** `ctx.state` 不是对象的手搓桩(单测夹具)共用一份 —— 只有那些桩会走到这里。 */
+const STUB_FURNACE_CLAIMS = new Map<string, number>();
+
+/** 本房间(或桩)的预占表;懒建。 */
+function claimLedgerOf(state: unknown): Map<string, number> {
+  if (state === null || typeof state !== 'object') return STUB_FURNACE_CLAIMS;
+  const key = state as object;
+  let m = FURNACE_CLAIMS.get(key);
+  if (m === undefined) {
+    m = new Map<string, number>();
+    FURNACE_CLAIMS.set(key, m);
+  }
+  return m;
+}
+
+/**
+ * 这一单的键 = **世界侧那把键**(`ALCHEMY_LAB@ORDER:<订单号>`),由
+ * `systems/idempotency.ts:settleKeyOf` 归一 —— 本文件不另写一份键格式。
+ *
+ * 没有 `orderId`(老报文)⇒ 退化成与 `WorldSim.brewAtFurnace` **同形**的派生键
+ * `${actorId}#<材料升序>#<帧>`:同一炉同一帧重放会撞键(那正是要拒的),
+ * 而换材料 / 换人 / 换帧不撞。
+ */
+export function furnaceClaimKeyOf(
+  actorId: string,
+  consumedIds: readonly number[],
+  tick: number,
+  orderId: string | null,
+): string {
+  const sorted = [...consumedIds].sort((a, b) => a - b);
+  if (orderId === null) {
+    return settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId: `${actorId}#${sorted.join('_')}#${tick}` })
+      ?? `${ALCHEMY_LAB_ROOM_KEY}@ORDER:${actorId}#${sorted.join('_')}#${tick}`;
+  }
+  return settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId })
+    ?? `${ALCHEMY_LAB_ROOM_KEY}@ORDER:${orderId}`;
+}
+
+/**
+ * 占键(判重**前移**的那一步):第一次成功,第二次(以及之后每一次)拒。
+ *
+ * 与 `claimSettlement` 的语义逐条相同,但台账是**按房间实例**的在线索引
+ * (见 `FURNACE_CLAIMS`):权威结算仍在世界侧 `brewAtFurnace`。
+ * ⚠️ 失败(材料扣不动 / 产物收不下)必须 `releaseFurnaceOrder` —— 先占键再判成败
+ * 会把订单永久锁死,那是比重复结算更坏的缺陷。
+ */
+export function claimFurnaceOrder(state: unknown, key: string, at: number): FurnaceClaim {
+  const ledger = claimLedgerOf(state);
+  const seenAt = ledger.get(key);
+  if (seenAt !== undefined) {
+    return {
+      ok: false, key, seenAt,
+      reason: `订单 ${key} 已在 ${seenAt} 结算过(重放)`,
+    };
+  }
+  const t = Number.isFinite(at) ? at : 0;
+  ledger.set(key, t);
+  return { ok: true, key, at: t };
+}
+
+/** 释放预占(失败路径专用;**幂等**)。 */
+export function releaseFurnaceOrder(state: unknown, key: string): void {
+  claimLedgerOf(state).delete(key);
+}
+
+/** 丢弃本房间(实例)的全部预占 —— `RESET_WORLD` 成功回执路径调它。 */
+export function forgetFurnaceClaims(state: unknown): void {
+  claimLedgerOf(state).clear();
+}
+
+/** 当前 tick(与 `item_source.ts` 的令牌 tick 同一读数;桩没有 `state` ⇒ 0)。 */
+function tickOf(ctx: ActionContext): number {
+  const state = ctx.state as unknown as { meta?: { tick?: number } } | null | undefined;
+  return typeof state?.meta?.tick === 'number' ? state.meta.tick : 0;
+}
+
 /**
  * 从 payload 里取**可选的**字符串维:缺项 / 非字符串 / 纯空白 ⇒ `null`。
  *
@@ -138,9 +236,10 @@ function numField(v: unknown): number | null {
  *   4 当前房间不是 `ALCHEMY_LAB` ⇒ `INVALID`(失败路径**不动**背包);
  *   5 报文缺项 / 产物不在内容表 / 产物没有配方 ⇒ `INVALID`;
  *   6 配方不满足(材料不足)⇒ `INVALID`,**一个材料都不扣**;
- *   7 材料扣减被拒 ⇒ `INVALID`;
- *   8 产物收不下 ⇒ **退回材料** + `INVALID`(不吞);
- *   9 成功 ⇒ `OK` + `effect`(材料、产物、实际消耗明细)。
+ *   7 ★ **订单预占失败(同一单已结算过)⇒ `INVALID`,材料没扣、产物没发(判重前移)**;
+ *   8 材料扣减被拒 ⇒ `INVALID`(预占已释放);
+ *   9 产物收不下 ⇒ **退回材料** + `INVALID`(不吞;产物凭证已撤销,预占已释放);
+ *  10 成功 ⇒ `OK` + `effect`(材料、产物、实际消耗明细)。
  */
 export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* 1 权限闸:越权在此返回,且**未产生任何副作用**(背包一个数都没动)。 */
@@ -216,24 +315,60 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     .map(([k, n]) => ({ itemId: Number(k), delta: -n }))
     .filter((op) => op.delta !== 0);
 
-  /* 7 **先扣材料**:整批 ops 一次提交 ⇒ 反作弊要么全过要么全拒,
+  /* ── 7 ★ **订单预占(判重前移)**:先 claim 订单,再扣料/发放 ──
+     审计 P2:修前的顺序是 `spend` → `gain` → `brewAtFurnace(orderId)`,判重发生在
+     **发完东西之后** ⇒ 同一单重放时材料被扣、产物被发,**第二炉**已经出来了,
+     只有 537 的陈列被世界侧拒掉(回执里那一句 `galleryNote`)。那正是「判重晚一步」。
+
+     现在:预占在本步发生 —— 任何副作用之前。失败 ⇒ 直接拒且**零副作用**
+     (材料没扣、产物没发、陈列没动)。预占成功后才扣料/发放;发放失败或产物
+     收不下(材料已退回)时**释放预占** —— 那一单并没有结算,补齐条件后同单号仍可炼
+     (与 `systems/idempotency.ts` 的纪律 2「只有成功才占键」同口径)。
+
+     ⚠️ 权威结算仍在世界侧 `brewAtFurnace`(它按同一把键 `ALCHEMY_LAB@ORDER:<订单号>`
+     记进 `roomSystemsState.settled`)—— 这里**不是第二张结算台账**,而是
+     「在扣任何东西之前先确认这单没结算过」的那一步。键由 `settleKeyOf` 归一,
+     两侧逐字同形(没有订单号时退化成与 `brewAtFurnace` 同形的
+     `${actorId}#<材料升序>#<帧>`)。 */
+  const tick = tickOf(ctx);
+  const consumedIds = Object.entries(match.consumed)
+    .filter(([, n]) => n > 0)
+    .map(([k]) => Number(k))
+    .sort((a, b) => a - b);
+  const claimKey = furnaceClaimKeyOf(ctx.actorId, consumedIds, tick, orderId);
+  const claim = claimFurnaceOrder(ctx.state, claimKey, tick);
+  if (!claim.ok) {
+    return {
+      ok: false, kind: 'INVALID',
+      reason: `${claim.reason} ⇒ 未消耗任何材料、未产出任何东西`,
+    };
+  }
+
+  /* 8 **先扣材料**:整批 ops 一次提交 ⇒ 反作弊要么全过要么全拒,
      不存在「扣了一半」。消耗是负 delta,不需要 source(凭证链只约束产出侧)。 */
   const spend = ctx.applyInventory(ctx.actorId, { ops: spendOps });
   if (!spend.allowed) {
+    /* 扣料都没成 ⇒ 这一单**没有结算** ⇒ 释放预占(否则一次失败把订单永久锁死)。 */
+    releaseFurnaceOrder(ctx.state, claim.key);
     return {
       ok: false, kind: 'INVALID',
       reason: `材料扣减被拒(${spend.rejectCode ?? '被拒'})⇒ 未消耗任何材料`,
     };
   }
 
-  /* 8 **再给产物**:先铸**绑定**凭证再 `applyInventory(+n, source)`,顺序反过来
+  /* 9 **再给产物**:先铸**绑定**凭证再 `applyInventory(+n, source)`,顺序反过来
      会被反作弊按「凭空产出」拒。产出件数取内容表的 `output`(`165` 是 1 → 3 件)。 */
   const made = Math.max(1, Math.trunc(def.output ?? 1));
   const src = bindItemSource(ctx, itemId, ItemSourcePurpose.CRAFT);
   const gain = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: made, source: src }] });
   if (!gain.allowed) {
-    /* 9 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
-       退回是正 delta ⇒ **每一件**都要自己的绑定令牌(令牌绑 itemId,不能串用)。 */
+    /* 10 事务性:产物收不下(容量 ⇒ `ITEM_OVERFLOW`)⇒ **退回材料**,不吞材料。
+       退回是正 delta ⇒ **每一件**都要自己的绑定令牌(令牌绑 itemId,不能串用)。
+       ★ 审计 P3:产物那张令牌已经登记却没用掉 ⇒ **显式撤销**,不让它留到 tick 末
+       变成「服务端认可过的来源」。
+       ★ 退回的返回值不再丢弃(与 `craft.ts` 同口径):退回失败必须写进回执。 */
+    unbindItemSource(ctx, src);
+    releaseFurnaceOrder(ctx.state, claim.key);
     const refund = ctx.applyInventory(ctx.actorId, {
       ops: spendOps.map((op) => ({
         itemId: op.itemId,
@@ -261,10 +396,8 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
      ## 材料清单取哪里
      `match.consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件);
      它同时也是 536 要求的「2~4 件材料」的权威来源 —— 不另抄一份报文。 */
-  const consumedIds = Object.entries(match.consumed)
-    .filter(([, n]) => n > 0)
-    .map(([k]) => Number(k))
-    .sort((a, b) => a - b);
+  /* `consumedIds` 已在判重之前算好(见第 7 步的「订单预占」)—— 这里不再算第二遍:
+     两次各自排序的写法会在留白槽选中项上分叉,而它正是 `brewAtFurnace` 的键的一维。 */
   /* `brewAtFurnace` 是 `WorldSaveHost` 的**可选**成员:老世界源没有它就
      如实标 `gallery: null`(而不是假装陈列已更新)。
 

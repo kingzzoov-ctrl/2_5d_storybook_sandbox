@@ -71,6 +71,17 @@ export interface ActionContext {
    */
   grantItemSource(userId: string, source: string): void;
 
+  /**
+   * **撤销**一张已登记的产出凭证(正向 `applyInventory` 被拒时调用)。
+   *
+   * ⚠️ 动作层**不要**直接调它:用 `actions/item_source.ts` 的
+   *   `unbindItemSource(ctx, token)` —— 它绑的就是 `bindItemSource` 铸出来的那张,
+   *   调用点因此不会退化成「撤错串」。
+   *
+   * 可选:手搓 `ctx` 的测试桩没有它 ⇒ `unbindItemSource` 回 `false` 表示
+   * 「这条链没接撤销口」,而不是静默当作撤销成功。
+   */
+  revokeItemSource?(userId: string, source: string): void;
   /** 角色变更;宿主方法**自带**权限闸。 */
   setMemberRole(actorId: string, targetId: string, role: RoomRole): { ok: boolean; reason?: string };
   /** 踢人;宿主方法**自带**权限闸。 */

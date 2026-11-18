@@ -2,6 +2,7 @@
 
 - **日期**:2026-11-18
 - **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。**2026-11-18 第三批处置**:再关 **3 条**(P2-13 上界 / P3-6 钳制选址 / P3-8 双端同源拦截)+ 订正本文件与代码现状矛盾的措辞(P3-9),判据 `tests/WS-FND-95-gate-and-bounds.test.ts`;详见 §7.5 与 §8。**现存仍登记 4 条**:P2-3 / P3-1 / P3-5 / P3-9。
+- **2026-11-18 第四批处置(第二轮)**:新审计的 **8 条 P1 + 12 条 P2/P3** 全部已修且各有判据(`tests/WS-FND-102..105`,共 42 条判据);逐条见 §9。
 - **口径**:本文件是交付物,不新增门禁;`docs/` 下其它文件一概未动。
 
 ## 1 覆盖率
@@ -67,6 +68,7 @@ foreach ($d in 'server/src','shared','client','scripts') {
 | P1-9 | P1 | 台账关闭靠放宽正则:`scripts/verify.ts` 的同义反复白名单(`TAUT_SUSPECT_EXEMPT`) | 已修(判据 `tests/WS-FND-90-gate-truth.test.ts`;37 条退回未关闭) |
 | P1-10 | P1 | `content-lock` 只哈希手挑字段 ⇒ 改别的字段指纹不变:`scripts/content-lock.ts` | 已修(判据 v2 整字段指纹;`node scripts/content-lock.ts --audit`) |
 | P1-11 | P1 | 判据「自己比自己」:actual 与 expected 同取自被测模块:`scripts/verify.ts` 同义反复检测 | 已修(判据 `tests/WS-FND-90-gate-truth.test.ts`) |
+> **第四批追加**:P1-7(文档数字 / 哈希陈旧)追加判据 `WS-FND-103:13` —— §九 README sha256 过期属同一族(见 §9.3)。
 
 ### 3.2 P2 / P3(2026-11-18 第二批 + 第三批:18 条已修 / 4 条仍登记)
 
@@ -94,6 +96,7 @@ foreach ($d in 'server/src','shared','client','scripts') {
 | P3-7 | P3 | `node:sqlite` 事务不支持嵌套:`server/src/db/driver.sqlite.ts:233`(`transaction` 直接转发) | 已修(判据 `tests/WS-FND-94` FND94-1a/1b/1c) |
 | P3-8 | P3 | 双端同源检测仍只告警:`scripts/verify.ts`(`advise('同义反复', ...)`,不进退出码) | 已修(2026-11-18 第三批:并进**默认拦截**,与三道 strict 同口径、`--lenient` 才降级,汇总行给出条数;见 §8.2;判据 `tests/WS-FND-95` FND95-1/2/3) |
 | P3-9 | P3 | client 顶点色与 `aLodMerge` 的 LOD 合并语义未定:`client/src/three/compat.ts`(属性与几何生成)、`client/src/stage/terrain_vcolor.ts` | 登记(理由 R22;要视觉裁决) |
+> **第四批追加**:P2-10 追加判据 `WS-FND-104:10/11`;P2-12 追加 `WS-FND-102:7`(同族第二处,见 §9.3)。
 
 ## 4 未修项(逐条理由)
 
@@ -126,6 +129,11 @@ foreach ($d in 'server/src','shared','client','scripts') {
   - R20 `node:sqlite` 事务不支持嵌套 ⇒ 现状没有嵌套调用点;要支持需自带 savepoint,收益低于风险。
   - ~~R21 双端同源检测仍只告警~~ **已关闭(2026-11-18 第三批)**:它的前提是「先把现存命中清零」,而实测已是 **0 处**(`node scripts/verify.ts --docs` 打印 `· 双端同源 0 处`)⇒ 前提满足,已并进默认拦截(§8.2)。判据 FND95-1/2/3。
   - R22 顶点色 + `aLodMerge` 的 LOD 合并语义 ⇒ 视觉语义未定(合并阈值与顶点色的插值口径要先出裁决),今天的判据只钉「属性存在且长度对」。
+> **第四批追加(2026-11-18,判据 `WS-FND-102..105`;逐条见 §9)**:
+> · **R10** 追加 `WS-FND-104:10/11` —— 1 MiB 上限已进 DDL(`CHECK`),`loadWorldArchive` 拒绝「摘要字节数 ≠ BLOB 长度」的原料;
+> · **R12** 追加 `WS-FND-102:7` —— 同族第二处:五张旁表在 `remove` 路径也曾漏收(`removePlayer` 用 `bodies.delete` 绕过 `PhysicsWorld.remove`);
+> · **R14** 追加 `WS-FND-102:4/5` —— 同函数另一条:`mobOrdinals` 按归档 id 重建而计数器清 0 ⇒ 发号撞号、同 id 静默整只替换。
+> 三行的原状态(已修 / 登记)不变;追加的是**同一族第二条路径**的判据。
 
 ## 5 本轮代码改动(唯一一处)
 
@@ -168,6 +176,7 @@ this.expireItemSources();
 | WS-FND-92 | P2-8(FND92-1..5/10 交互半径)· P2-9(FND92-6..9 放件扣件) |
 | WS-FND-93 | P2-1 / P2-2(FND93-1..6:唯一推送口 + 清空路径 + 非法值守卫 + 来源链) |
 | WS-FND-94 | P3-7(FND94-1a/1b/1c 嵌套事务)· P2-10(FND94-2a/2b 快照 1 MiB)· P2-11(FND94-4a/b/c clone 活跃集)· P2-12(FND94-5a/5b 旁表回收)· P3-2(FND94-6 setRoof 12 位)· P3-3(FND94-7 decodeRoofRle)· P3-4(FND94-8a/8b setCell 实心格) |
+> 这张表只覆盖**第二批**;第四批的同类对照在 **§9.1**(判据 `tests/WS-FND-102..105`)。
 
 ### 7.2 与交接单的两处**不一致**(如实记)
 
@@ -288,3 +297,78 @@ this.expireItemSources();
 - 已知的**非本批**红:`--docs` 有 2 条 HANDOVER 数字红(生产可达性 132/144 vs 实测 133/145、
   生产 .ts 合计 144 vs 145),根因是并行批次新增了 `server/src/systems/idempotency.ts`,
   不是本批四条改动。
+
+## 9 2026-11-18 第四批处置(第二轮:8 条 P1 + 12 条 P2/P3)
+
+> 判据:`tests/WS-FND-102-kill-drops-and-retire.test.ts`(8 条)、
+> `tests/WS-FND-103-gate-selfproof.test.ts`(13 条)、
+> `tests/WS-FND-104-archive-integrity.test.ts`(12 条)、
+> `tests/WS-FND-105-action-ledgers.test.ts`(9 条)—— 共 **42 条判据**。
+> 下面的 20 条按**发现**去重计数(同一修法的正/负对照算一条),严重度取套件文件头的标注:
+> **P1 8 条 / P2·P3 12 条**。关闭口径不变:已修 = 标记 ∧ 可查证据(每条点到判据编号)。
+
+### 9.1 判据 ↔ 条目对照
+
+| 套件 | 条数 | 钉住的条目 |
+|---|---|---|
+| WS-FND-102 | 8 | P1-A 击杀掉落落地(102:1/2/3)· P2-A `mobOrdinals` 重号(4/5)· P2-B `removePlayer` 漏清瞬态(6/7)· P2-C `KillLedger` 无界(8) |
+| WS-FND-103 | 13 | P1-B 门禁自检默认永不失败(1/2/3)· P1-C 测试门结构性可绕过(4/5/6/7)· P1-D 计数对账无下限(8..12)· P1-E HANDOVER §九 哈希过期(13) |
+| WS-FND-104 | 12 | P1-F 归档头裁剪不可见(1/2/5)· P1-G 块表校验和缺失(3/4)· P1-H 迁移版本护栏与漂移顺序(6/7/8/9)· P2-D 1 MiB 兜底 + `loadWorldArchive` 自相矛盾(10/11) |
+| WS-FND-105 | 9 | P2-E..P2-K + P3-A 动作层四本侧账与令牌(1..9,逐条见 9.2) |
+
+### 9.2 逐条处置(20 条)
+
+**P1(8 条)**
+
+| # | 发现 | 处置 |
+|---|---|---|
+| P1-A | 击杀掉落从不落地:`server/src/sim/world_sim.ts` 的 `settleKill` 把 `rollMobDrops()` 只写进诊断字段 `lastMobDrops`(生产 0 读者),从不调 `dropItem` ⇒ 打死怪的地面永远是空的 | 已修:击杀路径真调 `dropItem`,落地件数/坐标/内容按内容表(`shared/constants/mobs.ts`);负对照钉「同一实例二次结算不给第二份」(102:1/2/3) |
+| P1-B | 门禁自检默认永不失败:`scripts/verify.ts::checkGateSelfcheck` 非 `--strict-selfcheck` 时 `advise()` + `return`(exit 0)⇒ 「唯一证明各门有牙」的东西自己默认必绿 | 已修:默认口径**真跑**,`--lenient` 才降级;`selfcheckPolicy` / `selfcheckOutcome` 是判据面(103:1/2/3) |
+| P1-C | 测试门结构性可绕过:`tests/` 缺失或 0 套件只 `console.log` 后 return;套件不打印 `N/M 通过` 则 `if (c)` 静默跳过(实测 `--only __NOMATCH__` ⇒ exit 0 + 「全部通过」) | 已修:`suiteSetVerdict` / `assertionCountVerdict` / `parseAssertionCounts` 三处判据:0 套件即 fail、缺 `N/M` 即 fail(103:4/5/6/7) |
+| P1-D | 计数对账可无为通过:`scripts/count-audit.ts` 只认 4 条固定措辞,改个词 ⇒ hits=0 仍印「一致 0」exit 0;`verify.ts` 对缺 `count-audit.ts` 只 `advise` | 已修:命中数有具名下限、被扫文件必须在、文件缺失 ⇒ fail(103:8..12) |
+| P1-E | `docs/HANDOVER.md` §九 的 README sha256 已过期(表 `a38cb95b2d4b` / 实测 `d3604da144a2`) | 已修:表值改由重算脚本写入(本批改 README 后再次重算,见 9.4);判据钉「表值 = LF 归一后的实测值」(103:13) |
+| P1-F | 归档头裁剪不可见:头里没有 `chunksTotal` / `chunksChecksum`,删掉 `trim` 键即等同「没裁过」 | 已修:`server/src/world/archive.ts` 写两键;`planRestore.missingChunks` 恒按 `chunksTotal − 实际块数` 报缺口;旧字节(两键缺)⇒ `chunksChecksumOk === null`(**不可判 ≠ 通过**)(104:1/2/5) |
+| P1-G | 块表被改(cx / 长度)静默接受:解码器不核对块表校验和;改小 `chunksTotal` 同样被接受 | 已修:校验和规范文本含块数与每块 cx/长度 ⇒ 不匹配**抛错**(104:3/4) |
+| P1-H | 迁移既无版本护栏、漂移判定又在 DDL 之后:`migrate()` 对未知版本 99 / 更旧版本 0 不拒;同版本 checksum 漂移时 DDL 已执行;归档迁移漂移仍能写入;`bootstrap()` 会偷建第 10 张表 | 已修:`assertMigrationVersionSupported` 先判;漂移返回 `drift` 且判在 `db.exec(ddl)` 之前;`archiveWorldSnapshot` 遇漂移抛错且一行不写;`bootstrap()` 保持 9 张表(104:6/7/8/9) |
+
+**P2 / P3(12 条)**
+
+| # | 发现 | 处置 |
+|---|---|---|
+| P2-A | `mobOrdinals` 重号:`applyRestore` 按归档 id 重建,而 `rebuildWorld` 已把计数器清 0 ⇒ 后续发号从 `#1` 起重来、撞上已恢复实例;`addMob` 同 id **静默整只替换**(满血/丢 FSM),`killLedger` 按 id 去重 ⇒ 击杀被吞(经验不到账、不报错) | 已修:序号水位推进到「已恢复的最大序号」;`mob_boar`(无号)/ `mob_boar#0` / `mob_boar#x` 三种脏 id 不动水位;端到端钉「真刷出来的新怪不撞号」(102:4/5) |
+| P2-B | `removePlayer` 漏清瞬态:未清 `foodBuffs` / `liveBubbles` / `sprayUntil` / `knockbacks`,且用 `bodies.delete` 摘物理刚体(五张旁表留着)⇒ 同名重连继承上轮料理 buff(且 `hpFlat` 并进上限)/ 泡泡 / 击退 | 已修:瞬态逐项清;摘刚体改走 `PhysicsWorld.remove`,`speedCapOf` 回 `null`(102:6/7) |
+| P2-C | `KillLedger` 无界:只 add 无淘汰 ⇒ 常驻房间进程生命期内无界增长 | 已修:`server/src/combat/progression.ts` 的 `KillLedger` 按 `KILL_LEDGER_CAPACITY` FIFO 淘汰最老、窗口内仍去重、`reset()` 清顺序表(102:8) |
+| P2-D | 写库无 DDL 兜底,且 `loadWorldArchive` 会交出「摘要字节数 ≠ BLOB 长度」的自相矛盾原料 | 已修:`server/src/db/schema_world_archive.sql` 带 `CHECK (length(snapshot_blob) <= 1048576)`(两后端 1048577 均被拦、1048576 收);摘要与 BLOB 不等 ⇒ `undefined`(104:10/11) |
+| P2-E | `BUY_ITEM` 幂等键缺 actor 维:`purchaseCommit` 只传 `actorId` ⇒ 键退化成 `item#frame`,同帧同玩家第二单被判重放 | 已修:键带 actor,同帧第二单不再被拒;显式 `orderId` 重发仍按重放拒(105:1) |
+| P2-F | 同一键的另一个面:同帧**两个玩家**买同一件会撞键 ⇒ 第二个被当重放拒 | 已修:负对照钉「键不同、各成交一次」(105:2) |
+| P2-G | `USE_ALCHEMY_FURNACE` 判重发生在 `spend` + `gain` **之后** ⇒ 重放有副作用(再扣料 / 出第二炉 / 再 `brewAtFurnace`) | 已修:先 `claimFurnaceOrder` 再扣/产,重放**零副作用**(105:3) |
+| P2-H | 炼金订单预占在失败后不释放 ⇒ 同一单号补齐条件也炼不了(订单被锁死) | 已修:失败路径 `releaseFurnaceOrder`,同单号补齐后可炼(105:4) |
+| P2-I | 正向发放失败不撤销凭证:`bindItemSource` 之后 `!gain.allowed` 直接返回 ⇒ 那张串仍是合法来源 | 已修:`unbindItemSource` 撤销,撤销后同串被拒(105:5) |
+| P2-J | 退回失败被吞:`ctx.applyInventory` 的返回值被丢 ⇒ `use_item` / `place_block` 的退回失败不进回执,退回凭证也不撤 | 已修:`refund()` 带返回值并入回执、退回凭证一并撤销(105:6) |
+| P2-K | `RESET_WORLD` 不清本房间侧账:箱子 / 放置 / 宠物三本模块级 Map 全仓 0 个回收点 ⇒ 重置后残留到下一局 | 已修:`server/src/net/actions/reset_world.ts` 的 `forgetRoomSideLedgers` 挂在**成功**回执路径,**另一个房间不动**;`applied:false` 时一本都不动(105:7/8) |
+| P3-A | 令牌只增不减:`RoomRuntime` 没有撤销口(P3) | 已修:新增 `revokeItemSource`;在真 `RoomRuntime` 上复核「登记过的令牌就是合法来源 / 撤销后同串被拒」(105:9) |
+
+### 9.3 对前批台账的追加(§3 / §4 / §7 对应条目)
+
+- §3.1 **P1-7**(文档数字/哈希陈旧)追加判据 **WS-FND-103:13**:§九 README sha256 过期属同一族,
+  现在由「重算脚本 + 判据」双向钉住(改 README 不同步重算 ⇒ 红)。
+- §3.2 **P2-10**(`snapshot_blob` 写库无上限)追加判据 **WS-FND-104:10/11**:1 MiB 上限已进 DDL(`CHECK`),
+  `loadWorldArchive` 拒绝自相矛盾原料。
+- §3.2 **P2-12**(`physics.spawn()` 覆盖同 id 不清旁表)追加判据 **WS-FND-102:7**:同族第二处 ——
+  `removePlayer` 曾用 `bodies.delete` 绕过 `PhysicsWorld.remove`,现两条路同口径回收。
+- §4 **R10 / R12 / R14** 三行:在该条列表末尾追加了「第四批追加」块(§4 末,逐条 R10 → `WS-FND-104:10/11`、R12 → `WS-FND-102:7`、R14 → `WS-FND-102:4/5`),原状态不变。
+- §7.1 那张「判据 ↔ 条目」表只属第二批;第四批的同类对照在 **§9.1**(已在该表下注明)。
+
+### 9.4 本批验证口径
+
+- **未跑 `scripts/verify.ts --all`**(硬约束)。逐套件直跑 `node tests/<file>`:
+  **114 套件 / 2259 用例全绿**(基座 FND 1245 条 / 100 套件,WS 编号 1014 条 / 14 套件);
+  4 个新套件 8 / 13 / 12 / 9 条,全部 `N/N`。
+- `node scripts/typecheck-baseline-audit.ts` ⇒ **基线 261 条 / 实测 261 条,唯一指纹 129/129**
+  (`--docs` 之前先跑过 `node scripts/typecheck.ts`:261 条,与基线逐条一致,**未新增**)。
+- `node scripts/verify.ts --docs` ⇒ **exit 1 / 2 项失败**,同一根因(不在本批写权限内):
+  `WS-FND-102::KILL_LEDGER_CAPACITY` 被判「同义反复候选」—— 断言右侧取自被测常量
+  ⇒ 容量写错也照样绿(README 自己写明「常量要在 actual 侧才保留牙齿」);
+  连带 HANDOVER §三「同义反复候选 **0 条**(白名单 0)」与实测 1/0 不符。
+  修点在 `tests/WS-FND-102`(期望值改字面量 + 留常量锚点)或 `verify.ts` 白名单;本批**未动**。
+- 未跑 `content-lock`(未碰内容表);未 commit、未碰 `.pi/`。

@@ -30,7 +30,7 @@ import { fnv1a, seededRoll } from '../../bosses/raid.ts';
 /* ★ 审计 P0-2 + P1 的两道口:产出侧铸**绑定令牌**,扣减侧读**按件权威账**。
    见 `item_source.ts` 的文件头 —— 那里是"为什么",这里是"用在哪"。 */
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { bindItemSource, missingItemReadPort, ownedItemCount } from './item_source.ts';
+import { bindItemSource, missingItemReadPort, ownedItemCount, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -135,8 +135,16 @@ export const placeBlock: ActionHandler = (ctx: ActionContext) => {
     /* 扣了东西却没放下 ⇒ **退回**。退回是正 delta ⇒ 必须先铸**绑定**凭证
        (绑定 itemId:它只换回这一件,不能拿去铸别的)。 */
     const src = bindItemSource(ctx, itemId, ItemSourcePurpose.PLACE_REFUND);
-    ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
-    return { ok: false, kind: 'INVALID', reason: r.reason };
+    /* ★ 审计 P3:退回的返回值**不许丢**(与 `craft.ts:206` 同口径)。
+       修前这一行把结果丢掉 ⇒ 退回被拒时东西静默消失,而回执看起来像「已退回」。
+       退回被拒时这张凭证也没被用掉 ⇒ 一并**显式撤销**(见 `unbindItemSource`)。 */
+    const refund = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: 1, source: src }] });
+    if (!refund.allowed) unbindItemSource(ctx, src);
+    return {
+      ok: false, kind: 'INVALID',
+      reason: r.reason
+        + (refund.allowed ? '' : `(退回也被拒:${refund.rejectCode ?? '被拒'} ⇒ 这一件没能回到背包)`),
+    };
   }
   return { ok: true, kind: 'OK', effect: { x, y, itemId } };
 };
@@ -182,6 +190,10 @@ export const breakBlock: ActionHandler = (ctx: ActionContext): ActionOutcome => 
   };
   if (r.gatherMul !== undefined && r.gatherMul !== 1) effect.gatherMul = r.gatherMul;
   if (gain.allowed) return { ok: true, kind: 'OK', effect };
+  /* ★ 审计 P3:这张凭证已经登记、却没被用掉 ⇒ **显式撤销**(不靠 tick 末的
+     `expireItemSources` 兜)。留到 tick 末它一直是「服务端认可过的来源」,
+     同一 tick 内另一条分支拿同一张串铸 +delta 会被「登记过」放行。 */
+  unbindItemSource(ctx, src);
   mat.dropItem(x, y, r.objId, count);
   effect.dropped = count;
   effect.note = `背包收不下(${gain.rejectCode ?? '被拒'})⇒ 掉在原地`;

@@ -21,6 +21,13 @@
  * 8 成交                       ⇒ OK + effect(itemId / qty / cost / 剩余库存)
  * ```
  *
+ * ## ★ 同帧多单不再被判重放(审计 P2,见下文 `derivedOrderIdOf`)
+ *
+ * 修前只把 `{ actorId }` 交给 `purchaseCommit`,幂等键退化成
+ * `${actorId}#${itemId}#${frameCount}` ⇒ **同一帧的第二单撞第一单的键**、
+ * 回 `replayed: true` 被退回,回执写成 `INVALID`「成交提交被拒」。
+ * 现在:报文带 `orderId` 就用它;不带则由服务端派生 `actor#item#tick#序号`。
+ *
  * ## ⚠️ 本仓**没有货币账本**(这是如实边界,不是遗漏)
  *
  * 内容表里**没有「金币」这件物品**(`ITEM_LIST` 101~745 里没有),`PlayerState`
@@ -37,35 +44,115 @@
  */
 import { ITEM_BY_ID } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
-import { bindItemSource } from './item_source.ts';
+import { bindItemSource, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /**
  * `WorldSaveHost.purchaseCommit` 的**带幂等键**形态。
  *
- * `net/room.ts` 里那条声明仍是两参(本批只允许改本文件),而世界侧
- * `WorldSim.purchaseCommit(itemId, qty, { actorId })` 早就接受第三参并回
- * `stockOfItem`。⇒ 在本文件收窄一次,只为两件事:
+ * `net/room.ts` 里那条声明仍是两参,而世界侧
+ * `WorldSim.purchaseCommit(itemId, qty, { actorId, orderId })` 早就接受第三参并回
+ * `stockOfItem` / `replayed`。⇒ 在本文件收窄一次,只为三件事:
  *   1. 把 `actorId` 传下去 —— 不传则幂等键退化成 `#itemId#frame`,
  *      **两个不同玩家在同一帧买同一件会撞键**(第二个被当重放拒掉);
- *   2. 拿**提交时**的 `stockOfItem`,而不是报价那张旧快照。
+ *   2. ★ **把显式 `orderId` 传下去**(见下方「同帧多单」);
+ *   3. 拿**提交时**的 `stockOfItem`,而不是报价那张旧快照。
  * 字段逐个写出、不用 `any`:契约补进 `room.ts` 之后删掉这个别名即可。
  */
 type PurchaseCommitWithKey = (
   itemId: number,
   qty: number,
-  opts?: { actorId?: string },
-) => { ok: boolean; cost: number; reason: string; stockOfItem?: number };
+  opts?: { actorId?: string; orderId?: string },
+) => { ok: boolean; cost: number; reason: string; stockOfItem?: number; replayed?: boolean };
+
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
 /**
+ * 从 payload 里取**可选的**订单号:缺项 / 非字符串 / 纯空白 ⇒ `null`。
+ *
+ * 与 `use_alchemy_furnace.ts` 的同名守卫同一口径(空串不是订单号),**不拒绝** ——
+ * 它是可选维:老报文没有 `orderId` 仍然合法,由服务端派生(见下)。
+ */
+function orderIdField(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  return s === '' ? null : s;
+}
+
+/**
+ * ## ★ 同帧多单:显式 `orderId` 由谁给(审计 P2:修前第二单被判重放)
+ *
+ * 修前本文件只把 `{ actorId }` 传给 `purchaseCommit`,世界侧的幂等键退化成
+ * `${actorId}#${itemId}#${frameCount}` ⇒ **同一帧的第二单撞上第一单的键**,
+ * 回 `replayed: true` 被退回,而回执写成 `INVALID`「成交提交被拒」。玩家的行为
+ * 完全合法(同一帧买两单),却被当成重放 —— 这是键**不唯一**,不是玩家重发。
+ *
+ * 修法(两层,缺一层都还漏):
+ *   1 **客户端给了 `orderId` 就用它**(权威身份;重发同单号 ⇒ 世界侧按重放拒,
+ *      `stallStock` 一位不动 —— 幂等仍成立);
+ *   2 没给 ⇒ **服务端派生** `${actorId}#${itemId}#${tick}#${seq}`,其中 `seq` 是
+ *      本房间本 tick 内 `(actor, item)` 的第几单 ⇒ 同帧多单**必可区分**。
+ *
+ * ⚠️ 如实边界:没有 `orderId` 时这份派生键**不是**幂等键 —— 服务端无法把
+ *   「同一单重发」与「同帧第二单」区分开(两者在报文里完全一样)。扣减仍受
+ *   摊位库存与背包容量约束,而真正的重发保护要求客户端带 `orderId`。
+ *   这一句写在这里,而不是留成「看起来有幂等」的假象。
+ *
+ * 状态为什么挂在 `ctx.state` 的**对象身份**上(`WeakMap`):它只是「本房间本 tick
+ * 第几单」的计数器,不是账本 —— 按房间实例分桶既不会跨房间串号,也不会随
+ * 创建过的房间数增长(房间被回收即随 GC 消失)。
+ */
+type SeqBucket = { tick: number; byItem: Map<number, number> };
+const PURCHASE_SEQ = new WeakMap<object, SeqBucket>();
+/** `ctx.state` 不是对象的手搓桩(单测夹具)共用一份 —— 同样按 tick 重置。 */
+const STUB_SEQ_BUCKET: SeqBucket = { tick: Number.NaN, byItem: new Map<number, number>() };
+
+/** 本房间(或桩)的序号桶;`tick` 变了就整桶重置(序号只在本 tick 内有意义)。 */
+function seqBucketOf(ctx: ActionContext, tick: number): SeqBucket {
+  const state = ctx.state as unknown;
+  let bucket: SeqBucket | undefined;
+  if (state !== null && typeof state === 'object') {
+    bucket = PURCHASE_SEQ.get(state as object);
+    if (bucket === undefined) {
+      bucket = { tick, byItem: new Map<number, number>() };
+      PURCHASE_SEQ.set(state as object, bucket);
+    }
+  } else {
+    bucket = STUB_SEQ_BUCKET;
+  }
+  if (bucket.tick !== tick) {
+    bucket.tick = tick;
+    bucket.byItem.clear();
+  }
+  return bucket;
+}
+
+/** 当前 tick(与 `item_source.ts` 的令牌 tick 同一读数;桩没有 `state` ⇒ 0)。 */
+function tickOf(ctx: ActionContext): number {
+  const state = ctx.state as unknown as { meta?: { tick?: number } } | null | undefined;
+  return typeof state?.meta?.tick === 'number' ? state.meta.tick : 0;
+}
+
+/** 本帧第几单 `(actor, item)`;从不重复 ⇒ 同帧多单的派生键必不相同。 */
+function nextOrderSeq(bucket: SeqBucket, itemId: number): number {
+  const n = (bucket.byItem.get(itemId) ?? 0) + 1;
+  bucket.byItem.set(itemId, n);
+  return n;
+}
+
+/** 本文件里唯一的键形(派生形态):`actor#item#tick#序号`。 */
+function derivedOrderIdOf(ctx: ActionContext, itemId: number, tick: number, seq: number): string {
+  return `${ctx.actorId}#${itemId}#${tick}#${seq}`;
+}
+
+/**
  * 购买(515)。
  *
- * 报文契约:`{ itemId: number, qty: number }`。
+ * 报文契约:`{ itemId: number, qty: number, orderId?: string }`。
  */
 export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* 1 权限闸:越权在此返回,且未产生任何副作用。 */
@@ -104,6 +191,8 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   if (ITEM_BY_ID.get(itemId) === undefined) {
     return { ok: false, kind: 'INVALID', reason: `物品 ${itemId} 不在冻结内容表里` };
   }
+  /* ★ 可选订单号(见 `derivedOrderIdOf` 上方):给了就原样用,没给由下面派生。 */
+  const givenOrderId = orderIdField((ctx.payload as { orderId?: unknown }).orderId);
 
   /* 5 报价(纯判定,零副作用):无定价 / 库存不足都在这一步被拒。 */
   const quote = host.purchaseQuote(itemId, qty);
@@ -117,16 +206,23 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     ops: [{ itemId, delta: qty, source: src }],
   });
   if (!gain.allowed) {
-    /* 背包收不下 ⇒ 库存**还没动**(提交在第 7 步)⇒ 无需回滚,直接拒。 */
+    /* 背包收不下 ⇒ 库存**还没动**(提交在第 7 步)⇒ 无需回滚,直接拒。
+       ★ 审计 P3:这张凭证已经**登记**过了,而它没有被用掉 ⇒ **显式撤销**,
+       否则本 tick 内它一直是「服务端认可过的来源」(靠「消耗侧不读」兜是巧合,不是判据)。 */
+    unbindItemSource(ctx, src);
     return {
       ok: false, kind: 'INVALID',
       reason: `背包收不下 ${qty} 件(${gain.rejectCode ?? '被拒'})⇒ 未成交,摊位库存不变`,
     };
   }
 
-  /* 7 提交:成交才写库存。被拒 ⇒ 把刚收进来的东西退回去(不吞)。 */
+  /* 7 提交:成交才写库存。被拒 ⇒ 把刚收进来的东西退回去(不吞)。
+     ★ 幂等键:显式 `orderId`(客户端给的,或本帧第几单派生的)—— 见 `derivedOrderIdOf`。 */
+  const tick = tickOf(ctx);
+  const seq = nextOrderSeq(seqBucketOf(ctx, tick), itemId);
+  const orderId = givenOrderId ?? derivedOrderIdOf(ctx, itemId, tick, seq);
   const commitFn = host.purchaseCommit as PurchaseCommitWithKey;
-  const commit = commitFn(itemId, qty, { actorId: ctx.actorId });
+  const commit = commitFn(itemId, qty, { actorId: ctx.actorId, orderId });
   if (!commit.ok) {
     /* ★ 审计 P0-2:退回是**负 delta**(把这 qty 件拿回去),不是产出 ⇒
        **不发凭证**。修前这里 `grantItemSource(refundSrc)` ⇒ 一张退款凭证凭空多出来,
@@ -153,6 +249,9 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
          `?? quote...` 只是给**不返回该字段的老世界源/测试桩**兜底:它们连
          第三参都不接,拿不到实测值;权威路径仍是 `commit.stockOfItem`。 */
       stock: commit.stockOfItem ?? quote.stock[itemId] ?? 0,
+      /* ★ 本单的幂等键(显式派生或客户端给的)如实回执 —— 「这一单凭什么不被当重放」
+         是可判定事实,不该只活在服务端内存里。 */
+      orderId,
       roomKey: 'CLOUD_DEPOT',
       charged: false,
     },

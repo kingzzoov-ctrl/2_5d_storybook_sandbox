@@ -60,6 +60,30 @@ export function bindItemSource(
 }
 
 /**
+ * **撤销**一张已登记的产出凭证 —— 正向发放失败时的显式回撤入口。
+ *
+ * ## 为什么需要它(审计 P3:令牌先登记后正向失败不回撤)
+ *
+ * `bindItemSource` 是**登记**,`applyInventory(+, source)` 才是**发放**。两者的
+ * 顺序保证是对的(先登记后发放),但**发放被拒时不回撤登记** ⇒ 一张铸好却没用掉的
+ * 令牌留到 tick 末,`expireItemSources` 之前它一直是「服务端认可过的来源」。
+ * 同一 tick 内只要另一条分支拿它去铸 +delta,`checkInventory` 就会按「登记过」放行
+ * —— 那正是「凭证链只约束产出侧」被绕开的形态。
+ *
+ * ⇒ 失败路径**显式**撤销,而不是靠「消耗侧不读」兜(那不是判据,是巧合)。
+ *
+ * 撤销是**幂等**的:串不在集合里就什么都不做(重复调用安全)。
+ * 宿主没有撤销口(手搓 `ctx` 的测试桩)⇒ 返回 `false`,调用方据此知道
+ * 「这条链没接撤销口」—— 与 `missingItemReadPort` 同一条 fail-closed 纪律:
+ * 不把「没接」当成「撤过了」。
+ */
+export function unbindItemSource(ctx: ActionContext, source: string): boolean {
+  if (typeof ctx.revokeItemSource !== 'function') return false;
+  ctx.revokeItemSource(ctx.actorId, source);
+  return true;
+}
+
+/**
  * 「按件权威读口」的结构化窄化(`RoomRuntime` 把绑定函数挂进上下文)。
  *
  * 与 `use_item.ts` 的 `ctx as unknown as Partial<ItemReadPort>` 同一条口径:
