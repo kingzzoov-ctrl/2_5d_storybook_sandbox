@@ -182,9 +182,9 @@ async function auditIdentity(plan: { lines: string[] } | null): Promise<void> {
   const f = reg.contentFingerprints();
   add({
     group: G, label: '内容指纹 overall',
-    hb: 'v2-76694a25(既有锚点)', hbLine: null,
+    hb: 'v2-0afe5562(既有锚点)', hbLine: null,
     code: `v${f.version}-${f.overall}`, codeRef: 'server/src/content/registry.ts#contentFingerprints',
-    verdict: f.overall === '76694a25' && f.version === 2 ? 'MATCH' : 'MISMATCH',
+    verdict: f.overall === '0afe5562' && f.version === 2 ? 'MATCH' : 'MISMATCH',
     note: '锚点来自 README 状态块',
   });
   const cap = reg.contentCapacity().find((c: { space: string }) => c.space.includes('OBJ'));

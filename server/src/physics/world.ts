@@ -34,6 +34,32 @@ import {
   muOfSlot,
 } from '../world/chunk.ts';
 
+/* ═══════════════════════ 0. 质量守卫 ═══════════════════════ */
+
+/**
+ * 质量兜底值 —— 与冻结层 `MASS_PLAYER`(1.0,手册 §2.2 质量梯度 1.0/3.0/20.0)同源。
+ * 不新造数:质量为 1 时**一切按质量归一的算式与归一前逐位相同**。
+ */
+export const DEFAULT_BODY_MASS = MASS_PLAYER;
+
+/**
+ * 取一枚**可用**的质量;非法质量**拒绝**并退化为 `DEFAULT_BODY_MASS`。
+ *
+ * 「非法」的判据是 `Number.isInteger(mass) && mass > 0`,它一次覆盖三类坏值:
+ *   - `NaN`  —— 旧写法 `mass <= 0 ? 1 : mass` 对 `NaN` 判 `false` ⇒ `NaN` 顺着
+ *     `Δv = J / m` 传播成 `NaN` 速度(实测:质量为 `NaN` 的刚体被击退后位置变 `NaN`,
+ *     然后整条 AEI/投影链路一起变 `NaN`);
+ *   - `±Infinity` —— 旧写法同样漏(`-Infinity <= 0` 为真所以恰好被兜住,`+Infinity` 没有);
+ *   - `0` / 负数 / **小数**(非正整数) —— 手册的质量梯度是离散档 `1.0/3.0/20.0`,
+ *     小数质量没有来源,一律按非法处理(拒绝比静默接受更容易发现接线错误)。
+ *
+ * 非有限/非正整数 ⇒ **拒绝**(兜底),而不是抛错:调用点分布在物理步/冲量/撞击三条路径上,
+ * 抛错会把「某个刚体质量忘了填」升级成整帧崩。兜底后位移与速度仍是有限值,可判定。
+ */
+export function safeMass(mass: number): number {
+  return Number.isInteger(mass) && mass > 0 ? mass : DEFAULT_BODY_MASS;
+}
+
 /* ═══════════════════════ 1. 地形接口(结构化匹配 WorldGrid) ═══════════════════════ */
 
 export interface PhysTerrain {
@@ -838,9 +864,9 @@ export class PhysicsWorld {
         const nx = d > 1e-9 ? dx / d : 1;
         const ny = d > 1e-9 ? dy / d : 0;
 
-        /* 位置分离:按质量反比分配 */
-        const ma = a.mass <= 0 ? 1 : a.mass;
-        const mb = b.mass <= 0 ? 1 : b.mass;
+        /* 位置分离:按质量反比分配(非法质量先经 `safeMass` 拒绝,见 §0) */
+        const ma = safeMass(a.mass);
+        const mb = safeMass(b.mass);
         const total = ma + mb;
         const overlap = rr - d;
         a.x -= nx * overlap * (mb / total);
@@ -870,13 +896,18 @@ export class PhysicsWorld {
   /* ── 冲量工具 ── */
 
   /**
-   * 施加冲量 J:Δv = J / m。
+   * 施加冲量 J:Δv = J / m。**按质量归一**(质量越大 Δv 越小)。
    * 大锤击退走这条路径,平安盾在 CarrySystem 层拦截。
+   *
+   * `m` 一律经 `safeMass`(§0):`NaN` / `±Infinity` / `0` / 负数 / 小数质量被**拒绝**,
+   * 退化为 `DEFAULT_BODY_MASS`。旧写法 `mass <= 0 ? 1 : mass` 会让 `NaN` 质量
+   * 直接产出 `NaN` 冲量(`Δv = J / NaN`),而 `NaN` 一旦写进 `vx` 就再也回不来
+   * (积分器每一步都带着它)。
    */
   applyImpulse(id: string, jx: number, jy: number, jz: number): { dvx: number; dvy: number; dvz: number } {
     const b = this.bodies.get(id);
     if (b === undefined) return { dvx: 0, dvy: 0, dvz: 0 };
-    const m = b.mass <= 0 ? 1 : b.mass;
+    const m = safeMass(b.mass);
     const dvx = jx / m;
     const dvy = jy / m;
     const dvz = jz / m;
@@ -886,12 +917,12 @@ export class PhysicsWorld {
     return { dvx, dvy, dvz };
   }
 
-  /** 掼摔:把被举起者沿 dir 抛出并附加下压速度。 */
+  /** 掼摔:把被举起者沿 dir 抛出并附加下压速度。质量同样经 `safeMass` 归一。 */
   slam(id: string, dirX: number, dirY: number, power: number): { dvx: number; dvy: number; dvz: number } {
     const b = this.bodies.get(id);
     if (b === undefined) return { dvx: 0, dvy: 0, dvz: 0 };
     const len = Math.hypot(dirX, dirY) || 1;
-    const m = b.mass <= 0 ? 1 : b.mass;
+    const m = safeMass(b.mass);
     const dvx = (dirX / len) * power / m;
     const dvy = (dirY / len) * power / m;
     const dvz = -power / m;

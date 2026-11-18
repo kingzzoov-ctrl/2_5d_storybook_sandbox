@@ -346,8 +346,8 @@ export interface RoomElementResistEntry {
  *
  * ⇒ 按裁决口径登记一条**具名·待平衡**的默认(与 `combat/damage.ts` 的
  * `MOB_ELEMENT_BY_ID` 的「⚠ 待 owner 批准(平衡决策)」同一处理):
- * **数值与元素归属都不是平衡裁决**,owner 给了真内容就替换
- * `ROOM_ELEMENT_RESIST` 里那一行 —— 本常量随之退役。
+ * **数值不是平衡裁决**,owner 给了真内容就替换 `ROOM_ELEMENT_RESIST` 里那一行
+ * —— 本常量随之退役。
  *
  * 取 `0.5`(减半)的理由是**可观测**:它让判据能用关系式(「同一次元素伤害减半」
  * 「别的元素不串味」)钉住,而不是把一个平衡数字抄进断言里。
@@ -357,16 +357,58 @@ export const PENDING_ELEMENT_RESIST_MUL = 0.5;
 /**
  * 房间 → 玩家元素抗性的登记表(D4 的**数据来源**)。
  *
- * 元素取 `'ICE'`(霜冻)的读法:温泉馆的内容核心件是 `109 白玉温泉石`
- * (tag「保温」「恢复」)——「泡温泉取暖 ⇒ 抗霜冻」是与既有内容同向的那一个;
- * ⚠️ 元素归属同样**待 owner 裁决**。
+ * ## 元素怎么定:owner 裁决「**元素抗性按房间语义分元素**」
+ *
+ * 逐房间按**语义**定元素。依据写在每一行上面(房间名 / 核心件名;房间与核心件来自
+ * `ROOM_RECIPES`,`shared/constants/bosses.ts:255-265`,件名见
+ * `shared/constants/items.ts`)。**数值一律待平衡**(每行同一个
+ * `PENDING_ELEMENT_RESIST_MUL`,可整行替换)。
+ *
+ * ## 为什么表里只有 `FIRE` / `LIGHT`
+ *
+ * 元素必须与 `server/src/combat/weapons.ts` 的 `Element` **同口径** —— 那张表只有
+ * `NONE / FIRE / ICE / LIGHTNING / LIGHT / SLIME`(`weapons.ts:24-34`),伤害侧的
+ * `element` 也只可能是这 6 个之一。写一个表外元素(如 `EARTH` / `WATER`)=
+ * **写了永远没人读**(抗性按元素名索引,而伤害从不用那个名)⇒ 本表**不发明元素**:
+ * 语义元素在元素表里没有对应项的房间**一律不登记**,由 `roomElementResistOf` 返回
+ * `null`。要 `EARTH` / `WATER` 是 `combat` 层扩展元素表(`Element` 与
+ * `ELEMENT_COUNTER` 的 6×6 → 8×8)的事,不属于房间层 —— 判据
+ * `tests/WS-FND-97-room-element-semantics.test.ts` 第 1 条把「表里每个元素都在
+ * `ELEMENTS` 里」钉死。
+ *
+ * ## 未登记的房间(一律 `null` ⇒ 推送路径写中性值)
+ *
+ * · `ART_GALLERY`  —— 展示类(bonus 只有「像素画作与自定义纹章展示」),无语义元素;
+ * · `COZY_BEDROOM` —— 休憩类(bonus:每秒回 15 HP + 打盹),无语义元素;
+ * · `ECO_RANCH`    —— 语义元素是**土 / 农**(owner 示例写作 `EARTH`),元素表里没有它
+ *                     ⇒ 不发明元素、不登记;
+ * · `CLOUD_DEPOT`  —— 商店类(bonus:上架 / 购买),无语义元素。
  *
  * ⚠️ 这张表是元素抗性的**唯一**来源:不在这里的房间 = 无抗性
  * (`roomElementResistOf` 返回 null ⇒ 推送路径写中性值),
  * **不许**「顺手给每个房间都加一点」。
  */
 export const ROOM_ELEMENT_RESIST: Readonly<Record<string, RoomElementResistEntry>> = Object.freeze({
-  SAKURA_ONSEN: { element: 'ICE', mul: PENDING_ELEMENT_RESIST_MUL },
+  /* FORGE_MASTER【大师锻造房】⇒ FIRE:核心件 503 `矮人鼓风高炉` + 504 `大师秘银铁砧台`
+     (`ROOM_RECIPES` 第 1 条)= 高炉 / 熔炉;数值待平衡(可整行替换)。 */
+  FORGE_MASTER: { element: 'FIRE', mul: PENDING_ELEMENT_RESIST_MUL },
+  /* COZY_CANTEEN【欢聚大锅食堂】⇒ FIRE:核心件 506 `八人欢聚大汤锅`、可选 508
+     `红砖果木披萨炉` = 灶火 / 烤炉(「大餐」是火上做出来的);数值待平衡(可整行替换)。 */
+  COZY_CANTEEN: { element: 'FIRE', mul: PENDING_ELEMENT_RESIST_MUL },
+  /* SAKURA_ONSEN【绯樱露天温泉馆】⇒ FIRE:核心件 526 `露天温泉石灯笼` + 可选 109
+     `白玉温泉石`(tag「保温」)= 热水 / 地热;owner 裁决原话「温泉/火炉→FIRE」。
+     ⚠️ 本行此前登记的是 `ICE`(「泡温泉取暖 ⇒ 抗霜冻」那一读法),已按裁决退役。
+     数值待平衡(可整行替换)。 */
+  SAKURA_ONSEN: { element: 'FIRE', mul: PENDING_ELEMENT_RESIST_MUL },
+  /* ALCHEMY_LAB【奇想炼金实验室】⇒ FIRE:核心件 536 `【AI核心】万物奇想炼金炉`
+     (即 `ALCHEMY_FURNACE_ID`,`shared/types/alchemy.ts:202`)= 炼金炉;
+     数值待平衡(可整行替换)。 */
+  ALCHEMY_LAB: { element: 'FIRE', mul: PENDING_ELEMENT_RESIST_MUL },
+  /* AUTO_GREENHOUSE【自动物流温室】⇒ LIGHT:核心件 375 `阳光温室玻璃顶` + bonus
+     「全天候透光」= 阳光。⚠️ owner 示例写「温室→EARTH」,而元素表里没有 `EARTH`
+     ⇒ 落到内容里**真实存在**的 `LIGHT`(`ELEMENT_LABEL.LIGHT` =「星光」),
+     不发明元素;数值待平衡(可整行替换)。 */
+  AUTO_GREENHOUSE: { element: 'LIGHT', mul: PENDING_ELEMENT_RESIST_MUL },
 });
 
 /**
@@ -402,6 +444,9 @@ export interface ElementResistSink {
  * 1. **单点推送**:全仓只有这一处调 `setElementResist`(判据 `WS-FND-93` FND93-1)。
  * 2. **可重入**:每帧对**表里登记过的每个元素**各写一次 —— 同值重复写是幂等的
  *    (不是「叠加」),所以「进房 → 出房 → 再进房」不会累积成抗性斜线。
+ *    ⚠️ 口径是「每**元素**一次」,不是「每**行**一次」:表里同元素的多个房间
+ *    (FIRE 现在有 4 个房)只算一份,否则同一元素会被写 4 次(判据
+ *    `tests/WS-FND-97-room-element-semantics.test.ts` 第 5 条数写入次数钉它)。
  * 3. **清空路径**:本帧没有来源(不在房间 / 该房间没登记)时写
  *    `ELEMENT_RESIST_NEUTRAL`(1.0)—— 这是「离开即撤销」的实现。
  *    **没有这一条,玩家会永久带着抗性**(FND93-3 的负对照钉它)。
@@ -423,11 +468,16 @@ export function pushRoomElementResist(
 ): boolean {
   const src = roomElementResistOf(roomKey, table);
   let allAccepted = true;
-  for (const entry of Object.values(table)) {
+  /* 先把表里的元素**去重**成集合:同元素的多个房间行(FIRE 有 4 个房)只算一份
+     —— 逐行写会让同一元素被写 4 次(口径见上面第 2 条)。来源元素排在最前,
+     顺序确定 ⇒ 写入序列可复现。 */
+  const elements = new Set<string>();
+  if (src !== null) elements.add(src.element);
+  for (const entry of Object.values(table)) elements.add(entry.element);
+  for (const element of elements) {
     /* 同一元素只取**当前来源**那一份;其余一律回中性值(清空)。 */
-    const isSource = src !== null && entry.element === src.element;
-    const mul = isSource ? src.mul : ELEMENT_RESIST_NEUTRAL;
-    if (!sink.setElementResist(playerId, entry.element, mul)) allAccepted = false;
+    const mul = src !== null && element === src.element ? src.mul : ELEMENT_RESIST_NEUTRAL;
+    if (!sink.setElementResist(playerId, element, mul)) allAccepted = false;
   }
   return allAccepted;
 }

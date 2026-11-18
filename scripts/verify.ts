@@ -859,6 +859,7 @@ const ADVISE_UPGRADE: Record<string, string> = {
   同义反复: '--strict-taut',
   入口执行层: '--strict-inert',
   同义反复·双端同源: '--lenient(默认已拦)',
+  双端同源·结构化: '--lenient(默认已拦)',
   '门禁自检': '--strict-selfcheck',
 };
 
@@ -2039,8 +2040,8 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   // ⇒ 与 shared/testing/harness.ts 同族(门禁/判据真消费、生产暂不消费),**不是欠账**;
   // ⚠️ 这里刻意用行注释而不是块注释:上面 harness 条目的理由里含 `tests/**`(星号斜杠序列),
   //    任何紧随其后出现的「块注释结束符」都会与它凑成假配对,把本表剩下条目整段吞掉
-  ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。属 gate-only 家族(判据真消费、生产 0 引用,与 harness.ts 同判据)。判据 WS-FND-66 9 条;生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线 ⇒ 不是欠账。'],
-  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。属 gate-only 家族:判据真消费(WS-FND-66),生产侧由 shared/types/cooking.ts 的合并函数间接消费 ⇒ 不是欠账。'],
+  ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。**差集条目**:生产侧唯一 importer 是 shared/constants/cooking.ts,而它自己也不可达;计算式按 basename 匹配,还会把 server/src/combat/cooking.ts 的 importer 一并算进来 ⇒ 归入非欠账、不是缺接线动作。判据真消费(WS-FND-66 9 条);生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线。'],
+  ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。**差集条目**:生产侧无直接 importer,仅被 shared/types/cooking.ts 反向类型引用且两者均不可达(basename cooking 撞上 server/src/combat/cooking.ts,计算式据此判差集)⇒ 非欠账。判据真消费(WS-FND-66)。'],
   ['shared/types/events.ts', '契约先行(D-19 第 2 条 / RULINGS-DRAFT EVENT-BUS U6):29 种事件名的命名空间 SSoT。属 gate-only 家族:判据反向扫生产文本防过期(WS-FND-66 第 7 组);生产侧事件名仍是扁平字符串 ⇒ 等编排层接线。'],
 ]);
 
@@ -4170,6 +4171,331 @@ export function bothSidesVerdict(count: number, lenient: boolean): BothSidesVerd
   return { block: count > 0 && !lenient, message };
 }
 
+/* ═══════════ 2.8b 双端同源(结构化):同一符号在两个层**各自声明** ═══════════
+ *
+ * ## 为什么必须换判据(owner 裁决:把「各写一份」从启发式改成结构化)
+ *
+ * §2.8 的 `bothSides` 判的是**测试断言**(actual/expected 两侧都取自本仓常量)。
+ * 而「**同一份语义在服务端与客户端各写一份**」这一类缺陷,此前**没有结构化判据**:
+ * 它落在 `scripts/judgement_audit.ts:1508` 的候选型检测器 **G**(`gate: 'advise'`),
+ * 由 `scripts/judgement_baseline.ts:553` 的 `G_CANDIDATE_WATERMARK = 72`
+ * (`judgement_audit.ts:1850` 读它)**按总命中数**决定红/绿。
+ *
+ * 水位守卫的两个已知后果(owner 点名的就是这两条):
+ * ```text
+ * 1 它是**计数判据** ⇒ 只有「总命中数 > 72」才红 ⇒ 72 条以内的真命中**完全无声**;
+ * 2 它只给一个数 ⇒ 读者拿不到 `文件:行 + 两侧值` ⇒ 分不清「层间有意传递(合法)」
+ *   与「同一语义两份实现(危险)」 ⇒ **误报会把真问题一起遮住**。
+ * ```
+ * ⇒ 本轮把这一类判定改成**结构化**:直接找「**同一个符号名在两个层各声明了一次**」
+ *   这个结构性事实,逐条给出两侧的 `文件:行 = 值`,并**默认拦截**。
+ *
+ * ## 判据(5 条;全部落在纯函数里 ⇒ 可单独注入验证,见 `tests/WS-FND-99`)
+ *
+ * ```text
+ * S1 同名异值(常量)  `export const NAME = <expr>;` 在两个**不同层**的文件里各声明一次,
+ *                     且 `<expr>` 归一化后不同 ⇒ 命中(kind=同名异值)。
+ * S2 同名异形(类型)  同名 `interface` / `type` 在两个**不同层**的文件里各声明一次,
+ *                     且声明体(归一化)不同 ⇒ 命中(kind=同名异值)。
+ * S3 镜像对同名       两个**不同层**的文件 **basename 相同** 且各自声明了同名符号
+ *                     (即使两侧字面文本一致)⇒ 命中(kind=同名同形)。
+ *                     理由:逐字复制两份必然漂移;「还没漂移」不是安全,是**尚未观察到**。
+ * S4 层的定义         `shared/` ↔ `server/src/` ↔ `client/src/`(`layerOfPath`);
+ *                     只有**跨层**才算「双端」(同层同名是另一类问题,不在本判据内)。
+ * S5 证据是**声明级**   只比「两侧是否各声明了同一个符号名 + 值/形状」,
+ *                     不看计数、不看水位、不看文件相似度 ⇒ 不再有「水位以下听不见」的盲区。
+ * ```
+ *
+ * ## 负对照(与上面一一对应,全部在 `tests/WS-FND-99` 里有牙齿)
+ *
+ * ```text
+ * N1 真同源必红        两侧同名异值 ⇒ S1/S2 命中(注入:把某一侧的值改掉 ⇒ 当场变红)。
+ * N2 合法镜像不误报    1 两侧同名**同值**(如 `PROTOCOL_VERSION = 3`:server 与 shared
+ *                        各一份,由 FND14-8 钉住)⇒ 不命中;
+ *                      2 一侧 `import` 另一侧 ⇒ 根本没有第二处声明 ⇒ 不命中。
+ * N3 单侧缺失不报      符号只在一个层出现 ⇒ 不命中。
+ * N4 同层不报          同名异值但两侧同层(如 server 内部两处)⇒ 不命中。
+ * N5 不可解析不报      跨行对象/数组常量、找不到终止 `;` 的声明 ⇒ 值不可比 ⇒ 跳过(不猜)。
+ * ```
+ *
+ * ## 水位机制还在,但它**不再是主判据**
+ *
+ * `G_CANDIDATE_WATERMARK = 72`(`judgement_baseline.ts:553`)保留为**兜底**:
+ * 它比的是「同名符号在**任意两个**类型容器之间的总命中数」,覆盖面比本节宽
+ * (含同层、共享字段等形态),而且它**只告警**。
+ * ```text
+ * 主判据   本节 S1..S5 —— 结构化、逐条、默认拦(--lenient 才降级)
+ * 兜底     G 检测器 + 水位 72 —— 粗粒度增长守卫,只告警
+ * ```
+ * ⚠️ **不要再把水位当作「这条缺陷的判据」**:水位以下不等于干净 ——
+ *    本节的存在就是为了让「水位以下的真命中」也出现在输出里(实测:命中 7 处 ≪ 72;
+ *    逐条清单钉在 `tests/WS-FND-99` FND99-6)。
+ */
+
+/** 生产侧的三层。`null` = 不属于任何一层(不参与双端同源判定)。 */
+export type SideLayer = 'shared' | 'server' | 'client';
+
+/**
+ * 文件 → 层。`server/` 与 `client/` 只在 `src/` 以下才算(测试 / 脚本不算生产侧)。
+ */
+export function layerOfPath(rel: string): SideLayer | null {
+  if (rel.startsWith('shared/')) return 'shared';
+  if (rel.startsWith('server/src/')) return 'server';
+  if (rel.startsWith('client/src/')) return 'client';
+  return null;
+}
+
+/** 一条**声明** —— 结构化判据的最小证据单位。 */
+export interface SideDecl {
+  layer: SideLayer;
+  /** 仓库相对路径。 */
+  file: string;
+  line: number;
+  kind: 'const' | 'interface' | 'type';
+  name: string;
+  /** 归一化后的**值**(const 的 `= <expr>`)或**形状**(interface 体 / type 右侧)。 */
+  value: string;
+}
+
+/** 一条双端同源命中。`left` / `right` 分属两个不同的层。 */
+export interface BothSidesStructuredHit {
+  /** `同名异值` = 两侧值/形状不同;`同名同形` = 镜像文件对上的逐字同名声明。 */
+  kind: '同名异值' | '同名同形';
+  name: string;
+  left: SideDecl;
+  right: SideDecl;
+  /** 两侧 basename 相同(镜像对)。 */
+  mirror: boolean;
+}
+
+/** 归一化:剥注释 + 压空白 —— 于是「多一行注释 / 多一个空格」不会变成一条命中。 */
+function normDeclText(s: string): string {
+  return stripCommentsOnly(s).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * `= <expr> ;` —— 掩码态定位边界、原文取值。
+ *
+ * ⚠️ 掩码态(`maskSource`)长度不变 ⇒ 下标可直接切原文;而原文切出来的值**保留字符串
+ * 内容**(否则 `'BP1'` 与 `'BP2'` 都会被抹成同样的空白 ⇒ 假绿)。
+ * 跨行(对象/数组字面量)或找不到终止 `;` ⇒ `null`(N5:值不可比就不判)。
+ */
+function declExprAfter(masked: string, raw: string, from: number): string | null {
+  const eq = masked.indexOf('=', from);
+  if (eq < 0) return null;
+  const semi = masked.indexOf(';', eq + 1);
+  if (semi < 0) return null;
+  if (masked.slice(eq, semi).includes('\n')) return null;
+  if (masked.slice(from, eq).includes('\n')) return null;
+  return raw.slice(eq + 1, semi);
+}
+
+/** `interface X { ... }` 的 `{...}` 体;括号配平(掩码态 ⇒ 字符串里的花括号已抹掉)。 */
+function declBodyAfter(masked: string, raw: string, from: number): string | null {
+  const open = masked.indexOf('{', from);
+  if (open < 0) return null;
+  if (masked.slice(from, open).includes('\n')) return null;
+  let depth = 0;
+  for (let i = open; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === '{') depth += 1;
+    else if (c === '}') {
+      depth -= 1;
+      if (depth === 0) return raw.slice(open + 1, i);
+    }
+  }
+  return null;
+}
+
+/**
+ * 扫一个文件里的**声明级**证据(`export const` / `export interface` / `export type`)。
+ *
+ * 行号走 `makeLineLocator`(掩码态)⇒ 不被块注释/跨行字符串带偏;
+ * 取值回**原文**切 ⇒ 字符串常量的值不被抹掉。
+ */
+export function parseSideDecls(file: string, src: string): SideDecl[] {
+  const layer = layerOfPath(file);
+  if (layer === null) return [];
+  const masked = maskSource(src);
+  const lineOf = makeLineLocator(masked);
+  const out: SideDecl[] = [];
+  const re = /^export (const|interface|type)\s+(\w+)/gm;
+  for (const m of masked.matchAll(re)) {
+    const kind = m[1] as SideDecl['kind'];
+    const name = m[2] as string;
+    const at = m.index ?? 0;
+    const after = at + m[0].length;
+    const text = kind === 'interface'
+      ? declBodyAfter(masked, src, after)
+      : declExprAfter(masked, src, after);
+    if (text === null) continue;
+    out.push({ layer, file, line: lineOf(at), kind, name, value: normDeclText(text) });
+  }
+  return out;
+}
+
+/**
+ * 结构化双端同源判定(纯函数 —— 可被直接注入验证,见 `tests/WS-FND-99`)。
+ *
+ * 判据见本节 S1..S5;负对照 N1..N5。**只判「跨层且各声明一次」**,不判计数。
+ *
+ * @param files `{ path: 仓库相对路径, src: 原文 }`
+ */
+export function detectBothSidesStructured(
+  files: ReadonlyArray<{ path: string; src: string }>,
+): BothSidesStructuredHit[] {
+  const decls: SideDecl[] = [];
+  for (const f of files) decls.push(...parseSideDecls(f.path, f.src));
+
+  const byName = new Map<string, SideDecl[]>();
+  for (const d of decls) {
+    const arr = byName.get(d.name);
+    if (arr === undefined) byName.set(d.name, [d]);
+    else arr.push(d);
+  }
+
+  const hits: BothSidesStructuredHit[] = [];
+  for (const [name, arr] of byName) {
+    for (let i = 0; i < arr.length; i += 1) {
+      for (let j = i + 1; j < arr.length; j += 1) {
+        const left = arr[i] as SideDecl;
+        const right = arr[j] as SideDecl;
+        /* N4:同文件 / 同层 ⇒ 这不是「双端」 */
+        if (left.file === right.file || left.layer === right.layer) continue;
+        const mirror = basename(left.file) === basename(right.file);
+        const differ = left.value !== right.value || left.kind !== right.kind;
+        /* N2:同名 + 同形 + 不是镜像对 ⇒ 单一来源被逐字复用,不报 */
+        if (!differ && !mirror) continue;
+        hits.push({ kind: differ ? '同名异值' : '同名同形', name, left, right, mirror });
+      }
+    }
+  }
+  return hits.sort((a, b) => `${a.name}|${a.left.file}`.localeCompare(`${b.name}|${b.left.file}`));
+}
+
+/** 汇总行与 `advisedGates` 用的门禁名(结构化那条 —— 与启发式那条**分开**报)。 */
+export const BOTH_SIDES_STRUCTURED_GATE = '双端同源·结构化';
+
+/** 结构化命中的**拦截口径**(与 `bothSidesVerdict` 同形:默认拦,`--lenient` 才降级)。 */
+export function bothSidesStructuredVerdict(count: number, lenient: boolean): BothSidesVerdict {
+  const message =
+    `双端同源(结构化)${count} 处(同一符号在 shared/server/client **各声明一次**;判据 S1..S5)`;
+  return { block: count > 0 && !lenient, message };
+}
+
+/**
+ * 结构化双端同源命中的**登记表**(逐条理由)。
+ *
+ * ## 登记**不是**关掉检测
+ *
+ * 检测器(§2.8b S1..S5)照旧跑、照旧逐条打印;登记表只回答一件事:
+ * 「这一处同名是**有意的跨层镜像**(两侧各有一份,语义/口径本就不同),还是
+ * 同一份语义被抄成两份(缺陷)」。前者逐条写明理由后**不再作为失败**,
+ * 但仍会以 `i 双端同源(结构化)·已登记:…` 的形式逐条出现在输出里;
+ * 后者(未登记)一律照旧默认拦。
+ *
+ * ## 为什么必须有墓碑自检
+ *
+ * 登记表会因改名/删除/生产侧合并而**腐化**:条目还在、命中的那对已不存在。
+ * 那种失真会让门禁静默放宽(与 `DECORATOR_EXEMPT` / `UNREACHABLE_EXEMPT`
+ * 同一个失败形态)⇒ `checkBothSidesStructured` 会核对「登记的名字必须真的命中」,
+ * 不命中就 `fail`(报「登记表失真,应移出」),而不是默默生效。
+ *
+ * ## 判据取的是**符号名 + 两侧文件:行**(不是只按名字放行)
+ *
+ * 每一条都写明两侧文件与两侧为什么口径不同;名字相同只是入口。
+ * 这 7 条都是**跨层镜像**(服务端/客户端/shared 各一份),本仓禁改生产三层的
+ * 前提下不能合并来源 ⇒ 按 owner 口径「能合并就合并,不能合并的逐条登记理由」处理。
+ */
+export const BOTH_SIDES_STRUCTURED_REGISTERED: ReadonlyMap<string, string> = new Map<string, string>([
+  ['Blueprint',
+    '镜像文件对 `server/src/build/blueprint.ts` ↔ `client/src/ui/blueprint.ts`,但两侧是'
+    + '**两个读者各自的投影**:服务端存世界锚(`w/h` + `originX/originY` + `cells`),'
+    + '客户端存屏幕包围盒与裁剪态(`minX..maxY` + `area/filled/clipped`)。'
+    + '共用一份要么把 UI 裁剪态拖进服务端冻结层,要么让服务端依赖渲染口径 ⇒ 有意镜像'
+    + '(FND99-6 已把两侧形状取全当时证据)。'],
+  ['BlueprintCell', '`Blueprint` 的逐格投影,两侧口径不同:服务端 `obj/floor/elev/wire/meta`'
+    + '(世界体素),客户端 `x/y/z/tile`(绘制格)。随 `Blueprint` 一起跨层、同一次改动的两面 ⇒ 有意镜像。'],
+  ['BossState', '`server/src/bosses/phases.ts` 的是**服务端权威运行时逐帧状态**'
+    + '(`def/castCd/stunnedSec/shieldHp/clones/...`),`shared/types/wire.ts` 的是'
+    + '**下行电报的线格式**(只带 `telegraph*`/`phase/hp/maxHp` 这类订阅者需要的字段)。'
+    + '线格式刻意是运行时的**子集投影**;搬进 shared 会让服务端内部状态成为冻结层契约 ⇒ 有意镜像。'],
+  ['DYE_PALETTE_SIZE', '服务端 `party/scoring.ts` 用字面量 `32`(染色计分槽数),'
+    + '客户端 `stage/dye_overlay.ts` 由 `DYE_PALETTE.length` 派生(调色板数组是客户端的视觉来源)。'
+    + '服务端没有那张数组、也不该有(视觉资产不进服务端)⇒ 两处必然各有一份 ⇒ 有意镜像。'],
+  ['EncodeStats', '**同名异义**:`server/src/build/blueprint.ts` 的 `{code,bytes,runs,ratio}` 是'
+    + '蓝图文本压缩的构建期度量;`shared/net/delta.ts` 的 `{changedFields,removed,bytes}` 是'
+    + '网络增量编码的度量。两者只是名字撞了,语义与字段都不同 ⇒ 有意同名,不是同一份。'],
+  ['HelloFrame', '容错镜像:`server/src/net/ws_server.ts` 把入站 hello **刻意放宽成全字段可选**'
+    + '(`t?/protocolVersion?/contentClaim?/...`)以接住旧版/变体客户端;'
+    + '`client/src/net/session.ts` 是客户端上行的**字面量形状**(`t:\'hello\'` 等必填)。'
+    + '服务端若 import 客户端形状就会把容错收窄成严格校验 ⇒ 有意容错镜像。'],
+  ['MoveIntent', '客户端 `client/src/net/session.ts:252` 比服务端 `server/src/net/anticheat.ts:284`'
+    + '多一个可选 `seq?`(上行序号);服务端反作弊只读它需要的字段(`tick/x/y/z/speedMul?`)。'
+    + '两侧是同一报文的**不同消费面** ⇒ 有意镜像。'],
+]);
+
+/** 结构化命中数(汇总行用)。`null` = 本节没跑(`checkTautology` 无条件跑它)。 */
+let structuredBothSidesMeasured: number | null = null;
+
+/** 一行命中的人读格式:`符号 [类型 · 镜像对?] 左文件:行 = 值 ↔ 右文件:行 = 值`。 */
+function fmtBothSidesHit(h: BothSidesStructuredHit): string {
+  return `${h.name}  [${h.kind}${h.mirror ? ' · 镜像对' : ''}]  `
+    + `${h.left.file}:${h.left.line} = ${h.left.value}  ↔  `
+    + `${h.right.file}:${h.right.line} = ${h.right.value}`;
+}
+
+/**
+ * 跑结构化双端同源(读生产三层),**逐条**打印命中,默认拦 / `--lenient` 降级。
+ *
+ * 命中必须逐条落到 `文件:行 + 两侧值` —— 这正是替换水位计数判据的目的:
+ * 一个数无法区分「层间有意传递」与「同一语义两份实现」,一条明细可以。
+ */
+function checkBothSidesStructured(): void {
+  const files: { path: string; src: string }[] = [];
+  for (const d of ['server/src', 'client/src', 'shared']) {
+    for (const f of walk(join(ROOT, d), ['.ts'])) {
+      files.push({ path: relative(ROOT, f).split(sep).join('/'), src: readFileSync(f, 'utf8') });
+    }
+  }
+  const allHits = detectBothSidesStructured(files);
+  structuredBothSidesMeasured = allHits.length;
+  console.log(
+    `  i 双端同源(结构化):命中 ${allHits.length} 处`
+    + `(扫描 ${files.length} 个生产文件;判据 = 同一符号在两个层各声明一次)`,
+  );
+  /* ★ 登记表把「已逐条登记理由的有意跨层镜像」分出来:它们**仍逐条打印**
+     (登记不是静默豁免),但不再作为失败;未登记的一律照旧默认拦。 */
+  const hits: BothSidesStructuredHit[] = [];
+  const registeredHitNames = new Set<string>();
+  for (const h of allHits) {
+    const reason = BOTH_SIDES_STRUCTURED_REGISTERED.get(h.name);
+    if (reason === undefined) { hits.push(h); continue; }
+    registeredHitNames.add(h.name);
+    console.log(`  i 双端同源(结构化)·已登记:${fmtBothSidesHit(h)}\n        └─ 理由:${reason}`);
+  }
+  /* 登记表自检:登记的名字必须**真的命中** —— 否则是墓碑(条目腐化/漏删)。 */
+  const staleRegistered = [...BOTH_SIDES_STRUCTURED_REGISTERED.keys()]
+    .filter((n) => !registeredHitNames.has(n));
+  if (staleRegistered.length > 0) {
+    fail(`双端同源(结构化)登记表失真(登记的名字已不再命中,应移出):${staleRegistered.join(', ')}`);
+  }
+  if (hits.length === 0) return;
+  const verdict = bothSidesStructuredVerdict(hits.length, LENIENT);
+  if (verdict.block) {
+    for (const h of hits) fail(`双端同源·结构化:${fmtBothSidesHit(h)}`);
+    fail(
+      `${verdict.message} —— 默认拦截(与 --strict-reach/taut/inert 同口径);加 --lenient 才降级。`
+      + '修法:让两侧**共用一份**(一侧 import 另一侧,或搬进 shared),不要各写一份;'
+      + '确属有意跨层镜像的,在 `BOTH_SIDES_STRUCTURED_REGISTERED` 里逐条登记理由。',
+    );
+  } else {
+    for (const h of hits) console.warn(`  ⚠ 双端同源·结构化:${fmtBothSidesHit(h)}`);
+    advise(BOTH_SIDES_STRUCTURED_GATE, `${verdict.message}(--lenient:已降级为告警)`);
+  }
+}
+
+
 function checkTautology(): void {
   console.log('\n[同义反复候选]');
   const numExports = collectNumericExports();
@@ -4393,6 +4719,10 @@ function checkTautology(): void {
       advise(BOTH_SIDES_GATE, `${detail}(--lenient:已降级为告警)`);
     }
   }
+  /* ★ §2.8b:结构化双端同源(这一类缺陷的**主判据**)——
+     与上面那条(测试断言两侧同源)**分开报**:判据、门禁名、输出都不同。
+     命中逐条落「文件:行 + 两侧值」,默认拦 / --lenient 才降级。 */
+  checkBothSidesStructured();
   if (extHitLines.length > 0) {
     /* ⚠️ 这门告警**没有升级开关**(`--strict-taut` 只升级"未登记候选"):
        扩展槽位命中要先由测试线的清零动作处理(换成字面量),
@@ -7555,7 +7885,11 @@ const adviseSuffix = advises === 0
    读者要能从结论行看出这条判据的力度(而不只是「全部通过」四个字)。
    `?` = `checkTautology` 没跑(理论上不会发生:它在 main 里无条件调用)。 */
 const bothSidesSuffix = ` · 双端同源 ${bothSidesMeasured ?? '?'} 处`;
-console.log(`\n${verdict}${bothSidesSuffix}${adviseSuffix} · ${Date.now() - t0}ms`);
+/* ★ §2.8b:结构化双端同源**另给一个数** —— 它的判据、门禁名与上面那条都不同
+   (上面那条判的是「测试断言两侧同源」)。两个数分开印,避免「一个名字两套定义」(陷阱 27)。
+   `?` = `checkTautology` 没跑(理论上不会发生:它在 main 里无条件调用)。 */
+const structuredSuffix = ` · 双端同源(结构化) ${structuredBothSidesMeasured ?? '?'} 处`;
+console.log(`\n${verdict}${bothSidesSuffix}${structuredSuffix}${adviseSuffix} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
 }
 } /* ← 关闭 `if (import.meta.main)` 守卫(理由见该处长注释) */

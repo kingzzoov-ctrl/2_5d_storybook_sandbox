@@ -72,10 +72,12 @@ import { NEUTRAL_AFFINITY } from '../alchemy/degrade.ts';
    `Chunk`,不依赖 sim)。 */
 import type { RestorePlan } from '../world/archive.ts';
 import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
-import { PhysicsWorld, type StepReport } from '../physics/world.ts';
+/* ★ WS-FND-98:`safeMass` 是「质量归一 / 非法质量拒绝」的**唯一入口**(见 `physics/world.ts` §0)。 */
+import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import { rollMobDrops, type MobDropResult } from '../mobs/drops.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
 import { SignalGraph } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
@@ -1038,6 +1040,18 @@ export class WorldSim {
 
   /** 最近一次击杀结算结果(供断言与 UI;null = 尚未发生击杀)。 */
   lastKillSettle: ShareResult | null = null;
+
+  /**
+   * 最近一次击杀结算出的**掉落**(★ WS-FND-98)。
+   *
+   * 判定在 `settleKill` 里做,种子取**世界种子**(`worldSeed`)⇒
+   * 「同一个种子的世界,打死同一只怪,掉同一份东西」是可复现的;
+   * 同一次击杀被二次结算(`deduped`)时**不给第二次**,与经验/积分的去重口径一致。
+   *
+   * 空数组有两义:「这只怪没有掉落」与「还没发生过击杀」—— 与 `lastKillSettle` 的 `null`
+   * 一起看即可区分(后者为 `null` ⇒ 尚未击杀)。
+   */
+  lastMobDrops: readonly MobDropResult[] = [];
 
   /** 本帧新产生的升级事件(玩家 ID → 升级详情),供网络层播动画。 */
   readonly pendingLevelUps = new Map<string, { from: number; to: number }[]>();
@@ -2723,6 +2737,13 @@ export class WorldSim {
       }
     }
 
+    /* ── ★ WS-FND-98:掉落判定 ──
+       种子取 `worldSeed`(世界身份)⇒ 同一 seed 的世界打死同一物种得到同一份掉落,
+       判据可复现(`rollMobDrops` 是 (seed, mobId, itemId) 的纯函数,见 `mobs/drops.ts`)。
+       ⚠️ `deduped`(= 同一实例被二次结算)时清空:经验/积分都去重,掉落也不能给第二份
+       (姜饼小人复活 / `addMob` 替换旧条目都会走到这条)。 */
+    this.lastMobDrops = result.deduped ? [] : rollMobDrops(def.id, this.worldSeed);
+
     this.lastKillSettle = result;
     this.killSettleCount += 1;
     this.totalExpGranted += result.total;
@@ -3197,7 +3218,6 @@ export class WorldSim {
    */
   private readonly knockbacks = new Map<string, { dx: number; dy: number; left: number }>();
 
-  /** 一次慢帧推掉剩余位移的多少分之一(2 = 两段推完:一次推太大像瞬移)。 */
   private static readonly KNOCKBACK_STEPS = 2;
 
   /**
@@ -3209,10 +3229,27 @@ export class WorldSim {
    */
   private static readonly KNOCKBACK_DAMAGE_PER_CELL = 20;
   /**
-   * 受击击退的上限(格)。**必须有上限**:`applyKnockback` 一次性把位移写进位置,
+   * 受击击退的**总位移上限**(格)。**必须有上限**:`applyKnockback` 一次性把位移写进位置,
    * 没有上限时一次 100 伤害会推 5 格(穿墙/出界由 physics 兜,但观感与救援半径都崩)。
+   *
+   * 取 `2` = **D-09 裁决的同量级值**(`min(2, 实际伤害 / 20)` 格,owner 2026-11-16);
+   * 位移上界只能是**格**,不能用武器的格/秒。
+   * ★ WS-FND-98:本条从「受击点里的 `Math.min`」升级为 `applyKnockback` **内部**的上界,
+   * 于是**任何**调用方(受击点 / Boss 环形波 / 脚本 / 测试)给多大的距离都被钳在这里,
+   * 不存在「绕过受击点就不受上界约束」的第二条路。
    */
-  private static readonly KNOCKBACK_MAX_CELLS = 2;
+  static readonly KNOCKBACK_MAX_CELLS = 2;
+
+  /**
+   * 击退的**质量归一基准**(格)。`位移 = 距离 × (基准 / 质量)`:质量为 1(=`MASS_PLAYER`,
+   * 也是 `physics.safeMass` 的兜底值)时位移与归一前**逐位相同**,所以 D-09 那套判据
+   * (`WS-FND-53` FND53-1/3 的 `min(2, 伤害/20)`)一个数都不变;质量 20 的 Boss 只被推 1/20。
+   *
+   * 为什么归一化也要在**这一层**:`applyKnockback` 走**位置**路径(慢帧两段推),不经过
+   * `physics.applyImpulse` 的 `Δv = J / m`。两条路径各自归一,否则「轻的推得远、重的推得近」
+   * 只在纵向速度上成立、水平位移上不成立。
+   */
+  static readonly KNOCKBACK_MASS_REF = 1;
 
   /* ══════════════════ 世界时钟(★ D-07:20 分钟一天,0 帧 = 06:00)══════════════════ */
 
@@ -3277,10 +3314,21 @@ export class WorldSim {
   }
 
   /**
-   * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离 `distance` 格。
+   * 对玩家施加一次**远离**(fromX, fromY) 的击退,总距离最多 `KNOCKBACK_MAX_CELLS` 格。
    *
    * 距离由调用方给:内容层的击退量(`PRANK_HAMMER_KNOCKBACK`)是既有锚,
    * 本方法**不新造数值**(新造就得 owner 裁决)。
+   *
+   * ★ WS-FND-98 两条**上界/归一**规则(此前没有):
+   *   1 **质量归一**:`位移 = 距离 × (KNOCKBACK_MASS_REF / mass)`,质量越重推得越近。
+   *     `mass` 经 `physics.safeMass` —— 非有限(`NaN`/`±Infinity`)/非正整数(0/负数/小数)
+   *     的质量被**拒绝**并退化为基准值。修前 `mass = NaN` 时位移是 `NaN`,刚体位置随即变 `NaN`
+   *     (旧写法 `mass <= 0 ? 1 : mass` 对 `NaN` 判 `false`,漏掉的就是这一类)。
+   *   2 **总位移上界**:钳到 `KNOCKBACK_MAX_CELLS`(= D-09 的 2 格)。
+   *
+   * 为什么上界在这里、而不只在受击点:`applyKnockback` 是公开方法(受击点 / Boss 环形果冻波 /
+   * 脚本 / 测试都能调),把钳位放在**被调方**才不可能绕过 —— 修前只有受击点那一处 `Math.min`,
+   * 直接调 `applyKnockback(id, x, y, 1e9)` 能一次把玩家推出地图。
    */
   applyKnockback(playerId: string, fromX: number, fromY: number, distance: number): boolean {
     const b = this.physics.bodies.get(playerId);
@@ -3291,7 +3339,14 @@ export class WorldSim {
     const len = Math.hypot(dx, dy);
     /* 完全重合时没有方向可言 ⇒ 不击退(而不是随便挑一个方向)。 */
     if (!(len > 0)) return false;
-    this.knockbacks.set(playerId, { dx: (dx / len) * distance, dy: (dy / len) * distance, left: WorldSim.KNOCKBACK_STEPS });
+    /* ① 质量归一(非法质量在 `safeMass` 里被拒绝 ⇒ 这里的分母一定是正有限整数)。 */
+    const mass = safeMass(b.mass);
+    const normalized = distance * (WorldSim.KNOCKBACK_MASS_REF / mass);
+    /* ② 总位移上界。`normalized` 理论上有限(distance 已过 `isFinite`、mass 是正整数);
+       再兜一次是为了「上界」这条承诺本身不依赖上游:`!(cells > 0)` 同时挡住 0 与 NaN。 */
+    const cells = Math.min(WorldSim.KNOCKBACK_MAX_CELLS, normalized);
+    if (!(cells > 0)) return false;
+    this.knockbacks.set(playerId, { dx: (dx / len) * cells, dy: (dy / len) * cells, left: WorldSim.KNOCKBACK_STEPS });
     return true;
   }
 
@@ -4652,6 +4707,9 @@ export class WorldSim {
     this.killLedger.reset();
     this.pendingLevelUps.clear();
     this.lastKillSettle = null;
+    /* ★ WS-FND-98:掉落与击杀结算同生共死 —— 重置后 `lastKillSettle === null`
+       而掉落还留着上一局的东西,读的人会以为「新世界刚掉过」。 */
+    this.lastMobDrops = [];
     this.lastRevive = null;
     this.killSettleCount = 0;
     this.totalExpGranted = 0;
@@ -5207,7 +5265,12 @@ export class WorldSim {
         if (res.knockbackPerSec > 0) {
           const body = this.physics.bodies.get(res.playerId);
           if (body !== undefined) {
-            const m = body.mass > 0 ? body.mass : 1;
+            /* ★ WS-FND-98:质量一律经 `physics.safeMass` 取 —— `NaN` / `±Infinity` /
+               0 / 负数 / 小数被拒绝,退化为基准值 1。修前这里是一份**手写**兜底
+               (`body.mass > 0 ? body.mass : 1`),它恰好兜住 `NaN`(`NaN > 0` 为 false)
+               却没兜住 `+Infinity`(`Δv = J / Infinity = 0`,不炸但静默失效);
+               归一规则现在全仓只有 `safeMass` 一个入口。 */
+            const m = safeMass(body.mass);
             this.physics.applyImpulse(res.playerId, 0, 0, res.knockbackPerSec * m);
           }
         }

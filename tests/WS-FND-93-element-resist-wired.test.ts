@@ -18,7 +18,8 @@
  * **值**:⚠️ **既有内容表里没有这个数**(逐处核过:`ROOM_RECIPES` 9 种房间的 bonus、
  * `FOOD_PARAM_SLOTS` 料理 6 槽、`items.ts` 的 248 星光卡林巴琴 + `ArmorDef`
  * 全都没有可结算的元素抗性字段)⇒ 按裁决口径登记一条**具名·待平衡**的默认
- * (`PENDING_ELEMENT_RESIST_MUL = 0.5`),元素归属(`ICE`,霜冻)同样**待 owner 裁决**。
+ * (`PENDING_ELEMENT_RESIST_MUL = 0.5`),元素归属(`FIRE`,灶火 / 热水 —— 按现行映射
+ * `SAKURA_ONSEN → FIRE`)同样**待 owner 裁决**。
  * 列表/数值都不是平衡裁决;owner 给了真内容就替换 `ROOM_ELEMENT_RESIST` 里那一行。
  *
  * ## 生产调用点(世界编排层,本任务**不改**)
@@ -49,18 +50,18 @@ const BASE_HIT_12 = 12;
 
 /* ═════════════════ FND93-1 生产写入:减半 ═════════════════ */
 
-test('FND93-1 ★★ D4 生产写入:站进温泉 ⇒ 抗性真的落到 vitals,同一次 ICE 伤害减半', () => {
+test('FND93-1 ★★ D4 生产写入:站进温泉 ⇒ 抗性真的落到 vitals,同一次 FIRE 伤害减半', () => {
   const v = new VitalsSystem();
   v.register('p1');
-  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE').rawDamage, BASE_HIT_12, '基线:没推抗性 ⇒ 12');
+  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE').rawDamage, BASE_HIT_12, '基线:没推抗性 ⇒ 12');
 
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '★ 推送必须被接受');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '★ 抗性真的进了 vitals(0.5)—— 修前这里恒 1.0');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '★ 抗性真的进了 vitals(0.5)—— 修前这里恒 1.0');
 
-  const hit = v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE');
+  const hit = v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE');
   eq(hit.rawBeforeResist, BASE_HIT_12, '折算前仍是 12');
   eq(hit.resistMul, 0.5, '★ 本次结算读到的系数是 0.5(不是默认的 1.0)');
-  eq(hit.rawDamage, 6, '★★ 同一次 ICE 伤害 12 × 0.5 = 6(修前:写入侧零调用 ⇒ 恒 12)');
+  eq(hit.rawDamage, 6, '★★ 同一次 FIRE 伤害 12 × 0.5 = 6(修前:写入侧零调用 ⇒ 恒 12)');
 });
 
 /* ═════════════════ FND93-2 不串味 ═════════════════ */
@@ -70,17 +71,17 @@ test('FND93-2 ★ D4 不串味:只有登记的那个元素吃抗性;别的元素
   v.register('p1');
   v.register('p2');
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '前置:p1 进温泉馆');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '前置:p1 有 ICE 抗性');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '前置:p1 有 FIRE 抗性');
 
   /* 元素维度:没登记的元素一律原值(修前/修后都该是 12)。 */
-  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE').rawDamage, BASE_HIT_12, '★ FIRE 不吃 ICE 抗性');
+  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE').rawDamage, BASE_HIT_12, '★ ICE 不吃 FIRE 抗性');
   eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'LIGHTNING').rawDamage, BASE_HIT_12, '★ LIGHTNING 不吃');
   eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'NONE').rawDamage, BASE_HIT_12, '★ 无属性攻击不吃');
-  eq(v.elementResistOf('p1', 'FIRE'), 1, '★ 相邻元素没被顺手写成 0.5(全程逐元素)');
+  eq(v.elementResistOf('p1', 'ICE'), 1, '★ 相邻元素没被顺手写成 0.5(全程逐元素)');
 
   /* 玩家维度:抗性只落在被推送的那个玩家身上。 */
-  eq(v.applyHit('m', 'p2', 4, 1.0, 0, 0, 'ICE').rawDamage, BASE_HIT_12, '★ p2 没进房 ⇒ 原值');
-  eq(v.elementResistOf('p2', 'ICE'), 1, '★ p2 的抗性表是空的');
+  eq(v.applyHit('m', 'p2', 4, 1.0, 0, 0, 'FIRE').rawDamage, BASE_HIT_12, '★ p2 没进房 ⇒ 原值');
+  eq(v.elementResistOf('p2', 'FIRE'), 1, '★ p2 的抗性表是空的');
 });
 
 /* ═════════════════ FND93-3 清空路径 ═════════════════ */
@@ -89,17 +90,17 @@ test('FND93-3 ★★ D4 清空路径:走出房间(或房间没登记)⇒ 抗性�
   const v = new VitalsSystem();
   v.register('p1');
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '前置:进房');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '前置:抗性在身');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '前置:抗性在身');
 
   eq(pushRoomElementResist(v, 'p1', null), true, '★ 不在任何房间 ⇒ 推送仍成功(写的是中性值)');
-  eq(v.elementResistOf('p1', 'ICE'), 1, '★★ 离开房间 ⇒ 抗性被撤销(回到中性 1.0)—— 清空路径');
-  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE').rawDamage, BASE_HIT_12, '★★ 去掉来源后同一次 ICE 伤害恢复 12');
+  eq(v.elementResistOf('p1', 'FIRE'), 1, '★★ 离开房间 ⇒ 抗性被撤销(回到中性 1.0)—— 清空路径');
+  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE').rawDamage, BASE_HIT_12, '★★ 去掉来源后同一次 FIRE 伤害恢复 12');
 
   /* 负对照:未登记抗性的房间同样清空(不是「只有 `null` 才清」)。 */
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '前置:再进房');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '前置:抗性又回来了');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '前置:抗性又回来了');
   eq(pushRoomElementResist(v, 'p1', 'ART_GALLERY'), true, '未登记抗性的房间 ⇒ 也是推中性值');
-  eq(v.elementResistOf('p1', 'ICE'), 1, '★ 站进别的房间也得撤销(不许顺手给所有房间加抗性)');
+  eq(v.elementResistOf('p1', 'FIRE'), 1, '★ 站进别的房间也得撤销(不许顺手给所有房间加抗性)');
 });
 
 /* ═════════════════ FND93-4 非法值被拒 ═════════════════ */
@@ -108,20 +109,20 @@ test('FND93-4 ★★ D4 非法抗性被拒:NaN/Infinity 不写入、旧值不污
   const v = new VitalsSystem();
   v.register('p1');
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '前置:0.5 在身');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '前置:0.5 在身');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '前置:0.5 在身');
 
-  eq(v.setElementResist('p1', 'ICE', Number.NaN), false, '★ NaN 被拒(唯一守卫在 vitals)');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '★ 被拒之后旧值不变');
-  eq(v.setElementResist('p1', 'ICE', Number.POSITIVE_INFINITY), false, '★ Infinity 同样被拒');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '★ 旧值仍不变');
-  eq(v.setElementResist('p1', 'ICE', 99), true, '超上界 ⇒ 接受');
-  eq(v.elementResistOf('p1', 'ICE'), 2, '★ 夹到上界 2.0(不是 99)');
+  eq(v.setElementResist('p1', 'FIRE', Number.NaN), false, '★ NaN 被拒(唯一守卫在 vitals)');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '★ 被拒之后旧值不变');
+  eq(v.setElementResist('p1', 'FIRE', Number.POSITIVE_INFINITY), false, '★ Infinity 同样被拒');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '★ 旧值仍不变');
+  eq(v.setElementResist('p1', 'FIRE', 99), true, '超上界 ⇒ 接受');
+  eq(v.elementResistOf('p1', 'FIRE'), 2, '★ 夹到上界 2.0(不是 99)');
 
   /* 推送侧:表里出现非法值时**如实上报 false**,且不污染已写入的值。 */
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN'), true, '前置:复位到 0.5');
-  const badTable = { SAKURA_ONSEN: { element: 'ICE', mul: Number.NaN } };
+  const badTable = { SAKURA_ONSEN: { element: 'FIRE', mul: Number.NaN } };
   eq(pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN', badTable), false, '★★ 非法值 ⇒ 推送返回 false(拒绝可见,不是静默成功)');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '★★ 非法值没有污染旧抗性');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '★★ 非法值没有污染旧抗性');
 
   /* 生产表本身:每个值都要是 [0,2] 内的有限数(否则下游只会静默拒)。 */
   for (const [room, e] of Object.entries(ROOM_ELEMENT_RESIST)) {
@@ -138,8 +139,8 @@ test('FND93-5 ★ D4 可重入幂等:连推不叠加;未登记房间一律无抗
   pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN');
   pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN');
   pushRoomElementResist(v, 'p1', 'SAKURA_ONSEN');
-  eq(v.elementResistOf('p1', 'ICE'), 0.5, '★ 连推 3 次仍是 0.5(幂等;叠加的话会是 0.125)');
-  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE').rawDamage, 6, '★ 伤害仍是减半,没有越走越强');
+  eq(v.elementResistOf('p1', 'FIRE'), 0.5, '★ 连推 3 次仍是 0.5(幂等;叠加的话会是 0.125)');
+  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE').rawDamage, 6, '★ 伤害仍是减半,没有越走越强');
 
   /* 覆盖性:9 种房间的登记里,**只有**登记过的那个给抗性,其余必须 null。 */
   const registered = new Set(Object.keys(ROOM_ELEMENT_RESIST));
@@ -149,7 +150,7 @@ test('FND93-5 ★ D4 可重入幂等:连推不叠加;未登记房间一律无抗
     eq(roomElementResistOf(roomKey), null, `★ ${roomKey} 没登记抗性 ⇒ null(不许顺手加)`);
     uncheckedRooms += 1;
   }
-  ok(uncheckedRooms >= 8, `★ 应核到 8 种以上「无抗性」房间(实测 ${uncheckedRooms})`);
+  ok(uncheckedRooms >= 4, `★ 应核到 4 种以上「无抗性」房间(实测 ${uncheckedRooms})`);
   eq(roomElementResistOf(null), null, '不在任何房间 ⇒ null');
   eq(roomElementResistOf('NOT_A_ROOM'), null, '不存在的房间 key ⇒ null(不是抛错)');
 });
@@ -164,12 +165,12 @@ test('FND93-6 ★★ D4 来源链:房间定位(`roomAtCell`)→ 推送 —— �
   const inside = roomAtCell(rooms, 5.5, 5.5);
   eq(inside, 'SAKURA_ONSEN', '前置:站在温泉格上');
   eq(pushRoomElementResist(v, 'p1', inside), true, '★ 按定位结果推送成功');
-  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'ICE').rawDamage, 6, '★ 房内的 ICE 伤害减半');
+  eq(v.applyHit('m', 'p1', 4, 1.0, 0, 0, 'FIRE').rawDamage, 6, '★ 房内的 FIRE 伤害减半');
 
   const outside = roomAtCell(rooms, 20.5, 5.5);
   eq(outside, null, '前置:房外的格不属于任何房间');
   eq(pushRoomElementResist(v, 'p1', outside), true, '★ 房外推送成功(推中性值)');
-  eq(v.elementResistOf('p1', 'ICE'), 1, '★ 走出房 ⇒ 撤销(同一条链的两个方向都判)');
+  eq(v.elementResistOf('p1', 'FIRE'), 1, '★ 走出房 ⇒ 撤销(同一条链的两个方向都判)');
 });
 
 report('WS-FND-93-element-resist-wired');
@@ -184,8 +185,8 @@ report('WS-FND-93-element-resist-wired');
  * | :--- | :--- | :--- |
  * | M1 | `PENDING_ELEMENT_RESIST_MUL` 0.5 → 0.9 | **0/6**(FND93-1 期望 0.5 实得 0.9;FND93-6 期望 6 实得 11) |
  * | M2 | 删掉清空路径(`if (!isSource) continue;`,不再写中性值) | **4/6**(FND93-3「离开房间 ⇒ 撤销」期望 1 实得 0.5;FND93-6 同) |
- * | M3 | 表里多登记一个房间 `ART_GALLERY`(顺手给所有房间加抗性) | **5/6**(FND93-5「核到 8 种无抗性房间」实得 7) |
- * | M4 | 元素写错(`ICE` → `FIRE`) | **0/6**(FND93-1/2/6 的 ICE 伤害不再减半) |
+ * | M3 | 表里多登记一个房间 `ART_GALLERY`(顺手给所有房间加抗性) | **5/6**(FND93-5「核到 4 种无抗性房间」实得 3) |
+ * | M4 | 元素写错(`FIRE` → `ICE`) | **0/6**(FND93-1/2/6 的 FIRE 伤害不再减半) |
  * | M5 | 抗性被当加值再乘一次(`src.mul * src.mul`) | **0/6**(FND93-1 期望 0.5 实得 0.25;FND93-5 幂等条红) |
  * | M6 | 吞掉拒绝(`sink.setElementResist(...)` 不看返回值) | **5/6**(FND93-4「非法值 ⇒ 推送返回 false」期望 false 实得 true) |
  */

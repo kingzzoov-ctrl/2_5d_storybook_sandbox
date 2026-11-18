@@ -3641,3 +3641,97 @@ $ node scripts/backlog.ts
 - `scripts/backlog.ts`(关闭判据)· `tests/WS-FND-90-gate-truth.test.ts`(门禁真话)
 - `server/src/net/room.ts`(`issueJoinToken` / `verifyRoomToken` / join 认证门)· `server/src/net/ws_server.ts`(`?token=` / `requireToken`)
 - `tests/WS-FND-86-auth-token.test.ts` · `tests/WS-FND-87-item-source.test.ts` · `tests/WS-FND-88-wire-bounds.test.ts` · `tests/WS-FND-89-client-vertexcolor.test.ts`
+
+---
+
+## [CR-31] 2026-11-18 task-85(fixer)— mob 掉落概率维(`dropChance`)+ 房间元素抗性改按房间语义(FIRE/LIGHT)
+
+**触发**(两条内容/机制变更,同一批收口):
+
+1. **mob 掉落没有概率维**:`shared/constants/mobs.ts` 的 `drops: Record<number, number>` 只有
+   **件数**(手册的 `×N`)—— 「稀有材料」与「必掉材料」在数据上长得一模一样,判定侧没有任何
+   依据区分。手册 L387(`624 招财进宝猫耳箍`)「击败野生动物时金币与**稀有材料掉落率 +15%**」
+   是全手册唯一的野怪掉落率数字,此前**在数据里无处安放**。
+2. **房间元素抗性映射只有一行**:`server/src/rooms/effects.ts` 的 `ROOM_ELEMENT_RESIST` 此前
+   只登记 `SAKURA_ONSEN → ICE`,另外 8 种房间**没有元素归属** —— 「元素抗性按房间语义」
+   在数据上不成立(盖出锻造房 / 温室站进去,抗性表里没有任何来源,而门禁全绿)。
+
+### 1. mob 掉落概率字段(`dropChance` / `MOB_RARE_DROP_CHANCE = 0.15`)
+
+**依据**:手册 L387「稀有材料掉落率 **+15%**」⇒ 稀有材料档概率 `0.15`。
+
+| 落点 | 变更 |
+| :--- | :--- |
+| `shared/constants/mobs.ts:38` | 新增 `export const MOB_RARE_DROP_CHANCE = 0.15`(具名常量,不引魔法数) |
+| `shared/constants/mobs.ts:47` | 新增扩展接口 `MobDropRow extends MobDef { dropChance? }`(**不进冻结层 `MobDef`** —— 只本表与判定两处消费,冻结层形状不动) |
+| `shared/constants/mobs.ts:84` | `mob_squirrel` 追加 `dropChance: { 753: MOB_RARE_DROP_CHANCE }`(手册 L467 点名「**稀有**树种」) |
+| `shared/constants/mobs.ts:181` | `mob_choco_golem` 追加 `dropChance: { 751: MOB_RARE_DROP_CHANCE }`(手册 L481 点名「**稀有**甜点食谱」) |
+| `server/src/mobs/drops.ts`(**新增生产文件**) | 掉落判定唯一入口:件数/概率归一(`mobDropChanceOf` / `mobDropCountOf`)+ 确定 roll(`mobDropRoll`) + `rollMobDrops` |
+
+**口径**(全部可判定,见 `server/src/mobs/drops.ts` 文件头):**缺省 = 必掉**(手册没写概率的项
+`chance = 1`);概率项同种子可复现(`fnv1a32(seed|mobId|itemId) / 2^32`)、不依赖调用顺序;
+非法值 fail-closed(非有限 / `<= 0` ⇒ **不掉**,`> 1` ⇒ 钳到 `1`)。**只给手册点名「稀有」的两条**
+(`753` 稀有树种 / `751` 稀有甜点食谱);手册没写「稀有」的(如 `752 蓬松彩羽`)一律保持必掉。
+
+**判据名**:`WS-FND-98`(14 条)—— FND98-1(`MOB_RARE_DROP_CHANCE === 0.15`,依据手册 L387)、
+必掉项恒掉、同种子可复现、非法值 fail-closed、`751/753` 走概率而 `752` 不走。
+
+### 2. 房间元素抗性映射改按房间语义(`ROOM_ELEMENT_RESIST`)
+
+**依据**:owner 裁决「元素抗性按**房间语义**分元素」,以 `ROOM_RECIPES`
+(`shared/constants/bosses.ts:255-265`)的房间 / 核心件语义为准。
+
+| 落点 | 旧 → 新 |
+| :--- | :--- |
+| `server/src/rooms/effects.ts:391` | `ROOM_ELEMENT_RESIST` 只有 `SAKURA_ONSEN: ICE` → 登记 5 行:`FORGE_MASTER` / `COZY_CANTEEN` / `SAKURA_ONSEN` / `ALCHEMY_LAB → FIRE`、`AUTO_GREENHOUSE → LIGHT` |
+| `server/src/rooms/effects.ts:355` | 数值仍为具名「待平衡」`PENDING_ELEMENT_RESIST_MUL = 0.5`(**不是平衡裁决**;owner 给真内容就整行替换) |
+| `SAKURA_ONSEN` | `ICE`(「泡温泉取暖 ⇒ 抗霜冻」旧读法)→ `FIRE`(核心件 `526 露天温泉石灯笼` + `109 白玉温泉石`,地热 / 热水) |
+
+**不发明元素**:表里每个元素都必须在 `combat/weapons.ts` 的 `Element`
+(`NONE / FIRE / ICE / LIGHTNING / LIGHT / SLIME`)里;语义元素无对应项的房间
+(`ECO_RANCH` 的「土 / 农」、画廊 / 卧室 / 商店)**一律不登记** ⇒ `roomElementResistOf` 返回 `null`。
+
+**判据名**:`WS-FND-97`(6 条)—— FND97-1(表里每个元素 ∈ `ELEMENTS`)、逐房间语义归属、
+`SAKURA_ONSEN` 已从 `ICE` 退役、未登记房间返回 `null`、生产链 `roomAtCell → pushRoomElementResist`。
+
+### 3. 指纹与数字同步(本批)
+
+内容锁实测:整体 `76694a25 → 0afe5562`、`mobs 0e39b653 → 487f4515`;`items a008a5e6` /
+`bosses cf4bd9dc` / `modes b854dbfe` **未变**(`node scripts/content-lock.ts`)。
+
+| 落点 | 旧 → 新 |
+| :--- | :--- |
+| `tests/WS-FND-01.test.ts:207/211/216/228` | `v2-76694a25` / `'76694a25'` → `v2-0afe5562` / `'0afe5562'` |
+| `tests/WS-FND-01.test.ts:219` | `mobs '0e39b653'` → `'487f4515'` |
+| `tests/WS-FND-06.test.ts:1001` | `overall '76694a25'` → `'0afe5562'` |
+| `tests/WS-FND-84-abstract-loot.test.ts:28/538/546/550/551` | `overall 76694a25 → 0afe5562`、`mobs 0e39b653 → 487f4515` |
+| `README.md:58` | `指纹 v2-76694a25` → `v2-0afe5562` |
+| `scripts/data-conformance.ts:185/187` | `'v2-76694a25(既有锚点)'` → `'v2-0afe5562(既有锚点)'`;verdict `overall === '0afe5562'` |
+
+**数字**(新增 3 个套件 `WS-FND-97/98/99` = 6/14/8 = **+28 条**;新生产文件
+`server/src/mobs/drops.ts` ⇒ 生产 `.ts` **146**):
+
+| 落点 | 旧 → 新 |
+| :--- | :--- |
+| `README.md:62` | `105/105 ✅ 共 2173 个用例` → `108/108 ✅ 共 2201 个用例` |
+| `README.md:64` | `基座(FND-01..96) 1159 条 / 91 套件` → `基座(FND-01..99) 1187 条 / 94 套件` |
+| `README.md:66/157` | 生产可达性 `133/145` → `134/146`(不可达仍 12 = 白名单 12 + 未登记 0) |
+| `docs/HANDOVER.md:26` | `server/src` **91** → **92**;生产 `.ts` 合计 **145** → **146** |
+| `docs/HANDOVER.md:27` | `tests/*.test.ts` **105** → **108** |
+| `docs/HANDOVER.md:96` | `2173 条 / 105 套件 … FND 1159 条 / 91 套件` → `2201 条 / 108 套件 … FND 1187 条 / 94 套件`,号段 96 → 99 |
+| `docs/HANDOVER.md:100` | 生产可达性 `133 / 145` → `134 / 146` |
+| `docs/HANDOVER.md:§九 sha256 表` | README / CHANGE_REQUESTS 因本 CR 变动,按 LF 归一重算(`rehash_table_w17.mjs` 口径) |
+
+### 4. 刻意**没做**的事
+
+- **没跑** `node scripts/verify.ts --all`(硬约束);只跑 `--docs` + 逐套件直跑
+  (`WS-FND-01/06/84/97/98/99`);
+- **没改**别人的测试文件(`WS-FND-93` 仍红,归对应 owner);
+- **没改** `scripts/verify.ts`;**没 commit、没碰 `.pi/`**。
+
+### 5. 关联
+
+- 前置:CR-30(内容指纹 v1 → v2,`drops` 进 mobs 分区哈希)· CR-27/28/29(`748~754` 与 `loot` / `drops` 归属)
+- `shared/constants/mobs.ts`(概率字段)· `server/src/mobs/drops.ts`(判定入口)
+- `server/src/rooms/effects.ts`(`ROOM_ELEMENT_RESIST` / `PENDING_ELEMENT_RESIST_MUL`)
+- `tests/WS-FND-97-room-element-semantics.test.ts` · `tests/WS-FND-98-knockback-and-drops.test.ts`

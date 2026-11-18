@@ -204,19 +204,19 @@ test('A13 overall 由四分区与算法版本合成,可独立复现', () => {
   const f = contentFingerprints();
   /* 期望值写字面量 2,不引 `CONTENT_FINGERPRINT_VERSION`。
      `contentFingerprints()` 返回的 `version` **就是**该常量,故引用它恒真。
-     2 的**独立来源**:`node scripts/content-lock.ts` 实测指纹串 = `v2-76694a25`
+     2 的**独立来源**:`node scripts/content-lock.ts` 实测指纹串 = `v2-0afe5562`
      (CR-30:content-lock 改为**整字段投影**,算法版本 1 → 2),指纹串格式是
      `v{version}-{8hex}` ⇒ 首段 `v2` 即 version = 2。下方
      `eq(CONTENT_FINGERPRINT_VERSION, 2)` 继续锚定常量本身(双向锚定)。 */
-  eq(f.version, 2, '算法版本 = 2(CR-30 起整字段投影,指纹串形如 v2-76694a25)');
+  eq(f.version, 2, '算法版本 = 2(CR-30 起整字段投影,指纹串形如 v2-0afe5562)');
   eq(CONTENT_FINGERPRINT_VERSION, 2);
   /* 手工按实现公式重算,确认 overall 可复现 —— 而不是「某个神秘数字」。 */
   const expect = fnv1a32(`${f.version}|${f.items}|${f.mobs}|${f.bosses}|${f.modes}`);
   eq(f.overall, expect);
-  eq(f.overall, '76694a25', '当前内容的总体指纹(CR-30 实测基准)');
+  eq(f.overall, '0afe5562', '当前内容的总体指纹(CR-30 实测基准)');
   /* 分区指纹实测基准。 */
   eq(f.items, 'a008a5e6');
-  eq(f.mobs, '0e39b653');
+  eq(f.mobs, '487f4515');
   eq(f.bosses, 'cf4bd9dc', 'CR-30 起按整字段投影哈希 ⇒ 与 v1 的分区值不可比');
   eq(f.modes, 'b854dbfe');
 });
@@ -225,7 +225,7 @@ test('A14 contentFingerprintLine() 形如 v2-xxxxxxxx,8 位 hex', () => {
   const line = contentFingerprintLine();
   ok(/^v2-[0-9a-f]{8}$/.test(line), `格式应为 v2-8hex,实际 ${line}`);
   eq(line, `v2-${contentFingerprints().overall}`);
-  eq(line, 'v2-76694a25');
+  eq(line, 'v2-0afe5562');
 });
 
 test('A15 指纹只反映内容数据:等价的规范输入得到等价指纹', () => {

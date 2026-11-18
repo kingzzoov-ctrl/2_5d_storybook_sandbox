@@ -2,6 +2,10 @@
  * 冻结层:八大群系 24 种野生动物生态表(设计手册 §4.2 逐行落地)。
  *
  * 生物 ID 与手册完全一致(`mob_*`),掉落物 ID 引用 `shared/constants/items.ts`。
+ *
+ * ★ WS-FND-98:掉落**概率**只在手册点了「稀有」的项上给(`dropChance`,见
+ * `MOB_RARE_DROP_CHANCE` 的 docblock);手册 §4.2 只写物品与件数、没写百分比的项
+ * **一律保持必掉**(不写 `dropChance` 键),全部数值只有手册一个出处。
  */
 
 import { Biome, MobBehavior, type MobDef } from '../types/entities.ts';
@@ -11,7 +15,44 @@ export type { MobDef };
 const M = Biome.MEADOW, V = Biome.VALLEY, S = Biome.SAKURA, C = Biome.CAVERN;
 const O = Biome.OASIS, D = Biome.DESSERT, K = Biome.SKYSEA, R = Biome.RUINS;
 
-export const MOB_LIST: readonly MobDef[] = [
+/**
+ * **稀有材料**档的掉落概率(0..1)—— ★ WS-FND-98 新增。
+ *
+ * ## 数值来源(**只有一处**,不发明)
+ * 手册 L387(`624 招财进宝猫耳箍`)是手册里**唯一**写到野怪掉落率的数字:
+ * 「击败野生动物时金币与**稀有材料掉落率 +15%**」。本表据它把「稀有材料」这一档定为 `0.15`;
+ * 要改这个数需要新裁决 / 手册出新值 —— **不要**在这里按手感调参。
+ *
+ * ## 哪些项算「稀有材料」
+ * 只认手册自己标了「稀有」的掉落物:`753 稀有树种`(手册 L467 `mob_squirrel`
+ * 「掉 `101 原木`、**稀有树种**」)与 `751 稀有甜点食谱`(手册 L481 `mob_choco_golem`
+ * 「掉 …、**稀有甜点食谱**」)。手册**没**写「稀有」的掉落(例如 `752 蓬松彩羽`,
+ * 手册 L476 只写「掉蓬松彩羽」)**一律保持必掉**。
+ *
+ * ## 为什么默认是必掉
+ * 手册 §4.2 的 24 行掉落列**只写物品与件数,没有任何百分比**(唯一带数量的写法是 `×N`,
+ * 那是件数不是概率)⇒ 按「数值只能来自手册」的口径,凡手册没写概率的项都**不加**概率字段,
+ * 判定侧对缺省值的解释就是**必掉**(`chance = 1`)。这条同时是判据:
+ * 「手册没写的仍是必掉」由 `tests/WS-FND-98` 钉住。
+ */
+export const MOB_RARE_DROP_CHANCE = 0.15;
+
+/**
+ * 本表的行类型 = 冻结层 `MobDef` + 掉落概率字段。
+ *
+ * ⚠️ **为什么不把字段加进 `shared/types/entities.ts` 的 `MobDef`**:那是冻结层形状,
+ * 它的任何改动都会波及 Boss/客户端/协议三侧;而「掉落概率」目前只有本表与掉落判定两处消费。
+ * 用**扩展接口**表达,`MOB_BY_ID` 仍按 `MobDef` 暴露,既有调用方一个都不用改。
+ */
+export interface MobDropRow extends MobDef {
+  /**
+   * 掉落概率:`itemId → (0, 1]`。**缺省 = 必掉**(手册没写概率的项不写这个键)。
+   * 键必须是 `drops` 里已有的 itemId(判定侧按 `drops` 遍历,多余键不产生掉落)。
+   */
+  dropChance?: Readonly<Record<number, number>>;
+}
+
+export const MOB_LIST: readonly MobDropRow[] = [
   /* ── 1. 晨曦草甸 ── */
   {
     id: 'mob_sheep', name: '云朵绵羊', biome: M, behavior: MobBehavior.TAMEABLE,
@@ -36,8 +77,11 @@ export const MOB_LIST: readonly MobDef[] = [
   {
     id: 'mob_squirrel', name: '大尾花栗鼠', biome: V, behavior: MobBehavior.TAMEABLE,
     level: 2, hp: 50, exp: 20, tameItem: 121,
-    /* ★ CR-29:手册 L467「掉 `101 原木`、稀有树种」⇒ 753 按手册挂这里(件数缺省 1,不发明概率)。 */
+    /* ★ CR-29:手册 L467「掉 `101 原木`、稀有树种」⇒ 753 按手册挂这里(件数缺省 1)。
+       ★ WS-FND-98:753 是手册点名「**稀有**树种」的稀有材料 ⇒ 按 `MOB_RARE_DROP_CHANCE`
+       给概率(手册 L387 是唯一一处野怪掉落率数字,见该常量);`101 原木` 手册没写概率 ⇒ 保持必掉。 */
     drops: { 101: 1, 753: 1 },
+    dropChance: { 753: MOB_RARE_DROP_CHANCE },
     note: '在果树间窜动并往树洞藏松果;喂露水甜莓可驯化为帮玩家自动捡果子的小跟班。',
   },
   {
@@ -130,8 +174,11 @@ export const MOB_LIST: readonly MobDef[] = [
   {
     id: 'mob_choco_golem', name: '巧克力盾卫', biome: D, behavior: MobBehavior.HOSTILE_ELITE,
     level: 18, hp: 1100, exp: 320,
-    /* ★ CR-29:手册 L481「掉 `105 焦糖威化木×5`、稀有甜点食谱」⇒ 751 按手册挂这里(件数缺省 1)。 */
+    /* ★ CR-29:手册 L481「掉 `105 焦糖威化木×5`、稀有甜点食谱」⇒ 751 按手册挂这里(件数缺省 1)。
+       ★ WS-FND-98:751 是手册点名「**稀有**甜点食谱」的稀有材料 ⇒ 同上给 `MOB_RARE_DROP_CHANCE`;
+       `105`(手册写了 ×5)与 `603` 手册没写概率 ⇒ 保持必掉。 */
     drops: { 105: 5, 603: 1, 751: 1 },
+    dropChance: { 751: MOB_RARE_DROP_CHANCE },
     note: '体型巨大的巧克力魔像;若玩家用火椒或火把攻击它,它的巧克力护甲会融化变成满地加速巧克力浆(稀有甜点食谱)。',
   },
 
