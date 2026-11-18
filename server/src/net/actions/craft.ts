@@ -72,11 +72,9 @@
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
-import type { ActionOutcome, WorldSaveHost } from '../room.ts';
+import type { ActionOutcome, EffectRecord, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
-/** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型(见文件头)。 */
-type EffectRecord = NonNullable<ActionOutcome['effect']>;
 
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
@@ -223,9 +221,8 @@ export const craft: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   }
 
   /* 回执:`consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件),不是配方需求表。
-     该字段是嵌套对象,`ActionOutcome['effect']` 的值类型装不下 ⇒ 显式窄化(见文件头)。 */
-  return {
-    ok: true, kind: 'OK',
-    effect: { itemId, produced: made, consumed: match.consumed } as unknown as EffectRecord,
-  };
+     ★ 第五轮 P1:它是嵌套对象,而 `EffectRecord` 现在**自己就允许嵌套**
+     ⇒ 不需要 `as unknown as`(修前那一句就是「契约说标量、实现塞对象」的绕过)。 */
+  const effect: EffectRecord = { itemId, produced: made, consumed: match.consumed };
+  return { ok: true, kind: 'OK', effect };
 };

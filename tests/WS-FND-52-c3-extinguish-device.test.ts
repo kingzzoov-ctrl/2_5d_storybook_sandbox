@@ -83,7 +83,7 @@ const totalOf = (rt: Runtime): number =>
   (rt as unknown as { authoritativeItemTotal(u: string): number }).authoritativeItemTotal('p1');
 const disp = (rt: Runtime, payload: Record<string, unknown>) =>
   rt.dispatchAction('p1', RoomAction.USE_ITEM, payload);
-const eff = (r: { effect?: Record<string, string | number | boolean> }): Record<string, string | number | boolean> =>
+const eff = (r: { effect?: unknown }): Record<string, string | number | boolean> =>
   r.effect as Record<string, string | number | boolean>;
 const why = (r: { reason?: string }): string => String(r.reason ?? '');
 

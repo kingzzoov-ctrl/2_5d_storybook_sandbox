@@ -69,6 +69,46 @@ import {
   type EquipmentSnapshot,
 } from '../server/src/combat/revive.ts';
 import { createTarget } from '../server/src/combat/damage.ts';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const FND111_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 剥注释后只留**代码** —— 结构判据必须只看代码:说明里会引用被修的写法(本仓惯例)。
+ * 逐字符扫(不用正则),故 `https://` 之类的行注释误伤不存在。
+ */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    if (src.startsWith('/*', i)) {
+      const j = src.indexOf('*/', i + 2);
+      i = j < 0 ? src.length : j + 2;
+      out += ' ';
+      continue;
+    }
+    if (src.startsWith('//', i)) {
+      const j = src.indexOf('\n', i);
+      i = j < 0 ? src.length : j;
+      continue;
+    }
+    out += src[i];
+    i += 1;
+  }
+  return out;
+}
+
+/** 抽某段实现体(签名 → endMarker)并剥注释;锚点漂移必须抛错(否则判据静默恒真)。 */
+function codeOf(rel: string, signature: string, endMarker: string): string {
+  const src = readFileSync(join(FND111_ROOT, rel), 'utf8').replace(/\r\n/g, '\n');
+  const i = src.indexOf(signature);
+  if (i < 0) throw new Error(`找不到锚点 \`${signature}\`(漂移即本判据失效)`);
+  const end = src.indexOf(endMarker, i);
+  if (end < 0) throw new Error(`\`${signature}\` 之后找不到 ${JSON.stringify(endMarker)}`);
+  return stripComments(src.slice(i, end + endMarker.length));
+}
 
 /* ═════════════════ 独立检查器:矩阵自洽的四条规则 ═════════════════ */
 
@@ -243,10 +283,17 @@ test('FND111-6 vitals.heal:NaN / ±Infinity 拒绝且不污染 hp', () => {
   eq(v.heal('p1', 1e9), 20, '正对照:超量治疗被上限钳住(120 − 100)');
   eq(p.hp, 120, '正对照:不超过上限');
 
-  /* 负对照:修前那一行的形态(`Math.min(maxHp, hp + Math.max(0, NaN))`)确实是 NaN ——
-     「门」不是装饰,删掉它 hp 会被永久污染。 */
-  ok(Number.isNaN(Math.min(120, 90 + Math.max(0, Number.NaN))), '修前形态 ⇒ hp = NaN');
-  ok(!Number.isFinite(Math.max(0, Number.NaN)), '根因:`Math.max(0, NaN) === NaN`');
+  /* ★ 负对照(结构):这条门的牙在 `vitals.ts::heal` 的**代码**里 ——
+     删掉那一行有限性守卫本判据就红。替代了修前那两条
+     `Math.max(0, NaN) === NaN` 的纯 JS 恒真断言(它们一次也没碰被测模块)。 */
+  const healBody = codeOf('server/src/combat/vitals.ts', 'heal(id: string, amount: number): number {', '\n  }\n');
+  ok(/if \(!Number\.isFinite\(amount\)\)\s*return 0;/.test(healBody),
+    '★ heal 必须先做有限性门(删掉它 NaN 会把 hp 永久污染成 NaN)');
+  ok(healBody.indexOf('Number.isFinite') < healBody.indexOf('v.hp ='),
+    '有限性门必须排在**写 hp 之前**(排在写后等于没门)');
+  /* ★ 注入:把守卫那一行删掉 ⇒ 上面两条判据必须同时为假(证明它们不是恒真) */
+  const healInjected = healBody.replace(/if \(!Number\.isFinite\(amount\)\)\s*return 0;/, '');
+  ok(!/Number\.isFinite/.test(healInjected), '负对照:删掉守卫后判据必须为假');
 });
 
 /* ═════════════════ 7. gainExp 入口拒非有限 ═════════════════ */
@@ -266,17 +313,16 @@ test('FND111-7 gainExp:NaN / ±Infinity 不再一口气升到满级', () => {
     ok(r.progress === p, '档案原样回传(同一引用,一字不动)');
   }
 
-  /* 负对照:修前的循环形态(`exp = NaN` + 出口 `exp < need`)确实会顶到满级。 */
-  let level = 1;
-  let exp = Number.NaN;
-  while (level < MAX_LEVEL) {
-    const need = expToNext(level);
-    if (exp < need) break;
-    exp -= need;
-    level += 1;
-  }
-  eq(level, MAX_LEVEL, '修前形态:NaN ⇒ 直接 Lv.30');
-  ok(Number.isNaN(Math.max(0, Number.NaN)), '根因:`Math.max(0, NaN) === NaN`');
+  /* ★ 负对照(结构):修前的循环(`exp = NaN` + 出口 `exp < need`)会顶到满级 ——
+     这条断言打在 `progression.ts::gainExp` 的**代码**上:删掉非有限分支就红。
+     (替代了修前那个不碰模块的本地 while 循环 + `Math.max(0, NaN)` 恒真断言。) */
+  const gainBody = codeOf('server/src/combat/progression.ts', 'export function gainExp(', '\n}\n');
+  ok(/if \(!Number\.isFinite\(amount\)\)/.test(gainBody),
+    '★ gainExp 必须先拒非有限(删掉它 NaN 会一口气升到 Lv.30)');
+  ok(gainBody.indexOf('Number.isFinite') < gainBody.indexOf('while (level < MAX_LEVEL)'),
+    '非有限门必须排在升级循环**之前**');
+  const gainInjected = gainBody.replace(/if \(!Number\.isFinite\(amount\)\)/, 'if (false)');
+  ok(!/Number\.isFinite/.test(gainInjected), '负对照:去掉非有限门后判据必须为假(证明它不是恒真)');
 
   /* 正对照:闸不是「什么都拒」—— 合法经验照样升级,0 经验不升级 */
   eq(gainExp(createProgress('Grinder'), 449500).progress.level, MAX_LEVEL, '合法大额经验仍可满级');
@@ -293,10 +339,9 @@ test('FND111-8 铲子词条池:每条都有消费者(dodge_rate / knockback_mul 
     ok(!COMBAT_KEYWORD_POOL.includes(dead), `${dead} 不得回到池里:全仓零读取 ⇒ 静默空词条`);
   }
 
-  /* 负对照:修前 7 条池下,pick = (id + 1) % 7 ⇒ 607 恒拿 knockback_mul(零消费者)。 */
-  const OLD_POOL = ['atk_pct', 'def_flat', 'hp_flat', 'crit_rate', 'crit_dmg', 'dodge_rate', 'knockback_mul'];
-  eq(OLD_POOL[(607 + 1) % OLD_POOL.length], 'knockback_mul', '修前 607 的词条是零消费者的 knockback_mul');
-  eq(OLD_POOL[(606 + 1) % OLD_POOL.length], 'dodge_rate', '修前 606 同理');
+  /* 修前 7 条池下 607 恒拿 `knockback_mul` 的**本地数组模拟**已删除 ——
+     它不碰被测模块(恒真槽位)。下面是**行为**负对照:每道能出锅的料理,
+     铲子词条都必须真的改变至少一格 statMods(607 也只许走这条路)。 */
 
   /* 行为判据:经 506 能出锅的每道料理,铲子词条都必须**真的改变**至少一格 statMods。 */
   const reachable: Array<[number, Record<number, number>]> = [
@@ -336,8 +381,9 @@ test('FND111-9 hpFlat 不再线性叠加(602 × 3 ⇒ 30),单份值仍逐字透�
   const three = mergeFoodBuffs([foodBuffFrom(cake), foodBuffFrom(cake), foodBuffFrom(cake)]);
   eq(three.hpFlat, 30, '★ 三份 602 ⇒ 仍是 30(修前 90,无封顶)');
 
-  /* 负对照:修前的纯相加结果 = 90,正是本判据要拦的形状。 */
-  eq(30 * 3, 90, '修前(纯相加)会得到 90 —— 一道菜无限放大生命上限');
+  /* 负对照:修前的纯相加形态 —— 用**模块算出的单份值**乘份数(不是字面量乘法,
+     模块若把单份值改坏,这条会跟着红)。 */
+  ok(one.hpFlat * 3 === 90, '修前(纯相加)= 单份值 × 3 份 = 90');
   ok(three.hpFlat < 90, '叠加真的被挡住了');
 
   /* 既有契约保护:单份 40 必须**逐字**透传(WS-FND-17 FND17-3 的「原样透传」)。 */
@@ -389,17 +435,15 @@ test('FND111-10 倒地泡泡连击窗口:任意间隔的第 3 发不再「续杯
     eq(g.bubbleSinceHitSec, 0, '窗口计时一并归零(只在有层数时有意义)');
   }
 
-  /* 负对照(修前形态的模型):层数只 `+1`、没有任何衰减路径 ⇒ 同样三发必然困住。 */
-  let oldStacks = 0;
-  let oldTrapped = false;
-  for (let i = 0; i < 3; i += 1) {
-    oldStacks += 1;
-    if (oldStacks >= BUBBLE_GUN_SHOTS) {
-      oldTrapped = true;
-      oldStacks = 0;
-    }
-  }
-  eq(oldTrapped, true, '修前形态:任意间隔的第 3 发都会把 invulnSec 重置成 5 秒 —— 本判据就是拦这个');
+  /* ★ 负对照(取代修前那个不碰模块的本地循环模型):漂移**恰好等于**窗口时长
+     ⇒ 层数必须清零。走真 `tickGhostBubble`:删掉窗口过期分支 ⇒ 层数仍为 2 ⇒ 红。 */
+  let bd: DownedState = createDowned(progress, EQUIP, 0, 0);
+  bd = bubbleGunHit(bd).downed;
+  bd = bubbleGunHit(bd).downed;
+  eq(bd.bubbleStacks, 2, '前置:窗口内连中 2 发 ⇒ 2 层');
+  const atWindow = tickGhostBubble(bd, BUBBLE_STACK_WINDOW_SEC).downed;
+  eq(atWindow.bubbleStacks, 0, '★ 漂移 = 窗口 5.0s(边界)⇒ 层数清零(不再是恒真槽位)');
+  eq(atWindow.bubbleSinceHitSec, 0, '窗口计时一并归零');
 
   /* 键不得凭空出现在 `createDowned`(WS-FND-36 把键集钉成 13 个)。 */
   eq(Object.keys(createDowned(progress, EQUIP, 0, 0)).length, 13, 'createDowned 键数不变(窗口字段只由命中建立)');

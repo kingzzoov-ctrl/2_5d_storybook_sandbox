@@ -289,6 +289,8 @@ export class FluidField {
    * 岩石/墙里 —— `amount` 有了、`kindAt` 也有了,只是永远流不动(表面看水面
    * 浮在墙内)。判据:`amount > 0` 且**结果态**为实心 ⇒ 抛 `RangeError`。
    * 只清空(`amount: 0`)、只改 `base`/`elev`、或显式把 `solid` 置回 0 再注水都不受影响。
+   * **判定与写入同源**:判「实心格」用的是 `clampAmount` 之后的落盘值,不是入参原值 ——
+   * 否则 `amount: 0.5 / 0.9`(floor 后为 0、一格水都写不进去)会被误抛 `RangeError`。
    *
    * ## 基底层补齐(`kind` 口径)
    *
@@ -300,7 +302,12 @@ export class FluidField {
     if (!this.inBounds(x, y)) throw new RangeError(`FluidField.setCell 越界:(${x}, ${y})`);
     const i = this.index(x, y);
     const nextSolid = init.solid !== undefined ? (init.solid ? 1 : 0) : this.solid[i];
-    if (init.amount !== undefined && init.amount > 0 && nextSolid === 1) {
+    /* ★ 判定与**写入**同源(`clampAmount`),不拿入参原值去判:
+       改前判的是 `init.amount > 0`,而落盘的是 `clampAmount(init.amount)`(`Math.floor`
+       之后可能为 0)—— 于是 `amount: 0.5 / 0.9` 这种合法输入被误判成「向实心格注水」
+       并抛 `RangeError`,尽管它根本写不进任何水。 */
+    const nextAmount = init.amount !== undefined ? clampAmount(init.amount) : undefined;
+    if (nextAmount !== undefined && nextAmount > 0 && nextSolid === 1) {
       throw new RangeError(
         `FluidField.setCell 拒绝向实心格注水:(${x}, ${y})`
         + ' —— 与 addWater 同口径(实心格不存水)',
@@ -309,8 +316,8 @@ export class FluidField {
     if (init.base !== undefined) this.base[i] = init.base & 0xff;
     if (init.solid !== undefined) this.solid[i] = init.solid ? 1 : 0;
     if (init.elev !== undefined) this.elev[i] = init.elev & 0x3;
-    if (init.amount !== undefined) {
-      this.amount[i] = clampAmount(init.amount);
+    if (nextAmount !== undefined) {
+      this.amount[i] = nextAmount;
       /* 只有真的存了水才补种 —— `amount: 0` 不该把一个空格的基底层改掉。 */
       if (this.amount[i] > 0 && this.base[i] === BaseFluid.VOID) {
         this.base[i] = BaseFluid.SHALLOW_WATER;

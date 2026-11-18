@@ -446,6 +446,21 @@ export const ROOF_BITS = ROOF_LAYER_SPEC.bits;
 export const ROOF_ID_MAX = ROOF_LAYER_SPEC.max;
 
 /**
+ * 屋顶 ID 的**唯一**校验口径(12 位 / `ROOF_ID_MAX`,事实源同上)。
+ *
+ * 改前这条判定只存在于 `Chunk.setRoof` 里,于是**旁路入口**都能把值域外的 ID 写进去:
+ *   * `decodeRoofRle` 的 `& 0xffff` 放行 4096..65535 ⇒ `roofAt()` 读回一个 12 位之外的值;
+ *   * 快照/回滚路径走的正是 `decodeRoofRle` ⇒ 上面那个洞不在写口,在**读口**。
+ * 现在 `setRoof` 与 `decodeRoofRle` 共用这一个函数:两条路只有**一份**上界。
+ */
+export function assertRoofId(roofId: number, where: string): number {
+  if (!Number.isInteger(roofId) || roofId < 0 || roofId > ROOF_ID_MAX) {
+    throw new RangeError(`${where} 屋顶 ID 超出 ${ROOF_BITS} 位:${String(roofId)}`);
+  }
+  return roofId;
+}
+
+/**
  * 层名 → `TileFields` 字段名。
  * `TileFields` 的键是**小写**(elev/base/floor/wire/obj/meta),而层名是大写,
  * 因此 `layer()` 必须显式查这张表,不能直接把大写的层名当键去索引。
@@ -631,12 +646,12 @@ export class Chunk {
    *
    * 为什么不是**钳位**:钳到 4095 会把「非法输入」伪装成一个合法屋顶 ID,
    * 调用方拿不到任何信号;而 0 是「没有屋顶」,钳到 0 又会与清空不可区分。
+   * 上界本身来自 `assertRoofId()`(与 `decodeRoofRle` / 快照回滚路径**同源**),
+   * 不在这个函数里再写一份数字。
    */
   setRoof(x: number, y: number, roofId: number): void {
     if (!inChunkBounds(x, y)) throw new RangeError(`Chunk.setRoof 越界:(${x}, ${y})`);
-    if (!Number.isInteger(roofId) || roofId < 0 || roofId > ROOF_ID_MAX) {
-      throw new RangeError(`Chunk.setRoof 屋顶 ID 超出 ${ROOF_BITS} 位:${String(roofId)}`);
-    }
+    assertRoofId(roofId, 'Chunk.setRoof');
     const i = idx(x, y);
     if (this.roofs[i] === roofId) return;
     this.roofs[i] = roofId;
@@ -840,9 +855,19 @@ export class Chunk {
     c.dirtyCount = 0;
     for (let w = 0; w < DIRTY_WORDS; w += 1) c.dirtyCount += popcount32(c.dirty[w]);
     const rleLen = dv.getUint32(head + 16, true);
-    if (bytes.byteLength >= head + 24 + rleLen) {
-      decodeRoofRle(bytes.subarray(head + 24, head + 24 + rleLen), c.roofs);
+    /* ★ 声明的 RLE 长度**超出剩余字节**时不许静默跳过(审计 P2,反向复查)。
+       改前这里是 `if (够长) { decode }` —— **没有 else**:`decodeRoofRle` 会为截断的
+       0xff 游程抛错,而那个错被这一层吃掉,于是「被截断的屋顶层」看起来就是
+       「这一块没有屋顶」;`archive.ts:decodeChunk` 据此把它判成 tier 0(可重建原始
+       地形)并在超预算时**优先裁掉**,玩家建造的屋顶就这样没了,且没有任何信号。
+       口径与 `decodeRoofRle` 一致:截断 = 坏输入 ⇒ 抛 `RangeError`。 */
+    if (bytes.byteLength < head + 24 + rleLen) {
+      throw new RangeError(
+        `Chunk.deserializeSnapshot:屋顶层 RLE 声明 ${rleLen} 字节,`
+        + `缓冲只剩 ${bytes.byteLength - (head + 24)} 字节 —— 截断的屋顶层不等于「没有屋顶」`,
+      );
     }
+    decodeRoofRle(bytes.subarray(head + 24, head + 24 + rleLen), c.roofs);
     return c;
   }
 
@@ -924,6 +949,11 @@ export function encodeRoofRle(roofs: Uint16Array): Uint8Array {
  * 零游程(`tag < 0xff`)越过数组末尾仍然合法:它只是把余下的目标格留在原值
  * (`o += tag` 后循环条件 `o < into.length` 自然结束),这是编码侧 `n < 127`
  * 的对称语义,不产生任何越界读。
+ *
+ * ## 屋顶 ID 的值域(`& 0xffff` 不等于校验)
+ * 改前 `& 0xffff` 把 16 位**全部**收下,于是 4096..65535 也能进 `roofs` 并被
+ * `roofAt()` 读回 —— 快照/回滚路径绕过了 `Chunk.setRoof` 的 12 位校验。
+ * 现在每个非零值都过 `assertRoofId()`(与写入侧同一份上界),值域外 ⇒ 抛。
  */
 export function decodeRoofRle(buf: Uint8Array, into: Uint16Array): void {
   let i = 0;
@@ -937,7 +967,8 @@ export function decodeRoofRle(buf: Uint8Array, into: Uint16Array): void {
           + ' —— 拒绝静默写 0',
         );
       }
-      into[o] = (buf[i + 1] | (buf[i + 2] << 8)) & 0xffff;
+      const v = (buf[i + 1] | (buf[i + 2] << 8)) & 0xffff;
+      into[o] = assertRoofId(v, `decodeRoofRle 偏移 ${i}`);
       o += 1;
       i += 3;
       continue;

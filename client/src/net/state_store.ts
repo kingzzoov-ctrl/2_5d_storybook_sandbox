@@ -40,6 +40,7 @@
  */
 
 import {
+  PacketOp,
   applyPacket,
   decodePacket,
   type DecodedPacket,
@@ -77,12 +78,19 @@ export function emptyRoomState(): RoomState {
  * `apply()` 的结果。调用方**按它决定**要不要重画,不靠副作用。
  */
 export interface ApplyResult {
-  /** 状态是否真的变了(跳过空帧、解码失败时为 false)。 */
+  /** 状态是否真的变了(跳过空帧、解码失败、丢弃旧帧时为 false)。 */
   changed: boolean;
   /** 帧号(`meta.tick`);未变时保持上一个值。 */
   tick: number;
-  /** 本次为何跳过 / 失败;正常合入时为 `null`。 */
-  skipped: 'empty-frame' | 'decode-failed' | null;
+  /**
+   * 本次为何跳过 / 失败;正常合入时为 `null`。
+   *
+   * ★ WS-FND-113 新增 `'stale-frame'`:差量帧**比当前状态旧** ⇒ 丢弃。
+   * 它与 `'empty-frame'` 都"不是错误",但**成因完全不同**
+   * (一个"本 tick 无差量"、一个"这帧来晚了")⇒ 必须分开计数,否则
+   * 掉线与抖动在账上同形,正是本仓记过的「症状名 ≠ 成因名」。
+   */
+  skipped: 'empty-frame' | 'decode-failed' | 'stale-frame' | null;
   /** `skipped === 'decode-failed'` 时的原因文本(便于诊断与断言)。 */
   error?: string;
   /**
@@ -99,6 +107,14 @@ export class ClientStateStore {
   private localId_ = '';
   private decodeErrors_ = 0;
   private emptyFrames_ = 0;
+  /**
+   * ★ WS-FND-113:被**单调门**丢弃的旧帧数。
+   *
+   * 与 `emptyFrames_` / `decodeErrors_` **分开计**:三种"没合入"的成因不同
+   * (本 tick 无差量 / 坏包 / 这帧来晚了)。混成一个数就再也分不出
+   * 「网络乱序」与「重连重放」,而这两者的处置完全不同(见 `apply` 的单调门)。
+   */
+  private staleFrames_ = 0;
   private lastError_: string | undefined;
   /**
    * ★ D-14:最近一帧包头带回的 `ackedSeq`(`-1` = 还没收到过任何 ack)。
@@ -132,6 +148,11 @@ export class ClientStateStore {
   /** 被跳过的空帧计数。 */
   get emptyFrames(): number {
     return this.emptyFrames_;
+  }
+
+  /** ★ WS-FND-113:被单调门丢弃的旧帧(差量帧 tick 未前进)计数。 */
+  get staleFrames(): number {
+    return this.staleFrames_;
   }
 
   get lastError(): string | undefined {
@@ -177,13 +198,42 @@ export class ClientStateStore {
       };
     }
 
+    /* ── ★ WS-FND-113 第 5 处:单调门 —— **旧帧不许把权威状态拉回** ──
+     *
+     * ## 修的是什么
+     * 此前 `applyPacket` 无条件用包头 tick 覆盖 `meta.tick`,于是**晚到的旧帧**
+     * 也会被合入 ⇒ 权威位置被往回拉一小段。它的外观与"网络抖动"完全一样,
+     * 而且 `changed` 仍是 true、`decodeErrors` 仍是 0 ⇒ 没有任何指标会红。
+     *
+     * ## 为什么只拦 `DELTA`,而且用 `<=`
+     * `DELTA` 是**相对上一份状态**的差量 ⇒ 它作用在**已前进**的基线上会写坏状态
+     * (同一份差量应用两次 = 把某一帧的位移记两遍)。服务端每帧 `step()` 一次、
+     * 广播一次 ⇒ 同一条连接上 tick **严格递增**,`tick <= 当前` 只可能是
+     * 重复投递或乱序晚到。
+     *
+     * `FULL` **无条件接受**:它是自包含快照(入场 / 重连恢复)。重连时服务端的
+     * tick 可能**小于**断线前收到的那个数 —— 按 tick 丢掉它,就等于把唯一的
+     * 恢复快照扔掉,此后每一帧 `DELTA` 都因基线不符被继续丢 ⇒ 客户端**永久冻结**,
+     * 而且不会报任何错。⇒ 这条豁免是**必要的**,不是宽松。
+     */
+    if (pkt.op === PacketOp.DELTA && pkt.tick <= this.state_.meta.tick) {
+      this.staleFrames_ += 1;
+      return { changed: false, tick: tickBefore, skipped: 'stale-frame', ackedSeq: null };
+    }
+
     /* ── 坑 1:`applyPacket` 返回**新对象** ⇒ 必须接住返回值。
        写成 `applyPacket(this.state_, pkt);`(丢弃返回值)会静默无效 ——
        状态不变、不报错、画面冻住而没有任何提示。 */
     this.state_ = applyPacket(this.state_, pkt);
 
-    /* ★ D-14:包头带回的 ack 也是**这一帧的事实** —— 与状态一起落账。 */
-    this.ackedSeq_ = pkt.ackedSeq;
+    /* ★ D-14:包头带回的 ack 也是**这一帧的事实** —— 与状态一起落账。
+       ★ WS-FND-113:但**只进不退**。乱序帧的 ack 天然更旧,而 `ackedSeq_` 的
+       消费者(`LocalPredictor.pruneCmds`)按"最高 ack"剪队列 ⇒ 让它倒退会让
+       "已经确认过的命令"重新变成待确认,`prunedTotal` 也不再单调
+       (判据读的正是这个计数)。`-1`(本帧没带 ack)因此**不会**把已有值抹掉。 */
+    if (Number.isFinite(pkt.ackedSeq) && pkt.ackedSeq > this.ackedSeq_) {
+      this.ackedSeq_ = pkt.ackedSeq;
+    }
 
     return { changed: true, tick: this.state_.meta.tick, skipped: null, ackedSeq: pkt.ackedSeq };
   }

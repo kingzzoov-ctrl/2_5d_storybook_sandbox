@@ -10,6 +10,17 @@
  *   - 可调延时继电器 413 在固有延迟上加档位帧数;
  *   - 反相输出需显式指定输出色,读输入色与写输出色一般不同(见各件注释)。
  *
+ *
+ * ## ★ WS-FND-114 的两张台账(口径在此,不在注释里)
+ *
+ * · `ENV_KEY_LEDGER`  —— 每个**环境键**的生产者(`WORLD` / `LOCAL_STATIC` / `NONE`)。
+ *   修前世界环境口只回答 `hour` / `night`,其余键一律 0 ⇒ 一批输入判据**恒假**,
+ *   而反向判据(`moored === 0`,440)反而**恒真**。现在 `WORLD` 的 11 个键由
+ *   `WorldSim.installWorldEnv` 真的回答(逐格),`NONE` 的那批**如实登记**为欠账。
+ * · `COMPONENT_PRODUCER_LEDGER` —— 40 项件**在生产侧由谁造出来**。现状是
+ *   **没有任何生产调用点**(只有 `sim/demo.ts` 与 tests)⇒ `WorldSim` 的
+ *   `if (wiringOn)` 求值块空转。接线点在 `net/actions/**`(不在本线写域),
+ *   故**只登记不宣称**:见那张表的长注释(「不许两边都宣称已实现」)。
  * 本文件只依赖 `node:*` 与冻结层符号。
  */
 
@@ -233,7 +244,7 @@ export const COMPONENT_SPECS: readonly ComponentSpec[] = Object.freeze([
   S(437, 'VEHICLE_LOCOMOTIVE', '叮当蒸汽小火车头', ComponentGroup.VEHICLE, [], { crushDamage: 150 }),
   S(438, 'VEHICLE_WAGON', '观光与货运矿车厢', ComponentGroup.VEHICLE, [], {}),
   S(439, 'VEHICLE_SWAN_BOAT', '双人天鹅脚踏船', ComponentGroup.VEHICLE, [], {}),
-  S(440, 'VEHICLE_AIRSHIP', '八人云海探险飞艇', ComponentGroup.VEHICLE, [], { seats: 8 }),
+  S(440, 'VEHICLE_AIRSHIP', '八人云海探险飞艇', ComponentGroup.VEHICLE, [], { seats: 8, unmoored: 0 }),
 ]);
 
 /** ID → 规格。 */
@@ -302,9 +313,100 @@ export const STATE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, num
 /** kind → 规格。 */
 export const SPEC_BY_KIND: ReadonlyMap<string, ComponentSpec> = new Map(COMPONENT_SPECS.map((s) => [s.kind, s]));
 
+/* ══════════════════════════ 环境读数台账(★ WS-FND-114)══════════════════════ */
+
+/**
+ * 每个环境键的**生产者**口径。
+ *
+ * ## 为什么需要这张表(P1:「其它键在 `server/src` 无写入者 ⇒ 判据恒假」)
+ *
+ * 组件的输入判据分两半:一半是**摆放设置**(`params`,如音高/频道/朝向),另一半是
+ * **世界此刻的状态**(这一格上有没有实体、有没有水、是不是早上)。后者由 `param()`
+ * 在静态表缺键时向**世界环境口**要(见 `graph.ts` 的 `EnvSource`)。
+ *
+ * 修前世界环境口只回答 `hour` / `night`,其余键一律 0 ⇒ `entityCount > 0`、
+ * `fluid > 0`、`payloadAbove > 0` …… **全部恒假**;更糟的是**反向判据**
+ * `moored === 0`(440)与「键缺失」在 `param()` 里不可区分 ⇒ **恒真**(飞艇恒飞)。
+ *
+ * ⇒ 这张表把每个键的处境**逐条登记**:`WORLD` 的那批由 `WorldSim.installWorldEnv`
+ *   真的给出读数(逐格或全局);`NONE` 的那批是**如实登记的欠账** —— 它们要的是
+ *   「交互/动作层」的输入(点击、吹哨、踩踏、登船……),那是另一条线。
+ *
+ * ⚠️ 表必须**覆盖组件真的会问的全部键**:**不靠人肉对账** —— 判据 `WS-FND-114`
+ *    用一支记录型环境口跑遍 40 件,把「evaluator 问了、表里没有」当场判红。
+ */
+export const EnvKeyProducer = {
+  /** 世界侧有生产源(`WorldSim.installWorldEnv` 回答:逐格或全局)。 */
+  WORLD: 'WORLD',
+  /** 摆放/操作设置(缺省值写在 `SPEC_BY_KIND.params` 里),不是世界事实。 */
+  LOCAL_STATIC: 'LOCAL_STATIC',
+  /** **没有生产源**:判据恒假/恒真,已在本行写明出路(如实登记的欠账)。 */
+  NONE: 'NONE',
+} as const;
+export type EnvKeyProducer = (typeof EnvKeyProducer)[keyof typeof EnvKeyProducer];
+
+export interface EnvKeyRow {
+  producer: EnvKeyProducer;
+  /** 这个键是什么意思、生产源在哪(或为什么没有)。 */
+  note: string;
+}
+
+const K = (producer: EnvKeyProducer, note: string): Readonly<EnvKeyRow> => Object.freeze({ producer, note });
+
+export const ENV_KEY_LEDGER: Readonly<Record<string, Readonly<EnvKeyRow>>> = Object.freeze({
+  /* ── 世界侧有生产源(逐格 / 全局)── */
+  hour: K(EnvKeyProducer.WORLD, '世界钟(D-07)⇒ `WorldSim.hourOfDay()`;**带小数**(如 6.24)'),
+  night: K(EnvKeyProducer.WORLD, '`WorldSim.isNightNow()`;边界只有一处(`isNight`:19:00–06:00)'),
+  entityCount: K(EnvKeyProducer.WORLD, '件所在格的实体数:玩家 + 活着的生物 + 地面掉落堆(≥1 即「压上」)'),
+  entityWeight: K(EnvKeyProducer.WORLD, '件所在格的**总质量**(刚体质量求和;掉落物不压秤)'),
+  fluid: K(EnvKeyProducer.WORLD, '件所在格水量 > 0(读 `FluidField.amountAt`,不另存一份水位)'),
+  crossed: K(EnvKeyProducer.WORLD, '件所在格**本帧有实体**(玩家/活生物)—— 绊线柱的 1 帧电平'),
+  onPodium: K(EnvKeyProducer.WORLD, '件所在格有**玩家**(踏上领奖台;掉落物不算)'),
+  payloadAbove: K(EnvKeyProducer.WORLD, '件**上方一格**有载荷(实体或掉落堆)'),
+  enemyInRange: K(EnvKeyProducer.WORLD, '`params.range` 格内有活着的生物(半径取件自己的设置)'),
+  hitMob: K(EnvKeyProducer.WORLD, '件所在格有活着的生物(火车碾压接触)'),
+  morningTick: K(EnvKeyProducer.WORLD, '本慢帧是**世界日的头一个慢帧**(06:00 起头)⇒ 426「每早」只触发一次'),
+  /* ── 摆放设置(缺省写在 `SPEC_BY_KIND.params`)── */
+  unmoored: K(EnvKeyProducer.LOCAL_STATIC, '440 松缆(缺省 0 = 系泊)。**正向键**:缺失 = 停在码头,不是「恒飞」'),
+  /* ── 没有生产源(如实登记的欠账)── */
+  togglePulse: K(EnvKeyProducer.NONE, '403 点击翻转:交互输入,世界侧没有「谁点了它」的通道'),
+  pressed: K(EnvKeyProducer.NONE, '404 按下:交互输入(同上);`pulseTicks` 是静态档位,不受影响'),
+  playedPitch: K(EnvKeyProducer.NONE, '408 实际弹出的音高:演奏输入尚未回灌电路层'),
+  pitchActive: K(EnvKeyProducer.NONE, '408 本帧有没有演奏(同上)'),
+  chestFull: K(EnvKeyProducer.NONE, '409 储物箱满载:容器容量在 `systems/**`,世界侧无「这一格满没满」的读口'),
+  scored: K(EnvKeyProducer.NONE, '410 球进门:果冻球的进球判定尚未回灌'),
+  whistle: K(EnvKeyProducer.NONE, '411 吹哨:交互输入(红灯驱动可代替,故非死路)'),
+  nowMs: K(EnvKeyProducer.NONE, '412 停表用墙钟毫秒 ⇒ 缺省按 `elapsedTicks × 500ms` 折算(不读系统钟,保持确定性)'),
+  trigger: K(EnvKeyProducer.NONE, '416 手动触发(读黄线可代替,故非死路)'),
+  pulse: K(EnvKeyProducer.NONE, '417 手动脉冲(读 `inputColor` 线可代替,故非死路)'),
+  input: K(EnvKeyProducer.NONE, '418 本地广播输入(读红线可代替,故非死路)'),
+  stepped: K(EnvKeyProducer.NONE, '419 踩踏(读红线可代替,故非死路)'),
+  manual: K(EnvKeyProducer.NONE, '420/428/429/430/431 手动开关(读对应色线可代替,故非死路)'),
+  loaded: K(EnvKeyProducer.NONE, '425 装填(读红线可代替,故非死路)'),
+  clicked: K(EnvKeyProducer.NONE, '433 点击刷球(读红线可代替,故非死路)'),
+  ballRemoved: K(EnvKeyProducer.NONE, '433 果冻球被清除:球体生命周期尚未回灌'),
+  start: K(EnvKeyProducer.NONE, '434 开赛(读红线可代替,故非死路)'),
+  holder: K(EnvKeyProducer.NONE, '434 谁持冠:争夺战的持冠判定尚未回灌'),
+  revivePulse: K(EnvKeyProducer.NONE, '435 复活事件:复活走 `combat/revive.ts`,未回灌电路'),
+  mode: K(EnvKeyProducer.NONE, '436 裁判控制台:交互输入(派对运行时的持有者在 `world_sim.startPartyRun`)'),
+  fueled: K(EnvKeyProducer.NONE, '437 加煤(读绿线可代替,故非死路)'),
+  coupled: K(EnvKeyProducer.NONE, '438 挂接:车厢/火车头的编组关系尚未在世界侧登记'),
+  riderCount: K(EnvKeyProducer.NONE, '438/439/440 乘员数:载具登船接口尚未接线'),
+});
+
+/** `ENV_KEY_LEDGER` 里标了 `WORLD` 的键(顺序稳定,供判据与世界侧对账)。 */
+export const WORLD_ENV_KEYS: readonly string[] = Object.freeze(
+  Object.keys(ENV_KEY_LEDGER).filter((k) => ENV_KEY_LEDGER[k]?.producer === EnvKeyProducer.WORLD),
+);
+
 /* ══════════════════════════ 行为实现 ══════════════════════════ */
 
-/** 读「该件所在格是否有实体」的外界信号:由世界层通过 ctx.param 注入。 */
+/**
+ * 逐格传感事实的三个高频键名(其余键名在各自的求值器里直接写在 `ctx.param(...)`)。
+ *
+ * 生产源:`WorldSim.installWorldEnv`(按**件所在格**回答),口径与出路见
+ * `ENV_KEY_LEDGER`。修前世界环境口只答 `hour` / `night` ⇒ 这三个键恒 0。
+ */
 const P_ENTITY_COUNT = 'entityCount';
 const P_ENTITY_WEIGHT = 'entityWeight';
 const P_FLUID = 'fluid';
@@ -316,6 +418,7 @@ function out(ctx: ComponentContext, color: WireColor, on: boolean): void {
 /** 401 轻触木质压力板:任何玩家/动物/掉落物压上 → 输出 1。 */
 registerComponentKind('SENSOR_PLATE_LIGHT', (ctx) => {
   const pressed = ctx.param(P_ENTITY_COUNT) > 0;
+  ctx.setSt('pressed', pressed ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, pressed);
 });
 
@@ -324,6 +427,8 @@ registerComponentKind('SENSOR_PLATE_HEAVY', (ctx) => {
   const need = Math.max(2, ctx.param('requiredWeight') || 2);
   const weight = ctx.param(P_ENTITY_WEIGHT);
   const on = weight >= need;
+  ctx.setSt('pressed', on ? 1 : 0);
+  ctx.setSt('weight', weight);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });
 
@@ -342,6 +447,7 @@ registerComponentKind('SENSOR_PULSE_BUTTON', (ctx) => {
   const lit = pressed || remain > 0;
   if (pressed && remain === 0) ctx.setSt('remain', Math.max(1, ctx.param('pulseTicks') || PULSE_BUTTON_TICKS));
   else if (remain > 0) ctx.setSt('remain', remain - 1);
+  ctx.setSt('lit', lit ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, lit);
 });
 
@@ -350,12 +456,14 @@ registerComponentKind('SENSOR_LIGHT_DAYNIGHT', (ctx) => {
   const hour = ctx.param('hour');
   const forceNight = ctx.param('night') > 0;
   const on = forceNight || isNight(hour);
+  ctx.setSt('night', on ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });
 
 /** 406 河道水位传感器:所在格有水体漫入 → 输出 1。 */
 registerComponentKind('SENSOR_WATER_LEVEL', (ctx) => {
   const on = ctx.param(P_FLUID) > 0;
+  ctx.setSt('wet', on ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });
 
@@ -363,6 +471,7 @@ registerComponentKind('SENSOR_WATER_LEVEL', (ctx) => {
 registerComponentKind('SENSOR_LASER_TRIPWIRE', (ctx) => {
   const crossed = ctx.param('crossed') > 0;
   const lit = crossed;
+  ctx.setSt('lit', lit ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, lit);
 });
 
@@ -373,12 +482,14 @@ registerComponentKind('SENSOR_PITCH', (ctx) => {
   const tol = ctx.param('tolerance');
   const heard = ctx.param('pitchActive') > 0;
   const on = heard && pitchMatches(played, target, tol);
+  ctx.setSt('matched', on ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });
 
 /** 409 仓库满载传感器:旁边储物箱满载 → 输出 1。 */
 registerComponentKind('SENSOR_CHEST_FULL', (ctx) => {
   const on = ctx.param('chestFull') > 0;
+  ctx.setSt('full', on ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });
 
@@ -403,6 +514,16 @@ registerComponentKind('ARENA_START_GATE', (ctx) => {
     ctx.race.running = 1;
     ctx.race.startTick = ctx.tick;
     ctx.race.elapsedTicks = 0;
+    /*
+     * ★ WS-FND-114(P1):**开新一场必须把上一场的停表时间复位**。
+     *
+     * 412 领奖台的写点带 `ctx.race.finishMs === 0` 守卫(「第一次踏上才停表」),
+     * 而复位点此前**一处都没有** ⇒ 第二场跑到终点时守卫已经不成立:
+     * 表不停、`state.finishMs` 仍是上一场的数,而且**不报错**。
+     * 复位放在「开表」这一支里(与 `running`/`startTick` 同源、同一帧),
+     * 于是「一场比赛 = 一次开表 + 一次停表」这个不变式重新成立。
+     */
+    ctx.race.finishMs = 0;
   } else if (go) {
     ctx.race.elapsedTicks = ctx.tick - ctx.race.startTick;
   }
@@ -412,7 +533,13 @@ registerComponentKind('ARENA_START_GATE', (ctx) => {
   out(ctx, WireColor.YELLOW, go);
 });
 
-/** 412 跑酷终点领奖台:玩家踏上 → 停表并向黄线输出脉冲。 */
+/**
+ * 412 跑酷终点领奖台:玩家踏上 → 停表并向黄线输出脉冲。
+ *
+ * ⚠️ 停表守卫是 `finishMs === 0`(「这一场还没停过表」),它**依赖 411 开新一场时
+ * 复位** `finishMs` —— 两个件合起来才是「一场一次」,见 `ARENA_START_GATE`。
+ * `finished` / `finishMs` 两个读数因此是**本场**的结论,不是上一场的残值。
+ */
 registerComponentKind('ARENA_FINISH_PODIUM', (ctx) => {
   const arrived = ctx.param('onPodium') > 0;
   const running = ctx.race.running > 0;
@@ -439,6 +566,9 @@ registerComponentKind('LOGIC_DELAY_RELAY', (ctx) => {
   const inColor = (ctx.param('inputColor') as WireColor) ?? WireColor.RED;
   const input = ctx.readAt(0, 0, inColor) || ctx.readWire(inColor);
   const ticks = relayTicksFor(ctx.param('setting'));
+  /* ★ WS-FND-114:`lastTrigger` 是声明过的状态键,此前只写 `lastOut`(读数恒 0)。
+     写在提前返回**之前**,否则「无变化」的那些帧不更新这个读数。 */
+  ctx.setSt('lastTrigger', input ? 1 : 0);
   const key = `relay:${ticks}`;
   if (ctx.comp.lastOut[key] === (input ? 1 : 0)) return;
   ctx.comp.lastOut[key] = input ? 1 : 0;
@@ -455,13 +585,19 @@ registerComponentKind('LOGIC_DELAY_RELAY', (ctx) => {
 registerComponentKind('LOGIC_AND', (ctx) => {
   const a = ctx.readWire((ctx.param('inA') as WireColor) ?? WireColor.RED);
   const b = ctx.readWire((ctx.param('inB') as WireColor) ?? WireColor.BLUE);
-  out(ctx, WireColor.YELLOW, a && b);
+  const on = a && b;
+  /* ★ WS-FND-114:`out` 是声明过的状态键,此前只有黄线有值(读数恒 0)。 */
+  ctx.setSt('out', on ? 1 : 0);
+  out(ctx, WireColor.YELLOW, on);
 });
 
 /** 415 魔能逻辑非门 (NOT):输入 0 → 输出 1。 */
 registerComponentKind('LOGIC_NOT', (ctx) => {
   const a = ctx.readWire((ctx.param('inA') as WireColor) ?? WireColor.RED);
-  out(ctx, WireColor.YELLOW, !a);
+  const on = !a;
+  /* ★ WS-FND-114:`out` 是声明过的状态键,此前只有黄线有值(读数恒 0)。 */
+  ctx.setSt('out', on ? 1 : 0);
+  out(ctx, WireColor.YELLOW, on);
 });
 
 /**
@@ -607,11 +743,23 @@ registerComponentKind('DEF_BUBBLE_BALLISTA', (ctx) => {
   }
 });
 
-/** 426 旋转自动洒水器:接通水源或每早自动旋转,浇湿周围 5×5 耕地。 */
+/** 426 旋转自动洒水器:接通水源或**每早**自动旋转,浇湿周围 5×5 耕地。 */
 registerComponentKind('AGRI_SPRINKLER', (ctx) => {
-  const powered = ctx.readWire(WireColor.BLUE) || (ctx.param('hour') === 6 && ctx.param('morningTick') > 0);
+  /* ★ WS-FND-114:两个键的口径都修过 ——
+     · `hour` 是**带小数**的钟点(如 6.24)⇒ 旧写法 `hour === 6` 几乎永不成立;
+     · `morningTick` 由世界侧注入(见 `ENV_KEY_LEDGER`),= 1 表示
+       「本慢帧是当天头一个慢帧」(世界日 06:00 起头)。
+     修前 `morningTick` **没有任何生产者** ⇒ 这个括号恒 0 ⇒「每早自动洒水」是死分支。 */
+  /* ⚠️ 两个键**各自读一次**:写成 `Math.floor(ctx.param('hour')) === 6 && ctx.param('morningTick') > 0`
+     会被 `&&` 短路 —— `hour` 不满足时 `morningTick` 根本不问,于是台账里的
+     `morningTick` 成了"没人问的行"(判据 WS-FND-114 就是用"记录型环境口"抓这个的)。 */
+  const hourNow = ctx.param('hour');
+  const morningTick = ctx.param('morningTick');
+  const autoMorning = Math.floor(hourNow) === 6 && morningTick > 0;
+  const powered = ctx.readWire(WireColor.BLUE) || autoMorning;
   ctx.setSt('active', powered ? 1 : 0);
-  if (powered) ctx.setSt('wetCells', 25);
+  /* ⚠️ `wetCells` 必须**双向**写:断电时回 0,否则「件已停但读数还是 25」。 */
+  ctx.setSt('wetCells', powered ? 25 : 0);
 });
 
 /** 427 电动升降拦水闸门:通电开闸放水,断电关闭蓄水。 */
@@ -750,9 +898,17 @@ registerComponentKind('VEHICLE_SWAN_BOAT', (ctx) => {
   ctx.setSt('riderCount', Math.min(2, riders));
 });
 
-/** 440 八人云海探险飞艇:支持最多 8 人登船飞行。 */
+/**
+ * 440 八人云海探险飞艇:支持最多 8 人登船飞行。
+ *
+ * ★ WS-FND-114:起飞条件是 **`unmoored`(松缆)**,**缺省 = 系泊**。
+ *   旧写法是反向键 `ctx.param('moored') === 0` —— 而「键缺失」与「显式 0」在
+ *   `param()` 里**不可区分**(都返回 0),于是没接线时判据恒真 ⇒ **飞艇恒飞**。
+ *   换成缺省 0 的正向键后,「没人写这个键」= 停在码头(安全侧),
+ *   要飞必须**显式松缆**(`params.unmoored = 1`)或接绿线。
+ */
 registerComponentKind('VEHICLE_AIRSHIP', (ctx) => {
-  const powered = ctx.readWire(WireColor.GREEN) || ctx.param('moored') === 0;
+  const powered = ctx.readWire(WireColor.GREEN) || ctx.param('unmoored') > 0;
   const seats = Math.max(1, ctx.param('seats') || 8);
   ctx.setSt('flying', powered ? 1 : 0);
   ctx.setSt('crew', Math.min(seats, ctx.param('riderCount')));
@@ -789,6 +945,54 @@ export function auditComponentCoverage(): { total: number; missingKinds: string[
   const idGaps: number[] = [];
   for (let id = 401; id <= 440; id += 1) if (!SPEC_BY_ID.has(id)) idGaps.push(id);
   return { total: COMPONENT_SPECS.length, missingKinds, idGaps };
+}
+
+/**
+ * 一条「这个件在生产侧由谁造出来」的登记行。
+ */
+export interface ComponentProducerRow {
+  id: number;
+  kind: string;
+  /** 生产侧的造件者。`NONE` = 没有(见下面那张台账的长注释)。 */
+  worldProducer: 'NONE' | 'PRODUCTION';
+}
+
+/**
+ * **组件生产者台账**(P1,★ WS-FND-114):40 项自动化件在**生产侧**由谁造出来。
+ *
+ * ## 现状(`server/src` 实测,**逐调用点**;判据 `WS-FND-114` 用静态扫描钉住)
+ *
+ * · `SignalGraph.addComponent(...)` —— 唯一生产调用点 `server/src/sim/demo.ts`;
+ * · `WorldSim.addWireDrive(...)`    —— 唯一生产调用点 `server/src/sim/demo.ts`;
+ * · `makeComponent(...)`            —— **生产调用点 0**(连 demo 都没用它)。
+ *
+ * 而唯一的玩家路径 `PLACE_AUTOMATION`(`net/actions/place_automation.ts`)只把
+ * 「谁在哪一格放了什么」写进**它自己的 per-room 登记表**,**没有**在世界侧建
+ * `ComponentNode`。⇒ `WorldSim.tick()` 里 `if (this.wiringOn)` 那段求值块在生产中
+ * **没有件可求值**(`componentsEvaluated` 恒 0),40 项件的输入判据也就无从谈起。
+ *
+ * ## 为什么本文件只登记、不接线
+ *
+ * 接线点在 `net/actions/place_automation.ts`(应调 `WorldSim`)与 `net/room.ts`
+ * (房间 → 世界的桥),两者都**不在本线写域**。按裁定「要么接线、要么如实登记,
+ * 不许两边都宣称已实现」⇒ 这里选后者:表里 `worldProducer` 一律 `NONE`,
+ * 而 `place_automation.ts` 的回执也明写「只登记放置」。两处口径**此刻一致**。
+ *
+ * ⚠️ 这张表是「口径一致」的唯一登记处:判据 `WS-FND-114` 同时核
+ *   1 表仍是 40 行且全部 `NONE`(有人接线后必须来改这一行);
+ *   2 `server/src` 的三类调用点仍是:`.addComponent(` / `.addWireDrive(` 只在
+ *      `sim/demo.ts`,`makeComponent(` 为 **0**。
+ *   两条一起变红才可能漂 —— 只改一处会被另一条挡住。
+ */
+export const COMPONENT_PRODUCER_LEDGER: readonly Readonly<ComponentProducerRow>[] = Object.freeze(
+  COMPONENT_SPECS.map((s) => Object.freeze({ id: s.id, kind: s.kind, worldProducer: 'NONE' as const })),
+);
+
+/** 生产者台账的对账读数(`placedOnly` = 「只登记、不可求值」的件数)。 */
+export function auditComponentProducers(): { total: number; withWorldProducer: number; placedOnly: number } {
+  const total = COMPONENT_PRODUCER_LEDGER.length;
+  const withWorldProducer = COMPONENT_PRODUCER_LEDGER.filter((r) => r.worldProducer !== 'NONE').length;
+  return { total, withWorldProducer, placedOnly: total - withWorldProducer };
 }
 
 /** 规格里出现的全部输出颜色(去重),供 UI 画端口图标。 */

@@ -6,6 +6,9 @@
 - **2026-11-18 第五批处置(第三轮)**:本轮新审计的 **6 条 P1 + 12 条 P2/P3** 全部已修且各有判据,判据落在
   `tests/WS-FND-106-connection-lifecycle.test.ts`(13 条)、`tests/WS-FND-107-idempotency-hardening.test.ts`(9 条)、
   `tests/WS-FND-108-boss-party-bounds.test.ts`(6 条),外加 `tests/WS-FND-98` 的**补正 3 条**(14 → 17);
+- **2026-11-19 第五轮处置(第四轮审计 / 第七批)**:**7 条 P1(6 已修 + 1 只登记)+ 22 条 P2/P3**,判据落在
+  `tests/WS-FND-113..117`(13 / 13 / 9 / 8 / 6 = **49 条**);FND 号段 **01..117**、全仓 **126 套件 / 2381 条**。
+  ★ 本轮靶子是**装配层与跨模块契约**(不是单模块深挖),逐条见 §12。
   逐条见 §10(含世界侧 `tended` 生产者的五处接线)。
 - **口径**:本文件是交付物,不新增门禁;`docs/` 下其它文件一概未动。
 
@@ -579,3 +582,111 @@ this.expireItemSources();
   本文 §11。号段 **FND-01..112**。
 - 未 commit、未碰 `.pi/`;本轮写域:`tests/WS-FND-111-combat-numeric-bounds.test.ts`(仅同义反复槽位)、
   `README.md`、`docs/HANDOVER.md`、`docs/AUDIT-W34.md`。
+
+---
+
+## 12 2026-11-19 第五轮处置(第七批:7 条 P1 + 22 条 P2/P3)
+
+> 判据:`tests/WS-FND-113-client-prediction.test.ts`(13 条)、
+> `tests/WS-FND-114-wiring-producers.test.ts`(13 条)、
+> `tests/WS-FND-115-host-contract.test.ts`(9 条)、
+> `tests/WS-FND-116-hardening-reverse-review.test.ts`(8 条)、
+> `tests/WS-FND-117-judgement-hardening.test.ts`(6 条)—— 共 **49 条**判据;
+> FND 号段 **01..117**、基座 **112 套件 / 1367 条**、全仓 **126 套件 / 2381 条**。
+>
+> ★ **本轮的靶子与前四轮不同**:不再往单个模块里挖,而是**装配层**与**跨模块契约**。
+> 前四轮的判据几乎全落在「零件」—— 单个函数、单张表、单个守卫;零件全绿,装起来却不对。
+> 这一轮专挑三种形态:
+> 1 **接线断在装配点**:参数没传、生产者不存在、宿主成员是空桩 —— 每一侧单独测都是「对」,
+>   只有整条链测不出来的人才会以为它通;
+> 2 **契约与唯一实现不一致**:接口声明 6 个成员而生产实现少一个;回执形状靠 `as unknown as`
+>   绕过类型(契约说一套、实际另一套);
+> 3 **加固自己长出新缝**:上几轮加的守卫把合法旧字节判成坏数据、把「够长才 decode」当默认。
+>
+> 条数按**发现**去重(同一修法的正 / 负对照算一条):**P1 7 / P2 14 / P3 8 = 29 条**,
+> 其中**产品缺陷 23 条 + 元审计 6 条**(117 判的是「上一轮的判据会不会红」,不是新产品缺陷)。
+> 关闭口径不变:已修 = 标记 ∧ 可查证据(每条点到判据编号)。
+
+### 12.1 判据 ↔ 条目对照
+
+| 套件 | 条数 | 钉住的条目 |
+|---|---:|---|
+| WS-FND-113 | 13 | R5-P1-1 预测参数从没传过 + 预测结果零渲染消费(1..6)· R5-P1-2 `state_store` 无单调门(11/12)· R5-P2-1 上行 z 恒 0(7)· R5-P2-2 重连不复位(8/9/10)· R5-P3-1 装配点只能用源码子串(13,文件头已自报是弱判据) |
+| WS-FND-114 | 13 | R5-P1-3 40 项件生产者台账(1/12)· R5-P2-3 环境注入只答 `hour`/`night`(2..9)· R5-P2-4 `graph.race` 第二场永不停表(10)· R5-P2-5 `STATE_DEFAULTS` 的投影字段从不 `setSt`(11)· R5-P2-6 无电路时 `loadConveyorAt` 谎报成功(13) |
+| WS-FND-115 | 9 | R5-P1-4 `inventoryDetailOf` 在生产宿主上是空桩(1..3)· R5-P1-5 回执形状靠 `as unknown as` 绕过类型(4..6)· R5-P2-7 `ActionPayload` 缺 7 个动作消费的键 · R5-P2-8 `WorldSaveHost` 漏声明 6 个被实际读取的成员 · R5-P3-2 `partyMode` 两处维护 + `hostPositionOf` 声明 `{x,y}` 而实返含 z |
+| WS-FND-116 | 8 | R5-P1-6 快照 RLE 长度越界被静默接受(1)· R5-P1-7 三键齐删后无降级信号(3)· R5-P2-9 屋顶 ID 值域在快照 / 回滚路径同源(2)· R5-P2-10 `CHECK` 合取在内存后端也真的校验(4)· R5-P2-11 编码侧 `trim` 校验与解码同源(5)· R5-P2-12 `fluid.setCell` 实心格判定与写入值同源(6)· R5-P3-3 `parseCheckExpr` 真值表(7)· R5-P3-4 加固不得把合法旧字节 / 未裁剪归档打成坏数据(8) |
+| WS-FND-117 | 6 | **元审计**:R5-P2-13 恒真槽位(`WS-FND-111` 的 5 个槽)(1)· R5-P2-14 用未剥注释的 body 做子串断言(`WS-FND-112`)(2)· R5-P3-5 / R5-P3-6 子串判据两处(`WS-FND-110:353` / `WS-FND-109:310`)(3/4)· R5-P3-7 缺 typescript 时 `console.log + return` 不进汇总(`verify.ts:3777-3780`)(5)· R5-P3-8 计数下限只挡 0、没钉在实测值上(`count-audit.ts:363-367`)(6) |
+
+### 12.2 逐条处置
+
+**P1(7 条:6 已修 + 1 只登记)**
+
+| # | 发现与落点 | 状态 / 判据 |
+|---|---|---|
+| R5-P1-1 | 客户端预测链**两端都断着**:`main.ts` 全文无 `speedMul` / `frozen` / `mu`(眩晕、击退、背人、装备加速在生产里**必然分歧**);`predictor.renderPos` / `visualOffset` 全仓**零读者**(玩家看到的仍是滞后一个 RTT 的权威位置)—— `client/src/main.ts` + `client/src/net/predictor.ts` | 已修:`predictor.setParams(predictParamsOf(me))` 落在装配点,渲染改读 `predictedRenderPos` / `predictedVisualOffset`;FND113-1..6(注入:不传参数 ⇒ 同场景走 0.225 格;负对照:不校正时 `render == pos`) |
+| R5-P1-2 | `ClientStateStore` **无单调门**:`ackedSeq` 可倒退、`meta.tick` 无条件覆盖 ⇒ **旧帧能把权威位置拉回**(静默回退,零报错)—— `client/src/net/state_store.ts` | 已修:新增 `'stale-frame'` 丢弃旧差量、`ackedSeq` 只进不退;FND113-11/12(豁免:旧 FULL 仍接受) |
+| R5-P1-3 | 电路 **40 项件生产侧没有任何生产调用点**(只有 `sim/demo.ts` 与 tests)⇒ `WorldSim` 的 `if (wiringOn)` 求值块**空转**;件层判据全绿也测不出 — `server/src/wiring/components.ts` | **登记**(不声称接线):`COMPONENT_PRODUCER_LEDGER` 40 行逐件登记生产者、`NONE` 行如实记为欠账;接线点在 `net/actions/**`,不在本轮写域。FND114-1/12(含三类调用点的静态扫描 + 「无电路 ⇒ 求值块不跑」负对照) |
+| R5-P1-4 | 宿主契约**空桩**:`room.ts` 只读 `host.inventoryDetailOf`,而唯一生产宿主 `world_sim.ts` 恒返回 `null` ⇒ 「总量按明细重算」**永不执行**;总量由增量式 `inventoryTotals`、明细由 `itemCounts` 各自维护 ⇒ **漏一帧就永久偏差**(契约 §2.3 的 W5 裁定) | 已修:生产宿主落地该成员;FND115-1..3(增量与明细**两侧对账**) |
+| R5-P1-5 | 回执形状不统一:`EffectRecord` 只允许**标量**,而 `craft` / `use_alchemy_furnace` 塞嵌套对象 / 数组并用 `as unknown as EffectRecord` **绕过类型** ⇒ 契约说一套、实际另一套 | 已修:形状收成允许的联合,两处不再靠 `as unknown`;FND115-4..6 |
+| R5-P1-6 | 快照 RLE **声明长度超出剩余字节**时被**静默当成「没有屋顶」** ⇒ 坏字节当合法档读回(静默丢数据)—— `server/src/world/chunk.ts` | 已修:`deserializeSnapshot` 抛错;缺屋顶尾段的**旧布局**仍解得开。FND116-1(注入:改回「够长才 decode」⇒ 7/8) |
+| R5-P1-7 | 归档头**三键齐删**(`trim` + `chunksTotal` + `chunksChecksum`)⇒ 缺口语义归 0、却没有任何降级信号,「不可判」被读成「完整」—— `server/src/world/archive.ts` | 已修:`planRestore.chunksVerified === false` 是**不可信状态**。FND116-3(注入:删掉那条判定 ⇒ 6/8) |
+
+**P2 / P3(22 条)**
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R5-P2-1 | P2 | 上行 `z` 恒为 0:`predictor` 的构造 / `reset` / `onAuthoritative` 三处都写 `z: 0` ⇒ 权威高度被逐帧抹平 | 已修:播种 z=2 ⇒ `pos.z === 2`、回喂 z=3 ⇒ 抬到 3;FND113-7(注入:改回 `z: 0` ⇒ 0) |
+| R5-P2-2 | P2 | 重连**不复位**:`reset()` 只在首帧调一次,`InputSource.seq` 与摇杆都还是上一轮的 ⇒ 重连后第一个输入即错位 | 已修:`InputSource.reset`(seq 回 1 / 按键清空)+ `predictor.reset`(队列 / acked / 参数清);FND113-8/9/10(含「被动掉线 ⇒ 自动重连」,否则复位在生产里永不触发) |
+| R5-P2-3 | P2 | 环境注入只答 `hour` / `night` ⇒ 该层输入判据恒假、`moored === 0` **恒真**(判据自我实现) | 已修:`WorldSim.installWorldEnv` 逐格真的按世界事实回答(`WORLD` 11 个键),`NONE` 的如实登记为欠账;FND114-2..9(逐格键各配「同一世界同一帧但不是这一格」的负对照) |
+| R5-P2-4 | P2 | `graph.race` **第二场永不停表** | 已修:两场都停、第二场是新值;FND114-10 |
+| R5-P2-5 | P2 | `STATE_DEFAULTS` 的投影字段从不 `setSt`(读数恒 0)⇒ 件状态与线输出两张皮 | 已修:两极性双向对账;FND114-11 |
+| R5-P2-6 | P2 | `wiringOn = false` 时 `loadConveyorAt` 说成功而货**永不回写**(静默吞货) | 已修:无电路 ⇒ 拒绝装载且货留地面;FND114-13 |
+| R5-P2-7 | P2 | `ActionPayload` 缺 7 个动作消费的键 ⇒ 各消费方自己补交叉类型 | 已修(契约面):键进接口;FND115 |
+| R5-P2-8 | P2 | `WorldSaveHost` 未声明 6 个**被实际读取**的成员 ⇒ 全靠 `as` 交叉类型绕过,与接口自称的「结构化裁剪守卫」相悖 | 已修(契约面):成员补齐;FND115 |
+| R5-P3-2 | P3 | `partyMode` 两处维护(`rt.partyMode` 只写不读)+ `hostPositionOf` 声明 `{x,y}` 而实返含 `z`(被静默丢弃) | 已修:单点维护 + 声明与实现一致;FND115 |
+| R5-P2-9 | P2 | 屋顶 ID 值域(12 位 / 4095)只在 `setRoof` 强制,**快照 / 回滚路径**不强制 | 已修:`decodeRoofRle` 与 `setRoof` 同源(4095 收);FND116-2 |
+| R5-P2-10 | P2 | `snapshot_bytes` 的上下界在**内存后端**不校验(`AND` 合取未被 `parseCheckExpr` 认得)⇒ 双后端行为不一致 | 已修:双后端 −1 / 1 MiB+1 都拦、0 / 1 MiB 都收;FND116-4 |
+| R5-P2-11 | P2 | 编码侧对 `trim` 无整数 / 非负校验 ⇒ 能产出「自家解码必抛」的字节(2.5 / −1) | 已修:`trimIntField` 在**编码**就抛,与解码同源;FND116-5 |
+| R5-P2-12 | P2 | `fluid.setCell` 的实心格判定用**入参原值**而非写入值 ⇒ `amount: 0.5`(floor 后为 0)被误抛 | 已修:判定与写入值同源(`0.5` / `0.9` 不抛、`1` 仍抛);FND116-6 |
+| R5-P3-3 | P3 | `parseCheckExpr` 只「半懂」`AND`:同列合取 / `BETWEEN 1 AND 30` / 跨列合取的归类未钉 | 已修(判据钉真值表):同列 ⇒ `and`、`BETWEEN` 仍 `between`、跨列 ⇒ `unsupported`;FND116-7 |
+| R5-P3-4 | P3 | 加固**可能把合法旧字节 / 未裁剪归档打成坏数据** | 已修(反向锁):`encode(decode(x))` 逐字节往返、`ops` 自足、`missing` 不伪造;FND116-8 |
+| R5-P2-13 | P2 | **元审计**:`WS-FND-111` 的 5 个槽是**恒真断言**(`30*3===90` / `Math.max(0,NaN)` / 本地数组 / 本地循环),一次也不碰被测模块 | 已修:探针 `tautologySlots()` 剥注释后按五条形态扫,≥1 即报;FND117-1 |
+| R5-P2-14 | P2 | **元审计**:`WS-FND-112` 用**未剥注释**的 body 做子串断言 ⇒ 把被检代码注释成死代码仍可能绿 | 已修:先复现「注释掉 ⇒ 旧判据仍绿」、剥注释后必须红;FND117-2 |
+| R5-P3-5 | P3 | **元审计**:`WS-FND-110:353` 的 `src.includes('const unusable')` 子串判据,写回字面量仍绿 | 已修:`selfCheatSubstrings()` + 真跑 `data-conformance` 看 ✓;FND117-3 |
+| R5-P3-6 | P3 | **元审计**:`WS-FND-109:310` 的 `WORLD_SIM_SRC.includes('零调用')` 同族 | 已修:同上 + 真调用 `startPartyRun`;FND117-4 |
+| R5-P3-7 | P3 | **元审计**:`verify.ts:3777-3780` 缺 typescript 只 `console.log + return`,不进汇总行 | 已修:结构断言 `advise('类型检查基线锁'…)`(注入:换回 `console.log` ⇒ 红);FND117-5 |
+| R5-P3-8 | P3 | **元审计**:`count-audit.ts:363-367` 的下限 `1` 只挡得住 0,没有钉在**实测值**上 | 已修:`CLAIM_FLOORS ⇄ CLAIM_MEASURED` 互校 + 降下限负对照;FND117-6 |
+
+### 12.3 与前批台账 / 交付口的三处**不一致**(如实记)
+
+1 **R5-P1-3 仍是「登记」不是「已修」**:40 项件的接线点在 `net/actions/**`,不在本轮写域,
+   所以本文件只记「登记 40 行台账 + 负对照」,不写「电路层可用」。与 §11.2 的 R4-P2-3 同一取舍
+   (**不冒充接线**)。它的严重度记 P1 的理由也写在判据里:件层判据全绿、生产求值块空转,
+   属「判据面失效」而非「某个功能不灵」。
+2 **`WS-FND-113` 的 FND113-13 是弱判据**:`three/boot.ts` 与 `main.ts` 都摸 DOM,node 里 import
+   不了,只能做**源码子串**结构守卫;强判据是 1..12(可 import、可注入)。文件头已自报,
+   这里一并记,免得下一位把它当成行为判据。
+3 **117 不计入产品缺陷**:它的 6 条判的是**上一轮判据的牙口**(恒真槽位 / 未剥注释 / 子串 /
+   `console.log + return` / 下限只挡 0),不是新产品缺陷。本文件按「发现」口径把
+   **产品 23 条(7 P1 + 12 P2 + 4 P3)与元审计 6 条(2 P2 + 4 P3)** 分开数,29 是两者之和。
+
+### 12.4 本批验证口径
+
+- `node scripts/verify.ts --all` ⇒ **exit 0 / 行首 ✗ 0 项**:
+  `用例汇总:2381 条通过(126 个套件;WS-01..11 共 1014 条 / 14 套件;基座 1367 条 / 112 套件);跳过 0 项`,
+  `[同义反复候选]` 命中 **0** 条(白名单 0)、`HANDOVER §九 sha256 表自洽`、README 与 HANDOVER 两张数字表逐行比对通过。
+- 逐套件实跑(`node tests/<file>`,126 个逐条跑完、**0 个非零退出**):合计 **2381 / 126**;
+  本批 5 个套件 `113` 13/13 · `114` 13/13 · `115` 9/9 · `116` 8/8 · `117` 6/6。
+- **同义反复候选 0 ⇒ `tests/` 一个字节都没改**:§11.2 的 R4-P2-20 已把 `WS-FND-111` 的 5 个
+  槽位改成字面量,本轮 `--all` 复核仍为 0,故「仅同义反复槽位」的写权限**未动用**。
+- `node scripts/typecheck-baseline-audit.ts` ⇒ 基线锁 **261 条 / 指纹 129**,实测 **259 / 128**
+  (**未新增**:`scripts/data-conformance.ts` 的 `TS2367` 与 `tests/WS-FND-10-restore.test.ts` 的
+  `TS2339` 各少 1)⇒ HANDOVER §三如实写 **259**,**不用** `--update`(基线锁仍 261,只准减不准增)。
+- `docs/HANDOVER.md` §九 重算:`README.md` `0a2bd9115599 → 99bc3c8e8474`,其余 6 个**不变**;
+  重算用临时脚本副本跑完即删(LF 归一 = 索引 blob 口径)。
+- 数字落点:`README.md:62-64`(126/126 · 2381 个用例;基座 FND-01..117 · 1367 条 / 112 套件)、
+  `README.md:347-348`(类型检查 259 · tests 205 / scripts 15)、`README.md:309`(126 份测试套件 /
+  308 个 `.ts` / 约 15 万行,五源口径)、`README.md:315`(带日期的实测快照)、
+  `docs/HANDOVER.md:27`(126 个套件)、`:96`(用例行 + 第九批 113..117 = 13/13/9/8/6)、
+  `:102`(类型基线 259 / 指纹 128)、本文 §12。号段 **FND-01..117**。
+- 未 commit、未碰 `.pi/`;本轮写域:`README.md`、`docs/HANDOVER.md`、`docs/AUDIT-W34.md`。

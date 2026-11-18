@@ -598,6 +598,50 @@ export interface AttackReport {
  * `PipelineDamageResult` 等模拟层类型 —— 否则 `net` 就依赖 `combat` 了。
  * 房间只关心四个整数/字符串:结果形态、掉了多少血、是否命中、目标死活。
  */
+/* ══════════════ 回执 `effect` 的值域(★ 2026-11-18 第五轮 P1:统一形状)══════════════
+ *
+ * ## 修前是什么样
+ *
+ * 契约只允许**标量**,而两个写者塞了嵌套值:
+ * ```
+ * actions/craft.ts:229              consumed: match.consumed   ← Record<number, number>
+ * actions/use_alchemy_furnace.ts:543 consumed / certificate / gallery(对象 + 数组)
+ * ⇒ 两处都用 `as unknown as EffectRecord` **绕过**类型
+ * ```
+ * 绕过之后两端各自的编译器都是绿的:契约说「只放标量」、实现放对象,
+ * 线上靠 JSON 恰好能序列化 ⇒ **没有一处会红**。下一个人照「标量」写消费者时
+ * 才会炸(`undefined` 字段、`[object Object]` 进 UI)—— 本仓反复点名的
+ * 「静默绕类型」形态。
+ *
+ * ## 裁定:放宽**契约**,而不是继续绕过
+ *
+ * 回执的唯一出路是报文(`room.colyseus.ts` 的 `client.send('actionResult')`),
+ * 而报文就是 JSON ⇒ 允许的值域本来就是 **JSON 值**,不是「标量」:
+ * ```
+ * EffectValue = string | number | boolean | null | readonly EffectValue[] | EffectRecord
+ * ```
+ * 顶层仍是 `Record`(键必须是标识符),只有嵌套层递归 —— 深度由数据决定,
+ * 于是 `as unknown as` 两处全部消失(见 craft.ts / use_alchemy_furnace.ts)。
+ *
+ * ## ⚠️ 为什么**不**摊平(`consumed_103: 1` 那种)
+ *
+ * 键名由内容表 id 决定 ⇒ **键集随配方变**,摊平会得到一个键数随数据膨胀的回执;
+ * 而死角在于:逐件账是 `tests/WS-FND-25/31/55/79` 明写要看到的东西
+ * (「★ effect 里能看到**扣了哪几件**」),摊平等于把那条证据从回执里删掉。
+ * ⇒ 放宽是唯一不动语义、也不动既有断言的写法。
+ *
+ * ## ⚠️ 值域里**没有** `undefined`
+ *
+ * `exactOptionalPropertyTypes=false` ⇒ `undefined` 会静默进报文,和「没有这个键」
+ * 变成同一件事。要表达「没有」用 `null`(`galleryNote` 就是这一档)。
+ * 唯一允许缺省的地方是 `effect` 自己那个 `?:`。
+ */
+export type EffectScalar = string | number | boolean;
+export type EffectValue = EffectScalar | null | readonly EffectValue[] | EffectRecord;
+export interface EffectRecord {
+  readonly [key: string]: EffectValue;
+}
+
 /**
  * `USE_ITEM` 的世界侧回执。
  *
@@ -616,8 +660,11 @@ export interface UseItemOutcome {
   consume: boolean;
   /** 给人看的理由(`applied === true` 时为 `'ok'`)。 */
   reason: string;
-  /** 回执明细(只允许标量,与 `ActionOutcome['effect']` 同口径)。 */
-  effect?: Record<string, string | number | boolean>;
+  /**
+   * 回执明细。值域 = `EffectRecord`(**JSON 值**,不是「只标量」)——
+   * 与 `ActionOutcome['effect']` 同口径,嵌套项不再靠 `as` 绕过。见 `EffectValue` 的 docblock。
+   */
+  effect?: EffectRecord;
 }
 
 export interface WorldSaveHost {
@@ -1047,6 +1094,64 @@ export interface WorldSaveHost {
       firstAt: number;
     }[];
   };
+
+  /* ══════════ ★ 2026-11-18(第五轮 P2):被**实际读取**的 6 个成员必须在这里声明 ══════════
+   *
+   * ## 修前是什么形态
+   *
+   * 下面这 6 个成员 `WorldSim` 都有、房间也都在用,但**本接口一句都没声明** ⇒
+   * `createHost()` 的 `return sim` 会把它们**结构化裁掉**,于是各消费方只能:
+   * ```
+   * room.ts:2667        host as (WorldSaveHost & { syncMaxHp?(...) })        ← 交叉类型
+   * room.ts:2694        host as (WorldSaveHost & { inventoryDetailOf?(...) })← 交叉类型
+   * actions/sleep.ts     host as unknown as RoomEffectCapableHost           ← 局部窄类型
+   * actions/place_automation.ts  host as unknown as SizeCapableHost         ← 局部窄类型
+   * actions/use_alchemy_furnace.ts  host as unknown as AlchemyLabReadPort   ← 局部窄类型
+   * ```
+   * 这与本接口第 798-806 行自称的「结构化裁剪守卫」**直接相悖**:守卫的价值是
+   * 「漏声明 ⇒ 编译期红」,而这几处 `as` 让「漏声明」照样编译通过 ⇒ 守卫在最需要它的
+   * 地方失效了(第五轮实测 P2)。
+   *
+   * ## 为什么仍写成**可选**(`?`)
+   *
+   * 与 `setPlayerAfk` / `resetWorld` 同一契约:手写 host 假件(`tests/**`、`scripts/**`)
+   * 不实现它们本来就合法,那种宿主走动作层的「能力缺失」分支(显式 `NOT_IMPLEMENTED`),
+   * **不许**静默成功。改成必填会逼所有假件补一个假实现 —— 那正是本仓反复防的形态。
+   *
+   * ## 形状从哪来(以实现真相为准,不引模拟层类型)
+   *
+   * 逐字段对着 `server/src/sim/world_sim.ts` 的签名抄,并**只抄房间用到的那几维**:
+   * `roomEffectOf` 只留 `inBedroom`(`sleep.ts` 读的那一维)、`lastRoomEffects` 只留
+   * `playerId` / `roomKey`(`use_alchemy_furnace.ts` 站位判定读的那两维)——
+   * 多抄一维就多一份「将来会漂」的声明。
+   */
+  /**
+   * 等级 → **派生上限**(`progression.statsAtLevel` 的唯一算子,含温泉/大餐乘区)。
+   * `null` = 没有这个玩家。房间只**搬运**它(经 `syncMaxHp` 落到权威 `vitals`)。
+   */
+  maxHpForLevel?(playerId: string, level: number): number | null;
+  /**
+   * 把派生上限写进权威 `vitals`(钳制策略 C 在 vitals 内,**不在这里再钳一次**)。
+   * @returns 是否**真的发生变更**(同值重复提交 ⇒ false,供调用方避免重复投影)。
+   */
+  syncMaxHp?(playerId: string, maxHp: number): boolean;
+  /**
+   * 背包**明细**(第 8 项总量重算的唯一输入,契约 §2.3 的 W5 裁定)。
+   *
+   * ⚠️ 生产实现(`world_sim.ts`)如实返回 `null`:模拟层不持有背包明细。
+   * 房间侧因此**必须**有同源的退路(见 `RoomRuntime.inventoryDetailOf` 与
+   * `projectInventoryTotalFor`)——「宿主没有明细」不等于「不重算」。
+   */
+  inventoryDetailOf?(playerId: string): readonly { quantity?: unknown }[] | null;
+  /** 该玩家本慢帧的房间效果(只声明 `sleep.ts` 读的那一维)。 */
+  roomEffectOf?(playerId: string): { readonly inBedroom: boolean } | undefined;
+  /** 世界边长(格)。`place_automation` 的坐标上界读它,读不到才退回防呆常量。 */
+  readonly sizeCells?: number;
+  /**
+   * 最近一慢帧的房间效果**成行**结果(只声明站位判定读的两维:
+   * `playerId` / `roomKey`)。`roomKey === null` = 不在任何具名房间。
+   */
+  lastRoomEffects?: readonly { readonly playerId: string; readonly roomKey: string | null }[];
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */
@@ -1256,11 +1361,75 @@ export interface ActionPayload {
    * 之所以让客户端能报 slot:UI 列表天然是"第几格",而**翻译**这一步必须在服务端。
    */
   slot?: number;
+
+  /* ── ★ 2026-11-18(第五轮 P2):7 个动作的**消费键**此前不在契约里 ────────────
+   *
+   * 实测:下列键各自被动作模块读取,却**一个都没写进本接口** ⇒ 消费方只能
+   * 各自补交叉类型(`ActionPayload & { ... }`,六处)或直接 `as { key?: unknown }`,
+   * 于是「协议只有一处」这条纪律在实际读写里被绕过:
+   * ```
+   * WIRE_EDIT          dir / color / channel / clear
+   * BREED_TAME         op / petId / mobId / mateId
+   * MODIFY_TOWN        radius / name / totemCell
+   * RESET_WORLD        seed / confirm
+   * BUY_ITEM           qty / orderId
+   * ALCHEMY_LAB        orderId(与 BUY_ITEM 同键:同一个幂等请求号语义)
+   * PLACE_AUTOMATION   kind
+   * ```
+   *
+   * ⚠️ 为什么**全部**是 `unknown` 而不是各自的细类型:
+   * 报文是**外部输入**,`ws_server` 把客户端 JSON 原样递进来 ⇒ 契约侧只能说
+   * 「这个键可能出现,值未知」;真正的收窄在**唯一**的消费处(各动作模块的
+   * `intField` / `numField` / 域检查),那里失败一律 `INVALID` 并**不猜默认值**。
+   * 若在这里写 `radius?: number`,就等于让「字符串 8」在编译期变成合法报文 ——
+   * 那是把消毒从动作层挪进类型系统,而类型系统在运行期不存在。
+   *
+   * ⚠️ 各动作模块里的局部交叉类型(如 `TownPayload`)现在与这里**同义重复**,
+   * 但它们是**读**用的窄化,不是第二份协议定义;是否删由各模块自己定
+   * (本次可改范围不含那几个文件)。
+   */
+  /** `WIRE_EDIT`:方向下标(合法域 = `DIR_VECTORS` 下标)。 */
+  dir?: unknown;
+  /** `WIRE_EDIT`:四色之一(合法域 = `ALL_COLORS`)。 */
+  color?: unknown;
+  /** `WIRE_EDIT`:无线频道(合法域 = `[CHANNEL_MIN, CHANNEL_MAX]` 整数)。 */
+  channel?: unknown;
+  /** `WIRE_EDIT`:`true` = 断开(只接受字面 true)。 */
+  clear?: unknown;
+  /** `BREED_TAME`:子动作(`TAME` / `FEED` / `BREED` …)。 */
+  op?: unknown;
+  /** `BREED_TAME`:宠物 id。 */
+  petId?: unknown;
+  /** `BREED_TAME`:生物 id。 */
+  mobId?: unknown;
+  /** `BREED_TAME`:繁殖配对的那一只。 */
+  mateId?: unknown;
+  /** `MODIFY_TOWN`:新安全区半径(有限整数,`MIN/Max_TOWN_RADIUS` 之间)。 */
+  radius?: unknown;
+  /** `MODIFY_TOWN`:新城镇名(去空白后 1..`MAX_TOWN_NAME_LEN`)。 */
+  name?: unknown;
+  /** `MODIFY_TOWN`:新图腾格;`null` = 清掉图腾。 */
+  totemCell?: unknown;
+  /** `RESET_WORLD`:新世界种子(有限整数)。 */
+  seed?: unknown;
+  /** `RESET_WORLD`:二次确认(只接受字面 true —— 重置是不可逆破坏性动作)。 */
+  confirm?: unknown;
+  /** `BUY_ITEM`:购买件数(正整数;**缺省不等于 1**,缺了就是 `INVALID`)。 */
+  qty?: unknown;
+  /** `BUY_ITEM` / alchemy:客户端请求号(可选幂等键;给了就**原样**透传)。 */
+  orderId?: unknown;
+  /** `PLACE_AUTOMATION`:组件种类名(必须在 `wiring` 注册表里)。 */
+  kind?: unknown;
 }
 
 /**
- * 一次动作分派的**结果 + 回执**。`effect` 只放可序列化的少量字段 ——
+ * 一次动作分派的**结果 + 回执**。`effect` 放可序列化的少量字段 ——
  * 回执要能直接进报文,不许把内部对象漏出去。
+ *
+ * ⚠️ `effect` 的值域是 `EffectRecord`(**JSON 值**),不是「只标量」:
+ * `craft` 的逐件扣料表 / `use_alchemy_furnace` 的冠名证书与陈列投影都是嵌套结构,
+ * 它们此前被 `as unknown as EffectRecord` 绕过(见 `EffectValue` 的 docblock)。
+ * 仍然**不许**漏内部对象:能进这里的只有**纯数据**(JSON 值),不是类实例/Map/函数。
  */
 export interface ActionOutcome {
   ok: boolean;
@@ -1268,8 +1437,8 @@ export interface ActionOutcome {
   kind: 'OK' | 'PERMISSION' | 'INVALID' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
   /** 失败原因;`ok === true` 时不存在。 */
   reason?: string;
-  /** 成功时的后果摘要(回执用)。 */
-  effect?: Record<string, string | number | boolean>;
+  /** 成功时的后果摘要(回执用)。值域见 `EffectValue`。 */
+  effect?: EffectRecord;
 }
 
 /**
@@ -1291,6 +1460,18 @@ export interface ItemReadPort {
 }
 
 /**
+ * 第 8 项「总量 ← 明细」重算时,明细**是从哪来的**(诊断与判据用;见
+ * `RoomRuntime.inventoryDetailSource`)。
+ *
+ * ```
+ * 'host' = 世界源提供了明细(它以世界侧权威为准)
+ * 'room' = 宿主没有明细(生产实现恒 null)⇒ 退回**本房间按件账**(与总量账同一批 ops)
+ * 'none' = 两个来源都没有 ⇒ **不重算**(fail-closed,不编造 0)
+ * ```
+ */
+export type InventoryDetailSource = 'host' | 'room' | 'none';
+
+/**
  * 单个房间的运行时。**不 import colyseus** —— colyseus 的 Room 只是薄装配层
  * (`room.colyseus.ts`),把它的 onTick/onJoin 转发到这里的方法。
  */
@@ -1303,7 +1484,34 @@ export class RoomRuntime {
   accessMode: AccessMode;
   passwordHash: string | null;
   maxPlayers: number;
-  partyMode: PartyMode = PartyMode.NONE;
+  /**
+   * 派对模式。★ 2026-11-18(第五轮 P3):**唯一写者是 `state.meta.partyMode`**。
+   *
+   * ## 修前:两处维护,其中一处只写不读
+   *
+   * 此前这里是一个并列字段 `partyMode: PartyMode = PartyMode.NONE`,由
+   * `setPartyModeBy` 和 `state.meta.partyMode` **各写一次**:
+   * ```
+   * this.partyMode = mode;                                   ← 内存副本
+   * this.state.meta.partyMode = Object.values(PartyMode).indexOf(mode);  ← 线快照
+   * ```
+   * 实测:`rt.partyMode` 的**生产读者 = 0**(只有测试读它)⇒ 一份没人读的第二份状态,
+   * 迟早与快照漂移(而漂移时没有任何断言会红 —— 它本来就没读者)。
+   *
+   * ## 现在:解码读法(单一存储)
+   *
+   * 存储只有 `state.meta.partyMode`(枚举**下标**,因为线协议要 U8);
+   * 本访问器按 `Object.values(PartyMode)` 还原 —— 与 `setPartyModeBy` 编码用的是
+   * **同一张值表**,故 encode/decode 不可能对不上。越界下标(坏快照)⇒ `NONE`,
+   * 与 `START_PARTY` 那边「下标不是任何合法模式 ⇒ 拒」同一取向。
+   *
+   * ⚠️ `get` 而不是方法:既有调用点(`rt.partyMode`)与 `tests/WS-07` 的断言
+   * 都按**字段**读它,改成方法会在调用点静默变成「函数对象」。
+   */
+  get partyMode(): PartyMode {
+    const table = Object.values(PartyMode);
+    return table[this.state.meta.partyMode] ?? PartyMode.NONE;
+  }
   readonly ac: AntiCheatRoom;
   readonly members = new Map<string, MemberSession>();
   /** 上次「有人活动」的时刻。 */
@@ -1866,7 +2074,9 @@ export class RoomRuntime {
   setPartyModeBy(actorId: string, mode: PartyMode): { ok: boolean; reason?: string } {
     const gate = this.authorize(actorId, RoomAction.SET_PARTY_MODE);
     if (!gate.allowed) return { ok: false, reason: gate.reason };
-    this.partyMode = mode;
+    /* ★ 单一存储:只写线快照的枚举下标(值表顺序 = `Object.values(PartyMode)`,
+       `get partyMode()` 用同一张表还原)。修前这里还并写 `this.partyMode = mode`,
+       于是同一事实有两份状态、其中一份没有生产读者(见 partyMode 的 docblock)。 */
     this.state.meta.partyMode = Object.values(PartyMode).indexOf(mode);
     this.touch(this.clock.nowMs());
     if (this.db) setPartyMode(this.db, this.id, mode, this.clock.nowMs());
@@ -2654,9 +2864,7 @@ export class RoomRuntime {
    *   而**不是**拿一个猜的公式兜底 —— 那会是第二份实现。
    */
   private derivedMaxHp(playerId: string, level: number): number | null {
-    const host = this.worldSaveHost as
-      | (WorldSaveHost & { maxHpForLevel?(id: string, lv: number): number | null })
-      | null;
+    const host = this.worldSaveHost;
     if (host === null || typeof host.maxHpForLevel !== 'function') return null;
     const v = host.maxHpForLevel(playerId, level);
     return v !== null && Number.isFinite(v) ? v : null;
@@ -2664,12 +2872,73 @@ export class RoomRuntime {
 
   /** 把派生上限交给 vitals(经世界源;`net` 不认识 `VitalsSystem`)。 */
   private syncMaxHpOf(playerId: string, derivedMaxHp: number): void {
-    const host = this.worldSaveHost as
-      | (WorldSaveHost & { syncMaxHp?(id: string, hp: number): boolean })
-      | null;
+    const host = this.worldSaveHost;
     if (host === null || typeof host.syncMaxHp !== 'function') return;
     host.syncMaxHp(playerId, derivedMaxHp);
   }
+
+  /**
+   * 第 8 项「总量 ← 明细」重算时**明细从哪来** —— 全类唯一的取法(见 `InventoryDetailSource`)。
+   *
+   * ## ★★ 第五轮 P1 的修点就在这里
+   *
+   * 修前:`projectInventoryTotalFor` **只**读 `host.inventoryDetailOf`,而唯一生产宿主
+   * (`world_sim.ts:4247`)如实返回 `null` ⇒ **恒**返回 false ⇒「总量按明细重算」这条
+   * 契约**在生产上从未执行过**。两处账于是各自维护:
+   * ```
+   * inventoryTotals  增量式(applyItemTotalDelta:total += Σdelta)
+   * itemCounts       明细式(applyItemCountDelta:按件加减)
+   * ```
+   * 两者今天结果相同,但增量式**漏一帧就永久偏差** —— 正是契约 §2.3(W5 裁定)
+   * 要挡的形态;而「按明细重算」这道保险从未上过电。
+   *
+   * ## 修法:让明细来源**同源**,而不是让宿主编一个明细
+   *
+   * ```
+   * 宿主实现 inventoryDetailOf ⇒ 以世界侧为准(将来背包搬进模拟层时自动生效)
+   * 宿主没有(null / 未声明)  ⇒ 退回**本房间按件账** `itemCounts`
+   *                            它的唯一写入口 applyItemCountDelta 与总量账
+   *                            (applyItemTotalDelta)**吃的是同一批 ops、同一前提**
+   *                            ⇒ 两处账同源,重算有真输入
+   * 两者都没有                 ⇒ 'none':不重算(fail-closed,见下)
+   * ```
+   * ⚠️ 为什么**不**改 `world_sim.ts` 去实现 `inventoryDetailOf`:模拟层**确实**
+   * 不持有背包明细(那是 `users.inventory_json` / 房间账的事)。让它编一份出来
+   * 就是第二份事实源。⇒ 正确的落点是「房间自己的明细账」。
+   *
+   * ⚠️ 为什么返回**房间账的形状**(`{itemId, quantity}[]`)而不是直接返回 Map:
+   * `projectInventoryTotal` 只认 `quantity` 字段(它对 `Record` / `Map` 一概不认),
+   * 这里就地翻译成它认的**唯一**形状,免得下游再写一层解析。
+   */
+  private inventoryDetailSource(userId: string): {
+    readonly source: InventoryDetailSource;
+    readonly detail: readonly { quantity?: unknown }[];
+  } {
+    const host = this.worldSaveHost;
+    if (host !== null && typeof host.inventoryDetailOf === 'function') {
+      const fromHost = host.inventoryDetailOf(userId);
+      if (fromHost !== null) return { source: 'host', detail: fromHost };
+    }
+    const m = this.itemCounts.get(userId);
+    if (m === undefined) return { source: 'none', detail: [] };
+    const rows: { itemId: number; quantity: number }[] = [];
+    for (const [itemId, quantity] of m) rows.push({ itemId, quantity });
+    return { source: 'room', detail: rows };
+  }
+
+  /**
+   * 上一次总量投影的**来源与结果**(诊断;判据用它区分「重算真的跑了」与「静默没跑」)。
+   *
+   * `null` = 从未跑过。核心一维是 `source`:`'host'` / `'room'` = 重算**有输入**;
+   * `'none'` = 两个明细源都没有。第五轮 P1 的形态是「**恒** false 且没有任何地方
+   * 看得出它没跑」,本字段就是那个「看得出」。
+   */
+  lastInventoryProjection: {
+    readonly userId: string;
+    readonly source: InventoryDetailSource;
+    readonly total: number;
+    readonly changed: boolean;
+  } | null = null;
 
   /**
    * 第 8 项 `inventory`:总量投影(契约 §2.3 的 W5 裁定)。
@@ -2678,7 +2947,7 @@ export class RoomRuntime {
    *
    * 累加式(`total += delta`)漏一帧就**永久偏差**;
    * 重算式(`total = f(明细)`)任何一帧只依赖当时的明细。
-   * ⇒ 故这里**读明细**(经 `inventoryDetailOf`),不读 `inventoryTotals`。
+   * ⇒ 故这里**读明细**(经 `inventoryDetailSource`),不读 `inventoryTotals`。
    *   `inventoryTotals` 是纯内存模式下的**退路缓存**,不是本投影的输入。
    *
    * ## 为什么是「变更时」而不是逐帧(契约 §2.3 带宽裁定)
@@ -2687,22 +2956,29 @@ export class RoomRuntime {
    * `applyInventory` 通过后调一次。
    * ⚠️ 但**重算**这一点与频率无关:低频 + 累加式照样会漂(而且更晚发现)。
    *
+   * ## `source === 'none'` 时**不重算**(fail-closed,修前是静默 false)
+   *
+   * 明细源一个都没有 ⇒ 既**不**把总量写成 `0`(那是拿编造的值覆盖增量账),
+   * 也**不**假装成功;如实把这一次记进 `lastInventoryProjection`(source `'none'`)。
+   * 与修前的差别不是「多一个分支」,而是:**「没有明细」这件事从此可观测**
+   * ——修前它与「明细算出来没变化」是同一个返回值 `false`,从外面分不开。
+   *
    * @returns 是否发生变更(供调用方决定要不要下发)
    */
   projectInventoryTotalFor(userId: string): boolean {
-    const host = this.worldSaveHost as
-      | (WorldSaveHost & {
-        inventoryDetailOf?(id: string): readonly { quantity?: unknown }[] | null;
-      })
-      | null;
-    if (host === null || typeof host.inventoryDetailOf !== 'function') return false;
-    const detail = host.inventoryDetailOf(userId);
-    if (detail === null) return false;
+    const { source, detail } = this.inventoryDetailSource(userId);
+    if (source === 'none') {
+      this.lastInventoryProjection = {
+        userId, source, total: this.inventoryTotals.get(userId) ?? 0, changed: false,
+      };
+      return false;
+    }
     const total = projectInventoryTotal(detail);
-    const prev = this.inventoryTotals.get(userId);
-    if (prev === total) return false;
-    this.inventoryTotals.set(userId, total);
-    return true;
+    const prev = this.inventoryTotals.get(userId) ?? 0;
+    const changed = prev !== total;
+    if (changed) this.inventoryTotals.set(userId, total);
+    this.lastInventoryProjection = { userId, source, total, changed };
+    return changed;
   }
 
   /**

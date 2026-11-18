@@ -79,7 +79,7 @@ import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, mobSpeciesId, MOB_INSTANCE_SEP, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { rollMobDrops, type MobDropResult } from '../mobs/drops.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
-import { SignalGraph } from '../wiring/graph.ts';
+import { SignalGraph, type ComponentNode } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
    只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
 import { scanRooms, identifyRoom, DEFAULT_SCAN_OPTIONS, type RoomIdentity } from '../build/rooms.ts';
@@ -1430,7 +1430,7 @@ export class WorldSim {
     this.wiring = new SignalGraph(this.sizeCells, this.sizeCells);
     /* D-07 的世界钟必须**每帧**可读:405 昼夜感光器读的 `hour` 不是摆放时的静态参数。
        两条构造路径(构造器 / `rebuildWorld`)都要挂,否则重置之后感光器会退回"缺失 = 0"。 */
-    this.installWorldClockEnv();
+    this.installWorldEnv();
     this.aoi = new AoiManager();
     this.spawner = new MobSpawner();
 
@@ -3500,6 +3500,9 @@ export class WorldSim {
 
   /** 游戏内**一天**的秒数 —— D-07 裁决值(20 分钟)。改它需要新裁决。 */
   static readonly WORLD_DAY_SEC = 1200;
+
+  /** 世界日 = `WORLD_DAY_SEC / DT` **快帧**(20 分钟一天 ⇒ 24000 帧)。 */
+  private static readonly FRAMES_PER_DAY = WorldSim.WORLD_DAY_SEC / DT;
   /** 世界时间 0 帧对应的**钟点** —— D-07 裁决值(06:00 天亮)。 */
   static readonly WORLD_START_HOUR = 6;
   /**
@@ -3529,30 +3532,145 @@ export class WorldSim {
   }
 
   /**
-   * 把**世界钟**挂到电路求值环境上(★ 让 D-07 有可观测效果)。
+   * 把**世界环境**挂到电路求值环境上(★ D-07 的钟点 + ★ WS-FND-114 的逐格事实)。
    *
-   * 为什么需要:405 昼夜感光器读 `ctx.param('hour')`,而组件的 `params` 是**摆放时**的静态表 ——
-   * 不挂这一口,感光器拿不到钟点(`param` 缺失 ⇒ 0 ⇒ `isNight(0)` = 夜 ⇒ **恒亮**),
-   * D-07 的钟点就只是个没人读的字段。
+   * ## 为什么需要(两条,分别对应两个缺陷)
+   *
+   * 1 **钟点**:405 昼夜感光器读 `ctx.param('hour')`,而组件的 `params` 是**摆放时**
+   *    的静态表 —— 不挂这一口,感光器拿不到钟点(`param` 缺失 ⇒ 0 ⇒ `isNight(0)` = 夜
+   *    ⇒ **恒亮**),D-07 的钟点就只是个没人读的字段。
+   * 2 **逐格传感事实**(WS-FND-114):`entityCount` / `fluid` / `onPodium` / … 问的是
+   *    「**这一格**上有什么」。修前这一口只回答 `hour` / `night`,其余一律 0 ⇒
+   *    压力板 / 水位 / 绊线 / 领奖台 / 弹簧垫 / 炮台 / 火车…… 的输入判据**全部恒假**;
+   *    而 440 的反向判据(`moored === 0`)与「键缺失」在 `param()` 里不可区分
+   *    ⇒ **恒真**(飞艇恒飞)。⇒ 键的形状改成 `(key, comp)`(`graph.ts` 的 `EnvSource`),
+   *    逐格键按**件所在格**回答。
+   *
+   * 键的口径**只有一张台账**:`wiring/components.ts` 的 `ENV_KEY_LEDGER`
+   * (哪些是 `WORLD`、哪些是摆放设置、哪些根本没有生产者)。本函数只实现 `WORLD`
+   * 那一批;**没实现的键返回 0 的含义是「世界里没有这个事实」**,不是「忘了写」。
    *
    * 挂的时机:`SignalGraph` 每次被新建都要重挂(构造器与 `rebuildWorld` 两条路径),
-   * 否则重置过的世界会悄悄退回"恒亮"。
-   *
-   * 只提供 `hour` 与 `night` 两个键:其余键仍按"缺失 = 0"走,既有组件读数一个不变。
+   * 否则重置过的世界会悄悄退回「钟恒亮 + 传感恒假」。
    */
-  private installWorldClockEnv(): void {
-    this.wiring.setEnvSource((key: string): number => {
-      if (key === 'hour') return this.hourOfDay();
-      if (key === 'night') return this.isNightNow() ? 1 : 0;
-      return 0;
-    });
+  private installWorldEnv(): void {
+    this.wiring.setEnvSource((key: string, comp?: ComponentNode): number => this.automationEnvOf(key, comp));
+  }
+
+  /**
+   * 世界环境键的**唯一生产实现**(全局键 + 逐格键)。口径见 `ENV_KEY_LEDGER`。
+   *
+   * ⚠️ 逐格键在 `comp` 缺省时返回 0:那是「没有位置就没有答案」,不是「这个键没人写」。
+   *
+   * 复杂度:每个逐格键 O(玩家 + 生物 + 地面堆),与 `sizeCells` **无关**;生产件数
+   * 上限 40(见 `COMPONENT_PRODUCER_LEDGER`),每慢帧至多几十次 ⇒ 不进性能预算讨论。
+   */
+  private automationEnvOf(key: string, comp?: ComponentNode): number {
+    /* ── 与位置无关的键 ── */
+    if (key === 'hour') return this.hourOfDay();
+    if (key === 'night') return this.isNightNow() ? 1 : 0;
+    if (key === 'morningTick') return this.isMorningSlowFrame() ? 1 : 0;
+    /* ── 逐格键:没有位置就没有答案(旧行为等价于这一支恒 0)── */
+    if (comp === undefined) return 0;
+    const cx = Math.floor(comp.x);
+    const cy = Math.floor(comp.y);
+    switch (key) {
+      case 'entityCount': return this.entitiesAt(cx, cy).count;
+      case 'entityWeight': return this.entitiesAt(cx, cy).weight;
+      case 'fluid': return this.fluid.amountAt(cx, cy) > 0 ? 1 : 0;
+      /* 「穿过」= 本帧有实体在这个格;绊线柱的脉冲本来就是 1 帧(件自带固有延迟)。 */
+      case 'crossed': return this.entitiesAt(cx, cy).count > 0 ? 1 : 0;
+      case 'onPodium': return this.playersAt(cx, cy) > 0 ? 1 : 0;
+      case 'payloadAbove': return this.entitiesAt(cx, cy - 1).count > 0 ? 1 : 0;
+      /* 半径取件自己的 `params.range`(425 配表 7 格),不在世界侧另立一个数。 */
+      case 'enemyInRange': return this.mobWithin(cx, cy, Math.max(1, comp.params.range ?? 7)) ? 1 : 0;
+      case 'hitMob': return this.mobAt(cx, cy) ? 1 : 0;
+      default: return 0;
+    }
+  }
+
+  /**
+   * 某格的实体账:`count` = 玩家 + 活着的生物 + 地面掉落堆;
+   * `weight` = **刚体质量之和**(掉落物压上板子算「有东西」,但**不压秤** ——
+   * 「双人重物压力板」比的是玩家/动物的质量)。
+   */
+  private entitiesAt(cx: number, cy: number): { count: number; weight: number } {
+    let count = 0;
+    let weight = 0;
+    for (const id of this.playerIds) {
+      const b = this.physics.bodies.get(id);
+      if (b === undefined) continue;
+      if (Math.floor(b.x) !== cx || Math.floor(b.y) !== cy) continue;
+      count += 1;
+      weight += safeMass(b.mass);
+    }
+    for (const rt of this.mobHost.runtimes()) {
+      if (!rt.alive) continue;
+      if (Math.floor(rt.x) !== cx || Math.floor(rt.y) !== cy) continue;
+      count += 1;
+      const b = this.physics.bodies.get(rt.id);
+      weight += b === undefined ? 1 : safeMass(b.mass);
+    }
+    for (const g of this.mobGround) {
+      if (g.count <= 0) continue;
+      if (Math.floor(g.x) !== cx || Math.floor(g.y) !== cy) continue;
+      count += 1;
+    }
+    return { count, weight };
+  }
+
+  /** 某格有几名**玩家**(掉落物/生物不算「踏上」)。 */
+  private playersAt(cx: number, cy: number): number {
+    let n = 0;
+    for (const id of this.playerIds) {
+      const b = this.physics.bodies.get(id);
+      if (b === undefined) continue;
+      if (Math.floor(b.x) === cx && Math.floor(b.y) === cy) n += 1;
+    }
+    return n;
+  }
+
+  /** 该格有没有**活着的**生物(尸体不算)。 */
+  private mobAt(cx: number, cy: number): boolean {
+    for (const rt of this.mobHost.runtimes()) {
+      if (!rt.alive) continue;
+      if (Math.floor(rt.x) === cx && Math.floor(rt.y) === cy) return true;
+    }
+    return false;
+  }
+
+  /** 以格心为中心、`range` 格内(欧氏距离)有没有活着的生物。 */
+  private mobWithin(cx: number, cy: number, range: number): boolean {
+    const px = cx + 0.5;
+    const py = cy + 0.5;
+    for (const rt of this.mobHost.runtimes()) {
+      if (!rt.alive) continue;
+      if (Math.hypot(rt.x - px, rt.y - py) <= range) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 本帧是不是**世界日的头一个慢帧**(世界日 06:00 起头)⇒ 426「每早自动洒水」的触发点。
+   *
+   * 分母是 D-07 的一天(`WORLD_DAY_SEC`),**不另发明**「清晨窗口」的长度;窗口取
+   * 一个慢帧(`FAST_PER_SLOW` 快帧)是因为 426 本身就跑在 2Hz 上 ——
+   * 一天的帧数能被慢帧周期整除(`24000 % 10 == 0`),所以这个窗口里**恰好**含
+   * 当天第一个慢帧(在世界日边界那一拍)。
+   */
+  private isMorningSlowFrame(): boolean {
+    return this.frameCount % WorldSim.FRAMES_PER_DAY < FAST_PER_SLOW;
   }
 
   /**
    * 读电路求值环境里的某个键(公开读口,给判据用)。
    *
-   * 它读的是**真的挂上去了没有**,不是另算一遍:没人调 `installWorldClockEnv()` 或中途被摘掉,
-   * 这里就返回 0 —— 于是"接线断了"能变成一条红,而不是一个静默的恒亮感光器。
+   * 它读的是**真的挂上去了没有**,不是另算一遍:没人调 `installWorldEnv()` 或中途被摘掉,
+   * 这里就返回 0 —— 于是「接线断了」能变成一条红,而不是一个静默的恒亮感光器。
+   *
+   * ⚠️ 这里**不传 `comp`** ⇒ 只答得出位置无关的键(`hour` / `night`);
+   * 逐格键(`entityCount` / `fluid` / …)在这里一律 0,那是「没有位置就没有答案」——
+   * 逐格读数请直接 `wiring` 上的件求值结果(判据 `WS-FND-114` 就是这么做的)。
    */
   wiringEnvOf(key: string): number {
     return this.wiring.envOf(key);
@@ -4943,7 +5061,7 @@ export class WorldSim {
     this.grid = new WorldGrid();
     this.fluid = new FluidField(this.sizeCells, this.sizeCells);
     this.wiring = new SignalGraph(this.sizeCells, this.sizeCells);
-    this.installWorldClockEnv();
+    this.installWorldEnv();
     this.aoi = new AoiManager();
     this.spawner = new MobSpawner();
     this.physics = this.makePhysicsWorld();
@@ -5954,6 +6072,18 @@ export class WorldSim {
       const c = id ? this.wiring.get(id) : undefined;
       if (c) { c.state.delivered = a.state.delivered; c.state.idleCycles = a.state.idleCycles; }
     }
+    /* ★ WS-FND-114:`LOGISTICS_SORTER.routed` 是 `STATE_DEFAULTS` 里**声明过**的读数,
+       此前**没有任何写点**(分拣计数只活在 `logisticsSorters` 私有 Map 里,
+       从件表看过去恒 0)。这里按「已分流件数之和」投影出去,与 belt/arm/drill 同款。 */
+    for (const s of line.sorters) {
+      const id = this.componentIdOf(s.x, s.y, 'LOGISTICS_SORTER');
+      const c = id ? this.wiring.get(id) : undefined;
+      if (c) {
+        let routed = 0;
+        for (const n of s.state.routed.values()) routed += n;
+        c.state.routed = routed;
+      }
+    }
     for (const d of line.drills) {
       const id = this.componentIdOf(d.x, d.y, 'LOGISTICS_DRILL');
       const c = id ? this.wiring.get(id) : undefined;
@@ -6456,6 +6586,15 @@ export class WorldSim {
    * @returns 是否装载成功(该格无带 / 带已满 / 该格无货 都返回 false)
    */
   loadConveyorAt(x: number, y: number): boolean {
+    /*
+     * ★ WS-FND-114(口径一致化):`wiringOn === false` 的世界里**没人推进物流** ——
+     * `tickLogisticsStep()` 在 `if (this.wiringOn)` 块内,于是装上去的货会永远停在
+     * `logisticsBelts[id].item` 上:既不搬动、也不落地。修前这里照样返回 `true`
+     * (「装载成功」)⇒「已装载」与「会被搬运」两个口径**相反**。
+     * ⇒ 无电路的世界**拒绝装载**(返回 false,货留在地面):宁可不说成功,
+     * 也不许诺一次永远不会发生的搬运。
+     */
+    if (!this.wiringOn) return false;
     const id = this.componentIdOf(x, y, 'LOGISTICS_CONVEYOR');
     if (id === '') return false;
     /* 惰性建表:调用方可能在**首个慢帧之前**就装载(玩家开局放货),

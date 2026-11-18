@@ -76,9 +76,8 @@ function makeRoom(role: 'OWNER' | 'GUEST', reset?: ResetFn): Room {
 const disp = (rt: Room['rt'], payload: Record<string, unknown>) =>
   rt.dispatchAction('p1', RoomAction.RESET_WORLD, payload);
 
-/** 取 `effect`(`ActionOutcome['effect']` 是标量表)。 */
-const eff = (r: { effect?: Record<string, string | number | boolean> }) =>
-  r.effect as Record<string, string | number | boolean>;
+/** 取 `effect`。★ 值域已放宽为 `EffectRecord`(见 `room.ts` 的 `EffectValue`);这里只读标量。 */
+const eff = (r: { effect?: unknown }) => r.effect as Record<string, string | number | boolean>;
 
 /* ───────────────────────── 判据 ───────────────────────── */
 

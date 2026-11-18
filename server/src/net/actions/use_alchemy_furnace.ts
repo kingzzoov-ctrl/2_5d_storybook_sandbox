@@ -29,11 +29,10 @@
  * `SYSTEM_UNLOCK`(无逐玩家状态位)⇒ 那个口拿不到 `ALCHEMY_LAB`。
  * `lastRoomEffects` 是同一慢帧的**姊妹产物**,`roomKey` 就在它上面。
  *
- * ⚠️ `ActionContext.host` 声明为 `WorldSaveHost`,而 `lastRoomEffects`
- *   目前**不在**那份结构化契约里(`net/room.ts` 的可选成员清单)。
- *   本次改动只允许碰本文件 ⇒ 用**局部窄类型**读它;缺这一项时动作显式回
- *   `INVALID`,而不是静默跳过。若将来把它正式写进 `WorldSaveHost`,
- *   删掉下面的 `AlchemyLabReadPort` 即可(届时那段 `unknown` 转换也能收掉)。
+ * ⚠️ ★ 2026-11-18(第五轮 P2):`lastRoomEffects` **已经**正式写进
+ *   `WorldSaveHost`(`net/room.ts` 的可选成员,形状只留 `playerId` / `roomKey`
+ *   这两维)⇒ 本文件不再需要局部窄类型 `AlchemyLabReadPort` / `as unknown as`。
+ *   缺这一项(老宿主 / 慢帧还没跑到)时动作仍显式回 `INVALID`,不静默跳过。
  *
  * ## 三件必须**在同一处**做的事(照 `craft.ts` / `material.ts` 的纪律)
  *
@@ -77,7 +76,7 @@ import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/item
 import { SETTLEMENT_LEDGER_CAPACITY, SETTLEMENT_ROOMS, settleKeyOf } from '../../systems/idempotency.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
-import type { ActionOutcome, WorldSaveHost } from '../room.ts';
+import type { ActionOutcome, EffectRecord, EffectValue, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /**
@@ -89,15 +88,12 @@ import type { ActionContext, ActionHandler } from './types.ts';
 export const ALCHEMY_LAB_ROOM_KEY = 'ALCHEMY_LAB';
 
 /**
- * `USE_ALCHEMY_FURNACE` 在世界源上真正需要的那**一项**能力(见文件头的
- * 「站位判定读哪里」)。`WorldSaveHost` 里没有它 ⇒ 局部窄类型 + 显式拒绝。
+ * `effect` 的声明形状:**直接用 `room.ts` 的那一份**(递归 JSON 值)。
+ *
+ * ★ 2026-11-18(第五轮 P1):修前这里是 `NonNullable<ActionOutcome['effect']>`
+ * (值域只允许标量),于是 `consumed` / `certificate` / `gallery` 三个嵌套项只能靠
+ * `as unknown as EffectRecord` 绕过。现在契约自己允许嵌套 ⇒ **一个 `as` 都不需要**。
  */
-type AlchemyLabReadPort = {
-  lastRoomEffects?: readonly { playerId: string; roomKey: string | null }[];
-};
-
-/** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型。 */
-type EffectRecord = NonNullable<ActionOutcome['effect']>;
 
 /**
  * `WorldSaveHost.brewAtFurnace` 的**带请求号**形态。
@@ -321,9 +317,12 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     };
   }
 
-  /* 3/4 站位:只认世界源慢帧的房间判定,不自己识别房间。 */
-  const port = ctx.host as unknown as AlchemyLabReadPort;
-  const rows = port.lastRoomEffects;
+  /* 3/4 站位:只认世界源慢帧的房间判定,不自己识别房间。
+     ★ 第五轮 P2:`lastRoomEffects` 现在**声明在 `WorldSaveHost` 里** ⇒ 直接读宿主的,
+     不再 `as unknown as AlchemyLabReadPort`(那个局部窄类型已删:它的存在本身就是
+     「接口漏声明」的证据)。能力缺失(宿主没这个成员 / 还没跑到慢帧)仍走下面那条
+     显式 `INVALID`,不静默跳过。 */
+  const rows = ctx.host.lastRoomEffects;
   if (!Array.isArray(rows)) {
     return {
       ok: false, kind: 'INVALID',
@@ -483,8 +482,11 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
      ⚠️ **不是所有**世界侧拒绝都算重放:确定性配方只放 1 件(165 = `{108:1}`)时,536 的
      **自由炼金**路径会以「材料件数 1 不在 [2,4]」拒 —— 那只是陈列记不上,不是重复出货,
      产物照发(`galleryNote` 如实带因)。判别见 `worldRejectionLooksLikeReplay`。 */
-  let certificate: Record<string, unknown> | null = null;
-  let display: unknown = [];
+  /* ★ 第五轮 P1:这两个变量的类型改用**契约自己的**值域(`EffectRecord` / `EffectValue`)。
+     修前是 `Record<string, unknown>` / `unknown` —— 它们只能被 `as unknown as` 塞进回执;
+     现在回执允许嵌套 ⇒ 声明与写入同一套类型,`unknown` 不再出现在这条路径上。 */
+  let certificate: EffectRecord | null = null;
+  let display: readonly EffectValue[] = [];
   let brewReason: string | null = null;
   const brew = ctx.host.brewAtFurnace as FurnaceBrewWithOrder | undefined;
   if (typeof brew === 'function') {
@@ -525,21 +527,20 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     brewReason = '世界源没有炼金陈列能力(brewAtFurnace)⇒ 冠名未记录';
   }
 
-  /* 回执:`consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件),不是配方需求表。
-     该字段是嵌套对象,`ActionOutcome['effect']` 的值类型装不下 ⇒ 显式窄化(见文件头)。
-     `freeForge: false` 如实标明这一版不是 LLM 自由炼金。 */
-  return {
-    ok: true, kind: 'OK',
-    effect: {
-      itemId,
-      produced: made,
-      consumed: match.consumed,
-      roomKey: ALCHEMY_LAB_ROOM_KEY,
-      freeForge: false,
-      /* 537 陈列:证书(本次首创/复刻的那一行)+ 完整投影 + 记账失败原因。 */
-      certificate,
-      gallery: display,
-      galleryNote: brewReason,
-    } as unknown as EffectRecord,
+  /* 回执:`consumed` 是**真的被扣掉的那几件**(含留白槽选中的那件),不是配方需求表;
+     `certificate` / `gallery` 是 537 陈列(证书行 + 完整投影),`galleryNote` 是记账失败原因。
+     `freeForge: false` 如实标明这一版不是 LLM 自由炼金。
+     ★ 第五轮 P1:这三个嵌套项现在**就是** `EffectRecord` 允许的值域 ⇒ 不再有
+     `as unknown as`(修前那句绕过是「契约说标量、实现塞对象」的产物)。 */
+  const effect: EffectRecord = {
+    itemId,
+    produced: made,
+    consumed: match.consumed,
+    roomKey: ALCHEMY_LAB_ROOM_KEY,
+    freeForge: false,
+    certificate,
+    gallery: display,
+    galleryNote: brewReason,
   };
+  return { ok: true, kind: 'OK', effect };
 };

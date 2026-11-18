@@ -5,7 +5,7 @@
  *
  * `net/prediction.ts` 的四族(`predictStep` / `reconcile` / `resimulate` / `pruneCmds`)
  * 一直**没有生产者**:它们要 `InputCmd`,而客户端从来没人造过 ——
- * WASD 当时驱动的是**相机平移**(`three/boot.ts` 的 `pan.x += …`)。
+ * WASD 当时驱动的是**相机平移**(`three/boot.ts` 的 `pan.x += ...`)。
  * ⇒ 预测器整套在仓库里存在、有单测、却**在生产链上零引用**。
  *
  * `docs/TASK-83-wasd-three-options.md` 把这件事列成产品裁决,三个选项是:
@@ -85,6 +85,19 @@ export function dirFromPressed(isDown: (key: string) => boolean): MoveDir {
 export class InputSource {
   private readonly down = new Set<string>();
   private seq = 0;
+  /**
+   * 空格锁存:**恰好一条**命令带 `jump: true`(按住空格在 20Hz 下会每秒发 20 次)。
+   *
+   * ★ WS-FND-113:此前它**没有出口** —— `MoveIntent`(`session.ts`)没有 `jump` 字段、
+   * 服务端 `applyMove` 也只接 x/y/z ⇒ 锁存下来的那个跳跃永远发不出去;
+   * 而空格在 `main.ts` 里同时是**攻击键** ⇒ 玩家以为跳了,其实只是砍了一刀。
+   *
+   * 修法是**给出口**(`MoveIntent.jump` → 上行报文),不是删掉锁存:
+   * 删掉会让「空格 = 跳跃」这条已存在的行为无声消失,而它在
+   * `tests/WS-FND-16` 的 FND16-2 里被钉着(零输入也发、jump 恰好锁存一次)。
+   * ⚠️ 出口的**末端**目前仍是空的:服务端 `parseMoveIntent` 不认识这个字段,
+   * 会把它**丢掉**(不报错)。要让它真的落地得改服务端那条路 —— 本文件不谎称已落地。
+   */
   private jumpLatched = false;
 
   /** 按下(幂等:重复 keydown 不会重复计数 —— 浏览器会自动重复)。 */
@@ -105,6 +118,24 @@ export class InputSource {
     this.jumpLatched = false;
   }
 
+  /**
+   * ★ WS-FND-113 第 4 处:重连 / 传送时**整条输入链**复位。
+   *
+   * ## 为什么 `seq` 必须回零(而不是继续 +1)
+   * `seq` 的口径是「**这条连接**上的第几条命令」—— 服务端把它记在**每连接**的
+   * `WsConn.ackedSeq` 上(新连接从 -1 起,见 `ws_server.ts` 的 `onMove`)。
+   * 客户端这边的对照物是 `LocalPredictor.acked`,`reset()` 里同样回到 -1。
+   * 两侧都按「新连接 = 新账本」重启 ⇒ 头几条命令不会因为"序号比旧账小"被跳过。
+   *
+   * ## 按键集合也必须清
+   * 断线期间按下的键收不到 `keyup`(`attachKeyboard` 只在 `blur` 时清)
+   * ⇒ 重连后角色会朝一个**早已松开的方向**一直走,而没有任何东西会报错。
+   */
+  reset(): void {
+    this.clear();
+    this.seq = 0;
+  }
+
   /** 当前按下的键数(自检用)。 */
   get pressedCount(): number {
     return this.down.size;
@@ -117,8 +148,10 @@ export class InputSource {
 
   /**
    * 产出一条命令并推进 `seq`。
-   * `jump` 是**锁存**的:按下空格后,恰好一条命令带 `jump: true`
-   * (否则「按住空格」会在 20Hz 下每秒发 20 次跳跃)。
+   *
+   * `jump` 是**锁存**的:按下空格后恰好一条命令带 `jump: true`。
+   * ★ WS-FND-113:它的出口是 `MoveIntent.jump`(见 `session.ts`)—— 一个没有任何
+   * 消费者的字段只要留在生产路径上,就会被后来者读成"跳跃已实现"。
    */
   nextCmd(): InputCmd {
     const d = this.dir();

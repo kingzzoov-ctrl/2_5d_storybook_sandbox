@@ -307,7 +307,15 @@ test('FND109-8 ★P2 台账:生产零调用 `.startPartyRun(`、零假发射点�
   ok(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.CREATURE_KILL') > 0, '正对照:击杀那一个发射点真的在源码里(证明下面两个 0 不是"整个词表都没被用")');
   eq(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.GATHER'), 0, '★ 不得有假发射点:GATHER 在 world_sim 里没有生产者');
   eq(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.REACH_TARGET'), 0, '★ 不得有假发射点:REACH_TARGET 同上');
-  ok(WORLD_SIM_SRC.includes('零调用'), '缺口必须**登记在世界侧源码里**(台账),而不是只在注释里声称"三个发射点"');
+  /* ★ 第五轮元审计:原来的 `WORLD_SIM_SRC.includes('零调用')` 是**子串**判据 ——
+     注释里出现「零调用」就满足,把台账写成死代码也不红。
+     改成**行为判据**:方法真实存在且能开赛(⇒ 生产的「恒 IDLE」来自**零调用**,
+     不是方法没实现)。 */
+  const started = simParty.startPartyRun('BRIDGE_CTF', 'ref-1');
+  eq(started, true, '★ `startPartyRun` 能开赛(方法真实存在,不是死桩)');
+  ok(simParty.partyPhase() !== 'IDLE', '★ 开了之后 `partyPhase()` 不再是 IDLE ⇒ 生产的「恒 IDLE」是零调用造成的');
+  simParty.clearPartyRun();
+  eq(simParty.partyPhase(), 'IDLE', '收尾:清空后回到 IDLE(与生产恒 IDLE 同形态)');
 
   eq(afkTickedForParty, 1, '正对照:慢帧真的跑过(`tickPartyStep` 每慢帧都执行)');
   eq(partyTicked, 0, '★ 慢帧跑过但 `partyRun` 恒 null ⇒ `tickPartyMode` 从不推进');

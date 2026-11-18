@@ -114,9 +114,9 @@ const FACTORY = {
   updatedAtMs: 0,
 };
 
-/** 取 `effect`(类型窄化:它是 `Record<string, string | number | boolean>`)。 */
-const eff = (r: { effect?: Record<string, string | number | boolean> }) =>
-  r.effect as Record<string, string | number | boolean>;
+/** 取 `effect`。★ 值域已放宽为 `EffectRecord`(嵌套项是契约的一部分,见 `room.ts` 的
+ *  `EffectValue`);本套件只读**标量**字段 ⇒ 断言处再窄化一次(与 `WS-FND-105` 同一手法)。 */
+const eff = (r: { effect?: unknown }) => r.effect as Record<string, string | number | boolean>;
 
 /* ───────────────────────── 1 ───────────────────────── */
 

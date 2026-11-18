@@ -480,24 +480,61 @@ function optionalStrField(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
+/**
+ * 裁剪摘要里那些「计数 / 字节数」字段的**唯一**校验口径 —— 编码与解码**同源**。
+ *
+ * 三条(缺一不可):
+ *   1 必须是有限数 —— `undefined` / 字符串 / NaN 都不是「0」;
+ *   2 必须是整数   —— 改前编码侧只用 `Math.trunc(droppedChunks)` **算校验和**,
+ *      而字段本身原样写进头 ⇒ `2.5` 产出「编码器收下、自家解码器必抛」的字节;
+ *   3 必须非负     —— `-1` 在两端都不拦时,头里写着「裁了 -1 块」,而 `planRestore`
+ *      的 `Math.max(0, …)` 把它归 0:同一份字节在两个口径下自相矛盾。
+ *
+ * `stage` 只影响消息里的「编码 / 解码」字样,判定规则一个字都不差。
+ */
+function trimIntField(v: unknown, where: string, stage: '编码' | '解码'): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    throw new Error(`WSA1 ${stage}失败:${where} 必须是有限数(实得 ${String(v)})`);
+  }
+  if (!Number.isInteger(v)) {
+    throw new Error(`WSA1 ${stage}失败:${where} 必须是整数(实得 ${v})`);
+  }
+  if (v < 0) {
+    throw new Error(`WSA1 ${stage}失败:${where} 必须非负(实得 ${v})`);
+  }
+  return v;
+}
+
+/** 可选版本:缺席 / `null` ⇒ `undefined`(与「写了个 0」在字节层分得清)。 */
+function optionalTrimIntField(
+  v: unknown,
+  where: string,
+  stage: '编码' | '解码',
+): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  return trimIntField(v, where, stage);
+}
+
 /** 头里的 `trim` 扩展键(可选)。坏形状 ⇒ `null`(**不**把坏数据当「没裁过」之外的东西)。 */
 function decodeTrimNote(v: unknown): ArchiveTrimReport | null {
   if (v === undefined || v === null) return null;
   const o = recordField(v, 'header.trim');
   /* 水位那组键**只在裁过水位时才有**:没裁 ⇒ `undefined`(键也不写回),
-     「缺席」与「0 行」在字节层是两回事(见 `ArchiveTrimReport`)。 */
+     「缺席」与「0 行」在字节层是两回事(见 `ArchiveTrimReport`)。
+     ★ 每个字段都过 `trimIntField`(整数 + 非负)—— 与**编码侧同一个口径**,于是
+     「改小 / 改成非整数 / 写 -1」这些形态在两端都说同一种话。 */
   return {
-    budgetBytes: intField(o.budgetBytes, 'header.trim.budgetBytes'),
-    originalBytes: intField(o.originalBytes, 'header.trim.originalBytes'),
-    keptChunks: intField(o.keptChunks, 'header.trim.keptChunks'),
-    droppedChunks: intField(o.droppedChunks, 'header.trim.droppedChunks'),
-    droppedBytes: intField(o.droppedBytes, 'header.trim.droppedBytes'),
+    budgetBytes: trimIntField(o.budgetBytes, 'header.trim.budgetBytes', '解码'),
+    originalBytes: trimIntField(o.originalBytes, 'header.trim.originalBytes', '解码'),
+    keptChunks: trimIntField(o.keptChunks, 'header.trim.keptChunks', '解码'),
+    droppedChunks: trimIntField(o.droppedChunks, 'header.trim.droppedChunks', '解码'),
+    droppedBytes: trimIntField(o.droppedBytes, 'header.trim.droppedBytes', '解码'),
     rule: typeof o.rule === 'string' ? o.rule : '',
     reason: typeof o.reason === 'string' ? o.reason : '',
-    fluidLevelsTotal: optionalIntField(o.fluidLevelsTotal, 'header.trim.fluidLevelsTotal'),
-    fluidLevelsKept: optionalIntField(o.fluidLevelsKept, 'header.trim.fluidLevelsKept'),
-    fluidLevelsDropped: optionalIntField(o.fluidLevelsDropped, 'header.trim.fluidLevelsDropped'),
-    fluidBudgetBytes: optionalIntField(o.fluidBudgetBytes, 'header.trim.fluidBudgetBytes'),
+    fluidLevelsTotal: optionalTrimIntField(o.fluidLevelsTotal, 'header.trim.fluidLevelsTotal', '解码'),
+    fluidLevelsKept: optionalTrimIntField(o.fluidLevelsKept, 'header.trim.fluidLevelsKept', '解码'),
+    fluidLevelsDropped: optionalTrimIntField(o.fluidLevelsDropped, 'header.trim.fluidLevelsDropped', '解码'),
+    fluidBudgetBytes: optionalTrimIntField(o.fluidBudgetBytes, 'header.trim.fluidBudgetBytes', '解码'),
     fluidRule: optionalStrField(o.fluidRule),
     fluidReason: optionalStrField(o.fluidReason),
     /* 逐块清单不持久化(见 `ArchiveTrimReport.dropped`)。 */
@@ -987,32 +1024,45 @@ export function encodeWorldArchive(input: EncodeWorldArchiveInput): Uint8Array {
      是既有判据),凭空多两个键会当场把那条判据打红。
      两者都按**实际写入的块**算,不抄调用方的说法。 */
   if (input.trim !== undefined && input.trim !== null) {
-    const chunksTotal = input.chunks.length + Math.max(0, Math.trunc(input.trim.droppedChunks));
+    const t = input.trim;
+    /* ★ 先按**与解码同一个口径**校验,再算总块数 / 写字段(审计 P2,反向复查):
+       改前只用 `Math.trunc(t.droppedChunks)` **算校验和**,而 `droppedChunks` 原样写进头 ⇒
+       编码器能产出「自家解码器必抛」的字节(`2.5`);`-1` 更是两端都不拦,而
+       `planRestore` 的 `Math.max(0, …)` 把它归 0 —— 头里说「裁了 -1 块」、计划里说「缺口 0」。
+       下面每个**写出去的**字段各判一次(非负整数),坏值说清是哪个字段。 */
+    const budgetBytes = trimIntField(t.budgetBytes, 'header.trim.budgetBytes', '编码');
+    const originalBytes = trimIntField(t.originalBytes, 'header.trim.originalBytes', '编码');
+    const keptChunks = trimIntField(t.keptChunks, 'header.trim.keptChunks', '编码');
+    const droppedChunks = trimIntField(t.droppedChunks, 'header.trim.droppedChunks', '编码');
+    const droppedBytes = trimIntField(t.droppedBytes, 'header.trim.droppedBytes', '编码');
+    const fluidLevelsTotal = optionalTrimIntField(t.fluidLevelsTotal, 'header.trim.fluidLevelsTotal', '编码');
+    const fluidLevelsKept = optionalTrimIntField(t.fluidLevelsKept, 'header.trim.fluidLevelsKept', '编码');
+    const fluidLevelsDropped = optionalTrimIntField(t.fluidLevelsDropped, 'header.trim.fluidLevelsDropped', '编码');
+    const fluidBudgetBytes = optionalTrimIntField(t.fluidBudgetBytes, 'header.trim.fluidBudgetBytes', '编码');
+    /* 总块数 = **裁剪前**的口径(实际块数 + 被裁数);校验和把两个数都绑进规范文本。 */
+    const chunksTotal = input.chunks.length + droppedChunks;
     header.chunksTotal = chunksTotal;
     header.chunksChecksum = archiveChunksChecksum(
       input.chunks.map((c) => ({ cx: c.cx, cy: c.cy, bytes: c.bytes.byteLength })),
       input.chunks.length,
       chunksTotal,
     );
-  }
-  if (input.trim !== undefined && input.trim !== null) {
     const trim: Record<string, unknown> = {
-      budgetBytes: input.trim.budgetBytes,
-      originalBytes: input.trim.originalBytes,
-      keptChunks: input.trim.keptChunks,
-      droppedChunks: input.trim.droppedChunks,
-      droppedBytes: input.trim.droppedBytes,
-      rule: input.trim.rule,
-      reason: input.trim.reason,
+      budgetBytes,
+      originalBytes,
+      keptChunks,
+      droppedChunks,
+      droppedBytes,
+      rule: t.rule,
+      reason: t.reason,
     };
     /* ★ 水位那组键**只在裁过水位时**写(键序接在 `reason` 之后 —— 不裁时一个字节
        都不多,`encode(decode(x)) === x` 与既有的裁剪字节全都原样保持)。
        用赋值而不是写进上面的字面量:键缺席与「写个 0」在字节层是两回事。 */
-    const t = input.trim;
-    if (t.fluidLevelsTotal !== undefined) trim.fluidLevelsTotal = t.fluidLevelsTotal;
-    if (t.fluidLevelsKept !== undefined) trim.fluidLevelsKept = t.fluidLevelsKept;
-    if (t.fluidLevelsDropped !== undefined) trim.fluidLevelsDropped = t.fluidLevelsDropped;
-    if (t.fluidBudgetBytes !== undefined) trim.fluidBudgetBytes = t.fluidBudgetBytes;
+    if (fluidLevelsTotal !== undefined) trim.fluidLevelsTotal = fluidLevelsTotal;
+    if (fluidLevelsKept !== undefined) trim.fluidLevelsKept = fluidLevelsKept;
+    if (fluidLevelsDropped !== undefined) trim.fluidLevelsDropped = fluidLevelsDropped;
+    if (fluidBudgetBytes !== undefined) trim.fluidBudgetBytes = fluidBudgetBytes;
     if (t.fluidRule !== undefined) trim.fluidRule = t.fluidRule;
     if (t.fluidReason !== undefined) trim.fluidReason = t.fluidReason;
     header.trim = trim;
@@ -1778,6 +1828,18 @@ export interface RestorePlan {
   chunksInArchive?: number;
   /** 头里声明的**裁剪前**总块数(`DecodedWorldArchive.chunksTotal`)。 */
   chunksDeclaredTotal?: number;
+  /**
+   * 地形表**摘要核对结果**(审计 P2,反向复查):
+   *   * `true`  = 头里有 `chunksChecksum` 且对得上(块表被摘要绑住);
+   *   * `false` = 头里**根本没有摘要**(键被删 / 旧字节)⇒ 块表**不可判**。
+   *
+   * 为什么必须有这个字段:`trim` + `chunksTotal` + `chunksChecksum` **三个键都是可选的**,
+   * 一起删掉就退化成「看起来没裁过的完整归档」(`chunksTotal` = 实际块数 ⇒ `shortfall = 0`)。
+   * 所以「没有摘要」本身就是一个**不可信状态**,不是「完整」的同义词 ——
+   * `missingChunks: 0` 只表示「没检出缺口」,必须与这个字段一起读。
+   * (`chunksChecksumOk === false` 到不了这里:解码器对不上就抛,见 `decodeWorldArchive`。)
+   */
+  chunksVerified?: boolean;
   /** 被裁块的逐块清单(只在「刚裁完」的那份对象里非空;从库里读回时为空)。 */
   missing: ArchiveTrimDroppedChunk[];
   /** 与 `current` 的差异叙述(只影响可读性,**不**影响 ops)。 */
@@ -1926,6 +1988,10 @@ export function planRestore(
   const shortfall = Math.max(0, declaredTotalChunks - actualChunks);
   const trimDropped = trim === null ? 0 : Math.max(0, Math.trunc(trim.droppedChunks));
   const missingChunks = Math.max(trimDropped, shortfall);
+  /* ★ 「有没有摘要」是**另一个**口径(审计 P2,反向复查):缺口只报「检出的」,
+     而完整性必须显式说明。`chunksChecksumOk` 只可能是 `true`(对得上)或 `null`
+     (头里没有校验和 —— 旧字节 / 被删):后者是**不可判**,不是「通过」。 */
+  const chunksVerified = snapshot.chunksChecksumOk === true;
   const unavailable: string[] = [];
   const playersWithoutHp = snapshot.players.filter((p) => p.hp === undefined).length;
   if (playersWithoutHp > 0) {
@@ -1939,6 +2005,18 @@ export function planRestore(
     unavailable.push(
       `fluid:v${snapshot.version} 的归档头里**没有流体水位** ⇒ 计划不铺液面,`
       + '水位按宿主重建后的空地重新开始(不编一个全零密度场 —— 那和「已还原」看不出区别)',
+    );
+  }
+  /* ★ 「没有摘要」本身就是一个**不可信状态**,不许退化成「完整」:三个可选键
+     (`trim` / `chunksTotal` / `chunksChecksum`)一起被删时,`chunksTotal` 退化成实际块数
+     (`shortfall = 0`)、校验和也无从核对 ⇒ 缺口看起来是 0。缺口数照旧只报**检出的**
+     (不编),但「块表有没有被摘要绑住」必须降级说清:`chunksVerified = false`,
+     于是 `missingChunks: 0` 不再等于「这份归档是齐的」。 */
+  if (!chunksVerified) {
+    unavailable.push(
+      `chunks:归档头里**没有**地形表摘要(chunksChecksum / chunksTotal 都缺席)`
+      + `⇒ 块表不可判:实际带 ${actualChunks} 块,缺口按**检出**的 ${missingChunks} 块计`
+      + ' —— 不能当成「完整归档」,计划不替它担保块是齐的',
     );
   }
   /* (a) `trim` 缺席但**头声明的总块数 > 实际块数** ⇒ 这就是「摘要被删/缺失,
@@ -2002,6 +2080,7 @@ export function planRestore(
     missingChunks,
     chunksInArchive: actualChunks,
     chunksDeclaredTotal: declaredTotalChunks,
+    chunksVerified,
     missing: trim === null ? [] : trim.dropped.slice(),
     changes,
   };

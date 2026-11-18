@@ -35,11 +35,20 @@
  *   漏传**不报错**,只让乘区**静默**恒 `1.0`(判据
  *   `tests/WS-FND-47-meal-mul.test.ts` 第 4 条专门钉这个"漏传的显式后果")。
  * · **在谁身上生效**:`stepRoomEffects` 只**返回** `mealMul`;把它记进
- *   `WorldSim.lastRoomEffects` 是调用方的事。乘区最终乘在**该玩家的攻击 /
+ *   `WorldSim.lastRoomEffects` 是调用方的事。乘区**最终**该乘在**该玩家的攻击 /
  *   生命上限**上(手册 §3.8:「Boss 战前全团 +40% 攻击/生命上限大餐」)。
- * · **今天到哪一步**:本文件**已**返回 `mealMul`(纯函数,判据有牙);
- *   `WorldSim` 侧**尚未**传 `hasMealBuff`、`lastRoomEffects` 里**尚未**有
- *   `mealMul` ⇒ **生产路径上乘区恒 `1.0`**。即:判据有牙、接线未完成。
+ * · **今天到哪一步(★ WS-FND-114 订正:原文与实现相反)**:原句写的是
+ *   「`WorldSim` 侧**尚未**传 `hasMealBuff`、`lastRoomEffects` 里**尚未**有
+ *   `mealMul` ⇒ 生产路径上乘区恒 `1.0`」。**这句在写下时就已经不是事实**:
+ *    · `world_sim.ts` 的 `tickRoomEffects` **真的**按玩家身上的 `FoodBuff` 表
+ *      算出 `hasMealBuff` 再喂进来(`(this.foodBuffs.get(id) ?? []).length > 0`);
+ *    · 返回值 `mealMul` **真的**被写进 `WorldSim.lastRoomEffects` 的每一条记录
+ *      (`mealMul: r.mealMul`),不是算完即丢。
+ *   ⇒ 准确处境是:**触发链已通到「世界侧读数口」,而战斗结算尚未消费它** ——
+ *   `lastRoomEffects` 今天**没有任何游戏逻辑读者**(乘区还没乘到攻击/生命上限上)。
+ *   那是**接线欠账**(落点在战斗结算侧,不在本文件、也不在世界侧的传参),
+ *   **不是**「漏传 `hasMealBuff`」。判据 `WS-FND-47` 第 4 条钉的是"漏传的后果",
+ *   它仍然是有效判据(负对照),只是**不能当成现状描述**。
  */
 
 import { RANCH_SYSTEM } from '../systems/ranch.ts';

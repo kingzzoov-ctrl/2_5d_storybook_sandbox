@@ -124,8 +124,9 @@ const dispAs = (
 const disp = (rt: Room['rt'], payload: Record<string, unknown>): ActionOutcome =>
   dispAs(rt, 'p1', payload);
 
-/** 取回执里的 `effect`(它的值类型是 `string | number | boolean`)。 */
-const eff = (r: ActionOutcome): Record<string, string | number | boolean> => r.effect ?? {};
+/** 取回执里的 `effect`(★ 值域已放宽为 `EffectRecord`;这里只读标量 ⇒ 显式窄化)。 */
+const eff = (r: ActionOutcome): Record<string, string | number | boolean> =>
+  (r.effect ?? {}) as Record<string, string | number | boolean>;
 
 /**
  * 给 `p1` 播种 `n` 件 `itemId` —— **放置是要扣件的**(`place_automation.ts` 第 6 步

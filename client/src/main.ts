@@ -29,7 +29,7 @@ import {
 import { ActionEntry } from './net/action_entry.ts';
 import { createActionBinding, entryKeyHints, sessionPorts } from './net/action_binding.ts';
 import { InputSource, attachKeyboard } from './net/input.ts';
-import { LocalPredictor } from './net/predictor.ts';
+import { LocalPredictor, predictParamsOf } from './net/predictor.ts';
 /* ★ 2026-11-16(D-08 第一步):虚拟摇杆的**判定**住在这里(零 DOM、可单测)。
    `main.ts` 只把触屏指针喂进去 —— 判定留在事件回调里就没人测得到。 */
 import {
@@ -41,6 +41,7 @@ import {
    —— 只画不接 = 玩家仍然看不见手柄,而那**不会**让任何断言变红。 */
 import { createJoystickUI } from './ui/joystick_ui.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
+import { localPlayerZOf } from './net/height_placement.ts';
 import { DT } from '../../shared/types/physics.ts';
 
 declare global {
@@ -143,12 +144,20 @@ function main(): void {
       url,
       /* ★ 复用 boot 的 store —— 别让两个 store 各写各的(见上) */
       store: handle.store,
+      /* ★ WS-FND-113 第 4 处:被动断开 ⇒ 自动重连(主动 `close()` 不重连)。
+         没有它,"重连路径"在生产里根本不存在,那一堆复位也就无从触发。 */
+      autoReconnectMs: 1500,
       events: {
         /* 帧到达:渲染循环自己在读 `handle.store`,这里**不需要**触发重画。
            只把"坏包/空帧"留痕,便于自检脚本读。 */
         onFrame: () => { /* 渲染循环每帧自读 store */ },
         onState: (s, detail) => {
           if (s === 'failed') console.warn('[session] 失败:', detail);
+        },
+        /* ★ WS-FND-113 第 4 处:`epoch >= 2` = 这一次 open 是**重连** ⇒
+           先把整条本地预测链复位,再让新一代命令从 seq=1 出发。 */
+        onOpen: (epoch) => {
+          if (epoch > 1) resetLocalChain();
         },
         onWelcome: (w) => {
           playerId = w.playerId;
@@ -338,24 +347,57 @@ function main(): void {
   const predictor = new LocalPredictor();
   let localTick = 0;
   let seeded = false;
+  /* ═══ ★ WS-FND-113 第 4 处:重连复位(整条本地预测链)═══
+     重连之后 `InputSource.seq` / `LocalPredictor.acked` / 摇杆状态**都还是上一轮的**,
+     而服务端新连接从 ack `-1` 重新开始 ⇒ 症状只是"偶尔不走 / 偶尔回弹",不报任何错。
+     复位点**只有这一处**(由 `session` 的 `onOpen(epoch >= 2)` 触发,见下)——
+     把复位散进每个失败分支,迟早有一条分支漏掉,而那种漏法查不出来。 */
+  const resetLocalChain = (): void => {
+    /* 1 预测器:位置先留在原地(下一帧的权威值会重新播种),队列 / acked / 参数全清。 */
+    predictor.reset(predictor.pos);
+    seeded = false;
+    /* 2 输入序号:回零 —— 它就是"这条连接上的第几条命令"(服务端按连接记账)。 */
+    input.reset();
+    /* 3 摇杆:逻辑与视觉一起归零,指针也不再认作"第一根手指"(否则第二根手指点不动)。 */
+    stickPointerId = null;
+    stick.end();
+    stickUI.hide();
+  };
+  /* ★ WS-FND-113 第 2 处:渲染**每帧**从预测器拉一次位置(见 `boot.ts` 的
+     `setPoseSource`)。权威还没到(`seeded === false`)⇒ 返回 `null`,
+     渲染退回权威兜底 —— 即**没有预测时与接线前逐字段相同**。 */
+  handle.setPoseSource(() => (seeded ? predictor.poseView() : null));
   const inputLoop: ReturnType<typeof setInterval> = setInterval(() => {
     /* 摇杆推了就用摇杆,否则回落到 WASD —— 优先级只写在这一处(`mergeCmd`)。 */
     const cmd = mergeCmd(input.nextCmd(), stick.vector());
+    /* ★ WS-FND-113 第 1 处:`frozen` / `mu` / `speedMul` 必须**从权威状态推**出来,
+       而且**先于这一步**生效(判定在 `predictor.ts` 的 `predictParamsOf`,零 DOM、可单测)。
+       修前这里一个参数都不传 ⇒ 眩晕/冰冻禁步、击退、装备加速时客户端**必然**与权威分歧,
+       只能靠 1.5 格的 SNAP 硬清队列(玩家看到的是"橡皮筋",而不是"被冻住")。 */
+    const me = playerId === null
+      ? undefined
+      : handle.store.state.players.find((p) => p.id === playerId);
+    predictor.setParams(predictParamsOf(me));
     const p = predictor.step(cmd);
     localTick += 1;
     /* 权威姿态喂回预测器。第一次先**播种** —— 预测器必须从权威值起步,
        否则它从 (0,0) 出发一路追,表现是「角色从世界原点滑过来」。 */
     const pose = playerId === null ? null : telegraphCenterOf(handle.store.state, playerId);
+    /* ★ WS-FND-113 第 3 处:上行 `z` 的**真实来源**。
+       修前播种与回喂都写死 `z: 0` ⇒ predictor 恒把 0 当高度,而上行又照发 `p.z`
+       ⇒ 服务端 `applyPlayerMove` 每帧把 `b.z` 抹成 0,**权威高度被抹平**。
+       这里改用 `localPlayerZOf`(与 `boot.ts` 同一条入口,纯函数、可单测)。 */
+    const authoritativeZ = playerId === null ? 0 : localPlayerZOf(handle.store.state, playerId);
     if (pose !== null) {
       if (!seeded) {
-        predictor.reset({ x: pose.cx, y: pose.cy, z: 0 });
+        predictor.reset({ x: pose.cx, y: pose.cy, z: authoritativeZ });
         seeded = true;
       } else {
         /* ★ D-14(2026-11-17):ack 是**这一帧包头**带回来的数(`store` 解码时落账),
            不是本地推出来的 —— 否则"剪枝真的发生"会变成一条本地可以伪造的断言。
            `?server=off` 时 store 恒为空 ⇒ `lastAckedSeq === -1` ⇒ 一条都不剪。 */
         predictor.onAuthoritative({
-          x: pose.cx, y: pose.cy, z: 0, ackedSeq: handle.store.lastAckedSeq,
+          x: pose.cx, y: pose.cy, z: authoritativeZ, ackedSeq: handle.store.lastAckedSeq,
         });
       }
     }
@@ -366,7 +408,10 @@ function main(): void {
        `seq` 写进下行包头 `ackedSeq`,客户端据此剪 `pending`。漏了它的症状是
        「移动照常、永不剪枝」,而两端**都不报错**(TASK-100 实测:生产者此前不存在)。 */
     if (session !== null) {
-      session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z, seq: cmd.seq });
+      /* ★ WS-FND-113:`jump` 在这里**有出口**了(此前 `InputSource` 的锁存永远发不出去)。
+         ⚠️ 末端仍是空的:服务端 `parseMoveIntent` 不认这个字段、会丢掉(不报错)——
+            要让它真的跳起来得改服务端那条路,本行只保证"它不再被客户端吞掉"。 */
+      session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z, seq: cmd.seq, jump: cmd.jump });
     }
     /* ── HUD:连没连上 / 站在哪 / 附近有没有怪 / 最近一次命中 ──
        「命中量」不是客户端编的:它来自**权威快照里那只怪的血量下降**
@@ -391,6 +436,16 @@ function main(): void {
     /* 否则「输入有没有真的产生命令」只能靠看控制台,而那正是它静默一整轮的原因。 */
     inputKeys: input.pressedCount,
     predictedPos: predictor.pos,
+    /* ★ WS-FND-113 第 2 处:渲染**消费**的就是这两个 —— 只报 `predictedPos` 时,
+       "画面画的到底是预测位置还是权威位置"仍然读不出来(它正是静默一整轮的原因)。 */
+    predictedRenderPos: predictor.renderPos,
+    predictedVisualOffset: predictor.poseView()?.visualOffset ?? null,
+    /* ★ 第 1 处:喂进预测器的参数也是读数 —— 否则"冻结/摩擦到底生效没有"只能靠读代码。 */
+    predictParams: predictor.lastParams,
+    /* ★ 第 5 处:被单调门丢掉的旧帧数(与空帧、坏包**分开**计)。 */
+    staleFrames: handle.store.staleFrames,
+    /* ★ 第 3 处:上行用的 `z`(= 权威高度;修前这条路恒 0,把权威高度抹平了)。 */
+    uplinkZ: predictor.pos.z,
     pendingCmds: predictor.pendingCount,
     lastReconcileAction: predictor.lastReconcile?.action ?? null,
     /* ★ 2026-11-16(D-08):摇杆与 `ackedSeq` 也进自检口径 ——

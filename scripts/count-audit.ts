@@ -366,6 +366,19 @@ const CLAIM_FLOORS: Record<string, number> = {
   同义反复白名单: 1,
 };
 const CLAIM_FLOOR_TOTAL = 3;
+
+/* ★ 第五轮元审计:下限必须钉在**实测值**上,而不是一个"看起来像保护"的任意数。
+   今日实测:每类各 1 处自称(合计 3)—— 与 `CLAIM_FLOORS` 逐项相等。
+   只写下限 1 有一个洞:它只挡「命中掉到 0」这一种变少;若哪天某类实测变成 2,
+   而下限仍是 1,则「少了一处」不会被任何断言报出来。故把实测基线也写成具名常量
+   并与下限互校(改小 `CLAIM_FLOORS` 必须同时改这里 —— 那一刻必须回答
+   「我是不是把一处自称改没了」)。这仍然是常量,不是「自己比自己」的运行期基线。 */
+const CLAIM_MEASURED: Record<string, number> = {
+  可达性白名单: 1,
+  orphan: 1,
+  同义反复白名单: 1,
+};
+const CLAIM_MEASURED_TOTAL = 3;
 console.log(`\n══ 1 扫到 ${hits.length} 处「N 条」型自称(合计下限 ${CLAIM_FLOOR_TOTAL},低于即 fail)══`);
 let stale = 0;
 let match = 0;
@@ -509,8 +522,16 @@ let assertFailed = false;
     const got = hits.filter((h) => h.key === k).length;
     if (got < floor) belowFloor.push(`${k}:命中 ${got} < 下限 ${floor}`);
   }
+  /* ★ 第五轮:下限必须**钉在实测基线**上 —— 把下限改小到基线之下 = 静默撤销保护。 */
+  for (const [k, measured] of Object.entries(CLAIM_MEASURED)) {
+    const floor = CLAIM_FLOORS[k] ?? 0;
+    if (floor < measured) belowFloor.push(`${k}:下限 ${floor} < 实测基线 ${measured}(下限被改小)`);
+  }
   if (hits.length < CLAIM_FLOOR_TOTAL) {
     belowFloor.push(`合计:命中 ${hits.length} < 下限 ${CLAIM_FLOOR_TOTAL}`);
+  }
+  if (CLAIM_FLOOR_TOTAL < CLAIM_MEASURED_TOTAL) {
+    belowFloor.push(`合计:下限 ${CLAIM_FLOOR_TOTAL} < 实测基线 ${CLAIM_MEASURED_TOTAL}`);
   }
   if (belowFloor.length > 0) {
     console.log(`\n   ★ 命中数低于下限:${belowFloor.length} 项`);

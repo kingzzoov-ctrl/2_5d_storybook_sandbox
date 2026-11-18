@@ -28,6 +28,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -50,6 +51,20 @@ import { ROOM_RECIPES } from '../shared/constants/bosses.ts';
 import { floorSlotOfId } from '../server/src/world/chunk.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/** 跑一次 data-conformance,**退出码就地取出**(判据要真跑检测器,不是 grep 源码)。 */
+function runDataConformance(): { status: number; out: string } {
+  const r = spawnSync(process.execPath, [join('scripts', 'data-conformance.ts')], {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 67108864, timeout: 180_000,
+  });
+  return { status: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+}
+
+/** 从输出里取「动态房间配方数」那一行的结论标记(✓/✗/?);找不到 ⇒ null。 */
+function roomRowMark(out: string): string | null {
+  const m = /([✓?✗])\s+动态房间配方数/.exec(out);
+  return m === null ? null : m[1]!;
+}
 
 /* ══════════════════ 夹具 ══════════════════ */
 
@@ -350,7 +365,16 @@ test('FND110-9 数据审计「房间配方数」不再硬编码 8(与表内 9 �
     .join('\n');
   ok(!codeOnly.includes('ROOM_RECIPES.length === 8'), '★ 可执行代码里不得再硬编码 8(写回即红)');
   ok(src.includes("label: '动态房间配方数'"), '前置:该对照项仍在(不得整条删掉)');
-  ok(src.includes('const unusable'), '★ 判据必须由表推导(表长 + 表自身可用性),不是另一个字面量');
+  /* ★ 第五轮元审计:原来的 `src.includes('const unusable')` 是**子串**判据 ——
+     把 verdict 写回字面量('MATCH')、或把 `unusable` 留成死代码,它都不变红。
+     改成**行为判据**:真跑 data-conformance,看这一项**真的**被判成 ✓(MATCH)。 */
+  const dc = runDataConformance();
+  eq(dc.status, 0, '前置:data-conformance 必须正常退出(退出码 0)');
+  ok(roomRowMark(dc.out) === '✓',
+    `★ 「动态房间配方数」必须由表推导出 MATCH(修前硬编码 8 ⇒ 表内 9 条 ⇒ UNKNOWN);实测标记 ${String(roomRowMark(dc.out))}`);
+  /* ★ 负对照:把标记改成 `?`(旧版恒 UNKNOWN 的形态)⇒ 同一台判据必须为假 */
+  const injectedRow = dc.out.replace(/([✓?✗])(\s+动态房间配方数)/, '?$2');
+  eq(roomRowMark(injectedRow), '?', '负对照:旧版形态(UNKNOWN)必须被判据看见(证明它不是恒真)');
 
   const rooms = ROOM_RECIPES as readonly { key: string; required: readonly number[] }[];
   eq(rooms.length, 9, 'ROOM_RECIPES 9 条(表侧事实)');

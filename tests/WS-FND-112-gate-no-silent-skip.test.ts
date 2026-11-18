@@ -153,7 +153,11 @@ test('FND112-1 判据形态审计:judgement_audit.ts 缺失必须 fail,不许退
  * ══════════════════════════════════════════════════════════════════════════ */
 
 test('FND112-2 文档结构:0 份 WS 文档必须 fail,且非 WS / 链接 / 台账三段仍照跑', () => {
-  const body = funcBody(VERIFY_SRC, 'function checkDocs(');
+  /* ★ 第五轮元审计:`checkDocs` 的**注释里**就写着 `bad === 0 && files.length > 0`
+     与 `detectStale()`(本仓惯例:说明引用被修的写法)。拿未剥注释的 body 做子串断言
+     ⇒ 把早退 `return;` 加回去、或把三段检查写成死代码,判据仍可能绿。
+     ⇒ 下面**只在剥注释后的代码**上断言(与 FND112-1/FND112-10 同一套 stripComments)。 */
+  const body = stripComments(funcBody(VERIFY_SRC, 'function checkDocs('));
   const at = body.indexOf('files.length === 0');
   ok(at > 0, '必须有「0 份 WS 文档」这一支(锚点漂移即本用例失效)');
   const block = body.slice(at, body.indexOf('const required'));

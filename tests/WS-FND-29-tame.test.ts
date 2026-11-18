@@ -127,9 +127,9 @@ const tameOp = (rt: Room['rt'], userId: string, petId: string) =>
 const breedOp = (rt: Room['rt'], userId: string, petId: string, mateId: string) =>
   tame(rt, userId, { op: 'BREED', petId, mateId });
 
-/** 逐字取回执的 `effect`(回执只带基本类型;断言处按需窄化)。 */
+/** 逐字取回执的 `effect`(★ 值域已放宽为 `EffectRecord`;断言处按需窄化到标量表)。 */
 function effectOf(r: ActionOutcome): Record<string, string | number | boolean> {
-  return r.effect ?? {};
+  return (r.effect ?? {}) as Record<string, string | number | boolean>;
 }
 
 /** 某只宠物当前的记录(不存在 ⇒ 断言失败,并把房间里的全部宠物打出来)。 */

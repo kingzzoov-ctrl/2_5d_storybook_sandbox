@@ -84,6 +84,14 @@ export interface SessionEvents {
    *   而那正是本仓反复记的静默形态。
    */
   onActionResult?: (r: ActionResultFrame) => void;
+  /**
+   * ★ WS-FND-113:每次 socket **建立**都调一次(首连与每次重连同一条路)。
+   *
+   * `epoch` 从 1 起 ⇒ `>= 2` 就是**重连**,调用方必须把本地预测链整体复位
+   * (见 `main.ts` 的 `resetLocalChain`)。少了它,重连后 `seq` / `acked` /
+   * `pending` 全是上一轮的账,而表现只是"偶尔不走 / 偶尔回弹"。
+   */
+  onOpen?: (epoch: number) => void;
 }
 
 /**
@@ -154,6 +162,19 @@ export interface SessionHandle {
    */
   sendAction(intent: ActionIntent): boolean;
   close(): void;
+  /**
+   * ★ WS-FND-113:已建立的连接数(`1` = 只有首连;`>= 2` = 重连过)。
+   * 与 `onOpen` 的实参是**同一个数**(一处来源,不造第二份计数)。
+   */
+  readonly epoch: number;
+  /**
+   * ★ WS-FND-113:主动重连 —— 关掉当前 socket,换一条重新握手。
+   *
+   * 与自动重连共用同一段 `dial()` ⇒ 不产生第二份连接逻辑。旧 socket 的
+   * `close` 回调**不会**再触发一次重连(见 `dial` 里 `socket !== sock` 那道门),
+   * 否则每重连一次就会多排一个定时器。
+   */
+  reconnect(): void;
 }
 
 /** 帧首字节:0x01 = 文本(握手 JSON),0x02 = 二进制(协议包)。 */
@@ -259,6 +280,17 @@ export interface MoveIntent {
   speedMul?: number;
   /** 客户端命令序号 —— 服务端回执(包头 `ackedSeq`)就是它。省略 ⇒ 这条不带 ack。 */
   seq?: number;
+  /**
+   * ★ WS-FND-113:这一条命令里**是否按了跳跃**(由 `InputSource` 锁存,恰好一条为真)。
+   *
+   * ## 为什么在这里加字段(而不是把 InputSource 的锁存删掉)
+   * 修前那条锁存**没有任何出口**:`MoveIntent` 没这个字段、`parseMoveIntent` 也只认
+   * x/y/z ⇒ 按空格只会 "挥一刀 + 攒一个永远发不出去的跳跃"。两个方向都说得通,
+   * 而删锁存会让一条已存在的行为(`tests/WS-FND-16` 的 FND16-2)无声消失。
+   * ⇒ 取"给出口":字段进报文,**末端的服务端仍未消费它**(`parseMoveIntent` 会丢弃
+   *   未知字段,不报错)—— 这一半如实标注为**残留**,要真落地必须改服务端。
+   */
+  jump?: boolean;
 }
 
 /**
@@ -359,6 +391,14 @@ export interface SessionOptions {
   store?: ClientStateStore;
   /** 供测试替换(默认 `globalThis.WebSocket`)。 */
   makeSocket?: (url: string) => WebSocketLike;
+  /**
+   * ★ WS-FND-113:被动断开后的**自动重连间隔**(毫秒)。省略 / `<= 0` ⇒ 不重连
+   * —— 与接线前**逐字相同**,单测与 `?server=off` 因此完全不受影响。
+   *
+   * ⚠️ 只对**非主动**断开生效:`close()` 是调用方的决定(卸载 / 收尾),
+   * 不让它再把自己拉起来,否则关页面会变成"重连到别人都走了还在拨"。
+   */
+  autoReconnectMs?: number;
   events: SessionEvents;
 }
 
@@ -379,6 +419,13 @@ export function createSession(opts: SessionOptions): SessionHandle {
   let socket: WebSocketLike | null = null;
   let droppedFrames = 0;
   let lastDropReason: string | null = null;
+  /* ★ WS-FND-113 第 4 处:重连三件套。三个字段各有单一职责,别合并 —— */
+  /** 已建立的连接数;`onOpen` 的实参就是它(一处来源,不造第二份计数)。 */
+  let epoch = 0;
+  /** 待重连定时器;`null` = 当前没有在排。 */
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 调用方**主动** `close()` ⇒ 不再自动重连(见 `autoReconnectMs`)。 */
+  let closedByCaller = false;
 
   const setState = (s: SessionState, detail?: string): void => {
     state = s;
@@ -388,28 +435,61 @@ export function createSession(opts: SessionOptions): SessionHandle {
   const make = opts.makeSocket
     ?? ((u: string) => new WebSocket(u) as unknown as WebSocketLike);
 
+  /** 取消待重连(重连已经建立 / 调用方收尾时都要调,否则定时器会再拨一次)。 */
+  const clearRetry = (): void => {
+    if (retryTimer === null) return;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  };
+
+  /**
+   * 排一次自动重连。**只排一次**(`retryTimer !== null` 直接返回):
+   * 断开事件会连着来(`error` 之后紧接 `close`)⇒ 排两次会同时拨两条连接,
+   * 后一条顶掉前一条,表现是"刚连上又断",而日志里看不出成对关系。
+   */
+  const scheduleRetry = (): void => {
+    if (closedByCaller) return;
+    const ms = opts.autoReconnectMs ?? 0;
+    if (!(ms > 0) || retryTimer !== null) return;
+    const t = setTimeout(() => { retryTimer = null; dial(); }, ms);
+    /* Node 里别让"待重连"把进程吊住(与 `ws_server.ts` 的 broadcaster 同一做法)。 */
+    if (typeof t.unref === 'function') t.unref();
+    retryTimer = t;
+  };
+
+  /**
+   * 建立一条连接并挂上四个回调。**首连与每次重连走同一段**
+   * (没有第二条连接逻辑,也就不可能出现"重连与首连行为不一致")。
+   */
+  function dial(): void {
   try {
     setState('connecting');
-    socket = make(opts.url);
+    const sock = make(opts.url);
+    socket = sock;
     /* 二进制帧给 ArrayBuffer —— 实测内置客户端在 `arraybuffer` 下
        `ev.data instanceof ArrayBuffer` 为真,可直接喂 `decodePacket`。 */
     socket.binaryType = 'arraybuffer';
 
-    socket.addEventListener('open', (() => {
-      /* 连接建立后**先**发握手。上行也走 1 字节类型头,服务端据此分流。 */
-      const hello: HelloFrame = {
-        t: 'hello',
-        protocolVersion: PROTOCOL_VERSION,
-        contentClaim: null,          /* ★ 阶段 3 留空:见文件头 */
-      };
-      try {
-        socket?.send(encodeClientFrame(new TextEncoder().encode(JSON.stringify(hello)), true));
-      } catch (e) {
-        setState('failed', (e as Error).message);
-      }
-    }) as never);
+      sock.addEventListener('open', (() => {
+        /* ★ WS-FND-113:连接**真的**建立起来了 —— 先报 `epoch`,再发握手。
+           顺序不能反:调用方(重连)据 `epoch` 复位本地预测链,而复位必须在
+           **第一条上行之前**完成,否则新一代命令会带着上一代的 `seq` 发出去。 */
+        epoch += 1;
+        opts.events.onOpen?.(epoch);
+        /* 连接建立后**先**发握手。上行也走 1 字节类型头,服务端据此分流。 */
+        const hello: HelloFrame = {
+          t: 'hello',
+          protocolVersion: PROTOCOL_VERSION,
+          contentClaim: null,          /* ★ 阶段 3 留空:见文件头 */
+        };
+        try {
+          sock.send(encodeClientFrame(new TextEncoder().encode(JSON.stringify(hello)), true));
+        } catch (e) {
+          setState('failed', (e as Error).message);
+        }
+      }) as never);
 
-    socket.addEventListener('message', ((ev: { data: unknown }) => {
+      sock.addEventListener('message', ((ev: { data: unknown }) => {
       const raw = ev.data;
       /* 服务端的下行:**两种 WebSocket 帧类型都会出现**(实测,见下)。
          📌 2026-11-14 修:此前这里只接受 `ArrayBuffer` / 视图,于是
@@ -498,14 +578,28 @@ export function createSession(opts: SessionOptions): SessionHandle {
       opts.events.onFrame(r, store);
     }) as never);
 
-    socket.addEventListener('close', (() => { setState('closed'); }) as never);
-    socket.addEventListener('error', (() => {
-      /* 连接层错误:不抛(未连接的会话是正常状态,不是异常)。 */
-      setState('failed', 'socket error');
-    }) as never);
-  } catch (e) {
-    setState('failed', (e as Error).message);
+      sock.addEventListener('close', (() => {
+        /* ⚠️ 已被 `reconnect()` 换掉的老 socket 也**会**回调 close ——
+           不拦它,一次重连就会被记成"又断了一次"(状态改成 closed,
+           还多排一个重连定时器,两条连接轮流顶掉对方)。 */
+        if (socket !== sock) return;
+        setState('closed');
+        scheduleRetry();
+      }) as never);
+      sock.addEventListener('error', (() => {
+        /* 连接层错误:不抛(未连接的会话是正常状态,不是异常)。
+           与 close 同一道门:老 socket 的错误不再算本次会话的失败。 */
+        if (socket !== sock) return;
+        setState('failed', 'socket error');
+        scheduleRetry();
+      }) as never);
+    } catch (e) {
+      setState('failed', (e as Error).message);
+    }
   }
+
+  /* 首连。此后每一次重连都走同一段 `dial()`(见 `reconnect` / `scheduleRetry`)。 */
+  dial();
 
   return {
     get store() { return store; },
@@ -533,9 +627,28 @@ export function createSession(opts: SessionOptions): SessionHandle {
       socket.send(encodeActionUplink(intent));
       return true;
     },
+    get epoch() { return epoch; },
+    /**
+     * ★ WS-FND-113:主动重连(见 `SessionHandle.reconnect`)。
+     * `dial()` 是**同步**的:调用返回时新 socket 已经在建;而 `epoch` 只在它的
+     * `open` 事件里才 +1 —— 那才是"真的连上了"的时刻。
+     */
+    reconnect(): void {
+      clearRetry();
+      const old = socket;
+      /* ⚠️ 先摘引用再关:老 socket 的 `close` 回调据此判"这不是掉线"
+         (见 `dial` 里那道 `socket !== sock` 的门)。 */
+      socket = null;
+      if (old !== null) { try { old.close(); } catch { /* 已关:幂等 */ } }
+      dial();
+    },
     close(): void {
-      if (socket === null) return;
-      try { socket.close(); } catch { /* 已关:幂等 */ }
+      /* 主动关闭 ⇒ 不再自动重连(见 `autoReconnectMs` 的说明)。 */
+      closedByCaller = true;
+      clearRetry();
+      const cur = socket;
+      socket = null;
+      if (cur !== null) { try { cur.close(); } catch { /* 已关:幂等 */ } }
       setState('closed');
     },
   };

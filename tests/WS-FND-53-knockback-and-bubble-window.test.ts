@@ -144,7 +144,7 @@ test('FND53-6 ★ 世界侧同样生效:慢帧推进让层数过期(不是只有
   if (!seeded.allowed) throw new Error('前置失败:塞不进 227');
 
   const fire = () => a.runtime.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: 227, targetId: 'p2' });
-  const trappedOf = (r: { effect?: Record<string, string | number | boolean> }): boolean =>
+  const trappedOf = (r: { effect?: unknown }): boolean =>
     (r.effect as Record<string, string | number | boolean>).trapped === true;
 
   eq(trappedOf(fire()), false, '第 1 发不困住');

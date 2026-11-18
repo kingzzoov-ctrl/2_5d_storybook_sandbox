@@ -256,11 +256,15 @@ export class MemoryDb implements DbLike {
     const out: { table: string; sql: string }[] = [];
     for (const [table, r] of this.rules) {
       for (const c of r.tableChecks) {
-        if (c.expr.kind === 'unsupported') out.push({ table, sql: c.sql });
+        if (checkExprUnsupported(c.expr)) out.push({ table, sql: c.sql });
       }
       for (const [col, c] of r.byColumn) {
-        if (c.check && c.check.kind === 'unsupported') {
-          out.push({ table, sql: `${col}: ${c.check.sql}` });
+        if (c.check && checkExprUnsupported(c.check)) {
+          /* 原子的 `unsupported` 报它自己的表达式;合取(含认不出的段)报原文。 */
+          const sql = c.check.kind === 'unsupported'
+            ? `${col}: ${c.check.sql}`
+            : `${col}: ${c.checkSql ?? ''}`;
+          out.push({ table, sql });
         }
       }
     }
@@ -308,8 +312,10 @@ export class MemoryDb implements DbLike {
     /* 表级 CHECK:只对**被写入的列**涉及的表达式求值 ——
        完整求值需要表达式引擎,而这里的目标是「与 SQL 行为一致到能挡住错误写入」。 */
     for (const c of r.tableChecks) {
-      if (c.expr.kind === 'unsupported') continue;
-      const col = (c.expr as { col: string }).col;
+      /* `unsupported` 与**跨列**合取都不在这里猜:前者已由 `unsupportedChecks()` 暴露,
+         后者本仓没有(单列谓词够用;真需要就上表达式引擎,不在这里半懂)。 */
+      const col = singleColumnOf(c.expr);
+      if (col === null) continue;
       const present = Object.prototype.hasOwnProperty.call(row, col);
       if (!present) continue;
       const v = row[col];
@@ -624,10 +630,48 @@ export type CheckExpr =
   | { kind: 'in'; col: string; values: (string | null)[] }
   | { kind: 'between'; col: string; lo: number; hi: number }
   | { kind: 'cmp'; col: string; op: '>' | '>='; n: number }
+  /** `col <= n`:数值列的**上界**形态(`length(col) <= n` 走 `lengthMax`)。 */
+  | { kind: 'cmpMax'; col: string; n: number }
   | { kind: 'length'; col: string; n: number }
   /** `length(col) <= n`:上界形态(定长是 `length`,上界是 `lengthMax`)。 */
   | { kind: 'lengthMax'; col: string; n: number }
+  /**
+   * `A AND B`:顶层合取(**只收各段同列的**)。
+   *
+   * 为什么要它:归档 DDL 的 `snapshot_bytes >= 0 AND snapshot_bytes <= 1048576` 过去
+   * 整条落进 `unsupported`(默认放行)⇒ 内存后端**根本不校验**这条上下界,而真实
+   * SQLite 校验 —— 典型「测试绿、生产异」。收下它,两个后端才说同一种话。
+   */
+  | { kind: 'and'; parts: CheckExpr[] }
   | { kind: 'unsupported'; sql: string };
+
+/** 一条 CHECK 里是否含**认不出来**的部分(`unsupported` 自身算;合取逐段递归)。 */
+export function checkExprUnsupported(c: CheckExpr): boolean {
+  if (c.kind === 'unsupported') return true;
+  if (c.kind === 'and') return c.parts.some(checkExprUnsupported);
+  return false;
+}
+
+/**
+ * 合取**只用同一列**时返回那个列名;跨列 / 含 `unsupported` ⇒ `null`。
+ *
+ * 这条限制是刻意的:单值求值(`checkPasses(c, value)`)只有在各段同列时才说得通,
+ * 跨列合取需要行级求值 —— 认不出来就如实报 `unsupported`,不在这里半懂。
+ */
+function singleColumnOf(c: CheckExpr): string | null {
+  if (c.kind === 'unsupported') return null;
+  if (c.kind === 'and') {
+    let col: string | null = null;
+    for (const p of c.parts) {
+      const pc = singleColumnOf(p);
+      if (pc === null) return null;
+      if (col === null) col = pc;
+      else if (col !== pc) return null;
+    }
+    return col;
+  }
+  return c.col;
+}
 
 /** 解析一条 CHECK 表达式。不认识的形态返回 `{kind:'unsupported'}`(**不是** null)。 */
 export function parseCheckExpr(expr: string): CheckExpr {
@@ -651,6 +695,18 @@ export function parseCheckExpr(expr: string): CheckExpr {
      认得它,`unsupportedChecks()` 才不会把「已实现的约束」误报成未实现。 */
   const lenMaxM = /^length\s*\(\s*(\w+)\s*\)\s*<=\s*(\d+)$/i.exec(e);
   if (lenMaxM) return { kind: 'lengthMax', col: lenMaxM[1], n: Number(lenMaxM[2]) };
+  /* `col <= n`:数值列上界(归档表的 `snapshot_bytes <= 1048576` 就是它)。
+     放在 `BETWEEN` **之后**:后者里的 `AND` 不是合取,顺序反了会被切开。 */
+  const leM = /^(\w+)\s*<=\s*(-?\d+(?:\.\d+)?)$/i.exec(e);
+  if (leM) return { kind: 'cmpMax', col: leM[1], n: Number(leM[2]) };
+  /* 顶层 `AND` 合取:整串认不出来时再按 `AND` 切开逐段解析。
+     两条规矩:每段都认得、且**各段同列**(见 `singleColumnOf`)—— 否则整条仍是
+     `unsupported`(宁可显式说「不认识」,也不半懂)。 */
+  const andParts = e.split(/\s+AND\s+/i);
+  if (andParts.length > 1) {
+    const parts = andParts.map((p) => parseCheckExpr(p));
+    if (singleColumnOf({ kind: 'and', parts }) !== null) return { kind: 'and', parts };
+  }
   return { kind: 'unsupported', sql: e };
 }
 
@@ -664,6 +720,13 @@ export function checkPasses(c: CheckExpr, value: unknown): boolean {
       return typeof value === 'number' && value >= c.lo && value <= c.hi;
     case 'cmp':
       return typeof value === 'number' && (c.op === '>' ? value > c.n : value >= c.n);
+    case 'cmpMax':
+      /* 与 `cmp` 同一口径:非数值**不通过**(SQLite 里数值与文本比较按类型序,
+         文本 > 数值 ⇒ 上界对文本为假)。 */
+      return typeof value === 'number' && value <= c.n;
+    case 'and':
+      /* 合取只可能是**同列**的(见 `parseCheckExpr`)⇒ 逐段对同一个值求值是对的。 */
+      return c.parts.every((p) => checkPasses(p, value));
     case 'length':
       if (value instanceof Uint8Array) return value.length === c.n;
       return true; /* 长度对非 BLOB 不适用 —— 交给类型层,不在这里误伤 */

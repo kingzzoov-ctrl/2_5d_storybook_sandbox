@@ -95,6 +95,25 @@ export function createComponent(
   };
 }
 
+/**
+ * **世界环境读数口**的函数形状:按 `key` 给一个数;第二个参数是**正在问这个键的那一件**
+ * (`comp`,可缺省)。
+ *
+ * ## 为什么需要 `comp`(★ WS-FND-114)
+ *
+ * 一批键的答案是**逐格**的 —— `entityCount` / `entityWeight` / `fluid` /
+ * `crossed` / `onPodium` / `payloadAbove` / `enemyInRange` / `hitMob` 问的都是
+ * 「**这一格**上有什么」。没有位置就给不出答案:旧签名 `(key) => number` 让实现者
+ * 只能回答 `hour` / `night` 这类与位置无关的键,其余一律返回 0
+ * ⇒ 那些件的输入判据**恒假**(`moored === 0` 那类反向判据反而**恒真**,见 440)。
+ *
+ * 传 `comp` 之后,同一口既能回答全局键(`hour`),也能按件所在格回答局部键。
+ * `comp` 缺省的那一支必须**只**回答位置无关的键 —— `envOf(key)` /
+ * `WorldSim.wiringEnvOf(key)` 走的就是它(所以那里读 `entityCount` 仍是 0,
+ * 这是「没有位置就没有答案」,不是「键没人写」)。
+ */
+export type EnvSource = (key: string, comp?: ComponentNode) => number;
+
 export interface ComponentContext {
   graph: SignalGraph;
   comp: ComponentNode;
@@ -116,7 +135,7 @@ export interface ComponentContext {
   /** 读取/写入持久化运行态 */
   st(key: string): number;
   setSt(key: string, v: number): void;
-  /** 静态参数读取 */
+  /** 静态参数读取;静态表没有该键时退回**世界环境口**(见 `EnvSource`) */
   param(key: string): number;
   /** 共享跑酷计时器(411 开表 / 412 停表) */
   race: { running: number; startTick: number; elapsedTicks: number; finishMs: number };
@@ -200,14 +219,23 @@ export class SignalGraph {
    * 典型是 405 昼夜感光器读的 `hour`(D-07 的世界钟)。静态 `params` 只能由摆放者手填,
    * 那会把"白天黑夜"变成一次性常量;挂上环境口后,钟点是**每帧求值**的。
    *
+   * ★ WS-FND-114:另有一批键是**逐格**的(`entityCount` / `fluid` / `onPodium` …),
+   *   所以口子的签名带 `comp`(见 `EnvSource`)。整块口径(哪些键有世界侧生产者、
+   *   哪些键没有)登记在 `components.ts` 的 `ENV_KEY_LEDGER` —— 那里是**唯一台账**,
+   *   本文件不另抄一份。
+   *
    * 语义刻意是"静态优先":已有组件参数一个都不变(找不到才问环境),
    * 所以这条接线不会悄悄改掉任何既有件的读数。
    */
-  private envSrc: ((key: string) => number) | null = null;
+  private envSrc: EnvSource | null = null;
 
   /**
    * **共享跑酷计时器**(跑酷是跨件的单一比赛时钟,不属于任何单个件)。
    * 411 发令门负责开表,412 领奖台负责停表,其余件只读。
+   *
+   * ⚠️ `finishMs` 的复位由 **411 开新一场**时做(`components.ts` 的
+   * `ARENA_START_GATE`)。修前没有任何复位点,而 412 的写点又带
+   * `finishMs === 0` 守卫 ⇒ **第二场永远停不了表**(哨声一响、跑完不记时)。
    */
   race: { running: number; startTick: number; elapsedTicks: number; finishMs: number };
 
@@ -766,8 +794,10 @@ export class SignalGraph {
         comp.state[key] = v;
       },
       param(key: string): number {
-        /* 静态参数优先;没有就退回世界环境(见 envSrc)。没有环境口时与旧行为逐字节一致(0)。 */
-        return comp.params[key] ?? graph.envOf(key);
+        /* 静态参数优先;没有就退回世界环境(见 envSrc)。没有环境口时与旧行为逐字节一致(0)。
+           ⚠️ 必须把 `comp` 一起传下去:逐格键(`entityCount` / `fluid` / `onPodium` …)
+           只有知道"哪一件在问"才答得出来 —— 漏传就退回"只有全局键有值"。 */
+        return comp.params[key] ?? graph.envOf(key, comp);
       },
       race: this.race,
     };
@@ -775,14 +805,24 @@ export class SignalGraph {
 
   /* ── 世界环境读数(见 `envSrc`)── */
 
-  /** 挂上/摘掉世界环境读数口(`null` = 摘掉,回到"缺失参数一律 0")。 */
-  setEnvSource(fn: ((key: string) => number) | null): void {
+  /**
+   * 挂上/摘掉世界环境读数口(`null` = 摘掉,回到"缺失参数一律 0")。
+   *
+   * ⚠️ 函数形状见 `EnvSource`:**有位置才答得出逐格键**。只写一个
+   * `(key) => number` 的实现(少写第二个参数)在类型上仍然合法 —— 它等价于
+   * 「只回答位置无关的键」,逐格键一律 0(旧行为)。
+   */
+  setEnvSource(fn: EnvSource | null): void {
     this.envSrc = fn;
   }
 
-  /** 读世界环境(组件的 `param()` 在静态表里找不到键时的兜底层)。没挂 ⇒ 0。 */
-  envOf(key: string): number {
-    return this.envSrc === null ? 0 : this.envSrc(key);
+  /**
+   * 读世界环境(组件的 `param()` 在静态表里找不到键时的兜底层)。没挂 ⇒ 0。
+   *
+   * `comp` 就是「哪一件在问」(逐格键必需);不传时实现者只能回答位置无关的键。
+   */
+  envOf(key: string, comp?: ComponentNode): number {
+    return this.envSrc === null ? 0 : this.envSrc(key, comp);
   }
 
   /* ── 统计与诊断 ── */

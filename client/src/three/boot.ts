@@ -127,6 +127,9 @@ import {
      镜头在同一帧内跳到目标高度(真浏览器里闪一下,且不报任何错)。 */
   stepCameraHeight,
 } from '../net/height_placement.ts';
+/* ★ WS-FND-113:`PredictedPose` 只是**类型** ⇒ `import type`(渲染层不臆测它的形状,
+   更不反向驱动预测器:它每帧"拉一次、画出来",仅此而已)。 */
+import type { PredictedPose } from '../net/predictor.ts';
 /* task-83:玩家可见物。位置来源**唯一** —— 权威状态经 `telegraphCenterOf`,
    本文件只把那个位置翻译成 three 的摆放参数(纯逻辑在 `stage/assembly_math.ts`)。 */
 
@@ -170,6 +173,18 @@ export interface BootHandle {
    * ② 自检脚本能读到「权威位置是否真的到了」,而不只是"画面看起来对"。
    */
   store: ClientStateStore;
+  /**
+   * ★ WS-FND-113 第 2 处:接上**预测姿态源** —— 每帧拉一次,`null` = 没有预测。
+   *
+   * ## 为什么是函数(每帧拉)而不是一个值
+   * 渲染 60Hz、预测 20Hz。存一个值进来,渲染就会画"上次 push 进来的那个"位置,
+   * 最多滞后一帧 —— 与"滞后一个 RTT"只是程度不同,而两者的**症状看起来一样**。
+   *
+   * ## 为什么 `null` 必须退回权威
+   * 单机 / 权威还没到时没有预测可言。此时若拿 `(0,0)` 顶上,立牌会闪到世界原点
+   * —— 一个看起来合法的错误位置(与 `telegraphCenterOf` 的 `null` 同一条理由)。
+   */
+  setPoseSource: (fn: (() => PredictedPose | null) | null) => void;
 }
 
 /**
@@ -693,6 +708,13 @@ export function boot(container: HTMLElement): BootHandle {
   let playerGz = 0;
   /** 权威位置是否已到达过一次 —— 供 `summary()` 自检与 WS-12 观测。 */
   let authoritySeen = false;
+  /**
+   * ★ WS-FND-113:预测姿态源(由 `main.ts` 调 `setPoseSource` 注入)。
+   * `null` = 没有预测 ⇒ 渲染**只用权威值**(与接线前逐字段相同)。
+   */
+  let poseSource: (() => PredictedPose | null) | null = null;
+  /** 最近一帧真的用上的预测姿态(自检口径;`null` = 这一帧画的是权威值)。 */
+  let lastPredicted: PredictedPose | null = null;
   /**
    * 当前激活的屋顶分片。
    *
@@ -1283,6 +1305,20 @@ export function boot(container: HTMLElement): BootHandle {
      * ⇒ **保持上一帧**,不清零、不画到世界原点。
      */
     const center = telegraphCenterOf(authority.state, authority.localPlayerId);
+    /* ── ★ WS-FND-113 第 2 处:每帧拉一次**预测**姿态 ──
+     *
+     * 为什么是"拉"而不是"被 push":预测 20Hz、渲染 60Hz。存在一个变量里会让渲染画
+     * "上一次推进时的位置",最多滞后一帧(16ms)—— 与"滞后一个 RTT"只是程度不同,
+     * 而两者的症状看起来一样。`null` = 没有预测(未联机 / 权威还没到 / 坐标坏了)。
+     */
+    const predicted = poseSource === null ? null : poseSource();
+    lastPredicted = predicted;
+    /* ⚠️ `playerGx/playerGy` 仍然是**权威值**:`tests/WS-12` 把它的赋值点钉成
+     * 「恰好 1 处且等式右边是 `center.cx`」,`tests/WS-FND-23` 又把相机那一行
+     * (`cameraTargetFor(authoritySeen ? { x: playerGx, ... })`)逐字钉住。
+     * ⇒ 本轮的取舍:**立牌**画预测位置(见下面的 `baseShown`),**镜头/屋顶/预警圈**
+     *   仍跟权威值。代价是角色比镜头略前(≈ 一个 RTT 的位移,≤1 格),肉眼不可辨;
+     *   要连镜头一起提前,必须同时改那两条判据 —— 不在本轮偷改。 */
     if (center !== null) {
       playerGx = center.cx;
       playerGy = center.cy;
@@ -1319,12 +1355,31 @@ export function boot(container: HTMLElement): BootHandle {
      * ⚠️ 本块**必须在相机块之前**:相机的高度分量要用**同一帧**的这份摆放结果
      * (`mount.cameraFocus.z`),放在后面等于给镜头引入一帧滞后。
      */
+    /* ⚠️ 这一句的**字面形态**被 `tests/WS-09` 与 `tests/WS-FND-48` 钉住
+       (`playerMarkerPlacement(center, zAt)`)⇒ 保留它:它就是**权威兜底**那条路,
+       权威未知时(S1 之后)仍然只有这一句在决定"画不画"与"脚踩在哪格的高程上"。 */
     const base = playerMarkerPlacement(center, zAt);
-    const mount = placementForHeight({ x: base.gx, y: base.gy, z: playerGz }, base.gz);
-    /* ⚠️ 下面两行**刻意保留原来的字面写法**(`cell.gx/gy/gz` 与 `cell.visible`):
+    /* ── ★ WS-FND-113 第 2 处:**立牌画预测位置** ──
+     *
+     * 修前立牌只用 `base`(权威值)⇒ 玩家看到的位置比服务端**滞后一个 RTT**,
+     * 而 `LocalPredictor.renderPos` / `visualOffset` 全仓**零读者** ——
+     * "先剪再重演"与 SMOOTH 吸收在生产里一点都看不到(它们只是"存在")。
+     *
+     * `render` = 从权威值出发重演剩余命令后的位置 **+** 正在按指数收回的视觉偏移;
+     * 所以画 `render` 才是"先剪再重演 + 视觉吸收"的**产物**,而不是权威值再抄一遍。
+     *
+     * `visible` 仍取**权威**那一份(`base.visible`):权威说"不知道"时不冒出一个
+     * 预测位置上的立牌 —— 那会在死亡 / 退房时留下一块幽灵。
+     * 高度仍取**权威** `z`:预测器不积分 z(`predictStep` 原样保留 z)⇒ 与
+     * `predicted.render.z` 逐位相同,而"只有一个来源"因此仍然成立。
+     */
+    const baseShown = center !== null && predicted !== null
+      ? playerMarkerPlacement({ cx: predicted.render.x, cy: predicted.render.y }, zAt)
+      : base;
+    const mount = placementForHeight({ x: baseShown.gx, y: baseShown.gy, z: playerGz }, baseShown.gz);
+    /* ⚠️ 下面三行**刻意保留原来的字面写法**(`cell.gx/gy/gz` 与 `cell.visible`):
        `tests/WS-09` 用源码文本钉住「每帧写入立牌位置」与「可见性由 pure 层裁决」,
-       它们守的正是「本块不许被绕过」。⇒ 把合成结果**折回** `cell` 的字段名,
-       而不是去改那条判据。`cell.gz` 里已经含了 `z`(`mount.sprite.z = base.gz + z`)。 */
+       它们守的正是「本块不许被绕过」。`cell.gz` 已含 z(`mount.sprite.z = base.gz + z`)。 */
     const cell = { gx: mount.sprite.x, gy: mount.sprite.y, gz: mount.sprite.z, visible: base.visible };
     playerMarker.position.set(cell.gx, cell.gy, cell.gz);
     playerMarker.visible = cell.visible;
@@ -1437,6 +1492,8 @@ export function boot(container: HTMLElement): BootHandle {
 
   return {
     store: authority,
+    /* ★ WS-FND-113:把预测姿态源接进来(`main.ts` 注入 `predictor.poseView`)。 */
+    setPoseSource: (fn) => { poseSource = fn; },
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.length,
@@ -1513,6 +1570,16 @@ export function boot(container: HTMLElement): BootHandle {
         y: playerMarker.position.y,
         z: playerMarker.position.z,
       },
+      /* ── ★ WS-FND-113 第 2 处:预测消费自检口径 ──
+       * 三者一起读才分得清两种坏法:
+       *   `poseSourceInstalled=false` ⇒ 渲染**根本没接**预测(第 2 处复发);
+       *   `predictedRender=null` 而 `installed=true` ⇒ 权威还没到(正常,兜底生效)。
+       * `predictedVisualOffset>0` 是"平滑吸收正在发生"的**唯一**可读证据 ——
+       * 少了它,SMOOTH 那一档在生产里是否跑过就只能靠读代码。 */
+      poseSourceInstalled: poseSource !== null,
+      predictedRender: lastPredicted === null ? null : lastPredicted.render,
+      predictedLogical: lastPredicted === null ? null : lastPredicted.logical,
+      predictedVisualOffset: lastPredicted === null ? null : lastPredicted.visualOffset,
       /* ── 图集自检口径:截图脚本靠这几个字段判断「真图 vs 占位」── */
       atlasOk,
       atlasErr,

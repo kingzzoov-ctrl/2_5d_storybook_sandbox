@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS room_world_archives (
   -- 挪进仓储层、两头都钉:`archiveWorldSnapshot` 写入时**由 blob 长度算出**它,
   -- `loadWorldArchive` 读回时**核对**它,不一致 ⇒ 视为「这一版不完整」返回 undefined。
   -- 这里再加一条上界,防「摘要说 8 字节、blob 是 900KB」这种连读取都懒得核对的行。
+  -- ★ 上下界刻意写成 `col >= 0 AND col <= n` 的**同列合取**:`MemoryDb.parseCheckExpr`
+  -- 认得这个形态(`{kind:'and'}`),于是内存夹具与真实 SQLite **都真的校验**它。
+  -- 改前整条落进 `unsupportedChecks()`(默认放行)⇒ 内存后端等于没有这条约束,
+  -- 「测试绿、生产异」—— 守它的判据在 `tests/WS-FND-116`。
   snapshot_bytes INTEGER NOT NULL CHECK (snapshot_bytes >= 0 AND snapshot_bytes <= 1048576),
   reason         TEXT    NOT NULL DEFAULT '',
   archived_at    INTEGER NOT NULL

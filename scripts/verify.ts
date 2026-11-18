@@ -3761,7 +3761,9 @@ function checkClientBuild(): void {
  * 实测:末尾插一行 ⇒ **绿**(本锁);这是设计取舍,不是巧合。
  *
  * ## 边界(如实)
- * - `typescript` 未安装 ⇒ **跳过并说明**(本仓默认零依赖,"没装可选开发依赖"不是缺陷);
+ * - `typescript` 未安装 ⇒ **进汇总告警(advise)**,与 `checkClientBuild` 同口径
+ *   (第五轮元审计:旧写法只 `console.log + return`,既不 advise 也不进汇总,
+ *    于是「没装」与「类型错误未增加」在结论行上逐字相同);
  * - 我**没有**试图修那 267 条 —— 我未读它们的具体位置,不知道哪些是真漂移、
  *   哪些是 tsconfig 太严 ⇒ **"能烧掉"是我不能证明的**;
  * - 它**不替代** `vite build`:后者查语法与模块解析,本锁查类型,两者互补。
@@ -3775,7 +3777,14 @@ function checkTypecheckBaseline(): void {
     return;
   }
   if (!existsSync(join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'))) {
-    console.log('      · 未装 typescript(本仓默认零依赖)⇒ 类型检查基线锁跳过');
+    /* ★ 2026-11-18 第五轮元审计 —— 与第四轮给 `checkClientBuild` 的口径**统一**:
+       旧写法只 `console.log` 一句然后 `return`,**既不计 advise、也不进汇总行**,
+       于是「没装 typescript」与「类型错误未增加」在结论行上逐字相同(都是「全部通过」)。
+       ⚠️ 同样**不给升级开关**:装不装可选开发依赖是环境决定,不是欠账。 */
+    advise(
+      '类型检查基线锁',
+      '未装 typescript(本仓默认零依赖)⇒ 类型检查基线锁**未校验**(汇总行会列出本条)',
+    );
     return;
   }
   const r = spawnSync(process.execPath, [audit], {

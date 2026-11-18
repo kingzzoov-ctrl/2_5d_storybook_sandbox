@@ -53,8 +53,21 @@ export interface ActionContext {
   /** 世界的物质层;没有世界源时 `null`(见 `RoomRuntime.materialsOf`)。 */
   materialsOf(): ReturnType<WorldSaveHost['materials']> | null;
 
-  /** 玩家的**权威位置**;拿不到 `null`(见 `RoomRuntime.hostPositionOf`)。 */
-  hostPositionOf(userId: string): { x: number; y: number } | null;
+  /**
+   * 玩家的**权威位置**;拿不到 `null`(见 `RoomRuntime.hostPositionOf`)。
+   *
+   * ★ 2026-11-18(第五轮 P3):`z` 必须声明。修前这里是 `{ x, y }`,而实现
+   * (`host.playerPosition()` → `DynamicBody`)返回的是 `{ x, y, z }` ——
+   * 结构类型会**静默丢掉** `z`:
+   * ```
+   * const at = ctx.hostPositionOf(id);  // 类型上 at.z 不存在
+   * ⇒ 想用高度的动作(流体浮沉 / 跳跃 / 叠层判定)只能再 `as` 一次,
+   *   而漏掉它的表现是「平面距离永远正确、高度永远 0」——不报错。
+   * ```
+   * 现在 `z` 是可选(`?`):老宿主的 `playerPosition` 不返回 z 时它确实是
+   * `undefined` —— 与「z = 0」是两件事,消费方必须自己区分。
+   */
+  hostPositionOf(userId: string): { x: number; y: number; z?: number } | null;
 
   /** 背包增减的**唯一**入口(总量守恒与凭证链都在那条路上)。 */
   applyInventory(

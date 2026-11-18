@@ -152,8 +152,9 @@ const actAs = (
 const act = (room: Room, action: RoomAction, payload: Record<string, unknown> = {}): ActionOutcome =>
   actAs(room, 'p1', action, payload);
 
-/** 取回执里的 `effect`(它的值类型是 `string | number | boolean`)。 */
-const eff = (r: ActionOutcome): Record<string, string | number | boolean> => r.effect ?? {};
+/** 取回执里的 `effect`(★ 值域已放宽为 `EffectRecord`;这里只读标量 ⇒ 显式窄化)。 */
+const eff = (r: ActionOutcome): Record<string, string | number | boolean> =>
+  (r.effect ?? {}) as Record<string, string | number | boolean>;
 
 /* ───────────────────────── 1 ───────────────────────── */
 
