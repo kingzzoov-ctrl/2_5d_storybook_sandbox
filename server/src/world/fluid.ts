@@ -124,6 +124,25 @@ export interface FluidStepReport {
   consumedLava: number;
   /** 是否因为预算耗尽而截断 */
   truncated: boolean;
+  /**
+   * ★ R18:本帧**因预算耗尽被延后**的活跃格数(可判定指标)。
+   *
+   * 只回答一件事:「这一帧有多少格**本该被推进、但额度不够**」。
+   * `> 0` ⇒ 这一帧的水只动了一部分(或一动不动),**不是**「水不流」;
+   * 这些格**仍留在活跃集合里**(见 `fluxPass` 里「摘除后重新入队」那段),
+   * 下一帧继续;它们的 `amount` 一格未改 ⇒ **延后的是流动,不是水位**。
+   * 预算足够(`limit ≥ n`、活跃集全部服务完)时恒为 0 —— 所以它不是常量,
+   * 可以当判据用(负对照:大预算 ⇒ 0)。
+   */
+  deferredCells: number;
+  /**
+   * 被延后那批格里**存着的水量**(毫格)。
+   *
+   * 与 `deferredCells` 配对:`deferredCells > 0` 而 `deferredAmount > 0`
+   * 一起说明「水位还在场上,只是这一帧没轮到它流动」。守恒仍由
+   * `grandTotal()` 兜底(这笔量一分没少)。
+   */
+  deferredAmount: number;
 }
 
 /* ═══════════════════════ 3. FluidField ═══════════════════════ */
@@ -156,6 +175,11 @@ export class FluidField {
    *
    * **这是缓存,不是真相** —— `amount` 永远是唯一真相。缓存漏了某格,
    * 后果只是它这一帧不流动(游标会补上),不会算错。
+   *
+   * ★ **活跃集不进存档**(R18 口径)。它是性能缓存,存档里只有逐格水位
+   * `amount`;读档/回滚按 `amount` 重建水位(`setCell({ amount })` 内部
+   * `markActive`),活跃集随之重新长出来。所以「活跃集」绝不参与序列化 ——
+   * 否则会多出一份与 `amount` 可互相矛盾的真相。
    */
   private readonly activeArr: number[] = [];
   /** 格索引 → 在 `activeArr` 中的位置(用于 O(1) 去重与摘除)。 */
@@ -337,6 +361,25 @@ export class FluidField {
    * 2Hz 推进一帧。`budget` 为本次最多服务多少格(默认 FLUID_CELL_BUDGET)。
    * 返回统计;守恒关系恒为
    *   total_after + Σconsumed = total_before
+   *
+   * ## ★ R18 口径:预算被打满 ⇒ **只延后流动,不丢水位**
+   *
+   * 极端情况下(活跃集 ≫ `budget`)一帧的额度会在活跃集里用完,于是这一帧
+   * 「水不动」。这是**延后**,不是丢失,三条口径写在下面:
+   * 1 **水位(`amount`)是本帧唯一真相**:没轮到的格一字不改(不清零、不重算);
+   * 2 **没轮到的活跃格留在活跃集合里**(`fluxPass` 只摘除它实际服务过的格,
+   *    并且服务完仍按「有水/邻水」重新入队)⇒ 下一帧继续,轮转游标保证公平,
+   *    不会因为活跃集比预算大就把尾巴饿死;
+   * 3 **可判定**:`report.deferredCells` / `deferredAmount` 记下「这一帧延后了
+   *    多少格、多少毫格水」——`> 0` 表示「这一帧只动了一部分」,
+   *    `= 0` 表示额度够用(负对照,见 `tests/WS-FND-100`)。
+   *
+   * ## 与存档的边界(别把缓存当真相)
+   *
+   * **活跃集不进存档** —— 它只是缓存(`activeArr` 的注释),世界存档里只有
+   * 逐格水位 `amount`。读档/回滚时水位**按 `amount` 重建**(`world_sim` 的
+   * `applyRestore` 走 `setCell({ amount })`,顺手 `markActive` 把活跃集重新长出来),
+   * 所以「活跃集丢了 ⇒ 水不流」这种状态不可能被存档带出去。
    */
   step(budget: number = FLUID_CELL_BUDGET): FluidStepReport {
     if (!Number.isInteger(budget) || budget <= 0) {
@@ -345,6 +388,7 @@ export class FluidField {
     const report: FluidStepReport = {
       processed: 0, visited: 0, active: 0, moved: 0,
       phaseChanges: 0, consumedByPhase: 0, consumedLava: 0, truncated: false,
+      deferredCells: 0, deferredAmount: 0,
     };
     /* 活跃格数必须在**任何写入之前**取样:相变与落账都会改活跃集合。 */
     const activeAtStart = this.activeArr.length;
@@ -476,8 +520,10 @@ export class FluidField {
        实测表现:平衡后注入新水,`moved` 恒为 0、水原地不动(停顿,不是平衡)。
        轮转后每格都在 `ceil(size/limit)` 帧内被轮到,与插入时间无关。 */
     const activeSize = this.activeArr.length;
+    /* ★ R18:被服务过的活跃格数。`taken < activeSize` 且额度已满 ⇒
+       剩下 `activeSize - taken` 格**根本没被摘除**,仍留在活跃集合里(见下面「必须重新入队」)。 */
+    let taken = 0;
     if (activeSize > 0) {
-      let taken = 0;
       while (taken < activeSize && done < limit) {
         const i = this.activeArr[this.activeCursor % this.activeArr.length];
         this.activeCursor += 1;
@@ -492,11 +538,30 @@ export class FluidField {
          * 所以摘除后立刻按「是否仍需处理」重新入队:
          *   有水 或 四邻有水 → 入队(下一轮继续参与)
          *   彻底干涸且四邻也干 → 不入队(自然淘汰,集合不会无限增长)
+         *
+         * ★ R18 的另一半:**没被摘除就是没被延后丢掉**。循环因额度耗尽
+         * (`done >= limit`)退出时,剩下的活跃格原封不动留在 `activeArr` 里
+         * (这里只摘除 `taken` 个),下一帧继续服务 —— 所以水位不丢,
+         * 只是这一帧没轮到它流。
          */
         if (this.amount[i] > 0 || this.neighborHasFluid(i)) this.pushActive(i);
         else continue;
         visit(i);
       }
+    }
+
+    /* ★ R18 的**可判定指标**(必须在游标补齐**之前**算:额度打满时补齐不会跑,
+       `visited` 就只含活跃集里真正被服务的格)。 */
+    const deferredCells = activeSize - taken;
+    report.deferredCells = deferredCells > 0 ? deferredCells : 0;
+    if (deferredCells > 0) {
+      /* 被延后那批格**还存着多少水**:> 0 即「水位在场上,只是没轮到流动」。 */
+      let deferredAmount = 0;
+      for (const i of this.activeArr) {
+        if (visited.has(i)) continue;
+        deferredAmount += this.amount[i];
+      }
+      report.deferredAmount = deferredAmount;
     }
 
     /* ② 游标补齐:拿**剩余**额度。
@@ -738,6 +803,7 @@ export class FluidField {
     let last: FluidStepReport = {
       processed: 0, visited: 0, active: 0, moved: 0,
       phaseChanges: 0, consumedByPhase: 0, consumedLava: 0, truncated: false,
+      deferredCells: 0, deferredAmount: 0,
     };
     for (let f = 0; f < frames; f += 1) {
       last = this.step(budget);

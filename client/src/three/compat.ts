@@ -230,6 +230,16 @@ export function compatThree(): ThreeLike {
 /* ───────────────────────── 装配 ───────────────────────── */
 
 /**
+ * `aLodMerge` 属性的**名字**(唯一事实源:此前是散在装配函数里的字面量)。
+ *
+ * 该属性 = 这个几何**真实使用**的合并边长(格),每顶点 1 个分量、整个 Chunk 同一个值。
+ * 它的语义边界由 `stage/terrain_vcolor.ts` 的 `LOD_MERGE_MAX_DZ` /
+ * `LOD_COLOR_INTERPOLATION` 约束:merge 只决定「降多少」,不影响「同一块 z 的颜色必须
+ * 逐位相同」这条口径。
+ */
+export const LOD_MERGE_ATTRIBUTE = 'aLodMerge';
+
+/**
  * 把纯逻辑层写出的顶点数据装成几何(引擎中立)。
  *
  * 属性清单就是「渲染走顶点色」的实现口径:
@@ -249,9 +259,23 @@ export function assembleChunkGeometry(emitted: ChunkGeometry, lod: number): Comp
   geom.setAttribute(TERRAIN_COLOR_ATTRIBUTE,
     new three.BufferAttribute(emitted.colors, TERRAIN_COLOR_COMPONENTS));
   geom.setAttribute('normal', new three.BufferAttribute(emitted.normals, 3));
-  geom.setAttribute('aLodMerge', new three.BufferAttribute(merge, 1));
+  geom.setAttribute(LOD_MERGE_ATTRIBUTE, new three.BufferAttribute(merge, 1));
   geom.setIndex(new three.BufferAttribute(emitted.indices, 1));
   return geom;
+}
+
+/**
+ * 读出某几何装配时用的合并边长(= `aLodMerge[0]`);缺属性或空缓冲 ⇒ `null`。
+ *
+ * 存在的理由:装配层与判据都要回答「这份几何是**按哪个 merge** 建的」,而答案此前只能靠
+ * `getAttribute('aLodMerge').array[0]` 这种带两处字面量的写法去猜 —— 属性名一改,
+ * 判据静默从「读到了 1」变成「读到了 undefined」,两边都还能跑。
+ */
+export function lodMergeOfGeometry(geom: CompatGeometryLike): number | null {
+  const attr = geom.getAttribute(LOD_MERGE_ATTRIBUTE);
+  if (attr === undefined || attr.count === 0) return null;
+  const v = attr.array[0];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
 /** uniform 默认值(装配层不硬编码 uniform 名之外的任何东西) */

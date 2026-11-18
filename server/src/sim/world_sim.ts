@@ -704,6 +704,123 @@ export interface PlayerProfile {
 /** 空档案常引用 —— 无记录时返回它,避免每次分配。 */
 const EMPTY_PROFILE: PlayerProfile = { wearing: [], heldItem: 0 };
 
+
+/* ══════════ ★ R14:回滚失败的**分类**(字符串字面量 —— 仓规禁 enum)══════════ */
+
+/**
+ * `applyRestore` 的失败分类。
+ *
+ * ## 为什么必须分类(改前只有一句中文 reason)
+ *
+ * 改前 `applyRestore` 的坏档表现是「解码抛异常」:计划形状不对返回
+ * `ok:false`,而块体字节解不开**直接抛出去** —— 同一个方法的失败有两条
+ * 互不相同的出口,且调用方无法从回执上区分「坏档 / 形状不对 / 尺寸不符 /
+ * 代码缺陷」。四种码各有唯一的**发生面**:
+ * ```
+ * shape        计划或 op 的形状不对(不是对象 / 缺 ops / 缺 world 段 /
+ *              op 缺键 / chunk.bytes 不是 Uint8Array …)   —— 纯数据检查
+ * size         sizeCells 或流体场边界 ≠ 当前世界           —— 纯数据检查
+ * bad-archive  块体字节解不开(Chunk.deserializeSnapshot 抛 RangeError) —— 坏输入
+ * internal     以上之外的抛错(宿主对象上的意外 / 代码缺陷)  —— 非预期
+ * ```
+ * 前三种**全部在 `rebuildWorld` 之前**判定 ⇒ 失败时世界**一字未改**;
+ * `internal` 可能发生在写入阶段,回执措辞会如实说明「可能已被部分修改」。
+ */
+export const RESTORE_FAIL = {
+  SHAPE: 'shape',
+  SIZE: 'size',
+  BAD_ARCHIVE: 'bad-archive',
+  INTERNAL: 'internal',
+} as const;
+export type RestoreFailCode = (typeof RESTORE_FAIL)[keyof typeof RESTORE_FAIL];
+
+/** 异常 → 一行可读文本(回执里要能看见「抛了什么」,而不是一句「未知错误」)。 */
+function thrownText(err: unknown): string {
+  if (err instanceof Error) return `${err.name}: ${err.message}`;
+  return String(err);
+}
+
+/**
+ * ★ R14 的**形状闸**(纯读,零写入):返回第一条形状错误的说明,全对返回 `null`。
+ *
+ * 只校验「写入阶段真的会用到的键」—— 宁可少校验,也不写第二份计划语义:
+ * `world` 段(seed / sizeCells / frame)、`chunk` 的坐标与字节、`player` 的
+ * id 与坐标、`fluid` 的边界与水位表、`mob` / `ground` 的坐标。
+ *
+ * ⚠️ `bytes` 只校验「**当场**是 `Uint8Array` 且非空」:「是字节但解不开」
+ * 属于 `bad-archive`(由预解码那一层报),「根本不是字节」属于形状态。
+ */
+function restoreShapeError(op: unknown): string | null {
+  if (op === null || typeof op !== 'object') return '里有一条 op 不是对象';
+  const o = op as Record<string, unknown>;
+  const kind = o.kind;
+  if (typeof kind !== 'string') return '里有一条 op 缺 kind(不是字符串)';
+  const finite = (k: string): boolean => typeof o[k] === 'number' && Number.isFinite(o[k]);
+  const int = (k: string): boolean => typeof o[k] === 'number' && Number.isInteger(o[k]);
+  switch (kind) {
+    case 'world':
+      if (!finite('seed')) return '的 world.seed 不是有限数';
+      if (!int('sizeCells')) return '的 world.sizeCells 不是整数';
+      if (!finite('frame')) return '的 world.frame 不是有限数';
+      return null;
+    case 'chunk': {
+      if (!int('cx') || !int('cy')) return '的 chunk 坐标不是整数';
+      const bytes = o.bytes;
+      if (!(bytes instanceof Uint8Array)) return '的 chunk.bytes 不是 Uint8Array 快照';
+      if (bytes.byteLength === 0) return '的 chunk.bytes 是空缓冲';
+      return null;
+    }
+    case 'player':
+      if (typeof o.id !== 'string' || o.id.length === 0) return '的 player.id 不是非空字符串';
+      if (!finite('x') || !finite('y') || !finite('z')) return '的 player 坐标不是有限数';
+      if (!finite('level')) return '的 player.level 不是有限数';
+      if (o.hp !== undefined && !finite('hp')) return '的 player.hp 存在但不是有限数';
+      return null;
+    case 'fluid': {
+      if (!int('width') || !int('height')) return '的 fluid 边界不是整数';
+      const levels = o.levels;
+      if (!Array.isArray(levels)) return '的 fluid.levels 不是数组';
+      for (const l of levels) {
+        if (l === null || typeof l !== 'object') return '的 fluid 里有一条水位不是对象';
+        const lv = l as Record<string, unknown>;
+        if (!(typeof lv.x === 'number' && Number.isFinite(lv.x))) return '的 fluid 水位 x 不是有限数';
+        if (!(typeof lv.y === 'number' && Number.isFinite(lv.y))) return '的 fluid 水位 y 不是有限数';
+        if (!(typeof lv.amount === 'number' && Number.isFinite(lv.amount))) {
+          return '的 fluid 水位 amount 不是有限数';
+        }
+      }
+      return null;
+    }
+    case 'mob':
+      if (typeof o.id !== 'string' || o.id.length === 0) return '的 mob.id 不是非空字符串';
+      if (!finite('x') || !finite('y')) return '的 mob 坐标不是有限数';
+      if (!finite('hp') || !finite('maxHp')) return '的 mob.hp/maxHp 不是有限数';
+      return null;
+    case 'ground':
+      if (!finite('x') || !finite('y')) return '的 ground 坐标不是有限数';
+      if (!finite('itemId') || !finite('count')) return '的 ground.itemId/count 不是有限数';
+      return null;
+    default:
+      return `里有未知的 op.kind:${kind}`;
+  }
+}
+
+/**
+ * 闸的产物:要么带**全部待写入的值**,要么带一条**已分类**的拒绝理由。
+ *
+ * `chunks` 是**预解码好**的块体 —— 这是 R14 的核心:`applyRestore` 在
+ * `rebuildWorld` 之前就把每一块解完,坏的字节在那时就变成 `bad-archive`,
+ * 于是「世界已经重建、玩家已经清空,却在铺地形时抛异常」这条路不存在。
+ */
+type RestoreGate =
+  | {
+      ok: true;
+      seed: number;
+      biome: string;
+      frame: number;
+      chunks: { cx: number; cy: number; chunk: Chunk }[];
+    }
+  | { ok: false; code: RestoreFailCode; reason: string };
 /**
  * 可运行的世界。
  *
@@ -889,6 +1006,17 @@ export class WorldSim {
    * 从外面看不出区别。
    */
   lastBossTick: BossTickReport = { ticked: 0, phaseSwitched: [], stunEnded: [] };
+  /**
+   * ★ R18:最近一次慢帧**因流体预算被打满而延后**的活跃格数。
+   *
+   * 与 `lastMobTicks` / `lastBossTick` 同一模式 —— 把「这一帧水为什么没动」
+   * 暴露成可观测量。`> 0` 只说明**延后**(下一帧继续、水位未丢),
+   * 不是「流体坏了」;`0` 说明额度够用。没有它,「预算打满 ⇒ 这一帧水不动」
+   * 与「流体没接线 / 水已平衡」在外部**不可区分**。
+   *
+   * 取值来自 `FluidStepReport.deferredCells`(2Hz 慢帧),快帧保持上一值。
+   */
+  lastFluidDeferredCells = 0;
   /**
    * 最近一次慢帧的**物流推进结果**(供诊断与断言)。
    *
@@ -4678,6 +4806,8 @@ export class WorldSim {
     this.lastMobTicks = [];
     this.mobErrors = 0;
     this.lastBossTick = { ticked: 0, phaseSwitched: [], stunEnded: [] };
+    /* 流体场整件换新(4657)⇒ 上一帧的「延后格数」对新场没有意义,清零。 */
+    this.lastFluidDeferredCells = 0;
     this.lastLogisticsTick = {
       beltMoves: 0, sorterMoves: 0, armGrabs: 0, armFeeds: 0, drillOres: 0,
       exitsDelivered: 0, exitsDropped: 0, exitsHeld: 0,
@@ -6795,53 +6925,77 @@ export class WorldSim {
    *    `PLAYER_BASE_HP`(100)钳住 ⇒ 高等级玩家的归档血量**静默回滚成 100**。
    *    ② 之前的 `level` 写回是它的前提(`levelOf` 读的就是这一份)。
    *    v1 头里没有 `hp` ⇒ 上限照样按等级抬到位,`hp` 由 `revive` 缺省填满
-   *    (= 当前 `maxHp`,**不填一个 100** —— 高等级玩家填 100 不是满血)。 */
+   *    (= 当前 `maxHp`,**不填一个 100** —— 高等级玩家填 100 不是满血)。
+   *
+   * ## ★ R14 失败分类 + 「失败时世界一字未改」
+   *
+   * 三道闸(**纯读,全部在 `rebuildWorld` 之前**)依次是:
+   * ```
+   * 1 形状(plan / ops / 逐 op 形状)        ⇒ code 'shape'
+   * 2 尺寸(world.sizeCells / fluid 边界)    ⇒ code 'size'
+   * 3 预解码(每一块 chunk 的字节)          ⇒ code 'bad-archive'
+   * ```
+   * 第 3 道是 R14 的落点:改前块体解码夹在写入中间(重建完、玩家清完才解),
+   * 坏字节抛出的后果是「世界已经被拆了一半」,而且异常还**绕过了本方法的回执**。
+   * 现在**先在闸里全部解完**存进 `gate.chunks`,写入阶段只做搬运 ⇒ 三类失败都
+   * 满足「世界一字未改」,且一律以 `{ ok:false, code, reason }` 返回、不抛。
+   * 写入阶段的意外抛错归类为 `internal`(回执会写明「可能已被部分修改」)。
+   */
   applyRestore(plan: RestorePlan): {
+    ok: boolean;
+    /** ★ R14 失败分类(见 `RESTORE_FAIL`);`ok:true` 时不带这个键。 */
+    code?: RestoreFailCode;
+    reason?: string;
+    applied?: { chunks: number; players: number; mobs: number; ground: number; fluid: number; seed: number; frame: number };
+  } {
+    /* 0 闸:纯读。意外抛错也归 `internal`,且此时**还没写过任何东西**。 */
+    let gate: RestoreGate;
+    try {
+      gate = this.restorePreflight(plan);
+    } catch (err) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.INTERNAL,
+        reason: `内部异常(${thrownText(err)})—— 回滚在**任何写入之前**中止,世界一字未改`,
+      };
+    }
+    if (!gate.ok) return { ok: false, code: gate.code, reason: gate.reason };
+
+    /* 1..7 写入。意外抛错归 `internal`:写入阶段可能已经改过世界,措辞如实说。 */
+    try {
+      return this.applyRestoreWrite(gate, plan);
+    } catch (err) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.INTERNAL,
+        reason: `内部异常(${thrownText(err)})—— 写入阶段抛出,世界可能已被部分修改`,
+      };
+    }
+  }
+
+  /**
+   * `applyRestore` 的**写入**半边(闸已过 ⇒ 这里拿到的计划「形状/尺寸都对、
+   * 块体字节已全部解码」)。
+   *
+   * ⚠️ 顺序是既有语义的一部分(见 `applyRestore` 的 docblock):重建 → 身份 →
+   * 地形 → 玩家 → 水位 → 生物 → 地面 → 时钟。
+   */
+  private applyRestoreWrite(gate: Extract<RestoreGate, { ok: true }>, plan: RestorePlan): {
     ok: boolean;
     reason?: string;
     applied?: { chunks: number; players: number; mobs: number; ground: number; fluid: number; seed: number; frame: number };
   } {
-    if (plan === null || typeof plan !== 'object' || !Array.isArray(plan.ops)) {
-      return { ok: false, reason: '回滚计划形状不对(需要一个带 ops 数组的对象)' };
-    }
-    const worldOp = plan.ops.find((o) => o.kind === 'world');
-    if (worldOp === undefined || worldOp.kind !== 'world') {
-      return { ok: false, reason: '回滚计划里没有 world 段 ⇒ 身份与时钟无法还原' };
-    }
-    if (worldOp.sizeCells !== this.sizeCells) {
-      return {
-        ok: false,
-        reason: `世界边长不可回滚(归档 ${worldOp.sizeCells} 格 vs 当前 ${this.sizeCells} 格)`
-          + ' —— 网格/流体/物理边界都按这个数构造',
-      };
-    }
-
-    /* ★ v2 的流体场尺寸:**任何改动之前**校验(与上一条同处一道闸)。
-       水位场的边界按世界边长构造 ⇒ 尺寸不符就只能拒绝;若挪到重建之后才发现,
-       `WS-FND-78` 的「拒绝时世界一字未改」就已经破了(那时地形/玩家都动过了)。 */
-    const fluidOp = plan.ops.find((o) => o.kind === 'fluid');
-    if (
-      fluidOp !== undefined && fluidOp.kind === 'fluid'
-      && (fluidOp.width !== this.fluid.width || fluidOp.height !== this.fluid.height)
-    ) {
-      return {
-        ok: false,
-        reason: `流体场尺寸不可回滚(归档 ${fluidOp.width}×${fluidOp.height} vs 当前 `
-          + `${this.fluid.width}×${this.fluid.height}) —— 水位场边界按世界边长构造`,
-      };
-    }
-
     /* 1 内存重建(地形/物理/电路/生物全部换成新实例,种子用**归档的**)。 */
-    this.rebuildWorld(worldOp.seed);
+    this.rebuildWorld(gate.seed);
     /* 2 世界身份:群系可还原(只影响刷怪配表的键)。 */
-    this.biomeName = worldOp.biome;
+    this.biomeName = gate.biome;
 
-    /* 3 地形块:字节**原样**搬回(解码由 `Chunk.deserializeSnapshot` 做,
-       那是仓库里唯一的地形快照解码器 —— 不在这里写第二份)。 */
+    /* 3 地形块:**闸里已经全部解完**(`gate.chunks`),这里只做搬运 ——
+       解码异常不可能发生在「世界已重建、玩家已清空」之后(见 R14 注释)。
+       块体字节原样搬回(`Chunk.deserializeSnapshot` 仍是唯一解码器,不在这里写第二份)。 */
     let chunks = 0;
-    for (const op of plan.ops) {
-      if (op.kind !== 'chunk') continue;
-      this.grid.chunks.set(chunkKey(op.cx, op.cy), Chunk.deserializeSnapshot(op.bytes));
+    for (const c of gate.chunks) {
+      this.grid.chunks.set(chunkKey(c.cx, c.cy), c.chunk);
       chunks += 1;
     }
 
@@ -6925,7 +7079,7 @@ export class WorldSim {
 
     /* 7 时钟:帧号是**世界时钟的唯一来源**(`hourOfDay` 由它派生)⇒ 写回去,
        钟点自动跟上(D-07 不存累加器,这里也不写第二份)。 */
-    this.frameCount = Math.max(0, Math.trunc(worldOp.frame));
+    this.frameCount = Math.max(0, Math.trunc(gate.frame));
     this.syncPlayers();
     /* 地形变了 ⇒ 房间识别必须重算。 */
     this.roomsDirty = true;
@@ -6933,6 +7087,96 @@ export class WorldSim {
       ok: true,
       applied: { chunks, players, mobs, ground, fluid, seed: this.worldSeed, frame: this.frameCount },
     };
+  }
+
+  /**
+   * ★ R14 的**闸**(纯读,零写入):形状 → 尺寸 → 逐块预解码。
+   *
+   * 拒绝一律返回 `{ ok:false, code, reason }`;**任何一条不满足,世界一字未改**
+   * —— 因为整个方法都在 `rebuildWorld` 之前跑完(这正是改前的缺陷所在:
+   * 解码夹在写入中间,坏字节只会在「世界已经被拆一半」时才炸)。
+   *
+   * ## 为什么预解码是「临时结构」而不是「解一块写一块」
+   *
+   * 写入阶段要按 `gate.chunks` 原样搬运;解码是纯函数(`Chunk.deserializeSnapshot`
+   * 只读字节、写新 `Chunk` 实例,不碰世界),所以「先全部解到临时数组」既满足
+   * 「失败时世界不变」,也不改变成功路径的结果(块体字节逐位相同)。
+   *
+   * ## 错误分类
+   *
+   * - `RangeError`(`Chunk.deserialize` 缓冲不足 / `decodeRoofRle` 截断)⇒ 坏档;
+   * - 其他异常 ⇒ `internal`(形状闸已经把「不是字节 / 空缓冲」挡在 `shape`)。
+   */
+  private restorePreflight(plan: RestorePlan): RestoreGate {
+    if (plan === null || typeof plan !== 'object' || !Array.isArray(plan.ops)) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.SHAPE,
+        reason: '回滚计划形状不对(需要一个带 ops 数组的对象)',
+      };
+    }
+    const worldOp = plan.ops.find((o) => o.kind === 'world');
+    if (worldOp === undefined || worldOp.kind !== 'world') {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.SHAPE,
+        reason: '回滚计划里没有 world 段 ⇒ 身份与时钟无法还原',
+      };
+    }
+    if (worldOp.sizeCells !== this.sizeCells) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.SIZE,
+        reason: `世界边长不可回滚(归档 ${worldOp.sizeCells} 格 vs 当前 ${this.sizeCells} 格)`
+          + ' —— 网格/流体/物理边界都按这个数构造',
+      };
+    }
+
+    /* ★ v2 的流体场尺寸:**任何改动之前**校验(与上一条同处一道闸)。
+       水位场的边界按世界边长构造 ⇒ 尺寸不符就只能拒绝;若挪到重建之后才发现,
+       `WS-FND-78` 的「拒绝时世界一字未改」就已经破了(那时地形/玩家都动过了)。 */
+    const fluidOp = plan.ops.find((o) => o.kind === 'fluid');
+    if (
+      fluidOp !== undefined && fluidOp.kind === 'fluid'
+      && (fluidOp.width !== this.fluid.width || fluidOp.height !== this.fluid.height)
+    ) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.SIZE,
+        reason: `流体场尺寸不可回滚(归档 ${fluidOp.width}×${fluidOp.height} vs 当前 `
+          + `${this.fluid.width}×${this.fluid.height}) —— 水位场边界按世界边长构造`,
+      };
+    }
+
+    /* 逐 op 形状(纯数据):任何一条坏 ⇒ `shape`,且此时**还没有写过任何东西**。 */
+    for (const op of plan.ops) {
+      const shapeErr = restoreShapeError(op);
+      if (shapeErr !== null) {
+        return { ok: false, code: RESTORE_FAIL.SHAPE, reason: `回滚计划${shapeErr} ⇒ 拒绝(世界一字未改)` };
+      }
+    }
+
+    /* ★ R14:块体**全部解完再写**。坏字节在这里变成回执,而不是写入中途的异常。 */
+    const chunks: { cx: number; cy: number; chunk: Chunk }[] = [];
+    for (const op of plan.ops) {
+      if (op.kind !== 'chunk') continue;
+      let chunk: Chunk;
+      try {
+        chunk = Chunk.deserializeSnapshot(op.bytes);
+      } catch (err) {
+        const bad = err instanceof RangeError;
+        return {
+          ok: false,
+          code: bad ? RESTORE_FAIL.BAD_ARCHIVE : RESTORE_FAIL.INTERNAL,
+          reason: bad
+            ? `坏档:地形块 (${op.cx},${op.cy}) 解不开(${thrownText(err)})⇒ 拒绝,世界一字未改`
+            : `内部异常(${thrownText(err)})⇒ 拒绝,世界一字未改`,
+        };
+      }
+      chunks.push({ cx: op.cx, cy: op.cy, chunk });
+    }
+
+    return { ok: true, seed: worldOp.seed, biome: worldOp.biome, frame: worldOp.frame, chunks };
   }
 
   tick(): SimFrameReport {
@@ -7040,6 +7284,10 @@ export class WorldSim {
         fluidProcessed = fr.processed;
         fluidActive = fr.active;
         fluidMoved = fr.moved;
+        /* ★ R18:额度不够 ⇒ 这一帧只「延后」了流动(`deferredCells > 0`),
+           水位一格未改、剩下的活跃格留在场里等下一帧 —— 这是可观测的**延后**,
+           不是「水不流」。口径见 `FluidField.step` 的 docblock。 */
+        this.lastFluidDeferredCells = fr.deferredCells;
         /* ── 相变产物写回 OBJ 层(必须紧跟 step,不能漏) ──
          *
          * `FluidField.phasePass()` 在 step 内部把「水 + 熔岩」接触面的产物

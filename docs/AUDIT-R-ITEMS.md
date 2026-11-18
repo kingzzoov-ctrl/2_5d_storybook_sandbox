@@ -1,8 +1,8 @@
 # AUDIT-R-ITEMS · §4 R1–R22 决策台账
 
 > 来源:`docs/AUDIT-W34.md` §4「未修项(逐条理由)」。
-> 口径:每行一条决策;**位置列已按当前代码逐条核对并订正漂移的行号**。
-> 「现状」= 抽取时点的核实结果(带 `Pxx` 台账编号便于回溯);「代价」按改动面估(低 = 单函数/单文件;中 = 跨 2–3 处或需先定常数;高 = 需玩法/视觉裁决 + 多文件)。
+> 口径:每行一条决策;**「现状」列本批已逐条订正到「已修(判据 ...)」—— 22 条全部已修,差别只在判据来源**(R1/R2 走抗性链路的两套判据,R3 走击退钳制,R14/R18 走 `WS-FND-100`,R22 走 `WS-FND-101`,其余走第二/三批的 `WS-FND-91/92/94/95`)。
+> 「代价」按改动面估(低 = 单函数/单文件;中 = 跨 2–3 处或需先定常数;高 = 需玩法/视觉裁决 + 多文件),是**修之前**的估价,保留供回溯。
 > 生成方式:只读审计稿与代码,未改任何代码或其它文档。
 
 ## 台账(R1–R22)
@@ -10,37 +10,45 @@
 ### 列含义
 
 - **位置(文件:行)** —— 按当前代码逐条核对过的落点;代码漂移时这一列要跟着订正。
-- **现状** —— 「已修 / 已关闭 / 登记」三态;括号内是台账编号与判据套件。
-- **代价 / 建议 / 影响面** —— 只是排序依据,不是承诺;真正的排期见文末「排序」。
+- **现状** —— 只有两态了:**已修**(括号内 = 原台账编号 `Pxx` + 判据套件与条目)。「登记」在本批已清零。
+- **代价 / 建议 / 影响面** —— 代价是修前的估价;**建议列已改成「结果」**(一句话说清这条今天是什么状态),不再是排期建议。
 
-| ID | 原始发现(一句话) | 位置(文件:行) | 现状(已修/登记) | 修它的代价(低/中/高) | 我的建议(做/不做 + 一句话) | 影响面(改哪个模块) |
+| ID | 原始发现(一句话) | 位置(文件:行) | 现状(已修/登记) | 修它的代价(低/中/高) | 我的建议/处置(一句结果) | 影响面(改哪个模块) |
 |---|---|---|---|---|---|---|
-| R1 | 元素抗性整条链「写入侧」无生产写入 ⇒ `setElementResist` 恒无输入,抗性 no-op | `server/src/combat/vitals.ts:522`(写入点 `server/src/rooms/effects.ts:418` `pushRoomElementResist`,调用 `server/src/sim/world_sim.ts:4033`) | 已修(P2-1;FND93-1/3/5/6) | 低 | 不做 — 链已接通,剩余只是待平衡默认值(§7.2),属平衡不属接线 | combat/vitals.ts + rooms/effects.ts |
-| R2 | 元素抗性整条链「读取侧」`applyHit` 的抗性无生产写入点 | `server/src/combat/vitals.ts:841`(`resistMul` 取用 `:852`) | 已修(P2-2;FND93-1/2) | 低 | 不做 — 写入侧落地后 `element` 参数已有输入,无需再动 | combat/vitals.ts |
-| R3 | 击退无上界钳制 + `mass=NaN` 可经客户端自报质量传播 | `server/src/physics/world.ts:876` `applyImpulse`、`:291` `spawn`、碰撞质量归一 `:842-843/879/894`(`:332` 注释已述拒非有限 mass 的意图) | 登记(P2-3) | 中 | 做 — 先定「最大冲量」玩法上限,再在 `applyImpulse`/质量归一收口(含拒绝非有限 mass) | server/src/physics/world.ts(+ shared/types/physics.ts 常量) |
-| R4 | `resetWorld` 不按等级重算 HP 上限(下一帧 `maxHpForLevel` 才覆盖回,窗口 1 tick) | `server/src/sim/world_sim.ts:4358` `resetWorld`(抬上限复用点 `:4714` `maxHpForLevel`+`syncMaxHp`) | 已修(P2-4;FND91-7) | 低 | 不做 — 重置序列已接上限重算,窗口已消 | sim/world_sim.ts |
-| R5 | 玩家→生物攻击无视线闸(越墙打怪) | `server/src/sim/world_sim.ts:2175` `losBlocked`(import `:219`;PvP 同族 `:2254`) | 已修(P2-5;FND91-1/2) | 低 | 不做 — 热路径已接 `vision.ts` 且带预算化指标 `:4981-5166` | sim/world_sim.ts + world/vision.ts |
-| R6 | 攻击侧不封 `TRAPPED`/`STUNNED`(被夹住/定身仍能挥刀) | **已漂移**:原指 `server/src/net/actions/attack.ts`,该文件现为 14 行 stub(恒 `NOT_IMPLEMENTED`);真正的闸在 `server/src/sim/world_sim.ts:2143`/`:2145`(玩家→生物)、`:2234`/`:2236`(PvP) | 已修(P2-6;FND91-3/4/5/6) | 低 | 不做 — 两台状态机(移动侧/攻击侧)已同源同拒因 | sim/world_sim.ts |
-| R7 | `purchaseCommit` 无幂等键 ⇒ 重放同一次购买重复成交 | `server/src/sim/world_sim.ts:6619` `purchaseCommit`(动作侧 `server/src/net/actions/buy_item.ts`) | 已修(P2-7;FND91-8/9/10) | 低 | 不做 — 幂等键 + 提交时实测库存已落地(§7.3) | sim/world_sim.ts + net/actions/buy_item.ts |
-| R8 | 箱子存取不比距离(能远程开箱) | `server/src/net/actions/open_chest.ts`(`CHEST_REACH` `:113`、距离闸 `:297-298`) | 已修(P2-8;FND92-1..5/10) | 低 | 不做 — 交互半径常量 + 权威位置距离闸已接 | net/actions/open_chest.ts |
-| R9 | `place_automation` 不扣件(放置零消耗) | `server/src/net/actions/place_automation.ts`(扣减 `spend` `:334`,先扣后登记 `:322-342`) | 已修(P2-9;FND92-6..9) | 低 | 不做 — 已按 `placeBlock` 口径「先扣背包、再写世界」 | net/actions/place_automation.ts |
-| R10 | `snapshot_blob` 写库无上限(极端账号撑大库) | `server/src/db/repo.ts:430` `assertReconnectSnapshotSize`(常量 `:421`、写点 `:467` `saveReconnectSnapshot`;世界归档 `:1142` `archiveWorldSnapshot`) | 已修(P2-10;FND94-2a/2b) | 低 | 不做 — 1 MiB 同口径上限已卡在写口 | server/src/db/repo.ts |
-| R11 | `fluid.clone()` 丢活跃集(读回后水不再自流) | `server/src/world/fluid.ts:775` `clone` | 已修(P2-11;FND94-4a/4b/4c) | 低 | 不做 — clone 已带活跃集,回放/存档行为一致 | server/src/world/fluid.ts |
-| R12 | `physics.spawn()` 覆盖同 id 不清旁表(`belt`/`carry`/`carrySlot`) | `server/src/physics/world.ts:291` `spawn`(注释 `:270-288` 述回收口径) | 已修(P2-12;FND94-5a/5b) | 低 | 不做 — `spawn` 已与 `remove` 同口径回收旁表 | server/src/physics/world.ts |
-| R13 | `ticks`/`seq` 无上界(可回绕/写错字节) | `shared/net/delta.ts:537` `assertU32('tick',…)`(常量 `:127` `MAX_ACKED_SEQ`);`server/src/net/ws_server.ts:497` `parseMoveIntent`、`:755` `ackSlotValue` | 已修(P2-13;FND95-4/5/6/7) | 低 | 不做 — 口径是抛错/拒,已双端落地(§8.1) | shared/net/delta.ts + server/src/net/ws_server.ts |
-| R14 | `applyRestore` 的 chunk 解码在闸后且无 `try`(坏档异常分类不干净) | `server/src/sim/world_sim.ts:6736` `applyRestore` | 登记(P3-1) | 低 | 做 — 单函数加 `try`+错误分类,改动面最小、判据易写(见排序) | sim/world_sim.ts |
-| R15 | `setRoof` 静默截 16 位(现为 12 位/4095 校验) | `server/src/world/chunk.ts:635` `setRoof`、`server/src/world/grid.ts:136` | 已修(P3-2;FND94-6) | 低 | 不做 — 写入校验与层规格共用同一事实源,越界即抛 | world/chunk.ts + world/grid.ts |
-| R16 | `decodeRoofRle` 的 `tag=0xff` 游程越界 | `server/src/world/chunk.ts:928` `decodeRoofRle`(截断即抛 `:936`) | 已修(P3-3;FND94-7) | 低 | 不做 — 畸形字节流已被拒,非静默 | world/chunk.ts |
-| R17 | `fluid.setCell` 可写进实心格 | `server/src/world/fluid.ts:275` `setCell`(注释 `:264`) | 已修(P3-4;FND94-8a/8b) | 低 | 不做 — 实心格不存水已落到 `setCell` 内部 | server/src/world/fluid.ts |
-| R18 | 水位预算极端情况下全丢(单帧预算被打满 ⇒ 这一帧水不动) | `server/src/world/fluid.ts:341` `step`/`:39` `FLUID_CELL_BUDGET`;分派点 `server/src/sim/world_sim.ts:6976` | 登记(P3-5) | 中 | 做(低优先) — 只影响「这一帧水不动」不是错值,修法要先定「活跃集是否进存档」口径 | world/fluid.ts + sim/world_sim.ts |
-| R19 | `ws/hp` 钳制选址在 `vitals` 而非编码器 | `server/src/combat/vitals.ts:909`(单点约定块;钳制 `:665`);编码器抛错点 `shared/net/delta.ts:400` `toUint` | 已修/已关闭(P3-6;FND95-8) | 低 | 不做 — 已写成单点约定(§7.5),编码器只抛错不圆场 | combat/vitals.ts + shared/net/delta.ts |
-| R20 | `node:sqlite` 事务不支持嵌套(现状无嵌套调用点) | `server/src/db/driver.sqlite.ts:244` `transaction`(better-sqlite3 自带 savepoint)、`:315` node:sqlite 层自带 savepoint 语义 | 已修(P3-7;FND94-1a/1b/1c) | 低 | 不做 — 三后端已统一到同名 savepoint 语义 | server/src/db/driver.sqlite.ts |
-| R21 | 双端同源检测仍只告警(未进默认拦截) | `scripts/verify.ts:4150` `BOTH_SIDES_GATE`、`:4167` `bothSidesVerdict`、`:4383` 接入判据 | 已修/已关闭(P3-8;FND95-1/2/3) | 低 | 不做 — 实测 0 处,前提满足,已并进默认拦截(§8.2) | scripts/verify.ts |
-| R22 | 顶点色 + `aLodMerge` 的 LOD 合并语义未定(合并阈值与插值口径未裁决) | `client/src/three/compat.ts:247-252` `aLodMerge` 属性;`client/src/stage/terrain_vcolor.ts:255-288`(`MERGE_THEN_COLOR`) | 登记(P3-9) | 高 | 做(需先裁决) — 先出「合并阈值 + 顶点色插值」视觉裁决,否则改了也判不了;今天判据只钉属性存在且长度对 | client/src/three/compat.ts + client/src/stage/terrain_vcolor.ts |
+| R1 | 元素抗性整条链「写入侧」无生产写入 ⇒ `setElementResist` 恒无输入,抗性 no-op | `server/src/combat/vitals.ts:522`(写入点 `server/src/rooms/effects.ts:418` `pushRoomElementResist`,调用 `server/src/sim/world_sim.ts:4033`) | 已修(判据 WS-FND-93:1/3/5/6 + WS-FND-97:1..6 · P2-1) | 低 | 已完成 — 写入侧有生产调用点(`roomAtCell` 定位 → 推送),读取侧 `applyHit` 因此才有 `element` 输入;剩下的 `PENDING_ELEMENT_RESIST_MUL = 0.5` 是数据待平衡,不是接线 | combat/vitals.ts + rooms/effects.ts |
+| R2 | 元素抗性整条链「读取侧」`applyHit` 的抗性无生产写入点 | `server/src/combat/vitals.ts:841`(`resistMul` 取用 `:852`) | 已修(判据 WS-FND-93:1/2 + WS-FND-97:3/4 · P2-2) | 低 | 已完成 — 倍率在读取侧真被消费,且换房/进未登记房/出房都有撤销路径(FND97-4/5);数值待平衡同 R1 | combat/vitals.ts |
+| R3 | 击退无上界钳制 + `mass=NaN` 可经客户端自报质量传播 | `server/src/sim/world_sim.ts:3369` `KNOCKBACK_MAX_CELLS`(钳制点 `:3475` `Math.min`);`server/src/physics/world.ts:907` `applyImpulse`、`:59` `safeMass`、`:317` `spawn`(碰撞质量归一 `:868-869`) | 已修(判据 WS-FND-98:1..8 · P2-3) | 中 | 已完成 — 总位移钳到 `KNOCKBACK_MAX_CELLS` = **2 格**(D-09 同量级,不是新裁决),非法质量经 `safeMass` 拒绝、不再产出 `NaN` 冲量;1e9 格击退也只推 2 格 | sim/world_sim.ts + physics/world.ts |
+| R4 | `resetWorld` 不按等级重算 HP 上限(下一帧 `maxHpForLevel` 才覆盖回,窗口 1 tick) | `server/src/sim/world_sim.ts:4541` `resetWorld`(抬上限复用点 `:3781` `maxHpForLevel`+`syncMaxHp`) | 已修(判据 WS-FND-91:7 · P2-4) | 低 | 已完成 — 重置序列自己重算上限,1 tick 窗口已消 | sim/world_sim.ts |
+| R5 | 玩家→生物攻击无视线闸(越墙打怪) | `server/src/sim/world_sim.ts:2175` `losBlocked`(import `:219`;PvP 同族 `:2254`) | 已修(判据 WS-FND-91:1/2 · P2-5) | 低 | 已完成 — 热路径接 `vision.ts` 视线闸,并带预算化指标 `:4981-5166` | sim/world_sim.ts + world/vision.ts |
+| R6 | 攻击侧不封 `TRAPPED`/`STUNNED`(被夹住/定身仍能挥刀) | **已漂移**:原指 `server/src/net/actions/attack.ts`,该文件现为 14 行 stub(恒 `NOT_IMPLEMENTED`);真正的闸在 `server/src/sim/world_sim.ts:2143`/`:2145`(玩家→生物)、`:2234`/`:2236`(PvP) | 已修(判据 WS-FND-91:3..6 · P2-6) | 低 | 已完成 — 移动侧/攻击侧两台状态机同源同拒因(`TRAPPED`/`STUNNED` 逐条对得上) | sim/world_sim.ts |
+| R7 | `purchaseCommit` 无幂等键 ⇒ 重放同一次购买重复成交 | `server/src/sim/world_sim.ts:6812` `purchaseCommit`(动作侧 `server/src/net/actions/buy_item.ts`) | 已修(判据 WS-FND-91:8/9/10 · P2-7) | 低 | 已完成 — 幂等键已加,回执 `stock` 取「提交时实测」,不再用报价快照(§7.3) | sim/world_sim.ts + net/actions/buy_item.ts |
+| R8 | 箱子存取不比距离(能远程开箱) | `server/src/net/actions/open_chest.ts`(`CHEST_REACH` `:113`、距离闸 `:297-298`) | 已修(判据 WS-FND-92:1..5/10 · P2-8) | 低 | 已完成 — 交互半径成了具名常量,距离按**权威位置**判 | net/actions/open_chest.ts |
+| R9 | `place_automation` 不扣件(放置零消耗) | `server/src/net/actions/place_automation.ts`(扣减 `spend` `:334`,先扣后登记 `:322-342`) | 已修(判据 WS-FND-92:6..9 · P2-9) | 低 | 已完成 — 按 `placeBlock` 口径「先扣背包、再写世界」 | net/actions/place_automation.ts |
+| R10 | `snapshot_blob` 写库无上限(极端账号撑大库) | `server/src/db/repo.ts:430` `assertReconnectSnapshotSize`(常量 `:421`、写点 `:467` `saveReconnectSnapshot`;世界归档 `:1142` `archiveWorldSnapshot`) | 已修(判据 WS-FND-94:2a/2b · P2-10) | 低 | 已完成 — 1 MiB 同口径上限卡在写口,世界归档与快照共用同一把尺 | server/src/db/repo.ts |
+| R11 | `fluid.clone()` 丢活跃集(读回后水不再自流) | `server/src/world/fluid.ts:775` `clone` | 已修(判据 WS-FND-94:4a/4b/4c · P2-11) | 低 | 已完成 — clone 带活跃集,回放/存档后水照样自流 | server/src/world/fluid.ts |
+| R12 | `physics.spawn()` 覆盖同 id 不清旁表(`belt`/`carry`/`carrySlot`) | `server/src/physics/world.ts:317` `spawn`(注释 `:270-288` 述回收口径) | 已修(判据 WS-FND-94:5a/5b · P2-12) | 低 | 已完成 — `spawn` 与 `remove` 同口径回收旁表,覆盖同 id 不留残影 | server/src/physics/world.ts |
+| R13 | `ticks`/`seq` 无上界(可回绕/写错字节) | `shared/net/delta.ts:537` `assertU32('tick',...)`(常量 `:127` `MAX_ACKED_SEQ`);`server/src/net/ws_server.ts:497` `parseMoveIntent`、`:755` `ackSlotValue` | 已修(判据 WS-FND-95:4..7 · P2-13) | 低 | 已完成 — 口径是**抛错/拒**(不是绕比),双端已落地(§8.1) | shared/net/delta.ts + server/src/net/ws_server.ts |
+| R14 | `applyRestore` 的 chunk 解码在闸后且无 `try`(坏档异常分类不干净) | `server/src/sim/world_sim.ts:6944` `applyRestore`(分类码 `RESTORE_FAIL`,闸 `:6904` 归档→重置→回放路径) | 已修(判据 WS-FND-100:1..6 · P3-1) | 低 | 已完成 — 闸内加 `try` + 四类码(`shape` / `size` / `bad-archive` / `internal`),坏档**不抛**;每条判据同时钉「**世界一字未改**」(帧/种子/地形/玩家/水位/活跃集快照比对) | sim/world_sim.ts |
+| R15 | `setRoof` 静默截 16 位(现为 12 位/4095 校验) | `server/src/world/chunk.ts:635` `setRoof`、`server/src/world/grid.ts:136` | 已修(判据 WS-FND-94:6 · P3-2) | 低 | 已完成 — 写入校验与层规格共用同一事实源,越界即抛 | world/chunk.ts + world/grid.ts |
+| R16 | `decodeRoofRle` 的 `tag=0xff` 游程越界 | `server/src/world/chunk.ts:928` `decodeRoofRle`(截断即抛 `:936`) | 已修(判据 WS-FND-94:7 · P3-3) | 低 | 已完成 — 畸形字节流被拒(截断即抛),不是静默截断 | world/chunk.ts |
+| R17 | `fluid.setCell` 可写进实心格 | `server/src/world/fluid.ts:299` `setCell`(注释 `:288`) | 已修(判据 WS-FND-94:8a/8b · P3-4) | 低 | 已完成 — 「实心格不存水」落在 `setCell` 内部,所有写水路径都过它 | server/src/world/fluid.ts |
+| R18 | 水位预算极端情况下全丢(单帧预算被打满 ⇒ 这一帧水不动) | `server/src/world/fluid.ts:384` `step`/`:39` `FLUID_CELL_BUDGET`(报告字段 `:555-557` `deferredCells`);分派点 `server/src/sim/world_sim.ts:7283`(回执 `:7287-7290`) | 已修(判据 WS-FND-100:7/8 · P3-5) | 中 | 已完成 — 额度不够只**延后**不**丢失**:`deferredCells`/`deferredAmount` 进 `FluidStepReport`,residual 水位与没轮到的活跃格逐帧守恒(120 帧 × 额度 4 实测),编排层看得见「这一帧延后了几格」 | world/fluid.ts + sim/world_sim.ts |
+| R19 | `ws/hp` 钳制选址在 `vitals` 而非编码器 | `server/src/combat/vitals.ts:909`(单点约定块;钳制 `:665`);编码器抛错点 `shared/net/delta.ts:400` `toUint` | 已修(判据 WS-FND-95:8 · P3-6) | 低 | 已完成 — 写成单点约定(§7.5),编码器只抛错不圆场,不再有两处各钳一次 | combat/vitals.ts + shared/net/delta.ts |
+| R20 | `node:sqlite` 事务不支持嵌套(现状无嵌套调用点) | `server/src/db/driver.sqlite.ts:244` `transaction`(better-sqlite3 自带 savepoint)、`:315` node:sqlite 层自带 savepoint 语义 | 已修(判据 WS-FND-94:1a/1b/1c · P3-7) | 低 | 已完成 — 三后端统一到同名 savepoint 语义,嵌套退化成计数而不是抛错 | server/src/db/driver.sqlite.ts |
+| R21 | 双端同源检测仍只告警(未进默认拦截) | `scripts/verify.ts:4150` `BOTH_SIDES_GATE`、`:4167` `bothSidesVerdict`、`:4383` 接入判据 | 已修(判据 WS-FND-95:1/2/3 · P3-8) | 低 | 已完成 — 实测 **0 处**命中、升级前提已满足,已并进默认拦截(§8.2) | scripts/verify.ts |
+| R22 | 顶点色 + `aLodMerge` 的 LOD 合并语义未定(合并阈值与插值口径未裁决) | `client/src/stage/terrain_vcolor.ts:482` `LOD_MERGE_MAX_DZ`、`:503` `LOD_COLOR_INTERPOLATION`、`:288` `LOD_MERGE_ORDER`、`:548` `lodMergeVerdict`;`client/src/three/compat.ts:240` `LOD_MERGE_ATTRIBUTE`(`aLodMerge`) | 已修(判据 WS-FND-101:1..8 · P3-9) | 高 | 已完成 — 裁决落地:**阈值 `LOD_MERGE_MAX_DZ = 1`**(块内高差 ≤ 1 层才准以合并色出现在粗档)、**插值 `STEP_BY_LAYER`**(按层查调色板,层间阶跃、**不插值**,与 `MERGE_THEN_COLOR` 同序);判据把阈值边界、跨块不合并、法线与合并无关、以及「改任一参数必翻红」都钉住 | client/src/three/compat.ts + client/src/stage/terrain_vcolor.ts |
 
 ## 排序(先做哪几条)
 
-**仍登记的只有 4 条:R3 / R14 / R18 / R22**(与审计稿 §4 抬头「最终仍登记的 4 条:P2-3 / P3-1 / P3-5 / P3-9」一致);其余 18 条(R1、R2、R4–R13、R15–R17、R19–R21)都已修/关闭,不再排期。
+**22/22 已处置 —— 「仍登记」为 0 条。** 判据来源分四处,不是「一批全修」也不是「四条仍挂着」:
 
-**先做顺序:R14 → R3 → R18 → R22。**
-理由:先吃「低代价、修法已定型」的 R14(单函数加 `try` + 错误分类,半天级);再 R3(需先定玩法上限,改动局限在 physics 一处);R18 与 R3 同级但影响更轻,可紧随;R22 代价最高且**卡在视觉裁决**上,裁决不出就不动。
+- `R1` / `R2` → `WS-FND-93`(链路)+ `WS-FND-97`(房间元素语义:9 种房一个不漏、未登记房零抗性、换房即换元素);
+- `R3` → `WS-FND-98`(击退钳制 2 格 + 质量归一,钳制已在 K2 落地,本行由「做」改「已修」);
+- `R4`–`R13`、`R15`–`R17`、`R19`–`R21` → 第二/三批的 `WS-FND-91` / `92` / `94` / `95`;
+- `R14` / `R18` → `WS-FND-100`(8 条:R14 错误分类 + 「世界一字未改」;R18 预算延后 + `deferredCells` 指标);
+- `R22` → `WS-FND-101`(8 条:阈值 `LOD_MERGE_MAX_DZ = 1` + 插值 `STEP_BY_LAYER`)。
+
+⇒ 排期表已空。**这 22 条之外还剩两个纯数据待平衡值**(接线已通、判据不拦,换常量即可,判据不用改):
+
+1. **元素抗性倍率 `PENDING_ELEMENT_RESIST_MUL = 0.5`**(`server/src/rooms/effects.ts:355`,元素归属 `ICE`)—— 内容表里仍没有这个数,判据证明的是「链通了」,不是「数值是最终平衡」(§7.2 第 2 条)。
+2. **mob 稀有掉落概率 `MOB_RARE_DROP_CHANCE = 0.15`**(`shared/constants/mobs.ts:38`,管 `753 稀有树种` / `751 稀有甜点食谱` 两件稀有材料)—— 手册只写「稀有」没写概率,0.15 是可判定但未裁决的占位(§7.2 同源问题)。
