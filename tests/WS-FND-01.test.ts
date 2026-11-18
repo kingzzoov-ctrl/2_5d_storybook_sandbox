@@ -246,6 +246,25 @@ test('A15 指纹只反映内容数据:等价的规范输入得到等价指纹', 
     for (const k of Object.keys(p).reverse()) rev[k] = p[k];
     return rev;
   });
+  /* ★★ 2026-11-18 元审计:本用例此前**一个断言都没有**(恒绿)——
+     上面把 `viewA`/`viewB` 造出来就结束了,`ok`/`eq` 一次都没调用。
+     ⇒ 现在补真断言(**含两条负对照**),否则这只是一段会跑、但不判的代码。 */
+  const ca = canonicalize(viewA);
+  const cb = canonicalize(viewB);
+  ok(ca === cb, '键序不同、语义相同的两份视图,规范化后必须逐字节相同(指纹不得随键序漂移)');
+  eq(fnv1a32(ca), fnv1a32(cb), '等价输入 ⇒ 等价指纹');
+  /* ★ 独立复算:按 `FINGERPRINT_EXCLUDED.items`(= `note`)投影后,**与发布值比** ——
+     而不是拿 `contentFingerprints()` 的两侧互比(那是同义反复)。 */
+  eq(fnv1a32(ca), contentFingerprints().items,
+    '本地投影复算出的 items 指纹 == contentFingerprints().items(独立复算,不是自比)');
+  /* ★ 负对照 1:`note` 被登记为文档字段 ⇒ 改了它**不该**改指纹 */
+  const withNote = ITEM_LIST.map((i) => project({ ...i, note: 'A15 负对照:改了它也不该改指纹' }));
+  eq(fnv1a32(canonicalize(withNote)), fnv1a32(ca), 'note 在 FINGERPRINT_EXCLUDED 里 ⇒ 改它不该改指纹');
+  /* ★ 负对照 2:改一个**参与**投影的字段(name)⇒ 指纹必须变
+     (否则上面那条「不该改」是恒真式,证明不了这里真的在算) */
+  const mutated = ITEM_LIST.map((i, idx) =>
+    (idx === 0 ? { ...project(i), name: 'A15-负对照-MUTATED' } : project(i)));
+  ok(fnv1a32(canonicalize(mutated)) !== fnv1a32(ca), '改动参与投影的字段后指纹必须变(负对照)');
 });
 
 /* ═══════════════ A. registry.ts — 位域容量账本 ═══════════════ */

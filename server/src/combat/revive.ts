@@ -26,6 +26,19 @@ export const GHOST_DRIFT_SPEED = 0.6;
 export const BUBBLE_GUN_SHOTS = 3;
 /** 泡泡困人时长(秒) */
 export const BUBBLE_TRAP_SEC = 5.0;
+
+/**
+ * ★ 227 水枪**连击窗口**(秒):距上次命中超过它 ⇒ 已有层数作废(第四轮审计 P2)。
+ *
+ * ## 为什么不新增数值
+ *
+ * 口径与兄弟路径 `combat/live_bubble.ts` 的 `LIVE_BUBBLE_STACK_WINDOW_SEC`
+ * **逐字相同**:就是手册里「装进大泡泡随风乱飘」的那个时长(`BUBBLE_TRAP_SEC`)。
+ * 活人泡泡那条路在 D-10 已按此修过(且 FND53-5 把「不许续杯」钉死),
+ * 倒地泡泡这条兄弟路径漏了同一道闸 —— 于是「早上第 1 发、下午第 3 发」
+ * 也能把人装进泡泡并把 `invulnSec` 重置成 5 秒。
+ */
+export const BUBBLE_STACK_WINDOW_SEC = BUBBLE_TRAP_SEC;
 /** 435 四色复活旗:旗点复活读条(秒),比手动救援略慢 */
 export const FLAG_REVIVE_TIME = 2.0;
 /** 435 旗点复活半径(格) */
@@ -73,6 +86,21 @@ export interface DownedState {
   rescuerId: string | null;
   /** 已叠加的泡泡层数(227 泡泡水枪) */
   bubbleStacks: number;
+  /**
+   * ★ 距**上次** 227 水枪命中的秒数(连击窗口,第四轮审计 P2)。
+   *
+   * ## 为什么是可选字段,为什么不在 `createDowned` 里
+   *
+   * `tests/WS-FND-36` 用 `Object.keys(after).length === DOWNED_FIELDS.length + 1`
+   * 把 `createDowned` 的键集**钉死为 13**(逐字段 + 逐字节比对「入参一字未动」)。
+   * ⇒ 这个键**只能**由 `bubbleGunHit` 首次命中时建立,不能进 `createDowned`
+   *   (否则 WS-FND-36 的字段计数判据会红,而那是既有判据,不该为一条新字段让路)。
+   *
+   * 语义:只在 `bubbleStacks > 0` 时有意义;缺键(`?? 0`)= 刚命中过,
+   * 窗口从 0 起算。存活期内的写回路径:`world_sim` 的 BUBBLE 分支把返回值存回
+   * `downedStates`,`tickGhostBubble` 每慢帧推进它。
+   */
+  bubbleSinceHitSec?: number;
   /**
    * 是否处于 3 秒无敌。
    *
@@ -144,10 +172,25 @@ export function tickGhostBubble(d: DownedState, dt: number): GhostBubbleTick {
   const downedSec = Math.round((d.downedSec + dt) * 1000) / 1000;
   /* 幽灵泡泡无重力地在原地缓慢漂浮;不允许自主位移 */
   const drift = Math.sin(downedSec * 1.4) * GHOST_DRIFT_SPEED * dt;
-  return {
-    downed: { ...d, downedSec, y: Math.round((d.y + drift) * 1000) / 1000 },
-    revived: false,
-  };
+  /* ★ 227 水枪**连击窗口**的衰减路径(第四轮审计 P2)——
+     修前 `bubbleGunHit` 只 `+1` 而这里什么都不做 ⇒ 层数永不衰减,
+     于是「任意间隔的第 3 发」都能把 `invulnSec` 重置成 5 秒(与 FND53-5
+     钉死的「不许续杯」相悖)。口径与 `live_bubble.tickLiveBubble` 逐字对齐:
+     `sinceHitSec` 超过 `BUBBLE_STACK_WINDOW_SEC` ⇒ 层数归零、计时归零。
+     这是窗口的**唯一执行点**(理由见 `bubbleGunHit` 的注释)。 */
+  const sinceHitSec = d.bubbleStacks > 0
+    ? Math.round(((d.bubbleSinceHitSec ?? 0) + Math.max(0, dt)) * 1000) / 1000
+    : 0;
+  const bubbleStacks = sinceHitSec >= BUBBLE_STACK_WINDOW_SEC ? 0 : d.bubbleStacks;
+  const next: DownedState = { ...d, downedSec, y: Math.round((d.y + drift) * 1000) / 1000 };
+  next.bubbleStacks = bubbleStacks;
+  /* ★ 只在**键已存在**时写回:没有层数时它归零(它只在 `stacks > 0` 时有意义 ——
+     否则它会一路涨,与 `live_bubble` 同口径);而键本身由 `bubbleGunHit` 建立,
+     本函数不许凭空加键(理由见 `DownedState.bubbleSinceHitSec` 的注释)。 */
+  if (d.bubbleSinceHitSec !== undefined) {
+    next.bubbleSinceHitSec = bubbleStacks > 0 ? sinceHitSec : 0;
+  }
+  return { downed: next, revived: false };
 }
 
 /** 幽灵泡泡期间完全免伤:takenMul 归零由 damage.ts 的第 6 步兑现。 */
@@ -249,16 +292,29 @@ export interface RangedReviveInput {
 /**
  * 227 泡泡连发水枪:对活人连中 3 发 → 装进大泡泡(BUBBLED)5 秒随风乱飘;
  * 对幽灵泡泡使用则叠 1 层泡泡,满 3 层可被推着走(不复活)。
+ *
+ * ★ **连击窗口**(第四轮审计 P2):每次命中把「距上次命中」**重置为 0**;
+ *   窗口的**唯一执行点**在 `tickGhostBubble`(随时间自然过期 ⇒ 层数归零)。
+ *   这里**不**再判一次 —— 两个入口各判一次就是「同一个概念两份实现」,而且
+ *   第二份在 tick 正常跑的生产路径里**永远走不到**(本仓点名的死分支形态)。
+ *   生产写回链:`world_sim` 的 BUBBLE 分支把返回值存回 `downedStates`,
+ *   每慢帧 tick 它。窗口字段由本函数**首次命中**时建立(`createDowned` 不带它,
+ *   理由见 `DownedState.bubbleSinceHitSec` 的注释)。
  */
 export function bubbleGunHit(downed: DownedState): { downed: DownedState; trapped: boolean } {
   const bubbleStacks = downed.bubbleStacks + 1;
   if (bubbleStacks >= BUBBLE_GUN_SHOTS) {
     return {
-      downed: { ...downed, bubbleStacks: 0, state: BodyState.BUBBLED, invulnSec: BUBBLE_TRAP_SEC },
+      downed: {
+        ...downed, bubbleStacks: 0, bubbleSinceHitSec: 0,
+        state: BodyState.BUBBLED, invulnSec: BUBBLE_TRAP_SEC,
+      },
       trapped: true,
     };
   }
-  return { downed: { ...downed, bubbleStacks }, trapped: false };
+  /* ★ 每次命中把窗口**重置为 0**:窗口按「最后一次命中」算,不是按第一次
+     (`live_bubble.liveBubbleHit` 逐字同款,连中 3 发的最佳节奏因此合法)。 */
+  return { downed: { ...downed, bubbleStacks, bubbleSinceHitSec: 0 }, trapped: false };
 }
 
 /**

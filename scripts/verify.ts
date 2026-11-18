@@ -1850,6 +1850,19 @@ const CLIENT_HTML_ENTRY = './src/main.ts';
  *
  * 自检(见 `checkReachability`):表里每个路径必须**存在**;
  * 若某天它变成可达,也要移出。否则白名单会因改名/删除而静默放宽。
+
+ *
+ * ## 本表的两个条数是**可被代码算出来的数** —— 故必须写成「自称」
+ *
+ * 可达性白名单 12 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(10)(生产零引用清单,
+ * 定义在 `scripts/orphan-audit.ts`)写在这里,由 `scripts/count-audit.ts` 与
+ * **运行时** `Map.size` 双向比对:改了名单却忘了同步这两处 ⇒ 当场红在
+ * 「文档自称与代码正解不一致」上,而不是让两条注释各自腐烂。
+ *
+ * ⚠️ 这两句同时是那道检测器的**下限**:把措辞改掉(或把这两行删掉),
+ *    它的命中数会掉到 0 —— 而「0 处命中」与「全都对上了」在同一次运行里
+ *    长得一模一样(陷阱 126)。故 `CLAIM_FLOORS` 要求每一类都**至少还看得见 1 处**。
+ *    ⇒ 删改措辞时必须顺手改 `CLAIM_FLOORS` 并写明理由,不许让它静默归零。
  */
 const UNREACHABLE_EXEMPT = new Map<string, string>([
   /* ── 客户端:已接线部分**已移出**(2026-11-12,task-32)──
@@ -3674,7 +3687,18 @@ function checkClientBuild(): void {
   console.log('\n[客户端构建]');
   const viteJs = join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
   if (!existsSync(viteJs)) {
-    console.log('      · 未装 vite(node_modules/vite 不存在)⇒ 客户端构建检查跳过');
+    /* ★ 2026-11-18 审计 P1(四处「静默跳过」之四)——
+       旧代码只 `console.log` 一句然后 return:它**既不计 advise、也不进汇总行**,
+       于是「没装 vite」与「客户端能构建」在结论行上**逐字相同**(都是「全部通过」)。
+      而这是 `client/` 下的 `boot.ts`(零测试覆盖)**唯一**的自动化验证 ⇒
+       没跑这件事必须出现在汇总里(README/HANDOVER 也据此说明该栏未校验)。
+       ⚠️ 不给升级开关:装不装可选开发依赖是环境决定,不是欠账 ——
+       把它做成 fail 就会变成「换台机器就红」的假红。 */
+    advise(
+      '客户端构建',
+      '未装 vite(node_modules/vite 不存在)⇒ 客户端构建**未校验**'
+      + '(boot.ts 零测试覆盖,这是它唯一的自动化验证;汇总行会列出本条)',
+    );
     return;
   }
   /* ⚠️ `spawnSync` 必须读 `status` —— 本仓踩过:
@@ -5615,7 +5639,16 @@ function checkJudgementAudit(): void {
   console.log('\n[判据形态审计]');
   const script = join(ROOT, 'scripts/judgement_audit.ts');
   if (!existsSync(script)) {
-    advise('判据形态审计', 'judgement_audit.ts 不存在 ⇒ 判据形态审计未运行(它扫的是判据自身)');
+    /* ★ 2026-11-18 审计 P1(四处「静默跳过」之一)——
+       这里原来是 `advise('判据形态审计', ...)` + `return`:删掉 `judgement_audit.ts`
+       就等于**关掉整道判据形态审计**(它扫的是判据自身),而门禁照打「全部通过」。
+       同族的另外四处(`checkCountAudit` / 可达性 / 入口可加载 / 入口执行层)
+       用的都是 `fail` —— 判据被删掉与判据通过必须可区分(陷阱 126),
+       而"提醒一句"不会让任何人停下来处理。 */
+    fail(
+      '判据形态审计:scripts/judgement_audit.ts 不存在 ⇒ 这道判据**被删掉了**'
+      + '(不是"没跑",是"没有比对";它扫的是其它判据自身)',
+    );
     return;
   }
   const r = spawnSync(process.execPath, ['scripts/judgement_audit.ts', '--baseline'], {
@@ -5709,7 +5742,7 @@ function checkJudgementAudit(): void {
  *   (审计 P1 已把它改成默认真跑:同一个判据,同一个处置)。
  * ⇒ 判据:**一个"声明与事实不符"的检测器,不该由记得开开关的人来决定它有没有代价。**
  *
- * ## 消费侧必须同时看六件事
+ * ## 消费侧必须同时看七件事
  *
  * ```
  * 1 汇总行解析不到            ⇒ 崩溃 / 超时 / 格式变了 ⇒ **不能当绿**
@@ -5718,6 +5751,7 @@ function checkJudgementAudit(): void {
  * 4 ★ 登记失真                ⇒ fail(正解 ≠ 实测;2026-11-18 审计 P1-3 新增)
  * 5 ★ 命中数低于下限          ⇒ fail(检测面被改没了;2026-11-18 审计 P1 新增)
  * 6 ★ 扫描文件缺失            ⇒ fail(被扫文件被删 ⇒ 里面的自称一起消失;同上新增)
+ * 7 ★ 正解为 0 未登记          ⇒ fail(0 与「表真的空」不可区分;2026-11-18 审计 P1-4 新增)
  * ```
  * ⚠️ 5/6 与 2 是**相反**的:2 查「比过了且对上了没有」,5/6 查「**还比得上吗**」。
  *   少了它们:把文档那句话改个词 ⇒ 命中 0 ⇒ 2/3/4 全部成立 ⇒ 整道门印「一致 0」而绿。
@@ -5789,6 +5823,18 @@ function checkCountAudit(): void {
       `计数对账:${belowFloor[1]} 项命中数低于具名下限 ⇒ **不是"没有陈旧",是没有比对**`
       + '(措辞被改 / 那一行被删 ⇒ 正则再也匹配不到;见 count-audit 的 CLAIM_FLOORS)'
       + (detail.length > 0 ? `\n${detail.join('\n')}` : ''),
+    );
+    return;
+  }
+  /* ★ 第 7 条(2026-11-18 审计 P1):**正解为 0 未登记**。
+     0 是合法但极易被误读的正解(表体真的空),上游要求它必须被**显式认账**;
+     接线侧必须认得这一行,否则那条断言在门禁上等于不存在(与第 5/6 条同一纪律:
+     「还比得上吗」这类判据,消费侧不看就等于没有)。 */
+  const zeroUnlisted = /★ 正解为 0 未登记:(\d+) 个/.exec(out);
+  if (zeroUnlisted !== null) {
+    fail(
+      `计数对账:${zeroUnlisted[1]} 个正解键解析为 **0** 却未登记 ⇒ 与「表真的空」不可区分`
+      + '(改名 / 缩进变了 / 表被清空都会走到这里;见 count-audit 的 ZERO_TRUTH_DECLARED)',
     );
     return;
   }
@@ -6126,8 +6172,17 @@ function checkDocs(): void {
   const docsDir = join(ROOT, 'docs');
   const files = walk(docsDir, ['.md']).filter((f) => /WS-\d\d-/.test(f));
   if (files.length === 0) {
-    console.log('  · 暂无 WS 文档(docs/WS-XX-*.md)');
-    return;
+    /* ★ 2026-11-18 审计 P1(四处「静默跳过」之二)——
+       旧代码在这里**直接 `return`**:`docs/WS-*.md` 一份不剩时,本函数后面三段
+       (非 WS 文档实质内容 / 文档间链接存在性 / 未决台账过时条目)**一起**被跳过,
+       而且 `docStructCount` 保持 `null` ⇒ README「WS 文档结构 N/N」静默退化成
+       「**未校验**(不是通过)」。一处缺失让四道检查同时消失,汇总行还说不出来。
+       ⇒ 改成 fail 并**继续往下走**:删掉文档是一件事,顺带把其余三类检查也关掉
+       是另一件事 —— 不能由前者决定后者。 */
+    fail(
+      'docs/ 下 0 份 WS-XX-*.md ⇒ 文档结构门**整体失效**(不是「暂无文档」);'
+      + '非 WS 文档 / 链接存在性 / 未决台账三道仍照跑,README 那一栏也会被逐字比',
+    );
   }
   const required = ['职责边界', '接口', '数据结构', '算法', '参数', '性能', '边界', '耦合', '验收', '未决'];
   let bad = 0;
@@ -6179,7 +6234,10 @@ function checkDocs(): void {
         而缺文档这件事**本身已经是一条 fail**,不需要再靠跳过它来表达。
         (我第一版就是放在里面,于是 WS-12 一出现就变成"未校验"。) */
   docStructCount = files.length;
-  if (bad === 0) {
+  if (bad === 0 && files.length > 0) {
+    /* ⚠️ `files.length > 0` **不是**多余的:去掉上面的早退之后,0 份文档会走到这里,
+       而 `bad` 也是 0 ⇒ 会打出一句「0 份 WS 文档结构完整」的**绿色**结论,
+       把一条 fail 盖成"看起来通过"。见上面 0 份分支的长注释。 */
     pass(`${files.length} 份 WS 文档结构完整,且与测试集合一一对应`);
   }
 
@@ -7809,6 +7867,13 @@ function runTests(): void {
   let counted = 0;
   /* 按 WS 前缀分组累计,便于看清「哪个 WS 有多少断言」 */
   const byGroup = new Map<string, { passed: number; total: number }>();
+  /* ★ 2026-11-18 审计 P1:各套件**自报的跳过**必须进总账。
+     缺口(实测):`tests/WS-FND-06` 那条「手册不在场 ⇒ `ok(true,'跳过')`」
+     在输出里与「断言通过」逐字相同 ⇒ 汇总行看不出有东西**没跑**(静默绿)。
+     口径:套件在自己输出末尾打一行 `跳过 N 项(为什么)`(见该套件末行),
+     这里累加并在总账行**指名**是哪个套件 —— 跳过只有进了总数才不算静默。 */
+  let sumSkipped = 0;
+  const skipBySuite: string[] = [];
 
   for (const f of files) {
     const rel = relative(ROOT, f).split(sep).join('/');
@@ -7848,6 +7913,15 @@ function runTests(): void {
       sumPassed += c.passed;
       sumTotal += c.total;
       counted += 1;
+      /* ★ 各套件自报的跳过(见上面 `sumSkipped` 的注释)。
+         ⚠️ 只有**自报**的才算:套件不打这一行 ⇒ 这里看不见 ——
+         故 `tests/WS-FND-112-gate-no-silent-skip.test.ts` 钉住「WS-FND-06 必须自报」,
+         否则"不打这一行"就成了一条新的静默通路。 */
+      const sk = /跳过\s*(\d+)\s*项/.exec(out);
+      if (sk !== null && Number(sk[1]) > 0) {
+        sumSkipped += Number(sk[1]);
+        skipBySuite.push(`${rel} 跳过 ${sk[1]} 项`);
+      }
         /* `WS-01.test.ts` → `WS-01`;`WS-FND-01.test.ts` → `WS-FND-01`;
            `WS-FND-09-wiring.test.ts` → `WS-FND-09-wiring`。
 
@@ -7906,7 +7980,16 @@ function runTests(): void {
         + '请检查 L4185 的分组正则是否认不出该套件文件名形态',
       );
     }
-    pass(`用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`);
+    /* ★ 跳过数必须**进这一行**:它是全仓唯一的「总账」汇总行。
+       缺口(2026-11-18 审计 P1):某个套件里一条判据因环境缺失走「跳过」时,
+       它自己那行输出与「断言通过」逐字无异 ⇒ 总账看不见 ⇒ 静默绿。
+       ⇒ 口径:套件自报 `跳过 N 项`,这里把总数与出事的套件一起打印出来
+       (没有自报的套件按 0 计;**不许**把 0 当成"没有问题"的证明)。 */
+    pass(
+      `用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`
+      + `;跳过 ${sumSkipped} 项**未校验**`
+      + (skipBySuite.length > 0 ? `(${skipBySuite.join(' / ')})` : ''),
+    );
     /* ★ task B:暴露给 README 校验(README 有四行数字都来自这里)。
        ⚠️ 只赋**全量**值:--only 时 sumTotal 只是那一个套件的数。
        且必须在这里赋 —— 因为上面的自洽断言已保证

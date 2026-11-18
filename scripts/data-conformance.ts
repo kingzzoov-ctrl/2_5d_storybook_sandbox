@@ -1441,14 +1441,26 @@ async function auditParty(plan: { lines: string[] } | null): Promise<void> {
   numCheck(G, '皇冠获胜所需持冠(秒)', 60, crownWin, modes.CROWN_WIN_SEC,
     'server/src/party/modes.ts#CROWN_WIN_SEC');
 
-  /* 手册 §3.8 的房间核心件:8 个动态房间 */
+  /*
+   * 手册 §3.8 的房间核心件:期望值**从表长推导**,不再硬编码。
+   *
+   * 旧写法 `bosses.ROOM_RECIPES.length === 8 ? 'MATCH' : 'UNKNOWN'` 把期望值
+   * 钉成一个字面量 8,而表内是 **9 条** ⇒ 这一项**恒判 UNKNOWN**:看起来
+   * 「检查过了」,实际永远不会红也永远不会对(典型的空壳判据)。
+   * 手册没有给出「应有多少房间」的确定数字(note 已写明),故期望值只能取表长;
+   * 于是这一项的牙齿放在**表自身是否可用**:条数 > 0 且每条都有 key 与必需件。
+   */
   const roomLine = L ? findLine(L, /### 3\.8 工坊生产设备/) : null;
+  const rooms = bosses.ROOM_RECIPES as readonly { key: string; required: readonly number[] }[];
+  const unusable = rooms.filter((r) => r.key.length === 0 || r.required.length < 1).length;
   add({
     group: G, label: '动态房间配方数', hb: '手册 §3.8 列出的核心件组合', hbLine: roomLine,
-    code: String(bosses.ROOM_RECIPES.length),
+    code: String(rooms.length),
     codeRef: 'shared/constants/bosses.ts#ROOM_RECIPES',
-    verdict: bosses.ROOM_RECIPES.length === 8 ? 'MATCH' : 'UNKNOWN',
-    note: '手册未给出「应有多少房间」的确定数字,8 是代码取值',
+    verdict: rooms.length > 0 && unusable === 0 ? 'MATCH' : 'MISMATCH',
+    note: unusable === 0
+      ? '手册未给出「应有多少房间」的确定数字 ⇒ 期望值取表长(旧版硬编码 8,与表内 9 条矛盾 ⇒ 恒判 UNKNOWN)'
+      : `${unusable} 条配方缺 key 或必需件为空 ⇒ 永远无法被识别`,
   });
 }
 

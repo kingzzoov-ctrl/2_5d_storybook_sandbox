@@ -167,6 +167,19 @@ export interface ExpGainResult {
  * restartAt:便于测试指定起点等级。
  */
 export function gainExp(progress: PlayerProgress, amount: number): ExpGainResult {
+  /*
+   * ★ 入口拒非有限(第四轮审计 P2)——
+   * ```
+   * Math.max(0, NaN) === NaN ⇒ exp = progress.exp + NaN = NaN
+   * 而升级循环的出口是 `if (exp < need) break`:NaN < need 恒 false
+   * ⇒ 一口气把 level 推到 MAX_LEVEL(实测 Lv.1 + NaN ⇒ Lv.30)
+   * ```
+   * 与 `vitals.applyDamage` / `applyHit` 的「非有限一律拒绝」同口径:
+   * 拒绝 = 档案一字不动(`progress` 原样回传),不发明「补满 / 当 0」之类的猜测语义。
+   */
+  if (!Number.isFinite(amount)) {
+    return { progress, gained: 0, overflow: 0, levelUps: [], animation: { play: false, seconds: 0 } };
+  }
   const add = Math.max(0, amount);
   if (progress.level >= MAX_LEVEL) {
     return {

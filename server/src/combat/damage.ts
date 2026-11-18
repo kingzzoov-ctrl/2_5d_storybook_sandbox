@@ -166,8 +166,11 @@ export function createTarget(patch: Partial<TargetProfile> & { id: string; name:
     element: Element.NONE, crystalArmor: false, mass: 1.0, takenMul: 1.0,
     dmgReduce: 0, reflectMul: 0, dodgeRate: 0, isBoss: false, ...patch,
   };
+  /* ★ 修前这里有两行**条件完全相同**的 if(第四轮审计顺手清):同一条件、同一赋值,
+     只是 `&&` 两侧写法互换 ⇒ 第二行是死代码(删掉行为逐字不变)。
+     保留的语义:`shield` 给了而 `shieldMax` 没给 ⇒ 以 `shield` 当初始上限;
+     两者都给 ⇒ 显式 `shieldMax` 优先(`...patch` 已经写进去了)。 */
   if (patch.shieldMax === undefined && patch.shield !== undefined) base.shieldMax = patch.shield;
-  if (patch.shield !== undefined && patch.shieldMax === undefined) base.shieldMax = patch.shield;
   return base;
 }
 

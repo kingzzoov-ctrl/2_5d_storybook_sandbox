@@ -463,3 +463,119 @@ this.expireItemSources();
   `docs/COMPLETION-CRITERIA.md` 不变(`fc1142dd0afb`)。重算用临时脚本副本跑完即删(LF 归一 = 索引 blob 口径)。
 - 逐套件:`WS-FND-106` 13/13 · `WS-FND-107` 9/9 · `WS-FND-108` 6/6 · `WS-FND-98` 17/17。
 - 未 commit、未碰 `.pi/`、未改 `docs/` 下本轮写权限之外的文件。
+
+---
+
+## 11 2026-11-18 第四轮处置(第六批:5 条 P1 + 28 条 P2/P3)
+
+> 判据:`tests/WS-FND-109-worldsim-invariants.test.ts`(8 条)、
+> `tests/WS-FND-110-blueprint-bounds.test.ts`(9 条)、
+> `tests/WS-FND-111-combat-numeric-bounds.test.ts`(11 条)、
+> `tests/WS-FND-112-gate-no-silent-skip.test.ts`(14 条)—— 共 **42 条**;
+> FND 号段 **01..112**、基座 **107 套件**、全仓 **121 套件 / 2332 条**。
+> 条数按**发现**去重(同一修法的正 / 负对照算一条):**P1 5 条 / P2·P3 28 条**
+> (P2 19 / P3 9)。严重度:`WS-FND-109` 的文件头自带 ★P1 / ★P2 / ★P3 标注,
+> **110 / 111 / 112 的文件头未标** ⇒ 下表按 §2 定义**就地判定**(判据编号即证据,可复核)。
+> 关闭口径不变:已修 = 标记 ∧ 可查证据(每条点到判据编号)。
+
+### 11.1 判据 ↔ 条目对照
+
+| 套件 | 条数 | 钉住的条目 |
+|---|---:|---|
+| WS-FND-109 | 8 | R4-P1-5 扣料中途失败不回滚(1/2/3)· R4-P2-1 炉火单向闩锁(4/5)· R4-P2-2 `removePlayer` 漏清 `afkRuns`(6)· R4-P3-1 重复行守卫(7)· R4-P2-3 派对台账只登记(8) |
+| WS-FND-110 | 9 | R4-P2-4 蓝图游程**展开前**不判上界(1/2)· R4-P2-5 空蓝图编码入口不收(3)· R4-P2-6 `overlapCells` 口径(4)· R4-P2-7 `serializeWireView` 丢格(5)· R4-P2-8 配方可选件只数 OBJ 层(6/7)· R4-P2-9 接力选项静默夹取(8)· R4-P3-2 `data-conformance` 硬编码 8(9) |
+| WS-FND-111 | 11 | R4-P2-10..14 元素矩阵五条(1..5)· R4-P2-15 `vitals.heal`(6)· R4-P2-16 `gainExp`(7)· R4-P2-17 铲子词条池(8)· R4-P2-18 `hpFlat`(9)· R4-P2-19 泡泡连击窗口(10)· R4-P3-3 `createTarget` `shieldMax`(11) |
+| WS-FND-112 | 14 | R4-P1-1..4 门禁四处静默跳过 + 计数对账(1..8)· R4-P3-4..9 **旧判据元审计**六条(9..14) |
+| 元审计(本轮自查) | — | R4-P2-20 新套件自身的同义反复候选 3 条(见 `[同义反复候选]` 节) |
+
+### 11.2 逐条处置
+
+**P1(5 条,全部已修)**
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P1-1 | P1 | 判据形态审计静默降级:删掉 `scripts/judgement_audit.ts` ⇒ `verify.ts::checkJudgementAudit` 只 `advise`、不进退出码(同族另外四处用的都是 `fail`),「判据还活着吗」这一问**没人回答** | 已修:缺件 ⇒ `fail`(FND112-1;含负对照) |
+| R4-P1-2 | P1 | `verify.ts::checkDocs` 在「`docs/WS-*.md` 一份不剩」时直接 `return` ⇒ 非 WS 文档 / 链接存在性 / 未决台账**三段一起**被跳过,README「WS 文档结构」静默降级成「未校验」 | 已修:0 份 ⇒ `fail`,另三段照跑(FND112-2) |
+| R4-P1-3 | P1 | `verify.ts::checkClientBuild` 在 `node_modules/vite` 不存在时只 `console.log` + `return` ⇒ 既不计 advise、也不进汇总行;而它是 `client/**/boot.ts` 零测试覆盖下**唯一**的自动化验证 | 已修:降级 ⇒ advise 进汇总(FND112-3) |
+| R4-P1-4 | P1 | `scripts/count-audit.ts`:`CLAIM_FLOORS` 里两类下限写 **0**(= 没有保护);`countEntries` 缩进一变返回 **0**(非 `null`)而断言 #2 只查 `undefined` ⇒ 「自称 0 与实测 0」逐字全绿 | 已修:每类具名下限 **≥1**;表数为 0 时报「正解为 0 未登记」(FND112-4..8,含三处注入:改词 / 改缩进 / 清空) |
+| R4-P1-5 | P1 | `server/src/sim/world_sim.ts` 的 `forgeAlchemy` 逐项扣料,某项不足就 `return` ⇒ **已扣的永久消失**,与「`ok:false` 时世界完全未被改动」的自述矛盾;且复核只在 `await` **之前** | 已修:`consumeMaterialsFor` 先全量复核 + 还原分支(件数与次序逐字段);`await` 后的复核回到扣减**之前**(FND109-1/2/3,**零调用**通道也有判据) |
+
+**P2 / P3(28 条)**
+
+`WS-FND-109`(`server/src/sim/world_sim.ts`)
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P2-1 | P2 | `extinguishStationAt` 置 `fireOut` 后**全仓无复位路径** ⇒ 一次灭火永久失效(单向闩锁) | 已修:`relightStationAt` 真复位,本来就点着 ⇒ `false`(FND109-4/5) |
+| R4-P2-2 | P2 | `removePlayer` 只删连接态 `afkPlayers`,`afkRuns`(`dew` / `backgroundedAtSec` / `dozedSec`)从不清 ⇒ 同名重连继承上一轮的打盹计时 | 已修:`this.afkRuns.delete(id)`;慢帧 `afkTicked` 归零(FND109-6) |
+| R4-P3-1 | P3 | `removePlayer` 体内 `this.knockbacks.delete(id);` 有两行**逐字重复**(合并残留) | 已修:只出现 1 次 + `afkRuns.delete` 在册(结构守卫,FND109-7) |
+| R4-P2-3 | P2 | 注释声称 `GATHER` / `REACH_TARGET` 有「三个发射点」而实测只有一个;`startPartyRun` 全仓**零调用** ⇒ `partyRun` 恒 `null`、`partyPhase()` 恒 `'IDLE'` | **登记**(不冒充接线):判据钉「零调用 / 零发射点」,缺口写在 `notePartyEvent` / `partyRun` / `startPartyRun` 三处 docblock(FND109-8) |
+
+`WS-FND-110`(`server/src/build/{blueprint,wiring_view,rooms}.ts`)
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P2-4 | P2 | `decodeBlueprint` **先展开游程、后判格数**:`run = 5×10^14` 的一张**小码**就能挂死 / 爆内存 | 已修:上界判断移到展开之前;`MAX_RUN_CELLS` 具名常量 16384(合法),`+1` 非法且不误伤 128×128 单游程(FND110-1/2) |
+| R4-P2-5 | P2 | `encodeBlueprint` 不收空 cells ⇒ 产出 `run=0` 码,报错指向**解码器**,根因在编码入口 | 已修:编码入口按 `cells.length !== w*h` 拒(FND110-3) |
+| R4-P2-6 | P2 | `overlapCells` 字段文档写「两色以上重叠的**格**数」,实现返回 Σ(色数−1) ⇒ 本地 `overlapCells` 计数成**死代码** | 已修:统一到**格**口径(3 色格只算 1);负对照「无 3 色格时两口径才相等」(FND110-4) |
+| R4-P2-7 | P2 | `serializeWireView` 用 `Math.min(run, 255)` 直接**丢掉**溢出格 ⇒ 512 宽一行反序列化错位、丢线且**不报错** | 已修:`>255` 的同值游程**分段发**(FND110-5) |
+| R4-P2-8 | P2 | 房间配方只数「内部非 barrier 的 OBJ 层」⇒ `SAKURA_ONSEN`(304 地砖)/ `ECO_RANCH`(357 围合环)的可选件**恒不命中**、加分恒 0 | 已修:OBJ / FLOOR / 围合环三层都数,带「换地砖 / 普通墙 ⇒ 不命中」负对照(FND110-6/7)。纯材料类可选件(109 / 155 / 158)在原理上不在本文件可裁决范围 —— 文件头的「诚实边界」已写明 |
+| R4-P2-9 | P2 | `buildRelayQueue` 用 `void options` + `Math.max(1, ...)` **静默夹取**;`perBuilderParallel ≤ 0` 永不派活 | 已修:`assertRelayOptions` 入口**抛**;合法值照常派活(FND110-8) |
+| R4-P3-2 | P3 | `scripts/data-conformance.ts` 把「房间配方数」**硬编码成 8**,与表内 9 条恒冲突 ⇒ 该项**恒判 UNKNOWN**(空壳判据) | 已修:期望值取自表本身,断言不再自我比对(FND110-9)。同一文件仍是类型基线里被修掉的 1 条 `TS2367`(见 §11.4) |
+
+`WS-FND-111`(战斗数值层)
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P2-10 | P2 | `ELEMENT_COUNTER` 的 `ICE→SLIME = 1.25` 是全表**唯一**第五档值 | 已修:值域只允许 `{1.0, 1.5, 0.75, 0.5}`,6×6 全覆盖(FND111-1;负对照:把 1.25 写回 ⇒ 值越界 + 反克对不互反两条同时命中) |
+| R4-P2-11 | P2 | `SLIME→LIGHTNING = 0.5` 与 `LIGHTNING→SLIME = 1.5` **不成对**(反克对不互反) | 已修:双向互反,全表恰好 6 条克制关系(四元环 4 + 星光克胶质 + 霜冻克胶质)(FND111-2) |
+| R4-P2-12 | P2 | `elementMul` 与矩阵表**两份口径** | 已修:逐格等于表;同属性 0.5、`NONE` 行 / 列全 1.0(FND111-3) |
+| R4-P2-13 | P2 | `SLIME→LIGHT = 1.0` ⇒ 星光**列**全是 1.0,`LIGHT` 只作攻击方、没有任何目标 | 已修:`SLIME→LIGHT = 0.75`,星光列的非中性项 = 胶质(FND111-4;负对照:改回 1.0 ⇒ `LIGHT` 两侧都不可达) |
+| R4-P2-14 | P2 | `ICE` 的行 / 列是**不可达死键**,但没有任何登记 | 已修:`DEAD_ELEMENTS`(`kind = NO_ATTACKER`)与 `WEAPONS` 派生集合**双向**对齐(FND111-5) |
+| R4-P2-15 | P2 | `vitals.heal` 收非有限值:`Math.max(0, NaN) = NaN` ⇒ `hp` **永久** NaN | 已修:`!Number.isFinite(amount)` ⇒ 返回 0 且不污染 `hp` / `iframeSec`;正对照(合法治疗、超量钳到上限)与负对照齐全(FND111-6) |
+| R4-P2-16 | P2 | `gainExp` 收 NaN:出口 `exp < need` 恒 false ⇒ **Lv.1 + NaN = Lv.30** | 已修:入口拒非有限,档案原样回传;正对照「恰好一级所需经验 ⇒ Lv.2」「0 经验不升级」(FND111-7) |
+| R4-P2-17 | P2 | 铲子词条池 7 条里 `dodge_rate` / `knockback_mul` **全仓零读取** ⇒ 606 / 607 的铲子词条是静默 no-op | 已修:池缩到 5 条(全部有 `statMods` 消费者);行为判据:6 道可出锅料理的铲子词条都必须**真的改变**至少一格 `statMods`(FND111-8) |
+| R4-P2-18 | P2 | `hpFlat` **线性叠加**:602 × N ⇒ +30N,无封顶 ⇒ 一道菜无限放大生命上限 | 已修:`mergeFoodBuffs` 取最大(三份 ⇒ 仍 30);兼顾既有契约:单份 40 **逐字透传**、两份取强者 = 40(FND111-9) |
+| R4-P2-19 | P2 | 倒地泡泡层数只 `+1`、**无衰减路径** ⇒ 任意间隔的第 3 发都「续杯」把 `invulnSec` 重置成 5 秒 | 已修:`BUBBLE_STACK_WINDOW_SEC`(= 困住时长 5s)过期清层,命中把窗口重置为 0(FND111-10;负对照:每发间隔 6s ⇒ 层数只到 1、不许续杯) |
+| R4-P3-3 | P3 | `createTarget` 的 `shieldMax` 派生:两行**同条件** `if` 只剩一行 ⇒ 显式 `shieldMax` 的优先级被反转 | 已修:两者都给 ⇒ 显式 `shieldMax` 优先,`shield` 本体不被改写(FND111-11) |
+
+`WS-FND-112`(**旧判据的元审计**:六条)
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P3-4 | P3 | `tests/WS-FND-01` 的 A15 **零断言**(恒绿) | 已修:用例必须有真断言;负对照「抽掉断言后判据必须为 0」(FND112-9) |
+| R4-P3-5 | P3 | `tests/WS-09:3832` 写 `eq(L.cols*L.rows, L.cols*L.rows)`(**恒真 / 两侧同源**) | 已修:尺寸自洽可**独立复算**(FND112-10) |
+| R4-P3-6 | P3 | `tests/WS-FND-06:1028` 手册不在场 ⇒ `ok(true,'跳过')`,与「通过」**逐字相同** | 已修:跳过必须自报(计入 `SKIPS` + 打汇总行)(FND112-11) |
+| R4-P3-7 | P3 | `scripts/doc-line-audit.ts` 只判行区间**起点**,终点越界不报 | 已修:终点越界必须报(FND112-12) |
+| R4-P3-8 | P3 | `scripts/eol-audit.ts` 高危项合计只算 `[2] + [3]`,漏 `[1]`(纯 CRLF) | 已修:合计含 `[1]`(FND112-13) |
+| R4-P3-9 | P3 | `scripts/dead_items.ts`:`reason` 可为空、`consumer` 可指向**不存在**的文件 | 已修:`reason` 非空 + `consumer` 指向真实文件(FND112-14) |
+
+**元审计(本轮自查,1 条)**
+
+| # | 严重度 | 发现与落点 | 状态 / 判据 |
+|---|---|---|---|
+| R4-P2-20 | P2 | **本轮新套件自身**的同义反复:`tests/WS-FND-111` 的 `eq(ba, ELEMENT_REVERSE_MUL)` / `eq(ba, ELEMENT_COUNTER_MUL)` / `eq(h3.downed.invulnSec, BUBBLE_TRAP_SEC)` 把**被测模块的导出常量**放在 expected 一侧(L150 / L152 / L347 / L367 / L371,5 个槽位、3 个常量名) | 已修:期望值全改**字面量**(0.75 / 1.5 / 5),常量只留在 **actual 一侧**当锚点(`eq(BUBBLE_TRAP_SEC, 5)` / `elementMul(...)`)。`[同义反复候选]` 命中 **3 → 0**;两个投影同步(`README.md:183` 与 `docs/HANDOVER.md` §三「同义反复候选」行) |
+
+### 11.3 与交接单的两处**不一致**(如实记)
+
+- `tests/WS-FND-111` 的文件头写「战斗数值层的**五处** P2」,而该文件实际列了 **11 条**判据(元素矩阵 5 + 有限性门 2 + 词条池 / `hpFlat` / 泡泡窗口 / `shieldMax` 各 1)。文件头那句是**选材来源**的残留;条数以判据实数为准(**11**),README / HANDOVER 的用例汇总也按 11 记。同一时期内该文件还带着 3 条同义反复候选(上面 R4-P2-20),两件事同源:**文件头与判据逐条对账没做**。
+- §3.2 / §4 的编号(`P2-1..13` / `R1..R22`)是**第二批**的账本,本轮一律用 `R4-P1-*` / `R4-P2-*` / `R4-P3-*` 前缀,避免与旧号相撞。**仍登记的 4 条**(P2-3 击退上界 / P3-1 `applyRestore` chunk 解码 / P3-5 水位预算 / P3-9 顶点色 LOD 语义)**状态不变** —— 本轮的 109 / 110 / 111 / 112 都不覆盖它们。
+
+### 11.4 本批验证口径
+
+- `node scripts/verify.ts --all` ⇒ **exit 0 / 行首 ✗ 0 项**(本机 ≈213s,秒数别当基准):
+  `用例汇总:2332 条通过(121 个套件;WS-01..11 共 1014 条 / 14 套件;基座 1318 条 / 107 套件)`;
+  `[同义反复候选]` 命中 **0** 条(白名单 0);README 与 HANDOVER 两张数字表由门禁逐行比对通过;
+  `HANDOVER §九 sha256 表自洽` 亦通过。唯一的告警是**临时残留**(审计扫描根之外,按设计只告警、不属三道 strict),不是本批引入。
+- 逐套件:`WS-FND-109` 8/8 · `WS-FND-110` 9/9 · `WS-FND-111` 11/11 · `WS-FND-112` 14/14。
+- `node scripts/typecheck-baseline-audit.ts` ⇒ 基线锁 **261 条 / 指纹 129**,实测 **260 / 129**
+  (**未新增**,且 `scripts/data-conformance.ts` 的 1 条 `TS2367` 被本轮修掉)⇒ HANDOVER §三 如实写 **260**,
+  并注明「基线锁文件仍是 261,只准减不准增」。**不用** `--update`(本轮不动基线锁)。
+- `docs/HANDOVER.md` §九 sha256 表重算:`README.md` `c3ffd82859ac → 0a2bd9115599`,其余 6 个**不变**;
+  重算用临时脚本副本跑完即删(LF 归一 = 索引 blob 口径)。
+- 数字落点:`README.md:62-64`(121/121 · 2332 个用例;基座 FND-01..112 · 1318 条 / 107 套件)、
+  `README.md:309`(121 份测试套件 / 303 个 `.ts`)、`docs/HANDOVER.md:27`(121 个套件)、
+  `docs/HANDOVER.md:96`(用例行 + 第八批 109/110/111/112 = 8/9/11/14)、`docs/HANDOVER.md:102`(类型基线 260)、
+  本文 §11。号段 **FND-01..112**。
+- 未 commit、未碰 `.pi/`;本轮写域:`tests/WS-FND-111-combat-numeric-bounds.test.ts`(仅同义反复槽位)、
+  `README.md`、`docs/HANDOVER.md`、`docs/AUDIT-W34.md`。

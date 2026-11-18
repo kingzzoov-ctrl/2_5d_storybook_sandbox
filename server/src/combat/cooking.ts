@@ -314,9 +314,33 @@ export interface CookResult {
   reason: string;
 }
 
-/** 212 大铁铲可附加的战斗增益词条池。 */
+/**
+ * 212 大铁铲可附加的战斗增益词条池。
+ *
+ * ## 池的**准入门槛**:每一条都必须有**消费者**(第四轮审计 P2)
+ *
+ * `cookSoup` 让额外词条落地的方式是**双写**:第 1 步把那一条写进 `statMods`
+ * (见 `cookSoup` 里的 if 链,这才是消费者);第 2 步在 `buff.flags[kw_<词条>]`
+ * 记一笔账(给诊断看)。**只有第 2 步的词条 = 静默空词条** —— `kw_*` 在全仓
+ * 零读取,于是「大铁铲额外 +1 条战斗词条」对那道料理是看不见的 no-op。
+ *
+ * 修前池里正好有两格只走第 2 步:`dodge_rate`(闪避)与 `knockback_mul`(击退),
+ * 而 pick 是确定的 `(id + 1) % 池长` ⇒ **606 恒拿 `dodge_rate`、
+ * 607 恒拿 `knockback_mul`**,这两道汤的铲子加成从来没生效过(607/608 的文案
+ * 因此与实现不符)。
+ *
+ * ## 处置:**从池中移除**(而不是接消费者)—— 理由
+ *
+ * 这两个词条的消费者在**受击方 / 物理写回**侧(`damage.computeDamage` 的
+ * `dodgeRoll` 与 `world_sim` 的击退写回),要把料理 buff 喂进去**必须改
+ * `world_sim.ts`**(本轮写域之外);在 `cooking.ts` 里自造一份「料理给的闪避 /
+ * 击退」= 本仓点名的**第二份真值**,正是要防的形态。
+ * ⇒ 池缩到 5 条,**全部**有 `statMods` 消费者;原文案「铲子额外 +1 条战斗词条」
+ * 因此逐字成立。将来要接 `dodge_rate`:先在 `world_sim` 接上消费者,
+ * 再把键加回本池(判据 `tests/WS-FND-111` FND111-8 会先红)。
+ */
 export const COMBAT_KEYWORD_POOL: readonly string[] = [
-  'atk_pct', 'def_flat', 'hp_flat', 'crit_rate', 'crit_dmg', 'dodge_rate', 'knockback_mul',
+  'atk_pct', 'def_flat', 'hp_flat', 'crit_rate', 'crit_dmg',
 ];
 
 const BONUS_KEYWORD_VALUE: Record<string, number> = {
@@ -325,8 +349,6 @@ const BONUS_KEYWORD_VALUE: Record<string, number> = {
   hp_flat: 20,
   crit_rate: 0.03,
   crit_dmg: 0.10,
-  dodge_rate: 0.02,
-  knockback_mul: 0.10,
 };
 
 function matches(inputs: Record<number, number>, need: Record<number, number>): boolean {
@@ -548,12 +570,35 @@ export function cleansePrankBuffs(buffs: readonly FoodBuff[]): FoodBuff[] {
   return buffs.filter((b) => b.branch !== CookBranch.PRANK);
 }
 
-/** 合并多个料理 buff 的乘区(乘区相乘,加值相加,flags 后写覆盖)。 */
+/**
+ * `hpFlat` 的**叠加律**:不叠加,取**单份最大值**(第四轮审计 P2)。
+ *
+ * ## 修前是什么病
+ *
+ * 纯相加 ⇒ 吃 N 份 602(庆典蛋糕,+30)= 上限 **+30N**,无封顶,
+ * 再顺着 `world_sim.maxHpForLevel` 一路写进 `vitals.maxHp`。
+ * 手册只给了**一人份**的 `+30`,没有「连吃 N 份」的规则;继续相加
+ * 就是**凭空发明平衡值**。
+ *
+ * ## 为什么不是「求和后钳一个 CAP」
+ *
+ * `tests/WS-FND-17` FND17-3 钉的是「单份字段**原样透传**」(夹具
+ * `hpFlat: 40` 必须原样出来)—— 任何小于单份真值的 CAP 都会把那条
+ * **既有判据**搞红,而它是对的:合并函数不许篡改单份数值。
+ * ⇒ 取「不叠加」:同一时刻只认最强的**一份**,单份值**逐字**透传。
+ * 实测数据里 `hpFlat` 的产出方只有两处(602 的 `+30`、铲子词条
+ * `hp_flat` 的 `+20`)⇒ 结果恒 ≤ 30,天然有界,且不需要新魔法数字。
+ *
+ * 判据:`tests/WS-FND-111` FND111-9(三份 602 ⇒ 30,不是 90;
+ * 单份 40 ⇒ 仍逐字 40,不被钳)。
+ */
 export function mergeFoodBuffs(buffs: readonly FoodBuff[]): FoodBuff['statMods'] {
   const out = mods();
   for (const b of buffs) {
     out.atkMul *= b.statMods.atkMul;
-    out.hpFlat += b.statMods.hpFlat;
+    /* ★ 加值**取最大**而不是求和(理由见紧邻的上方注释):602 × N 不再线性
+     *   放大生命上限;单份数值原样透传(不钳)。 */
+    out.hpFlat = Math.max(out.hpFlat, b.statMods.hpFlat);
     out.defFlat += b.statMods.defFlat;
     out.moveMul *= b.statMods.moveMul;
     out.critRate += b.statMods.critRate;

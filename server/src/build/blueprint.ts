@@ -47,6 +47,17 @@ export const BLUEPRINT_MIN_SIZE = 16;
 export const BLUEPRINT_MAX_SIZE = 128;
 /** 单张蓝图格数上限(16384)。 */
 export const BLUEPRINT_MAX_CELLS = BLUEPRINT_MAX_SIZE * BLUEPRINT_MAX_SIZE;
+/**
+ * 单个游程(RLE `run`)的**具名上界** —— 与单张蓝图格数上限同值。
+ *
+ * 为什么必须单独有一个名字:`readVarint` 是 7-bit 续位编码,8 字节就能
+ * 解出 ~2^49 级的数。解码侧若「先 `for (k < run) cells.push(...)` 展开、
+ * 再判格数是否超过尺寸」,那段守卫**永远等不到执行** —— 一张 16×16 的
+ * 短码(`BP1:16x16:` + 几个字节)就足以挂死/爆内存(实测:`run = 5×10^14`)。
+ * 上界取 `BLUEPRINT_MAX_CELLS`:合法游程不可能比整张蓝图还长,
+ * 所以这个下刀处**不误伤任何**由编码器产出的码。
+ */
+export const MAX_RUN_CELLS = BLUEPRINT_MAX_CELLS;
 /** 蓝图码魔数前缀。 */
 export const BLUEPRINT_MAGIC = 'BP1';
 
@@ -246,9 +257,27 @@ export interface EncodeStats {
 
 /** 蓝图 → 蓝图码(RLE + varint + base64)。 */
 export function encodeBlueprint(bp: Blueprint): EncodeStats {
+  /*
+   * 入口校验(**必须在编码之前**):格数必须与尺寸相符。
+   *
+   * 放行 `cells: []` 会走进「循环体一次都不执行」的分支 —— `run` 停在初值 0,
+   * 于是吐出一段 `(value, run=0)` 三元组,而解码侧把它读成
+   * 「蓝图码损坏:游程长度为 0」:**报错指向解码器,根因在编码入口**。
+   * 0 格蓝图本来也不可能是框选结果(尺寸下限 16 ⇒ 至少 256 格),
+   * 所以这里直接拒,而不是「编出一段注定解不开的码」。
+   */
+  if (!Number.isInteger(bp.w) || !Number.isInteger(bp.h) || bp.w <= 0 || bp.h <= 0) {
+    throw new Error(`蓝图尺寸非法:${bp.w}×${bp.h}`);
+  }
+  if (bp.cells.length !== bp.w * bp.h) {
+    throw new Error(
+      `蓝图格数与尺寸不符:${bp.cells.length} 格 vs ${bp.w}×${bp.h} = ${bp.w * bp.h} 格`,
+    );
+  }
   const bytes: number[] = [];
   let runs = 0;
-  let prev = cellToValue(bp.cells[0] ?? { obj: 0, floor: 0, elev: 0, wire: 0, meta: 0 });
+  /* 上面已断言 `cells.length === w*h ≥ 1` ⇒ 首格必然存在(不再是「空 cells 兜底值」) */
+  let prev = cellToValue(bp.cells[0]);
   let run = 0;
   for (const c of bp.cells) {
     const v = cellToValue(c);
@@ -293,15 +322,30 @@ export function decodeBlueprint(code: string): Blueprint {
       + `(单边 ${BLUEPRINT_MIN_SIZE}..${BLUEPRINT_MAX_SIZE})`,
     );
   }
+  const cells: BlueprintCell[] = [];
+  const expected = w * h;
+  /*
+   * ⚠️ **游程上界必须在展开之前判**。展开是 `for (k < run) cells.push(...)`,
+   * 而 `readVarint` 能解出 ~2^49 级的 run(8 字节 `\xff` 续位)。
+   * 旧写法「先展开、再判 `cells.length > w*h`」让守卫永远等不到执行:
+   * 一张 16×16 的短码就能让 `cells` 涨到 5×10^14 格 ⇒ 挂死 / OOM,
+   * 攻击者不需要大 payload,只需要一个小 run 字段。
+   *   ⇒ 两个上界都判:`run` 自身的具名上限(`MAX_RUN_CELLS`)
+   *      与「累计格数不得超过 `w*h`」。任一越界立刻抛,内存占用恒为 O(w*h)。
+   */
   const bytes = fromBase64(payload);
   const cursor: Cursor = { i: 0, buf: bytes };
-  const cells: BlueprintCell[] = [];
   while (cursor.i < bytes.length) {
     const v = readVarint(cursor);
     const run = readVarint(cursor);
     if (run === 0) throw new Error('蓝图码损坏:游程长度为 0');
+    if (run > MAX_RUN_CELLS || cells.length + run > expected) {
+      throw new Error(
+        `蓝图码损坏:游程长度 ${run} 超出尺寸上界`
+        + `(单游程 ≤ ${MAX_RUN_CELLS},累计 ≤ ${expected},已解 ${cells.length})`,
+      );
+    }
     for (let k = 0; k < run; k += 1) cells.push(valueToCell(v));
-    if (cells.length > w * h) throw new Error('蓝图码损坏:解出格数超过尺寸');
   }
   if (cells.length !== w * h) {
     throw new Error(`蓝图码不完整:解出 ${cells.length} 格,期望 ${w * h}`);
@@ -454,6 +498,36 @@ export const DEFAULT_RELAY_OPTIONS: RelayQueueOptions = {
   maxBuilders: 8,
   perBuilderParallel: 2,
 };
+/**
+ * 接力选项的**入口校验** —— 全局只此一处实现(`buildRelayQueue` 与
+ * `RelayQueue` 构造函数都走它)。
+ *
+ * ## 为什么必须显式拒绝,而不是夹取/容忍
+ *
+ * 旧写法对两个字段各有一套**静默**的坏行为,而且方向相反:
+ * ```ts
+ * builders.slice(0, Math.max(1, options.maxBuilders))  // 0 / 负值 ⇒ 悄悄抬成 1
+ * if (flyingCount(b.id) >= options.perBuilderParallel) continue;
+ *                                                       // 0 / 负值 ⇒ 恒成立
+ *                                                       // ⇒ 永不派活、drain() 空转
+ * ```
+ * 也就是 `{maxBuilders: 0, perBuilderParallel: 0}` 这种配置**不报错**:
+ * 前者被改写、后者让整个接力队列一条任务都不发(`remaining` 永远 > 0)。
+ * 调用方(派对模式 / 自定义难度)拿到的是「接力功能静默失效」,
+ * 而日志里一个异常都没有 ⇒ 只能靠人肉读代码发现。
+ *   ⇒ 改成**当场抛**:上限必须是 ≥1 的整数。默认值 `DEFAULT_RELAY_OPTIONS`
+ *      合法,既有调用点行为不变。
+ */
+function assertRelayOptions(options: RelayQueueOptions): void {
+  if (!Number.isInteger(options.maxBuilders) || options.maxBuilders < 1) {
+    throw new Error(`接力人数上限必须是 ≥1 的整数,收到 ${options.maxBuilders}`);
+  }
+  if (!Number.isInteger(options.perBuilderParallel) || options.perBuilderParallel < 1) {
+    throw new Error(`每人并行在飞上限必须是 ≥1 的整数,收到 ${options.perBuilderParallel}`);
+  }
+}
+
+/**
 
 /**
  * 飞砖接力队列:把蓝图拆成「每格一个任务」,按「先下后上、先外后内」排序。
@@ -462,6 +536,14 @@ export const DEFAULT_RELAY_OPTIONS: RelayQueueOptions = {
  * 墙体优先立起,让接力队伍能看到房间轮廓。
  */
 export function buildRelayQueue(bp: Blueprint, options: RelayQueueOptions = DEFAULT_RELAY_OPTIONS): RelayTask[] {
+  /*
+   * 入口校验。本函数**自己不消费** options(排队顺序与人数无关,归属由
+   * `RelayQueue` 构造时一次算定),但旧代码用一句 `void options;` 把这事实
+   * 写成了「参数收下就不用管」—— 于是非法配置从这里一路静默通过,
+   * 直到 `RelayQueue` 里才以「夹取 / 永不派活」两种静默形态爆出来。
+   *   ⇒ 校验放在**最早**的入口:一张非法配置不该先造出 N 个任务再报错。
+   */
+  assertRelayOptions(options);
   const tasks: RelayTask[] = [];
   const cellCount = bp.cells.length;
   for (let i = 0; i < cellCount; i += 1) {
@@ -545,12 +627,14 @@ export class RelayQueue {
   private cursor: number;
 
   constructor(tasks: RelayTask[], builders: RelayBuilder[], options: RelayQueueOptions = DEFAULT_RELAY_OPTIONS) {
+    /* 非法上限**当场拒**(见 `assertRelayOptions`):此处不再 `Math.max(1, ...)` 静默夹取 */
+    assertRelayOptions(options);
     this.tasks = tasks;
     this.builders = builders;
     this.options = options;
     this.cursor = 0;
     this.plan = new Map<number, string>();
-    const active = builders.slice(0, Math.max(1, options.maxBuilders));
+    const active = builders.slice(0, options.maxBuilders);
     if (active.length > 0) {
       for (let i = 0; i < tasks.length; i += 1) {
         this.plan.set(tasks[i].seq, active[i % active.length].id);
@@ -582,7 +666,8 @@ export class RelayQueue {
     }
 
     /* 2. 派发:按预定归属走,只受并发上限约束 */
-    const active = this.builders.slice(0, Math.max(1, this.options.maxBuilders));
+    /* 构造时已校验过上限(≥1)⇒ 这里直接切,不再 `Math.max(1, ...)` 掩盖非法值 */
+    const active = this.builders.slice(0, this.options.maxBuilders);
     if (active.length > 0) {
       let progressed = true;
       while (progressed) {

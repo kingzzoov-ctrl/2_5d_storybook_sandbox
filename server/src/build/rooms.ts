@@ -14,6 +14,11 @@ import { OBJ_MASK, packTile, unpackTile } from '../../../shared/types/tile.ts';
 import { ROOM_RECIPES } from '../../../shared/constants/bosses.ts';
 import { TileGrid, DIR_DX, DIR_DY, type TileGridLike } from './grid.ts';
 import { isBarrier, isDoor, isWindow, isWall, isRoof } from './autotile.ts';
+/*
+ * 地砖槽位 → 物品 ID 的唯一事实源(WS-01)。与 `blueprint.ts#floorItemId` 同源:
+ * 本层不重写 `300 + 槽位` 那个偏移(UGC 槽位 31..63 会因此产出幽灵 ID)。
+ */
+import { floorIdOfSlot } from '../world/chunk.ts';
 
 /** 单房间默认上限:100 格(手册 §3.8 动态房间面积约束)。 */
 export const DEFAULT_MAX_AREA = 100;
@@ -74,10 +79,24 @@ export interface RoomInfo {
   wallCount: number;
   /** 泛洪是否触到世界边界(漏墙的强信号) */
   boundaryLeak: boolean;
-  /** 房间内部物体 ID → 数量 */
+  /** 房间内部物体的 ID → 数量(**只含 OBJ 层、只含内部格**)。配方评分用 `inventory`,不用它。 */
   objects: Map<number, number>;
-  /** 内部地砖 ID 集合(去重) */
+  /** 围合环上的构件 ID → 数量(墙/门/窗;这些格被 `isBarrier` 判为围合 ⇒ 不在 `cells` 里) */
+  ringObjects: Map<number, number>;
+  /** 内部地砖**槽位**集合(去重;槽位 ≠ 物品 ID) */
   floorSet: Set<number>;
+  /** 内部地砖的**物品 ID** 集合(`floorIdOfSlot` 换算,如 304) */
+  floorItems: Set<number>;
+  /**
+   * ★ 配方评分的**在场清单**(物品 ID → 数量)= 内部 OBJ ∪ 围合环 OBJ ∪ 地砖物品 ID。
+   *
+   * 「在场」= 该 ID 的物件/地砖**真的出现在这间房里**。三层并集是必需的:
+   * 只看 OBJ 层内部格会让「地砖类」与「围合构件类」可选件恒不命中(加分永远 0)。
+   * 纯材料类 ID(不进任何 tile 层,如 155 黄铜锭 / 158 发条齿轮 / 109 白玉温泉石)
+   * 不在这里出现 —— 那要改 `ROOM_RECIPES` 的条目,属内容表(指纹锁 + 冻结判据),
+   * 不在本文件可裁决的范围。
+   */
+  inventory: Map<number, number>;
   /** 内部是否含屋顶构件(屋顶在房间之上) */
   roofed: boolean;
   /** 矩形填充率 */
@@ -169,6 +188,14 @@ export const ALL_REQUIRED_IDS: readonly number[] = Object.freeze(
 
 /* ─────────────────── 数据抽取 ─────────────────── */
 
+/**
+ * 内部 OBJ 层统计(物体 ID → 数量)。
+ *
+ * ⚠️ 口径边界:**只数内部格**(围合环不属于 `cells`,见 `extractRingObjects`)、
+ * **只数 OBJ 层**(地砖见 `floorItemCounts`)。这两个边界正是本轮修过的点:
+ * 配方评分不再用它,而改用三层并集 `RoomInfo.inventory`;
+ * 本函数保留为「内部家具/加工台清单」的读口(UI 与既有判据在用)。
+ */
 function extractObjects(grid: TileGridLike, cells: readonly RoomCell[]): Map<number, number> {
   const m = new Map<number, number>();
   for (const c of cells) {
@@ -178,6 +205,7 @@ function extractObjects(grid: TileGridLike, cells: readonly RoomCell[]): Map<num
   return m;
 }
 
+/** 内部地砖**槽位**集合(去重)。槽位 ≠ 物品 ID,换算见 `floorItemCounts`。 */
 function extractFloors(grid: TileGridLike, cells: readonly RoomCell[]): Set<number> {
   const s = new Set<number>();
   for (const c of cells) {
@@ -185,6 +213,48 @@ function extractFloors(grid: TileGridLike, cells: readonly RoomCell[]): Set<numb
     if (f !== 0) s.add(f);
   }
   return s;
+}
+
+/**
+ * 内部地砖 → **物品 ID 计数**(口径:每格一票)。
+ *
+ * 槽位→物品映射的唯一事实源是 WS-01 的 `floorIdOfSlot`:UGC 槽位 31..63
+ * 全部映射到 314,不服从 `300 + 槽位`;本地重写偏移会产出物品表里不存在的幽灵 ID。
+ *
+ * 用途:`ROOM_RECIPES` 的可选件里有地砖(SAKURA_ONSEN 的 304 绯樱榻榻米席),
+ * 它只出现在 FLOOR 层 ⇒ OBJ 层的 `objects` 永远看不到它。
+ */
+function floorItemCounts(grid: TileGridLike, cells: readonly RoomCell[]): Map<number, number> {
+  const m = new Map<number, number>();
+  for (const c of cells) {
+    const f = unpackTile(grid.get(c.x, c.y)).floor;
+    if (f === 0) continue;
+    const id = floorIdOfSlot(f);
+    if (id > 0) m.set(id, (m.get(id) ?? 0) + 1);
+  }
+  return m;
+}
+
+/**
+ * 围合环上的构件 ID → 数量(墙 351~362 / 门 363~369 / 窗 370~371 / 半高篱笆 357)。
+ *
+ * 为什么需要它:围合格被 `isBarrier` 判为「不是内部」,不进 `cells` ⇒
+ * `extractObjects` 看不到它们;而 `ECO_RANCH` 的可选件 357 竹篱笆 / 360 巧克力墙
+ * 恰好是围合构件 —— 只看内部时这两条可选件**永远命中不了**。
+ */
+function extractRingObjects(
+  grid: TileGridLike,
+  ring: Iterable<number>,
+  width: number,
+): Map<number, number> {
+  const m = new Map<number, number>();
+  for (const idx of ring) {
+    const x = idx % width;
+    const y = (idx - x) / width;
+    const obj = (grid.get(x, y) & OBJ_MASK) >>> 16;
+    if (obj !== 0) m.set(obj, (m.get(obj) ?? 0) + 1);
+  }
+  return m;
 }
 
 /* ─────────────────── 核心:BFS 闭合检测 ─────────────────── */
@@ -215,7 +285,10 @@ export function floodRoom(
     wallCount: 0,
     boundaryLeak: false,
     objects: new Map(),
+    ringObjects: new Map(),
     floorSet: new Set(),
+    floorItems: new Set(),
+    inventory: new Map(),
     roofed: false,
     fill: 0,
     consumed: [],
@@ -357,7 +430,29 @@ export function floodRoom(
   }
   const outerBBox: RoomBBox = { x0: ox0, y0: oy0, x1: ox1, y1: oy1, w: ox1 - ox0 + 1, h: oy1 - oy0 + 1 };
 
+  /* ── 三层信息的语义化汇总:配方评分只看 `inventory` ── */
   const objects = extractObjects(grid, cells);
+  const floors = extractFloors(grid, cells);
+  const floorCounts = floorItemCounts(grid, cells);
+  const floorItems = new Set<number>(floorCounts.keys());
+  const ringObjects = extractRingObjects(grid, seenBarrier, width);
+  /*
+   * ★ **在场清单**:OBJ 层(内部)+ 围合环构件 + 地砖物品 ID。
+   *   为什么必须合起来 —— `ROOM_RECIPES` 的可选件分布在三层里:
+   *     · 室内加工台/家具 …… OBJ 层内部格(`objects`);
+   *     · 地砖 ……………… FLOOR 层(如 304 绯樱榻榻米席);
+   *     · 墙 / 篱笆 ………… OBJ 层,但被 `isBarrier` 判为围合 ⇒ 不在 `cells` 里
+   *                        (如 357 竹篱笆、360 巧克力墙)。
+   *   旧口径只看 `objects` ⇒ 后两类**永远命中不了**,「可选加分」恒 0。
+   */
+  const inventory = new Map<number, number>();
+  const bump = (id: number, n: number): void => {
+    if (id <= 0 || n <= 0) return;
+    inventory.set(id, (inventory.get(id) ?? 0) + n);
+  };
+  for (const [id, n] of objects) bump(id, n);
+  for (const [id, n] of ringObjects) bump(id, n);
+  for (const [id, n] of floorCounts) bump(id, n);
   let roofed = false;
   for (const id of objects.keys()) if (isRoof(id)) roofed = true;
 
@@ -383,7 +478,10 @@ export function floodRoom(
     wallCount,
     boundaryLeak,
     objects,
-    floorSet: extractFloors(grid, cells),
+    floorSet: floors,
+    floorItems,
+    ringObjects,
+    inventory,
     roofed,
     fill,
     consumed,
@@ -437,15 +535,22 @@ export const SWEET_SPOT_MAX = 64;
  *         + (面积在甜点区 ? 5 : 0)
  *         + (门 ≤ 2 且无窗泄漏 ? 3 : 0)
  * 必需件缺失时 `matched=false`,但仍返回分数供调试排序。
+ * 命中判定一律走 `RoomInfo.inventory`(**三层并集**),不再只看内部 OBJ 层。
  */
 export function scoreRoom(room: RoomInfo, recipe: RoomRecipeDef): RoomMatch {
+  /*
+   * 评分只认 `inventory`(内部 OBJ ∪ 围合环 OBJ ∪ 地砖物品 ID),见 `RoomInfo`。
+   * 必需件全是 U 类加工台/家具,落在 OBJ 层内部 ⇒ 与旧口径**等价**;
+   * 可选件里却有地砖(SAKURA_ONSEN 的 304)与围合构件(ECO_RANCH 的 357/360),
+   * 只看 `objects` 时这两类恒不命中 ⇒ 可选加分永远 0。
+   */
   const missingRequired: number[] = [];
   for (const id of recipe.required) {
-    if ((room.objects.get(id) ?? 0) <= 0) missingRequired.push(id);
+    if ((room.inventory.get(id) ?? 0) <= 0) missingRequired.push(id);
   }
   const hitOptional: number[] = [];
   for (const id of recipe.optional) {
-    if ((room.objects.get(id) ?? 0) > 0) hitOptional.push(id);
+    if ((room.inventory.get(id) ?? 0) > 0) hitOptional.push(id);
   }
   const matched = missingRequired.length === 0;
   let score = matched ? SCORE_REQUIRED_BASE : 0;
@@ -565,7 +670,12 @@ export function placeInRoom(grid: TileGridLike, x: number, y: number, objId: num
   grid.setObj(x, y, objId);
 }
 
-/** 从房间信息里反查某配方必需件是否齐备(轻量查询,不做全量评分)。 */
+/**
+ * 从房间信息里反查某配方必需件是否齐备(轻量查询,不做全量评分)。
+ *
+ * 与 `scoreRoom` 同口径:查 `inventory`(三层并集,见 `RoomInfo.inventory`),
+ * 不是只查内部 OBJ 层的 `objects`。
+ */
 export function hasAllRequired(room: RoomInfo, recipe: RoomRecipeDef): boolean {
-  return recipe.required.every((id) => (room.objects.get(id) ?? 0) > 0);
+  return recipe.required.every((id) => (room.inventory.get(id) ?? 0) > 0);
 }

@@ -890,7 +890,6 @@ export class VitalsSystem {
     v.totalTaken += raw;                     /* ★ 累计统计:有界(修前吸收 2e9) */
     v.hitCount += 1;
     base.applied = raw;                      /* ★ **对外返回值**:有界(修前外流 2e9) */
-    base.applied = raw;                      /* ★ **对外返回值**:有界(修前外流 2e9) */
     /* ★ D1 击退记账:`0` = 上游没给 / 值非法 ⇒ 不产生击退。
        `Number.isFinite` 不是为了好看:`knockback` 是公开入参,`NaN` 经
        `applyImpulse` 会把刚体速度永久污染成 NaN(`ensureFinite` 会复位,
@@ -943,10 +942,25 @@ export class VitalsSystem {
   /* ↑ 块注释放在类体内是刻意的:它讲的是「本类的写点」,离写点最近。 */
 
   /** 治疗(料理/药水/队友技能)。 */
+  /**
+   * 治疗(料理/药水/队友技能)。
+   *
+   * ★ 有限性门(第四轮审计 P2):与 `applyDamage` / `applyHit` / `revive` **同口径**。
+   * ```
+   * Math.max(0, NaN) === NaN  ⇒ 修前 v.hp + NaN = NaN, Math.min(maxHp, NaN) = NaN
+   *                           ⇒ hp 被**永久**污染成 NaN(置死、回血、u16 编码全部失效)
+   * ```
+   * 而本文件的两处注释都声称写点已兜底(上方钳制约定「写点:… heal … 每一条出边
+   * 都经 Math.min/Math.max」、`revive()` 的「甲/乙两机制」)—— 修前 `heal` 是**唯一**
+   * 缺了甲(有限性)那一步的写点,注释与实现对不上。
+   * 非有限一律**拒绝**(返回 0、不改 hp),不接受「补满」之类的猜测值:
+   * 与 `setElementResist` 的「宁可保持旧值」同族。
+   */
   heal(id: string, amount: number): number {
     const v = this.players.get(id);
     if (!v) return 0;
     if (v.downed) return 0;
+    if (!Number.isFinite(amount)) return 0;
     const before = v.hp;
     v.hp = Math.min(v.maxHp, v.hp + Math.max(0, amount));
     return v.hp - before;

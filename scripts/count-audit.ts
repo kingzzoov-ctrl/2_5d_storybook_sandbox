@@ -48,7 +48,49 @@ function countEntries(file: string, declName: string): number | null {
   /* Map 条目形如 ['key', 'reason'] 在行首缩进 2 空格;Set 是 'key' */
   const mapEntries = [...body.matchAll(/^\s{2}\['([^']+)',/gm)].length;
   const setEntries = [...body.matchAll(/^\s{2}'([^']+)',/gm)].length;
-  return mapEntries > 0 ? mapEntries : setEntries;
+  if (mapEntries > 0) return mapEntries;
+  if (setEntries > 0) return setEntries;
+  /* ★ 2026-11-18 审计 P1-4:此前这里是
+   *   `return mapEntries > 0 ? mapEntries : setEntries;`
+   * ⇒ 条目**缩进一变**(2 空格 → 4 空格)两张正则都数不到,返回值是 **0**,
+   *   而 0 是一个**合法正解**(表真的空)⇒ 断言 #2(只查 `undefined`)看不出来:
+   *   正解静默变成 0,若引用它的自称也写着 0,整条链**逐字全绿**。
+   * ⇒ 现在把两种世界分开:表体**确实为空**才是 0;数不出条目一律 null,
+   *   由 `EXPECTED_TRUTH_KEYS`(键缺失)与 `ZERO_TRUTH_DECLARED`(0 必须认账)两道判。 */
+  /* ⚠️ 判据是「剥掉注释后还剩什么」,不是 `body.trim() === ''`:
+     本仓的空白名单是**会说话的注释**(`TAUT_SUSPECT_EXEMPT` 里整段都是块注释、
+     说明「哪条已修、为什么摘除」,而**一条条目都没有**)⇒ 那种表体 trim 不为空,
+     但它确实是 0 条。故:剥注释后为空 ⇒ 0(实测的空表);还剩非注释内容却数不出
+     条目 ⇒ null(缩进 / 形态变了)。 */
+  return stripComments(body).trim() === '' ? 0 : null;
+}
+
+/**
+ * 剥掉注释(块 + 行),只回答「还剩代码吗」。
+ *
+ * ⚠️ **刻意不用正则**:剥行注释的常见写法若缺 `(^|[^:])` 前缀,会把 `https://`
+ * 当注释起点(judgement_audit 的 B 类形态,本仓已登记若干处挂账)。
+ * 逐字符扫没有那个洞,也不需要往登记表里再加一条挂账。
+ */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    if (src.startsWith('/*', i)) {
+      const j = src.indexOf('*/', i + 2);
+      i = j < 0 ? src.length : j + 2;
+      out += ' ';
+      continue;
+    }
+    if (src.startsWith('//', i)) {
+      const j = src.indexOf('\n', i);
+      i = j < 0 ? src.length : j;
+      continue;
+    }
+    out += src[i];
+    i += 1;
+  }
+  return out;
 }
 
 const TRUTH: Record<string, number> = {};
@@ -56,10 +98,18 @@ const TRUTH: Record<string, number> = {};
  * 这张表**必须**列出全部应有键:漏一个键 ⇒ 该键永远 undefined ⇒
  * 引用它的自称被判 '?'(既不 ✓ 也不 ★)⇒ **改个声明名就能让它静默恒绿**。 */
 const EXPECTED_TRUTH_KEYS = ['可达性白名单', 'orphan', '同义反复白名单'] as const;
+/* ★ 2026-11-18 审计 P1-4:**0 也要判**。
+ * `countEntries` 现在只在「表体确实是空的」时才返回 0(见它的注释)⇒ 理论上
+ * 0 已经是实测值;但「某个键的正解变成 0」这件事**必须有人显式认账** ——
+ * 否则一张表被清空(或改写形态导致数不出条目、且恰好真的成了空表)会静默通过。
+ * ⇒ 判据:任何一个 TRUTH 键解析为 0,都必须出现在这张登记里(断言 #2b)。 */
+const ZERO_TRUTH_DECLARED: readonly string[] = ['同义反复白名单'];
 {
   const wl = countEntries(join(ROOT, 'scripts/verify.ts'), 'UNREACHABLE_EXEMPT');
   const orphan = countEntries(join(ROOT, 'scripts/orphan-audit.ts'), 'ORPHAN_KNOWN');
   const taut = countEntries(join(ROOT, 'scripts/verify.ts'), 'TAUT_SUSPECT_EXEMPT');
+  /* ⚠️ `!== null` 是**唯一**的收下条件:null(数不出条目)不许写成 0 —— 那正是
+     审计 P1-4 那条「正解静默变 0」;键不落地 ⇒ 断言 #2 报「正解缺失」。 */
   if (wl !== null) TRUTH['可达性白名单'] = wl;
   if (orphan !== null) TRUTH['orphan'] = orphan;
   if (taut !== null) TRUTH['同义反复白名单'] = taut;
@@ -298,16 +348,24 @@ for (const f of files) {
  * 与上次比较需要一份基线文件,而基线自己也会跟着一起变(自己比自己)。
  * 具名常量迫使**改文档的人**显式来这里把下限改小 ——
  * 那一刻他必须回答「我是不是把一条自称改没了」。
- * ⚠️ 下限 = 2026-11-18 的实测值(`同义反复白名单` 1 条;其余两类今天
- *    的命中全被 〔引用〕 标注或压根没写 ⇒ 下限 0,**这不代表它们有保护**)。
- *    **降低任何一项都必须写明理由**,不许顺手改。
+ *
+ * ## ★ 2026-11-18 审计 P1-4:下限**不许是 0**
+ *
+ * 旧口径给「可达性白名单 / orphan」各写了下限 **0** —— 那等于这两类
+ * **完全没有保护**(把措辞改掉后命中 0,也不低于 0)。同一轮里那两句话
+ * 也确实从被扫文件里消失了(只剩 〔引用〕 标注的历史值),于是检测器
+ * 「什么都没报」而读者以为"这两类都对上了"。
+ * ⇒ 现口径:每一类都必须**至少还看得见 1 处自称**(下限 = 2026-11-18 实测值,
+ *    三处;`scripts/verify.ts` 的 `UNREACHABLE_EXEMPT` 说明段里现在**显式**
+ *    写着「可达性白名单 12 条」与 `ORPHAN_KNOWN`(10) 供比对)。
+ *    **降低任何一项都必须写明理由**,不许顺手改 —— 因为 0 下限 = 没有判据。
  */
 const CLAIM_FLOORS: Record<string, number> = {
-  可达性白名单: 0,
-  orphan: 0,
+  可达性白名单: 1,
+  orphan: 1,
   同义反复白名单: 1,
 };
-const CLAIM_FLOOR_TOTAL = 1;
+const CLAIM_FLOOR_TOTAL = 3;
 console.log(`\n══ 1 扫到 ${hits.length} 处「N 条」型自称(合计下限 ${CLAIM_FLOOR_TOTAL},低于即 fail)══`);
 let stale = 0;
 let match = 0;
@@ -413,6 +471,22 @@ let assertFailed = false;
     console.log('      ⇒ 不是"没有陈旧",是**没有比对** —— 两者必须可区分');
     assertFailed = true;
   }
+  /* ★ #2b(2026-11-18 审计 P1-4):**正解为 0 必须被显式认账** ——
+     `countEntries` 现在只在「表体确实是空的」时才返回 0,理论上 0 已是实测;
+     但「某键的正解变成 0」= 一张表被清空 / 形态被改写 ⇒ 必须有人回答
+     「这是有意的吗」。⚠️ 文案里**不得**出现「正解缺失」——
+     否则与 #2 不可区分(WS-FND-90 的注入 B 会跟着误报)。 */
+  const zeroUnlisted = EXPECTED_TRUTH_KEYS.filter(
+    (k) => TRUTH[k] === 0 && !ZERO_TRUTH_DECLARED.includes(k),
+  );
+  if (zeroUnlisted.length > 0) {
+    console.log(`\n   ★ 正解为 0 未登记:${zeroUnlisted.length} 个`);
+    for (const k of zeroUnlisted) {
+      console.log(`      · ${k} —— 解析结果是 **0**(表体为空),而它不在 ZERO_TRUTH_DECLARED 里`);
+    }
+    console.log('      ⇒ 0 与「表真的空了」不可区分 ⇒ 要么恢复条目,要么显式登记并写明理由');
+    assertFailed = true;
+  }
   /* #3 登记 ↔ 实测 */
   if (CROSS_PROBLEMS.length > 0) {
     console.log(`\n   ★ 登记失真:${CROSS_PROBLEMS.length} 处(见上面「3 登记 ↔ 实测 互校」)`);
@@ -456,12 +530,14 @@ let assertFailed = false;
 }
 
 /* 退出码策略(与 --selftest 的分工):
- *   默认运行 = **报告 + 五组断言**(陈旧 / 真值缺失 / 登记失真 / 命中数低于下限 / 扫描文件缺失)。
+ *   默认运行 = **报告 + 六组断言**(陈旧 / 真值缺失 / 正解为 0 未登记 / 登记失真 /
+ *   命中数低于下限 / 扫描文件缺失)。
  *   默认运行因此**可进链**:它不是"打印 N 处陈旧",而是任何一种"没比对成"都非零。
  *   ⚠️ 定位变化必须写下来 —— 本文件原来的 docblock 说"不是门禁",
  *      那是**加断言之前**的事实;加完之后那句就不再成立(陷阱 125:说明会过期)。
- *   ⚠️ 「没比对成」(#2/#4/#5)必须与「比对了且都对上」**在退出码上分开** ——
- *      否则删掉一句话、改一个词、删一个被扫文件,都能让本检测器静默变成恒绿。 */
+ *   ⚠️ 「没比对成」(#2/#2b/#4/#5)必须与「比对了且都对上」**在退出码上分开** ——
+ *      否则删掉一句话、改一个词、删一个被扫文件、把一张表清空,
+ *      都能让本检测器静默变成恒绿。 */
 if (assertFailed) process.exitCode = 1;
 
 /* ─────── selftest ───────

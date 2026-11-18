@@ -74,11 +74,16 @@ export interface WireView {
    */
   wiredCells: number;
   /**
-   * **色·格**口径的总数:Σ 各颜色的格数。
-   * 与 `wiredCells` 的差值恰好等于 `overlapCells`。
+   * **色·格**口径的总数:Σ 各颜色的格数(重叠格在每个颜色层里各计 1 次)。
    */
   perColorWiredCells: number;
-  /** 出现两色以上重叠的格数(提示玩家可能串色) */
+  /**
+   * 出现**两色以上重叠**的格数(提示玩家可能串色)。
+   *
+   * 这是 **格**口径:同一格上叠了 3 条线也仍只算 1 格。
+   * 与 `perColorWiredCells − wiredCells`(= Σ(色数−1),「多计出来的色·格」)
+   * 的关系恒为 `≤`,且**当且仅当**没有任何格叠 3 色及以上时取等号。
+   */
   overlapCells: number;
   /** 按颜色统计的格数 */
   perColorCount: Record<number, number>;
@@ -91,7 +96,12 @@ export interface WireView {
  * 去重口径(不能混):
  *  - `wiredCells` 用 `Set<globalIndex>` 求并集,同一格叠两色只算 1;
  *  - `perColorWiredCells` 是逐色计数之和,重叠格在每色各计 1 次;
- *  - `perColorWiredCells − wiredCells === overlapCells` 是必须成立的不变量。
+ *  - `overlapCells` 是上面那个计数器的**格**口径(同一格见 ≥2 色):
+ *      `perColorWiredCells − wiredCells` = Σ(色数−1) **≥** `overlapCells`,
+ *      无 3 色格时取等。
+ *    ⚠️ 旧实现取的是左边那个差(Σ(色数−1)),与「重叠**格数**」在 3 色格上
+ *       不相等(一格会多算),而本地 `overlapCells` 计数器成了死代码 ⇒
+ *       现在只留一个口径:**格**。
  */
 export function buildWireView(grid: TileGridLike): WireView {
   const width = grid.width;
@@ -100,6 +110,7 @@ export function buildWireView(grid: TileGridLike): WireView {
   const perColorCount: Record<number, number> = { 0: 0, 1: 0, 2: 0, 3: 0 };
   const wiredSet = new Set<number>();
   let perColorWiredCells = 0;
+  /** ★ `overlapCells` 的**唯一**来源:出现 ≥2 色的格数(不再由两个口径相减得出) */
   let overlapCells = 0;
 
   for (let y = 0; y < height; y += 1) {
@@ -147,7 +158,7 @@ export function buildWireView(grid: TileGridLike): WireView {
     layers,
     wiredCells,
     perColorWiredCells,
-    overlapCells: Math.max(0, perColorWiredCells - wiredCells),
+    overlapCells,
     perColorCount,
   };
 }
@@ -244,9 +255,37 @@ export function danglingEnds(view: WireView): number {
   return n;
 }
 
-/** 把视图压缩成可下发客户端的紧凑字节流:每行 run-length 编码。 */
+/**
+ * 单行 RLE 里一段游程的**具名上限**:`(值, 游程)` 各占一字节 ⇒ 游程 1..255。
+ *
+ * 超过就必须**分段发**(见 `serializeWireView`),不能截断。
+ */
+export const MAX_WIRE_RUN = 255;
+
+/**
+ * 把视图压缩成可下发客户端的紧凑字节流:每行 run-length 编码。
+ *
+ * 格式:每行若干 `(值, 游程)` 字节对,值取低 4 位、游程 ∈ 1..`MAX_WIRE_RUN`。
+ *
+ * ⚠️ 宽度可以超过 255(`BLUEPRINT_MAX_SIZE = 128` 只是框选上限,世界网格更大):
+ * 同一行里出现连续 >255 的**同值**游程是正常输入。旧写法 `Math.min(run, 255)`
+ * 把溢出的那一截**直接丢掉** —— 该行解出的格数少于 `view.width`,
+ * 后续所有行整体前移:反序列化错位 / 丢线,而且**不报错**(字节流仍「合法」)。
+ *   ⇒ 改成**分段发**:同一值连发 `(值,255)` 若干段(必要时再接一段余数)。
+ *      同一值的相邻段落解出来就是同一段游程,因此与旧客户端解码器兼容。
+ *      代价:单行字节对数量的上界从 1 变成 `ceil(width / 255)`。
+ */
 export function serializeWireView(view: WireView): number[] {
   const out: number[] = [];
+  /** 写一段游程;长游程按 `MAX_WIRE_RUN` 切段,总和恒等于 `run`(不丢格)。 */
+  const emit = (value: number, run: number): void => {
+    let rest = run;
+    while (rest > MAX_WIRE_RUN) {
+      out.push(value & 0xf, MAX_WIRE_RUN);
+      rest -= MAX_WIRE_RUN;
+    }
+    out.push(value & 0xf, rest);
+  };
   for (let y = 0; y < view.height; y += 1) {
     let run = 0;
     let cur = 0;
@@ -260,12 +299,12 @@ export function serializeWireView(view: WireView): number[] {
       if (v === cur) {
         run += 1;
       } else {
-        out.push(cur & 0xf, Math.min(run, 255));
+        emit(cur, run);
         cur = v;
         run = 1;
       }
     }
-    out.push(cur & 0xf, Math.min(run, 255));
+    emit(cur, run);
   }
   return out;
 }

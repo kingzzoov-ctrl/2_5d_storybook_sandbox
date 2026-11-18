@@ -3829,7 +3829,12 @@ test('面板布局:窄视口下也不越界(不能只在 1280 宽成立)', () =>
 
 test('面板布局:格子尺寸自洽(格子数 × 格宽 = 网格宽)', () => {
   const L = layoutInventoryPanel(VW, VH);
-  eq(L.cols * L.rows, L.cols * L.rows, '网格格数 = 列×行');
+  /* ★ 原判据是 `eq(L.cols * L.rows, L.cols * L.rows)` —— 两侧**同一个表达式**
+     ⇒ 恒真(2026-11-18 元审计实测;与「同义反复候选」同一形态:永远绿、什么都没测)。
+     ⇒ 改成**独立复算**:格数用字面量锚定,面板尺寸由「部件之和」推出。 */
+  eq(L.cols * L.rows, 160, '一页格数 = 列 × 行 = 160(分页容量,字面量锚定)');
+  eq(L.panel.w - L.cols * L.cell, 32, '面板宽 − 网格宽 = 两侧外边距(PANEL_MARGIN 16 × 2)');
+  eq(L.panel.h - L.rows * L.cell, 106, '面板高 − 网格高 = 标题 28 + 标签 24 + 分页 22 + 外侧 32');
   /* 单元格 inset 不能把格子吃光 */
   ok(CELL_INSET * 2 < L.cell, `内缩 ${CELL_INSET}×2 < 格宽 ${L.cell}`);
   const r0 = slotRect(L, 0);

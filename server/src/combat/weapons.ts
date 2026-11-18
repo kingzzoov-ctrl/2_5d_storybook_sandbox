@@ -44,17 +44,82 @@ export const ELEMENT_LABEL: Record<Element, string> = {
 
 /**
  * 元素克制矩阵(行=攻击方,列=防御方)。
- * 四元环:烈焰 → 霜冻 → 雷暴 → 胶质 → 烈焰(1.5 克制、0.75 逆克、0.5 同抗);
- * 星光对胶质 1.5(果冻类),对自身同抗 0.5。
+ *
+ * ## 「自洽」的四条判据(第四轮审计 P2:修前全表不自洽,已按判据抹平)
+ *
+ * 1 **四元环**:烈焰 → 霜冻 → 雷暴 → 胶质 → 烈焰(相邻即克制);
+ *   星光(`LIGHT`)是**环外**元素,只克制胶质(果冻类)。
+ * 2 **反克对必须互反**:`X→Y = 1.5 ⟺ Y→X = 0.75`。
+ *   修前反例:`SLIME→LIGHTNING = 0.5`(应为 `0.75`)。
+ * 3 **取值只有四档**(登记在 `ELEMENT_MATRIX_VALUES`):
+ *   `1.0` 中性 / `1.5` 克制 / `0.75` 逆克 / `0.5` 同属性互抗。
+ *   修前反例:`ICE→SLIME = 1.25` —— 全表唯一的第五档值,且与
+ *   `SLIME→ICE = 0.75` 不构成反克对;已按第 2 条抹平为 `1.5`(霜冻克胶质)。
+ * 4 **每个元素至少有一侧可达**:除 `NONE`(注定全 1.0 的中性元素)外,
+ *   每个元素都至少出现在一条克制关系里。
+ *   修前反例:`SLIME→LIGHT = 1.0` 让 `LIGHT` 只作攻击方、**没有任何目标**
+ *   (它的列全是 1.0);已按第 2 条补成 `0.75`(被星光克制的胶质打星光更轻)。
+ *
+ * ## 死元素:保留,但**显式登记**(见 `DEAD_ELEMENTS`)
+ *
+ * `ICE` 在**内容层没有任何产出方**:`WEAPONS` 的 13 把武器只有
+ * NONE / FIRE / LIGHTNING / LIGHT / SLIME(`world_sim.ts` 的
+ * 「刻意没有 `case Element.ICE`」与 `tests/WS-10` 的「武器表无 ICE 武器」同源)。
+ * ⇒ 裁定:**矩阵行/列保留**(删掉会让本表与 `ELEMENTS` 不一致),
+ *   但登记为 `NO_ATTACKER`,让「这条关系运行时不可达」成为**显式事实**,
+ *   而不是等读者自己去发现的静默死键。
  */
 export const ELEMENT_COUNTER: Record<Element, Record<Element, number>> = {
   NONE: { NONE: 1.0, FIRE: 1.0, ICE: 1.0, LIGHTNING: 1.0, LIGHT: 1.0, SLIME: 1.0 },
   FIRE: { NONE: 1.0, FIRE: 0.5, ICE: 1.5, LIGHTNING: 1.0, LIGHT: 1.0, SLIME: 0.75 },
-  ICE: { NONE: 1.0, FIRE: 0.75, ICE: 0.5, LIGHTNING: 1.5, LIGHT: 1.0, SLIME: 1.25 },
+  ICE: { NONE: 1.0, FIRE: 0.75, ICE: 0.5, LIGHTNING: 1.5, LIGHT: 1.0, SLIME: 1.5 },
   LIGHTNING: { NONE: 1.0, FIRE: 1.0, ICE: 0.75, LIGHTNING: 0.5, LIGHT: 1.0, SLIME: 1.5 },
   LIGHT: { NONE: 1.0, FIRE: 1.0, ICE: 1.0, LIGHTNING: 1.0, LIGHT: 0.5, SLIME: 1.5 },
-  SLIME: { NONE: 1.0, FIRE: 1.5, ICE: 0.75, LIGHTNING: 0.5, LIGHT: 1.0, SLIME: 0.5 },
+  SLIME: { NONE: 1.0, FIRE: 1.5, ICE: 0.75, LIGHTNING: 0.75, LIGHT: 0.75, SLIME: 0.5 },
 };
+
+/** 矩阵**只允许**出现这四个值(判据:`tests/WS-FND-111` FND111-1)。 */
+export const ELEMENT_MATRIX_VALUES: readonly number[] = [1.0, 1.5, 0.75, 0.5];
+/** 中性:两元素无关。 */
+export const ELEMENT_NEUTRAL_MUL = 1.0;
+/** 克制:`X→Y` 放大。 */
+export const ELEMENT_COUNTER_MUL = 1.5;
+/** 逆克:`X→Y` 而 `Y` 克制 `X`。 */
+export const ELEMENT_REVERSE_MUL = 0.75;
+/** 同属性互抗(`X→X`)。 */
+export const ELEMENT_SELF_MUL = 0.5;
+
+/** 死元素登记项。 */
+export interface DeadElementEntry {
+  element: Element;
+  /**
+   * `NO_ATTACKER` = **攻击侧无产出方**:内容表里没有任何武器/技能的 element 是它,
+   * ⇒ 它的行与列运行时都不可达。
+   */
+  kind: 'NO_ATTACKER';
+  note: string;
+}
+
+/**
+ * 死元素登记(裁定:**保留,但登记**)。
+ *
+ * 判据(`tests/WS-FND-111` FND111-5)**双向**:
+ * ```
+ * 正向  `WEAPONS` 里没有的 element ⇒ 必须在表里;        (漏登记 ⇒ 红)
+ * 反向  表里的 element 必须在 `WEAPONS` 里确实不存在。   (腾笼后没撤登记 ⇒ 红)
+ * ```
+ * 只写单向会留下「登记表自我宣告」的空断言 —— 两侧都算才是判据。
+ */
+export const DEAD_ELEMENTS: readonly DeadElementEntry[] = [
+  {
+    element: 'ICE',
+    kind: 'NO_ATTACKER',
+    note:
+      '13 把武器的 element 只有 NONE/FIRE/LIGHTNING/LIGHT/SLIME ⇒ ICE 行/列无产出方。' +
+      '矩阵条目保留(与 ELEMENTS 对齐),但运行时不可达。' +
+      '新增 ICE 武器时必须同时撤掉本条(world_sim 的 `case Element.ICE` 注释同源)。',
+  },
+];
 
 export function elementMul(atkElement: Element, defElement: Element): number {
   return ELEMENT_COUNTER[atkElement][defElement];
@@ -798,7 +863,8 @@ export function emptySummary(): EquipSummary {
 
 /**
  * 六部位装备合计。未识别的 ID 一律忽略(不抛错),便于客户端先行预览。
- * weapon 槽只取第一件命中武器(后装备的覆盖)。
+ * weapon 槽**只取数组里第一件命中武器**(先出现者生效;其后的武器一律忽略 ——
+ * 与「后装备的覆盖」正好相反,修前那句注释把语义写反了)。
  */
 export function equipSummary(equippedIds: readonly number[]): EquipSummary {
   const s = emptySummary();

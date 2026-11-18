@@ -1060,6 +1060,10 @@ export class WorldSim {
    *
    * ⇒ 故本字段只由 `startPartyRun()` 写入,没开就是 `null`,tick 里直接跳过。
    * 这与 `afkPlayers` 的纪律一致(「只存房间推过来的事实,单写入」)。
+   *
+   * ⚠️ ★ 第四轮实测:`startPartyRun()` 本身在全仓**零调用**(只有 `tests/WS-11`
+   * 直接调)⇒ **生产里本字段恒 `null`**、`tickPartyMode` 从不推进、
+   * `partyPhase()` 恒 `'IDLE'`。缺口与补法登记在 `notePartyEvent` 的台账段。
    */
   private partyRun: PartyModeRuntime | null = null;
 
@@ -2050,6 +2054,11 @@ export class WorldSim {
    * @param itemIds 投入的材料 ID(2~4 件,可含梦境露水 130)
    * @param opts    `playerName` 冠名 / `seed` 固定随机种子 / `lvProf` 专精等级
    * @returns `ok:false` 时**世界完全未被改动**;`ok:true` 时附带 `consumed` 账
+   *
+   * ★ 第四轮实测 P1:上面这句此前**不成立** —— 扣料是逐项做的、某一项不足就
+   *   `return ok:false`,**已扣的那几项永久消失**(既不产出也不归还);而复核与扣减
+   *   之间还隔着一次 `await forge(...)`。今天由 `consumeMaterialsFor` 的
+   *   「同一段同步代码里复核 + 扣减 + 失败还原」保证。
    */
   async forgeAlchemy(
     itemIds: readonly number[],
@@ -2068,12 +2077,14 @@ export class WorldSim {
       return { ok: false, stage: 'GATE', message: gate.message };
     }
 
-    /* 2 材料必须在**地面**上真的存在(够扣)。露水不从材料位扣(门禁已剥离)。 */
+    /* 2 材料必须在**地面**上真的存在(够扣)。露水不从材料位扣(门禁已剥离)。
+       ⚠️ 这一步只是**早退**(跑不通就别白跑一次 forge):**权威的那次复核**在扣料前
+       一刻、与扣减处在**同一段同步代码**里(`consumeMaterialsFor`)。
+       修前这里是唯一的复核,而它与扣减之间隔着 `await forge(...)` ⇒ 可被交错。 */
     const need = new Map<number, number>();
     for (const id of gate.materialIds) need.set(id, (need.get(id) ?? 0) + 1);
     for (const [id, want] of need) {
-      let have = 0;
-      for (const g of this.mobGround) if (groundItemId(g) === id) have += g.count;
+      const have = this.groundCountOf(id);
       if (have < want) {
         return {
           ok: false,
@@ -2095,24 +2106,17 @@ export class WorldSim {
       return { ok: false, stage: result.stage, message: result.message };
     }
 
-    /* 4 扣料:逐个 `consumeGroundItem`,并记账「实际扣了多少」。 */
-    const consumed: { itemId: number; count: number }[] = [];
-    for (const [id, want] of need) {
-      const got = this.consumeGroundItem(id, want);
-      if (got !== want) {
-        /*
-         * 理论不可达(第 2 步已核过库存),但**必须防守**:并发调用或
-         * 中间被别的系统改过地面时,扣不满就成了「白拿产物」。
-         * 这里如实返回差额,让调用方看得见,而不是静默吞掉。
-         */
-        consumed.push({ itemId: id, count: got });
-        return {
-          ok: false,
-          stage: 'INVENTORY',
-          message: `扣料阶段材料被改动:${id} 期望扣 ${want} 实际扣 ${got}`,
-        };
-      }
-      consumed.push({ itemId: id, count: got });
+    /* 4 扣料:**原子**(复核 + 扣减 + 失败还原在同一段同步代码里 ——
+       见 `consumeMaterialsFor` 的 docblock)。修前这里是「逐项扣,某一项不足就
+       `return ok:false`」:前几项**已永久消失** ⇒ 与本方法
+       「`ok:false` 时世界完全未被改动」的自述直接矛盾(第四轮实测 P1)。 */
+    const consumed = this.consumeMaterialsFor(need);
+    if (consumed === null) {
+      return {
+        ok: false,
+        stage: 'INVENTORY',
+        message: '扣料阶段材料被改动:地面库存与复核时不一致(本批材料已**全部还原**)',
+      };
     }
 
     /*
@@ -2132,6 +2136,61 @@ export class WorldSim {
       count: 1,
     } as GroundItem);
     return { ok: true, result, consumed, spawned: { x, y } };
+  }
+
+  /** 地面某件材料的**总件数**(单一计数实现:`forgeAlchemy` 的早退与原子扣料共用)。 */
+  private groundCountOf(itemId: number): number {
+    let have = 0;
+    for (const g of this.mobGround) if (groundItemId(g) === itemId) have += g.count;
+    return have;
+  }
+
+  /**
+   * 一次性扣掉一组材料 —— **原子**(复核 / 扣减 / 失败还原都在同一段同步代码里)。
+   *
+   * ## 修的是什么(第四轮实测 P1)
+   *
+   * 修前 `forgeAlchemy` 是「逐项 `consumeGroundItem`,扣到某一项不足就
+   * `return ok:false`」,两个后果:
+   * ```
+   * 1 前面几项**已经扣掉了** ⇒ 那批材料永久消失(既不产出、也不归还),
+   *   与该方法契约「ok:false 时世界完全未被改动」直接矛盾;
+   * 2 扣料发生在 `await this.alchemy.forge(...)` **之后** ⇒ 从「上一步核过库存」
+   *   到「真的扣下去」之间隔着一次 await,别的系统可以在那道缝里改地面。
+   * ```
+   * 本方法把「全量复核 + 扣减」压进**同一段同步代码**:JS 单线程 ⇒ 复核一旦成立就
+   * 一定扣得满;仍留一条防守分支 —— 一旦有一项扣不满,就把这一批**逐堆还原**
+   * (件数 **和** 数组次序都还原 ⇒ 与调用前逐字段相同)。
+   *
+   * ⚠️ 扣减仍然**只走** `consumeGroundItem`(全仓唯一的那种读法):这里不另写一份
+   *   遍历,否则又回到"同一个类里两种读法"那个已被点名的缺陷。
+   *
+   * @returns 逐项实际扣减数(键序与 `need` 一致);任何一项不足 ⇒ `null`(**世界已还原**)
+   */
+  private consumeMaterialsFor(need: ReadonlyMap<number, number>): { itemId: number; count: number }[] | null {
+    /* 1 全量复核:每一项都得够 —— 与下面的扣减之间**没有 await**。 */
+    for (const [id, want] of need) {
+      if (this.groundCountOf(id) < want) return null;
+    }
+
+    /* 2 还原快照:**数组次序 + 每堆件数**。只记总件数不够 —— 被扣空的堆会被
+       `consumeGroundItem` 从数组里摘掉,还原时必须连位置一起放回去。 */
+    const order = this.mobGround.slice();
+    const counts = order.map((g) => g.count);
+
+    /* 3 扣减。 */
+    const consumed: { itemId: number; count: number }[] = [];
+    for (const [id, want] of need) {
+      const got = this.consumeGroundItem(id, want);
+      consumed.push({ itemId: id, count: got });
+      if (got !== want) {
+        for (let i = 0; i < order.length; i += 1) order[i].count = counts[i];
+        this.mobGround.length = 0;
+        for (const g of order) this.mobGround.push(g);
+        return null;
+      }
+    }
+    return consumed;
   }
 
   /**
@@ -2935,8 +2994,29 @@ export class WorldSim {
   }
 
   /**
-   * 报告一件与赛局有关的事实。三个发射点(击杀 / 采集拾取 / 到达目标)
-   * 各处就近调用它 —— 它们各自知道事实,但都不该知道"分数怎么算"。
+   * 报告一件与赛局有关的事实:世界侧把「谁做了什么」送出去,它**不该**知道
+   * "分数怎么算"(规则在 `party/scoring.ts`,落账在 `net/actions/start_party.ts`)。
+   *
+   * ## ⚠️ 台账:发射点只有**一个**(★ 第四轮实测 P2,按现状改写)
+   *
+   * 修前这段注释写的是「**三个**发射点(击杀 / 采集拾取 / 到达目标)各处就近调用它」。
+   * 实测全仓:只有**击杀**那一处真在发(`settleKill` 的
+   * `PARTY_SCORE_EVENT.CREATURE_KILL`,见本文件 `:2941`);另两个是空的:
+   * ```
+   * GATHER       (`party_gather`)       无生产者。拾取走 `net/actions/material.ts`
+   *              的 `materials().takeGroundItemNear(x, y, itemId, radius)` —— 那个签名
+   *              **不带玩家 id**,本层拿不到 `source`;编一个(空串 / 猜人)只会被
+   *              `index.ts:257` 的 `source === ''` 丢弃、或把分算到别人头上。
+   *              补法:给该调用链加 `actorId`(要改 `MaterialApi` 与动作层)。
+   * REACH_TARGET (`party_reach_target`) 无生产者。目标件(435 旗 / 410 球门框 /
+   *              434 皇冠底座)的"踩到"判定今天不在本层,没有「按玩家坐标扫目标格」
+   *              的入口。补法:在快帧里按玩家刚体所在格查 `objIdAt`,命中目标件就发。
+   * ```
+   * 同批:`startPartyRun`(`:5991`)在全仓**零调用**(只有 `tests/WS-11` 直接调)⇒
+   * 生产里 `partyRun` 恒 `null`、`tickPartyMode` 从不推进、`partyPhase()` 恒 `'IDLE'`。
+   * ⇒ 两条缺口都**只登记不冒充接线**:它们的补法都落在本文件**之外**
+   *   (`room.ts` / `net/actions/*` 的签名与装配层),而那超出本任务的可改范围。
+   * ⚠️ 没接 sink ⇒ 事件被丢弃(与"世界侧不知道"等价),判据按"分数不变"断言。
    */
   notePartyEvent(ev: { kind: string; source?: string }): void {
     this.partyScoreSink?.(ev);
@@ -3706,6 +3786,15 @@ export class WorldSim {
    * 五张表本就都按**玩家 id** 索引 ⇒ 生命周期必须跟着玩家 id 走(`rebuildWorld` 的
    * 那段注释里也是同一纪律)。这里逐项点名删除,不做"清空一切"。
    *
+   * ## ★ 第四轮实测 P2:玩法表 `afkRuns` 也漏了(与 `afkPlayers` **不是**同一张)
+   *
+   * `afkPlayers` 只是**连接态**标记;真正的玩法表是 `afkRuns`
+   * (`dew` 已攒露水 / `backgroundedAtSec` 切后台时刻 / `dozedSec` 打盹累计秒)。
+   * 修前它**从不清** ⇒ 同名玩家重连会**继承上一轮的打盹态与已攒露水**
+   * (表现:刚上线就按打盹速率产露水、`dewOf()` 一进场就非 0)。
+   * `rebuildWorld` 刻意**保留**它(玩家世代数据,不是世界世代),但
+   * **移除玩家**是另一件事 —— 那条 id 已经不在房间里了。
+   *
    * ## 物理刚体走 `PhysicsWorld.remove` 而不是 `bodies.delete`
    *
    * `bodies.delete` 只摘掉主表,`trapTimers / muMuls / speedCaps / gravityMuls /
@@ -3730,12 +3819,13 @@ export class WorldSim {
     /* 出生点一并清掉:留着会让**重新加入**的同名玩家被重置送到上一局的出生点
        (房间把出生点按席位排开,席位是会变的)。与上面两条是同一类残留。 */
     this.spawnPoints.delete(id);
-    /* ★ 五张按 id 索引的瞬态表(见 docblock):漏任何一张都是"重连继承上一轮"。 */
+    /* ★ 按 id 索引的瞬态/玩法表(见 docblock):漏任何一张都是"重连继承上一轮"。 */
     this.foodBuffs.delete(id);
     this.liveBubbles.delete(id);
     this.sprayUntil.delete(id);
     this.tendUntil.delete(id);
-    this.knockbacks.delete(id);
+    /* ★ 第四条:打盹玩法表(与上面那条连接态标记**不是**同一张,见 docblock)。 */
+    this.afkRuns.delete(id);
     this.knockbacks.delete(id);
     this.syncPlayers();
     return had;
@@ -5874,7 +5964,17 @@ export class WorldSim {
   /* ═══════════════ task-84:WS-11 对局运行时的每帧驱动 ═══════════════ */
 
   /**
-   * 开一局派对模式。**这是 `createPartyMode` 在全仓的第一个生产调用点。**
+   * 开一局派对模式(**房间侧的入口名**,`createPartyMode` 的持有者只能在这里)。
+   *
+   * ## ⚠️ 台账(★ 第四轮实测 P2,如实登记)
+   *
+   * 本方法今天在全仓**没有调用点**:`net/actions/*`、`room.ts`、`index.ts` 都没调它,
+   * 只有 `tests/WS-11` 直接调。⇒ **生产里** `partyRun` 恒 `null`、
+   * `tickPartyMode` 从不被推进、`partyPhase()` 恒 `'IDLE'`、赛局播报一条不发。
+   * 修前的 docblock 写的是「这是 `createPartyMode` 在**全仓的第一个生产调用点**」,
+   * 那句与现状不符(把它改成"入口已就绪,等装配层接线"),缺口与补法一并记在
+   * `notePartyEvent` 的台账段(那里还有 `GATHER` / `REACH_TARGET` 两个发射点)。
+   * 补接线要动 `room.ts` 与动作层 = 超出本文件可改范围,故本文件只登记不改口径。
    *
    * ## 为什么由模拟层提供这个入口,而不是让房间直接 new
    *
@@ -6124,6 +6224,19 @@ export class WorldSim {
    * 与机械臂的 `feed()` 走同一条记账路径 —— 两条路都必须把货记进锅里,
    * 否则又会造出「一边投一边丢」的分叉实现。
    *
+   * ## ★ 第四轮实测 P2:灭火后**不再**由投料复燃(语义定案)
+   *
+   * 灭火曾经是**单向闩锁**(全仓只有 `RESET_WORLD` 的 `kitchens.clear()` 能清
+   * `fireOut`)—— 那部分已经修掉,但复燃走的是**另一条动作**:
+   * ```
+   * 投料 ≠ 点火   火灭了 ⇒ 本方法照旧**一件都不收**(`feedStation` 对
+   *               `fireOut` 返回 0,料留在地面)。这条口径由 `WS-14` 的
+   *               C3 负对照钉住(「灭火后不应再进料」「材料应留在地面」),
+   *               故**不能**改成「投料即复燃」——那会静默吃掉玩家的料。
+   * 复燃 = 显式动作 `relightStationAt()`(见它与 `extinguishStationAt`
+   *               的语义表)。"灭火需要重新点火",而不是"丢件料就自动好"。
+   * ```
+   *
    * @returns 实际投入的件数(该格无货 / 火已灭 时为 0)
    */
   feedStationAt(deviceId: number, x: number, y: number, maxCount = 1): number {
@@ -6223,9 +6336,45 @@ export class WorldSim {
     return n;
   }
 
-  /** 浇灭某料理站的炉火(227 水枪 / 212 大铁铲)。锅内料保留,只是不再出锅。 */
+  /**
+   * 浇灭某料理站的炉火(227 水枪 / 212 大铁铲)。锅内料保留,只是不再出锅。
+   *
+   * ## 灭火是**可逆**的,但复燃是**独立动作**(★ 第四轮实测 P2,语义定案)
+   *
+   * 修前这里把 `fireOut` 置位后**全仓没有复位路径**(只有 `RESET_WORLD` 的
+   * `kitchens.clear()` 会清)⇒ 一次误浇就让这口锅永久废掉,而 `WS-14` / `WS-FND-52`
+   * 的门禁全绿(它们只断言"真的灭了")。今天的语义是:
+   * ```
+   * 灭火   extinguishStationAt(deviceId)            本方法(单向,幂等)
+   * 点火   relightStationAt(deviceId)               显式动作:把 fireOut 复位
+   * 投料 ≠ 点火 —— 火灭着就**一件都不收**(`feedStation` 对 `fireOut` 返回 0,
+   *        料留在地面)。这条口径被 `WS-14` 的 C3 负对照钉住,不能改成
+   *        「投料即复燃」:那会静默吃掉玩家的料,也会让一次空投解除灭火。
+   * ```
+   * ⇒ 「灭火需要**重新点火**」,而 `relightStationAt` 就是那个动作的世界侧落点
+   * (与 `extinguishStationAt` 对称)。动作层把它接到 `USE_ITEM` 需要改
+   * `net/actions/*` 与 `useItem` 的分派表 —— 超出本次可改范围,已登记在
+   * 本文件与 `tests/WS-FND-109` 的台账段。
+   */
   extinguishStationAt(deviceId: number): void {
     this.stationState(deviceId).fireOut = true;
+  }
+
+  /**
+   * **重新点火**:把某料理站的 `fireOut` 复位(灭火的可逆那一半,语义表见
+   * `extinguishStationAt`)。
+   *
+   * 为什么必须是独立动作而不是"投料时顺手点火":投料被拒时料会落地,
+   * 玩家看到的是"我的料没进锅"—— 那是可解释的;若改成"投料即复燃",
+   * 灭着的锅会静默收下料(甚至被一次空投解除灭火)。
+   *
+   * @returns 是否**真的**改了状态 —— `false` = 本来就是点着的(不是"失败")
+   */
+  relightStationAt(deviceId: number): boolean {
+    const k = this.stationState(deviceId);
+    if (!k.fireOut) return false;
+    k.fireOut = false;
+    return true;
   }
 
   /**

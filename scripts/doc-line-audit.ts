@@ -111,9 +111,24 @@ for (const r of refs) {
   }
   const f = res.file;
   const L = readFileSync(f, 'utf8').split(/\r?\n/);
+  /* ★ 2026-11-18 审计(最小校验补齐):**区间两端都要判**。
+     旧代码只查起点(`r.line > L.length`)⇒ `a.ts:10-99999` 这种
+     「起点在范围内、终点早就超出」的引用被判成「行号在范围内(需人看)」,
+     而它与起点越界一样是 **100% 确定的陈旧**(文件缩了/区间是抄来的)。
+     ⚠️ why 里必须保留 `> 文件总行数` 这个子串:下面「行号越界(确定陈旧)逐条」
+     那一节与「文件不存在/同名多文件」的分类都按它过滤 —— 否则新增的这一类
+     会掉进「文件不存在」的桶里,报错指错地方(本仓反复点名的形态)。 */
   if (r.line > L.length) {
     overrun += 1;
     bad.push({ r, why: `行号 ${r.line} > 文件总行数 ${L.length}`, actual: relative(ROOT, f).replace(/\\/g, '/') });
+    continue;
+  }
+  if (r.end !== undefined && r.end > L.length) {
+    overrun += 1;
+    bad.push({
+      r, why: `行区间终点 ${r.end} > 文件总行数 ${L.length}(起点 ${r.line} 在范围内)`,
+      actual: relative(ROOT, f).replace(/\\/g, '/'),
+    });
     continue;
   }
   ok.push(r);
@@ -123,7 +138,7 @@ for (const r of refs) {
 console.log(`\n══ 1 机械可判的错误 ══`);
 console.log(`   · 目标文件不存在        : ${missing} 处`);
 console.log(`   · 同名多文件(需人判)  : ${ambiguous} 处`);
-console.log(`   · ★ 行号超出文件总行数  : ${overrun} 处  ← 这一条是 100% 确定的陈旧`);
+console.log(`   · ★ 行号/区间终点越界  : ${overrun} 处  ← 这一条是 100% 确定的陈旧(起点与终点都判)`);
 console.log(`   · 行号在范围内(需人看)  : ${ok.length} 处`);
 
 /* ★ 只把"确定陈旧"的逐条列出;其余只归类报数(它们多半是我的解析器没找到) */

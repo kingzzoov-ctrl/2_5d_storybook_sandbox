@@ -52,7 +52,57 @@
  *
  * ⚠️ 接口**未变**:`DEAD_ITEMS` / `DEAD_ITEM_BY_ID` 两个 export 名字与形状都不动
  *    (FND17-6 直接 import 它们)。本批只**加**入口块,不改登记表内容。
+ * ★ 2026-11-18:`reason` / `consumer` 两条**内容**判据(`reasonVerdict` /
+ *   `consumerVerdict`)也是 export —— 判据本身可被 `tests/WS-FND-112` 单独注入验证,
+ *   而不是只能靠"跑一遍看有没有红"。
  */
+
+/* ★ 2026-11-18 审计(最小校验补齐):两条**内容**判据(旧自检只看形状)。
+   ⚠️ 仓库根用**文件位置**算,不用 `process.cwd()` —— 本文件会被
+   `tests/WS-FND-17` / `tests/WS-FND-112` import,判据必须与 cwd 无关。 */
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 「未实装」的**理由**判据 —— 返回 null 表示合格,否则给出不合格的原因。
+ *
+ * 缺口(实测):旧自检只查 `implemented ↔ consumer` 是否配套,
+ * 于是 `reason: ''`(等于什么都没写)能通过 —— 判据只看了**形状**,没看**内容**。
+ */
+export function reasonVerdict(reason: string): string | null {
+  const r = reason.trim();
+  if (r.length === 0) return 'reason 为空(必须写清「缺什么」)';
+  if (r.length < 20) return `reason 只有 ${r.length} 字(< 20),写不清「缺什么」`;
+  if (/^(?:todo|tbd|待办|待补|以后再说|回头再说)/i.test(r)) {
+    return 'reason 只是 TODO 占位(必须写清「缺什么」,不是「待办」)';
+  }
+  return null;
+}
+
+/**
+ * 「消费点」的**真实性**判据 —— 返回 null 表示合格。
+ *
+ * 缺口(实测):`consumer` 此前只要求「非空字符串」⇒ `'see room.ts'` 这种
+ * **指向一个不存在的位置**的写法照样过,而它正是「过度声称」的形态。
+ * 判据(最小、可机械判定):`null` 合法(未实装时的约定);
+ * 非 null 时必须至少写出一个 `*.ts` 路径,且**该文件真的存在**。
+ */
+export function consumerVerdict(consumer: string | null): string | null {
+  if (consumer === null) return null;
+  const c = consumer.trim();
+  if (c.length === 0) return 'consumer 是空串(要么写清消费点,要么按约定写 null)';
+  const files = [...c.matchAll(/([A-Za-z0-9_./-]+\.tsx?)/g)].map((m) => m[1]!);
+  if (files.length === 0) {
+    return 'consumer 里没有任何 `*.ts` 路径 ⇒ 无法核验消费点是否存在(「提到」不算消费点)';
+  }
+  const missing = files.filter((f) => !existsSync(join(ROOT, f)));
+  if (missing.length > 0) {
+    return `consumer 指向的文件不存在:${missing.join(' / ')}(消费点是假的)`;
+  }
+  return null;
+}
 
 /**
  * 死道具清单。`implemented` **只有在这件道具真的有生产消费点时**才为 `true`。
@@ -125,6 +175,14 @@ if (import.meta.main) {
     } else if (!d.implemented && d.consumer !== null) {
       bad.push(`${d.id} ${d.name}:implemented false 但 consumer 非 null(自相矛盾)`);
     }
+    /* ★ 2026-11-18 审计(最小校验补齐):上面那条只查**形状**(implemented ↔
+       consumer 是否配套),下面两条查**内容** —— `reason` 非空(且不是 TODO 占位)、
+       `consumer` 指向的文件**真的存在**。旧口径下 `reason: ''` 与
+       `consumer: 'see room.ts'` 都能过。 */
+    const rv = reasonVerdict(d.reason);
+    if (rv !== null) bad.push(`${d.id} ${d.name}:${rv}`);
+    const cv = consumerVerdict(d.consumer);
+    if (cv !== null) bad.push(`${d.id} ${d.name}:${cv}`);
     console.log(`  【${d.implemented ? '已实装' : '未实装'}】${d.id} ${d.name}`);
     console.log(`      消费点:${d.consumer ?? '(无 —— 未实装时按约定必为 null)'}`);
     console.log(`      仍缺什么:${d.reason}`);
