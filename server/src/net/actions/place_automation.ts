@@ -26,11 +26,35 @@
  *   2 坐标不是有限整数 / kind 不是非空字符串 ⇒ INVALID,零状态
  *   3 坐标越界 ⇒ INVALID,零状态
  *   4 `hasComponentKind(kind)` 为假 ⇒ INVALID,零状态(判据是注册表,不是本文件的名单)
+ *   4' `SPEC_BY_KIND` 里没有这一种的规格 ⇒ NOT_IMPLEMENTED,零状态
+ *      (注册表说有、规格表说没有 = 两张表不同步,是链路问题不是报文问题)
  *   5 该格**已有东西** ⇒ INVALID,原记录一字不动(不可覆盖):
  *       · 本模块登记表里有那一格 ⇒ 拒绝(自动化件之间不覆盖);
  *       · 世界物质层(有的话)那一格的 obj 层非空 ⇒ 也拒绝(不盖住玩家的块);
- *   6 全部通过 ⇒ 写登记表并回 OK + `effect`(kind / 坐标 / 时刻 / 谁放的)
+ *   6 ★ **扣件**:`spec.id` 对应的**实物**要真扣:
+ *       · 缺按件权威读口 ⇒ NOT_IMPLEMENTED,零状态(与 `craft.ts` 同口径);
+ *       · 不持有(服务端账面 < 1)⇒ INVALID,零状态;
+ *       · 扣减走 `ctx.applyInventory`(负 delta);被拒 ⇒ INVALID,零状态
+ *   7 全部通过 ⇒ 写登记表并回 OK + `effect`(kind / 坐标 / 时刻 / 谁放的 /
+ *      `itemId` = 第 6 步**真的扣掉的那一件**,两处同源)
  * ```
+ *
+ * ## ★ 放置要**扣件**(owner 裁决;与 `craft.ts` / `material.ts` 同一条扣减口径)
+ *
+ * 自动化件是**实物**(冻结层 401~440,每一件在 `shared/constants/items.ts` 里都有
+ * 自己的 id / 配方),而「放置」在接线时**不扣任何东西** ⇒ 一件 428 定向物流传送带
+ * 可以无限放。现在:要放 `kind` ⇒ 必须**真的持有** `SPEC_BY_KIND.get(kind).id` 那一件。
+ *
+ *   · **哪一件**由服务端注册表决定(`spec.id`),不是报文的值(`kind` 才是报文里的);
+ *   · **有没有**由按件权威账决定(`ownedItemCount` ⇒ `RoomRuntime.itemCountOf`),
+ *     不是「总量守恒」;缺读口 ⇒ `NOT_IMPLEMENTED`(fail-closed,不退回信客户端);
+ *   · 扣减走 `ctx.applyInventory`(唯一写入口;负 delta 不需要 source 凭证);
+ *   · 回执的 `itemId` 与**真的扣掉的那一件**是**同一个变量**(`spec.id`)
+ *     ⇒ 两处不可能漂。
+ *
+ * 顺序照 `material.ts` 的 `placeBlock`:**先扣背包、再写世界**(这里「世界」= 登记表)。
+ * 登记表写入是同步的、不可能失败 ⇒ 不需要退回路径(与放块不同:那里 `placeBlock`
+ * 会拒,所以有 `PLACE_REFUND`)。
  *
  * ## 权限位取自**实际定义**,本模块不写角色表
  *
@@ -72,6 +96,8 @@
  */
 import { hasComponentKind } from '../../wiring/graph.ts';
 import { SPEC_BY_KIND } from '../../wiring/components.ts';
+/* ★ 扣件侧的按件权威读口(与 `craft.ts` / `material.ts` 同一份,不另写判定)。 */
+import { missingItemReadPort, ownedItemCount } from './item_source.ts';
 import type { ActionOutcome, ActionPayload } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -256,6 +282,19 @@ export const placeAutomation: ActionHandler = (ctx: ActionContext): ActionOutcom
     };
   }
 
+  /* ── 4' 规格:`spec.id` 是**扣件**与**回执**的唯一出处(见文件头「放置要扣件」)。
+        注册表(`hasComponentKind`)说有、规格表(`SPEC_BY_KIND`)说没有 = 两张表
+        不同步 ⇒ 链路问题,显式 NOT_IMPLEMENTED;**此时背包与登记表都还没动**。
+        ⚠️ 不猜默认 id、不放行 —— 那会让「注册表与规格表漂了」表现成「免费放件」。 ── */
+  const spec = SPEC_BY_KIND.get(kind);
+  if (spec === undefined) {
+    return {
+      ok: false, kind: 'NOT_IMPLEMENTED',
+      reason: `种类 ${kind} 已注册,但 SPEC_BY_KIND 里没有它的规格`
+        + ' ⇒ 定不出要扣哪一件实物(零副作用)',
+    };
+  }
+
   const roomId = ctx.state.roomId;
 
   /* ── 5a 本模块登记表:同一格不可覆盖(自动化件之间也一样)。 ── */
@@ -280,7 +319,27 @@ export const placeAutomation: ActionHandler = (ctx: ActionContext): ActionOutcom
     }
   }
 
-  /* ── 6 写登记表。 ── */
+  /* ── 6 ★ **扣件**:放置 = 消耗 `spec.id` 那一件**实物**(见文件头「放置要扣件」)。
+        顺序照 `material.ts` 的 `placeBlock`:**先扣背包、再写世界**(这里「世界」=登记表)。
+        `spec.id` 来自服务端注册表(不是报文的 `kind` 字符串换算的)。 ── */
+  const owned = ownedItemCount(ctx, spec.id);
+  if (owned === null) return missingItemReadPort(ctx);
+  if (owned < 1) {
+    return {
+      ok: false, kind: 'INVALID',
+      reason: `背包里没有这件自动化件 ${spec.id}(${spec.name})`
+        + `(服务端账面 ${owned} 件)⇒ 放不了 ${kind}`,
+    };
+  }
+  const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: spec.id, delta: -1 }] });
+  if (!spend.allowed) {
+    return {
+      ok: false, kind: 'INVALID',
+      reason: `背包里没有可放置的 ${spec.id}(${spec.name})(${spend.rejectCode ?? '被拒'})`,
+    };
+  }
+
+  /* ── 7 写登记表(扣件已在上一步成功)。 ── */
   const placedAtMs = clockMs();
   const record: AutomationPlacement = {
     kind,
@@ -291,10 +350,10 @@ export const placeAutomation: ActionHandler = (ctx: ActionContext): ActionOutcom
   };
   bucketOf(roomId).set(cellKey(x, y), record);
 
-  /* `SPEC_BY_KIND` 只为把冻结层的 401~440 编号带进回执(将来接线要用它造
-     `SignalGraph` 节点)。理论上走到这里它一定有(第 4 步已确认种类已注册),
-     故 `-1` 只是"没有规格"的显式哨兵,而不是默认值。 */
-  const spec = SPEC_BY_KIND.get(kind);
+  /* 回执的 `itemId` 就是第 6 步**真的扣掉的那一件**(同一个 `spec.id`)——
+     冻结层的 401~440 编号,将来接线要用它造 `SignalGraph` 节点。
+     ⚠️ 这里**不再**重新 `SPEC_BY_KIND.get(kind)`:两次查表就可能两次给出不同的
+     东西(比如表被改),而「回执说 428、实际扣的是 429」正是本判据要钉的缺陷。 */
 
   return {
     ok: true,
@@ -304,7 +363,7 @@ export const placeAutomation: ActionHandler = (ctx: ActionContext): ActionOutcom
       x,
       y,
       kind,
-      itemId: spec === undefined ? -1 : spec.id,
+      itemId: spec.id,
       placedBy: record.placedBy,
       placedAtMs,
       note: '只登记放置:电路求值(wiring/graph.ts)今天没有任何读者,见本文件开头',

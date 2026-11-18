@@ -255,13 +255,44 @@ export class FluidField {
     return this.amount[this.index(x, y)];
   }
 
+  /**
+   * 写一格流体状态(存档回铺 / 相变 / 调试的统一写口)。
+   *
+   * ## 实心格拒写(`solid` 校验)
+   *
+   * 与 `addWater` 同一条口径(见它的第 2 行:`if (this.solid[i] === 1) return 0;`):
+   * **实心格不存水**。改前 `setCell({ amount })` 不看 `solid`,于是水会被写进
+   * 岩石/墙里 —— `amount` 有了、`kindAt` 也有了,只是永远流不动(表面看水面
+   * 浮在墙内)。判据:`amount > 0` 且**结果态**为实心 ⇒ 抛 `RangeError`。
+   * 只清空(`amount: 0`)、只改 `base`/`elev`、或显式把 `solid` 置回 0 再注水都不受影响。
+   *
+   * ## 基底层补齐(`kind` 口径)
+   *
+   * 与 `addWater` 的 `if (this.base[i] === BaseFluid.VOID) this.base[i] = base` 对齐:
+   * 水量落进一个基底层还是 `VOID` 的格时补上默认水种。改前只写 `amount`,
+   * 于是那格的水在 `kindAt()` 里是 `NONE`(相变与引水渠判据看不到它)。
+   */
   setCell(x: number, y: number, init: FluidCellInit): void {
     if (!this.inBounds(x, y)) throw new RangeError(`FluidField.setCell 越界:(${x}, ${y})`);
     const i = this.index(x, y);
+    const nextSolid = init.solid !== undefined ? (init.solid ? 1 : 0) : this.solid[i];
+    if (init.amount !== undefined && init.amount > 0 && nextSolid === 1) {
+      throw new RangeError(
+        `FluidField.setCell 拒绝向实心格注水:(${x}, ${y})`
+        + ' —— 与 addWater 同口径(实心格不存水)',
+      );
+    }
     if (init.base !== undefined) this.base[i] = init.base & 0xff;
     if (init.solid !== undefined) this.solid[i] = init.solid ? 1 : 0;
     if (init.elev !== undefined) this.elev[i] = init.elev & 0x3;
-    if (init.amount !== undefined) { this.amount[i] = clampAmount(init.amount); this.markActive(i); }
+    if (init.amount !== undefined) {
+      this.amount[i] = clampAmount(init.amount);
+      /* 只有真的存了水才补种 —— `amount: 0` 不该把一个空格的基底层改掉。 */
+      if (this.amount[i] > 0 && this.base[i] === BaseFluid.VOID) {
+        this.base[i] = BaseFluid.SHALLOW_WATER;
+      }
+      this.markActive(i);
+    }
   }
 
   /** 注入水量,超出容量部分丢弃并返回实际注入量。 */
@@ -724,6 +755,23 @@ export class FluidField {
     return this.total() + this.totalConsumedByPhase + this.totalConsumedLava;
   }
 
+  /**
+   * 深拷贝(回滚快照 / 预演用)。
+   *
+   * ## 活跃集必须一起复制(改前漏了)
+   *
+   * `activeArr` / `activeIdx` / `activeCursor` 是**性能缓存**(见它们的注释),
+   * 但它们不是纯装饰:`fluxPass` 先服务活跃格、再用游标补齐**剩余额度**。
+   * 预算小于格数时(大世界常态:`n=4096`、`budget=256`),活跃集就是
+   * 「这一帧水会不会动」的唯一依据 —— 丢掉它以后拷贝场里那些格要等
+   * `n/budget` 帧才轮到,表现成「回滚/预演出来的水不流」,而两份场的
+   * `moved` / `active` 也就对不上。
+   *
+   * `pendingObj` 同理:它承载「相变产物待写回 OBJ 层」,漏拷会让拷贝场
+   * 把上一帧的产物再写一遍(或反过来,原件那份被 `drainPhaseProducts` 清掉后
+   * 拷贝场里一件都没有)。`events` 是观测日志,不影响 `step` 的判据,故不复制
+   * (它自身有 256 条上限,不构成增长面)。
+   */
   clone(): FluidField {
     const c = new FluidField(this.width, this.height);
     c.amount.set(this.amount);
@@ -733,6 +781,16 @@ export class FluidField {
     c.cursor = this.cursor;
     c.totalConsumedByPhase = this.totalConsumedByPhase;
     c.totalConsumedLava = this.totalConsumedLava;
+    /* ★ 活跃集(轮转数组 + 位置索引 + 游标):顺序逐位照搬,才能让
+       `step(budget < n)` 在拷贝场与原场上服务**同一批格、同一顺序**。 */
+    c.activeArr.length = 0;
+    for (const i of this.activeArr) c.activeArr.push(i);
+    c.activeIdx.clear();
+    for (const [i, at] of this.activeIdx) c.activeIdx.set(i, at);
+    c.activeCursor = this.activeCursor;
+    /* ★ 相变产物队列:不转移所有权(两边各持一份,`drain` 各自消费)。 */
+    c.pendingObj.length = 0;
+    for (const p of this.pendingObj) c.pendingObj.push({ index: p.index, obj: p.obj });
     return c;
   }
 

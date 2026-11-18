@@ -229,7 +229,18 @@ export class SqliteDb implements DbLike {
     const row = this.conn.get(`SELECT COUNT(*) AS c FROM ${table}`, []) as { c: number };
     return row.c;
   }
-
+  /**
+   * 事务。**支持嵌套**,语义与 `memory_db.ts` 逐条一致(三个后端同一口径):
+   *
+   * | 情形 | 结果 |
+   * | :--- | :--- |
+   * | 内层抛错、外层捕获后继续 | 只回滚**内层**写入(外层已做的改动保留) |
+   * | 外层抛错 | 连同内层写入一起回滚 |
+   * | 嵌套调用 | 不抛错(第 2 层起用 `SAVEPOINT`,而不是再 `BEGIN`) |
+   *
+   * 三层实现:`better-sqlite3` 的 `transaction()` 自带 savepoint;`node:sqlite`
+   * 没有,由适配器手写(`nodeSqliteConnection`);`memory_db` 用每层一份快照。
+   */
   transaction<T>(fn: () => T): T {
     return this.conn.transaction(fn);
   }
@@ -261,6 +272,8 @@ export function betterSqlite3Connection(db: Database): SqlConnection {
       const info = db.prepare(sql).run(...(params as unknown[]));
       return { changes: info.changes, lastInsertRowid: info.lastInsertRowid };
     },
+    /* `better-sqlite3` 的 `transaction()` **自带嵌套处理**(内层自动开 savepoint,
+       与 SQLite 的官方语义一致),故直接转发 —— 它就是本仓「嵌套事务」的参考实现。 */
     transaction: <T,>(fn: () => T): T => db.transaction(fn)() as T,
     close: () => db.close(),
   };
@@ -282,26 +295,44 @@ interface NodeSqliteDb {
  *
  * 差异都在这几行里被吸收:
  *   * 没有 `pragma()`,因此 `PRAGMA` 走 `exec`;
- *   * 没有 `transaction()`,因此手写 BEGIN/COMMIT/ROLLBACK;
+ *   * 没有 `transaction()`,因此手写 BEGIN/COMMIT/ROLLBACK —— 且**嵌套**时改用
+ *     `SAVEPOINT`(SQLite 不允许在事务里再 `BEGIN`;改前第二层会直接抛
+ *     `cannot start a transaction within a transaction`,而另外两个后端都能嵌套);
  *   * BLOB 读回是 `Uint8Array`(而非 `Buffer`),由 `normalizeRow` 统一。
  *
  * 加载 `node:sqlite` 会打一条 ExperimentalWarning —— 用
  * `process.getBuiltinModule` 惰性取,避免顶层 import 时任何用法都被警告污染。
  */
 export function nodeSqliteConnection(db: NodeSqliteDb): SqlConnection {
+  /* 事务嵌套深度:0 = 没有活动事务。>0 时第 N 层用 `SAVEPOINT ws_sp_N`
+     (与 `better-sqlite3` 的 `transaction()` 同名语义),而不是再 `BEGIN`。 */
+  let txDepth = 0;
   return {
     exec: (sql) => db.exec(sql),
     all: (sql, params) => db.prepare(sql).all(...(params as unknown[])) as Record<string, unknown>[],
     get: (sql, params) => db.prepare(sql).get(...(params as unknown[])) as Record<string, unknown> | undefined,
     run: (sql, params) => db.prepare(sql).run(...(params as unknown[])),
     transaction: <T,>(fn: () => T): T => {
-      db.exec('BEGIN');
+      const sp = txDepth > 0 ? `ws_sp_${txDepth}` : null;
+      if (sp === null) db.exec('BEGIN');
+      else db.exec(`SAVEPOINT ${sp}`);
+      txDepth += 1;
       try {
         const r = fn();
-        db.exec('COMMIT');
+        txDepth -= 1;
+        if (sp === null) db.exec('COMMIT');
+        else db.exec(`RELEASE ${sp}`);
         return r;
       } catch (e) {
-        db.exec('ROLLBACK');
+        txDepth -= 1;
+        if (sp === null) {
+          db.exec('ROLLBACK');
+        } else {
+          /* 先回到 savepoint,再 `RELEASE` 真正弹出这一层 ——
+             只 `ROLLBACK TO` 不 `RELEASE`,savepoint 会一直堆在栈上。 */
+          db.exec(`ROLLBACK TO ${sp}`);
+          db.exec(`RELEASE ${sp}`);
+        }
         throw e;
       }
     },

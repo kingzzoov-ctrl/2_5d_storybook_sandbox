@@ -47,6 +47,11 @@ import { GREENHOUSE_SYSTEM } from '../systems/greenhouse.ts';
 import { ALCHEMY_LAB_SYSTEM } from '../systems/alchemy_lab.ts';
 import { DEPOT_SYSTEM } from '../systems/depot.ts';
 
+/* D4:元素抗性的**中性值**(1.0)从结算层读同一个常量,不在本文件再写一个 `1.0`
+   —— 两份定义迟早漂移。这里只 import 常量,不 import `VitalsSystem` 类:
+   房间层不依赖战斗层的**类**,只依赖「有一个能写抗性的口」(见 `ElementResistSink`)。 */
+import { ELEMENT_RESIST_NEUTRAL } from '../combat/vitals.ts';
+
 /**
  * 一个「系统解锁」房间的实现登记:模块路径 + 接线方要调的那个入口。
  *
@@ -307,4 +312,122 @@ export function roomAtCell(
     }
   }
   return null;
+}
+
+/* ═══════════ 10. 元素抗性:房间来源 → `vitals.setElementResist`(D4) ═══════════ */
+
+/**
+ * 一个玩家从**房间**获得的元素抗性(逐元素、乘区)。
+ *
+ * `element` 必须与 `server/src/combat/weapons.ts` 的 `Element` 同口径(大写英文);
+ * `mul` 是 `vitals.setElementResist` 的口径:1.0 = 无抗性、<1 减伤、0 = 完全免疫、
+ * >1 易伤(上界由 vitals 夹取)。
+ *
+ * ⚠️ 与 `Element` 的「克制矩阵」(`ELEMENT_COUNTER`)是**两件事**:那条算的是
+ * 「攻击方元素 → 防御方元素」的克制;本条算的是「受击方对某元素」的抗性。
+ */
+export interface RoomElementResistEntry {
+  element: string;
+  mul: number;
+}
+
+/**
+ * **待平衡**的元素抗性系数(本文件里唯一的数值登记)。
+ *
+ * ## 为什么是「待平衡」而不是一个内容值
+ *
+ * D4 要求「玩家侧元素抗性有生产写入点」,但**既有内容表里没有这个数**(逐处核过):
+ *
+ * | 候选来源 | 检索结果 |
+ * | :--- | :--- |
+ * | `shared/constants/bosses.ts` 的 `ROOM_RECIPES`(手册 §3.8 的 9 种房间) | bonus 只有 解锁 / 回血 / 生命上限 / 大餐 —— **没有元素抗性** |
+ * | `shared/constants/cooking.ts` 的 `FOOD_PARAM_SLOTS`(料理 6 槽) | `defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul` —— **没有抗性槽** |
+ * | `shared/constants/items.ts` + `combat/weapons.ts` 的 `ArmorDef` | 带「抗性」字样的只有 248 星光卡林巴琴(护盾 tag,**无可结算字段**);`ArmorDef` 没有抗性字段 |
+ *
+ * ⇒ 按裁决口径登记一条**具名·待平衡**的默认(与 `combat/damage.ts` 的
+ * `MOB_ELEMENT_BY_ID` 的「⚠ 待 owner 批准(平衡决策)」同一处理):
+ * **数值与元素归属都不是平衡裁决**,owner 给了真内容就替换
+ * `ROOM_ELEMENT_RESIST` 里那一行 —— 本常量随之退役。
+ *
+ * 取 `0.5`(减半)的理由是**可观测**:它让判据能用关系式(「同一次元素伤害减半」
+ * 「别的元素不串味」)钉住,而不是把一个平衡数字抄进断言里。
+ */
+export const PENDING_ELEMENT_RESIST_MUL = 0.5;
+
+/**
+ * 房间 → 玩家元素抗性的登记表(D4 的**数据来源**)。
+ *
+ * 元素取 `'ICE'`(霜冻)的读法:温泉馆的内容核心件是 `109 白玉温泉石`
+ * (tag「保温」「恢复」)——「泡温泉取暖 ⇒ 抗霜冻」是与既有内容同向的那一个;
+ * ⚠️ 元素归属同样**待 owner 裁决**。
+ *
+ * ⚠️ 这张表是元素抗性的**唯一**来源:不在这里的房间 = 无抗性
+ * (`roomElementResistOf` 返回 null ⇒ 推送路径写中性值),
+ * **不许**「顺手给每个房间都加一点」。
+ */
+export const ROOM_ELEMENT_RESIST: Readonly<Record<string, RoomElementResistEntry>> = Object.freeze({
+  SAKURA_ONSEN: { element: 'ICE', mul: PENDING_ELEMENT_RESIST_MUL },
+});
+
+/**
+ * 某房间给玩家的元素抗性;**不在表里 / 不在任何房间 ⇒ null**(= 必须清空)。
+ *
+ * `null` 与「中性值」是两种东西:后者是「被登记过、但这一元素此刻不吃抗性」,
+ * 前者是「根本没有来源」;推送路径按后者处理(写中性值)。
+ */
+export function roomElementResistOf(
+  roomKey: string | null,
+  table: Readonly<Record<string, RoomElementResistEntry>> = ROOM_ELEMENT_RESIST,
+): RoomElementResistEntry | null {
+  if (roomKey === null) return null;
+  return table[roomKey] ?? null;
+}
+
+/**
+ * 抗性的**写入口**(结构类型)。
+ *
+ * 刻意**不 import `VitalsSystem`**:本文件是房间层,只依赖「有一个能写抗性的口」;
+ * `VitalsSystem.setElementResist` 结构上就满足它(判据 `tests/WS-FND-93` 直接拿
+ * 真的 `VitalsSystem` 当 sink,不造假桩)。
+ */
+export interface ElementResistSink {
+  setElementResist(playerId: string, element: string, mul: number): boolean;
+}
+
+/**
+ * 把**房间来源**的元素抗性推给结算层(D4 的**生产写入点**,单点)。
+ *
+ * ## 三条口径
+ *
+ * 1. **单点推送**:全仓只有这一处调 `setElementResist`(判据 `WS-FND-93` FND93-1)。
+ * 2. **可重入**:每帧对**表里登记过的每个元素**各写一次 —— 同值重复写是幂等的
+ *    (不是「叠加」),所以「进房 → 出房 → 再进房」不会累积成抗性斜线。
+ * 3. **清空路径**:本帧没有来源(不在房间 / 该房间没登记)时写
+ *    `ELEMENT_RESIST_NEUTRAL`(1.0)—— 这是「离开即撤销」的实现。
+ *    **没有这一条,玩家会永久带着抗性**(FND93-3 的负对照钉它)。
+ *
+ * 非法 `mul`(NaN / Infinity / 非数字)**不由本函数判定**:`setElementResist`
+ * 是唯一守卫(拒绝写入、保留旧值),本函数只把它**如实上报**(返回 false)——
+ * 所以「加了守卫」这件事在判据里看得见(FND93-4)。
+ *
+ * ⚠️ 慢帧房间效果的唯一调用点在世界编排层(`WorldSim.tickRoomEffects`)——
+ *    见 `tests/WS-FND-93` 文件头的「生产调用点」一节(房间效果本来就是慢帧产物)。
+ *
+ * @returns 每一次写入是否被接受(全部接受才为 true)
+ */
+export function pushRoomElementResist(
+  sink: ElementResistSink,
+  playerId: string,
+  roomKey: string | null,
+  table: Readonly<Record<string, RoomElementResistEntry>> = ROOM_ELEMENT_RESIST,
+): boolean {
+  const src = roomElementResistOf(roomKey, table);
+  let allAccepted = true;
+  for (const entry of Object.values(table)) {
+    /* 同一元素只取**当前来源**那一份;其余一律回中性值(清空)。 */
+    const isSource = src !== null && entry.element === src.element;
+    const mul = isSource ? src.mul : ELEMENT_RESIST_NEUTRAL;
+    if (!sink.setElementResist(playerId, entry.element, mul)) allAccepted = false;
+  }
+  return allAccepted;
 }

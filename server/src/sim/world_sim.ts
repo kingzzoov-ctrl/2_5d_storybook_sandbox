@@ -61,7 +61,7 @@ import {
 } from '../systems/wiring.ts';
 import { sprinklerCells, type Weather } from '../systems/greenhouse.ts';
 import { feedItemOf, type RanchAnimal, type RanchDayResult } from '../systems/ranch.ts';
-import { buy, type BuyResult } from '../systems/depot.ts';
+import { buy, CONTENT_PRICE_TABLE, type BuyResult, type PriceTable } from '../systems/depot.ts';
 /* ★ A-3:炼金的**中性初判**不在这里发明 —— 复用 `alchemy/**` 既有的口径:
    `NEUTRAL_AFFINITY`(0.7 = 不倾斜)与 `S_LOGIC_BASE + SPAN × affinity`
    (`gate.ts:204` 的公式,本文件只照它算默认值,允许调用方显式覆盖)。 */
@@ -87,6 +87,7 @@ import {
   createRoomEffectState,
   stepRoomEffects,
   roomAtCell,
+  pushRoomElementResist,
   maxHpMulOf,
   type RoomEffectState,
 } from '../rooms/effects.ts';
@@ -1213,6 +1214,13 @@ export class WorldSim {
   } | null = null;
   /** 无人自助售货摊(515)的库存:`物品 id → 件数`(世界世代的一部分)。 */
   private stallStock: Record<number, number> = {};
+  /**
+   * 购买提交的**幂等键**表:键 → 成交时的帧号(`frameCount`)。
+   *
+   * 键由 `(actorId, 摊位=itemId, tick 或订单号)` 派生(见 `purchaseCommit`)。
+   * 它属于**世界世代**(帧号在 `rebuildWorld` 里归零),所以随 `stallStock` 一起换代。
+   */
+  private committedPurchaseKeys = new Map<string, number>();
   /** 最近一次牧场日结的**落货**账(哪些产出真的落到地上 / 哪些没物品 id)。 */
   private lastRanchDrop: { dropped: { itemId: number; count: number; x: number; y: number }[]; skipped: string[] } =
     { dropped: [], skipped: [] };
@@ -2060,15 +2068,17 @@ export class WorldSim {
    * @returns `hit === null` 且 `outcome === 'OK'` = 没有这只生物(不静默造伤害);
    *          `outcome === 'OUT_OF_AOI'` = **未结算**(目标不在活跃区,或被闸拒绝 ——
    *          是哪种看 `rejected`);
-   *          `rejected` = 显式拒绝的理由(`null` = 未被拒绝)。
+   *          `rejected` = 显式拒绝的理由(`null` = 未被拒绝),取值:
+   *          `NOT_A_PLAYER` / `DOWNED` / `STUNNED` / `TRAPPED` /
+   *          `LOS_BLOCKED`(隔墙,与 PvP / 生物→玩家同一条射线)/ `OUT_OF_AOI`。
    *
-   *          ⚠️ 为什么不新造一个 `outcome: 'DOWNED'`:该联合类型是**对外契约**
-   *          (`server/src/net/room.ts` 的 `AttackReport.outcome` 与
-   *          `WorldSaveHost.attackMobAuthorized` 的声明),加一个成员会立刻在
-   *          `room.ts` 里产生**新的**类型错误 —— 而本仓的 `typecheck-baseline`
-   *          锁住既有错误数,新增即门禁红。
+   *          ⚠️ 为什么不新造 `outcome` 的成员(`'DOWNED'` / `'STUNNED'` ...):
+   *          该联合类型是**对外契约**(`server/src/net/room.ts` 的
+   *          `AttackReport.outcome` 与 `WorldSaveHost.attackMobAuthorized` 的声明),
+   *          加一个成员会立刻在 `room.ts` 里产生**新的**类型错误 —— 而本仓的
+   *          `typecheck-baseline` 锁住既有错误数,新增即门禁红。
    *          ⇒ 机器外契约不动,理由由 `rejected` 字段承载(它同时是**可判定**的:
-   *          `=== 'DOWNED'` 即可,不需要读人类可读的字符串)。
+   *          `=== 'DOWNED'` / `=== 'LOS_BLOCKED'` 即可,不需要读人类可读的字符串)。
    */
   attackMobAuthorized(
     playerId: string,
@@ -2084,7 +2094,7 @@ export class WorldSim {
      * 而「被打成幽灵泡泡 ⇒ 不能攻击」与「目标在 32 格外」是**两件事**,
      * 混成一个值就是**谎报**(本文件反复强调的取舍)。
      */
-    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'OUT_OF_AOI' | null;
+   rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'STUNNED' | 'TRAPPED' | 'LOS_BLOCKED' | 'OUT_OF_AOI' | null;
   } {
     /* 闸 0:`playerId` 必须是**登记过的玩家**,不是生物。
        否则攻击者可用一只生物当「玩家」去打另一只(它同样在
@@ -2114,6 +2124,18 @@ export class WorldSim {
       return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'DOWNED' };
     }
 
+    /* 闸 0c / 0d:★ 攻击侧也封 **STUNNED / TRAPPED**(与移动侧 `applyPlayerMove`
+       的 3316 / 3323 **逐字同源**):真值来源不变 —— `vitals.stunOf`(Boss 定身)
+       与 `isTrapped(liveBubbleOf(...))`(227 泡泡)。此前**只有移动侧**读它们 ⇒
+       「被冻住 / 被泡泡装起来,却还能挥刀」。与移动侧同一台状态机、同一批拒因名,
+       不新造第二套判定(否则两条路会漂移,而门禁查不出)。 */
+    if (this.vitals.stunOf(playerId) > 0) {
+      return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'STUNNED' };
+    }
+    if (isTrapped(this.liveBubbleOf(playerId))) {
+      return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'TRAPPED' };
+    }
+
     const rt = this.mobHost.runtimeOf(mobId);
     if (rt === null) return { outcome: 'OK', hit: null, rejected: null };
 
@@ -2132,6 +2154,16 @@ export class WorldSim {
     const distance = this.mobDistance(playerId, mobId);
     if (!Number.isFinite(distance) || distance > AOI_WAKE_DISTANCE) {
       return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'OUT_OF_AOI' };
+    }
+
+    /* ★ 闸 2:视线(与 PvP 的第 3 闸、生物→玩家的 D2 是**同一条射线**)——
+       隔墙砍不到生物,对怪同样成立。判据读 `grid.isSolidAt`(权威地形),
+       与 :2202 / :5091 逐字同参。`losBlocked` 的取反语义见 `vision.ts`
+       (端点在实心格 / 坏坐标 ⇒ fail-open,那是既有取舍,这里不复述)。 */
+    const attackerBody = this.physics.bodies.get(playerId);
+    if (attackerBody !== undefined &&
+        losBlocked(attackerBody.x, attackerBody.y, rt.x, rt.y, (cx, cy) => this.grid.isSolidAt(cx, cy))) {
+      return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'LOS_BLOCKED' };
     }
 
     const hit = this.attackMob(playerId, mobId, {
@@ -2167,14 +2199,14 @@ export class WorldSim {
    * (它负责无敌帧与 `downed`,不重算公式)。击退用**武器侧**的
    * `result.knockbackImpulse`(内容值)写回刚体 —— 与 D1 同一条写回路径。
    *
-   * @returns `rejected`: `'NOT_A_PLAYER' | 'DOWNED' | 'PVP_OFF' | 'PVP_SELF' | 'NO_LOS' | 'OUT_OF_AOI'`,
+   * @returns `rejected`: `'NOT_A_PLAYER' | 'DOWNED' | 'STUNNED' | 'TRAPPED' | 'PVP_OFF' | 'PVP_SELF' | 'PVP_NO_TARGET' | 'NO_LOS' | 'OUT_OF_AOI'`,
    *          `null` = 真的结算了(`applied` 可能为 0:被闪避/无敌帧)。
    */
   attackPlayerAuthorized(
     attackerId: string,
     targetId: string,
   ): {
-    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'PVP_OFF' | 'PVP_SELF' | 'PVP_NO_TARGET' | 'NO_LOS' | 'OUT_OF_AOI' | null;
+    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'STUNNED' | 'TRAPPED' | 'PVP_OFF' | 'PVP_SELF' | 'PVP_NO_TARGET' | 'NO_LOS' | 'OUT_OF_AOI' | null;
     applied: number;
     result: PipelineDamageResult | null;
   } {
@@ -2183,6 +2215,16 @@ export class WorldSim {
     }
     if (this.vitals.get(attackerId)?.downed === true || this.vitals.get(targetId)?.downed === true) {
       return { rejected: 'DOWNED', applied: 0, result: null };
+    }
+    /* ★ D3 补:攻击侧也封 **STUNNED / TRAPPED** —— 只封**攻击者**那一侧
+       (被冻住 / 被泡泡装起来的人不能挥刀)。真值来源与移动侧(:3316/:3323)
+       同源:`vitals.stunOf` / `isTrapped(liveBubbleOf(...))`,同一台状态机、
+       同一批拒因名。受击方照常挨打(被困不等于免伤,那是另一条规则)。 */
+    if (this.vitals.stunOf(attackerId) > 0) {
+      return { rejected: 'STUNNED', applied: 0, result: null };
+    }
+    if (isTrapped(this.liveBubbleOf(attackerId))) {
+      return { rejected: 'TRAPPED', applied: 0, result: null };
     }
     /* ★ 唯一授权判定 —— 本方法**不**自己判 `this.pvpEnabled`
        (那会长出第二份 PvP 语义,日后与 `pvpVerdict` 漂移)。 */
@@ -3974,6 +4016,11 @@ export class WorldSim {
       /* 玩家坐标定位到格:房间按格集合记录,必须 floor 到格再查。 */
       const key = roomAtCell(roomsView, b.x, b.y);
 
+      /* ★ D4 生产写入点:把**房间来源**的元素抗性推给 `vitals`(单点推送)。
+         `key` 为 null(不在任何已识别房间)时本函数写回中性值 ⇒「离开即撤销」。
+         不发返回值:这里不消费「是否被接受」—— 非法 `mul` 的守卫在
+         `setElementResist` 里,判据 WS-FND-93 FND93-4 直接钉那一层。 */
+      pushRoomElementResist(this.vitals, id, key);
       let st = this.roomEffects.get(id);
       if (st === undefined) {
         st = createRoomEffectState();
@@ -4620,6 +4667,9 @@ export class WorldSim {
        两者都不报错,只是跨世代残留(与 `killLedger` / `mobOrdinals` 同一纪律)。 */
     this.roomSystemsState = createRoomSystemsState();
     this.stallStock = {};
+    /* ★ 幂等键表同样换代:键里含 `frameCount`,而它在下面被归零 ⇒
+       不一起清,新世界里第 0 帧的一笔会和旧世代同键相撞(静默拒一单)。 */
+    this.committedPurchaseKeys.clear();
     this.dayFraction = 0;
     this.lastRoomSystems = null;
     this.lastRanchDrop = { dropped: [], skipped: [] };
@@ -4631,16 +4681,28 @@ export class WorldSim {
        就是让帧序归零。这也是"喷射意图窗口"之类以帧序计的窗口一起失效的原因。 */
     this.frameCount = 0;
 
-    /* 5 玩家**保留**:回出生点、满血、非倒地。
+    /* 5 玩家**保留**:回出生点、**满血**、非倒地。
        `addPlayer` 一次做全四件事(物理刚体 / AOI / `playerIds` / `vitals.register`),
        所以这里只调它 —— 不另写一份"重生玩家"的实现(那会是第二份注册逻辑,
-       漏掉 AOI 或 vitals 就是"看不见"或"打不掉血")。 */
+       漏掉 AOI 或 vitals 就是"看不见"或"打不掉血")。
+
+       ★ 但 `vitals.register` 给的上限是**构造缺省值**(`PLAYER_BASE_HP` = 100),
+       与等级无关;而等级档案是**玩家的**、跨世代保留(它不在本方法清空的那批里)。
+       ⇒ 不补这一步,5 级玩家重置后上限被抓回 100 且**不报错**(正是 W1 的形态)。
+       补法与 `restoreFromProfile` 第 3 步 / `applyRestore` 的 (2) **同一口径**:
+       `maxHpForLevel`(上限的唯一算子)+ `syncMaxHp`(vitals 唯一写入口)抬上限;
+       再 `revive` 让 `hp` 跟到新上限(`syncMaxHp` 是策略 C:只钳不补)。
+       ⚠️ 这里**不写** `100 + 15*(lv-1)`(那是第二份派生公式,正是 W1 的成因)。 */
     const keep = [...this.playerIds].sort();
     this.playerIds.clear();
     for (const id of keep) {
       const sp = this.spawnPoints.get(id)
         ?? { x: this.sizeCells / 2, y: this.sizeCells / 2 };
       this.addPlayer(id, sp.x, sp.y);
+      /* 等级 → 上限(复用唯一算子)+ 满血(复用 vitals 的唯一写入口)。 */
+      const derived = this.maxHpForLevel(id, this.levelOf(id));
+      if (derived !== null) this.syncMaxHp(id, derived);
+      this.vitals.revive(id);
     }
     this.syncPlayers();
   }
@@ -6453,14 +6515,20 @@ export class WorldSim {
   }
 
   /**
+  /**
    * **报价**(纯判定,**零副作用**):用 `depot.buy` 在库存**副本**上算一遍。
    *
    * 为什么先报价再提交:动作层要在「扣玩家背包之前」知道这笔交易成不成立
    * (否则失败时会出现"东西扣了但没买到")。`depot.buy` 本身就是
    * 「副本上算、失败原样退回」的实现,所以报价 = 一次不提交的 buy。
+   *
+   * @param table 价格表;**缺省 = `CONTENT_PRICE_TABLE`**(缺省语义逐字段不变)。
+   *   与 `depot.buy` 的 `table?` 是**同一个入参的纯转发**,不是第二份实现 ——
+   *   它存在的理由是:内容表今天**一条价格都没写** ⇒ 缺省路径恒 `UNPRICED`,
+   *   而「成交之后」才有意义的幂等/实测库存那几条判据需要一条走得通的价。
    */
-  purchaseQuote(itemId: number, qty: number): BuyResult {
-    return buy({ itemId, qty, stock: this.stallStock });
+  purchaseQuote(itemId: number, qty: number, table: PriceTable = CONTENT_PRICE_TABLE): BuyResult {
+    return buy({ itemId, qty, stock: this.stallStock, table });
   }
 
   /**
@@ -6468,12 +6536,76 @@ export class WorldSim {
    *
    * 与 `purchaseQuote` 是**同一次**结算的两次调用(`buy` 是纯函数)——
    * 不是两份实现:两边都在调 `systems/depot.ts:buy`。
+   *
+   * ## ★ 幂等键(本次新增)
+   *
+   * 提交是**有副作用**的那一步,而「报价 → 提交」之间没有任何原子性保证:
+   * 报文重放 / 客户端重发 / 上层重试都会走到这里。⇒ 给每次提交一个由
+   * `(actorId, 摊位 = itemId, tick 或订单号)` 派生的键,同一个键**只准成交一次**:
+   * ```
+   * 有 orderId     ⇒ key = `order:${orderId}`(订单号是调用方给的权威身份)
+   * 否则           ⇒ key = `${actorId}#${itemId}#${frameCount}`(退化形态)
+   * ```
+   * 第二次(重放)⇒ `ok:false` + `replayed:true`,且**库存一位都不动**。
+   *
+   * ⚠️ 退化形态里没有 `actorId` 时两个不同玩家在同一帧买同一件会撞键 ——
+   * 那是**上层没传 actorId** 的如实后果(契约:调用方应传 `{ actorId }`),
+   * 不是本方法能猜出来的信息。见交付报告的「需别处改」清单。
+   *
+   * ## ★ 返回的 `stock` / `stockOfItem` 是**提交时**的实测值
+   *
+   * 不是 `purchaseQuote` 那张**旧快照**(它按报价那一刻的库存算)。两者在
+   * 「报价之后、提交之前库存又被动过」时会分叉;权威只有一个:`stallStock`。
+   *
+   * @param opts.actorId 发起者(幂等键的一维;缺省 ⇒ 退化形态见上)
+   * @param opts.orderId 订单号(给了就以它为准,不再看 actorId / tick)
+   * @param opts.table 价格表;缺省 = `CONTENT_PRICE_TABLE`(与 `purchaseQuote` 同一入参)
    */
-  purchaseCommit(itemId: number, qty: number): { ok: boolean; cost: number; reason: string } {
-    const r = buy({ itemId, qty, stock: this.stallStock });
-    if (!r.ok) return { ok: false, cost: 0, reason: r.reason };
+  purchaseCommit(
+    itemId: number,
+    qty: number,
+    opts: { actorId?: string; orderId?: string; table?: PriceTable } = {},
+  ): {
+    ok: boolean;
+    cost: number;
+    reason: string;
+    /** ★ **提交时**的库存快照(实测值,不是报价的旧值)。 */
+    stock: Record<number, number>;
+    /** ★ **提交时**该物品的件数(同上)。 */
+    stockOfItem: number;
+    /** 是否因**同一个幂等键已成交过**而被拒(重放)。 */
+    replayed: boolean;
+  } {
+    const tick = this.frameCount;
+    const key = (opts.orderId !== undefined && opts.orderId !== '')
+      ? `order:${opts.orderId}`
+      : `${opts.actorId ?? ''}#${itemId}#${tick}`;
+    const seenAt = this.committedPurchaseKeys.get(key);
+    if (seenAt !== undefined) {
+      /* 重放:拒,且**不做任何写入**(`stallStock` 一位不动)。 */
+      return {
+        ok: false, cost: 0, replayed: true,
+        reason: `重复提交(幂等键 ${key} 已在第 ${seenAt} 帧成交过)⇒ 拒绝,库存不变`,
+        stock: { ...this.stallStock },
+        stockOfItem: this.stallStock[itemId] ?? 0,
+      };
+    }
+    const r = buy({ itemId, qty, stock: this.stallStock, table: opts.table ?? CONTENT_PRICE_TABLE });
+    if (!r.ok) {
+      return {
+        ok: false, cost: 0, replayed: false, reason: r.reason,
+        stock: { ...this.stallStock },
+        stockOfItem: this.stallStock[itemId] ?? 0,
+      };
+    }
     this.stallStock = r.stock;
-    return { ok: true, cost: r.cost, reason: r.reason };
+    this.committedPurchaseKeys.set(key, tick);
+    return {
+      ok: true, cost: r.cost, replayed: false, reason: r.reason,
+      /* 实测:提交后的 `stallStock`(权威),不是 `purchaseQuote` 的旧快照。 */
+      stock: { ...this.stallStock },
+      stockOfItem: this.stallStock[itemId] ?? 0,
+    };
   }
 
   /* ── C:料理 3 字段 → 物理层的**单点推送** ── */

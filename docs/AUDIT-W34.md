@@ -1,7 +1,7 @@
 # AUDIT-W34 · 八路审计汇编(第 2/8 组)
 
 - **日期**:2026-11-18
-- **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。
+- **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。
 - **口径**:本文件是交付物,不新增门禁;`docs/` 下其它文件一概未动。
 
 ## 1 覆盖率
@@ -68,32 +68,32 @@ foreach ($d in 'server/src','shared','client','scripts') {
 | P1-10 | P1 | `content-lock` 只哈希手挑字段 ⇒ 改别的字段指纹不变:`scripts/content-lock.ts` | 已修(判据 v2 整字段指纹;`node scripts/content-lock.ts --audit`) |
 | P1-11 | P1 | 判据「自己比自己」:actual 与 expected 同取自被测模块:`scripts/verify.ts` 同义反复检测 | 已修(判据 `tests/WS-FND-90-gate-truth.test.ts`) |
 
-### 3.2 P2 / P3(登记,未修)
+### 3.2 P2 / P3(2026-11-18 第二批:15 条已修 / 7 条仍登记)
 
 | 编号 | 严重度 | 位置 | 状态 |
 |---|---|---|---|
-| P2-1 | P2 | `server/src/combat/vitals.ts:522` `setElementResist` 生产零写入 ⇒ 元素抗性 no-op | 登记(理由 R1) |
-| P2-2 | P2 | 击中生物侧:`server/src/combat/vitals.ts:841` `applyHit` 的抗性无生产写入点(`sim/world_sim.ts` 调用处只传倍率) | 登记(理由 R2) |
-| P2-3 | P2 | 击退无上界钳制 + `mass=NaN` 传播:`server/src/physics/world.ts`(`spawn` / `applyImpulse` / 碰撞质量归一) | 登记(理由 R3) |
-| P2-4 | P2 | `resetWorld` 不按等级重算上限:`server/src/sim/world_sim.ts:4301` | 登记(理由 R4) |
-| P2-5 | P2 | 玩家→生物无视线闸:`server/src/sim/world_sim.ts`(索敌/受击路径未接 `world/vision.ts`) | 登记(理由 R5) |
-| P2-6 | P2 | 攻击侧不封 `TRAPPED` / `STUNNED`:`server/src/net/actions/attack.ts`(无状态闸) | 登记(理由 R6) |
-| P2-7 | P2 | `purchaseCommit` 无幂等键:`server/src/sim/world_sim.ts:6472` | 登记(理由 R7) |
-| P2-8 | P2 | 箱子存取不比距离:`server/src/net/actions/open_chest.ts`(容器模型 `chestsByRoom`) | 登记(理由 R8) |
-| P2-9 | P2 | `place_automation` 不扣件:`server/src/net/actions/place_automation.ts`(只登记不消耗) | 登记(理由 R9) |
-| P2-10 | P2 | `snapshot_blob` 写库无上限:`server/src/db/repo.ts`(快照写入点) | 登记(理由 R10) |
-| P2-11 | P2 | `fluid.clone()` 丢活跃集:`server/src/world/fluid.ts:727` | 登记(理由 R11) |
-| P2-12 | P2 | `physics.spawn()` 覆盖同 id 不清旁表:`server/src/physics/world.ts:265` | 登记(理由 R12) |
-| P2-13 | P2 | `ticks` / `seq` 无上界:`shared/net/delta.ts` 帧头 `w.u32(tick)` / `ackedSeq` | 登记(理由 R13) |
-| P3-1 | P3 | `applyRestore` 的 chunk 解码在闸后且无 `try`:`server/src/sim/world_sim.ts:6553` | 登记(理由 R14) |
-| P3-2 | P3 | `setRoof` 静默截 16 位:`server/src/world/chunk.ts:613` / `server/src/world/grid.ts:136` | 登记(理由 R15) |
-| P3-3 | P3 | `decodeRoofRle` 的 `tag=0xff` 越界:`server/src/world/chunk.ts:890` | 登记(理由 R16) |
-| P3-4 | P3 | `fluid.setCell` 可写进实心格:`server/src/world/fluid.ts:258` | 登记(理由 R17) |
-| P3-5 | P3 | 水位预算在极端情况下全丢:流体预算分派点(`server/src/world/fluid.ts` / `sim/world_sim.ts`) | 登记(理由 R18) |
-| P3-6 | P3 | `ws/hp` 的钳制选址在 `vitals` 而非编码器:`server/src/combat/vitals.ts` + `shared/net/delta.ts` | 登记(理由 R19) |
-| P3-7 | P3 | `node:sqlite` 事务不支持嵌套:`server/src/db/driver.sqlite.ts:233`(`transaction` 直接转发) | 登记(理由 R20) |
-| P3-8 | P3 | 双端同源检测仍只告警:`scripts/verify.ts`(`advise('同义反复', …)`,不进退出码) | 登记(理由 R21) |
-| P3-9 | P3 | client 顶点色与 `aLodMerge` 的 LOD 合并语义未定:`client/src/three/compat.ts`(属性与几何生成)、`client/src/stage/terrain_vcolor.ts` | 登记(理由 R22) |
+| P2-1 | P2 | `server/src/combat/vitals.ts:522` `setElementResist` 生产零写入 ⇒ 元素抗性 no-op | 已修(判据 `tests/WS-FND-93-element-resist-wired.test.ts` FND93-1/3/5/6;写入点是 `rooms/effects.ts` 的 `pushRoomElementResist`) |
+| P2-2 | P2 | 击中生物侧:`server/src/combat/vitals.ts:841` `applyHit` 的抗性无生产写入点(`sim/world_sim.ts` 调用处只传倍率) | 已修(判据同 `tests/WS-FND-93` FND93-1/2:写入侧落地后 `applyHit` 的 `element` 参数才有输入) |
+| P2-3 | P2 | 击退无上界钳制 + `mass=NaN` 传播:`server/src/physics/world.ts`(`spawn` / `applyImpulse` / 碰撞质量归一) | 登记(理由 R3;第二批对该文件只改了旁表回收) |
+| P2-4 | P2 | `resetWorld` 不按等级重算上限:`server/src/sim/world_sim.ts:4301` | 已修(判据 `tests/WS-FND-91-combat-gates.test.ts` FND91-7) |
+| P2-5 | P2 | 玩家→生物无视线闸:`server/src/sim/world_sim.ts`(索敌/受击路径未接 `world/vision.ts`) | 已修(判据 `tests/WS-FND-91` FND91-1/2) |
+| P2-6 | P2 | 攻击侧不封 `TRAPPED` / `STUNNED`:`server/src/net/actions/attack.ts`(无状态闸) | 已修(判据 `tests/WS-FND-91` FND91-3/4/5/6) |
+| P2-7 | P2 | `purchaseCommit` 无幂等键:`server/src/sim/world_sim.ts:6472` | 已修(判据 `tests/WS-FND-91` FND91-8/9/10) |
+| P2-8 | P2 | 箱子存取不比距离:`server/src/net/actions/open_chest.ts`(容器模型 `chestsByRoom`) | 已修(判据 `tests/WS-FND-92-action-gates.test.ts` FND92-1..5/10) |
+| P2-9 | P2 | `place_automation` 不扣件:`server/src/net/actions/place_automation.ts`(只登记不消耗) | 已修(判据 `tests/WS-FND-92` FND92-6..9) |
+| P2-10 | P2 | `snapshot_blob` 写库无上限:`server/src/db/repo.ts`(快照写入点) | 已修(判据 `tests/WS-FND-94-storage-invariants.test.ts` FND94-2a/2b) |
+| P2-11 | P2 | `fluid.clone()` 丢活跃集:`server/src/world/fluid.ts:727` | 已修(判据 `tests/WS-FND-94` FND94-4a/4b/4c) |
+| P2-12 | P2 | `physics.spawn()` 覆盖同 id 不清旁表:`server/src/physics/world.ts:265` | 已修(判据 `tests/WS-FND-94` FND94-5a/5b) |
+| P2-13 | P2 | `ticks` / `seq` 无上界:`shared/net/delta.ts` 帧头 `w.u32(tick)` / `ackedSeq` | 登记(理由 R13;第二批未动 `shared/net/delta.ts`) |
+| P3-1 | P3 | `applyRestore` 的 chunk 解码在闸后且无 `try`:`server/src/sim/world_sim.ts:6553` | 登记(理由 R14;第二批改的是玩家/上限/hp 序列,chunk 解码段未动) |
+| P3-2 | P3 | `setRoof` 静默截 16 位:`server/src/world/chunk.ts:613` / `server/src/world/grid.ts:136` | 已修(判据 `tests/WS-FND-94` FND94-6) |
+| P3-3 | P3 | `decodeRoofRle` 的 `tag=0xff` 越界:`server/src/world/chunk.ts:890` | 已修(判据 `tests/WS-FND-94` FND94-7) |
+| P3-4 | P3 | `fluid.setCell` 可写进实心格:`server/src/world/fluid.ts:258` | 已修(判据 `tests/WS-FND-94` FND94-8a/8b) |
+| P3-5 | P3 | 水位预算在极端情况下全丢:流体预算分派点(`server/src/world/fluid.ts` / `sim/world_sim.ts`) | 登记(理由 R18;第二批对该文件只改了 `setCell` / `clone`) |
+| P3-6 | P3 | `ws/hp` 的钳制选址在 `vitals` 而非编码器:`server/src/combat/vitals.ts` + `shared/net/delta.ts` | 登记(理由 R19;分层位置问题,行为正确) |
+| P3-7 | P3 | `node:sqlite` 事务不支持嵌套:`server/src/db/driver.sqlite.ts:233`(`transaction` 直接转发) | 已修(判据 `tests/WS-FND-94` FND94-1a/1b/1c) |
+| P3-8 | P3 | 双端同源检测仍只告警:`scripts/verify.ts`(`advise('同义反复', ...)`,不进退出码) | 登记(理由 R21;要先清现存命中,与 P1-9 同源) |
+| P3-9 | P3 | client 顶点色与 `aLodMerge` 的 LOD 合并语义未定:`client/src/three/compat.ts`(属性与几何生成)、`client/src/stage/terrain_vcolor.ts` | 登记(理由 R22;要视觉裁决) |
 
 ## 4 未修项(逐条理由)
 
@@ -148,3 +148,47 @@ this.expireItemSources();
 - **未跑 `scripts/verify.ts --all`**(本轮硬约束)。
 - `npm run typecheck` 实测 **261 条**(与 HANDOVER 基线 261 一致,本轮改动**未新增**;`room.ts` 无任何报错)。
 - 未 commit、未改 `.pi/`、未动 `docs/` 下其它文件。
+
+## 7 2026-11-18 第二批处置(P2 / P3)
+
+四条修复线并行交回,判据落在 4 个新套件:`tests/WS-FND-91-combat-gates.test.ts`(10 条)、
+`tests/WS-FND-92-action-gates.test.ts`(10 条)、`tests/WS-FND-93-element-resist-wired.test.ts`(6 条)、
+`tests/WS-FND-94-storage-invariants.test.ts`(15 条)—— 共 **41 条**。
+
+### 7.1 判据 ↔ 条目对照(点得开才叫关闭)
+
+| 套件 | 钉住的条目 |
+|---|---|
+| WS-FND-91 | P2-4(FND91-7 重置后 160/160)· P2-5(FND91-1/2 视线)· P2-6(FND91-3..6 定身/困住)· P2-7(FND91-8/9/10 幂等键 + 提交时实测库存) |
+| WS-FND-92 | P2-8(FND92-1..5/10 交互半径)· P2-9(FND92-6..9 放件扣件) |
+| WS-FND-93 | P2-1 / P2-2(FND93-1..6:唯一推送口 + 清空路径 + 非法值守卫 + 来源链) |
+| WS-FND-94 | P3-7(FND94-1a/1b/1c 嵌套事务)· P2-10(FND94-2a/2b 快照 1 MiB)· P2-11(FND94-4a/b/c clone 活跃集)· P2-12(FND94-5a/5b 旁表回收)· P3-2(FND94-6 setRoof 12 位)· P3-3(FND94-7 decodeRoofRle)· P3-4(FND94-8a/8b setCell 实心格) |
+
+### 7.2 与交接单的两处**不一致**(如实记)
+
+1. 交接单写「已修的 22 条」,**实测只有 15 条**有能点开的判据(P2-1/2/4/5/6/7/8/9/10/11/12 +
+   P3-2/3/4/7)。其余 **7 条本批根本没被触碰**,按本仓「关闭 = 标记 ∧ 可查证据」的口径
+   **不能**改成「已修」—— 它们是 P2-3、P2-13、P3-1、P3-5、P3-6、P3-8、P3-9(理由见 §4 与 §3.2 状态列)。
+2. 本批的**调用面**还有一处必须与「已修」一起看:`WS-FND-93` 的值取自 `ROOM_ELEMENT_RESIST`
+   里的**待平衡默认值**(`PENDING_ELEMENT_RESIST_MUL = 0.5`,元素归属 `ICE`),
+   内容表里仍**没有**这个数 ⇒ 判据证明的是「链通了」,不是「数值是最终平衡」。
+   接 owner 给了真内容就换掉表里那一行,判据不需要改。
+
+### 7.3 第二批顺带改到的、与 P0/P1 同族的接线
+
+- `server/src/net/actions/buy_item.ts`:`purchaseCommit(itemId, qty, { actorId })` ——
+  不传 `actorId` 时幂等键退化成 `#itemId#frame`,**两个玩家同帧买同一件会撞键**(第二个被当重放拒);
+  回执的 `stock` 取 `commit.stockOfItem`(提交时实测),不再用报价快照。
+  `net/room.ts` 那条两参声明本批不许改,故在动作文件里收窄一次(`PurchaseCommitWithKey`),
+  契约补进 `room.ts` 后删掉即可。
+- `server/src/sim/world_sim.ts` 两行挂钩:`tickRoomEffects` 里
+  `const key = roomAtCell(roomsView, b.x, b.y);` 之后 `pushRoomElementResist(this.vitals, id, key);`
+  —— 这是 P2-1 的**生产调用点**,也是 `WS-FND-93` FND93-6 钉的「来源链」。
+
+### 7.4 验证口径
+
+- 未跑 `scripts/verify.ts --all`(本批硬约束)。逐套件直跑:`node tests/<file>` ——
+  全仓 **103 个套件 / 2152 个用例全绿**(基座 FND 1138 条 / 89 套件,WS 编号 1014 条 / 14 套件)。
+- `node scripts/verify.ts --docs`:见本批交接报告;`node scripts/content-lock.ts` 指纹仍为
+  `v2-76694a25`(本批未碰内容表)。`node scripts/backlog.ts`:133 条 / 37 未关闭 / 0 阻塞 / 96 已关闭(未变)。
+- `npm run typecheck`:261 条(与基线一致,**未新增**)。

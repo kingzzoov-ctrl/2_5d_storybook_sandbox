@@ -436,6 +436,16 @@ export const VERTICAL_STACK: readonly LayerSpec[] = [
 ];
 
 /**
+ * ROOF 层的位宽与上界 —— **从 `VERTICAL_STACK` 取**,不在别处再写一份数字。
+ * 写入校验(`Chunk.setRoof`)与层级规格共用同一个事实源,否则两者迟早漂移
+ * (改前 `setRoof` 就与这里的 12 位/4095 不一致:它按 32 位收、按 16 位存)。
+ */
+const ROOF_LAYER_SPEC = VERTICAL_STACK.find((s) => s.layer === VerticalLayer.ROOF);
+if (ROOF_LAYER_SPEC === undefined) throw new Error('VERTICAL_STACK 缺少 ROOF 层规格');
+export const ROOF_BITS = ROOF_LAYER_SPEC.bits;
+export const ROOF_ID_MAX = ROOF_LAYER_SPEC.max;
+
+/**
  * 层名 → `TileFields` 字段名。
  * `TileFields` 的键是**小写**(elev/base/floor/wire/obj/meta),而层名是大写,
  * 因此 `layer()` 必须显式查这张表,不能直接把大写的层名当键去索引。
@@ -610,12 +620,26 @@ export class Chunk {
     return this.withCell(x, y, 'floor', floorSlotOfId(itemId));
   }
 
+  /**
+   * 写屋顶构件 ID。
+   *
+   * **口径 = 按 12 位掩码拒绝**(不是钳位、也不是静默截 16 位):
+   * `VERTICAL_STACK` 里 ROOF 层是 `bits: 12 / max: 4095`,而 `Uint16Array` 只有
+   * 16 位 —— 改前 `roofId >>> 0` 会把 65536 静默截成 0(看起来像「清空屋顶」),
+   * 也会让 `roofAt()` 读回的 4096 落到 12 位之外的值域。超范围在这里就抛,
+   * 比「存进去了但读出来是另一个数」早一步暴露。
+   *
+   * 为什么不是**钳位**:钳到 4095 会把「非法输入」伪装成一个合法屋顶 ID,
+   * 调用方拿不到任何信号;而 0 是「没有屋顶」,钳到 0 又会与清空不可区分。
+   */
   setRoof(x: number, y: number, roofId: number): void {
     if (!inChunkBounds(x, y)) throw new RangeError(`Chunk.setRoof 越界:(${x}, ${y})`);
+    if (!Number.isInteger(roofId) || roofId < 0 || roofId > ROOF_ID_MAX) {
+      throw new RangeError(`Chunk.setRoof 屋顶 ID 超出 ${ROOF_BITS} 位:${String(roofId)}`);
+    }
     const i = idx(x, y);
-    const v = roofId >>> 0;
-    if (this.roofs[i] === v) return;
-    this.roofs[i] = v;
+    if (this.roofs[i] === roofId) return;
+    this.roofs[i] = roofId;
     this.markDirtyIndex(i);
   }
 
@@ -887,18 +911,38 @@ export function encodeRoofRle(roofs: Uint16Array): Uint8Array {
   return Uint8Array.from(out);
 }
 
+/**
+ * 屋顶层 RLE 解码。
+ *
+ * ## `tag = 0xff` 的边界(必须显式,不许静默写 0)
+ *
+ * `0xff` 后面必须跟 2 个字节(`vL vH`)。持到末尾只剩 1 个或 0 个字节时,
+ * 改前 `buf[i + 1] | (buf[i + 2] << 8)` 里的 `undefined` 会被 `<<8` 折成 0,
+ * 于是**悄悄写了一个 0 值** —— 看起来像「这一格没有屋顶」,坏字节被伪装成合法内容。
+ *
+ * 口径:**抛 `RangeError`**(截断的 RLE 是坏输入,不是「缺少屋顶」)。
+ * 零游程(`tag < 0xff`)越过数组末尾仍然合法:它只是把余下的目标格留在原值
+ * (`o += tag` 后循环条件 `o < into.length` 自然结束),这是编码侧 `n < 127`
+ * 的对称语义,不产生任何越界读。
+ */
 export function decodeRoofRle(buf: Uint8Array, into: Uint16Array): void {
   let i = 0;
   let o = 0;
   while (i < buf.length && o < into.length) {
     const tag = buf[i];
     if (tag === 0xff) {
+      if (i + 2 >= buf.length) {
+        throw new RangeError(
+          `decodeRoofRle:0xff 游程在偏移 ${i} 处被截断(需要 3 字节,实得 ${buf.length - i})`
+          + ' —— 拒绝静默写 0',
+        );
+      }
       into[o] = (buf[i + 1] | (buf[i + 2] << 8)) & 0xffff;
       o += 1;
       i += 3;
-    } else {
-      o += tag;
-      i += 1;
+      continue;
     }
+    o += tag;
+    i += 1;
   }
 }

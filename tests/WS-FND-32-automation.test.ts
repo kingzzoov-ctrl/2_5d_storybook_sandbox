@@ -127,6 +127,25 @@ const disp = (rt: Room['rt'], payload: Record<string, unknown>): ActionOutcome =
 /** 取回执里的 `effect`(它的值类型是 `string | number | boolean`)。 */
 const eff = (r: ActionOutcome): Record<string, string | number | boolean> => r.effect ?? {};
 
+/**
+ * 给 `p1` 播种 `n` 件 `itemId` —— **放置是要扣件的**(`place_automation.ts` 第 6 步
+ * 按注册表的 `spec.id` 查按件权威账,账面 < 1 ⇒ `INVALID`),所以每个「应成功」的
+ * 放置点都得先备货。
+ *
+ * 走生产同一条路:服务端 `grantItemSource` 先登记来源串,再正向 `applyInventory`
+ * (与 FND32-7 给 101 播种的写法逐字同款)。`seed:` 前缀的旧口径串**只可能**由
+ * 服务端注入(`net/anticheat.ts:990` 那条注释),不是客户端可达面。
+ */
+function seedHeld(rt: Room['rt'], itemId: number, n = 1): void {
+  const src = `seed:${itemId}:${n}`;
+  rt.grantItemSource('p1', src);
+  const r = rt.applyInventory('p1', { ops: [{ itemId, delta: n, source: src }] });
+  ok(
+    r.allowed,
+    `前置:给 p1 播种 ${n} 件 ${itemId} 应成功(被拒说明守恒/容量层先坏了:${r.rejectCode ?? '被拒'})`,
+  );
+}
+
 /* ───────────────────────── 1 ───────────────────────── */
 
 test('FND32-1 空格 + 已注册 kind ⇒ OK,`effect` 带 kind/坐标/时刻,且登记可查', () => {
@@ -138,6 +157,8 @@ test('FND32-1 空格 + 已注册 kind ⇒ OK,`effect` 带 kind/坐标/时刻,且
   eq(sim.materials().blockAt(5, 5), 0, '前置:目标格在世界里是空的');
   eq(placementsOfRoom(roomId).size, 0, '前置:该房间还没有任何登记');
 
+  /* ★ 放置要扣件:先给 p1 播种 1 件 428(定向物流传送带),否则第 6 步按账面 0 拒。 */
+  seedHeld(rt, 428);
   const r = disp(rt, { x: 5, y: 5, kind: KIND });
   eq(r.ok, true, `放置应成功(实测 kind=${r.kind} reason=${r.reason ?? '-'})`);
   eq(r.kind, 'OK', '成功路径必须是 OK(接线前这里是 NOT_IMPLEMENTED)');
@@ -162,6 +183,9 @@ test('FND32-1 空格 + 已注册 kind ⇒ OK,`effect` 带 kind/坐标/时刻,且
 test('FND32-2 同一格再放 ⇒ INVALID,且原记录一字不动(不可覆盖)', () => {
   reset();
   const { rt, roomId } = makeRoom();
+  /* ★ 第一次放置要扣件 ⇒ 播种 410(ARENA_GOAL_FRAME)。第二次(LOGIC_AND)不播种:
+     它必须先被第 5a 步「这一格已有自动化件」拒掉,播种反而会掩盖判序。 */
+  seedHeld(rt, 410);
   const first = disp(rt, { x: 6, y: 6, kind: 'ARENA_GOAL_FRAME' });
   eq(first.kind, 'OK', `前置:第一次放置应成功(实测 reason=${first.reason ?? '-'})`);
 
@@ -223,6 +247,9 @@ test('FND32-4 坐标非法(负 / 小数 / NaN / 缺失 / 越界)⇒ INVALID 且�
   eq(placementsOfRoom(roomId).size, 0, '★ 全部被拒后零登记');
 
   /* 负对照:同一格用合法整数坐标就成功 —— 证明上面拒绝的是**坐标**,不是这个动作本身。 */
+  /* ★ 负对照那一次是**真的**放置 ⇒ 先播种 415(否则它被「账面 0 件」拒掉,
+     负对照就退化成「又在测同一个拒绝」,证不出坐标是被拒的原因)。 */
+  seedHeld(rt, 415);
   const good = disp(rt, { x: 5, y: 5, kind: KIND });
   eq(good.kind, 'OK', `负对照:合法坐标应成功(实测 reason=${good.reason ?? '-'})`);
   eq(placementsOfRoom(roomId).size, 1, '负对照:这时才有 1 条登记');
@@ -243,6 +270,8 @@ test('FND32-5 越权(GUEST 没有 wiring 位)⇒ PERMISSION 且不写状态', ()
   eq(placementsOfRoom(roomId).size, 0, '★ 越权被拒后零状态');
   eq(placementAt(roomId, 8, 8), null, '★ 那一格没登记');
 
+  /* ★ 房主那一次也是真的放置 ⇒ 先播种 414。 */
+  seedHeld(rt, 414);
   /* 负对照:同一格让带 `wiring` 位的房主放 ⇒ OK
      (证明上面失败的是**权限**,不是这个动作本身)。 */
   const allowed = disp(rt, { x: 8, y: 8, kind: 'LOGIC_AND' });
@@ -258,6 +287,8 @@ test('FND32-6 跨房间隔离:两个 roomId 的同坐标互不可见', () => {
   const b = makeRoom();
   ok(a.roomId !== b.roomId, '前置:两个房间号不同');
 
+  /* ★ ACT_RGB_LAMP ⇒ 播种 420。 */
+  seedHeld(a.rt, 420);
   const ra = disp(a.rt, { x: 9, y: 9, kind: 'ACT_RGB_LAMP' });
   eq(ra.kind, 'OK', `房间 A 放置应成功(实测 reason=${ra.reason ?? '-'})`);
 
@@ -266,6 +297,8 @@ test('FND32-6 跨房间隔离:两个 roomId 的同坐标互不可见', () => {
   eq(placementsOfRoom(b.roomId).size, 0, '★ B 的登记表是空的');
 
   /* 房间 B 在同一格放**另一件**:不该被 A 的记录挡住。 */
+  /* ★ 房间 B 的 LOGIC_SPLITTER ⇒ 播种 416(两个房间各扣各的,不共用一件)。 */
+  seedHeld(b.rt, 416);
   const rb = disp(b.rt, { x: 9, y: 9, kind: 'LOGIC_SPLITTER' });
   eq(rb.kind, 'OK', `房间 B 同坐标放置应成功(实测 reason=${rb.reason ?? '-'})`);
   eq(placementAt(b.roomId, 9, 9)!.kind, 'LOGIC_SPLITTER', '★ B 那一格是 B 放的那件');
@@ -302,6 +335,8 @@ test('FND32-7 世界里已有物件的格子不可覆盖(登记表与 obj 层都
 test('FND32-8 读回的是**副本**:改它不会影响登记表(唯一写者是本动作)', () => {
   reset();
   const { rt, roomId } = makeRoom();
+  /* ★ 放置要扣件:`place_automation.ts` 第 6 步按 `spec.id` 查按件权威账 ⇒ 先播种 418。 */
+  seedHeld(rt, 418);
   const r = disp(rt, { x: 4, y: 7, kind: 'WIRELESS_LINK' });
   eq(r.kind, 'OK', `前置:放置应成功(实测 reason=${r.reason ?? '-'})`);
 

@@ -113,9 +113,8 @@ export class MemoryDb implements DbLike {
   private indexSet = new Set<string>();
   private viewSet = new Set<string>();
   private triggerSet = new Set<string>();
-  /** 事务嵌套深度:>0 时写操作写入暂存区,提交时一次性合并。 */
+  /** 事务嵌套深度(0 = 没有活动事务)。仅用于观测/断言,回滚靠每层自己的快照。 */
   private txDepth = 0;
-  private txSnapshot: Map<string, Row[]> | null = null;
 
   /* ── 表结构自省 ── */
 
@@ -487,23 +486,32 @@ export class MemoryDb implements DbLike {
     return this.ensure(table).length;
   }
 
+  /**
+   * 事务。**支持嵌套**,语义与 `driver.sqlite.ts` 的两个 SQL 后端**逐条一致**:
+   *
+   * | 情形 | 结果 |
+   * | :--- | :--- |
+   * | 内层抛错、外层捕获后继续 | 只回滚**内层**写入(外层已做的改动保留) |
+   * | 外层抛错 | 连同内层写入一起回滚(外层那份快照更早) |
+   * | 嵌套调用 | 不抛错(每层各持一份快照 = 该层的 SAVEPOINT) |
+   *
+   * 改前只有**最外层**会还原:内层抛错、外层捕获后继续时,内层的半截写入
+   * 留在库里 —— 真实 SQLite(SAVEPOINT)会把它回滚掉,于是同一个仓储函数
+   * 在两种后端下产生不同的数据。
+   */
   transaction<T>(fn: () => T): T {
-    if (this.txDepth === 0) {
-      this.txSnapshot = new Map();
-      for (const [k, v] of this.tables) this.txSnapshot.set(k, v.map((r) => ({ ...r })));
-    }
+    /* 每层进入时快照一次(浅拷贝每行:行内不做原地改字段,写入都是整行 replace)。 */
+    const snapshot = new Map<string, Row[]>();
+    for (const [k, v] of this.tables) snapshot.set(k, v.map((r) => ({ ...r })));
     this.txDepth += 1;
     try {
       const out = fn();
       this.txDepth -= 1;
-      if (this.txDepth === 0) this.txSnapshot = null;
       return out;
     } catch (err) {
       this.txDepth -= 1;
-      if (this.txDepth === 0 && this.txSnapshot) {
-        this.tables = this.txSnapshot;
-        this.txSnapshot = null;
-      }
+      /* 只还原**这一层**:更外层的快照仍在栈上,它若也抛错会覆盖这次还原。 */
+      this.tables = snapshot;
       throw err;
     }
   }
@@ -617,6 +625,8 @@ export type CheckExpr =
   | { kind: 'between'; col: string; lo: number; hi: number }
   | { kind: 'cmp'; col: string; op: '>' | '>='; n: number }
   | { kind: 'length'; col: string; n: number }
+  /** `length(col) <= n`:上界形态(定长是 `length`,上界是 `lengthMax`)。 */
+  | { kind: 'lengthMax'; col: string; n: number }
   | { kind: 'unsupported'; sql: string };
 
 /** 解析一条 CHECK 表达式。不认识的形态返回 `{kind:'unsupported'}`(**不是** null)。 */
@@ -637,6 +647,10 @@ export function parseCheckExpr(expr: string): CheckExpr {
   if (gtM) return { kind: 'cmp', col: gtM[1], op: gtM[2] === '>=' ? '>=' : '>', n: Number(gtM[3]) };
   const lenM = /^length\s*\(\s*(\w+)\s*\)\s*=\s*(\d+)$/i.exec(e);
   if (lenM) return { kind: 'length', col: lenM[1], n: Number(lenM[2]) };
+  /* `length(col) <= n`:**上界**形态(`>=` 无法用 `=` 表达)。
+     认得它,`unsupportedChecks()` 才不会把「已实现的约束」误报成未实现。 */
+  const lenMaxM = /^length\s*\(\s*(\w+)\s*\)\s*<=\s*(\d+)$/i.exec(e);
+  if (lenMaxM) return { kind: 'lengthMax', col: lenMaxM[1], n: Number(lenMaxM[2]) };
   return { kind: 'unsupported', sql: e };
 }
 
@@ -653,6 +667,11 @@ export function checkPasses(c: CheckExpr, value: unknown): boolean {
     case 'length':
       if (value instanceof Uint8Array) return value.length === c.n;
       return true; /* 长度对非 BLOB 不适用 —— 交给类型层,不在这里误伤 */
+    case 'lengthMax':
+      /* 与 SQLite 的 `CHECK (length(x) <= n)` 一致:NULL / 非 BLOB **通过**
+         (SQLite 里 CHECK 只在表达式求值为 0 时失败,求值为 NULL 也算通过)。 */
+      if (value instanceof Uint8Array) return value.length <= c.n;
+      return true;
     default:
       return true;
   }

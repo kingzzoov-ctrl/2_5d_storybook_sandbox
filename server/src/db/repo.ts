@@ -72,6 +72,19 @@ export const TABLE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
 
 export const SCHEMA_FILE_NAME = 'schema.sql';
 
+/**
+ * 单个 BLOB 列的字节上限 = **1 MiB**。
+ *
+ * 两个写入点共用同一个数,DDL 侧各有一条对应的 `CHECK`:
+ *   * §13 世界归档 `room_world_archives.snapshot_blob`(`WORLD_ARCHIVE_MAX_BYTES`):
+ *     超限时**按整块 chunk 裁剪**(合法的 `WSA1` 才有块可裁);
+ *   * §6 重连快照 `room_players.snapshot_blob`(`RECONNECT_SNAPSHOT_MAX_BYTES`):
+ *     超限**直接拒** —— 重连快照没有「可裁的块」,按字节截断出来的东西恢复
+ *     出去就是一个坏状态(`schema.sql` 里那条 `CHECK (length(...) <= 1048576)`
+ *     是同一口径的第二道闸,防绕过本模块直插)。
+ */
+export const BLOB_MAX_BYTES = 1048576;
+
 /** DDL 全文:用真实文件路径读取,保证测试与运行时读的是同一份产物。 */
 export function schemaSqlPath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), SCHEMA_FILE_NAME);
@@ -404,6 +417,27 @@ export const RoomRole = {
 } as const;
 export type RoomRole = (typeof RoomRole)[keyof typeof RoomRole];
 
+/** 重连快照(`room_players.snapshot_blob`)的字节上限 —— 与归档**同口径** 1 MiB。 */
+export const RECONNECT_SNAPSHOT_MAX_BYTES = BLOB_MAX_BYTES;
+
+/**
+ * 重连快照的字节闸口(两个写入点共用)。
+ *
+ * 超限**如实拒**(抛错),不截断、不静默丢弃:截断后的字节恢复出去是一个
+ * 坏状态(背包/等级/位置被切掉一半),而调用方看到的却是「保存成功」。
+ * 与 `archiveWorldSnapshot` 对非 `WSA1` 快照的取舍一致(见 §13)。
+ */
+function assertReconnectSnapshotSize(snapshot: Uint8Array, where: string): void {
+  if (!(snapshot instanceof Uint8Array)) {
+    throw new Error(`${where}:快照必须是 Uint8Array(实得 ${typeof snapshot})`);
+  }
+  if (snapshot.byteLength > RECONNECT_SNAPSHOT_MAX_BYTES) {
+    throw new Error(
+      `${where}:快照 ${snapshot.byteLength} 字节超出上限 ${RECONNECT_SNAPSHOT_MAX_BYTES}`
+      + ' —— 拒绝写入而不是截断(截断的重连快照恢复出去是坏状态)',
+    );
+  }
+}
 export function upsertRoomPlayer(
   db: DbLike,
   roomId: string,
@@ -412,6 +446,8 @@ export function upsertRoomPlayer(
   nowMs: number,
   snapshot?: Uint8Array,
 ): void {
+  /* ★ 写入侧的字节闸口(§6):与归档同口径 1 MiB,超限**如实拒**(不截断)。 */
+  if (snapshot !== undefined) assertReconnectSnapshotSize(snapshot, '重连快照(room_players)');
   const key = { room_id: roomId, user_id: userId };
   const existing = db.get('room_players', key);
   if (existing) {
@@ -435,6 +471,7 @@ export function saveReconnectSnapshot(
   snapshot: Uint8Array,
   nowMs: number,
 ): number {
+  assertReconnectSnapshotSize(snapshot, '重连快照(room_players)');
   return db.update('room_players', { room_id: roomId, user_id: userId }, {
     snapshot_blob: snapshot,
     last_seen_at: nowMs,
@@ -768,22 +805,28 @@ export function saveVitalsToUsers(
   vitals: Record<string, { hp: number }>,
   nowMs: number,
 ): VitalsSaveReport {
-  let saved = 0;
-  let skipped = 0;
-  for (const id of Object.keys(vitals).sort()) {
-    const row = vitals[id];
-    if (!row || typeof row.hp !== 'number' || !Number.isFinite(row.hp)) {
-      skipped += 1;
-      continue;
+  /* ★ 一次批量落盘 = **一个事务**。
+     改前是逐人 UPDATE 而**没有事务**:第 3 个人写失败时,前 2 个人已经落库,
+     而调用方拿到的是异常 —— 「存档写了一半」既不守恒也不可重试(重试会把
+     前面几个人的 hp 再写一遍,语义上还是半截)。包进事务后:**全成或全不成**。 */
+  return db.transaction(() => {
+    let saved = 0;
+    let skipped = 0;
+    for (const id of Object.keys(vitals).sort()) {
+      const row = vitals[id];
+      if (!row || typeof row.hp !== 'number' || !Number.isFinite(row.hp)) {
+        skipped += 1;
+        continue;
+      }
+      if (!getUser(db, id)) {
+        skipped += 1;
+        continue;
+      }
+      savePlayerState(db, id, { hp: row.hp }, nowMs);
+      saved += 1;
     }
-    if (!getUser(db, id)) {
-      skipped += 1;
-      continue;
-    }
-    savePlayerState(db, id, { hp: row.hp }, nowMs);
-    saved += 1;
-  }
-  return { saved, skipped };
+    return { saved, skipped };
+  });
 }
 
 /**
@@ -939,7 +982,7 @@ export const WORLD_ARCHIVE_KEEP_PER_ROOM = 6;
  * 「少了哪几块 + 为什么」可查的,不是静默丢数据。
  * 1MiB 远高于 radius 4 的全量地形(~81KB),却小到一次误传撑不爆库。
  */
-export const WORLD_ARCHIVE_MAX_BYTES = 1048576;
+export const WORLD_ARCHIVE_MAX_BYTES = BLOB_MAX_BYTES;
 
 /** 归档 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
 export function worldArchiveSqlPath(): string {

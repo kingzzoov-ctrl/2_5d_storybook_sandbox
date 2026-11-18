@@ -262,20 +262,41 @@ export class PhysicsWorld {
 
   /* ── 实体管理 ── */
 
+  /**
+   * 回收某刚体 id 在所有**按 id 索引的旁表**里的记录。
+   *
+   * 口径与 `remove()` / `clear()` 一致(三处共用本函数):一条 id 的生命周期
+   * 结束时,它不该在任何旁表里留下记录。**不是可选项** ——
+   * `spawn()` 覆盖同 id 时若不清,新刚体会**继承上一条命的滑溜/料理状态**
+   * (muMuls 的注释专门写了这一条),而三张 buff 表还会随「换图/重置时的
+   * 同 id 重生」逐轮留下再没人读的僵尸条目(无界增长)。
+   *
+   * `openedTraps` 刻意**不在这儿**:它的键是格 `"cx,cy"`,不是刚体 id ——
+   * 陷阱开了就是世界状态,只由 `clear()`(重建世界)清。
+   */
+  private reclaimSideTables(id: string): void {
+    this.trapTimers.delete(id);
+    this.muMuls.delete(id);
+    this.speedCaps.delete(id);
+    this.gravityMuls.delete(id);
+    this.jumpMuls.delete(id);
+  }
+
+  /**
+   * 生成(或**覆盖**)一个刚体。
+   *
+   * 覆盖同 id 与新建走同一条路:`remove()` 能回收的,`spawn()` 也必须回收 ——
+   * 否则「同 id 重生」与「先 remove 再 spawn」在旁表上留下两种状态。
+   */
   spawn(id: string, patch: Partial<DynamicBody> = {}): DynamicBody {
+    this.reclaimSideTables(id);
     const b = createBody(id, patch);
     this.bodies.set(id, b);
     return b;
   }
 
   remove(id: string): boolean {
-    this.trapTimers.delete(id);
-    /* 乘子必须跟着刚体一起消失:同 id 重生的新实体不得继承上一条命的滑溜状态。
-       ★ WS-FND-77:料理 3 字段的三张旁表同理 —— 漏删会让新刚体继承上一份 buff。 */
-    this.muMuls.delete(id);
-    this.speedCaps.delete(id);
-    this.gravityMuls.delete(id);
-    this.jumpMuls.delete(id);
+    this.reclaimSideTables(id);
     return this.bodies.delete(id);
   }
 

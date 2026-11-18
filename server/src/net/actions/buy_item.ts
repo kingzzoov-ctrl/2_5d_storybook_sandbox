@@ -41,6 +41,22 @@ import { bindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
+/**
+ * `WorldSaveHost.purchaseCommit` 的**带幂等键**形态。
+ *
+ * `net/room.ts` 里那条声明仍是两参(本批只允许改本文件),而世界侧
+ * `WorldSim.purchaseCommit(itemId, qty, { actorId })` 早就接受第三参并回
+ * `stockOfItem`。⇒ 在本文件收窄一次,只为两件事:
+ *   1. 把 `actorId` 传下去 —— 不传则幂等键退化成 `#itemId#frame`,
+ *      **两个不同玩家在同一帧买同一件会撞键**(第二个被当重放拒掉);
+ *   2. 拿**提交时**的 `stockOfItem`,而不是报价那张旧快照。
+ * 字段逐个写出、不用 `any`:契约补进 `room.ts` 之后删掉这个别名即可。
+ */
+type PurchaseCommitWithKey = (
+  itemId: number,
+  qty: number,
+  opts?: { actorId?: string },
+) => { ok: boolean; cost: number; reason: string; stockOfItem?: number };
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
@@ -109,7 +125,8 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   }
 
   /* 7 提交:成交才写库存。被拒 ⇒ 把刚收进来的东西退回去(不吞)。 */
-  const commit = host.purchaseCommit(itemId, qty);
+  const commitFn = host.purchaseCommit as PurchaseCommitWithKey;
+  const commit = commitFn(itemId, qty, { actorId: ctx.actorId });
   if (!commit.ok) {
     /* ★ 审计 P0-2:退回是**负 delta**(把这 qty 件拿回去),不是产出 ⇒
        **不发凭证**。修前这里 `grantItemSource(refundSrc)` ⇒ 一张退款凭证凭空多出来,
@@ -131,7 +148,11 @@ export const buyItem: ActionHandler = (ctx: ActionContext): ActionOutcome => {
       itemId,
       qty,
       cost: commit.cost,
-      stock: quote.stock[itemId] ?? 0,
+      /* ★ 提交时的实测库存(权威),不是 `quote.stock` 那张报价快照 ——
+         两者在「报价之后、提交之前库存又被动过」时会分叉。
+         `?? quote...` 只是给**不返回该字段的老世界源/测试桩**兜底:它们连
+         第三参都不接,拿不到实测值;权威路径仍是 `commit.stockOfItem`。 */
+      stock: commit.stockOfItem ?? quote.stock[itemId] ?? 0,
       roomKey: 'CLOUD_DEPOT',
       charged: false,
     },

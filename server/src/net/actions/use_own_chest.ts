@@ -13,6 +13,10 @@
  * 权限位是 `baseline`(见 `ACTION_PERMISSION`)⇒ 只要在房里就能用,这正是
  * `OPEN_CHEST`(要求 `publicStorage`)与它的**权限对照**。
  *
+ * ⚠️ 它与 `OPEN_CHEST` 共用**同一条**距离闸与权限闸(`runChestAction` 一处说了算):
+ *   私有箱同样要走到箱子跟前(`CHEST_REACH` 格内),超距 ⇒ `INVALID` + 两侧零副作用
+ *   (`docs/AUDIT-W34.md:108` 的 R8 修的是这一族「不比距离」的动作,不只公共箱)。
+ *
  * ⚠️ 本文件不自己实现取放:容器模型与事务顺序**唯一**在 `open_chest.ts`
  *   (`runChestAction` + `ChestContainers`)。这里只剩「选哪个容器」这一件事。
  * ⚠️ 边界(与 `open_chest.ts` 同一份,别当成做到了):

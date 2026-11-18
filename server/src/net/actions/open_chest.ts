@@ -36,6 +36,24 @@
  *   · 取出:**先扣容器** ⇒ 再 `ctx.grantItemSource`(产出侧凭证,必须早于正向
  *     `applyInventory`)⇒ 再进背包;背包收不下就**放回容器**(不留痕)。
  * 任一步失败都直接返回,另一侧一个字都不动 —— 这是「半步事务」的对照面。
+ *
+ * ## 判序(与其他动作逐段同构:权限 → 校验 → 能力 → 执行 → 回执)
+ *
+ * ```
+ *   1 `authorize` 不通过          ⇒ PERMISSION(闸在第一行,零状态)
+ *   2 x / y 不是有限数            ⇒ INVALID
+ *   3 距离闸(R8):拿不到权威位置 / 离目标格超过 `CHEST_REACH`
+ *                               ⇒ INVALID,容器一个字都没动
+ *   4 这一格不是箱子              ⇒ INVALID
+ *   5 `itemId` / `count` 非法     ⇒ INVALID(含 `ITEM_ID_SET` 拒「编号空投」)
+ *   6 容器容量 / 件数不够         ⇒ INVALID(容器与背包都还没动)
+ *   7 两侧事务(见上)            ⇒ 任一步失败 ⇒ INVALID + 另一侧原样
+ *   8 成功                        ⇒ OK + `effect`
+ * ```
+ *
+ * ⚠️ 距离闸在**读容器之前**:闸拒的是「谁在哪」(状态),不是「这一格是什么」;
+ *   两条都 `INVALID`,但把距离放在前面 ⇒ 「不是箱子」这条事实不会**先**泄露给
+ *   站得老远的调用方(`OPEN_CHEST` 的只读回执会报箱内档数)。
  */
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
@@ -75,6 +93,35 @@ const chestsByRoom = new Map<string, Map<string, ChestCell>>();
  * 同一 `itemId` 的多次存入合并进**同一档**,不占新格 ⇒ 「满」= 24 个不同的物品。
  */
 export const CHEST_SLOTS = 24;
+
+/**
+ * 箱子**交互半径**(格)。
+ *
+ * 出处:`docs/AUDIT-W34.md:108`(R8)「箱子存取不比距离……修法要先定交互半径常量」
+ * —— 仓库里**没有**现成的「容器交互半径」,本常量就是那条裁决的落点。
+ *
+ * 取值 5:与既有 `STREET_LAMP_RADIUS`(`mobs/spawner.ts:43` = 5)同一量级 ——
+ *   那个常量同样是「一个**已放置的器件**周围多少格内算玩家在跟前」的口径。
+ *   比 `PICKUP_RADIUS`(`material.ts:44` = 2)宽是刻意的:箱子是一格**实体**,
+ *   玩家贴着它站时自己的刚体(半径 0.35)就在旁边,2 格会把「站在箱子旁边」
+ *   也算成超距 ⇒ 箱子没法用。
+ *
+ * ⚠️ 它是**防远程开箱**的防呆界,**不是**视线闸:闸内不判中间有没有墙
+ *   (`world/vision.ts` 才有墙的判定;R5 记了「接视线要在热路径跑 O(格)」,
+ *   今天没接)⇒ 闸外一律拒,闸内一律放。
+ */
+export const CHEST_REACH = 5;
+
+/**
+ * 玩家**权威位置**(浮点)到目标**格**(整数格号)的欧氏距离。
+ *
+ * 与 `world_sim` 判地面物品距离的 `Math.hypot`(`consumeGroundItem` /
+ * `takeGroundItemNear`)同一口径 —— 不用曼哈顿/切比雪夫:那会让斜着站
+ * 比正着站更远,与玩家直觉相反。
+ */
+function chestDistance(ax: number, ay: number, x: number, y: number): number {
+  return Math.hypot(ax - x, ay - y);
+}
 
 /** 格子键。用字符串省掉一层嵌套 Map,失败信息里也能直接打印。 */
 function cellKey(x: number, y: number): string {
@@ -235,6 +282,26 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
   const x = numField(ctx.payload.x);
   const y = numField(ctx.payload.y);
   if (x === null || y === null) return { ok: false, kind: 'INVALID', reason: '需要 x / y(数字)' };
+
+  /* ── 距离闸(docs/AUDIT-W34.md:108 的 R8)──
+     坐标是**客户端自报**的,而「谁在哪」只有服务端知道 ⇒ 取**权威位置**
+     (`hostPositionOf`,与 `material.ts` 的丢/捡**同一读法**)与目标格比距离,
+     超距一律拒。拿不到位置(不在世界里 / 老世界源没有这个读口)也**拒**
+     —— fail-closed,与 `DROP_ITEM` / `PICKUP_ITEM` 的「拿不到权威位置 ⇒ INVALID」
+     同口径,不退回「信客户端」。
+     ★ 位置判在**读容器之前**:被拒时容器一个字都没动(零副作用)。 */
+  const at = ctx.hostPositionOf(ctx.actorId);
+  if (at === null) {
+    return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
+  }
+  const dist = chestDistance(at.x, at.y, x, y);
+  if (dist > CHEST_REACH) {
+    return {
+      ok: false, kind: 'INVALID',
+      reason: `离箱子 (${x},${y}) 太远(要 ${CHEST_REACH} 格内,`
+        + `实测 ${Math.round(dist * 1000) / 1000};半径的出处见 CHEST_REACH)`,
+    };
+  }
 
   const roomId = ctx.state.roomId;
   const view = containers.read(roomId, x, y);

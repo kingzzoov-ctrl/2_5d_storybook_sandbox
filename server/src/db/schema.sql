@@ -117,7 +117,13 @@ CREATE TABLE IF NOT EXISTS room_players (
   user_id       TEXT    NOT NULL,
   role          TEXT    NOT NULL DEFAULT 'MEMBER'
                 CHECK (role IN ('OWNER', 'ADMIN', 'MEMBER', 'GUEST')),
-  snapshot_blob BLOB,
+  -- 重连快照的字节上限 = 1 MiB(与归档 `snapshot_bytes` 同口径,值见 repo.ts:BLOB_MAX_BYTES)。
+  -- 为什么落在 DDL 而不是只在写入侧判:写入侧那条闸(`assertReconnectSnapshotSize`)
+  -- 挡不住绕过 repo 直接 `insert` 的路径,而「单行快照随背包/等级无界增长」正是
+  -- 被登记的那条缺陷 —— 第二道闸必须在库上。`length(NULL)` 为 NULL ⇒ 空快照照过。
+  -- (MemoryDb 认得 `length(x) <= n` 这个形态,故它不计入 `unsupportedChecks()`。)
+  snapshot_blob BLOB
+                CHECK (length(snapshot_blob) <= 1048576),
   joined_at     INTEGER NOT NULL,
   last_seen_at  INTEGER NOT NULL,
   PRIMARY KEY (room_id, user_id),

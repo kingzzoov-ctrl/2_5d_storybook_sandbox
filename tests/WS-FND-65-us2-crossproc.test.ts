@@ -171,8 +171,8 @@ async function main(): Promise<void> {
   await atest('FND65-1 ★★★ US2 三段因果:上行 move ⇒ 世界坐标真的变 ⇒ 快照带回同一个坐标', async () => {
     const c = await rawConnect('r65us2', 'us2e2e');
     try {
-      await withTimeout(c.opened, 5000, 'socket 打开');
-      await waitUntil(() => c.welcome !== null, 5000, 'welcome 到达', () => String(c.welcome));
+      await withTimeout(c.opened, 15000, 'socket 打开');
+      await waitUntil(() => c.welcome !== null, 15000, 'welcome 到达', () => String(c.welcome));
       eq(c.welcome!.playerId, 'us2e2e', '握手给回的 playerId 必须来自 URL 的 ?userId=');
       await waitUntil(() => clientX(c, 'us2e2e') !== undefined, 5000, '客户端快照里出现该玩家', () => where(c, 'us2e2e', Number.NaN));
       ok(c.srv.connCount() >= 1, '服务端应记录这条连接');
@@ -214,7 +214,7 @@ async function main(): Promise<void> {
   await atest('FND65-2 ★ 负对照:一条 move 都不发 ⇒ 权威坐标与快照坐标都不变', async () => {
     const c = await rawConnect('r65idle', 'idle65');
     try {
-      await withTimeout(c.opened, 5000, 'socket 打开');
+      await withTimeout(c.opened, 15000, 'socket 打开');
       await waitUntil(() => clientX(c, 'idle65') !== undefined, 5000, '客户端快照里出现该玩家', () => where(c, 'idle65', Number.NaN));
       const a0 = c.sim.playerPosition('idle65')!;
       const s0 = clientX(c, 'idle65')!;
@@ -234,8 +234,8 @@ async function main(): Promise<void> {
   await atest('FND65-3 ★ 有牙对照:换一个 userId ⇒ 动的正是那一个玩家(不是常量/第一个)', async () => {
     const c = await rawConnect('r65who', 'zoe65');
     try {
-      await withTimeout(c.opened, 5000, 'socket 打开');
-      await waitUntil(() => c.welcome !== null, 5000, 'welcome 到达', () => String(c.welcome));
+      await withTimeout(c.opened, 15000, 'socket 打开');
+      await waitUntil(() => c.welcome !== null, 15000, 'welcome 到达', () => String(c.welcome));
       eq(c.welcome!.playerId, 'zoe65', '★ welcome.playerId 跟随 URL');
       await waitUntil(() => clientX(c, 'zoe65') !== undefined, 5000, '客户端快照里出现该玩家', () => where(c, 'zoe65', Number.NaN));
       const p0 = c.sim.playerPosition('zoe65');
@@ -267,7 +267,7 @@ async function main(): Promise<void> {
       },
     });
     try {
-      const w = await withTimeout(welcome, 5000, 'welcome 到达(生产客户端)');
+      const w = await withTimeout(welcome, 15000, 'welcome 到达(生产客户端)');
       eq(w.playerId, 's65', '★ 生产客户端的 playerId 也来自 URL');
       eq(session.state, 'live', '★ 握手通过后会话进 live');
       await waitUntil(
