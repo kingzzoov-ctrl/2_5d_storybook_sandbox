@@ -211,10 +211,16 @@ export class ClientStateStore {
      * 广播一次 ⇒ 同一条连接上 tick **严格递增**,`tick <= 当前` 只可能是
      * 重复投递或乱序晚到。
      *
-     * `FULL` **无条件接受**:它是自包含快照(入场 / 重连恢复)。重连时服务端的
-     * tick 可能**小于**断线前收到的那个数 —— 按 tick 丢掉它,就等于把唯一的
-     * 恢复快照扔掉,此后每一帧 `DELTA` 都因基线不符被继续丢 ⇒ 客户端**永久冻结**,
+     * `FULL` **无条件接受**:它是自包含快照(入场 / 重连恢复),而且 `applyPacket`
+     * 会按「**整体替换**」处理它(`shared/net/delta.ts`:op === FULL 时先清空
+     * 实体表与房间级 meta 再重建,见那边的 P1 说明)。重连时服务端的 tick 可能
+     * **小于**断线前收到的那个数 —— 按 tick 丢掉它,就等于把唯一的恢复快照扔掉,
+     * 此后每一帧 `DELTA` 都因基线不符被继续丢 ⇒ 客户端**永久冻结**,
      * 而且不会报任何错。⇒ 这条豁免是**必要的**,不是宽松。
+     *
+     * ⚠️ 反过来也成立:FULL 不能被当成"在旧状态上 merge" —— 那样旧快照独有的
+     * player/wildlife/boss 会**永远留着**(幽灵实体),而两端都不报错
+     * (编码侧 FULL 的 `removedCount` 恒 0,它无从列出"谁消失了")。
      */
     if (pkt.op === PacketOp.DELTA && pkt.tick <= this.state_.meta.tick) {
       this.staleFrames_ += 1;

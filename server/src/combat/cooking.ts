@@ -546,7 +546,14 @@ export function tryCook(state: KitchenState, stationId: number): CookResult | nu
   return res;
 }
 
-/** 浇灭炉火(227 泡泡水枪 / 212 大铁铲)。浇灭后锅内的料**保留**,只是不再出锅。 */
+/**
+ * 浇灭炉火(227 泡泡水枪 / 212 大铁铲)。浇灭后锅内的料**保留**,只是不再出锅。
+ *
+ * ★ 第六轮实测 P2(两份实现):`WorldSim.extinguishStationAt` 曾经**自己**写
+ *   `stationState(id).fireOut = true`,与本函数是同一件事的第二份实现。
+ *   现在那份改为**委托本函数**(`world_sim.ts#extinguishStationAt`)⇒ 「炉火怎么灭」
+ *   只有这一个写点;`relightStationAt` 是它的可逆那一半(复位 `fireOut`)。
+ */
 export function extinguishStation(state: KitchenState): void {
   state.fireOut = true;
 }
@@ -565,7 +572,14 @@ export function tickFoodBuff(buff: FoodBuff, dt: number): { buff: FoodBuff; expi
   return { buff: { ...buff, remainingSec }, expired: remainingSec <= 0 };
 }
 
-/** 612 冰爽薄荷净化饮 / 612:清空全部整蛊类 buff。 */
+/**
+ * 612 冰爽薄荷净化饮:清空全部整蛊类 buff(`branch === PRANK`)。
+ *
+ * ★ 第六轮实测 P2:此前**生产零调用** —— 喝 612 只加一条 `cleanse` 标记,
+ *   已有的整蛊 buff 一条都不掉。现在接在 `WorldSim.useItem` 的料理分支:
+ *   `food.flags.cleanse === true` ⇒ 先过本函数再加新 buff。
+ *   判据:`tests/WS-FND-118` FND118-9。
+ */
 export function cleansePrankBuffs(buffs: readonly FoodBuff[]): FoodBuff[] {
   return buffs.filter((b) => b.branch !== CookBranch.PRANK);
 }
@@ -626,6 +640,11 @@ export interface FireCell {
 /**
  * 212 大铁铲/227 水枪灭火:3 格内所有火格强度直接归零。
  * 对高炉与汤锅分别返回「是否降温成功」与「本轮是否继续烹饪」。
+ *
+ * ⚠️ 第六轮实测 P2:本函数**没有接线对象** —— 全仓**没有 `FireCell[]` 的生产者**
+ *   (地形火在 `FluidField`/`rooms/effects` 里都是另一套表示,不提供 `{x,y,intensity}` 表)。
+ *   给不存在的火格表接线只会造出一个恒空的调用点,故 `UNWIRED` 并登记在
+ *   `combat/wiring_ledger.ts`。别把这里的注释读成「灭火已生效」。
  */
 export function extinguishFire(
   cells: readonly FireCell[],

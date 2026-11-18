@@ -108,6 +108,21 @@ export interface PartyModeRuntime {
   board: Map<TeamKey, TeamScore>;
   broadcaster: Broadcaster;
   settlement: PartySettlement | null;
+  /**
+   * ★ WS-FND-120:进入 `SETTLED` 时由 `tickPartyMode` 调用的结算钩子。
+   *
+   * ## 为什么需要它
+   *
+   * `tickPartyMode` 只持有 `PartyModeRuntime`,不认识「这是造桥 / 果冻球 / 抢皇冠 / 涂色」
+   * 哪一个子运行时 ⇒ 生产里相位到点变成 `SETTLED` 之后,没人去调对应模式的
+   * `settle*`(`settleBridgeRun` / `settleJellyBall` / `settleCrown` / `settlePaintWar`
+   * 修前**生产零调用**)⇒ `m.settlement` 恒 `null`、`rewards` 永不发放。
+   *
+   * 由五个 `create*Run` 工厂各自把「自己的结算函数」挂上来(见各工厂末尾),
+   * 于是「相位到点 ⇒ 结算」只有**一条**路径,不存在第二份调度表。
+   * `null` = 该运行时没有结算语义(裸 `createPartyMode` 的用例)。
+   */
+  settleHook: (() => PartySettlement) | null;
   rng: Rng;
   /** 累计阶段切换次数 */
   phaseSwitches: number;
@@ -152,6 +167,7 @@ export function createPartyMode(opts: {
     board: createScoreboard(),
     broadcaster: createBroadcaster(),
     settlement: null,
+    settleHook: null,
     rng: makeRng(opts.seed ?? 1),
     phaseSwitches: 0,
   };
@@ -175,13 +191,40 @@ export function modeTotalSec(m: PartyModeRuntime): number {
 }
 
 /**
+ * 通过**结算钩子**结算一次(`settleHook` 由各 `create*Run` 挂上)。
+ *
+ * 幂等:`m.settlement` 非空 ⇒ 原样返回那一份,不重算(重复调用一分不加)。
+ * `null` = 这个运行时没有结算语义(裸 `createPartyMode`),或钩子还没挂。
+ */
+export function settlePartyRun(m: PartyModeRuntime): PartySettlement | null {
+  if (m.settlement !== null) return m.settlement;
+  const hook = m.settleHook;
+  if (hook === null) return null;
+  return hook();
+}
+
+/**
  * 全模式统一推进入口:处理 BUILD→RACE→SETTLED 的相位与总时长。
  * 注意 CROWN_BR 由 `tickCrown` 自行判定提前结束,此函数只兜底超时。
+ *
+ * ★ WS-FND-120:相位走到 `SETTLED` 时**顺便结算**(`settlePartyRun`),不再依赖
+ * 上层「记得调 settle*」—— 修前五个 `settle*` 在生产里零调用,`settlement`
+ * 恒 `null`、`rewards` 一份不发。现在有两条进入结算的路径,都只走钩子:
+ *   · 本函数把相位推到 `SETTLED` 的那一帧(超时);
+ *   · 子运行自己提前结束(如 `tickCrown` 的 60 秒持冠)⇒ 下一次 tick 走
+ *     「已 SETTLED 但还没结算」那一支。
  */
 export function tickPartyMode(m: PartyModeRuntime): string[] {
   const ev: string[] = [];
-  if (m.phase === PARTY_PHASE.IDLE || m.phase === PARTY_PHASE.SETTLED) return ev;
+  if (m.phase === PARTY_PHASE.IDLE) return ev;
   const t = modeElapsedSec(m);
+
+  /* 已结束但尚未结算(子运行提前宣胜 / 上一帧只置了相位)⇒ 本帧补结算。 */
+  if (m.phase === PARTY_PHASE.SETTLED) {
+    const done = settlePartyRun(m);
+    if (done !== null && m.settlement === done) ev.push('PARTY_SETTLED');
+    return ev;
+  }
 
   if (m.buildSec > 0 && m.phase === PARTY_PHASE.BUILD && t >= m.buildSec - 1e-9) {
     m.phase = PARTY_PHASE.RACE;
@@ -191,11 +234,13 @@ export function tickPartyMode(m: PartyModeRuntime): string[] {
   }
 
   if (t >= modeTotalSec(m) - 1e-9) {
-    if (m.phase !== PARTY_PHASE.SETTLED) {
-      m.phase = PARTY_PHASE.SETTLED;
-      m.phaseSwitches += 1;
-      ev.push('PHASE:SETTLED');
-    }
+    m.phase = PARTY_PHASE.SETTLED;
+    m.phaseSwitches += 1;
+    ev.push('PHASE:SETTLED');
+    /* 结算与相位切换**同帧**:`settleBridgeRun` 的安慰分只在 `SETTLED` 折算,
+       故必须先置相位再结算(顺序颠倒会把安慰分静默吞掉)。 */
+    const done = settlePartyRun(m);
+    if (done !== null) ev.push('PARTY_SETTLED');
   }
   return ev;
 }
@@ -228,13 +273,16 @@ export function createBridgeRun(clock: Clock, refereeId: string, seed = 11): Bri
   if (mode.buildSec !== BRIDGE_BUILD_SEC || mode.raceSec !== BRIDGE_RACE_SEC) {
     throw new Error('PARTY_MODES 的造桥夺旗节拍与手册 §6.3 的 15s / 30s 不符');
   }
-  return {
+  const run: BridgeRunRuntime = {
     mode,
     built: new Map(TEAM_ORDER.map((t) => [t, 0])),
     flagged: new Map(TEAM_ORDER.map((t) => [t, false])),
     traps: 0,
     rng: makeRng(seed),
   };
+  /* ★ WS-FND-120:把结算函数挂到相位钩子上 —— `tickPartyMode` 到点自己结算。 */
+  mode.settleHook = () => settleBridgeRun(run);
+  return run;
 }
 
 /** 建造阶段:摆一块桥板 / 一个盲盒陷阱。冲刺阶段拒绝建造。 */
@@ -355,7 +403,7 @@ export interface JellyBallRuntime {
 
 export function createJellyBall(clock: Clock, refereeId: string, seed = 22): JellyBallRuntime {
   const mode = createPartyMode({ key: PARTY_MODE_KEY.JELLY_BALL, clock, refereeId, seed });
-  return {
+  const run: JellyBallRuntime = {
     mode,
     ball: { spawnX: 20, spawnY: 0, x: 20, y: 0, vx: 0, vy: 0, resetTimer: 0, live: true },
     goals: [
@@ -365,6 +413,9 @@ export function createJellyBall(clock: Clock, refereeId: string, seed = 22): Jel
     goalTriggers: 0,
     rng: makeRng(seed),
   };
+  /* ★ WS-FND-120:同上,果冻球的结算也挂到相位钩子上。 */
+  mode.settleHook = () => settleJellyBall(run);
+  return run;
 }
 
 export function kickBall(r: JellyBallRuntime, vx: number, vy: number): void {
@@ -487,7 +538,7 @@ export interface CrownRuntime {
 export function createCrownRun(clock: Clock, refereeId: string, seed = 33): CrownRuntime {
   const mode = createPartyMode({ key: PARTY_MODE_KEY.CROWN_BR, clock, refereeId, seed });
   if (mode.raceSec !== CROWN_MODE_SEC) throw new Error('抢皇冠模式时长与 PARTY_MODES 的 180s 不符');
-  return {
+  const run: CrownRuntime = {
     mode,
     holder: null,
     holderTeam: null,
@@ -496,6 +547,10 @@ export function createCrownRun(clock: Clock, refereeId: string, seed = 33): Crow
     winner: null,
     teams: new Map(),
   };
+  /* ★ WS-FND-120:抢皇冠的胜者由 `tickCrown` 提前置 SETTLED ⇒ 钩子让下一次
+     `tickPartyMode` 把 `settleCrown` 真的跑掉(修前它生产零调用)。 */
+  mode.settleHook = () => settleCrown(run);
+  return run;
 }
 
 /** 玩家入座时登记归属队伍(对应 435 复活旗选色)。 */
@@ -611,13 +666,16 @@ export interface PaintWarRuntime {
 export function createPaintWar(clock: Clock, refereeId: string, seed = 44): PaintWarRuntime {
   const mode = createPartyMode({ key: PARTY_MODE_KEY.PAINT_WAR, clock, refereeId, seed });
   if (mode.raceSec !== PAINT_MODE_SEC) throw new Error('涂色模式时长与 PARTY_MODES 的 120s 不符');
-  return {
+  const run: PaintWarRuntime = {
     mode,
     grid: createPaintGrid(PAINT_GRID_W, PAINT_GRID_H),
     balls: new Map(TEAM_ORDER.map((t) => [t, 0])),
     dyeLog: [],
     rng: makeRng(seed),
   };
+  /* ★ WS-FND-120:涂色的结算同样挂到相位钩子上。 */
+  mode.settleHook = () => settlePaintWar(run);
+  return run;
 }
 
 export interface ThrowPaintResult {
@@ -686,7 +744,10 @@ export function createRaceRun(clock: Clock, refereeId: string, raceSec = 90, see
   mode.name = '风车跑酷计时赛';
   mode.buildSec = 0;
   mode.raceSec = raceSec;
-  return { mode, timers: new Map(), results: [], gateOpen: false };
+  const run: RaceRuntime = { mode, timers: new Map(), results: [], gateOpen: false };
+  /* ★ WS-FND-120:跑酷结算走同一个相位钩子(修前 `settleRace` 生产零调用)。 */
+  mode.settleHook = () => settleRace(run);
+  return run;
 }
 
 export function registerRunner(r: RaceRuntime, playerId: string): RaceTimer {
@@ -741,6 +802,150 @@ export function settleRace(r: RaceRuntime): PartySettlement {
   };
   r.mode.settlement = settlement;
   return settlement;
+}
+
+/* ═══════════════════════ 对局容器(子运行 + 相位 + 结算) ═══════════════════════ */
+
+/**
+ * ★ WS-FND-120:四大模式**子运行**的统一容器。
+ *
+ * ## 为什么需要一个容器(而不是只持 `PartyModeRuntime`)
+ *
+ * `PartyModeRuntime` 只有相位 / 记分板 / 播报队列;「夺旗」「拾冠」「进球」
+ * 这些**动作**全挂在子运行时上(`BridgeRunRuntime` / `CrownRuntime` / ...)。
+ * 修前世界侧只持有 `PartyModeRuntime` ⇒ 拿不到子运行 ⇒
+ * `bridgeCapture` / `crownPickup` 在生产里**只剩测试一个调用者**。
+ *
+ * ⇒ 容器把「相位 + 子运行」绑在一起:世界侧(`sim/world_sim.ts`)持容器,
+ *   动作层(`party/actions.ts`)只认容器,两者都不需要认识五个子运行类型。
+ */
+export type PartyContest =
+  | { key: typeof PARTY_MODE_KEY.BRIDGE_CTF; bridge: BridgeRunRuntime }
+  | { key: typeof PARTY_MODE_KEY.JELLY_BALL; jelly: JellyBallRuntime }
+  | { key: typeof PARTY_MODE_KEY.CROWN_BR; crown: CrownRuntime }
+  | { key: typeof PARTY_MODE_KEY.PAINT_WAR; paint: PaintWarRuntime };
+
+export function createPartyContest(
+  key: PartyModeKey,
+  clock: Clock,
+  refereeId: string,
+  seed = 1,
+): PartyContest {
+  switch (key) {
+    case PARTY_MODE_KEY.BRIDGE_CTF: return { key, bridge: createBridgeRun(clock, refereeId, seed) };
+    case PARTY_MODE_KEY.JELLY_BALL: return { key, jelly: createJellyBall(clock, refereeId, seed) };
+    case PARTY_MODE_KEY.CROWN_BR: return { key, crown: createCrownRun(clock, refereeId, seed) };
+    case PARTY_MODE_KEY.PAINT_WAR: return { key, paint: createPaintWar(clock, refereeId, seed) };
+    default: {
+      /* 词表来自冻结层 ⇒ 这里不可能到;写成抛错而不是兜底,避免「静默跑错模式」。 */
+      const never: never = key;
+      throw new Error(`未知派对模式 ${String(never)}`);
+    }
+  }
+}
+
+export function contestMode(c: PartyContest): PartyModeRuntime {
+  return c.key === PARTY_MODE_KEY.BRIDGE_CTF ? c.bridge.mode
+    : c.key === PARTY_MODE_KEY.JELLY_BALL ? c.jelly.mode
+      : c.key === PARTY_MODE_KEY.CROWN_BR ? c.crown.mode
+        : c.paint.mode;
+}
+
+export function contestBroadcaster(c: PartyContest): Broadcaster {
+  return contestMode(c).broadcaster;
+}
+
+/**
+ * 推进一帧:**子运行在前,相位在后**。
+ *
+ * 顺序有实质意义:`tickCrown` 会在 60 秒持冠时自己把相位置 `SETTLED`,
+ * 紧接着的 `tickPartyMode` 走「已结束但未结算」那一支把 `settleCrown` 跑掉。
+ * 反过来先推相位再推子运行,宣胜那一帧就白过。
+ */
+export function tickPartyContest(c: PartyContest, dt: number): string[] {
+  const ev: string[] = [];
+  if (c.key === PARTY_MODE_KEY.JELLY_BALL) {
+    tickJellyBall(c.jelly, dt);
+    const goal = judgeGoal(c.jelly);
+    if (goal.scored) ev.push('PARTY_GOAL');
+  }
+  if (c.key === PARTY_MODE_KEY.CROWN_BR) {
+    ev.push(...tickCrown(c.crown, dt));
+  }
+  ev.push(...tickPartyMode(contestMode(c)));
+  return ev;
+}
+
+/** 造桥:摆一块桥板(消耗由调用方负责)。非造桥容器 / 相位不对 ⇒ false。 */
+export function contestPlaceBoard(c: PartyContest, team: TeamKey, isTrap = false): boolean {
+  if (c.key !== PARTY_MODE_KEY.BRIDGE_CTF) return false;
+  return bridgePlace(c.bridge, team, isTrap);
+}
+
+/** 造桥:夺旗。非造桥容器 ⇒ false。 */
+export function contestCapture(c: PartyContest, team: TeamKey): boolean {
+  if (c.key !== PARTY_MODE_KEY.BRIDGE_CTF) return false;
+  return bridgeCapture(c.bridge, team);
+}
+
+/** 造桥:某队已建桥板数(动作层的前置判定与断言用);非造桥 ⇒ null。 */
+export function contestBuiltOf(c: PartyContest, team: TeamKey): number | null {
+  if (c.key !== PARTY_MODE_KEY.BRIDGE_CTF) return null;
+  return c.bridge.built.get(team) ?? 0;
+}
+
+/** 抢皇冠:登记玩家队伍(对应 435 复活旗选色)。非抢皇冠容器 ⇒ false。 */
+export function contestAssignTeam(c: PartyContest, playerId: string, team: TeamKey): boolean {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return false;
+  crownAssignTeam(c.crown, playerId, team);
+  return true;
+}
+
+/** 抢皇冠:拾冠。非抢皇冠容器 / 未登记队伍 ⇒ false。 */
+export function contestCrownPickup(c: PartyContest, playerId: string): boolean {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return false;
+  return crownPickup(c.crown, playerId);
+}
+
+/** 抢皇冠:掉冠(被整蛊玩具击退)。非抢皇冠容器 ⇒ false。 */
+export function contestCrownDrop(c: PartyContest): boolean {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return false;
+  return crownDrop(c.crown);
+}
+
+/** 抢皇冠:当前持冠者;非抢皇冠 / 皇冠落地 ⇒ null。 */
+export function contestCrownHolder(c: PartyContest): string | null {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return null;
+  return c.crown.holder;
+}
+
+/** 造桥:某队是否已夺过旗;非造桥 ⇒ false。 */
+export function contestBridgeFlagged(c: PartyContest, team: TeamKey): boolean {
+  if (c.key !== PARTY_MODE_KEY.BRIDGE_CTF) return false;
+  return c.bridge.flagged.get(team) === true;
+}
+
+/** 抢皇冠:掉冠冷却剩余秒数;非抢皇冠 ⇒ 0。 */
+export function contestCrownCooldown(c: PartyContest): number {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return 0;
+  return c.crown.cooldownSec;
+}
+
+/** 抢皇冠:已达标获胜的队伍;非抢皇冠 / 没人达标 ⇒ null。 */
+export function contestCrownWinner(c: PartyContest): TeamKey | null {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return null;
+  return c.crown.winner;
+}
+
+/** 抢皇冠:某玩家累计持冠秒数(诊断用);非抢皇冠 ⇒ null。 */
+export function contestCrownSecOf(c: PartyContest, playerId: string): number | null {
+  if (c.key !== PARTY_MODE_KEY.CROWN_BR) return null;
+  return c.crown.perPlayer.get(playerId) ?? 0;
+}
+
+/** 结算结果(未结算 ⇒ null)。 */
+export function contestSettlement(c: PartyContest): PartySettlement | null {
+  return contestMode(c).settlement;
 }
 
 /* ═══════════════════════ 自检 ═══════════════════════ */

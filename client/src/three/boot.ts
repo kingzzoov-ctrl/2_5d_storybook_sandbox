@@ -20,7 +20,7 @@
  */
 
 import * as THREE from 'three';
-import { createCamera, type IsoCamera, Z_Y_PER_LEVEL } from '../stage/iso_camera.ts';
+import { createCamera, stepZoom, ZOOM_LEVELS, type IsoCamera, Z_Y_PER_LEVEL } from '../stage/iso_camera.ts';
 import {
   buildChunkGeometry,
   buildOrthographicCamera,
@@ -64,9 +64,21 @@ import {
 } from '../ui/recipe_tree.ts';
 import {
   buildTelegraph,
+  bossHudFrom,
+  decayGhost,
   layoutHpBar,
+  type BossHudView,
   type TelegraphSpec,
 } from '../ui/boss_hud.ts';
+/* ★ 2026-11(第六轮审计 P1):`meta.partyMode/partyTimer/scoreA/scoreB` 此前
+   **零读点**(`client/src` 命中 0)⇒ 派对/比分永远不上屏。判定(模式词表换算、
+   文本拼装)全在 `ui/party_hud.ts`(纯函数、零 DOM ⇒ 可被 node 直接断言),
+   本文件只把它的输出每帧写进 `#hint` 与自检口径。 */
+import { partyHudOf, type PartyHudView } from '../ui/party_hud.ts';
+/* ★ 第六轮审计 P1/P3:接线台账。**生产里也读它** —— `summary().wiring.ledger`
+   把"哪些装配函数仍未接"变成自检口径里的读数;只有测试读它的话,
+   这块信息在真机上就又不可见了(那正是本轮要消灭的形态)。 */
+import { WIRING_LEDGER, validateLedger } from '../wiring_ledger.ts';
 import {
   buildRoofMask,
   labelRoofComponents,
@@ -550,6 +562,36 @@ export function boot(container: HTMLElement): BootHandle {
 
   /* ── HUD ── */
   const hud = makeHud(container);
+  /**
+   * `#hint`(页面底部那行提示)的**读点**。
+   *
+   * ★ 第六轮审计 P3:这个元素在 `client/index.html:49` 里写死了一段文案,
+   *   而 `client/src` 里 `getElementById('hint')` 命中 **0** ⇒ 它永远不更新,
+   *   文案里也没有缩放/搜索这两个**存在但没人知道**的键位。
+   *   现在它由 `paintHint()` 每帧按真实状态刷新(缩放档位、搜索串、拖拽成交、
+   *   派对/比分),并且**只在文本变化时**写 `textContent`(避免每帧触发重排)。
+   */
+  const hintEl = document.getElementById('hint');
+  let lastHint = '';
+  const paintHint = (): void => {
+    if (hintEl === null) return;
+    const parts: string[] = [];
+    const bv = bossView();
+    if (bv !== null) {
+      parts.push(`Boss ${bv.name} ${Math.round(bv.hp)}/${Math.round(bv.baseHp)}`
+        + (bv.phaseName === '' ? '' : ` [${bv.phaseName}]`));
+    }
+    const party = partyHudOf(authority.state.meta);
+    if (party.active) parts.push(party.text);
+    parts.push(`缩放 ${isoCam.zoom}×([ / ])`);
+    if (searchMode) parts.push(`搜索 "${invQuery}"(Enter 收下 / Esc 清空)`);
+    if (lastMove !== '') parts.push(`拖拽 ${lastMove}`);
+    parts.push('I 背包 · / 搜索 · 拖拽整理背包 · WASD 移动 · 单指拖动视角');
+    const text = parts.join(' · ');
+    if (text === lastHint) return;
+    lastHint = text;
+    hintEl.textContent = text;
+  };
 
   /* ══════════════════ UI 运行时:8 个模块的接入点 ══════════════════
    *
@@ -566,8 +608,15 @@ export function boot(container: HTMLElement): BootHandle {
   const uiFsm = new UiStateMachine();
 
   /* ── inventory:背包视图 ──
-   * 调用点:`refreshInventory()` → `buildView()`,每帧被 `UiDrawState.view` 消费 */
+   * 调用点:`refreshInventory()` → `buildView()`,每帧被 `UiDrawState.view` 消费。
+   *
+   * ★ 第六轮审计 P3:`invQuery` 此前**恒为 `''`** —— `buildView({query})` 与
+   *   `inventory.matchesQuery()` 都实现了搜索,但**没有任何键能写它** ⇒
+   *   "搜索不可达"(功能在、入口不在)。现在 `/` 进入搜索态,后续可打印字符
+   *   追加进 `invQuery`(Backspace 退格、Enter/Escape 退出),见 `onKeyDown`。 */
   let invQuery = '';
+  /** 是否处于搜索输入态(`/` 进入,Enter/Escape 退出)—— 只有在它里面才吃字符键 */
+  let searchMode = false;
   let invCategory: string | null = null;
   let invPage = 0;
   let invView: InventoryView = buildView({ page: 0 });
@@ -613,12 +662,42 @@ export function boot(container: HTMLElement): BootHandle {
   const clickSound = (): number => audioOut.uiClick(24);
 
   /* ── boss_hud:血条 + 地面预警圈 ──
-   * 调用点:`layoutHpBar()` 在 `ui_binding.drawBoss()`;`buildTelegraph()` 在 `telegraphRing()` */
-  const boss = BOSS_LIST[0] ?? null;
-  let bossHp = boss ? boss.baseHp : 0;
+   * 调用点:`bossHudFrom()` 在 `bossView()`(每帧一次,读**权威** `RoomState.bosses`);
+   *        `layoutHpBar()` 在 `ui_binding.drawBoss()`;`buildTelegraph()` 在 `telegraphGeometry()`。
+   *
+   * ★ 第六轮审计 P1:接线前这里有两个**本地伪造**:
+   *   1 `bossHp = Math.max(baseHp*0.18, bossHp - dt/1000*baseHp*0.035)` —— 血条自己
+   *     慢慢往下走,与服务端 boss 的真实血量**毫无关系**;
+   *   2 `RoomState.bosses` 在 `client/src` 里的读者数是 0 ⇒ 服务端掉血/进阶段/换预警
+   *     几何,屏幕上完全一样。两个都不报错。
+   *   ⇒ 现在血条/阶段/预警几何的唯一来源是快照(`bossHudFrom`),`bossActive` 只剩
+   *     「B 键召唤 demo boss」这一个用途(**没有**权威 boss 时才用它撑起一张演示血条)。
+   */
+  const demoBoss = BOSS_LIST[0] ?? null;
+  /** 残影条的**比例**(由权威 ratio 指数回落而来,见主循环的 `decayGhost`) */
   let bossGhost = 1;
-  /** Boss 是否在场(按 B 键召唤/遣返,用来验证 HUD 真的会出现/消失) */
+  /** demo 用的「Boss 是否在场」开关(仅当快照里没有 boss 时生效) */
   let bossActive = false;
+  /** 本帧该显示的 boss:HUD 的**唯一**数据源(权威优先,demo 兜底)。 */
+  const bossView = (): BossHudView | null => {
+    const authoritative = bossHudFrom(authority.state);
+    if (authoritative !== null) return authoritative;
+    if (!bossActive || demoBoss === null) return null;
+    /* demo 血条:血量 = 上限(不随时间伪造),阶段/名字仍来自内容层的 BossDef */
+    return {
+      id: `demo:${demoBoss.id}`,
+      bossId: demoBoss.id,
+      name: demoBoss.name,
+      level: demoBoss.level,
+      baseHp: demoBoss.baseHp,
+      hp: demoBoss.baseHp,
+      ratio: 1,
+      phaseIndex: 0,
+      phaseName: String(demoBoss.phases[0]?.name ?? ''),
+      phases: demoBoss.phases,
+      telegraph: null,
+    };
+  };
 
   /* ── roof_transparency:玩家进屋顶时整片淡出 ──
    * 调用点:主循环里 `roofFades` 按玩家格 `setPlayerCellByPos()` 的结果推进 */
@@ -903,6 +982,15 @@ export function boot(container: HTMLElement): BootHandle {
    */
   let camOverride: CameraPoint | null = null;
   /**
+   * 最近一次**真的成交**的背包拖拽(`''` = 还没有)。
+   *
+   * ★ 第六轮审计 P1:`DragController.drop()` 此前零调用 ⇒ 这里没有"成交"可言。
+   * 现在它由 `onUiPointerUp` 写入,并作为 `#hint` 的一行与
+   * `summary().wiring.inventory.lastMove` 暴露 —— 「拖拽能不能搬东西」变成
+   * **读得出来**的事实,而不是只能靠肉眼看格子。
+   */
+  let lastMove = '';
+  /**
    * 相机聚焦点的**高度**分量(`IsoCamera.focusZ`)—— ★ WS-FND-48 新增的那个轴。
    *
    * ⚠️ **声明顺序不能挪**:`?at=` / `__uiDebug.teleport()` 会在下面的 URL 块里
@@ -1031,44 +1119,86 @@ export function boot(container: HTMLElement): BootHandle {
     if (q.get('recipe') === '1') refreshRecipe();
   }
 
-  /* ── 组装一帧的 UI 绘制状态 ── */
-  const uiState = (): UiDrawState => ({
-    panel: uiFsm.activePanel,
-    openProgress: uiFsm.state === 'OPEN' ? 1 : uiFsm.openingProgress,
-    dragging: dragCtl.isDragging,
-    hoverSlot: dragCtl.hover,
-    view: invView,
-    activeCategory: invCategory,
-    recipe: recipeTree,
-    recipeId: RECIPE_ID,
-    recipeBatches: RECIPE_BATCHES,
-    recipeNote,
-    easel,
-    paletteIndex,
-    pitchMask,
-    boss: bossActive ? boss : null,
-    bossHp,
-    bossGhost,
-    telegraphNote: bossActive && boss ? String(boss.phases[0]?.telegraph ?? '') : '',
-    blueprintNote: bpSummary,
-    /* ★ 提示行说清"谁动"与"谁跟":WASD 动的是**角色**,相机是**跟随** ——
-       接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。 */
-    keysHint: 'I 背包 · R 配方 · E 画架 · P 音高 · B Boss · 拖拽框选蓝图 · WASD 移动角色(相机跟随)',
-  });
-
-  /** 预警圈屏幕坐标:交 `boss_hud.buildTelegraph` 算,本层只取结果 */
-  const telegraphGeometry = (): { outer: { x: number; y: number }[]; inner: { x: number; y: number }[]; vertices: number } => {
-    if (!bossActive || !boss) return { outer: [], inner: [], vertices: 0 };
-    const spec: TelegraphSpec = {
-      shape: 'ANNULUS',
-      cx: playerGx,
-      cy: playerGy,
-      cz: 0,
-      radius: 3.5,
-      innerRadius: 2,
-      chargeSec: 0.8,
-      danger: 0.8,
+  /* ── 组装一帧的 UI 绘制状态 ──
+   *
+   * ★ 第六轮审计 P1/P2:这里的每个字段都必须是**某个真实读者**要用的量,
+   *   而不是"算好了放着":
+   *   · `boss` / `bossGhost` 来自 `bossView()`(权威 `RoomState.bosses`);
+   *   · `dragging` / `dragFrom` 由 `ui_binding` 用来画拖拽中的源格与目标格;
+   *   · `party` 由 `drawNotes` 画成一行(派对/比分此前**零读者**)。
+   */
+  const uiState = (): UiDrawState => {
+    const bv = bossView();
+    return {
+      /* 预警圈多边形由主循环在 `ui.draw(st)` 之前填入(它要用**本帧**的相机);
+         这里给空数组,保证 `UiDrawState` 在构造时就是完整的形状。 */
+      telegraphRing: [],
+      telegraphInner: [],
+      panel: uiFsm.activePanel,
+      openProgress: uiFsm.state === 'OPEN' ? 1 : uiFsm.openingProgress,
+      dragging: dragCtl.isDragging,
+      dragFrom: dragCtl.dragging === null ? -1 : dragCtl.dragging.fromSlot,
+      hoverSlot: dragCtl.hover,
+      view: invView,
+      invQuery,
+      activeCategory: invCategory,
+      recipe: recipeTree,
+      recipeId: RECIPE_ID,
+      recipeBatches: RECIPE_BATCHES,
+      recipeNote,
+      easel,
+      paletteIndex,
+      pitchMask,
+      boss: bv,
+      bossGhost,
+      /* 提示行:**权威** boss 的预警文案(没有 boss 时说空);不再拿内容层第一条
+         阶段的文案冒充"当前预警" —— 那是接线前的假值,和血条一样对不上服务端。 */
+      telegraphNote: bv !== null && bv.telegraph !== null
+        ? `预警 ${bv.telegraph.shape} r=${bv.telegraph.radius.toFixed(1)} 格`
+        : (bv !== null && bv.phases.length > 0 ? String(bv.phases[bv.phaseIndex]?.telegraph ?? '') : ''),
+      party: partyHudOf(authority.state.meta),
+      blueprintNote: bpSummary,
+      /* ★ 提示行说清"谁动"与"谁跟":WASD 动的是**角色**,相机是**跟随** ——
+         接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。
+         ★ 缩放档位(`[` / `]`,6 档)与搜索(`/`)也必须写进提示 —— 否则
+           "存在但没人知道能按"的键位等于不存在。 */
+      keysHint: `I 背包 · R 配方 · E 画架 · P 音高 · B Boss · [ ] 缩放 ${isoCam.zoom}×`
+        + ` · / 搜索${searchMode ? `("${invQuery}")` : ''} · 拖拽框选蓝图 · WASD 移动角色(相机跟随)`,
     };
+  };
+
+  /**
+   * 预警圈屏幕坐标:交 `boss_hud.buildTelegraph` 算,本层只取结果。
+   *
+   * ★ 第六轮审计 P1:几何现在优先来自**权威 boss 实体**的 `telegraphShape/X/Y/R`
+   *   (线上数字经 `clientTelegraphShapeOf` 映射成渲染几何)。接线前这里是
+   *   硬编码的 `shape:'ANNULUS'` + 圆心钉在**本地玩家**身上 ⇒ 服务端换了几何/位置,
+   *   玩家看到的还是同一个环,而且不报错。
+   *   没有权威预警时退到旧的 demo 环(仅 `bossActive` 演示路径)。
+   */
+  const telegraphGeometry = (): { outer: { x: number; y: number }[]; inner: { x: number; y: number }[]; vertices: number } => {
+    const bv = bossView();
+    if (bv === null) return { outer: [], inner: [], vertices: 0 };
+    const spec: TelegraphSpec = bv.telegraph !== null
+      ? {
+        shape: bv.telegraph.shape,
+        cx: bv.telegraph.cx,
+        cy: bv.telegraph.cy,
+        cz: 0,
+        radius: bv.telegraph.radius,
+        chargeSec: 1.2,
+        danger: 0.85,
+      }
+      : {
+        shape: 'ANNULUS',
+        cx: playerGx,
+        cy: playerGy,
+        cz: 0,
+        radius: 3.5,
+        innerRadius: 2,
+        chargeSec: 0.8,
+        danger: 0.8,
+      };
     /* ★ WS-FND-48:预警圈的屏幕投影必须用**与渲染同一个**相机口径(含 `focusZ`),
        否则立牌抬起来后它在屏幕上会与镜头差半格 —— 而这种错没有任何东西会报 */
     const cam = cameraAtFocus();
@@ -1097,7 +1227,10 @@ export function boot(container: HTMLElement): BootHandle {
         /* 悬停高亮走 state_machine 的 DragController(拿起 → 悬停 → 放下) */
         const sl = invView.slots[hit.indexInPage];
         if (sl) {
-          dragCtl.pickUp(hit.slot, sl.item.id, 1);
+          /* ⚠ 拿起与悬停**必须用同一个下标口径**(页内下标):`drop(slot)` 比的是
+             `fromSlot === slot`;若一处给全局槽位、另一处给页内下标,同一格会
+             永远"不相等" ⇒ 放下被当成"放回原处"而静默变成取消。 */
+          dragCtl.pickUp(hit.indexInPage, sl.item.id, 1);
           dragCtl.hoverAt(hit.indexInPage);
         }
       } else if (hit.kind === 'easel') {
@@ -1156,18 +1289,53 @@ export function boot(container: HTMLElement): BootHandle {
       }
     }
     bpDrag = null;
-    if (dragCtl.isDragging) dragCtl.cancel();
+    /* ── ★ 第六轮审计 P1:抬手 → `drop()`,不是一律 `cancel()` ──
+     *
+     * 修前这一行是 `if (dragCtl.isDragging) dragCtl.cancel();` —— `DragController.drop()`
+     * 在**整个 client 里零调用**,于是「拿起 → 悬停 → 放下」永远走不到第三态:
+     * 拖拽只剩一个高亮框,背包里什么都搬不动,而 `drop()` 的返回结构
+     * `{fromSlot,toSlot,itemId,count}`(唯一的"成交"凭证)没有任何读者。
+     *
+     * 现在:悬停在某一格 ⇒ **成交**(`drop` 返回 from/to);悬停在自身或面板外
+     * ⇒ `drop` 内部按"放回原处"取消(`fromSlot === slot` 分支)。
+     * ⚠ 悬停为 `-1`(面板外/空白)时**不能**调 `drop(-1)`:它会返回一个
+     *   `toSlot = -1` 的"成交",让上层把一个物品搬到不存在的格子里。
+     */
+    if (dragCtl.isDragging) {
+      const hover = dragCtl.hover;
+      const moved = hover >= 0 ? dragCtl.drop(hover) : null;
+      if (moved !== null) {
+        /* 成交凭证进 `#hint` 与自检口径:玩家能看见,脚本能读到 */
+        lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格(${moved.itemId} ×${moved.count})`;
+        clickSound();
+      } else {
+        dragCtl.cancel();
+      }
+    }
   };
 
-  /* ── 键盘:只剩面板/画架/Boss 快捷键 ──
+  /* ── 键盘:面板 / 画架 / Boss / **缩放** / **背包搜索** ──
    *
    * ★ WS-FND-23:这里**曾经**还维护一个 `keys` 集合,给渲染循环读去做相机平移。
    *   那条路已删(相机现在跟权威位置走,见 `net/camera_follow.ts`),
    *   `keys` 于是变成"只写不读"的死状态 ⇒ 一并删掉,不留一个看起来还在用的变量。
    *   WASD 的去向完全在 `main.ts` 的输入链路里(`InputSource` → `predictor` → 上行)。
    * ⚠ `pan` / `dragCtl` 已在上面的 UI 运行时块中声明(那里要先用)——
-   * 这里**不要**再声明一次,否则是重复定义。 */
+   * 这里**不要**再声明一次,否则是重复定义。
+   *
+   * ★ 第六轮审计 P2:
+   *   · `isoCam.zoom` 此前**只有读点没有写点** ⇒ `ZOOM_LEVELS` 的 6 档缩放
+   *     在生产里完全不存在(按什么都没反应)。现在 `[` / `]` 走纯函数
+   *     `stepZoom` → 写 `isoCam.zoom` → `syncCamera()`(正交半宽 = 视口/2/pixelScale,
+   *     见 `assembly_math.orthoHalfExtents`,所以缩放是**真的**改变视野,不是改个数字)。
+   *   · `invQuery` 此前恒 `''` ⇒ 背包搜索不可达。现在 `/` 进出搜索态。
+   */
   const onKeyDown = (e: KeyboardEvent): void => {
+    /* ── 搜索态:先吃掉输入,再轮到快捷键(否则打 "i" 会开背包而不是搜索)── */
+    if (searchMode) {
+      onSearchKey(e);
+      return;
+    }
     /* 面板快捷键 —— **走 state_machine 的合法迁移**,不是自己存字符串。
      * 这里也是 `state_machine` 的最直接接入点:按 I 打开背包,再按 I 关闭。 */
     switch (e.key.toLowerCase()) {
@@ -1175,10 +1343,27 @@ export function boot(container: HTMLElement): BootHandle {
       case 'r': setPanel(UiPanel.RECIPE_TREE); break;
       case 'e': setPanel(UiPanel.PIXEL_EASEL); break;
       case 'p': setPanel(UiPanel.PITCH_EDITOR); break;
+      /* ★ 6 档缩放:`[` 缩小 / `]` 放大。两个键都只调 `stepZoom`(端点不越界),
+         然后重建相机 —— 只写 `isoCam.zoom` 而不 `syncCamera()` 的话,
+         画面不会变(而数字"看起来对了")。 */
+      case '[':
+      case ']': {
+        const next = stepZoom(isoCam, e.key === ']' ? 1 : -1);
+        isoCam.zoom = next.zoom;
+        syncCamera();
+        clickSound();
+        break;
+      }
+      /* `/` 进搜索态(背包/配方面板时才有效 —— 那份 view 才有 query 语义) */
+      case '/':
+        if (uiFsm.activePanel === 'INVENTORY' || uiFsm.activePanel === 'RECIPE_TREE') {
+          searchMode = true;
+          e.preventDefault();
+        }
+        break;
       case 'b':
-        /* Boss 召唤/遣返 —— 用来验证 boss_hud 真的会出现/消失 */
+        /* demo Boss 召唤/遣返 —— 只影响**没有权威 boss**时的演示血条 */
         bossActive = !bossActive;
-        if (bossActive) bossHp = boss ? boss.baseHp : 0;
         clickSound();
         break;
       /* 画架工具键(仅画架打开时有效) */
@@ -1189,6 +1374,31 @@ export function boot(container: HTMLElement): BootHandle {
       case 'escape': if (uiFsm.state !== 'CLOSED') uiFsm.transition('CLOSED', 'escape'); break;
       default: break;
     }
+  };
+  /**
+   * 搜索态下的按键 —— **唯一**能写 `invQuery` 的地方。
+   *
+   * 出口三条:Enter(收下并退出)/ Escape(清空并退出)/ Backspace(退格)。
+   * 其余**单字符**键追加到查询串;多字符键(Shift/Control/Arrow…)直接忽略 ——
+   * 否则 `e.key === 'Shift'` 会被拼进查询串,再把整个背包过滤成空。
+   *
+   * ⚠️ 必须在**快捷键之前**拦(见 `onKeyDown` 的第一支):否则打 `i` 会开背包、
+   *   打 `b` 会召唤 boss,搜索框永远只能搜到不含这些字母的物品名。
+   */
+  const onSearchKey = (e: KeyboardEvent): void => {
+    e.preventDefault();
+    if (e.key === 'Enter') { searchMode = false; return; }
+    if (e.key === 'Escape') { searchMode = false; invQuery = ''; invPage = 0; refreshInventory(); return; }
+    if (e.key === 'Backspace') {
+      invQuery = invQuery.slice(0, -1);
+      invPage = 0;
+      refreshInventory();
+      return;
+    }
+    if (e.key.length !== 1) return; /* Shift / Arrow / F1 … 不是字符 */
+    invQuery += e.key;
+    invPage = 0;
+    refreshInventory();
   };
   /* ⚠ 没有 `keyup` 监听:相机不再由按键驱动(WS-FND-23)⇒ 不需要"记着哪些键还按着" */
   window.addEventListener('keydown', onKeyDown);
@@ -1448,10 +1658,20 @@ export function boot(container: HTMLElement): BootHandle {
     updateRoof(dt / 1000);
     /* 把算出来的 alpha 真的喂给材质 —— 否则「淡出」只是内存里的一个数 */
     (roofMesh.material as THREE.MeshLambertMaterial).opacity = roofOpacity();
-    /* 3. boss_hud:残影条缓慢回落 + 血量按时间缓慢下降(让血条可见地变化) */
-    if (bossActive && boss) {
-      bossGhost = Math.max(bossHp / boss.baseHp, bossGhost - (dt / 1000) * 0.06);
-      bossHp = Math.max(boss.baseHp * 0.18, bossHp - (dt / 1000) * boss.baseHp * 0.035);
+    /* 3. boss_hud:残影条按**权威**比例指数回落 —— 血量本身**不在这里改**
+     *
+     * 修前这里是两行本地伪造:
+     * ```
+     * bossGhost = Math.max(bossHp / boss.baseHp, bossGhost - dt/1000*0.06);
+     * bossHp = Math.max(boss.baseHp*0.18, bossHp - dt/1000*baseHp*0.035);
+     * ```
+     * 血条因此自己慢慢往下走,与服务端 boss 的真实血量毫无关系(而且**永远**
+     * 到不了 18% 以下 —— 看起来像"打不动")。现在 `bossHp` 这个名字已删除:
+     * 血量每帧从 `bossView()` 读,这里只让**残影**(刚掉的那截血)平滑收拢。
+     */
+    {
+      const bv = bossView();
+      bossGhost = decayGhost(bossGhost, bv === null ? 0 : bv.ratio, dt / 1000);
     }
 
     /* ── ★ WS-FND-89:地形顶点色材质的矩阵上传 ──
@@ -1469,6 +1689,10 @@ export function boot(container: HTMLElement): BootHandle {
     st.telegraphRing = tg.outer;
     st.telegraphInner = tg.inner;
     ui.draw(st);
+    /* ── `#hint`:底部那行提示的**唯一**写点(缩放档位/搜索串/拖拽成交/派对比分)──
+       放这里而不是在事件回调里:`#hint` 的内容是**状态的函数**(缩放、查询串、
+       最近成交),散在回调里迟早有一条路径忘写 —— 那正是它此前"永不更新"的成因。 */
+    paintHint();
 
     frames += 1;
     acc += dt;
@@ -1530,6 +1754,15 @@ export function boot(container: HTMLElement): BootHandle {
       cameraFocus: { x: pan.x, y: pan.y },
       cameraTarget: cameraTargetFor(authoritySeen ? { x: playerGx, y: playerGy } : null, CAMERA_OPTS),
       cameraLagCells: Math.round(Math.hypot(playerGx - pan.x, playerGy - pan.y) * 1000) / 1000,
+      /* ── ★ 第六轮审计 P2:缩放档位自检口径 ──
+       * `isoCam.zoom` 修前**只有读点没有写点** ⇒ `ZOOM_LEVELS` 的 6 档在生产里
+       * 根本不存在。三个字段一起读才分得清两种坏法:
+       *   `zoom` 变了而 `zoomPixels` 没变 ⇒ 只写了数字,没重建相机(画面不动);
+       *   `zoomLevels` ≠ 6 ⇒ 档位表被改了(判据会红)。 */
+      zoom: isoCam.zoom,
+      zoomLevels: ZOOM_LEVELS.length,
+      zoomPixels: Math.round(isoCam.scale * isoCam.zoom * 1000) / 1000,
+      hintText: lastHint,
       /* ── ★ WS-FND-48 高度轴(`z`)自检口径 ──
        *
        * 让「z 真的被用起来了」**可被读出来**,而不是靠看图说"看着抬起来了":
@@ -1648,6 +1881,22 @@ export function boot(container: HTMLElement): BootHandle {
           buckets: invView.buckets.length,
           activeCategory: invCategory,
           filledRatio: Math.round(usedSlotRatio(invView.visibleCount) * 1000) / 1000,
+          /* ★ 第六轮审计 P3:搜索与拖拽成交都必须是**读数**。
+             `invQuery` 修前恒 `''`(没有任何键能写它)⇒ 搜索不可达;
+             `lastMove` 修前不存在(`drop()` 零调用)⇒ "拖拽能不能搬东西"读不出来。 */
+          query: invQuery,
+          searchMode,
+          lastMove,
+          /* `UiOverlay.invLayout` 的读点:命中测试与绘制共用同一份布局,这里把它的
+             实际几何报出来(自检可据此判断"格子是不是按布局画的")。 */
+          layout: {
+            cols: ui.invLayout.cols,
+            rows: ui.invLayout.rows,
+            cell: ui.invLayout.cell,
+            pageSlots: ui.invLayout.cols * ui.invLayout.rows,
+          },
+          /* `UiOverlay.hasAtlas`:图集真的挂上去了吗(没有时格子画的是色块占位) */
+          atlasReady: ui.hasAtlas,
         },
         /* recipe_tree:节点数/叶子数/缺料提示来自 buildRecipeTree + checkCraft */
         recipe: recipeTree
@@ -1661,29 +1910,63 @@ export function boot(container: HTMLElement): BootHandle {
             craftable: recipeNote === '',
           }
           : null,
-        /* boss_hud:血条比例与阶段名/预警圈顶点数来自 layoutHpBar + buildTelegraph */
-        bossHud: boss && bossActive
-          ? (() => {
-            const L = layoutHpBar(boss.baseHp, bossHp, window.innerWidth, boss.phases);
-            const tg = telegraphGeometry();
-            return {
-              name: boss.name,
-              hp: Math.round(bossHp),
-              baseHp: boss.baseHp,
-              ratio: Math.round(L.ratio * 1000) / 1000,
-              ticks: L.ticks.length,
-              barWidth: L.width,
-              /* 阶段名取自 layoutHpBar(权威),不在绑定层重算 */
-              phaseName: L.phaseName,
-              phaseIndex: L.phaseIndex,
-              /* 环:外圈 + 内圈顶点数都要 > 0,否则退化成实心盘 */
-              telegraphOuter: tg.outer.length,
-              telegraphInner: tg.inner.length,
-              telegraphVertices: tg.vertices,
-              ringOnScreen: tg.outer.some((p) => p.x > 0 && p.x < window.innerWidth && p.y > 0 && p.y < window.innerHeight),
-            };
-          })()
-          : null,
+        /* boss_hud:血条/阶段/预警几何**全部**来自权威快照(`bossHudFrom`);
+         * `layoutHpBar` 只把那份视图排成条(`layoutHpBar(baseHp, hp, w, phases)`)。
+         * ★ 第六轮审计 P1:修前这里的 `hp` 是本地伪造值 —— 自检脚本读到的
+         * "血条比例"与房间真实血量无关,于是「血条没接上」在自检口径里也看不出来。 */
+        bossHud: (() => {
+          const bv = bossView();
+          if (bv === null) return null;
+          const L = layoutHpBar(bv.baseHp, bv.hp, window.innerWidth, bv.phases);
+          const tg = telegraphGeometry();
+          return {
+            id: bv.id,
+            bossId: bv.bossId,
+            name: bv.name,
+            hp: Math.round(bv.hp),
+            baseHp: bv.baseHp,
+            ratio: Math.round(bv.ratio * 1000) / 1000,
+            ticks: L.ticks.length,
+            barWidth: L.width,
+            /* 阶段名/索引来自**线上** boss 实体(不是按血条刻度重算) */
+            phaseName: bv.phaseName,
+            phaseIndex: bv.phaseIndex,
+            /* 预警几何来自线上 `telegraphShape/X/Y/R` 的映射结果(`null` = 无预警) */
+            telegraphShape: bv.telegraph === null ? null : bv.telegraph.shape,
+            telegraphRadius: bv.telegraph === null ? 0 : bv.telegraph.radius,
+            /* 环:外圈 + 内圈顶点数都要 > 0,否则退化成实心盘 */
+            telegraphOuter: tg.outer.length,
+            telegraphInner: tg.inner.length,
+            telegraphVertices: tg.vertices,
+            ringOnScreen: tg.outer.some((p) => p.x > 0 && p.x < window.innerWidth && p.y > 0 && p.y < window.innerHeight),
+          };
+        })(),
+        /* party_hud:派对模式 / 剩余秒数 / 双方比分 —— 四个 `meta` 字段的**读者**。
+         * ★ 第六轮审计 P1:修前 `client/src` 里这四个字段命中 0 ⇒ 派对/比分永不上屏。 */
+        party: (() => {
+          const p: PartyHudView = partyHudOf(authority.state.meta);
+          return {
+            mode: p.mode,
+            modeName: p.modeName,
+            active: p.active,
+            timer: Math.round(p.timer * 10) / 10,
+            scoreA: p.scoreA,
+            scoreB: p.scoreB,
+            text: p.text,
+          };
+        })(),
+        /* 接线台账(生产读点):哪些装配函数**仍未接**、每条的原因在
+         * `client/src/wiring_ledger.ts`。`ok === false` 表示台账自己前后矛盾
+         * (比如把还没接的东西标成 wired)—— 那时自检一眼可见。 */
+        ledger: (() => {
+          const v = validateLedger();
+          return {
+            entries: WIRING_LEDGER.length,
+            blocked: WIRING_LEDGER.filter((e) => e.status === 'blocked').map((e) => e.symbol),
+            ok: v.ok,
+            errors: v.errors.slice(0, 3),
+          };
+        })(),
         /* audio:唤醒状态与已播放音符数 */
         audio: {
           awake: audioOut.awake,

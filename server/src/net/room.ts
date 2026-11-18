@@ -58,6 +58,10 @@ import {
   type RoomState,
 } from './schema.ts';
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
+import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
+/* ★ 第六轮:`meta.partyTimer/scoreA/scoreB` 的**数据源**在本房间的派对赛局记录里
+   (`START_PARTY` 写的那份,单例模块)。只读两个导出,不碰它的写口。 */
+import { PartyPhase, partyStateOf } from './actions/start_party.ts';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { lookupActionHandler } from './actions/action_table.ts';
@@ -82,6 +86,16 @@ export const EVICT_MS = 24 * 60 * 60 * 1000;
 export const HEARTBEAT_TIMEOUT_MS = 5_000;
 /** 每帧最多处理的动作条数(防止单帧被灌爆)。 */
 export const MAX_ACTIONS_PER_TICK = 64;
+
+/**
+ * `meta.partyTimer` 的上界:24 小时。
+ *
+ * 为什么要有:`partyTimer` 在线上是 **POS 类型**(i32 × 1024),而它载的是**秒数**。
+ * 超长的值(时钟回拨 / 模式表被人改成天文数字)会让这个字段写出一个编码器
+ * 只能按 i32 截断的数 —— 客户端读回一个**负数剩余时间**,而那不报错。
+ * 取 24h:四种模式最长 180s,留出的余量已是三个数量级,不会卡住真实值。
+ */
+export const MAX_PARTY_TIMER_SEC = 24 * 60 * 60;
 
 /**
  * 打盹超时:30 分钟。
@@ -962,6 +976,20 @@ export interface WorldSaveHost {
    * ⚠️ 类型是 `number`(U16),**不是**契约里写的 `string` —— 见上表。
    */
   weaponOf?(playerId: string): number | undefined;
+  /**
+   * 玩家的**派对队伍**(435 复活旗是唯一来源)。没有队伍 / 世界没有派对 ⇒ `null`。
+   *
+   * ## 为什么房间需要它(第六轮 P1:`meta.scoreA/scoreB`)
+   * `state.meta.scoreA` / `scoreB` 是**队伍口径**的两个比分,而房间手里的派对账
+   * (`actions/start_party.ts` 的 `PartySnapshot.scores`)是**按玩家 id** 的。
+   * 两者之间缺的正是「这个人在哪一队」—— 那是世界的权威事实(`partyTeams`,
+   * 由 `WorldSim.scanPartyTeams` 从 435 旗扫出来),房间不自己猜。
+   *
+   * 可选(与 `levelOf?` 同一取舍):老世界源没有这个读口时,比分如实写 0,
+   * 不按「加入顺序」编一个队伍 —— 编出来的表现是「比分显示在别人头上」,
+   * 不报错、不影响推进,只把名次算错。
+   */
+  partyTeamOf?(playerId: string): string | null;
   /* ⚠️ 此处**刻意没有** `inventoryTotalOf(): {used, cap}` —— 契约 §3.1 列了它,
      但实测它在本仓是**三无**:零实现(WorldSim 没有)、零消费者(step/applyInventory
      都不读)、零断言引用。而它给的又是**总量**,与 W5 的裁定
@@ -2078,9 +2106,76 @@ export class RoomRuntime {
        `get partyMode()` 用同一张表还原)。修前这里还并写 `this.partyMode = mode`,
        于是同一事实有两份状态、其中一份没有生产读者(见 partyMode 的 docblock)。 */
     this.state.meta.partyMode = Object.values(PartyMode).indexOf(mode);
+    /* ★ 第六轮:选完模式**立刻**把 HUD 三字段对齐一次(不等下一帧)——
+       否则 `SET_PARTY_MODE` 与「下一帧 step」之间,客户端会看到「已选模式但
+       计时/比分还是全 0」的一帧。没有赛局记录时 `syncPartyHud` 如实写 0。 */
+    this.syncPartyHud();
     this.touch(this.clock.nowMs());
     if (this.db) setPartyMode(this.db, this.id, mode, this.clock.nowMs());
     return { ok: true };
+  }
+
+  /**
+   * 派对 HUD 的**唯一写口**:`state.meta.partyTimer` / `scoreA` / `scoreB`。
+   *
+   * ## 为什么需要它(第六轮 P1:「有字段、无写点」)
+   * `shared/types/wire.ts` 的 `ROOM_FIELD_TABLE` bit 2..4 声明了这三个字段,
+   * 客户端 `client/src/ui/party_hud.ts` 也在读(`partyHudOf`,经
+   * `three/ui_binding.ts` 画到 HUD 上)—— 但**生产侧一个写点都没有**:
+   * 实测它们只出现在 `schema.ts` / `schema.colyseus.ts` 的默认值里。
+   * ⇒ 表现是「派对在跑,客户端恒显示 剩余 0s / 红 0 : 0 蓝」,而这**不报错**。
+   *
+   * ## 两个数字各自的**已有**权威(不新造第三份状态)
+   * ```
+   * 计时:`actions/start_party.ts` 的房间赛局记录 `startedAtMs` + 模式总时长
+   *       (时长取 `shared/constants/bosses.ts::PARTY_MODES` —— `party/modes.ts`
+   *        建运行时用的也是这张表,故两边同源)
+   * 比分:同一份记录的 `scores`(按玩家 id),队伍归属问世界 `partyTeamOf`
+   * ```
+   * ⚠️ 房间**不**自己跑一份对局时钟:那是第二份真值,两份迟早不同步。
+   *
+   * ## 四个分支都**如实写 0**(不是缺失静默)
+   * 1 房间没有赛局记录(`START_PARTY` 从没开过)⇒ 三个字段全 0;
+   * 2 赛局已 `SETTLED` ⇒ 剩余秒数归 0(比分保留:名次已定格,清掉会让 HUD 闪成 0:0);
+   * 3 世界没有 `partyTeamOf`(老宿主)⇒ 分不出红/蓝 ⇒ 比分 0,不按加入顺序编;
+   * 4 模式不在 `PARTY_MODES`(契约外取值)⇒ 总时长 0 ⇒ 剩余 0。
+   *
+   * ## 幂等与代价
+   * 只写**值有变化**的字段(与 `syncLevelProjections` 同一取舍):20Hz 每帧写一遍值
+   * 本身不贵,但逐帧把同一个值写回快照会让差量编码器看见「每帧都变」——
+   * 那是真的多余。故三个字段各自比较后赋值。
+   */
+  private syncPartyHud(): void {
+    const snap = partyStateOf(this.id);
+    let remainSec = 0;
+    let scoreA = 0;
+    let scoreB = 0;
+    if (snap !== null) {
+      const cfg = PARTY_MODES.find((m) => m.key === snap.mode);
+      const totalSec = cfg === undefined ? 0 : cfg.buildSec + cfg.raceSec;
+      if (snap.state === PartyPhase.RUNNING) {
+        const elapsedSec = Math.max(0, (this.clock.nowMs() - snap.startedAtMs) / 1000);
+        remainSec = Math.max(0, Math.round(totalSec - elapsedSec));
+      }
+      /* 队伍的权威在世界侧(435 旗)。没有这个读口 ⇒ 比分 0,不猜。 */
+      const host = this.worldSaveHost;
+      const teamOf = host === null ? undefined : host.partyTeamOf;
+      if (teamOf !== undefined) {
+        for (const [userId, score] of snap.scores) {
+          const team = teamOf.call(host, userId);
+          if (team === 'RED') scoreA += score;
+          else if (team === 'BLUE') scoreB += score;
+        }
+      }
+    }
+    /* `partyTimer` 是 POS(i32×1024)载秒数、`scoreA/B` 是 U16 ⇒ 逐字段夹到值域内:
+       负剩余(时钟回拨)与溢出都会让编码器写出垃圾,而那是静默的。 */
+    const timer = Math.min(MAX_PARTY_TIMER_SEC, Math.max(0, remainSec));
+    if (this.state.meta.partyTimer !== timer) this.state.meta.partyTimer = timer;
+    const a = Math.min(65535, Math.max(0, Math.round(scoreA)));
+    if (this.state.meta.scoreA !== a) this.state.meta.scoreA = a;
+    const b = Math.min(65535, Math.max(0, Math.round(scoreB)));
+    if (this.state.meta.scoreB !== b) this.state.meta.scoreB = b;
   }
 
   /* ── 4.4 动作分派(RoomAction 的**执行层**)── */
@@ -2594,6 +2689,10 @@ export class RoomRuntime {
   step(prevSnapshot: RoomState | null = null): Uint8Array {
     if (this.status !== RoomStatus.OPEN) return new Uint8Array(0);
     this.state.meta.tick += 1;
+    /* ★ 第六轮:派对 HUD 的三个字段与 `meta.tick` **同一个写点**(每帧一次)——
+       放在这里而不是 `worldSaveHost.advance()` 里,是因为它读的两份事实
+       (房间赛局记录 / 世界队伍)在**任何**宿主下都存在,而 `advance` 是可选成员。 */
+    this.syncPartyHud();
     this.ac.tick(this.state.meta.tick);
 
     /* ── 推进世界(task-59:驱动缺失)──

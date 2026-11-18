@@ -6,16 +6,21 @@
  * 本轮把那条欠账里**属于动作层**的两件补上:宠物归属容器 + 三个子动作。
  * 只改本文件 —— `action_table.ts` / `room.ts` / `world_sim.ts` / `mobs/**` 一个字没动。
  *
- * ## 分支口径:一个动作、三个子操作,由 `payload.op` 选
+ * ## 分支口径:一个动作、四个子操作,由 `payload.op` 选
  *
- * `RoomAction` 只有一个 `BREED_TAME`(22 个动作里没有 `FEED_PET` / `TAME_PET` /
- * `BREED`),所以三个子操作只能是**同一动作的三种 payload**:
+ * `RoomAction` 只有一个 `BREED_TAME`(动作表里没有 `FEED_PET` / `TAME_PET` /
+ * `BREED` / `SEND_TO_RANCH`),所以子操作只能是**同一动作的几种 payload**:
  *
  * ```ts
  * { op: 'FEED',  petId, itemId, mobId? }   // 投喂:扣 1 件、好感 +1
  * { op: 'TAME',  petId }                   // 驯服:好感达标 + 无主 ⇒ 记主人
  * { op: 'BREED', petId, mateId }           // 繁殖:两只都归自己且都达标 ⇒ 记一条记录
+ * { op: 'RANCH', petId }                   // ★ WS-FND-119 送进牧场 ⇒ host.setRanchPets
  * ```
+ *
+ * ★ `RANCH` 是三个「喂料口」之一:修前 `WorldSim.setRanchPets` 在 `server/**` 内
+ *   **零调用**(唯一调用方是 `tests/**`)⇒ 牧场日结每慢帧空跑而校验全绿。
+ *   判定在 `systems/intake.ts`(`addPetToRanch`),世界写入仍是宿主的那个方法。
  *
  * `op` / `petId` / `mobId` / `mateId` **不在** `ActionPayload`(`room.ts:828-853`)里 ——
  * 那条接口是别的动作的字段表;本模块的键照 `craft.ts:63` 的先例**局部**收窄读取
@@ -135,6 +140,8 @@
  */
 import { tameableMobs } from '../../../../shared/constants/mobs.ts';
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
+/* ★ WS-FND-119:圈养名单的判定在 systems 层(纯函数);本文件只把结果交给宿主。 */
+import { addPetToRanch, roomSystemsPortOf } from '../../systems/intake.ts';
 import { ownedItemCount } from './item_source.ts';
 import type { ActionOutcome, ActionPayload } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
@@ -147,11 +154,19 @@ export const AFFECTION_REQUIRED = 3;
 /** 每个房间保留的繁殖记录条数上限(超出丢最旧的)。 */
 export const MAX_BREED_RECORDS = 64;
 
-/** 三个子操作。用 `as const` 对象(本仓禁 `enum`)。 */
+/** 四个子操作。用 `as const` 对象(本仓禁 `enum`)。 */
 export const TameOp = {
   FEED: 'FEED',
   TAME: 'TAME',
   BREED: 'BREED',
+  /**
+   * ★ WS-FND-119:送进牧场(第七轮补的**第一个**真实入口)。
+   *
+   * 修前实测:`WorldSim.setRanchPets` 在 `server/**` 内**零调用**(唯一调用方是
+   * `tests/**`)⇒ 生产里 `ranchPets` 恒空 ⇒ 牧场日结每慢帧空跑而校验全绿。
+   * 报文只多用两个**契约里已有**的键(`op` + `petId`),不新增协议字段。
+   */
+  RANCH: 'RANCH',
 } as const;
 export type TameOp = (typeof TameOp)[keyof typeof TameOp];
 
@@ -362,6 +377,62 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   const pets = roomPetsOf(roomId);
   const pet = pets.get(petId);
 
+  /* ── 2b ★ WS-FND-119「送进牧场」:写 `roomSystemsState.ranchPets`(生产里的**唯一**入口) ──
+   *
+   * 修前实测:`WorldSim.setRanchPets` 在 `server/**` 内**零调用**,唯一调用方是
+   * `tests/**` ⇒ 生产里 `ranchPets` 恒空 ⇒ `settleRanchIfDayChanged` 每慢帧**空跑**
+   * (牧场没有产出、槽里有没有饲料都一样),而全部校验是绿的。
+   * ⇒ 本分支就是那一口的真实路径:判定在 `systems/intake.ts`(`addPetToRanch`),
+   *   世界写入仍是宿主的 `setRanchPets`(本文件不 import 模拟层)。
+   *
+   * 前置(任何一条不过 ⇒ 零副作用,名单一位不动):
+   *   · 有记录、**主人是本人**、好感达标(与驯服共用 `AFFECTION_REQUIRED`);
+   *   · 物种必须进得了牧场(手册 529 只写云朵绵羊与水豚 ⇒ `ranch.ts` 的登记表说了算);
+   *   · 宿主必须有圈养名单的读 + 写口(缺 ⇒ `NOT_IMPLEMENTED`,不假装送成了)。
+   *
+   * 亲和度换算只用**既有常量**:`affection / AFFECTION_REQUIRED` 钳到 0..1
+   * (达标即 1.0 ≥ `RANCH_AFFINITY_MIN`,未达标的分支上面已经拒掉)—— 不新造阈值。
+   */
+  if (op === TameOp.RANCH) {
+    if (pet === undefined) {
+      return { ok: false, kind: 'INVALID', reason: `宠物 ${petId} 没有记录 ⇒ 先投喂(FEED)、再驯服(TAME)` };
+    }
+    if (pet.ownerId !== ctx.actorId) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `宠物 ${petId} 的主人不是 ${ctx.actorId}(实为 ${pet.ownerId ?? '无主'})⇒ 不能送别人的宠物进牧场`,
+      };
+    }
+    if (pet.affection < AFFECTION_REQUIRED) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `好感 ${pet.affection}/${AFFECTION_REQUIRED} 未达标 ⇒ 还没养熟,不进牧场`,
+      };
+    }
+    const port = roomSystemsPortOf(ctx.host);
+    if (port === null
+      || typeof port.setRanchPets !== 'function'
+      || typeof port.ranchPets !== 'function') {
+      return {
+        ok: false, kind: 'NOT_IMPLEMENTED',
+        reason: '宿主没有圈养名单写口(`setRanchPets` / `ranchPets`)⇒ 没有牧场可送(零副作用)',
+      };
+    }
+    const affinity = Math.min(1, Math.max(0, pet.affection / AFFECTION_REQUIRED));
+    const merged = addPetToRanch(port.ranchPets(), { petId, speciesId: pet.mobId, affinity });
+    if (!merged.ok) {
+      return { ok: false, kind: 'INVALID', reason: `送不进牧场:${merged.reason}` };
+    }
+    port.setRanchPets(merged.next);
+    return {
+      ok: true, kind: 'OK',
+      effect: {
+        op, petId, mobId: pet.mobId, affinity,
+        ranchPets: merged.next.length,
+        note: '已进牧场:慢帧跨日时按 ranch.ts 的「自动进食 + 每日产出」结算(见 world_sim 的 settleRanchIfDayChanged)',
+      },
+    };
+  }
   /* ── 3a 投喂:扣 1 件 → 好感 +1 ── */
   if (op === TameOp.FEED) {
     const itemId = numField(p.itemId);

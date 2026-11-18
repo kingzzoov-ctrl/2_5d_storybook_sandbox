@@ -10,15 +10,24 @@
  * | 5 | 灭火后投料**被拒且料落地**(与 `WS-14` C3 同口径);`relightStationAt` 重新点火后同一批料才进锅 → 出锅 | 同上(单向闩锁) | 源码里 `relightStationAt` 的 `k.fireOut = false` 删掉(此时本条与判据 4 一起红) |
  * | 6 | `removePlayer` 清**玩法表** `afkRuns`(慢帧 `afkTicked` 归零);不调 ⇒ 计数仍 1 | `removePlayer` 只删连接态 `afkPlayers`,`afkRuns`(`dew`/`backgroundedAtSec`/`dozedSec`)从不清 ⇒ 同名重连继承上轮打盹 | `removePlayer` 里的 `this.afkRuns.delete(id);` |
  * | 7 | 结构:`removePlayer` 体内 `this.knockbacks.delete(id);` **只出现 1 次**;`afkRuns.delete` 在册 | 连续两行逐字相同的重复行 | 重复行加回去 |
- * | 8 | 结构 + 行为:生产代码 `.startPartyRun(` **零调用**、`GATHER`/`REACH_TARGET` **零发射点**、`partyPhase()` 恒 `'IDLE'` | 注释声称「三个发射点」而实测只有一个;`startPartyRun` 全仓零调用 ⇒ `partyRun` 恒 null | 台账段被删 / 补一个假发射点 |
+ * | 8 | 结构 + 行为:生产代码 `.startPartyRun(` **有**调用点;`GATHER` / `REACH_TARGET` 各 **≥1** 个真发射点;真调一次 `startPartyRun` 后 `partyPhase()` **不再 IDLE** | 注释声称「三个发射点」而实测只有一个;`startPartyRun` 全仓零调用 ⇒ `partyRun` 恒 null | 摘掉哨台入口 / 摘掉某一个发射点 |
  *
- * ## 台账(判据 8;不冒充接线)
+ * ## 判据 8 的翻面(第六轮:Z3 已接线)
  *
- * 判据 8 钉的是**现状**:世界侧今天只发得出 `CREATURE_KILL`;`GATHER` / `REACH_TARGET`
- * 的补法要动 `net/actions/material.ts`(拾取签名没有 `actorId`)与快帧的目标格扫描,
- * `startPartyRun` 的接线要动 `room.ts` / 装配层 —— 都超出本次「只改 `world_sim.ts`
- * + 新增本文件」的范围。⇒ 该缺口**只登记**(写在 `world_sim.ts` 的 `notePartyEvent` /
- * `partyRun` / `startPartyRun` 三处 docblock 里),判据按「生产零调用 / 零发射点」断言。
+ * 第四轮写这条时,世界侧只发得出 `CREATURE_KILL`,而 `startPartyRun` 全仓零调用 ——
+ * 那时判据是「**零**调用 / **零**发射点 / `partyPhase()` 恒 IDLE」。
+ * 第六轮 Z3 把哨台入口接进 `tickPartyStep`(`world_sim.ts` 的 `stepRefereeDesk`),
+ * 并补上 `REACH_TARGET`(`scanPartyTeams`)与 `GATHER`(`stepRushDelivery`)两个发射点 ⇒
+ * **那条台账不再是事实**,判据必须跟着翻面,否则它只是在守一个已经修好的缺陷。
+ * 翻面后仍要能证伪,故三件事一起断言:
+ * ```
+ * 1 `.startPartyRun(` 在生产代码里有调用点(摘掉哨台入口 ⇒ 红);
+ * 2 `GATHER` / `REACH_TARGET` 各有一个**真发射点**(用 `this.notePartyEvent({ kind: …`
+ *   的**代码形态**计数 —— 只数 `PARTY_SCORE_EVENT.GATHER` 这个词会把注释也算进去,
+ *   本文件 `world_sim.ts:3313` 的台账就写着它);
+ * 3 **行为**:真调一次 `startPartyRun` ⇒ `partyPhase()` 不再是 `'IDLE'`。
+ * ```
+ * ⚠️ 第 3 条才是真守卫:前两条只能证明「代码里出现过」,证明不了「真的能开赛」。
  *
  * ## 断言右侧一律用**字面量**
  *
@@ -301,25 +310,37 @@ test('FND109-7 ★P3 `removePlayer` 体内击退那一行只出现一次(重复�
   ok(body.includes('this.afkPlayers.delete(id);'), '负对照:连接态 afkPlayers 的既有清理不得被顺手删掉(证明这段确实是清除名单)');
 });
 
-test('FND109-8 ★P2 台账:生产零调用 `.startPartyRun(`、零假发射点、`partyPhase` 恒 IDLE', () => {
-  eq(prodCallers, [], '★ 台账现状:生产代码里没有任何 `.startPartyRun(` 调用点 ⇒ partyRun 恒 null');
-  ok(testCallers.some((f) => f.endsWith('WS-11.test.ts')), '负对照:WS-11 里就有真实调用点 ⇒ 上面那条扫描不是恒空');
-  ok(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.CREATURE_KILL') > 0, '正对照:击杀那一个发射点真的在源码里(证明下面两个 0 不是"整个词表都没被用")');
-  eq(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.GATHER'), 0, '★ 不得有假发射点:GATHER 在 world_sim 里没有生产者');
-  eq(occurrenceCount(WORLD_SIM_SRC, 'PARTY_SCORE_EVENT.REACH_TARGET'), 0, '★ 不得有假发射点:REACH_TARGET 同上');
-  /* ★ 第五轮元审计:原来的 `WORLD_SIM_SRC.includes('零调用')` 是**子串**判据 ——
-     注释里出现「零调用」就满足,把台账写成死代码也不红。
-     改成**行为判据**:方法真实存在且能开赛(⇒ 生产的「恒 IDLE」来自**零调用**,
-     不是方法没实现)。 */
+test('FND109-8 ★P1 接线:`.startPartyRun(` 有生产调用点、`GATHER`/`REACH_TARGET` 各有真发射点、开会后相位不再 IDLE', () => {
+  /* ★ 第六轮翻面:Z3 把哨台入口接进了 `tickPartyStep` ⇒ 第四轮那条
+     「生产零调用」的台账**不再是事实**。判据改成钉**接线 + 行为**。 */
+  ok(prodCallers.length >= 1,
+    `★ 生产代码里必须有 \`.startPartyRun(\` 调用点(实测 ${prodCallers.length} 个:${prodCallers.join(', ') || '无'})`);
+  ok(prodCallers.some((f) => f.endsWith('world_sim.ts')),
+    '★ 那个调用点必须来自**世界侧驱动**(`stepRefereeDesk`),不是装配层的旁路');
+  ok(testCallers.some((f) => f.endsWith('WS-11.test.ts')), '负对照:WS-11 里也有调用点 ⇒ 上面的扫描不是恒空');
+
+  /* ★ 判据用**发射形态**而不是词频:`world_sim.ts` 的台账注释里也写着
+     `PARTY_SCORE_EVENT.GATHER`(说明「修前无生产者」),只数那个词会让「假发射点」恒真。 */
+  const emit = (kind: string): number =>
+    occurrenceCount(WORLD_SIM_SRC, `this.notePartyEvent({ kind: PARTY_SCORE_EVENT.${kind}`);
+  eq(emit('CREATURE_KILL'), 1, '正对照:击杀那个发射点在册(证明下面两条不是"整个词表都没被用")');
+  ok(emit('GATHER') >= 1, '★ `GATHER` 有真发射点(急单交付成功、扣掉地面货的那一刻)');
+  ok(emit('REACH_TARGET') >= 1, '★ `REACH_TARGET` 有真发射点(站上 435 旗 / 434 底座 / 410 球门那一慢帧)');
+  /* 负对照:不存在的 kind 必须数到 0 —— 否则上面的 ≥1 只是「这个词出现过」。 */
+  eq(emit('NO_SUCH_EVENT'), 0, '负对照:未登记的 kind ⇒ 0(发射形态计数不会什么都匹配)');
+
+  /* ★ 行为断言:真调一次 `startPartyRun` ⇒ 相位不再是 IDLE。
+     只数调用点证明不了「真能开赛」(方法可以是死桩)。 */
+  eq(phase, 'IDLE', '前置:没读过哨台命令的世界从没开过局');
   const started = simParty.startPartyRun('BRIDGE_CTF', 'ref-1');
   eq(started, true, '★ `startPartyRun` 能开赛(方法真实存在,不是死桩)');
-  ok(simParty.partyPhase() !== 'IDLE', '★ 开了之后 `partyPhase()` 不再是 IDLE ⇒ 生产的「恒 IDLE」是零调用造成的');
+  ok(simParty.partyPhase() !== 'IDLE', `★ 开了之后 \`partyPhase()\` 不再是 IDLE(实测 ${simParty.partyPhase()})`);
   simParty.clearPartyRun();
-  eq(simParty.partyPhase(), 'IDLE', '收尾:清空后回到 IDLE(与生产恒 IDLE 同形态)');
+  eq(simParty.partyPhase(), 'IDLE', '收尾:清空后回到 IDLE(未开局的世界由 `partyPhase()` 如实报 IDLE)');
 
   eq(afkTickedForParty, 1, '正对照:慢帧真的跑过(`tickPartyStep` 每慢帧都执行)');
-  eq(partyTicked, 0, '★ 慢帧跑过但 `partyRun` 恒 null ⇒ `tickPartyMode` 从不推进');
-  eq(phase, 'IDLE', '★ 生产里没开派对 ⇒ `partyPhase()` 恒 IDLE');
+  eq(partyTicked, 0, '负对照:这张图**没有哨台** ⇒ 慢帧不开局 ⇒ `tickPartyMode` 不推进');
+  eq(phase, 'IDLE', '负对照:没有哨台命令 ⇒ `partyPhase()` 仍是 IDLE(不是"世界一 tick 就自动开赛")');
 });
 
 process.exit(report('WS-FND-109') === 0 ? 0 : 1);

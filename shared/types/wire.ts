@@ -232,28 +232,29 @@ export interface WildlifeState {
  *   **是错的、且从未成立**:`git log -S "ANNULUS: 1"` 全仓历史 0 命中,
  *   `boss_hud.ts` 自首个提交 `d10a59f` 起就是字符串。
  *
- * ⇒ 实测的**真实**关系:
+ * ⇒ 实测的**真实**关系(★ 第六轮审计后已更新:下面第 2 条不再成立):
  *   · 生产代码里把本文件的数字赋给 `boss_hud` 的 `shape` 字段的位置:**0 处**
  *     (而 string/number 不相交,真去赋值会被类型检查挡住)
- *   · 客户端读 `telegraphShape` 的位置:**0 处**(客户端预警圈由
- *     `boot.ts` 的本地常量驱动,`shape: 'ANNULUS'` 硬编码)
+ *   · 客户端读 `telegraphShape` 的位置:**1 处**(第六轮起:
+ *     `client/src/ui/boss_hud.ts` 的 `clientTelegraphShapeOf()` —— 线上数字先
+ *     经它映射成渲染几何,再由 `boot.ts` 的 `telegraphGeometry()` 交给
+ *     `buildTelegraph()`;接线前那里是硬编码 `shape: 'ANNULUS'`)
  *   · 对 `TELEGRAPH_SHAPES` 做数字下标的位置:**0 处**
  *
- * ## 但**协议缺口是真的**(不是下标冲突,是**词表覆盖不到**)
+ * ## 那层映射函数长什么样(补在客户端,不改协议)
  *
  * 两侧不是「同一概念的两套编号」,而是**两套不同的形状词汇**:
  *   · 仅 wire  : NONE / SECTOR / RECT / RING
  *   · 仅 client: ANNULUS / CONE / LINE / CROSS
  *   · 两侧同名: CIRCLE —— 语义也相同(都是「实心圆」),这是唯一真同义的一对
  *
- * ⇒ SECTOR 对 CONE、RECT 对 LINE、RING 对 ANNULUS 是**语义对应但拼写不同**,
- *   中间**缺一层显式映射**。这才是接线时要补的东西 —— 一个
- *   `wire 数字 → 客户端 shape 字符串` 的转换函数,而不是「统一编号」。
+ * ⇒ SECTOR 对 CONE、RECT 对 LINE、RING 对 ANNULUS 是**语义对应但拼写不同**。
+ * 这层显式映射就住在客户端:`bossHud.clientTelegraphShapeOf(wire: number)`,
+ * **未知值返回 `null`(不兜底成 CIRCLE)** —— 兜底会让"服务端加了新几何"在
+ * 客户端表现为一个看起来正常的实心圆,而没有任何东西会红。
  *
- * ## 何时必须补
- *
- * 当客户端开始**从协议读** `boss.telegraphShape` 时。此前不补是安全的,
- * 因为客户端目前完全不听这个字段(见上「0 处」)。
+ * ⚠️ 协议里**没有** CROSS(十字)对应的线上值;客户端保留该几何只用于内容层
+ * (手册文案)驱动的那条路径,不指望服务端下发。
  */
 export const TelegraphShape = {
   NONE: 0,

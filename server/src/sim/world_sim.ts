@@ -108,6 +108,9 @@ import {
   foodCombatInput,
   tickFoodBuff,
   mergeFoodBuffs,
+  /* ★ 第六轮 P2:两个零调用符号的接线点(见各自 docblock)。 */
+  cleansePrankBuffs,
+  extinguishStation,
   type FoodBuff,
   type KitchenState,
 } from '../combat/cooking.ts';
@@ -172,6 +175,12 @@ import {
   createRushOrderSession,
   startRushOrder,
   tickRushOrder,
+  /* ★ WS-FND-120:急单的「回执」与「交付」—— 修前 `settleSession` 全仓零引用 ⇒
+     `RUSH_GRADE` 永远传不出去;`submitDelivery` 也只有测试在推。 */
+  settleSession,
+  submitDelivery,
+  RUSH_ORDER_STATE,
+  type RushSessionSettlement,
   /* ★ D-13:把玩家坐标换成 `opts.spraying`(工位种类)的唯一函数 —— 半径口径也在那边。 */
   stationsBeingSprayedBy,
   /* ★ 第三轮:照看(翻炒)半边 —— 与 `stationsBeingSprayedBy` 同坐标口径。
@@ -182,13 +191,62 @@ import {
   type RushOrderSession,
 } from '../coop/rush_order.ts';
 import {
-  createPartyMode,
+  PARTY_MODE_KEY,
   startPartyMode,
   tickPartyMode,
-  PARTY_MODE_KEY,
+  /* ★ WS-FND-120:对局容器 —— 修前世界侧只持 `PartyModeRuntime`,拿不到子运行 ⇒
+     `bridgeCapture` / `crownPickup` 在生产里只剩测试一个调用者。 */
+  createPartyContest,
+  contestMode,
+  contestBroadcaster,
+  tickPartyContest,
+  contestPlaceBoard,
+  contestCapture,
+  contestBuiltOf,
+  contestAssignTeam,
+  contestCrownPickup,
+  contestCrownDrop,
+  contestCrownHolder,
+  contestCrownCooldown,
+  contestCrownWinner,
+  contestBridgeFlagged,
+  contestSettlement,
+  settlePartyRun,
+  BRIDGE_BOARD_ITEM_ID,
+  BRIDGE_TILES_TO_WIN,
+  PARTY_PHASE,
+  type PartyContest,
   type PartyModeRuntime,
+  type PartySettlement,
 } from '../party/modes.ts';
-import { createAfkPlayer, tickAfk, type AfkPlayer } from '../social/afk.ts';
+/* ★ WS-FND-120:动作层闸门(权限 + 前置)。**世界侧不许再判一次** —— 两份判定迟早漂移。 */
+import {
+  gatePartyStart,
+  gatePartyStop,
+  gateBridgePlace,
+  gateBridgeCapture,
+  gateCrownPickup,
+  gateCrownKnock,
+  gateRushStart,
+  gateRushDelivery,
+  deskModeKey,
+  REFEREE_DESK_STOP_MODE,
+} from '../party/actions.ts';
+/* ★ WS-FND-120:急单读口(订单还差什么 / 奖励落哪)。 */
+import {
+  RUSH_DELIVERY_RADIUS,
+  RUSH_ENTRY_ROOM_LEVEL,
+  openOrderLines,
+  rushAcceptsDelivery,
+  rushRewardCellOf,
+} from '../coop/rush_actions.ts';
+import {
+  createAfkPlayer,
+  goBackground,
+  goForeground,
+  tickAfk,
+  type AfkPlayer,
+} from '../social/afk.ts';
 /* ── 副作用 import:必须保留 ──
  *
  * `components.ts` **没有任何导出被本文件调用**,它的作用是**模块加载时**
@@ -242,6 +300,9 @@ import {
   DEFAULT_UNARMED_KNOCKBACK,
   MOB_ELEMENT_BY_ID,
   ARMOR_K,
+  /* ★ 第六轮 P0 [Q] 技能段数 + P1 反伤折算:两条都是既有实现、生产零调用。 */
+  planSkillHits,
+  reflectFrom,
   pvpVerdict,
   targetFromStats,
   type AttackInput as PipelineAttackInput,
@@ -250,6 +311,8 @@ import {
 } from '../combat/damage.ts';
 import {
   combatantStats,
+  /* ★ 第六轮 P0:[Q] 技从武器表取(修前 skillOf 生产 0 调用)。 */
+  skillOf,
   weaponById,
   ARMOR_BY_ID,
   Element,
@@ -263,15 +326,23 @@ import {
   createProgress,
   setLevel,
   settleMobExp,
+  gainExp,
   applyShareResult,
   isTalentUnlocked,
   SHARE_RADIUS,
   type PlayerProgress,
   type ShareResult,
 } from '../combat/progression.ts';
+/* ★ 第六轮:战斗侧「实现了但没接」的**具名台账**。
+   为什么由世界侧 import:它是 `server/src/combat/**` 的接线现状账本,而 `scripts/` 的
+   可达性/孤儿门禁只认**生产**引用 —— 只被测试引用的新模块会被判成「未登记孤儿」。
+   ⚠️ 本模块**不做任何运行时动作**(纯数据 + 纯函数),import 它不会把「未接线」变成「接线」。 */
+import { COMBAT_WIRING_LEDGER, type CombatWiringRow } from '../combat/wiring_ledger.ts';
 import { statsAtLevel } from '../../../shared/types/entities.ts';
 import {
   createDowned,
+  /* ★ 第六轮 P1:幽灵期动作权限的唯一规则(ghostControl.canAttack)。 */
+  ghostControl,
   tickGhostBubble,
   touchRevive,
   flagRevive,
@@ -290,7 +361,7 @@ import {
   isTrapped,
   type LiveBubbleState,
 } from '../combat/live_bubble.ts';
-import { PARTY_SCORE_EVENT } from '../party/scoring.ts';
+import { PARTY_SCORE_EVENT, TEAM_ORDER, drainBroadcasts, makeRng, type TeamKey } from '../party/scoring.ts';
 
 /**
  * 读地面掉落物的物品 ID —— **兼容两种字段名**。
@@ -1061,11 +1132,66 @@ export class WorldSim {
    * ⇒ 故本字段只由 `startPartyRun()` 写入,没开就是 `null`,tick 里直接跳过。
    * 这与 `afkPlayers` 的纪律一致(「只存房间推过来的事实,单写入」)。
    *
-   * ⚠️ ★ 第四轮实测:`startPartyRun()` 本身在全仓**零调用**(只有 `tests/WS-11`
-   * 直接调)⇒ **生产里本字段恒 `null`**、`tickPartyMode` 从不推进、
-   * `partyPhase()` 恒 `'IDLE'`。缺口与补法登记在 `notePartyEvent` 的台账段。
+   * ★ WS-FND-120(第六轮 P1 修复):`startPartyRun()` 现在**有生产调用者**了 ——
+   * `tickPartyStep` 的**哨台入口**每慢帧读 436 `ARENA_REFEREE_DESK` 的
+   * `params.mode`(1..4 开局 / -1 收局)与「此刻站在哨台格上的玩家」,
+   * 过 `party/actions.ts#gatePartyStart` 之后才调它。判据见
+   * `tests/WS-FND-120`(含负对照:没人站哨台 ⇒ 不开局)。
    */
   private partyRun: PartyModeRuntime | null = null;
+
+  /**
+   * ★ WS-FND-120:对局**容器**(相位 + 子运行)。
+   *
+   * `partyRun` 只够推相位;夺旗 / 拾冠 / 掉冠 / 进球都挂在子运行上。
+   * 容器由 `startPartyRun` 与 `partyRun` **同一次写入**建立,`clearPartyRun` 同时清空 ——
+   * 两半绝不允许单独存在(否则世界侧会「相位在跑但动作层没有容器」)。
+   */
+  private partyContest: PartyContest | null = null;
+
+  /**
+   * ★ WS-FND-120:玩家 → 队伍(唯一来源 = 玩家**站上 435 复活旗**那一格时读到的
+   * `params.team`)。抢皇冠的 `crownAssignTeam` 与夺旗的「本队桥板数」都读它。
+   * 没站过任何旗 ⇒ 没有队伍 ⇒ 拾冠/夺旗被动作层闸门拒绝(不是猜一个队)。
+   */
+  private readonly partyTeams = new Map<string, TeamKey>();
+
+  /**
+   * ★ WS-FND-120:`party_gather`(GATHER)与 `party_reach_target`(REACH_TARGET)
+   * 两个**发射点**的去重锁。
+   *
+   * 键 = `玩家:格` 或 `玩家:物品`。它解决的是**电平 ≠ 脉冲**:玩家站在旗格上
+   * 每慢帧都会「触达」一次,不去重就会每 0.5 秒加一次分(不报错,只是分数失真)。
+   * 离开格子 / 交付完成后清键 ⇒ 下一次触达重新计。
+   */
+  private readonly reachLatch = new Set<string>();
+
+  /**
+   * ★ WS-FND-120:哨台命令的**锁存**(键 = `组件ID:mode`)。同一条命令只执行一次 ——
+   * 否则 `params.mode` 不清零时,一局结束后会**在同一帧立刻再开一局**,永远停不下来。
+   */
+  private refereeDeskLatch = '';
+
+  /** 最近一次**真的发生**的派对结算(未结算 ⇒ null)。 */
+  private lastPartySettlement: PartySettlement | null = null;
+
+  /** 慢帧下发到客户端的播报(已从 broadcaster 取出 ⇒ 队列不再积压)。 */
+  lastPartyBroadcasts: { kind: string; text: string; atSec: number }[] = [];
+
+  /** 累计下发播报条数(可观测量:证明 broadcaster 有**消费者**,不是只写不读的队列)。 */
+  partyBroadcastCount = 0;
+
+  /** 最近一次结算发放的奖励合计(证明 rewards 真的落账,不只是躺在对象里)。 */
+  lastPartyRewards: { exp: number; items: number; players: number } = { exp: 0, items: 0, players: 0 };
+
+  /** 累计交付进急单的件数(= `submitDelivery` 被真调用的次数)。 */
+  rushDeliveryCount = 0;
+
+  /** 急单结算回执(`RUSH_GRADE` 从这里出去);未结算 ⇒ null。 */
+  private lastRushSettlement: RushSessionSettlement | null = null;
+
+  /** 打盹入口触发次数(= `setPlayerDozing` 被世界事实驱动的次数)。 */
+  dozeEntryCount = 0;
 
   /**
    * 逻辑时钟。**与 `frameCount` 分离**,理由见 `tickPartyStep` 的注释。
@@ -2313,10 +2439,30 @@ export class WorldSim {
   attackMobAuthorized(
     playerId: string,
     mobId: string,
-    opts: { fromDeg?: number } = {},
+    opts: {
+      fromDeg?: number;
+      /**
+       * ★ [Q] 意图(生产形态):`true` ⇒ 技能从**当前武器**取(`skillOf`)。
+       * 客户端只表达「我按了 Q」,不带任何数值 —— 与 `weaponId` 的自报纪律同源。
+       * ⚠️ `net/**` 还没有这个动作报文(不在本轮写域),见 `combat/wiring_ledger.ts`。
+       */
+      useSkill?: boolean;
+    } = {},
   ): {
     outcome: 'OK' | 'OUT_OF_AOI';
-    hit: { result: PipelineDamageResult; hpLoss: number; events: string[] } | null;
+    /**
+     * 形状与 `attackMob` 的返回**逐字段对齐**(含 `segments` / `totalDamage`)——
+     * 少了它们,[Q] 的多段在回执里就会被读成「1 段」。
+     * ⚠️ `net/room.ts` 的 `WorldSaveHost` 只声明它用到的那三项,那是**子集**,
+     *    与这里不冲突(结构化类型)。
+     */
+    hit: {
+      result: PipelineDamageResult;
+      hpLoss: number;
+      events: string[];
+      segments: number;
+      totalDamage: number;
+    } | null;
     /**
      * 显式拒绝的理由;`null` = 未被拒绝(走到了结算或缺生物)。
      *
@@ -2350,7 +2496,10 @@ export class WorldSim {
      * ⇒ 免伤(`applyHit` 的 `if (v.downed) return base`)与不能治疗
      *   (`heal` 的 `if (v.downed) return 0`)读的**也是**这个字段 ——
      *   四条规则一个真值来源,不新造第二套「是否倒地」。 */
-    if (this.vitals.get(playerId)?.downed === true) {
+    /* ★ 第六轮实测 P1(幽灵期规则两套):本闸**不再自己手判** `downed` ——
+       那套手判与 `revive.ts#ghostControl` 是同一规则的两种表达(后者生产 0 调用)。
+       判定收在 `canActAsPlayer`(读 `ghostControl(...).canAttack`),两条攻击入口共用。 */
+    if (!this.canActAsPlayer(playerId)) {
       return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'DOWNED' };
     }
 
@@ -2401,6 +2550,8 @@ export class WorldSim {
       wearing: this.wearingOf(playerId),
       comboMul: 1.0,
       ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
+      /* ★ [Q]:意图原样转发。技能本身由 attackMob 从**武器**取,不从这里传定义。 */
+      ...(opts.useSkill === true ? { useSkill: true } : {}),
     });
     return { outcome: 'OK', hit, rejected: null };
   }
@@ -2443,7 +2594,9 @@ export class WorldSim {
     if (!this.playerIds.has(attackerId) || !this.playerIds.has(targetId)) {
       return { rejected: 'NOT_A_PLAYER', applied: 0, result: null };
     }
-    if (this.vitals.get(attackerId)?.downed === true || this.vitals.get(targetId)?.downed === true) {
+    /* ★ 第六轮实测 P1(幽灵期规则两套):不再手判 downed,改走 canActAsPlayer
+       (规则来自 revive.ts#ghostControl)。与 attackMobAuthorized 同一条判据。 */
+    if (!this.canActAsPlayer(attackerId) || !this.canActAsPlayer(targetId)) {
       return { rejected: 'DOWNED', applied: 0, result: null };
     }
     /* ★ D3 补:攻击侧也封 **STUNNED / TRAPPED** —— 只封**攻击者**那一侧
@@ -2504,6 +2657,24 @@ export class WorldSim {
         playerId: targetId, attacker: attackerId, damage: out.applied, hp: this.vitals.get(targetId)?.hp ?? 0,
       }, attackerId);
       if (out.downed) this.bus.emit('player_downed', { playerId: targetId, by: attackerId }, attackerId);
+    }
+    /* ★ 第六轮实测 P1(反伤整段丢弃):第 7 步算出的 result.reflectDamage 修前
+       **没有任何生产消费者** ⇒ 728 反伤甲在 PvP 里等于不存在。现在施加回**攻击者**:
+       走 vitals.applyDamage 同一条落账路径(含无敌帧 —— 「反伤是否穿透无敌」是
+       玩法裁决,本仓不擅自发明),并记进 reflectTotalDamage()。
+       判据:tests/WS-FND-118 的 FND118-5(负对照:受击方没穿 728 ⇒ 攻击者 HP 不动)。 */
+    /* ⚠️ 判据是「**这次真的打进去了**」(`out.applied > 0`),不是「公式算出了反伤」:
+       被无敌帧/护盾全额挡下的那一击没有造成承伤,反伤也就无从谈起(与「命中才附加」同口径)。 */
+    if (out.applied > 0 && result.reflectDamage > 0) {
+      const back = this.vitals.applyDamage(attackerId, result.reflectDamage);
+      this.reflectTotal += back.applied;
+      if (back.applied > 0) {
+        this.bus.emit('player_hit', {
+          playerId: attackerId, attacker: targetId, damage: back.applied,
+          hp: this.vitals.get(attackerId)?.hp ?? 0,
+        }, targetId);
+        if (back.downed) this.bus.emit('player_downed', { playerId: attackerId, by: targetId }, targetId);
+      }
     }
     return { rejected: null, applied: out.applied, result };
   }
@@ -2589,8 +2760,21 @@ export class WorldSim {
       level?: number;
       /** 武器 ID;缺省从 wearing 里自动识别。语义同 `wearing`,见上。 */
       weaponId?: number;
-      /** 技能(有则走 SKILL 源,并叠技能倍率)。 */
+      /**
+       * 显式技能(测试夹具)。生产形态见下面的 `useSkill` —— 别再让客户端自报
+       * 一整份 `SkillDef`(CR-14 U1 同族:自带合法数值就能凭空放技能)。
+       */
       skill?: SkillDef | null;
+      /**
+       * ★ **生产形态的 [Q] 意图**:`true` ⇒ 技能从**当前武器**取(`skillOf`)。
+       *
+       * 修前 13 把武器的 `[Q]` 技**整组不可达**(`skillOf` / `planSkillHits` 生产
+       * 0 调用,PvP 那条路还显式写死 `skill: null`)。本开关是那半边的入口:
+       * `attackMobAuthorized` 把它原样转发下来,客户端只表达「我按了 Q」。
+       * ⚠️ 仍缺的一环:网络层没有 `[Q]` 的动作报文(`net/**` 不在本轮写域)⇒
+       *    玩家真按键仍打不出技能,见 `combat/wiring_ledger.ts`。
+       */
+      useSkill?: boolean;
       /** 普攻连段倍率(1.00 / 1.00 / 1.25)。 */
       comboMul?: number;
       /** 覆盖伤害类型(默认由武器推导)。 */
@@ -2598,7 +2782,20 @@ export class WorldSim {
       /** 朝向(度),供生物 AI 的正面/背面判定。 */
       fromDeg?: number;
     } = {},
-  ): { result: PipelineDamageResult; hpLoss: number; events: string[] } | null {
+  ): {
+    /**
+     * **首段**的八步记录(`segments > 1` 时**不是**合计)。
+     * 合计看 `totalDamage`(公式侧)与 `hpLoss`(真实掉血)。
+     */
+    result: PipelineDamageResult;
+    /** 本次攻击**真的掉了多少血**(已扣格挡/晶甲,并按攻击前 HP 钳制)。 */
+    hpLoss: number;
+    events: string[];
+    /** 本次结算的段数(普攻 1;[Q] 技由 `planSkillHits` 决定)。 */
+    segments: number;
+    /** 各段 `finalDamage` 之和(= 公式侧的合计;**不等于** `hpLoss`)。 */
+    totalDamage: number;
+  } | null {
     const rt = this.mobHost.runtimeOf(mobId);
     if (rt === null) return null;
 
@@ -2662,18 +2859,37 @@ export class WorldSim {
        ⚠ 用 `combatRng` 而非 `this.rng` —— 后者与生物 AI 共用,
        拿它取战斗随机会把「玩家攻击次数」变成生物 AI 的隐式输入
        (实测扰动远处生物轨迹,见 `WorldSimOptions.combatRng`)。 */
-    const critRoll = this.combatRng();
-    const dodgeRoll = this.combatRng();
-    const result = computeDamage({
+    /* ★ 等级伤害倍率的**权威值**(`PlayerProgress.dmgMul`)—— 与本次结算等级一致才用。
+       判据是「档案等级 === 结算等级」而不是「档案存在」:两者不一致时(测试注入
+       `opts.level`、存档回填与档案尚未同步)用档案倍率会让 `attacker.level` 与
+       实际乘区打架,那正是两份等级口径。不一致 ⇒ 退回公式的现算式(逐字旧行为)。 */
+    const progress = this.progresses.get(playerId);
+    const damageMul = progress !== undefined && progress.level === level ? progress.dmgMul : undefined;
+
+    /* ★ [Q] 技能路径(第六轮实测 P0:13 把武器的技能此前**整组不可达**)。
+       `opts.skill` = 测试注入的显式技能;`opts.useSkill` = **生产形态**的意图
+       (「按了 Q」)—— 技能从**当前武器**取(`skillOf`),段数与命中区域由
+       `planSkillHits` 给出。技能不另写公式:它仍然走同一条八步管线
+       (`computeDamage` 的第 1/2/3/4/5/8 步都有 `skill` 分支)。
+       ⚠️ 本路径只实现**伤害那一半**:`telegraphSec` / `tickSec` 的**时序**
+          (同帧连发代替逐段调度)、`stunSec` / `freezeSec`、`healHp`、
+          召唤/护盾类 `extras` 仍未接线 —— 见 `combat/wiring_ledger.ts`。 */
+    const skill = opts.skill ?? (opts.useSkill === true ? skillOf(weaponId) : null);
+    const plan = skill === null ? null : planSkillHits(skill);
+    /** 段数 = `planSkillHits` 的结算帧数(例:715 三连散射 = 3,716 箭雨 = 6)。 */
+    const segments = plan === null ? 1 : Math.max(1, plan.ticks.length);
+
+    const rollSegment = (): PipelineDamageResult => computeDamage({
       attacker,
       target,
       weapon,
-      skill: opts.skill ?? null,
+      skill,
       comboMul: opts.comboMul,
-      critRoll,
-      dodgeRoll,
+      critRoll: this.combatRng(),
+      dodgeRoll: this.combatRng(),
       distance: blindMiss ? Number.POSITIVE_INFINITY : distance,
-      source: opts.skill ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
+      source: skill !== null ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
+      ...(damageMul !== undefined ? { damageMul } : {}),
     });
 
     /* 5 落账:公式给出通用伤害,生物 AI 再叠个体特性(格挡/反弹/晶甲)。
@@ -2704,9 +2920,27 @@ export class WorldSim {
      * 注意**这句冗余本身测不住**——注入实验里去掉它,断言全绿完全相同,
      * 属等价变异体,不是断言盲区。 */
     const hpBefore = rt.hp;
-    const ai = this.damageMob(mobId, result.finalDamage, kind, fromDeg);
-    const rawLoss = ai?.hpLoss ?? 0;
-    const hpLoss = Math.max(0, Math.min(rawLoss, hpBefore));
+    /* 首段结算 */
+    const result = rollSegment();
+    let rawLossSum = 0;
+    let totalDamage = result.finalDamage;
+    const events: string[] = [];
+    const aiFirst = this.damageMob(mobId, result.finalDamage, kind, fromDeg);
+    rawLossSum += aiFirst?.hpLoss ?? 0;
+    if (aiFirst !== null) events.push(...aiFirst.events);
+    /* ★ 多段(715 三连 / 716 箭雨 / 722 流沙 / 723 力场):**同帧连发**。
+       目标中途死掉就停 —— 给尸体结算第 2、3 段会把 `hpLoss` 与击杀账算花。
+       每段都是**独立**一次 `computeDamage`(暴击/破盾/击退各自结算),
+       段数只由 `planSkillHits` 决定,不在这里另定段数。 */
+    for (let seg = 1; seg < segments; seg += 1) {
+      if (!rt.alive || rt.hp <= 0) break;
+      const r = rollSegment();
+      totalDamage += r.finalDamage;
+      const ai = this.damageMob(mobId, r.finalDamage, kind, fromDeg);
+      rawLossSum += ai?.hpLoss ?? 0;
+      if (ai !== null) events.push(...ai.events);
+    }
+    const hpLoss = Math.max(0, Math.min(rawLossSum, hpBefore));
 
     /* 6 灼烧 DoT(task-44 接线)—— 命中带 `dot` 的武器则点燃目标。
      *
@@ -2724,7 +2958,10 @@ export class WorldSim {
     if (weapon !== null && weapon.dot !== null && hpLoss > 0 && rt.alive) {
       this.applyDot(mobId, weapon.dot, fromDeg);
     }
-    return { result, hpLoss, events: ai?.events ?? [] };
+    /* ★ `plan` 的另一半产出(命中区域)进事件流:它是 `planSkillHits` 除段数之外
+       唯一可被消费者读到的信息(客户端飘字 / 战斗日志)。 */
+    if (skill !== null && plan !== null) events.push(`skill:${skill.key}:${plan.area}`);
+    return { result, hpLoss, events, segments, totalDamage };
   }
 
   /**
@@ -2734,6 +2971,60 @@ export class WorldSim {
    * 原实现读 `mobPlayers.find(...).wearing`,而 `syncPlayers()` 每帧把该字段
    * 写成 `[]` ⇒ 装备在第二帧起失效。详见 `PlayerProfile` 注释。
    */
+  /**
+   * 「这个玩家现在能不能动手」的**唯一**判据(攻击侧)。
+   *
+   * 第六轮实测 P1(幽灵期规则两套):attackMobAuthorized / attackPlayerAuthorized
+   * 各自手判 vitals.downed,而 revive.ts#ghostControl(规则的具名实现)生产 0 调用。
+   * 现在两条入口共用本方法,两档各自的真值来源写死在下面:
+   * ```
+   * 已有 DownedState(泡泡已建)     → ghostControl(d).canAttack   ← 规则在 revive.ts
+   * 还没有泡泡(刚倒地,慢帧未建)  → vitals.downed              ← 瞬时真值(同一帧置位)
+   * ```
+   * 为什么保留第二档:DownedState 由慢帧(2Hz)建立 ⇒ 只读它会让「HP 已归零」到
+   * 「泡泡建好」之间存在最多 0.5s 的可攻击窗口(见 attackMobAuthorized 闸 0b)
+   * —— 那是「两份判据漂移」的另一头,不是保险。
+   */
+  private canActAsPlayer(playerId: string): boolean {
+    /* ⚠️ 判断**顺序不能反**:`downedStates` 的清账在慢帧(2Hz),复活后最多 0.5s
+       还留着一份 GHOST_BUBBLE 快照 —— 先读它会表现为「刚被救起来却打不出普攻」。
+       所以:没倒地 ⇒ 一律放行;倒地 ⇒ 泡泡已建时规则来自 revive.ts,未建则封手。 */
+    if (this.vitals.get(playerId)?.downed !== true) return true;
+    const d = this.downedStates.get(playerId);
+    return d === undefined ? false : ghostControl(d).canAttack;
+  }
+
+  /** 反伤累计(只增;诊断与判据用,不是玩法状态)。 */
+  private reflectTotal = 0;
+
+  /**
+   * 生产里**真的施加出去**的反伤总量。
+   *
+   * 存在的理由:修前反伤算到第 7 步就被丢,reflectDamage 只有单测读过 ⇒
+   * 「反伤接了没有」在外部**不可观测**。有它之后,WS-FND-118 才能把
+   * 「接了」与「恰好在这次为 0」分开。
+   */
+  reflectTotalDamage(): number {
+    return this.reflectTotal;
+  }
+
+  /**
+   * 战斗侧「实现了但没接」的**台账**(只读)。
+   *
+   * 存在的理由(两个):
+   * ```
+   * 一 门禁:combat/** 里哪些符号接了、哪些没接,必须有一个**机器可判**的出处
+   *    (判据在 tests/WS-FND-118:WIRED 必须真有消费点、UNWIRED 必须真的零读者)。
+   * 二 可达性:账本模块只被测试引用会被孤儿门禁判红 ⇒ 由世界源(战斗的调用方)读它,
+   *    这是**真实**的引用,不是为了让门禁变绿的假调用:它回答的是「本世界跑的这套战斗,
+   *    哪些规则还是空壳」。
+   * ```
+   * ⚠️ 它**不是**玩法状态,也不改变任何结算 —— 只读快照。
+   */
+  combatWiringLedger(): readonly CombatWiringRow[] {
+    return COMBAT_WIRING_LEDGER;
+  }
+
   private wearingOf(playerId: string): readonly number[] {
     /* `?? []` 不是洁癖:档案里 `wearing` 可能是 `undefined`(外部构造),
        直接返回会让调用方在 `[...wearing]` 处抛 `TypeError: wearing is not iterable`。
@@ -3012,10 +3303,15 @@ export class WorldSim {
    *              434 皇冠底座)的"踩到"判定今天不在本层,没有「按玩家坐标扫目标格」
    *              的入口。补法:在快帧里按玩家刚体所在格查 `objIdAt`,命中目标件就发。
    * ```
-   * 同批:`startPartyRun`(`:5991`)在全仓**零调用**(只有 `tests/WS-11` 直接调)⇒
-   * 生产里 `partyRun` 恒 `null`、`tickPartyMode` 从不推进、`partyPhase()` 恒 `'IDLE'`。
-   * ⇒ 两条缺口都**只登记不冒充接线**:它们的补法都落在本文件**之外**
-   *   (`room.ts` / `net/actions/*` 的签名与装配层),而那超出本任务的可改范围。
+   * 同批:`startPartyRun` 在全仓**曾**零调用(只有 `tests/WS-11` 直接调)⇒ 生产里
+   * `partyRun` 恒 `null`、`tickPartyMode` 从不推进、`partyPhase()` 恒 `'IDLE'`。
+   * ★ WS-FND-120 已修:`tickPartyStep` 的**哨台入口**(436 `params.mode` + 站在哨台格上
+   * 的玩家)是 `startPartyRun` 的生产调用者 —— 判据见 `tests/WS-FND-120`。
+   * 同一次修复还补上了 `REACH_TARGET` 与 `GATHER` 两个发射点:
+   * ``` 
+   * REACH_TARGET  玩家**站上** 435 复活旗 / 434 皇冠底座那一格时发一次(`reachLatch` 去重);
+   * GATHER        急单交付成功时发(`stepRushDelivery` 扣掉地面货的那一刻就是「拾取」)。
+   * ```
    * ⚠️ 没接 sink ⇒ 事件被丢弃(与"世界侧不知道"等价),判据按"分数不变"断言。
    */
   notePartyEvent(ev: { kind: string; source?: string }): void {
@@ -4330,8 +4626,17 @@ export class WorldSim {
 
     const food = FOOD_BY_ID.get(itemId);
     if (food !== undefined) {
-      const list = this.foodBuffs.get(actorId) ?? [];
-      list.push(foodBuffFrom(food));
+      /* ★ 第六轮实测 P2:`cleansePrankBuffs`(612 净化饮)此前**生产 0 调用** ——
+         喝一瓶净化饮只会多一条 `{cleanse:true}` 的 buff,身上已有的整蛊 buff
+         一条都不掉(而手册写着「解除一切负面/整蛊状态」)。现在由本分支执行:
+         `flags.cleanse === true` ⇒ 先过 `cleansePrankBuffs` 再挂新 buff。
+         ⚠️ 判据只看**食物自带的 flag**,不看 id:612 的语义在内容表里,
+            在编排层再写一次 `itemId === 612` 就是第二份实现。 */
+      const next = foodBuffFrom(food);
+      const kept = next.flags.cleanse === true
+        ? cleansePrankBuffs(this.foodBuffs.get(actorId) ?? [])
+        : (this.foodBuffs.get(actorId) ?? []);
+      const list = [...kept, next];
       this.foodBuffs.set(actorId, list);
       let healed = 0;
       if (food.instantHealHp > 0) healed = this.vitals.heal(actorId, food.instantHealHp);
@@ -5094,8 +5399,21 @@ export class WorldSim {
     this.logisticsArms.clear();
     this.logisticsDrills.clear();
     this.partyRun = null;
+    this.partyContest = null;
     this.rushRun = null;
     this.rushTicked = 0;
+    /* ★ WS-FND-120:动作层的瞬态(队伍归属 / 哨台锁存 / 结算回执 / 播报下发计数)
+       必须与它对局的运行时一起清 —— 留着上一局的「谁是哪队」会让新一局一开始
+       就有队伍,而那种错误不报错、只错归属。 */
+    this.partyTeams.clear();
+    this.refereeDeskLatch = '';
+    this.lastPartySettlement = null;
+    this.lastPartyBroadcasts = [];
+    this.partyBroadcastCount = 0;
+    this.lastPartyRewards = { exp: 0, items: 0, players: 0 };
+    this.rushDeliveryCount = 0;
+    this.lastRushSettlement = null;
+    this.dozeEntryCount = 0;
     this.lastPartyTick = { partyTicked: 0, afkTicked: 0, afkDew: 0, events: [] };
     /* 瞬态:喷射意图窗口 / 翻炒意图窗口 / 击退窗口 / 倒地 / 活人泡泡 / 料理 buff / DoT /
        厨房锅内状态(含 `fireOut` —— 一份"炉火已浇灭"跨世代留着就是错的)。 */
@@ -5692,6 +6010,26 @@ export class WorldSim {
       if (res.applied > 0) {
         applied.push(res);
         this.hitCount += 1;
+        /* ★ 第六轮实测 P1(反伤整段丢弃):728 反伤甲把承伤折算回**攻击者生物**。
+           修前这条路上一点反伤都没有 —— 玩家穿 728 挨打,怪毫发无损。
+           数值口径与 computeDamage 第 7 步一致(reflectFrom:承伤 × 反伤倍率),
+           施加走 damageMob(生物伤害的唯一收口 ⇒ 反伤也能击杀,击杀照常结算)。
+           ⚠️ 只对**生物**施加:damageMob 对 Boss 返回 null(它们不在 MOB_BY_ID),
+              那是既有边界,不在这里补第二套。
+           判据:tests/WS-FND-118 的 FND118-6(负对照:不穿 728 ⇒ 生物 HP 不动)。 */
+        const reflectMul = combatantStats(
+          this.levelOf(res.playerId), [...this.wearingOf(res.playerId)],
+          foodCombatInput(this.buffsOf(res.playerId)),
+        ).reflectMul;
+        const refl = reflectFrom(reflectMul, res.applied);
+        if (refl.reflectDamage > 0 && this.mobHost.runtimeOf(h.attackerId) !== null) {
+          this.reflectTotal += refl.reflectDamage;
+          /* 反伤的方向 = 玩家 → 生物(供生物 AI 的正面/背面判定)。 */
+          const deg = from !== null && to !== undefined
+            ? (Math.atan2(from.y - to.y, from.x - to.x) * 180) / Math.PI
+            : 0;
+          this.damageMob(h.attackerId, refl.reflectDamage, DamageKind.PHYSICAL, deg);
+        }
         /* ★ D-09(owner,2026-11-16):受击击退 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**。
            裁决给了数值(伤害折算 + 上限 2 格)⇒ 按它接,且**位移仍走 `applyKnockback`**
            (慢帧推 + 搬家窗口),不写速度。
@@ -6094,23 +6432,20 @@ export class WorldSim {
   /* ═══════════════ task-84:WS-11 对局运行时的每帧驱动 ═══════════════ */
 
   /**
-   * 开一局派对模式(**房间侧的入口名**,`createPartyMode` 的持有者只能在这里)。
+   * 开一局派对模式(`createPartyContest` 的持有者只能在这里)。
    *
-   * ## ⚠️ 台账(★ 第四轮实测 P2,如实登记)
+   * ## 生产调用者(★ WS-FND-120 修复第六轮 P1)
    *
-   * 本方法今天在全仓**没有调用点**:`net/actions/*`、`room.ts`、`index.ts` 都没调它,
-   * 只有 `tests/WS-11` 直接调。⇒ **生产里** `partyRun` 恒 `null`、
-   * `tickPartyMode` 从不被推进、`partyPhase()` 恒 `'IDLE'`、赛局播报一条不发。
-   * 修前的 docblock 写的是「这是 `createPartyMode` 在**全仓的第一个生产调用点**」,
-   * 那句与现状不符(把它改成"入口已就绪,等装配层接线"),缺口与补法一并记在
-   * `notePartyEvent` 的台账段(那里还有 `GATHER` / `REACH_TARGET` 两个发射点)。
-   * 补接线要动 `room.ts` 与动作层 = 超出本文件可改范围,故本文件只登记不改口径。
+   * `tickPartyStep` 的**哨台入口**:每慢帧读 436 `ARENA_REFEREE_DESK` 的
+   * `params.mode`(1..4 = 四种模式,`-1` = 收局)与此刻**站在哨台格上**的玩家,
+   * 过 `party/actions.ts#gatePartyStart`(未知模式 / 无裁判 / 已在跑 ⇒ 拒绝)。
+   * `--` 修前本方法在全仓**零调用**(只有 `tests/WS-11` 直接调),
+   * 于是 `partyRun` 恒 `null`、`tickPartyMode` 从不推进、`partyPhase()` 恒 `IDLE`。
    *
    * ## 为什么由模拟层提供这个入口,而不是让房间直接 new
    *
    * 驱动必须与 `tick()` 同源(否则「谁先谁后」取决于两个调用方),
    * 而 `tick()` 在 `WorldSim` 里 ⇒ 持有者也只能在这里。
-   * 房间侧只需要调这一行,不必认识 `PartyModeRuntime` 的结构。
    *
    * ## 参数全部**必填**,不给默认值
    *
@@ -6122,15 +6457,36 @@ export class WorldSim {
     const known = Object.values(PARTY_MODE_KEY) as string[];
     if (!known.includes(key)) return false;
     if (refereeId === '') return false;
-    const m = createPartyMode({ key: key as (typeof PARTY_MODE_KEY)[keyof typeof PARTY_MODE_KEY], clock: this.partyClock, refereeId });
-    startPartyMode(m);
-    this.partyRun = m;
+    const contest = createPartyContest(
+      key as (typeof PARTY_MODE_KEY)[keyof typeof PARTY_MODE_KEY],
+      this.partyClock,
+      refereeId,
+    );
+    startPartyMode(contestMode(contest));
+    this.partyContest = contest;
+    this.partyRun = contestMode(contest);
+    this.lastPartySettlement = null;
+    /* ★ 把**上一帧已经读到过**的队伍归属补登记进容器:哨台入口比玩家站旗晚一帧
+       (同一慢帧里先扫旗、后开局),不补的话「第一帧就站上旗的玩家」永远不会被
+       登记 ⇒ 拾冠 `crownPickup` 会被 `teams.get(pid) === undefined` 静默拒掉。 */
+    for (const [pid, team] of this.partyTeams) contestAssignTeam(contest, pid, team);
     return true;
   }
 
-  /** 结束并清空对局(房间关局 / 重开时调)。不含结算 —— 结算归上层。 */
+  /**
+   * 结束并清空对局。
+   *
+   * ★ WS-FND-120:清空**之前**先结算一次(若还没结算)—— 否则「裁判按 -1 收局」
+   * 会把这一局的名次与奖励整份丢掉,而那种丢法**不报错**:相位照样回 `IDLE`。
+   */
   clearPartyRun(): void {
+    const contest = this.partyContest;
+    if (contest !== null) {
+      const settlement = contestSettlement(contest) ?? settlePartyRun(contestMode(contest));
+      if (settlement !== null) this.grantPartyRewards(settlement);
+    }
     this.partyRun = null;
+    this.partyContest = null;
   }
 
   /**
@@ -6160,11 +6516,15 @@ export class WorldSim {
     });
     startRushOrder(s);
     this.rushRun = s;
+    /* ★ WS-FND-120:新一场急单 ⇒ 清掉上一场的回执(否则 `rushSettlement()` 会把
+       上一场的 S/A/B 当成这一场的)。 */
+    this.lastRushSettlement = null;
     return true;
   }
 
-  /** 结束并清空急单。 */
+  /** 结束并清空急单(★ 收工前先结算,见 `stepRushSettle`)。 */
   clearRushRun(): void {
+    this.stepRushSettle();
     this.rushRun = null;
   }
 
@@ -6205,12 +6565,10 @@ export class WorldSim {
   setPlayerDozing(playerId: string, atSec: number | null): boolean {
     if (playerId === '') return false;
     if (atSec === null) {
-      /* 回前台:保留已攒的露水,只清打盹态(`goForeground` 的语义)。 */
       const p = this.afkRuns.get(playerId);
       if (p === undefined) return false;
-      p.backgroundedAtSec = null;
-      p.dozedSec = 0;
-      p.dewAcc = 0;
+      /* 回前台:保留已攒的露水,只清打盹态 —— `goForeground` 是**唯一**写口。 */
+      goForeground(p);
       return true;
     }
     let p = this.afkRuns.get(playerId);
@@ -6218,7 +6576,9 @@ export class WorldSim {
       p = createAfkPlayer(playerId);
       this.afkRuns.set(playerId, p);
     }
-    p.backgroundedAtSec = atSec;
+    /* 切后台:`goBackground` 幂等(已在后台 ⇒ 不重置计时);修前这里直接写字段,
+       等于把「重置计时」这件事又实现了一遍(两份实现迟早漂移)。 */
+    goBackground(p, atSec);
     return true;
   }
 
@@ -6273,6 +6633,14 @@ export class WorldSim {
     let afkTicked = 0;
     let afkDew = 0;
 
+    /* ── ★ WS-FND-120 入口(世界事实 → 动作层闸门 → 动作)──
+       三段都**只在事实成立时**才动:玩家站上 435 旗 / 有人站在 436 哨台 / 食堂建成
+       且有人站在工位格。修前这三件事一件都没有入口,`partyRun` / `rushRun` /
+       `afkRuns` 在生产里恒空。 */
+    this.scanPartyTeams();
+    this.stepRefereeDesk(nowSec);
+    this.stepRushEntry();
+
     /* 急单(WS-11 §6)。★ 这一行是我**补上**的 —— 第一版漏了它,
        只 import 不调用 ⇒ 门禁全绿而什么都没推进。详见 `rushRun` 的注释。 */
     if (this.rushRun !== null) {
@@ -6301,11 +6669,24 @@ export class WorldSim {
       }
       events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT, { spraying, tended }));
       this.rushTicked = 1;
+      /* ★ WS-FND-120:交付与结算回执 —— 修前 `submitDelivery` / `settleSession`
+         生产零调用(后者连引用都没有)⇒ 急单永远是「跑完就没了」。 */
+      const delivered = this.stepRushDelivery();
+      if (delivered > 0) events.push(`RUSH_DELIVERED:${delivered}`);
+      const receipt = this.stepRushSettle();
+      if (receipt !== null) events.push(`RUSH_SETTLED:${receipt.grade}`);
     } else {
       this.rushTicked = 0;
     }
 
-    if (this.partyRun !== null) {
+    if (this.partyContest !== null) {
+      /* ★ WS-FND-120:整局推进走**容器**(子运行在前、相位在后),再把世界事实
+         (谁站在旗上 / 谁站在底座上 / 谁被击退)过动作层闸门换成真动作。 */
+      const contest = this.partyContest;
+      events.push(...tickPartyContest(contest, SIM_SLOW_DT));
+      this.stepPartyActions(contest, events);
+      partyTicked = 1;
+    } else if (this.partyRun !== null) {
       events.push(...tickPartyMode(this.partyRun));
       partyTicked = 1;
     }
@@ -6315,12 +6696,460 @@ export class WorldSim {
       afkTicked += 1;
       afkDew += whole;
     }
+    /* ★ WS-FND-120:`setPlayerDozing` 的生产入口 —— 世界侧唯一知道的「谁在睡」是
+       装配层注入的 `sleepSource`(index.ts:266 接 `actions/sleep.ts`)。
+       没有它 ⇒ 不登记(与修前同形态,判据按 0 断言)。 */
+    const dozeEntries = this.stepDozingEntry(nowSec);
+    if (dozeEntries > 0) events.push(`DOZE_ENTER:${dozeEntries}`);
+    /* ★ WS-FND-120:broadcaster 的**消费者**。修前 `shiftBroadcast` /
+       `drainBroadcasts` 零调用 ⇒ 队列只写不读(播报永远发不出去)。 */
+    const drained = this.stepPartyBroadcasts();
+    if (drained > 0) events.push(`PARTY_BROADCAST:${drained}`);
 
     this.lastPartyTick = { partyTicked, afkTicked, afkDew, events };
     /* 事件并入世界总线。**必须与 `bus.drain()` 同帧语义**:总线每快帧末尾排空,
        而本方法在慢帧内被调,故这里 emit 的事件会在**本帧末尾**被投递 ——
        与 mobHost 的 emit 行为一致(同一慢帧内产生、同帧末尾 drain)。 */
     for (const ev of events) this.bus.emit('party_event', { kind: ev });
+  }
+
+  /* ══════════════ ★ WS-FND-120:WS-11 的动作层入口(世界事实 → 闸门 → 动作)══════════════ */
+
+  /**
+   * 玩家此刻站在哪一格(**权威刚体坐标**)。非玩家 / 没有刚体 ⇒ `null`。
+   *
+   * 为什么用 `playerIds` 而不是 `physics.bodies.has`:`physics.bodies` 里玩家与生物
+   * **混在一起**(`addPlayer` 与 `addMob` 都调 `physics.spawn`)⇒ 不查这一条,
+   * 一只怪站在哨台格上就能冒充裁判(`applyPlayerMove` 的闸 0 是同一处理由)。
+   */
+  private playerCellOf(playerId: string): { x: number; y: number } | null {
+    if (!this.playerIds.has(playerId)) return null;
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return null;
+    return { x: Math.floor(b.x), y: Math.floor(b.y) };
+  }
+
+  /** 站在该格上的玩家(没有 ⇒ `''`)。同格多名玩家时按 `vitals.ids()` 序取第一个。 */
+  private playerAtCell(x: number, y: number): string {
+    for (const pid of this.vitals.ids()) {
+      const cell = this.playerCellOf(pid);
+      if (cell !== null && cell.x === x && cell.y === y) return pid;
+    }
+    return '';
+  }
+
+  /** 某类金件的世界格列表(没有 ⇒ 空数组)。电路关闭时也没有。 */
+  private componentCells(kind: string): { id: string; x: number; y: number; params: Record<string, number> }[] {
+    if (!this.wiringOn) return [];
+    const out: { id: string; x: number; y: number; params: Record<string, number> }[] = [];
+    for (const c of this.wiring.components.values()) {
+      if (c.kind !== kind) continue;
+      out.push({ id: c.id, x: c.x, y: c.y, params: c.params });
+    }
+    return out;
+  }
+
+  /**
+   * 435 复活旗 → `partyTeams`(**队伍归属的唯一来源**)。
+   *
+   * 为什么用旗而不是按加入顺序轮转:轮转会造出「模式在跑但队伍是猜的」——
+   * 不报错、不影响推进,只是结算归属错人(`startPartyRun` 的参数纪律同源)。
+   * 没站过任何旗 ⇒ 没有队伍 ⇒ 拾冠/夺旗被闸门拒绝(`NO_TEAM_BANNER`)。
+   */
+  private scanPartyTeams(): void {
+    const banners = this.componentCells('ARENA_TEAM_BANNER');
+    const pedestals = this.componentCells('ARENA_CROWN_PEDESTAL');
+    const goals = this.componentCells('ARENA_GOAL_FRAME');
+    /* 触达点 = 三类目标件格;`REACH_TARGET` 只说「踩到了本模式的目标件」,
+       具体是哪一件由本层的格判定决定(scoring 不需要知道坐标)。 */
+    const reachCells = [...banners, ...pedestals, ...goals];
+    const seen = new Set<string>();
+    for (const pid of this.vitals.ids()) {
+      const cell = this.playerCellOf(pid);
+      if (cell === null) continue;
+      const banner = banners.find((b) => b.x === cell.x && b.y === cell.y);
+      if (banner !== undefined) {
+        const idx = Math.abs(Math.trunc(banner.params.team ?? 0)) % TEAM_ORDER.length;
+        const team = TEAM_ORDER[idx];
+        this.partyTeams.set(pid, team);
+        if (this.partyContest !== null) contestAssignTeam(this.partyContest, pid, team);
+      }
+      /* ★ WS-FND-120:REACH_TARGET 的**唯一发射点**(修前全仓零生产者)。
+         只在「刚站上去」那一慢帧发(电平 → 脉冲),离开再踩重新计。 */
+      if (reachCells.some((c) => c.x === cell.x && c.y === cell.y)) {
+        const key = `${pid}:${cell.x},${cell.y}`;
+        seen.add(key);
+        if (!this.reachLatch.has(key)) {
+          this.notePartyEvent({ kind: PARTY_SCORE_EVENT.REACH_TARGET, source: pid });
+        }
+      }
+    }
+    this.reachLatch.clear();
+    for (const k of seen) this.reachLatch.add(k);
+  }
+
+  /**
+   * 436 哨台:**开局 / 收局**的唯一生产入口。
+   *
+   * ## 命令从哪里来
+   * 436 `ARENA_REFEREE_DESK` 的 `params.mode`(`components.ts` 的 436 求值器:
+   * `1..4` = 一键开启四种模式,`-1` = 收局)。**裁判是谁**由世界事实决定 ——
+   * 此刻站在哨台格上的玩家;没人站在那儿 ⇒ 拒绝(`NO_REFEREE_AT_DESK`)。
+   *
+   * ## 为什么要锁存(`refereeDeskLatch`)
+   * `params.mode` 是**电平**不是脉冲:不锁存的话一局结束(相位 SETTLED → 清空)后
+   * 同一帧就会再开一局,永远停不下来,而且不报错。锁存键 = `组件ID:mode`,
+   * 只有命令**变了**才响应一次。
+   */
+  private stepRefereeDesk(nowSec: number): void {
+    const desks = this.componentCells('ARENA_REFEREE_DESK');
+    if (desks.length === 0) return;
+    const desk = desks[0];
+    const mode = Math.trunc(desk.params.mode ?? 0);
+    const latchKey = `${desk.id}:${mode}`;
+    if (latchKey === this.refereeDeskLatch) return;
+
+    const actorId = this.playerAtCell(desk.x, desk.y);
+    if (mode === REFEREE_DESK_STOP_MODE) {
+      const gate = gatePartyStop({
+        refereeId: this.partyRun?.refereeId ?? '',
+        actorId,
+        refereeAtDesk: actorId !== '',
+        runActive: this.partyContest !== null || this.partyRun !== null,
+      });
+      if (!gate.ok) return;
+      this.clearPartyRun();
+      this.bus.emit('party_desk_stop', { atSec: nowSec, refereeId: actorId });
+      this.refereeDeskLatch = latchKey;
+      return;
+    }
+
+    const modeKey = deskModeKey(mode);
+    if (modeKey === null) return;
+    const gate = gatePartyStart({
+      modeKey,
+      refereeId: actorId,
+      refereeAtDesk: actorId !== '',
+      runActive: this.partyContest !== null || this.partyRun !== null,
+    });
+    /* ★ 拒绝时**不锁存**:裁判走上哨台后再按一次仍能开局。 */
+    if (!gate.ok) return;
+    if (this.startPartyRun(modeKey, actorId)) {
+      this.refereeDeskLatch = latchKey;
+      this.bus.emit('party_desk_start', { atSec: nowSec, mode: modeKey, refereeId: actorId });
+    }
+  }
+
+  /**
+   * 急单开工:**食堂建成 + 三工位在场 + 有人站在工位格上**。
+   *
+   * 为什么把「食堂建成」当前置:急单是**食堂的活动**(`ROOM_RECIPES` 的
+   * `COZY_CANTEEN`,必需件 506 + 519)。不加这条,任何摆了锅的测试房间都会
+   * 被自动开工 —— 那不是接线,那是噪声。
+   *
+   * 房间等级取 `RUSH_ENTRY_ROOM_LEVEL`(最低档):真实等级由**房间**持有,
+   * 世界侧没有 (`docs` 与 `rush_actions.ts` 的台账 `ROOM_LEVEL` 行已登记)。
+   */
+  private stepRushEntry(): void {
+    if (this.rushRun !== null) return;
+    if (!this.rooms().some((r) => r.key === 'COZY_CANTEEN')) return;
+    const pot = this.deviceTileOf(SOUP_POT_ID);
+    const furnace = this.deviceTileOf(PIZZA_OVEN_ID);
+    const cutter = this.deviceTileOf(KITCHEN_TABLE_ID);
+    const stationsReady = pot !== null && furnace !== null && cutter !== null;
+    const cells = [pot, furnace, cutter].filter((c): c is { x: number; y: number } => c !== null);
+    let actorAtStation = false;
+    for (const pid of this.vitals.ids()) {
+      const cell = this.playerCellOf(pid);
+      if (cell === null) continue;
+      if (cells.some((c) => c.x === cell.x && c.y === cell.y)) { actorAtStation = true; break; }
+    }
+    const gate = gateRushStart({
+      /* 上面已 `if (this.rushRun !== null) return;` ⇒ 此刻必然是没开工。 */
+      state: RUSH_ORDER_STATE.IDLE,
+      stationsReady,
+      actorAtStation,
+    });
+    if (!gate.ok) return;
+    /* 独立确定性 rng:**不碰 `this.rng`**(`tests/WS-01` 钉住了 tick 里的抽数顺序)。 */
+    this.startRushRun(RUSH_ENTRY_ROOM_LEVEL, makeRng(this.worldSeed), {});
+  }
+
+  /**
+   * 急单交付:玩家**脚下 1 格**内有订单点名的地面货 ⇒ 扣货 + 交付。
+   *
+   * 为什么走地面货而不是背包:模拟层**没有背包明细**(`inventoryDetailOf` 返回
+   * `null` 是如实表达)。地面货是世界侧真有的事实,扣减也只有一个写口
+   * (`consumeGroundItem`)⇒ 不存在第二份账。
+   */
+  private stepRushDelivery(): number {
+    const s = this.rushRun;
+    if (s === null || !rushAcceptsDelivery(s)) return 0;
+    let delivered = 0;
+    for (const pid of this.vitals.ids()) {
+      const b = this.physics.bodies.get(pid);
+      if (b === undefined) continue;
+      /* 每帧重算:上一条刚交付 ⇒ 剩余量变了。 */
+      for (const line of openOrderLines(s)) {
+        const near = this.groundItemsNear(b.x, b.y, RUSH_DELIVERY_RADIUS)
+          .find((g) => g.itemId === line.itemId);
+        if (near === undefined) continue;
+        const qty = Math.min(near.count, line.remaining);
+        const gate = gateRushDelivery({
+          state: s.state, remaining: line.remaining, qty, distance: near.dist, radius: RUSH_DELIVERY_RADIUS,
+        });
+        if (!gate.ok) continue;
+        const taken = this.consumeGroundItem(line.itemId, qty, b.x, b.y, RUSH_DELIVERY_RADIUS);
+        if (taken <= 0) continue;
+        const r = submitDelivery(s, line.itemId, taken);
+        if (!r.accepted) continue;
+        delivered += r.consumed;
+        this.rushDeliveryCount += r.consumed;
+        /* ★ WS-FND-120:GATHER 的**唯一发射点**(修前零生产者):扣掉地面货的那一刻
+           就是「拾取」—— `source` 是权威玩家 id,不再需要给 `MaterialApi` 加签名。 */
+        this.notePartyEvent({ kind: PARTY_SCORE_EVENT.GATHER, source: pid });
+      }
+    }
+    return delivered;
+  }
+
+  /**
+   * 急单结算回执:**只在状态变 `SETTLED` 的那一慢帧**结算一次。
+   *
+   * 修前 `settleSession` 全仓**零引用** ⇒ `RUSH_GRADE` 永远传不出去,
+   * 奖励表(`REWARD_TABLE`)也永远没人读。回执在这里落账 + 奖励掉到工位格地面。
+   */
+  private stepRushSettle(): RushSessionSettlement | null {
+    const s = this.rushRun;
+    if (s === null || s.state !== RUSH_ORDER_STATE.SETTLED) return null;
+    if (this.lastRushSettlement !== null) return this.lastRushSettlement;
+    const receipt = settleSession(s);
+    this.lastRushSettlement = receipt;
+    const cell = rushRewardCellOf(s);
+    if (cell !== null) {
+      for (const [idStr, n] of Object.entries(receipt.rewards)) {
+        const itemId = Number(idStr);
+        if (!Number.isFinite(itemId) || n <= 0) continue;
+        this.dropItem(cell.x + 0.5, cell.y + 0.5, itemId, n);
+      }
+    }
+    return receipt;
+  }
+
+  /**
+   * 对局动作:把**世界事实**换成真动作(每一步都先过 `party/actions.ts` 的闸)。
+   *
+   * | 事实 | 动作 | 前置 |
+   * | :--- | :--- | :--- |
+   * | 玩家站上 435 旗 + 建造阶段 + 脚下有 152 木板 | `bridgePlace`(铺板) | `gateBridgePlace` |
+   * | 玩家站上 435 旗 + 冲刺阶段 + 本队桥板 ≥ 12 | `bridgeCapture`(夺旗) | `gateBridgeCapture` |
+   * | 玩家站上 434 底座 + 有队伍 | `crownPickup`(拾冠) | `gateCrownPickup` |
+   * | 持冠者进入击退窗口 | `crownDrop`(掉冠) | `gateCrownKnock`(过 218 和平盾) |
+   * | 相位到点 / 提前宣胜 | `settle*`(结算) | 相位钩子(见 `modes.ts`) |
+   */
+  private stepPartyActions(contest: PartyContest, events: string[]): void {
+    const mode = contestMode(contest);
+    for (const pid of this.vitals.ids()) {
+      const team = this.partyTeams.get(pid) ?? null;
+      const cell = this.playerCellOf(pid);
+      const b = this.physics.bodies.get(pid);
+      if (cell === null || b === undefined) continue;
+      /* 队伍登记幂等重放:玩家站过旗之后,容器里必须一直有他的队伍。 */
+      if (team !== null) contestAssignTeam(contest, pid, team);
+
+      /* ① 铺板:建造阶段,脚下 1 格内有 152 木板 ⇒ 消耗 1 块 + 铺 1 块桥板。 */
+      if (mode.phase === PARTY_PHASE.BUILD && gateBridgePlace({ phase: mode.phase, team }).ok && team !== null) {
+        const boards = this.groundItemsNear(b.x, b.y, RUSH_DELIVERY_RADIUS)
+          .filter((g) => g.itemId === BRIDGE_BOARD_ITEM_ID);
+        if (boards.length > 0 && this.consumeGroundItem(BRIDGE_BOARD_ITEM_ID, 1, b.x, b.y, RUSH_DELIVERY_RADIUS) > 0) {
+          if (contestPlaceBoard(contest, team)) events.push('PARTY_BOARD');
+        }
+      }
+
+      /* ② 夺旗:冲刺阶段,本队桥板够 `BRIDGE_TILES_TO_WIN` ⇒ 夺旗。 */
+      if (mode.phase === PARTY_PHASE.RACE) {
+        const banner = this.componentCells('ARENA_TEAM_BANNER')
+          .find((c) => c.x === cell.x && c.y === cell.y);
+        if (banner !== undefined && team !== null) {
+          const gate = gateBridgeCapture({
+            phase: mode.phase,
+            team,
+            builtTiles: contestBuiltOf(contest, team) ?? 0,
+            alreadyFlagged: contestBridgeFlagged(contest, team),
+          });
+          if (gate.ok && contestCapture(contest, team)) events.push('PARTY_FLAG');
+        }
+      }
+
+      /* ③ 拾冠:站在 434 底座格 + 队伍已由 435 登记。 */
+      const atPedestal = this.componentCells('ARENA_CROWN_PEDESTAL')
+        .some((c) => c.x === cell.x && c.y === cell.y);
+      if (atPedestal) {
+        const gate = gateCrownPickup({
+          phase: mode.phase,
+          team,
+          atPedestal,
+          holder: contestCrownHolder(contest),
+          cooldownSec: contestCrownCooldown(contest),
+          winner: contestCrownWinner(contest),
+        });
+        if (gate.ok && contestCrownPickup(contest, pid)) events.push('CROWN_PICKUP');
+      }
+    }
+
+    /* ④ 掉冠:持冠者进入击退窗口 ⇒ 过整蛊掉冠判定(218 盾可拦)。 */
+    const holder = contestCrownHolder(contest);
+    if (holder !== null && this.knockbackOf(holder)) {
+      /* ⚠️ 218 和平盾的**开关**还没有生产者(`useItem` 的 218 分支不在本任务写域),
+         故这里按「没开」传;台账 `prank/actions.ts#PRANK_ACTION_LEDGER` 已登记。 */
+      const { gate } = gateCrownKnock({ knockback: true, shieldOn: false });
+      if (gate.ok && contestCrownDrop(contest)) events.push('CROWN_DROP');
+    }
+
+    /* ⑤ 结算:相位钩子已经把 `settle*` 跑掉 ⇒ 这里只负责**把奖励真发出去**。 */
+    const settlement = contestSettlement(contest);
+    if (settlement !== null && settlement !== this.lastPartySettlement) {
+      this.lastPartySettlement = settlement;
+      this.grantPartyRewards(settlement);
+    }
+  }
+
+  /**
+   * **把 `settlement.rewards` 真的落账**(修前 `rewards` 只是一份躺在对象里的数组
+   * —— 五个 `settle*` 生产零调用,连生成都没发生)。
+   *
+   * 落点只有两个,都是世界侧已有的权威写口:
+   * · 经验 → `gainExp(progressOf(pid), …)`(成长档案的唯一写口);
+   * · 物品 → `dropItem(x, y, …)`(地面的唯一写口)。
+   * 团队奖励发给**该队在本局登记过的玩家**(`partyTeams`,来自 435 旗);
+   * 一名队员都没登记 ⇒ 不发明受益者(计数里看得见)。
+   */
+  grantPartyRewards(settlement: PartySettlement): { exp: number; items: number; players: number } {
+    const lines = [...settlement.rewards, ...settlement.personalRewards];
+    const paid = new Set<string>();
+    let exp = 0;
+    let items = 0;
+    for (const line of lines) {
+      const targets = line.playerId !== null
+        ? [line.playerId]
+        : line.team !== null
+          ? this.vitals.ids().filter((pid) => this.partyTeams.get(pid) === line.team)
+          : [];
+      for (const pid of targets) {
+        if (line.exp > 0) {
+          /* `gainExp` 是**纯函数**(返回新档案)⇒ 必须写回,否则经验只活在返回值里。 */
+          const res = gainExp(this.progressOf(pid), line.exp);
+          this.progresses.set(pid, res.progress);
+          exp += res.gained;
+          if (res.levelUps.length > 0) {
+            const list = this.pendingLevelUps.get(pid) ?? [];
+            for (const lu of res.levelUps) list.push({ from: lu.from, to: lu.to });
+            this.pendingLevelUps.set(pid, list);
+          }
+        }
+        paid.add(pid);
+        const b = this.physics.bodies.get(pid);
+        if (b === undefined) continue;
+        for (const [idStr, n] of Object.entries(line.rewards)) {
+          const itemId = Number(idStr);
+          if (!Number.isFinite(itemId) || n <= 0) continue;
+          this.dropItem(b.x, b.y, itemId, n);
+          items += n;
+        }
+      }
+    }
+    this.lastPartyRewards = { exp, items, players: paid.size };
+    return this.lastPartyRewards;
+  }
+
+  /**
+   * 播报**下发**:把 broadcaster 队列取空并交给世界总线(`party_broadcast`)。
+   *
+   * 修前 `shiftBroadcast` / `drainBroadcasts` 生产零调用 ⇒ 队列只写不读:
+   * 比分播报、终场文案、前三名耗时全部堆在一个永远没人取的数组里。
+   * 返回值 = 本慢帧下发条数(`lastPartyTick.events` 里记 `PARTY_BROADCAST:n`)。
+   */
+  private stepPartyBroadcasts(): number {
+    const contest = this.partyContest;
+    if (contest === null) {
+      this.lastPartyBroadcasts = [];
+      return 0;
+    }
+    const drained = drainBroadcasts(contestBroadcaster(contest), 99);
+    this.lastPartyBroadcasts = drained.map((b) => ({ kind: b.kind, text: b.text, atSec: b.atSec }));
+    this.partyBroadcastCount += drained.length;
+    for (const b of drained) this.bus.emit('party_broadcast', { kind: b.kind, text: b.text });
+    return drained.length;
+  }
+
+  /**
+   * 打盹入口:`setPlayerDozing` 的**生产驱动**。
+   *
+   * 世界侧唯一知道的「谁在睡」是装配层注入的 `sleepSource`
+   * (`index.ts:266` 接 `actions/sleep.ts`)—— 没接 ⇒ 一条都不登记
+   * (与修前同形态;判据按 `dozingCount() === 0` 断言,别读成「没人睡」)。
+   */
+  private stepDozingEntry(nowSec: number): number {
+    const src = this.sleepSource;
+    if (src === null) return 0;
+    const ids = this.vitals.ids();
+    let entries = 0;
+    for (const pid of ids) {
+      let sleeping = false;
+      try { sleeping = src(pid) === true; } catch { sleeping = false; }
+      const dozing = this.afkRuns.has(pid);
+      if (sleeping && !dozing) {
+        if (this.setPlayerDozing(pid, nowSec)) { entries += 1; this.dozeEntryCount += 1; }
+      } else if (!sleeping && dozing) {
+        this.setPlayerDozing(pid, null);
+        /* 醒来 ⇒ 整条玩法态注销:留着「已醒来但仍在表里」的记录会让
+           `dozingCount()` 说「还有人在睡」,而露水其实已经不产了。 */
+        this.afkRuns.delete(pid);
+      }
+    }
+    /* 离场玩家的打盹态一并注销:否则露水会在「人已不在」的记录上继续累加。 */
+    const present = new Set(ids);
+    for (const pid of [...this.afkRuns.keys()]) if (!present.has(pid)) this.afkRuns.delete(pid);
+    return entries;
+  }
+
+  /** 最近一次**真的发生**的派对结算(未结算 ⇒ null)。 */
+  partySettlement(): PartySettlement | null {
+    return this.lastPartySettlement;
+  }
+
+  /** 急单结算回执(`RUSH_GRADE` 在这);未结算 ⇒ null。 */
+  rushSettlement(): RushSessionSettlement | null {
+    return this.lastRushSettlement;
+  }
+
+  /** 急单订单板上还差哪些货(诊断与断言用)。 */
+  rushOpenLines(): { itemId: number; remaining: number }[] {
+    if (this.rushRun === null) return [];
+    return openOrderLines(this.rushRun).map((l) => ({ itemId: l.itemId, remaining: l.remaining }));
+  }
+
+  /** 某玩家在派对里的队伍(来自 435 复活旗);没站过 ⇒ null。 */
+  partyTeamOf(playerId: string): TeamKey | null {
+    return this.partyTeams.get(playerId) ?? null;
+  }
+
+  /** 当前持冠者(非抢皇冠 / 皇冠落地 ⇒ null)。 */
+  crownHolder(): string | null {
+    const c = this.partyContest;
+    return c === null ? null : contestCrownHolder(c);
+  }
+
+  /** 本局裁判 id(未开局 ⇒ '')。 */
+  partyReferee(): string {
+    return this.partyRun?.refereeId ?? '';
+  }
+
+  /** 造桥模式下某队已建桥板数(非造桥 ⇒ 0)。 */
+  partyBuiltOf(team: TeamKey): number {
+    const c = this.partyContest;
+    if (c === null) return 0;
+    return contestBuiltOf(c, team) ?? 0;
   }
 
   /** 按 (x,y,kind) 反查件 ID。物流节点只带坐标,回写 state 时需要 ID。 */
@@ -6487,7 +7316,10 @@ export class WorldSim {
    * 本文件与 `tests/WS-FND-109` 的台账段。
    */
   extinguishStationAt(deviceId: number): void {
-    this.stationState(deviceId).fireOut = true;
+    /* ★ 第六轮实测 P2(两份实现):修前这里**自己**写 `stationState(id).fireOut = true`,
+       而 `combat/cooking.ts#extinguishStation` 早就是同一件事的具名实现(生产 0 调用)。
+       现在委托它 ⇒ 「炉火怎么灭」只有那一个写点。判据:`tests/WS-FND-118` FND118-10。 */
+    extinguishStation(this.stationState(deviceId));
   }
 
   /**
@@ -6772,11 +7604,30 @@ export class WorldSim {
    *
    * ⚠️ **不 import `mobs/taming.ts`**:它仍是 `scripts/verify.ts` 的不可达白名单成员
    *   (宠物容器未接线),从这里 import 会把那条白名单变成陈旧条目,而
-   *   `scripts/verify.ts` 不在本线写域。⇒ 圈养名单由 `setRanchPets` 注入,
+   *   `scripts/verify.ts` 不在本线写域。⇒ 圈养名单由动作层经 `setRanchPets` 注入,
    *   唯一权威仍是 `mobs/taming.ts` 的「在圈标记」(见 `systems/wiring.ts` 文件头)。
    *   ⚠️ 那里**只用文字描述**、不写那个字段的名字:`tests/WS-04` 的 W4-38 系列用
    *   **源码文本**判「world_sim 不碰宠物容器」(存在性无法用 import 表达),
-   *   在注释里写字段名会让那条判据红 —— 而它红得对(本文件确实没有容器)。 */
+   *   在注释里写字段名会让那条判据红 —— 而它红得对(本文件确实没有容器)。
+   *
+   * ## ★ WS-FND-119(第六轮实测 P0):三个**进料口**曾经在生产里零调用
+   *
+   * 修前实测:`setRanchPets` / `plantCrop` / `setSortFilters` 在 `server/**` 内的
+   * 调用点是 **0**,唯一调用方是 `tests/**` ⇒ 生产里 `ranchPets` / `crops` /
+   * `sortFilters` **恒空**,于是 `settleRanchIfDayChanged`(牧场无产出)、
+   * `advanceRoomSystems` 的温室分支(无作物可长)、`sortHarvest`(道号恒 -1)
+   * 每慢帧**空跑**,而门禁全绿。
+   *
+   * ⇒ 三个入口现在各有一条真实动作路径(判定在 `systems/intake.ts`,本文件只做世界写入):
+   *
+   * ```
+   * BREED_TAME 的 RANCH 子操作                 → net/actions/breed_tame.ts     → setRanchPets
+   * PLACE_AUTOMATION 的播种分支                → net/actions/place_automation.ts → plantCrop
+   * PLACE_AUTOMATION 放下 LOGISTICS_SORTER     → 同上                          → setSortFilters
+   * ```
+   *
+   * ⚠️ 本块注释里同样**不写** `mobs/taming.ts` 的那几个函数名:`tests/WS-04`
+   *   读的是源码文本(它要钉的正是「生产侧对它们的调用点 = 0」)。 */
 
   /** 内容表 `301 肥沃农田耕地` —— 能在上面播种的唯一地表。 */
   private static readonly CROP_SOIL_ID = 301;
@@ -6816,6 +7667,19 @@ export class WorldSim {
       out.push({ lane: Math.trunc(f.lane), itemIds: [...f.itemIds] });
     }
     this.roomSystemsState.sortFilters = out;
+  }
+
+  /**
+   * 当前 429 过滤规则(**拷贝**;改返回值不影响世界)。
+   *
+   * ★ WS-FND-119:动作层要「再加一条规则」就必须先读到已有的那几条
+   *   (`systems/intake.ts` 的 `addSortFilter` 只合并不覆盖整表 —— `sortHarvest`
+   *   走「第一条命中」,别的道号的规则必须原样留着)。没有这个读口时,动作层只能
+   *   `setSortFilters([新的一条])` ⇒ 每放一台 429 就把上一台的规则抹掉,
+   *   而回执看起来完全正常。
+   */
+  sortFilters(): { lane: number; itemIds: number[] }[] {
+    return this.roomSystemsState.sortFilters.map((f) => ({ lane: f.lane, itemIds: [...f.itemIds] }));
   }
 
   /**
@@ -6968,7 +7832,11 @@ export class WorldSim {
     for (const a of animals) {
       if (typeof a.speciesId !== 'string' || a.speciesId.length === 0) continue;
       const affinity = Number.isFinite(a.affinity) ? a.affinity : 0;
-      out.push({ speciesId: a.speciesId, affinity });
+      /* ★ WS-FND-119:`petId`(可选去重键)必须**原样带进来** —— 丢掉它,
+         下一次「送进牧场」就查不到「这只已经在圈里」⇒ 同一只宠物能被反复
+         追加成 N 行 ⇒ N 倍产出。键缺省时不写它(判据夹具的旧形状逐字段不变)。 */
+      const petId = typeof a.petId === 'string' && a.petId.length > 0 ? a.petId : null;
+      out.push(petId === null ? { speciesId: a.speciesId, affinity } : { petId, speciesId: a.speciesId, affinity });
     }
     this.roomSystemsState.ranchPets = out;
   }

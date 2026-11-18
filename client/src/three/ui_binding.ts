@@ -28,10 +28,13 @@ import {
   type PitchPanelLayout,
   bossHudShowsLabels,
   brickRect,
+  layoutBlueprintHud,
+  layoutBossHudBand,
   layoutEaselPanel,
   layoutInventoryPanel,
   layoutPitchPanel,
   paletteRect,
+  rectVisible,
   slotRect,
 } from '../ui/panel_layout.ts';
 import {
@@ -43,12 +46,13 @@ import {
 } from '../ui/inventory.ts';
 import { type RecipeNode, type RecipeTree, sortedLeaves } from '../ui/recipe_tree.ts';
 import {
+  type BossHudView,
   type HpBarLayout,
   dangerColor,
   hpBarText,
   layoutHpBar,
 } from '../ui/boss_hud.ts';
-import type { BossDef } from '../../../shared/types/entities.ts';
+import type { PartyHudView } from '../ui/party_hud.ts';
 import { EASEL_SIZE, type PixelEasel, PALETTE_SIZE, paletteColor, paletteLabel } from '../ui/pixel_easel.ts';
 import { type PitchInfo, PITCH_TABLE } from '../audio.ts';
 import { ATLAS_CELL, ATLAS_COLS, cellIndexFromId } from '../stage/assembly_math.ts';
@@ -70,11 +74,21 @@ export interface UiDrawState {
   panel: UiPanel;
   /** 打开动画进度 0..1(state_machine.openingProgress) */
   openProgress: number;
-  /** 处于拖拽中(画高亮边框) */
+  /**
+   * 处于拖拽中(源格画虚线 + 目标格画热框)。
+   *
+   * ★ 第六轮审计 P3:本字段修前**只被赋过值、从没被读过**(`ui_binding` 里
+   *   `s.dragging` 命中 0)⇒ 拖拽在画面上与"只是悬停"完全一样。现在它由
+   *   `drawInventory` 读(见那边的源格/目标格分支)。
+   */
   dragging: boolean;
+  /** 拖拽的源格(页内下标;−1 = 没有拖拽) */
+  dragFrom: number;
   /** 悬停格(页内下标,−1 = 无) */
   hoverSlot: number;
   view: InventoryView;
+  /** 当前的搜索串(空串 = 没在搜)—— 画进背包标题,让"为什么只剩 3 件"可解释 */
+  invQuery: string;
   /** 当前激活分类 */
   activeCategory: string | null;
   recipe: RecipeTree | null;
@@ -86,9 +100,22 @@ export interface UiDrawState {
   paletteIndex: number;
   /** 音高砖掩码(32 位) */
   pitchMask: number;
-  boss: BossDef | null;
-  bossHp: number;
+  /**
+   * 权威 Boss HUD 视图(`ui/boss_hud.bossHudFrom` 的产物;`null` = 没有 boss)。
+   *
+   * ★ 第六轮审计 P1:修前这里是 `BossDef | null` + 一个**本地伪造**的 `bossHp`
+   *   (boot 里按 `dt * baseHp * 0.035` 递减)。现在血量/上限/阶段/预警形状
+   *   全在这份视图里,本层只做布局 —— 没有再算一遍的余地。
+   */
+  boss: BossHudView | null;
   bossGhost: number;
+  /**
+   * 派对 / 比分(`ui/party_hud.partyHudOf` 的产物)。
+   *
+   * ★ 第六轮审计 P1:`meta.partyMode/partyTimer/scoreA/scoreB` 修前零读者
+   *   ⇒ 派对进行中屏幕上没有任何提示。`text` 为空串表示没在派对,不画。
+   */
+  party: PartyHudView;
   /** 预警圈提示文本(空串 = 不画) */
   telegraphNote: string;
   /**
@@ -126,6 +153,8 @@ const C = {
   cellBg: 'rgba(255,255,255,.05)',
   cellEdge: 'rgba(140,170,225,.22)',
   hot: 'rgba(255,220,140,.95)',
+  /** 拖拽源格的描边(比 `hot` 淡:它不是"目标",只是"正在被搬") */
+  hotGhostLine: 'rgba(255,220,140,.45)',
   ok: '#8fe0a8',
   bad: '#ff9d9d',
   hp: '#e2564a',
@@ -264,7 +293,10 @@ export class UiOverlay {
 
   private drawInventory(s: UiDrawState, a: number): void {
     const ctx = this.ctx;
-    const L = this.inv;
+    /* ★ 第六轮审计 P3:`invLayout` 这个 getter 修前**零读者**(绘制层直接用私有
+       `this.inv`,命中测试用 `lastInvLayout` —— 三条路各读各的)。现在绘制也用
+       那一个正规出口:布局只有一份,不再有"画的和点的不是同一个矩形"的余地。 */
+    const L = this.invLayout;
     fillPanel(ctx, L.panel, a);
 
     ctx.save();
@@ -273,7 +305,15 @@ export class UiOverlay {
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'middle';
     const total = INVENTORY_SLOTS;
-    ctx.fillText(`背包  ${s.view.visibleCount}/${total} 件  ·  已用 ${(usedSlotRatio(s.view.visibleCount) * 100).toFixed(0)}%`, L.title.x, L.title.y + L.title.h / 2);
+    /* ★ 搜索串与图集状态都画进标题:
+       · 没有它,"为什么只剩 3 件"是**不可解释**的(搜索把其余的都滤掉了);
+       · `hasAtlas === false` 时格子是色块占位,标题必须说出来(否则玩家以为图挂了)。 */
+    const queryNote = s.invQuery === '' ? '' : `  ·  搜索"${s.invQuery}"`;
+    const atlasNote = this.hasAtlas ? '' : '  ·  无图集(色块占位)';
+    ctx.fillText(
+      `背包  ${s.view.visibleCount}/${total} 件  ·  已用 ${(usedSlotRatio(s.view.visibleCount) * 100).toFixed(0)}%${queryNote}${atlasNote}`,
+      L.title.x, L.title.y + L.title.h / 2,
+    );
 
     /* 分类标签条:12 个分类,按桶宽平分 */
     const tabs = [{ category: null as string | null, label: '全部', color: '#dcd2b8' }, ...BUCKETS.map((b) => ({ category: b.category as string | null, label: b.label, color: b.color }))];
@@ -300,13 +340,33 @@ export class UiOverlay {
       const filled = slot < s.view.slots.length && s.view.slots[i] !== undefined && s.view.slots[i]!.visible;
       ctx.fillStyle = C.cellBg;
       ctx.fillRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
-      ctx.strokeStyle = i === s.hoverSlot ? C.hot : C.cellEdge;
-      ctx.lineWidth = i === s.hoverSlot ? 2 : 1;
+      const isSource = s.dragging && i === s.dragFrom;
+      const isHover = i === s.hoverSlot;
+      ctx.strokeStyle = isHover ? C.hot : (isSource ? C.hotGhostLine : C.cellEdge);
+      ctx.lineWidth = isHover ? 2 : 1;
       ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
+      /* ★ 拖拽中的源格画虚线框:否则"拿起来了"在画面上与"只是悬停"一样
+         (`s.dragging` 修前就是那个"算了不读"的字段)。 */
+      if (isSource) {
+        ctx.save();
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = C.hot;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
+        ctx.restore();
+      }
 
       if (!filled) continue;
       const sl = s.view.slots[i]!;
       this.drawItemIcon(sl.item.id, r);
+      /* 拖拽中的源格:图标变半透明 —— "它正在被搬走"必须看得出来 */
+      if (isSource) {
+        ctx.save();
+        ctx.globalAlpha = a * 0.35;
+        ctx.fillStyle = C.cellBg;
+        ctx.fillRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+        ctx.restore();
+      }
     }
     ctx.restore();
   }
@@ -475,12 +535,19 @@ export class UiOverlay {
   private drawBoss(s: UiDrawState, a: number): void {
     if (!s.boss) return;
     const ctx = this.ctx;
-    const L: HpBarLayout = layoutHpBar(s.boss.baseHp, s.bossHp, this.w, s.boss.phases);
+    /* ★ 第六轮审计 P1:血量取自**权威视图**(`s.boss.hp`,来自 `RoomState.bosses`),
+       不再是 boot 里那个按 `dt * baseHp * 0.035` 本地递减的假值。
+       `layoutHpBar` 只负责条内几何(width/ticks/ratio);阶段名走线上 `phase`,
+       不在这里按 `hpThreshold` 重算(否则"刻度"与"阶段名"会有两套并行逻辑)。 */
+    const L: HpBarLayout = layoutHpBar(s.boss.baseHp, s.boss.hp, this.w, s.boss.phases);
+    /* ★ 第六轮审计 P3:`panel_layout.layoutBossHudBand` 修前零读者(本文件自己
+       手算 `(viewportW - w)/2`)。它算的正是同一件事 —— 现在只有一份。 */
+    const band = layoutBossHudBand(this.w, this.h);
     ctx.save();
     ctx.globalAlpha = a;
     /* 背景框 */
     const pad = 6;
-    const box: PanelRect = { x: L.x - pad, y: L.y - pad - 20, w: L.width + pad * 2, h: L.height + pad * 2 + 20 };
+    const box: PanelRect = { x: band.x - pad, y: band.y - pad - 20, w: band.w + pad * 2, h: band.h + pad * 2 + 20 };
     fillPanel(ctx, box, a * 0.92);
 
     ctx.font = `12px ${MONO}`;
@@ -501,14 +568,12 @@ export class UiOverlay {
     ctx.fillStyle = 'rgba(255,255,255,.65)';
     for (const t of L.ticks) ctx.fillRect(L.x + t, L.y, 1, L.height);
 
-    /* 血量文本 + 当前阶段名 —— 阶段名直接取 layoutHpBar 的权威字段,
-       不在这里自己按 hpThreshold 再判一次(那会产生「血条刻度」与「阶段名」
-       两套并行逻辑,一旦阈值语义变化就会不一致)。 */
+    /* 血量文本 + 当前阶段名 —— 两者都是**线上**字段(s.boss.hp / s.boss.phaseName) */
     ctx.font = `11px ${MONO}`;
     ctx.fillStyle = '#fff';
-    ctx.fillText(hpBarText(Math.round(s.bossHp), s.boss.baseHp), L.x + 6, L.y + 3);
+    ctx.fillText(hpBarText(Math.round(s.boss.hp), s.boss.baseHp), L.x + 6, L.y + 3);
     ctx.fillStyle = C.dim;
-    ctx.fillText(L.phaseName, L.x + L.width - 180, L.y + 3);
+    if (s.boss.phaseName !== '') ctx.fillText(s.boss.phaseName, L.x + L.width - 180, L.y + 3);
     ctx.restore();
   }
 
@@ -521,20 +586,64 @@ export class UiOverlay {
     if (s.telegraphNote) {
       const w = 420;
       const box: PanelRect = { x: (this.w - w) / 2, y: this.h - 74, w, h: 26 };
-      ctx.fillStyle = dangerColor(0.85);
-      roundRect(ctx, box, 6);
-      ctx.fill();
-      ctx.fillStyle = '#22110f';
-      ctx.fillText(s.telegraphNote, box.x + 10, box.y + 6);
+      /* `rectVisible` 修前零读者:完全落在视口外的提示条没必要画(小屏/超宽屏时
+         它是真的会跑出去) —— 这里用它做一次显式跳过,而不是先 fill 再被裁掉。 */
+      if (rectVisible(box, this.w, this.h)) {
+        ctx.fillStyle = dangerColor(0.85);
+        roundRect(ctx, box, 6);
+        ctx.fill();
+        ctx.fillStyle = '#22110f';
+        ctx.fillText(s.telegraphNote, box.x + 10, box.y + 6);
+      }
     }
     if (s.blueprintNote) {
-      const w = 300;
-      const box: PanelRect = { x: (this.w - w) / 2, y: this.h - 108, w, h: 24 };
-      ctx.fillStyle = 'rgba(140,190,255,.85)';
-      roundRect(ctx, box, 6);
-      ctx.fill();
-      ctx.fillStyle = '#0d1626';
-      ctx.fillText(s.blueprintNote, box.x + 10, box.y + 5);
+      /* ★ 第六轮审计 P3:`panel_layout.layoutBlueprintHud` 修前零读者 —— 绘制层
+         自己写死 `{x:(w-300)/2, y:h-108, w:300, h:24}`。现在位置来自那个纯函数
+         (它已被测试覆盖,且会随视口给出一致的 `visible` 判定)。 */
+      const bp = layoutBlueprintHud(this.w, this.h, true);
+      if (bp.visible && rectVisible(bp.hint, this.w, this.h)) {
+        ctx.fillStyle = 'rgba(140,190,255,.85)';
+        roundRect(ctx, bp.hint, 6);
+        ctx.fill();
+        ctx.fillStyle = '#0d1626';
+        ctx.fillText(s.blueprintNote, bp.hint.x + 10, bp.hint.y + 5);
+      }
+    }
+    /* ── ★ 第六轮审计 P1:派对 / 比分 ──
+       四个 `meta` 字段此前零读者;现在只要在派对里就有这一行(`text` 为空则不画)。 */
+    if (s.party.active) {
+      const w = 420;
+      const box: PanelRect = { x: (this.w - w) / 2, y: this.h - 140, w, h: 26 };
+      if (rectVisible(box, this.w, this.h)) {
+        ctx.fillStyle = 'rgba(255,220,140,.9)';
+        roundRect(ctx, box, 6);
+        ctx.fill();
+        ctx.fillStyle = '#221b0d';
+        ctx.fillText(s.party.text, box.x + 10, box.y + 6);
+      }
+    }
+    /* ── ★ 第六轮审计 P3:背包 tooltip ──
+       `UiOverlay.tooltipFor()` 修前**零读者** ⇒ 悬停到格子上永远看不到物品说明。
+       现在悬停格有 tooltip(文本仍由 `inventory.slotTooltip` 给出,本层只画)。 */
+    if (s.hoverSlot >= 0 && (s.panel === 'INVENTORY' || s.panel === 'RECIPE_TREE')) {
+      const text = this.tooltipFor(s.view.page * 160 + s.hoverSlot, s.view);
+      const L = this.invLayout;
+      if (text !== '') {
+        const r = slotRect(L, s.hoverSlot);
+        ctx.font = `11px ${MONO}`;
+        const w = Math.min(320, Math.max(120, ctx.measureText(text).width + 16));
+        const box: PanelRect = { x: Math.min(this.w - w - 8, r.x + r.w + 8), y: Math.max(8, r.y - 6), w, h: 22 };
+        if (rectVisible(box, this.w, this.h)) {
+          ctx.fillStyle = 'rgba(20,26,42,.96)';
+          roundRect(ctx, box, 5);
+          ctx.fill();
+          ctx.strokeStyle = C.cellEdge;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.fillStyle = C.title;
+          ctx.fillText(text, box.x + 8, box.y + 5);
+        }
+      }
     }
     /* 组合键提示条 */
     ctx.fillStyle = C.dim;

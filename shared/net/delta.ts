@@ -175,7 +175,19 @@ export function assertAckedSeq(v: unknown): number {
 export function ackSlotValue(ackedSeq: unknown): number {
   return assertAckedSeq(ackedSeq) + 1;
 }
-
+/**
+ * 报文 op。
+ *
+ * | op | 名字 | 语义 |
+ * |----|------|------|
+ * | 0  | `FULL`  | **自包含快照 + 整体替换**:接收方先清空实体表再按载荷重建 |
+ * | 1  | `DELTA` | 增量:载荷作用在**已有**状态上 |
+ *
+ * ⚠️ `FULL` 的「整体替换」是**协议语义**,由 `applyPacket` 执行(见那边 §5 的说明)。
+ * 修前 `applyPacket` 对 op **不做任何区分**,FULL 只在**空 base** 上才等价于快照;
+ * 重连/入场时套在一份旧状态上就变成「只 merge 不删」⇒ 旧快照独有的实体
+ * (player / wildlife / boss)永远留着,是**幽灵实体**且两端都不报错(审计 P1)。
+ */
 export const PacketOp = {
   FULL: 0,
   DELTA: 1,
@@ -521,7 +533,9 @@ function planFor(
 
 /**
  * 差量编码:`next` 相对 `prev` 的增量报文。
- * `prev === null` 时退化为全量快照(op = FULL)。
+ * `prev === null` 时退化为全量快照(op = FULL)—— 此时 `removedCount` **恒 0**
+ * (没有"上一份"可比较),「整体替换」的语义**不由编码侧表达**,而由解码侧的
+ * `applyPacket` 按 op 执行。⇒ 谁也不能只读 `stats.removed` 就断言"没东西被删"。
  */
 export function encodeDelta(
   prev: RoomState | null,
@@ -544,7 +558,12 @@ export function encodeDelta(
   const removed: { kind: number; id: string }[] = [];
   const plans: UpsertPlan[] = [];
 
-  /* ── 先算删除 ── */
+  /* ── 先算删除 ──
+     ⚠️ `prev === null`(FULL)时**这里必然一条都不产生** —— 没有"上一份"可比。
+     全量报文的"整体替换"不靠 removed 表达,靠解码侧 `applyPacket` 的
+     `pkt.op === FULL` 分支清表(审计 P1)。⇒ 别在调用方读 `stats.removed`
+     来断言"这份快照没有删除项",那恒成立。
+     顺序固定 WILDLIFE → BOSS → PLAYER 是为了让报文逐字节确定(见文件头 §3)。 */
   if (prev) {
     for (const kind of [EntityKind.WILDLIFE, EntityKind.BOSS, EntityKind.PLAYER] as const) {
       const prevList = listOf(prev, kind);
@@ -607,7 +626,14 @@ export function encodeDelta(
   };
 }
 
-/** 全量快照编码(新客户端入场 / 断线重连)。 */
+/**
+ * 全量快照编码(新客户端入场 / 断线重连)。
+ *
+ * 载荷**自包含**:房间级 5 字段 + 全部 player/wildlife/boss 一行不落
+ * (`removedCount` 恒 0 —— 见 `encodeDelta` 的说明)。
+ * ⇒ 接收方必须按「整体替换」处理:FULL 之后的状态**只**取决于这一份报文,
+ *   与它此前持有过什么无关。执行点在 `applyPacket`(审计 P1)。
+ */
 export function encodeFull(state: RoomState, tick: number = state.meta.tick): EncodedPacket {
   return encodeDelta(null, state, tick);
 }
@@ -685,11 +711,43 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
   return { version, op, tick, ackedSeq, removed, upserts, bytesConsumed: r.pos };
 }
 
-/** 把解码结果套用到一份状态上,得到重建后的状态(round-trip 断言用)。 */
+/**
+ * 把解码结果套用到一份状态上,得到重建后的状态(round-trip 断言用)。
+ *
+ * ## ★ 审计 P1:`FULL` 是**整体替换**,不是 merge
+ *
+ * 修前本函数对 `pkt.op` **不做任何区分** —— 于是 `FULL` 只在"base 是空状态"时
+ * 才等价于快照。入场 / 断线重连时它被套在一份**旧状态**上,表现是:
+ *
+ * ```
+ * 旧快照有 player A,B + wildlife w1,w2 + boss z;新快照只有 player A
+ * 修前: A 被 upsert 覆盖,B/w1/w2/z **原样留着** → 屏幕上是幽灵实体
+ *        (编码侧 `removedCount` 恒 0:prev === null 时没有任何比较对象,见
+ *        `encodeDelta` 的说明 ⇒ 解码侧无从得知"谁消失了")
+ * 修后: 实体表先清空,再按载荷重建 ⇒ 结果**只**取决于这一份报文
+ * ```
+ *
+ * 两端都不报错,是这一处最难查的地方 —— 所以替换语义必须写在**解码侧**
+ * (它是唯一同时知道 op 与 base 的地方),而不是指望编码侧列出 removed。
+ * `DELTA` 分支**不受影响**:它仍然只按 `pkt.removed` 删、按 upsert 合。
+ */
 export function applyPacket(base: RoomState, pkt: DecodedPacket): RoomState {
   const out = cloneRoomState(base);
   /* 帧号来自报文头,无条件覆盖 —— 它是单调时钟,不是 diff 字段。 */
   out.meta.tick = pkt.tick;
+  if (pkt.op === PacketOp.FULL) {
+    /* 自包含快照:实体表与房间级 meta 一律从零开始。
+       (`encodeFull` 一定带一条覆盖全部 5 个 ROOM 字段的 upsert,所以下面
+       的清零不会让 meta 丢值;而万一报文残缺,这里也只会得到"空"而不是"旧值"。) */
+    out.players = [];
+    out.wildlife = [];
+    out.bosses = [];
+    out.meta.chunkVersions = {};
+    out.meta.partyMode = 0;
+    out.meta.partyTimer = 0;
+    out.meta.scoreA = 0;
+    out.meta.scoreB = 0;
+  }
   for (const r of pkt.removed) {
     if (r.kind === EntityKind.PLAYER) out.players = out.players.filter((p) => p.id !== r.id);
     else if (r.kind === EntityKind.WILDLIFE) out.wildlife = out.wildlife.filter((w) => w.id !== r.id);

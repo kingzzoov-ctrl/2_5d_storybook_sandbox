@@ -41,6 +41,9 @@ import {
    —— 只画不接 = 玩家仍然看不见手柄,而那**不会**让任何断言变红。 */
 import { createJoystickUI } from './ui/joystick_ui.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
+/* ★ 第六轮审计 P1:派对模式的**下标 → 名字**换算(词表来自冻结层 `PARTY_MODES`),
+   同时服务于 `#hint`(boot.ts)与 `START_PARTY` 的模式回声(本文件)。 */
+import { partyModeName } from './ui/party_hud.ts';
 import { localPlayerZOf } from './net/height_placement.ts';
 import { DT } from '../../shared/types/physics.ts';
 
@@ -129,11 +132,13 @@ function main(): void {
         const me = handle.store.state.players.find((p) => p.id === handle.store.localPlayerId);
         return me === undefined ? { x: undefined, y: undefined } : cellUnder(me);
       },
-      /* 派对模式回声:**不给**。`meta.partyMode` 是**下标**(1=BRIDGE_CTF...),
-         而服务端 `start_party.ts` 拿它跟**模式名**比(`String(declared) !== String(mode)`)
-         ⇒ 回声一个下标会被判"不一致"。模式词表的唯一出处是服务端,客户端不另写一份
-         ⇒ 不知道就**不声称**(省略这个键 = 不核对)。 */
-      partyModeEcho: () => undefined,
+      /* 派对模式回声:★ 第六轮起**给了** —— `meta.partyMode` 已经有读者
+         (`ui/party_hud.ts` 的下标→模式名换算),而服务端 `start_party.ts` 拿它跟
+         **模式名**比(`String(declared) !== String(mode)`)⇒ 这里必须回**名字**,
+         不能回下标(回下标会被判"不一致")。
+         `partyMode === 0`(房间还没选模式)⇒ `undefined` ⇒ 省略这个键 = 不核对
+         (不知道就**不声称**,与接线前同一条纪律)。 */
+      partyModeEcho: () => partyModeName(handle.store.state.meta.partyMode) ?? undefined,
     },
   });
   /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */

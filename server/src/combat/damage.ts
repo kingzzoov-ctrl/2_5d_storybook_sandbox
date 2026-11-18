@@ -256,6 +256,24 @@ export interface AttackInput {
   dodgeRoll: number;
   /** 相机抖动/环境易伤等外部乘区 */
   externalMul?: number;
+  /**
+   * 等级伤害倍率的**权威值**(= `PlayerProgress.dmgMul`,与 `statsAtLevel` 同源)。
+   *
+   * ## 为什么要有这个入参(第六轮实测 P0:天赋/成长档案无出口)
+   *
+   * `progression.PlayerProgress.dmgMul` 每级重算并写进档案,但**全仓没有读者** ——
+   * 「等级 → 伤害倍率」这条规则在公式里由 `attacker.level` 现算一遍,档案里的那
+   * 份于是成了装饰品。两者数值相同(都是 `1 + 0.03(L−1)`)时看不出问题,
+   * 一旦有人按档案调数值(天赋/洗练改 `dmgMul`),生产**一点反应都没有**。
+   *
+   * ⇒ 调用方(编排层)给出权威值时用这里;不给(= `undefined`)则**逐字**走
+   * 修前的现算式。两条路不会叠加(它是**替换** `levelMul`,不是再乘一个乘区),
+   * 所以「接线」不会让伤害凭空翻倍。
+   *
+   * 非有限值一律忽略、退回现算式(与 `comboMul` 的消毒同族:`NaN` 会让
+   * `finalDamage` 变 `NaN` 并把生物 HP 永久污染)。
+   */
+  damageMul?: number;
   source?: DamageSource;
   /** 命中时目标与玩家的水平距离(格),用于 reach 校验 */
   distance?: number;
@@ -355,7 +373,11 @@ export function computeDamage(input: AttackInput): DamageResult {
   }
 
   /* 1 基础 = ATK总 × 等级倍率 × 武器倍率 × 连段 × 技能倍率 */
-  const levelMul = 1 + 0.03 * (attacker.level - 1);
+  /* ★ 等级倍率的**权威值优先**(`PlayerProgress.dmgMul`):给了就用它,**替换**现算式,
+     不叠加。非有限值退回现算式(理由见 `AttackInput.damageMul`)。 */
+  const levelMul = Number.isFinite(input.damageMul)
+    ? (input.damageMul as number)
+    : 1 + 0.03 * (attacker.level - 1);
   const weaponMul = weapon ? weapon.attackMul : 1.0;
   /* 连段倍率消毒 —— 详见 `MAX_COMBO_MUL`。
      ⚠ 这是本公式里**唯一**的自报标量:其余六个乘数都有界
@@ -452,7 +474,15 @@ export function computeDamage(input: AttackInput): DamageResult {
     detail: `DEF ${r2(effectiveDef)} → 护甲系数 ${r2(mitigationMul)}(递减曲线,趋近 0 不归零);词条减伤 ${r2(target.dmgReduce)} → ×${r2(keywordMul)};外部 ×${externalMul};易伤 ×${target.takenMul} → 未取整 ${r2(finalDamageRaw)}`,
   });
 
-  /* 7 反伤:受击方反伤倍率(728 = 1.50)作用于 3 格内攻击者 */
+  /* 7 反伤:受击方反伤倍率(728 = 1.50)作用于 3 格内攻击者。
+     ⚠️ 本函数**只算不施加**(纯函数没有攻击者档案)。施加点是编排层的**两条**
+     伤害通道,`result.reflectDamage` 是它们唯一取数处:
+     ``` 
+     PvP   WorldSim.attackPlayerAuthorized  → vitals.applyDamage(attackerId, result.reflectDamage)
+     怪打人 WorldSim.resolveMobStrikes       → damageMob(attackerId, reflectFrom(玩家 reflectMul, applied).reflectDamage)
+     ```
+     第六轮实测(修前):这两处**都没有**这一行 ⇒ 728 反伤甲在生产里等于不存在
+     (`reflectDamage` 只在单测里被读过)。判据:`tests/WS-FND-118` FND118-5/6。 */
   const reflectDamage = r2(finalDamage * target.reflectMul);
   steps.push({
     step: '7 反伤', value: reflectDamage,
@@ -545,10 +575,29 @@ export interface AppliedDamage {
   result: DamageResult;
   /** 目标是否被本次攻击击倒(HP 归零) */
   downed: boolean;
-  /** 击破护盾后的护盾余量 */
+  /**
+   * 击破护盾后的护盾余量(**只读回音**)。
+   *
+   * ⚠️ 第六轮实测:它在 `server/**` 里**没有消费者**(只有测试读它)。不删的理由:
+   * 它是「这一刀把盾打剩多少」的唯一出处,删掉会让测试自己再算一遍;
+   * 但它**不是**任何一条玩法规则的执行点 —— 已登记在 `combat/wiring_ledger.ts`
+   * (`AppliedDamage.shieldLeft`,`RESERVED`)。
+   */
   shieldLeft: number;
 }
 
+/**
+ * 把**已经算好**的伤害落在一份受击方档案上。
+ *
+ * ⚠️ 两件它**刻意不做**的事(第六轮实测把它们误读成「被丢了」):
+ * ``` 
+ * 第 7 步反伤  结果只在 `result.reflectDamage` 里 ⇒ 由编排层施加(见 computeDamage 第 7 步注释)
+ * shieldLeft   只是回音 ⇒ 没有生产读者(登记在 wiring_ledger)
+ * ```
+ * 本函数是**纯**的:它拿不到攻击者,施加反伤所需的攻击者档案不在签名里。
+ * 「把它丢在纯函数里」与「让纯函数凭空造一个攻击者」都是错的,所以施加点在
+ * `WorldSim` 的两条伤害通道(判据:`tests/WS-FND-118` FND118-5/6)。
+ */
 export function applyDamage(target: TargetProfile, result: DamageResult): AppliedDamage {
   if (result.dodged || result.outOfReach) {
     return { target: { ...target }, result, downed: false, shieldLeft: target.shield };
@@ -557,7 +606,6 @@ export function applyDamage(target: TargetProfile, result: DamageResult): Applie
   const hp = Math.max(0, target.hp - result.finalDamage);
   return { target: { ...target, hp, shield: shieldLeft }, result, downed: hp <= 0, shieldLeft };
 }
-
 /**
  * PvP 授权判定(D3)—— **纯函数**,本仓 PvP 的唯一判据。
  *

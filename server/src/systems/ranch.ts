@@ -92,8 +92,16 @@ export function resolveItemByName(name: string): number | null {
   return ITEM_ID_BY_NAME.get(name) ?? null;
 }
 
-/** 圈养中的一只动物:物种 id + 亲和度(0..1)。 */
+/**
+ * 圈养中的一只动物:物种 id + 亲和度(0..1)。
+ *
+ * ★ WS-FND-119:`petId` 是**可选的去重键**(挡“同一只羊反复送进牧场 ⇒ N 倍产出”)。
+ *   它不由 `settleRanchDay` 消费 —— 日结只按「有几只在圈里」算,去重是**进料侧**
+ *   (`systems/intake.ts`)的事;判据夹具可以照旧只给 `{speciesId, affinity}`。
+ */
 export interface RanchAnimal {
+  /** 宠物 id(进料侧的去重键;判据夹具可省略)。 */
+  petId?: string;
   speciesId: string;
   affinity: number;
 }

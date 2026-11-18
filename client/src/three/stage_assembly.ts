@@ -165,7 +165,25 @@ export function assemblySource(): 'injected' | 'fallback' {
   return threeSource();
 }
 
-/* ───────────────────── Shader 材质 ───────────────────── */
+/* ─────────────── 未接线的装配函数(第六轮审计 P1:登记,不宣称)───────────────
+ *
+ * 下面这 6 个导出在 `client/src` 里**仍然没有调用点**(实测):
+ *
+ * ```
+ * buildShaderMaterial / buildPixelTexture / buildBillboard /
+ * attachAuraEmitters / applyDyeUniforms / createStage
+ * ```
+ *
+ * 连带没有消费者的还有:`stage/shaders.ts` 的 12 个程序、`stage/particles.ts`
+ * 的粒子池、`stage/dye_overlay.ts` 的染色通道、`entity_sprites.buildWeaponTexture`。
+ *
+ * **本文件的注释不再暗示它们被生产使用**(修前注释里的"装配入口"读起来像已接线)。
+ * 每条为什么没接、接了需要什么,写在 `client/src/wiring_ledger.ts` 的台账里;
+ * 台账状态与真实调用点由 `tests/WS-FND-121` 双向核对(标 blocked 就必须真的 0 调用点)。
+ *
+ * ⚠️ 谁把它们接上去了,**必须**同步把台账那条改成 `wired` —— 否则判据会红,
+ *    那不是判据坏了,是台账过期了。
+ */
 
 /**
  * 由 shader 契约表生成 three 材质(不硬编码任何 uniform 名)。

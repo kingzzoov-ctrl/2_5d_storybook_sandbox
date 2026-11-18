@@ -85,7 +85,14 @@ export const TALENTS: readonly TalentDef[] = [
 
 export const TALENT_BY_ID: ReadonlyMap<string, TalentDef> = new Map(TALENTS.map((t) => [t.id, t]));
 
-/** 等级 → 已解锁天赋(按解锁顺序) */
+/**
+ * 等级 → 已解锁天赋(按解锁顺序)。
+ *
+ * ⚠️ 消费面只有两处,且都在**本模块内**:`recompute` 摊平进 `talentFlags`
+ *   (无读者,见 `PlayerProgress.talentFlags`)、`gainExp` 的升级动画事件。
+ *   生产里真正按天赋改数值的**一条都没有** ⇒ 已登记在
+ *   `combat/wiring_ledger.ts`(`TALENTS` / `activeTalents`:`UNWIRED`)。
+ */
 export function activeTalents(level: number): TalentDef[] {
   return TALENTS.filter((t) => level >= t.unlockLevel);
 }
@@ -125,9 +132,35 @@ export interface PlayerProgress {
   /** 开档以来的累计总经验 */
   totalExp: number;
   maxHp: number;
+  /**
+   * 等级伤害倍率 `1 + 0.03(L−1)`(与 `statsAtLevel` 同源)。
+   *
+   * ★ 第六轮实测 P0:本字段此前**全 server 无读者**(公式在 `computeDamage` 里
+   *   由 `attacker.level` 现算了一遍)。现在经 `AttackInput.damageMul` 进管线:
+   *   `WorldSim.attackMob` 在「档案等级 === 本次结算等级」时传它(替换 `levelMul`,
+   *   **不叠加**)。两者数值相同 ⇒ 生产行为不变,但从此**改这个字段真的会改伤害**。
+   *   判据:`tests/WS-FND-118` FND118-4。
+   */
   dmgMul: number;
+  /**
+   * 背包容量槽数 `8 + (L−1)`(与 `statsAtLevel` 同源)。
+   *
+   * ⚠️ **本字段仍无读者** —— 唯一真实的容量闸在 `net/room.ts#carryCapacityOf`
+   *   (它**内联**了同一条公式 `8 + (lv-1)`,见那里的注释),而 `net/**` 不在本轮
+   *   写域。把它接到 `net` 只会让「容量由谁说了算」从一份变成两份。
+   *   ⇒ 登记 `UNWIRED`(`combat/wiring_ledger.ts`),待 owner 裁决单一口径。
+   */
   carrySlots: number;
-  /** 天赋钩子:每级重算后写入,供战斗管线读取 */
+  /**
+   * 天赋钩子:每级重算后写入(`activeTalents` 的 `effects` 摊平)。
+   *
+   * ⚠️ **全 server 无读者**(第六轮实测 P0)。生产里真正生效的天赋只有一条:
+   *   `talent_dream_revelation` 经 `isTalentUnlocked(level, ...)` 在
+   *   `settleMobExp` 的入参里被读(`world_sim.settleKill`)—— 它读的是**等级**,
+   *   **不是**本表。其余 5 条天赋的效果(`shadowBomb*` / `throw*` /
+   *   `reviveTimeMul` / `critRateBonus` / `elementMulBonus` ...)没有任何消费点。
+   *   ⇒ 整表登记 `UNWIRED`;别把「写进 talentFlags」读成「天赋已生效」。
+   */
   talentFlags: Record<string, number>;
 }
 

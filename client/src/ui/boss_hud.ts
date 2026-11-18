@@ -15,6 +15,12 @@
 
 import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
 import type { BossDef, BossPhase } from '../../../shared/types/entities.ts';
+/* ⚠️ `shared/types/wire.ts` 也导出一个叫 `TelegraphShape` 的常量,但那是**线上数字**
+   (`0 NONE / 1 CIRCLE / 2 SECTOR / 3 RECT / 4 RING`),本文件的 `TelegraphShape` 是
+   **渲染用的字符串**。⇒ 必须别名导入,否则同名遮蔽会让"数字当字符串用"这种错误
+   一路通过类型检查(两者都只是 `number`/`string` 的一部分)。
+   语义映射见本文件末尾的 `clientTelegraphShapeOf()`。 */
+import { TelegraphShape as WireTelegraphShape, type BossState } from '../../../shared/types/wire.ts';
 import { projectGridToScreen, type IsoCamera } from '../stage/iso_camera.ts';
 
 /** 血条像素尺寸 */
@@ -519,4 +525,138 @@ export function validatePhaseThresholds(): { ok: boolean; errors: string[] } {
     }
   }
   return { ok: errors.length === 0, errors };
+}
+/* ═════════════ 权威 Boss 状态 → HUD 视图(第六轮审计 P1)═════════════
+ *
+ * ## 接线前是什么样(实测)
+ *
+ * ```
+ * client/src 里 RoomState.bosses 的读者数 = 0
+ * three/boot.ts:  bossHp = Math.max(baseHp*0.18, bossHp - dt/1000 * baseHp * 0.035)
+ * ```
+ *
+ * 即 HUD 的血量是**本地按时间递减伪造**的:服务端 boss 掉血、进阶段、换预警几何,
+ * 屏幕上**一模一样**(它只会自己慢慢往下走)。两端都不报错 —— 与本仓反复记的
+ * 「生产者存在、消费者不存在」同型。
+ *
+ * ## 现在
+ *
+ * `bossHudFrom(state)` 把 `RoomState.bosses` 投影成 HUD 要的**唯一**视图:
+ * 血量/上限/阶段/名字/预警几何全部来自线上字段,`layoutHpBar()` 只做布局。
+ * ⇒ 「服务端掉血 ⇒ 血条变短」变成一条**行为**关系,可被 node 直接断言
+ *   (不需要浏览器:`ui/boss_hud.ts` 零 three、零 DOM)。
+ */
+
+export interface BossHudTelegraph {
+  shape: TelegraphShape;
+  /** 中心(世界格) */
+  cx: number;
+  cy: number;
+  radius: number;
+  /** 服务端结算帧(绝对 tick);`0` = 未给 */
+  endTick: number;
+}
+
+export interface BossHudView {
+  /** 实体 id(同场多 boss 时用于区分) */
+  id: string;
+  /** `bosses.ts` 的 `boss_*` 键 */
+  bossId: string;
+  /** 展示名(内容层没登记时退化为 `bossId`,不编一个名字) */
+  name: string;
+  level: number;
+  /** HP 上限(线上 `maxHp`;它已经被服务端缩放,优先于内容层的 `baseHp`) */
+  baseHp: number;
+  hp: number;
+  /** `hp / baseHp`,夹在 `[0,1]` */
+  ratio: number;
+  phaseIndex: number;
+  phaseName: string;
+  /** 阶段表(来自内容层;`layoutHpBar` 的刻度用它) */
+  phases: readonly BossPhase[];
+  /** 地面预警几何(`telegraphShape === NONE` ⇒ `null`) */
+  telegraph: BossHudTelegraph | null;
+}
+
+/**
+ * 线上 `telegraphShape`(数字)→ 渲染用几何(字符串)。
+ *
+ * `shared/types/wire.ts` 的注释把这层映射记成「接线时要补的东西」——
+ * 就是本函数。两套词表**不是同一套编号**,而是两套词汇:
+ *
+ * | 线上 | 含义 | 本文件 |
+ * |------|------|--------|
+ * | 1 `CIRCLE` | 实心圆 | `CIRCLE`(唯一同义词) |
+ * | 2 `SECTOR` | 扇形 | `CONE` |
+ * | 3 `RECT`   | 矩形/长条 | `LINE` |
+ * | 4 `RING`   | 环 | `ANNULUS` |
+ * | 0 `NONE` / 未知 | 无预警 | `null` |
+ *
+ * ⚠️ 未知值返回 `null`(**不兜底成 CIRCLE**):兜底会让"服务端加了新几何"
+ * 在客户端表现为一个看似正常的实心圆 —— 那是错的图,却没有任何东西会红。
+ */
+export function clientTelegraphShapeOf(wire: number): TelegraphShape | null {
+  switch (wire) {
+    case WireTelegraphShape.CIRCLE: return 'CIRCLE';
+    case WireTelegraphShape.SECTOR: return 'CONE';
+    case WireTelegraphShape.RECT: return 'LINE';
+    case WireTelegraphShape.RING: return 'ANNULUS';
+    default: return null;
+  }
+}
+
+/** 单个线上 boss 实体 → HUD 视图(纯函数;`phases` 缺失时给空表而不是猜) */
+export function bossHudOf(b: BossState): BossHudView {
+  const def: BossDef | undefined = BOSS_LIST.find((d) => d.id === b.bossId);
+  const phases: readonly BossPhase[] = def?.phases ?? [];
+  /* 上限优先取线上 `maxHp`(服务端按人数缩放后的值),没有才退到内容层 */
+  const baseHp = b.maxHp > 0 ? b.maxHp : Math.max(1, def?.baseHp ?? 1);
+  const hp = Number.isFinite(b.hp) ? Math.max(0, b.hp) : 0;
+  const ratio = Math.min(1, Math.max(0, hp / baseHp));
+  /* 阶段索引:线上 `phase` 是权威;越界时夹到合法区间(不静默丢成 0 —— 夹紧后
+     阶段名与血条刻度至少自洽)。 */
+  const raw = Number.isFinite(b.phase) ? Math.trunc(b.phase) : 0;
+  const phaseIndex = phases.length === 0 ? Math.max(0, raw) : Math.min(phases.length - 1, Math.max(0, raw));
+  const phaseName = phases.length === 0 ? '' : String(phases[phaseIndex]?.name ?? '');
+  const shape = clientTelegraphShapeOf(b.telegraphShape);
+  const radius = Number.isFinite(b.telegraphR) ? b.telegraphR : 0;
+  const telegraph: BossHudTelegraph | null = shape === null || radius <= 0
+    ? null
+    : {
+      shape,
+      cx: Number.isFinite(b.telegraphX) ? b.telegraphX : 0,
+      cy: Number.isFinite(b.telegraphY) ? b.telegraphY : 0,
+      radius,
+      endTick: Number.isFinite(b.telegraphEndTick) ? b.telegraphEndTick : 0,
+    };
+  return {
+    id: b.id,
+    bossId: b.bossId,
+    name: def?.name ?? b.bossId,
+    level: def?.level ?? 0,
+    baseHp,
+    hp,
+    ratio,
+    phaseIndex,
+    phaseName,
+    phases,
+    telegraph,
+  };
+}
+
+/**
+ * 整份快照 → 这一场该显示的 boss(`null` = 没有 boss,不画血条)。
+ *
+ * **多个 boss 时取 `hp` 最大的那一只**,而不是 `bosses[0]`:
+ * `telegraph_center.ts` 记着同款教训(悄悄挑 `players[0]` 会在多人房把圆心钉到
+ * 别人头上)。raid 里同时存在两只 boss 只可能是"召唤物/阶段分身",
+ * 而 HUD 要显示的是**这一场的主目标** = 血最多的那一只;并且 id 一并返回,
+ * 调用方因此能判断"这一帧的主目标换人了"。
+ */
+export function bossHudFrom(state: { bosses: readonly BossState[] }): BossHudView | null {
+  const list = state.bosses;
+  if (list.length === 0) return null;
+  let pick = list[0]!;
+  for (const b of list) if (b.hp > pick.hp) pick = b;
+  return bossHudOf(pick);
 }

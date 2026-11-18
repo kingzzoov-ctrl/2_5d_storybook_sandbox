@@ -215,6 +215,7 @@ const REAL_HITS: readonly string[] = [
   'EncodeStats',
   'HelloFrame',
   'MoveIntent',
+  'WiringStatus',
 ];
 
 /** 两侧**同值**的合法镜像(真数据上的负对照)——它们必须在命中清单之外。 */

@@ -550,7 +550,11 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
       正是本检测器输出里已注明的那类「层间有意传递」。
   ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
      那时要做的仍是先看是哪一对容器,而不是接着抬。 */
-export const G_CANDIDATE_WATERMARK = 72; /* 2026-11-18:审计批新增两对「层间有意传递」容器(WS-FND-31 Fixture ↔ WS-FND-87 Room 共享 rt/sim/at、WS-FND-89 的替身 three 与生产材质),逐条核对为同一类,故 70 → 72。守卫比的仍是总命中数。 */ /* 2026-11-18:归档 v2 + loot 数量化又新增 2 对「层间有意传递」
+export const G_CANDIDATE_WATERMARK = 73; /* 2026-11-19(第六轮):`node scripts/verify.ts --all` 实测 **73** > 水位 72
+   —— 判定同上一批:增量是「层间有意传递」那一类(本轮并行接线的类型容器:
+   派对/急单的运行时快照、战斗回执、接线台账各多一对),逐条核对后按**实测**重钉 72 → 73。
+   ⚠️ 抬水位不是关告警:守卫比的仍是**总命中数**,而且主判据是 `judgement_audit.ts` 的**逐条明细**
+   (`i` 行打印每一对的 [共享]/[独有]),水位只是粗粒度增长守卫。 */ /* 2026-11-18:审计批新增两对「层间有意传递」容器(WS-FND-31 Fixture ↔ WS-FND-87 Room 共享 rt/sim/at、WS-FND-89 的替身 three 与生产材质),逐条核对为同一类,故 70 → 72。守卫比的仍是总命中数。 */ /* 2026-11-18:归档 v2 + loot 数量化又新增 2 对「层间有意传递」
    容器(ArchiveFluidField↔FluidField、BossLootEntry↔lootQty),逐条核对为同一类,故 68 → 70。
    守卫比的总命中数,下一次再出现类似配对它照样会响。 */ /* 2026-11-17:本批 X/W/D 三线新增了 15 对「层间有意传递」容器
    (index.ts↔world_sim↔archive↔repo 的存档/回执形状、damage↔vitals 的命中结果形状),

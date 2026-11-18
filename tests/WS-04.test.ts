@@ -1341,16 +1341,45 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
     ['server/src/content/registry.ts', 'server/src/mobs/taming.ts', 'server/src/systems/ranch.ts', 'shared/constants/mobs.ts'],
     `全仓读 .tameItem 的文件共 ${tameReaderFiles.length} 个 ⇒ tameItem **有**消费者(「无人消费」不成立)`);
 
-  /* 5b 真正无人消费的是 `feedPet` 这个**函数**:生产侧调用点 0(只 1 处定义)。 */
-  let feedPetCalls = 0;
+  /* 5b `feedPet` 的接线现状(★ 第六轮:按**实测**写,不冒充已接)。
+   *
+   * 原判据是 `eq(feedPetCalls, 0)`,而它把 `systems/intake.ts:44` 的**台账注释**
+   * (「… 的六个导出(`feedPet` / …)全仓 0 import …」)也算成一个调用点(实测 1)
+   * ⇒ 读数是「1 ≠ 0」,而事实是「0 import / 0 调用」。判据的锚与它要判的事不对齐
+   * (与 task-73 在这里修掉的那一类同形)。
+   *
+   * 本轮的翻面目标是「调用点 ≥1 且被调用时有效果」。实测**做不到**:
+   * `feedPet` 至今 **0 import**(生产里唯一的命中是上面那条注释),缺的仍是宿主
+   * (宠物容器 + 驯服交互)。⇒ 这里不写「已接」,按现状钉住三件事:
+   * ```
+   * 1 剥掉注释后,生产代码里 `feedPet` 只剩 **1** 处 —— 就是 `mobs/taming.ts:125` 的定义行;
+   * 2 「效果未接」的台账锚点在册(`intake.ts` 的「全仓 0 import」登记)⇒ 接上那天这条必红;
+   * 3 函数本身**有真效果**(喂食真推 `stage` / `fedCount`)⇒ 缺的是宿主,不是实现。
+   * ```
+   * ⚠️ 第 1 条的「剥注释」是**必要**的:不剥的话注释行会让「≥1」恒真(本套件在
+   * task-73 修过同一个病,见 5a 上方)。第 3 条是它的负对照 —— 若函数变空壳,两条一起红。 */
+  const isCommentLine = (text: string): boolean => /^(\*|\/\/|\/\*)/.test(text.trim());
+  const feedPetCode: { rel: string; line: number; text: string }[] = [];
   for (const p of prod) {
     const ls = p.src.split('\n');
     for (const ln of linesMatching(p.src, /feedPet/)) {
-      if (!/export function feedPet/.test(ls[ln - 1] as string)) feedPetCalls += 1;
+      const text = ls[ln - 1] as string;
+      if (!isCommentLine(text)) feedPetCode.push({ rel: p.rel, line: ln, text });
     }
   }
-  eq(feedPetCalls, 0,
-    'feedPet 生产调用点 0(1 处定义 + 0 调用)⇒ 无人消费的是**函数**,不是 tameItem 字段');
+  eq(feedPetCode.length, 1,
+    'feedPet 生产调用点 0(0 import + 0 调用;剥注释后只剩 1 处定义行)⇒ 无人消费的是**函数**');
+  ok(feedPetCode[0]!.rel.endsWith('mobs/taming.ts') && /export function feedPet/.test(feedPetCode[0]!.text),
+    `剥注释后唯一那处命中必须是定义行(实测 ${feedPetCode[0]!.rel}:${feedPetCode[0]!.line})`
+    + ' ⇒ 扫描器看得见它,上面那条不是恒空');
+  const intakeSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'systems', 'intake.ts'), 'utf8');
+  ok(/feedPet/.test(intakeSrc) && /全仓 0 import/.test(intakeSrc),
+    '效果未接的台账锚点在册(intake.ts 登记 taming 六个导出「全仓 0 import」)⇒ 接上那天这条会红,必须一并改写');
+  /* 行为:函数本身有真效果 —— 否则「缺宿主」与「实现是空壳」是两种完全不同的修法。 */
+  const fedPet = createPetRecord('mob_chocobo')!;
+  eq(fedPet.stage, TameStage.WILD, '前置:野生');
+  eq(feedPet(fedPet, 123).ok, true, 'feedPet 真有效果(不是空壳)');
+  eq(fedPet.fedCount, 1, '★ 计数真的推了 ⇒ 缺的是**宿主**,不是效果');
 
   /* 5c 全仓**生产侧**该名单只出现 1 次(仅定义处)⇒「从未被生产消费」成立。
    *    ⚠️ 与上方第 3 条范围不同:3 只数 4 个文件;本条数**全部生产文件**。

@@ -1854,7 +1854,7 @@ const CLIENT_HTML_ENTRY = './src/main.ts';
  *
  * ## 本表的两个条数是**可被代码算出来的数** —— 故必须写成「自称」
  *
- * 可达性白名单 12 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(10)(生产零引用清单,
+ * 可达性白名单 10 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(9)(生产零引用清单,
  * 定义在 `scripts/orphan-audit.ts`)写在这里,由 `scripts/count-audit.ts` 与
  * **运行时** `Map.size` 双向比对:改了名单却忘了同步这两处 ⇒ 当场红在
  * 「文档自称与代码正解不一致」上,而不是让两条注释各自腐烂。
@@ -2116,12 +2116,15 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
      实测:可达性闭包经 `client/src/main.ts → net/predictor.ts → net/prediction.ts` 命中。
      ⚠️ 摘除动作**必须写在这里**:否则下一个人会以为它还在等接线 ——
         而「没人再读那条理由」正是这类登记腐烂的方式(与 `social/afk.ts` 摘除同形)。 */
-  ['server/src/prank/immunity.ts',
-    'WS-11 整蛊免疫,等施加整蛊的宿主(与 toys.ts 同一个);'
-    + 'data-conformance.ts 只读它的常量,逻辑未接'],
-  /* ★ 2026-11-14 Lead 补措辞:生产引用者 immunity 本身不可达 ⇒ 差集条目。 */
-  ['server/src/prank/toys.ts', 'WS-11 玩具,等施加整蛊的宿主(与 immunity.ts 同一个);'
-    + '生产引用者 immunity **不可达** ⇒ 差集条目'],
+  /* ── ★ 2026-11-19(第六轮):`prank/immunity.ts` + `prank/toys.ts` **已可达 ⇒ 摘除** ──
+   * 它们此前以「等施加整蛊的宿主」挂在表里,而那个宿主**已经在了**:
+   *   `sim/world_sim.ts` → `party/actions.ts:45` → `prank/actions.ts` → `prank/toys.ts`
+   *   → `prank/immunity.ts`(后两条是同目录值导入,`immunity.ts:15` 还 re-export 了 toys 的两个符号)。
+   * 传递闭包从 `PROD_ENTRIES` 走得到它们 ⇒ 留着会报「白名单失真(已可达,应移出)」,
+   * 而那是**真失真**(白名单的语义是「生产走不到」,不是「逻辑没写完」)。
+   * ⚠️ 与「toys 曾是差集条目」不冲突:`差集` 说的是「有生产引用者、但引用者自己不可达」,
+   *   现在引用者可达了,**两个判据同时失效**,故两处登记一起摘(
+   *   `PRANK-2 applyPrank` 是否还存在是另一件事,记在 `docs/AUDIT-W34.md §13`)。 */
   /* `social/afk.ts` 已随 task-84(WS-11 缺口 A)接线 ⇒ 从本表摘除。
      见上方 task-84 的整块说明。
      ⚠️ 它曾被记为「等房间每帧驱动(与 room 的 AFK **同名异义**)」——
@@ -4589,7 +4592,8 @@ export function bothSidesStructuredVerdict(count: number, lenient: boolean): Bot
  * ## 判据取的是**符号名 + 两侧文件:行**(不是只按名字放行)
  *
  * 每一条都写明两侧文件与两侧为什么口径不同;名字相同只是入口。
- * 这 7 条都是**跨层镜像**(服务端/客户端/shared 各一份),本仓禁改生产三层的
+ * 每一条都写明两侧文件与两侧为什么口径不同;名字相同只是入口。
+ * 这 8 条都是**跨层镜像**(服务端/客户端/shared 各一份),本仓禁改生产三层的
  * 前提下不能合并来源 ⇒ 按 owner 口径「能合并就合并,不能合并的逐条登记理由」处理。
  */
 export const BOTH_SIDES_STRUCTURED_REGISTERED: ReadonlyMap<string, string> = new Map<string, string>([
@@ -4618,6 +4622,15 @@ export const BOTH_SIDES_STRUCTURED_REGISTERED: ReadonlyMap<string, string> = new
   ['MoveIntent', '客户端 `client/src/net/session.ts:252` 比服务端 `server/src/net/anticheat.ts:284`'
     + '多一个可选 `seq?`(上行序号);服务端反作弊只读它需要的字段(`tick/x/y/z/speedMul?`)。'
     + '两侧是同一报文的**不同消费面** ⇒ 有意镜像。'],
+  ['WiringStatus',
+    '**同名异值 · 镜像对**:`server/src/combat/wiring_ledger.ts:32` 的 `WIRING_STATUS` 是三值'
+    + '(`WIRED` / `UNWIRED` / `RESERVED`,大写值 —— 它描述**战斗侧**符号的接线账);'
+    + '`client/src/wiring_ledger.ts:40` 的 `WiringStatus` 是两值(`WIRED` / `BLOCKED`,小写值 ——'
+    + '它描述**客户端**条目,且「没接」只有一种形态:blocked + reason)。'
+    + '两侧词表本就不同,不是同一份枚举被抄两遍;而客户端**不能** import 服务端'
+    + '(跨层守卫 `checkCrossLayerImports` 禁止 client 说明符落到 server 之下)⇒ 只能各声明一份。'
+    + '(2026-11-19 第六轮:`client/src/wiring_ledger.ts` 是这一轮新增的,'
+    + '`tests/WS-FND-99` 的真实命中清单同步加了 `WiringStatus`;此处补登记理由。)' ],
 ]);
 
 /** 结构化命中数(汇总行用)。`null` = 本节没跑(`checkTautology` 无条件跑它)。 */
@@ -5120,9 +5133,9 @@ export const CROSS_ANNOTATION: ReadonlyMap<string, string> = new Map<string, str
     '可达性侧:传递不可达;orphan 侧:生产零引用。'
     + '相容原因:**服务端侧根本不该接**(纯视图计算),客户端侧宿主不存在 —— '
     + '所以"不可达"与"零引用"在这里都是**正确状态**,不是待办。'],
-  ['server/src/prank/immunity.ts',
-    '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
-    + '相容原因:等 `applyPrank` 这个施加端,两边同一处未接线。'],
+  /* ★ 2026-11-19(第六轮):`server/src/prank/immunity.ts` 的交叉标注**摘除** ——
+     它已随可达性白名单一起摘(见那里:`party/actions.ts` → `prank/actions.ts` 值导入),
+     而 R2 是**双向**判据:本表每一条必须「确实同时在两张表里」,留着就成墓碑。 */
   ['shared/testing/harness.ts',
    '可达性侧:传递不可达(没有任何生产根能走到它);orphan 侧:生产零引用(直接引用=0)。'
    + '两者相容的原因:它是**测试夹具**(只被 tests/** 消费、生产侧真 importer=0),故既不在生产闭包里、'

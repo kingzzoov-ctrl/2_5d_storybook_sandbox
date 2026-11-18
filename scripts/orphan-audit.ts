@@ -107,7 +107,11 @@ export const ORPHAN_KNOWN = new Map<string, string>([
    *     笼统的理由在事实变化后会继续豁免**,不会自己失效;
    *     与 `UNREACHABLE_EXEMPT` 的「理由过时」是同一个病。
    */
-  ['server/src/prank/immunity.ts', 'WS-11 整蛊免疫;待接 applyPrank'],
+  /* ★ 2026-11-19(第六轮):`server/src/prank/immunity.ts` **已可达 ⇒ 摘除**。
+     接线路径(值导入,不是类型边):`sim/world_sim.ts` → `party/actions.ts:45`
+     → `prank/actions.ts` → `prank/toys.ts` → `prank/immunity.ts`。
+     本表自检那次「已可达,应移出」就是本轮的发现机制 —— 留着会让
+     「登记 10 / 实测 9」永远不相等(FND90-6 / FND103-12 / FND117-6 都钉着这个等式)。 */
   /* ⚠️ 2026-11-14 订正措辞(task-84 顺手;旧文案是「WS-08 电路可视视图;待客户端接线」)。
    *
    * **归属不变:它仍是 orphan。** 改的只是理由 —— 旧措辞把两件**方向相反**的事

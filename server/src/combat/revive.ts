@@ -193,12 +193,34 @@ export function tickGhostBubble(d: DownedState, dt: number): GhostBubbleTick {
   return { downed: next, revived: false };
 }
 
-/** 幽灵泡泡期间完全免伤:takenMul 归零由 damage.ts 的第 6 步兑现。 */
+/**
+ * 幽灵泡泡期间完全免伤:`takenMul` 归零(由 `damage.ts` 第 6 步兑现)。
+ *
+ * ⚠️ 第六轮实测 P1(规则两套):**本函数在生产里仍无调用点,而且不该有。**
+ *   「倒地 = 免伤」的实际执行点是 `vitals.ts` 的
+ *   `applyHit` / `applyDamage` 开头那句 `if (v.downed) return` —— 那是**唯一**
+ *   能拿到瞬时真值(`vitals.downed` 在 HP 归零的同一帧置位)的地方。
+ *   若在编排层再乘一次本函数,同一次伤害会被判两遍,且两处判据会漂移
+ *   (本仓点名的缺陷形态)。⇒ 登记为 `UNWIRED`(规则已由 `vitals` 拥有),
+ *   见 `combat/wiring_ledger.ts`。本函数保留给 `takenMul` 的**纯函数**判据用。
+ */
 export function ghostDamageMul(d: DownedState): number {
   return d.state === BodyState.GHOST_BUBBLE ? 0 : 1;
 }
 
-/** 幽灵泡泡期间位移乘数与动作权限。 */
+/**
+ * 幽灵泡泡期间位移乘数与动作权限。
+ *
+ * ★ 第六轮实测 P1:本条**已接线**(动作权限那一半)—— `WorldSim` 的攻击闸
+ *   (`attackMobAuthorized` / `attackPlayerAuthorized`)不再自己手判 `downed`,
+ *   而是经 `WorldSim#canActAsPlayer` → 本函数的 `canAttack`。
+ *   修前那两处是「手判一套 + 本函数一套」两份规则,谁也没读过这里。
+ *
+ * ⚠️ `moveMul` 的消费点(慢帧位移)与 `canBeHealed`(`vitals.heal` 的
+ *   `if (v.downed) return 0`)都**不在本模块**:前者仍读 `vitals.downed`、
+ *   后者在 `vitals.heal`。两条**没有**改接 —— 理由同上(同一帧真值只有
+ *   `vitals` 有)。已在台账里写明,不要把那两条读成「经这里判定」。
+ */
 export function ghostControl(d: DownedState): { moveMul: number; canAttack: boolean; canBeHealed: boolean } {
   const ghost = d.state === BodyState.GHOST_BUBBLE;
   return {
@@ -207,7 +229,6 @@ export function ghostControl(d: DownedState): { moveMul: number; canAttack: bool
     canBeHealed: !ghost,
   };
 }
-
 /* ───────────────────────────── 手动触摸救援(1 秒半血) ───────────────────────────── */
 
 export interface TouchReviveInput {
