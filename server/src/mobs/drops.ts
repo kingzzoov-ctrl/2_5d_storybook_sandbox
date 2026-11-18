@@ -13,19 +13,27 @@
  *
  * ## 判定口径(全部可判定)
  *   1 **必掉项仍必掉**:`chance` 缺省 / `>= 1` ⇒ `roll ∈ [0,1)` 恒小于它 ⇒ **每次都掉**。
- *   2 **同种子可复现**:随机数是 `(seed, mobId, itemId)` 的**纯函数**
- *     (`fnv1a32`,与内容指纹 / 存档 checksum 同族)→ 同种子同怪同物品 ⇒ 同结果,
+ *   2 **同种子可复现**:随机数是 `(seed, mobId, itemId, killKey)` 的**纯函数**
+ *     (`fnv1a32`,与内容指纹 / 存档 checksum 同族)→ 同种子同怪同物品**同一次击杀** ⇒ 同结果,
  *     且**不依赖调用顺序**(不是流式 RNG,不存在「谁先抽谁影响谁」)。
  *   3 **长期频率 ≈ 概率**:`roll` 在 `[0,1)` 上近似均匀 ⇒ `P(drop) = chance`。
+ *     ⚠ 这一条**只在 `killKey` 逐次不同**时成立 —— 见第 5 条。
  *   4 非法输入**拒绝**而不是污染:
- *     - `chance` 非有限 / `<= 0` ⇒ 该物品**不掉**(fail-closed,不许静默变成必掉);
  *     - `chance` 非有限 / `<= 0` ⇒ 该物品**不掉**(fail-closed,不许静默变成必掉);
  *     - `chance > 1` ⇒ 钳到 1(必掉);
  *     - 未知 `mobId` ⇒ 空掉落(不抛错,调用方在受击/击杀热路径上);
  *     - `seed` 非有限 ⇒ 按 `0` 处理(仍是确定值,不是 `NaN` 随机)。
+ *   5 **击杀实例维(`killKey`)** —— 第三轮实测 **P1**:roll 只吃 `(seed, mobId, itemId)` 时,
+ *     同一世界里同种怪**每次击杀**的 roll 完全相同 ⇒ `dropChance` 退化成「该物种在这个世界
+ *     **必掉 / 必不掉**」(实测 0% 或 100%),与第 3 条自相矛盾。修法:调用方把**每一次击杀的
+ *     唯一标识**作为 `killKey` 传进来(生产传实例 id `` `mob_species#序号` ``,见
+ *     `world_sim.ts#settleKill`)⇒ 同一次击杀可复现、不同次击杀在概率上**独立**。
+ *     `killKey` 缺省 / 空串 = **不启用该维**(哈希串里不追加该段,逐位等于修前口径),
+ *     只留给「一个物种只判一次」的纯函数调用点。
  * ## 不引入新依赖
- * 随机源是本文件内的 FNV-1a 32 位哈希(**6 行**),不引第三方 RNG,也不用 `Math.random()`
- * (它**不可复现**,判据就没法写)。
+ * 随机源是本文件内的 FNV-1a 32 位哈希(**6 行**),外加**击杀实例维路径上的一次 32 位雪崩**
+ * (`avalanche32`,6 行 —— 为什么不能省见它的 docblock),不引第三方 RNG,也不用
+ * `Math.random()`(它**不可复现**,判据就没法写)。
  *
  * ⚠️ 这里**故意不**复用 `content/registry.ts` 里的那份 `fnv1a32`:
  * `tests/WS-FND-01.ts#FND1-T43-1` 钉着一条可达性事实 —— registry.ts 的**生产引用者必须
@@ -45,6 +53,29 @@ function hash32(s: string): string {
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return h.toString(16).padStart(8, '0');
+}
+
+/**
+ * 32 位**雪崩**混合(murmur3 的 `fmix32`,6 行;与 FNV-1a 同一「自包含、不引依赖」取舍)。
+ *
+ * ## 为什么需要它(**实测**)
+ * FNV-1a 的**末位字符**几乎不扩散:两个输入只差最后一个字符时,输出恰好差
+ * `(c1 ^ c2) * 0x01000193`(mod 2^32)—— 一个与全部前缀无关的**常量**。于是
+ * `mob_squirrel#8` 与 `#9` 的 roll 只差 `0.0039` 量级 ⇒ 连打 100 次同种怪会得到
+ * **成段相同**的结果(实测 seed 7 呈「9 掉 / 9 不掉 / …」阶梯,seed 9 整整 100 次全不掉),
+ * 「同种怪每次击杀独立」根本没成立 —— 只是把「恒掉 / 恒不掉」换成了「阶梯」。
+ *
+ * 故**只在带击杀实例维的那条路径上**做一次雪崩(不带 `killKey` 的旧口径逐位不变,
+ * 见 `mobDropRoll`);这 6 行买到的是「逐次击杀近似独立采样」。
+ */
+function avalanche32(h: number): number {
+  let x = h >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x85ebca6b) >>> 0;
+  x ^= x >>> 13;
+  x = Math.imul(x, 0xc2b2ae35) >>> 0;
+  x ^= x >>> 16;
+  return x >>> 0;
 }
 
 /** 缺省概率 = **必掉**(手册没写概率的项)。 */
@@ -118,25 +149,36 @@ function safeSeed(seed: number): number {
 }
 
 /**
- * `(seed, mobId, itemId)` 的确定 roll ∈ `[0,1)`。
+ * `(seed, mobId, itemId, killKey)` 的确定 roll ∈ `[0,1)`。
  *
- * 三个输入全进哈希 ⇒ 同一只怪的不同物品**各有独立**的 roll(不会「抽中一件就全中」),
- * 同一物品在不同世界种子下不同。**纯函数**:没有内部状态,调用顺序无影响。
+ * 四个输入全进哈希 ⇒ 同一只怪的不同物品**各有独立**的 roll(不会「抽中一件就全中」),
+ * 同一物品在不同世界种子下不同,**同一种怪的不同次击杀也不同**(见文件头第 5 条)。
+ *
+ * `killKey` = **这次击杀的唯一标识**(生产传实例 id,如 `mob_squirrel#7`);缺省 / 空串
+ * ⇒ 哈希串里**不追加**该段、也**不做雪崩**(逐位等于 WS-FND-98 修前的 `(seed, mobId, itemId)`
+ * 口径),只留给「一个物种只判一次」的调用点。**纯函数**:没有内部状态,调用顺序无影响。
  */
-export function mobDropRoll(seed: number, mobId: string, itemId: number): number {
-  /* 0x100000000 = 2^32:`hash32` 的值域是 [0, 2^32) ⇒ 商恰在 [0,1)。 */
-  return parseInt(hash32(`${safeSeed(seed)}|${mobId}|${itemId}`), 16) / 0x100000000;
+export function mobDropRoll(seed: number, mobId: string, itemId: number, killKey?: string): number {
+  const kill = typeof killKey === 'string' ? killKey : '';
+  const base = `${safeSeed(seed)}|${mobId}|${itemId}`;
+  /* 0x100000000 = 2^32:两个哈希的值域都是 [0, 2^32) ⇒ 商恰在 [0,1)。 */
+  if (kill === '') return parseInt(hash32(base), 16) / 0x100000000;
+  return avalanche32(parseInt(hash32(`${base}|${kill}`), 16)) / 0x100000000;
 }
 
 /**
- * 判定一次击杀的掉落。**同种子可复现**、必掉项恒在、概率项按 `chance` 抽。
+ * 判定一次击杀的掉落。**同种子同次击杀可复现**、必掉项恒在、概率项按 `chance` 抽。
+ *
+ * `killKey` = **这一次击杀的唯一标识**(生产传实例 id,如 `mob_squirrel#7`)。
+ * ⚠ 不传它时 roll 只吃 `(seed, mobId, itemId)`,同一世界里同种怪**每次击杀都得到同一份
+ * 掉落**(退化成「该物种在这个世界必掉 / 必不掉」)—— 生产调用点必须传(见文件头第 5 条)。
  *
  * 返回顺序 = `mobDropTableOf` 的顺序(itemId 升序),便于逐位比对。
  */
-export function rollMobDrops(mobId: string, seed: number): MobDropResult[] {
+export function rollMobDrops(mobId: string, seed: number, killKey?: string): MobDropResult[] {
   const out: MobDropResult[] = [];
   for (const entry of mobDropTableOf(mobId)) {
-    const roll = mobDropRoll(seed, mobId, entry.itemId);
+    const roll = mobDropRoll(seed, mobId, entry.itemId, killKey);
     if (entry.chance >= 1 || roll < entry.chance) {
       out.push({ itemId: entry.itemId, count: entry.count, chance: entry.chance, roll });
     }
@@ -145,6 +187,6 @@ export function rollMobDrops(mobId: string, seed: number): MobDropResult[] {
 }
 
 /** 判定结果的**物品 id 集合**(判定用的最简形状,判据主要读它)。 */
-export function rolledDropIds(mobId: string, seed: number): number[] {
-  return rollMobDrops(mobId, seed).map((d) => d.itemId);
+export function rolledDropIds(mobId: string, seed: number, killKey?: string): number[] {
+  return rollMobDrops(mobId, seed, killKey).map((d) => d.itemId);
 }

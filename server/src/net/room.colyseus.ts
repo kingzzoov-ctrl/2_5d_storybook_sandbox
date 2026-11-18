@@ -236,6 +236,14 @@ export class NetPersistRoom extends Room<RoomSchema> {
   private deps!: NetPersistRoomOptions;
   private lastBroadcastState: ReturnType<RoomRuntime['cloneState']> | null = null;
 
+  /**
+   * ★ P1-1(2026-11-19):**连接 → 成员键**的绑定表(`Colyseus sessionId → 成员键`)。
+   *
+   * 建表/拆表/取键三件事都收敛在 `bindSeat` / `seatKeyOf` / `unbindSeat`
+   * 三个方法里(缺陷形态与修法见 `bindSeat` 的长注释)。
+   */
+  private seatKeys = new Map<string, string>();
+
   override onCreate(options: RoomCreateOptions): void {
     assertSchemaReady();
     this.maxClients = Math.min(16, Math.max(1, options.maxPlayers ?? 16));
@@ -334,6 +342,77 @@ export class NetPersistRoom extends Room<RoomSchema> {
   }
 
   /**
+   * ★ P1-1(2026-11-19):**席位键** —— 装配层里**唯一**一处决定「拿哪个串去调 runtime」。
+   *
+   * ## 缺陷形态(修前,三处调用点都是同一个错串)
+   *
+   * (下列行号是**修前那一版**的;修完后这三处都经本方法取键)
+   * ```
+   * onJoin      :361-368   userId = 凭证里的 userId(带 token 入场者)   ← 成员键
+   * onLeave     :393       this.runtime.leave(client.sessionId)         ← 另一个串
+   * onMessage   :439/449/483/510  applyMove(client.sessionId, ...)      ← 同一个错串
+   * ```
+   * `sessionId` 是 Colyseus **服务端生成**的连接号,而凭证里的 `userId` 是
+   * 身份来源 —— 两者**逐字不同** ⇒ 带凭证入场的人身上会同时发生两件事:
+   * ```
+   * 1 席位/连接旁表**永不回收**:`leave(sessionId)` 在 `members` 里查不到
+   *   (`:1622` 的 `members.get` = undefined)⇒ 直接 `return false`
+   *   ⇒ 房间根本不知道有人在退房,人走了席位还在、重连也拿不到 resumed;
+   * 2 输入**整条落空**:`applyMove(sessionId, ...)` ⇒ 反作弊里没有这个 id
+   *   (`anticheat.ts:1113` 的 `states.get(playerId)` = undefined)
+   *   ⇒ `allowed:false` ⇒ 客户端每帧收到一条 `correct`,
+   *     外部表现是「WASD 按了没反应」,而服务端**不报任何错**。
+   * ```
+   * ⚠️ 这正是本仓反复记的形态:**两个名字指同一件事,而只有一个是对的**。
+   *   它不会自己暴露:两条路径各自的局部断言(「凭证验过了」「handler 注册了」)
+   *   都还是绿的。
+   *
+   * ## 为什么是「绑定表 + 统一取键」,而不是二选一
+   * ```
+   * 把成员键统一成 sessionId ⇒ 房主(u_owner)永远进不来:
+   *   room.ts 判 OWNER 靠 `input.userId === this.ownerId`(:1486),
+   *   而 sessionId 不可能等于 'u_owner' ⇒ 房主凭证白验(见 onJoin 的威胁模型);
+   * 把成员键统一成凭证 userId ⇒ 无 token 的存量客户端没有 userId 可当键
+   *   (`onJoin` 明写「无 token ⇒ 行为不变」)。
+   * ```
+   * ⇒ 键的**取值规则不变**(有凭证 ⇒ 凭证的 userId;没凭证 ⇒ sessionId),
+   *   变的是「三条路径都经同一个函数取它」—— 于是不可能再分叉。
+   *
+   * ## 三条路径的一致性(逐条)
+   * ```
+   * onJoin     :入场成功后 bindSeat(sessionId, userId);
+   * 重连       :Colyseus 侧是**新连接**(新 sessionId)⇒ 再次 onJoin
+   *            ⇒ 表里旧键由 bindSeat 顺手拆掉(一名成员只留一条绑定),
+   *              新键指向**同一个** userId ⇒ 席位走 room.ts 的 resumed 路径;
+   * onLeave    :unbindSeat(sessionId) 拿到键**并**拆掉旁表 ⇒ leave/disconnect
+   *            (修前旁表在这里永不回收,正是缺陷的一半);
+   * onMessage  :seatKeyOf(client) ⇒ 与上面两条**同一个**键。
+   * ```
+   */
+  private bindSeat(sessionId: string, userId: string): void {
+    /* ★ 同一成员只该有一条活连接(`room.ts` 的 join 对在线者直接回
+       「该用户已在线」,不会走到这里)⇒ 先把它的旧绑定拆掉,免得重连换了
+       sessionId 之后旧键永远留在表里(那会让「旁表不回收」的形态复活,
+       只是换了个地方)。 */
+    for (const [sid, uid] of [...this.seatKeys]) {
+      if (uid === userId && sid !== sessionId) this.seatKeys.delete(sid);
+    }
+    this.seatKeys.set(sessionId, userId);
+  }
+
+  /** 取本条连接该用的成员键(规则与理由见 `bindSeat` 的长注释)。 */
+  private seatKeyOf(client: Client): string {
+    return this.seatKeys.get(client.sessionId) ?? client.sessionId;
+  }
+
+  /** 拆掉本条连接的绑定并**回传**它的成员键(`onLeave` 用)。 */
+  private unbindSeat(sessionId: string): string {
+    const key = this.seatKeys.get(sessionId) ?? sessionId;
+    this.seatKeys.delete(sessionId);
+    return key;
+  }
+
+  /**
    * 入场。**身份与鉴权(审计 P0-1)**:
    *
    * ## 这一条路径的威胁模型与裸 WS **不同**,必须明说
@@ -353,6 +432,12 @@ export class NetPersistRoom extends Room<RoomSchema> {
    * ```
    * ⚠️ 那条"不静默降级"是关键:伪造的凭证如果被当成"没给凭证"放过去,
    *   就等于"客户端决定服务端怎么解读它的输入"(CR-14 U1 同形)。
+   *
+   * ## ★ P1-1(2026-11-19):入场成功之后,**键必须跟着凭证走**
+   * 上面那段决定的是「这次入场算谁」;而同一次入场之后,离开 / 报文 /
+   * 重连三条路径**必须**用**同一个键**。修前只有本方法用凭证的 userId,
+   * 另外三处用 `client.sessionId` ⇒ 席位不回收、输入全落空 ——
+   * 形态、后果与修法见 `bindSeat` 的长注释(它是本装配层唯一的取键口径)。
    */
   override onJoin(client: Client, options: { passwordHash?: string; asGuest?: boolean; token?: string }): void {
     const token = typeof options?.token === 'string' && options.token.length > 0
@@ -375,7 +460,11 @@ export class NetPersistRoom extends Room<RoomSchema> {
       passwordHash: options?.passwordHash ?? null,
       asGuest: options?.asGuest ?? false,
       /* 有凭证 ⇒ 让房间**再验一次**(同一份实现、同一把密钥:签发与校验收敛在一处);
-         无凭证 ⇒ 不强制(见上面的威胁模型说明)。 */
+         无凭证 ⇒ 不强制(见上面的威胁模型说明)。
+         ★ P1-3(2026-11-19):这一步与上面 `decodeJoinToken` 是**同一口径** ——
+         断线宽限期内「过期」按**断线时刻**起算(`reconnectTokenGraceUntilMs`),
+         故会话超过 5 分钟的人掉线后仍能在 30s 内重连;修前它必然被拒,
+         而拒因写的是「token 已过期」(看起来像客户端的问题)。 */
       token,
       requireToken: token !== undefined,
     });
@@ -383,18 +472,28 @@ export class NetPersistRoom extends Room<RoomSchema> {
       client.leave(4000, res.reason ?? 'join rejected');
       return;
     }
+    /* ★ P1-1:入场**成功之后**才建绑定 —— 被拒的连接不许在表里留键,
+       否则 `unbindSeat` 会把一个房间从没收过的 userId 交给 leave/disconnect。 */
+    this.bindSeat(client.sessionId, userId);
     /* 入场报文:全量快照(重连时是逐字节一致的恢复快照)。 */
     if (res.snapshot) client.send('snapshot', res.snapshot);
     this.schema().syncFrom(this.runtime.cloneState());
   }
 
   override onLeave(client: Client, consented?: boolean): void {
+    /* ★ P1-1:键必须经过 `unbindSeat` —— 修前这里写死 `client.sessionId`,
+       而带凭证入场者的成员键是**凭证里的 userId** ⇒ `leave()`/`disconnect()`
+       查不到人,席位与连接旁表**都不回收**(形态见 `bindSeat`)。
+       它同时负责拆表:`onLeave` 是连接消失的那一点。 */
+    const key = this.unbindSeat(client.sessionId);
     /* 主动退房直接回收;异常断开保留 30 秒宽限。 */
-    if (consented) this.runtime.leave(client.sessionId);
-    else this.runtime.disconnect(client.sessionId);
+    if (consented) this.runtime.leave(key);
+    else this.runtime.disconnect(key);
   }
 
   override onDispose(): void {
+    /* ★ P1-1:房间销毁 ⇒ 连接旁表一并清掉(席位表由 `runtime.close()` 负责)。 */
+    this.seatKeys.clear();
     this.runtime.close();
   }
 
@@ -436,7 +535,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
   /** 客户端输入:移动 / 攻击 / 物品。**只有这些入口**能改权威状态。 */
   private registerHandlers(): void {
     this.onMessage('move', (client, msg: { tick: number; x: number; y: number; z: number; speedMul?: number }) => {
-      const verdict = this.runtime.applyMove(client.sessionId, msg);
+      const verdict = this.runtime.applyMove(this.seatKeyOf(client), msg);
       if (!verdict.allowed) client.send('correct', verdict.corrected ?? null);
     });
     /* ⚠️ 报文里**只接受「打谁」**(mobId)与客户端的攻速声明。
@@ -446,7 +545,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
        这与 `inventory` 通道同一形态(见 CR-14 U1)。 */
     this.onMessage('attack', (client, msg: { claimedBonus?: number; mobId?: string }) => {
       const verdict = this.runtime.applyAttack(
-        client.sessionId,
+        this.seatKeyOf(client),
         msg?.claimedBonus ?? 0,
         typeof msg?.mobId === 'string' ? msg.mobId : undefined,
       );
@@ -480,7 +579,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
     this.onMessage('inventory', (client, msg: {
       ops: { itemId: number; delta: number; source?: string }[];
     }) => {
-      const r = this.runtime.applyInventory(client.sessionId, { ops: msg.ops });
+      const r = this.runtime.applyInventory(this.seatKeyOf(client), { ops: msg.ops });
       if (!r.allowed) client.send('reject', { kind: 'INVENTORY' });
     });
     /* ── action:授权 → 执行 → **回执**(2026-11-14 接线)──
@@ -507,7 +606,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
       action: Parameters<RoomRuntime['authorize']>[1];
       payload?: Parameters<RoomRuntime['dispatchAction']>[2];
     }) => {
-      const out = this.runtime.dispatchAction(client.sessionId, msg.action, msg.payload ?? {});
+      const out = this.runtime.dispatchAction(this.seatKeyOf(client), msg.action, msg.payload ?? {});
       if (out.ok) {
         client.send('actionResult', { ok: true, action: msg.action, effect: out.effect ?? null });
         return;

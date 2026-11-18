@@ -74,7 +74,7 @@
  *   只有 537 陈列被世界侧拒掉;现在预占失败 ⇒ 直接拒且**零副作用**。
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
-import { SETTLEMENT_ROOMS, settleKeyOf } from '../../systems/idempotency.ts';
+import { SETTLEMENT_LEDGER_CAPACITY, SETTLEMENT_ROOMS, settleKeyOf } from '../../systems/idempotency.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome, WorldSaveHost } from '../room.ts';
@@ -145,14 +145,39 @@ function claimLedgerOf(state: unknown): Map<string, number> {
 }
 
 /**
- * 这一单的键 = **世界侧那把键**(`ALCHEMY_LAB@ORDER:<订单号>`),由
+ * 这一单的键 = **世界侧那把键**(`ALCHEMY_LAB@ORDER:<命名空间串>`),由
  * `systems/idempotency.ts:settleKeyOf` 归一 —— 本文件不另写一份键格式。
  *
- * 没有 `orderId`(老报文)⇒ 退化成与 `WorldSim.brewAtFurnace` **同形**的派生键
- * `${actorId}#<材料升序>#<帧>`:同一炉同一帧重放会撞键(那正是要拒的),
- * 而换材料 / 换人 / 换帧不撞。
+ * ## ★ 两套键必须**不同命名空间 + 转义**(第三轮实测 P2)
+ *
+ * 修前显式订单号与派生键共用同一形 `ALCHEMY_LAB@ORDER:<串>`:客户端只要自造
+ * `orderId = "<别人的 actorId>#<材料>#<帧>"`,就与**别人合法炼金**的派生键**撞同一把**,
+ * 把对方那一炉永久判成重放(而且自己还顶了对方的键)。
+ *
+ * 现在两条路各自加**命名空间前缀**并把内部串 `encodeURIComponent` 转义:
+ * ```
+ * 显式订单号(报文给了)  ⇒ `req:<percent-encode(orderId)>`
+ * 派生键(报文没给)      ⇒ `der:<percent-encode(actor#材料升序#帧)>`
+ * ```
+ * 前缀不同 ⇒ 显式串**永远**造不出派生键(转义是单射,`#` / `:` / `%` 都被编码);
+ * 两个玩家的派生键本来就含 actorId,前缀 + 转义只让它更不可伪造。
+ * ⚠️ 这个命名空间串**就是**透传给 `brewAtFurnace` 的 `orderId`(见 `furnaceOrderIdOf`)
+ *    —— 动作侧预占键与世界侧台账键必须逐字同形,否则判重前移就失效。
  */
-export function furnaceClaimKeyOf(
+
+/** 显式订单号那一套键的命名空间前缀(见上)。 */
+export const FURNACE_KEY_NS_EXPLICIT = 'req';
+/** 派生(报文没给订单号)那一套键的命名空间前缀(见上)。 */
+export const FURNACE_KEY_NS_DERIVED = 'der';
+
+/**
+ * **这一单透传给世界侧的 `orderId`**:命名空间前缀 + 转义后的串(见上)。
+ *
+ * 动作侧预占键与 `WorldSim.brewAtFurnace` 的台账键都取它(`settleKeyOf` 再套
+ * `ALCHEMY_LAB@ORDER:` 前缀)⇒ 两侧逐字同形。动作侧**一律**显式喂它(即使报文没给
+ * 订单号也自己派生),于是世界侧不再走它自己的退化路径,两套键不可能再撞。
+ */
+export function furnaceOrderIdOf(
   actorId: string,
   consumedIds: readonly number[],
   tick: number,
@@ -160,11 +185,24 @@ export function furnaceClaimKeyOf(
 ): string {
   const sorted = [...consumedIds].sort((a, b) => a - b);
   if (orderId === null) {
-    return settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId: `${actorId}#${sorted.join('_')}#${tick}` })
-      ?? `${ALCHEMY_LAB_ROOM_KEY}@ORDER:${actorId}#${sorted.join('_')}#${tick}`;
+    return `${FURNACE_KEY_NS_DERIVED}:${encodeURIComponent(`${actorId}#${sorted.join('_')}#${tick}`)}`;
   }
-  return settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId })
-    ?? `${ALCHEMY_LAB_ROOM_KEY}@ORDER:${orderId}`;
+  return `${FURNACE_KEY_NS_EXPLICIT}:${encodeURIComponent(orderId)}`;
+}
+
+/**
+ * 这一单的**预占键** = 世界侧那把键。命名空间串由 `furnaceOrderIdOf` 给,这里只套
+ * `settleKeyOf` 的房间前缀(与 `WorldSim.brewAtFurnace` 同一处归一)。
+ */
+export function furnaceClaimKeyOf(
+  actorId: string,
+  consumedIds: readonly number[],
+  tick: number,
+  orderId: string | null,
+): string {
+  const namespaced = furnaceOrderIdOf(actorId, consumedIds, tick, orderId);
+  return settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId: namespaced })
+    ?? `${ALCHEMY_LAB_ROOM_KEY}@ORDER:${namespaced}`;
 }
 
 /**
@@ -172,8 +210,12 @@ export function furnaceClaimKeyOf(
  *
  * 与 `claimSettlement` 的语义逐条相同,但台账是**按房间实例**的在线索引
  * (见 `FURNACE_CLAIMS`):权威结算仍在世界侧 `brewAtFurnace`。
- * ⚠️ 失败(材料扣不动 / 产物收不下)必须 `releaseFurnaceOrder` —— 先占键再判成败
- * 会把订单永久锁死,那是比重复结算更坏的缺陷。
+ * ⚠️ 失败(材料扣不动 / 产物收不下 / 世界侧拒)必须 `releaseFurnaceOrder` ——
+ * 先占键再判成败会把订单永久锁死,那是比重复结算更坏的缺陷。
+ *
+ * ★ **线上索引也有界**(第三轮实测 P2):键来自客户端可控的 `orderId`,只增不删会让
+ *   本房间实例的索引在世代内无界;`Map` 保序 ⇒ 超 `SETTLEMENT_LEDGER_CAPACITY` 就删
+ *   **最老插入**的一条(与 `claimSettlement` 同一 FIFO 口径)。
  */
 export function claimFurnaceOrder(state: unknown, key: string, at: number): FurnaceClaim {
   const ledger = claimLedgerOf(state);
@@ -186,6 +228,11 @@ export function claimFurnaceOrder(state: unknown, key: string, at: number): Furn
   }
   const t = Number.isFinite(at) ? at : 0;
   ledger.set(key, t);
+  while (ledger.size > SETTLEMENT_LEDGER_CAPACITY) {
+    const oldest = ledger.keys().next();
+    if (oldest.done === true) break;
+    ledger.delete(oldest.value);
+  }
   return { ok: true, key, at: t };
 }
 
@@ -222,6 +269,23 @@ function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
+/**
+ * 世界侧拒绝是不是「这一单**已经进过世界台账**」(重放)?
+ *
+ * ⚠️ 本仓的 `WorldSaveHost.brewAtFurnace` 契约里**没有**结构化的 `replayed` 字段
+ * (只有 `ok` + `reason`)⇒ 只能按理由里那把幂等键的措辞判。这里的正/负样本是
+ * `systems/wiring.ts:brewInLabOnce` 与 `systems/alchemy_lab.ts:brewAndRecord` 的两句:
+ *   · 重放:`订单 … 已在 … 结算过(幂等键 …)⇒ 拒绝,陈列不变`;
+ *   · 其它(例:确定性配方只放 1 件,而 536 的**自由炼金**路径要求 2~4 件):
+ *     `材料件数 1 不在 [2, 4]`。
+ * 只有前者才是「静默出货」的形状(重复出第二炉);后者是陈列路径自身的输入约束,
+ * 产物该照发。契约补上 `replayed?: boolean` 之后,把这一句换成结构化字段即可。
+ */
+function worldRejectionLooksLikeReplay(reason: string | undefined): boolean {
+  if (typeof reason !== 'string') return false;
+  return reason.includes('结算过') || reason.includes('重放') || reason.includes('幂等');
+}
+
 /* ⚠️ 修前这里有 `AlchemyPayload` / `stockField`:材料明细取自报文里的 `have`
    (客户端自报)。审计 P1 之后材料只从**按件权威账**读,两个符号已删。 */
 
@@ -239,7 +303,9 @@ function numField(v: unknown): number | null {
  *   7 ★ **订单预占失败(同一单已结算过)⇒ `INVALID`,材料没扣、产物没发(判重前移)**;
  *   8 材料扣减被拒 ⇒ `INVALID`(预占已释放);
  *   9 产物收不下 ⇒ **退回材料** + `INVALID`(不吞;产物凭证已撤销,预占已释放);
- *  10 成功 ⇒ `OK` + `effect`(材料、产物、实际消耗明细)。
+ *   10 世界侧**判重(重放)** ⇒ `INVALID` + **回滚**(撤产物 / 收产物 / 释预占 / 退材料);非重放的
+ *      世界侧拒绝(如 1 件材料进不了 [2,4] 的陈列路径)⇒ 产物照发,只在 `galleryNote` 带因;
+ *   11 成功 ⇒ `OK` + `effect`(材料、产物、实际消耗明细)。
  */
 export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* 1 权限闸:越权在此返回,且**未产生任何副作用**(背包一个数都没动)。 */
@@ -328,13 +394,16 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
      ⚠️ 权威结算仍在世界侧 `brewAtFurnace`(它按同一把键 `ALCHEMY_LAB@ORDER:<订单号>`
      记进 `roomSystemsState.settled`)—— 这里**不是第二张结算台账**,而是
      「在扣任何东西之前先确认这单没结算过」的那一步。键由 `settleKeyOf` 归一,
-     两侧逐字同形(没有订单号时退化成与 `brewAtFurnace` 同形的
-     `${actorId}#<材料升序>#<帧>`)。 */
+     两侧逐字同形(命名空间 + 转义后的串见 `furnaceOrderIdOf`;动作侧**一律**显式喂它,
+     世界侧不再走自己的退化路径 ⇒ 显式串与派生键不可能撞)。 */
   const tick = tickOf(ctx);
   const consumedIds = Object.entries(match.consumed)
     .filter(([, n]) => n > 0)
     .map(([k]) => Number(k))
     .sort((a, b) => a - b);
+  /* ★ 这一单的**世界侧 orderId**(命名空间 + 转义):预占键与 `brewAtFurnace` 的台账键
+     都取它 ⇒ 两侧同形。见 `furnaceOrderIdOf` 上方「两套键必须不同命名空间」。 */
+  const claimOrderId = furnaceOrderIdOf(ctx.actorId, consumedIds, tick, orderId);
   const claimKey = furnaceClaimKeyOf(ctx.actorId, consumedIds, tick, orderId);
   const claim = claimFurnaceOrder(ctx.state, claimKey, tick);
   if (!claim.ok) {
@@ -401,16 +470,25 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
   /* `brewAtFurnace` 是 `WorldSaveHost` 的**可选**成员:老世界源没有它就
      如实标 `gallery: null`(而不是假装陈列已更新)。
 
-     ★ WS-FND-96:把请求号**透传**下去(第三参 `opts.orderId`)—— 世界侧据此
+     ★ WS-FND-96:把请求号 **透传**下去(第三参 `opts.orderId`,取本文件的
+     `claimOrderId` —— 命名空间 + 转义后的串,见 `furnaceOrderIdOf`)—— 世界侧据此
      判重,同一单号重发 ⇒ `ok:false` + 理由,`craftCount` / 冠名 / 陈列一位不动。
      这一层**不做**判重(那会是第二份实现):键的归一与台账都在
-     `systems/idempotency.ts` + `WorldSim.brewAtFurnace`。 */
+     `systems/idempotency.ts` + `WorldSim.brewAtFurnace`。
+
+     ★ **世界侧判重(重放)⇒ 整笔失败 + 回滚**(第三轮实测 P2):修前只把世界侧的理由塞进
+     `galleryNote` 而**照旧返回 `ok:true`**(材料已扣、产物已发、预占还滞留在
+     `FURNACE_CLAIMS`)—— 一笔**没进世界台账的静默出货**。现在**重放**那一拒就
+     撤销产物凭证 ⇒ 收回产物 ⇒ 释放预占 ⇒ 退回材料,并如实返回 `INVALID`。
+     ⚠️ **不是所有**世界侧拒绝都算重放:确定性配方只放 1 件(165 = `{108:1}`)时,536 的
+     **自由炼金**路径会以「材料件数 1 不在 [2,4]」拒 —— 那只是陈列记不上,不是重复出货,
+     产物照发(`galleryNote` 如实带因)。判别见 `worldRejectionLooksLikeReplay`。 */
   let certificate: Record<string, unknown> | null = null;
   let display: unknown = [];
   let brewReason: string | null = null;
   const brew = ctx.host.brewAtFurnace as FurnaceBrewWithOrder | undefined;
   if (typeof brew === 'function') {
-    const out = brew.call(ctx.host, ctx.actorId, consumedIds, orderId === null ? undefined : { orderId });
+    const out = brew.call(ctx.host, ctx.actorId, consumedIds, { orderId: claimOrderId });
     if (out.ok) {
       certificate = {
         ...(out.entry ?? {}),
@@ -419,6 +497,28 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
       display = out.display;
     } else {
       brewReason = out.reason ?? '炼金记录被拒';
+      if (worldRejectionLooksLikeReplay(out.reason)) {
+        /* ★ 世界侧**重放**判重 = 这一炉与旧账重复且没进世界台账 ⇒ 不许出货。
+           回滚顺序与第 9 步同构:撤凭证 → 收回产物 → 释放预占 → 退回材料;失败写进回执。 */
+        unbindItemSource(ctx, src);
+        const takeBack = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -made }] });
+        releaseFurnaceOrder(ctx.state, claim.key);
+        const refund = ctx.applyInventory(ctx.actorId, {
+          ops: spendOps.map((op) => ({
+            itemId: op.itemId,
+            delta: -op.delta,
+            source: bindItemSource(ctx, op.itemId, ItemSourcePurpose.CRAFT_REFUND),
+          })),
+        });
+        return {
+          ok: false, kind: 'INVALID',
+          reason: `世界侧拒绝这一炉(${brewReason})⇒ 已回滚:产物收回、材料退回、预占释放`
+            + (takeBack.allowed ? '' : `(产物收回被拒:${takeBack.rejectCode ?? '被拒'})`)
+            + (refund.allowed ? '' : `(材料退回被拒:${refund.rejectCode ?? '被拒'})`),
+        };
+      }
+      /* 非重放的世界侧拒绝(例:1 件材料的确定性配方进不了 [2,4] 的陈列路径)⇒
+         没有「重复出货」这回事,产物照发,只在 `galleryNote` 里如实带因。 */
       display = out.display;
     }
   } else {

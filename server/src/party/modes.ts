@@ -260,10 +260,32 @@ export function bridgeCapture(r: BridgeRunRuntime, team: TeamKey): boolean {
   return true;
 }
 
-/** 冲刺阶段结束时结算:未夺旗队伍按已建桥板数折算安慰分。 */
+/**
+ * 冲刺阶段结束时结算:未夺旗队伍按已建桥板数折算安慰分。
+ *
+ * ## ★ 幂等 + 相位门槛(第三轮实测缺陷)
+ *
+ * 改前这个函数**没有结算标记、也没有相位门槛**:每调一次就
+ * `score += built × BRIDGE_SCORE_PER_TILE` 一遍。于是
+ *   · 重复调用(编排层重发同一帧、重试、测试里手滑两次)⇒ 安慰分翻倍;
+ *   · 建造阶段 / 冲刺中途调用 ⇒ 「没打完就先发安慰分」。
+ * 两条都不报错,只是分数悄悄不对 —— 而分数就是本模式的唯一产出。
+ *
+ * 修法分两步,判据各自独立:
+ *   1 **幂等**:`r.mode.settlement` 是既有的结算句柄(`tickPartyMode` 到点把
+ *     相位置成 `SETTLED`)。非空 ⇒ 直接返回那一份,**不重算、不加分**;
+ *   2 **相位门槛**:只有 `SETTLED` 才折算安慰分,且只有那时才**占用**结算句柄
+ *     (`r.mode.settlement` 保持 `null`)—— 提早调用拿到的是一份「当前排名、
+ *     无安慰分」的快照,之后的正常结算仍会照常发生。
+ */
 export function settleBridgeRun(r: BridgeRunRuntime): PartySettlement {
-  for (const t of TEAM_ORDER) {
-    if (!r.flagged.get(t)) getTeam(r.mode.board, t).score += (r.built.get(t) ?? 0) * BRIDGE_SCORE_PER_TILE;
+  /* 1 幂等:已结算 ⇒ 原样返回(第二次调用一分不加)。 */
+  if (r.mode.settlement !== null) return r.mode.settlement;
+  /* 2 相位门槛:只有冲刺阶段走完(SETTLED)才发安慰分。 */
+  if (r.mode.phase === PARTY_PHASE.SETTLED) {
+    for (const t of TEAM_ORDER) {
+      if (!r.flagged.get(t)) getTeam(r.mode.board, t).score += (r.built.get(t) ?? 0) * BRIDGE_SCORE_PER_TILE;
+    }
   }
   const rows = TEAM_ORDER.map((t) => ({ team: t, value: getTeam(r.mode.board, t).score }));
   rows.sort((a, b) => (b.value - a.value) || (TEAM_ORDER.indexOf(a.team) - TEAM_ORDER.indexOf(b.team)));
@@ -283,7 +305,8 @@ export function settleBridgeRun(r: BridgeRunRuntime): PartySettlement {
     personalRewards: [],
     broadcastText: text,
   };
-  r.mode.settlement = settlement;
+  /* 只在相位真的走完时才占用结算句柄(提早调用 ⇒ 不锁死后面的正常结算)。 */
+  if (r.mode.phase === PARTY_PHASE.SETTLED) r.mode.settlement = settlement;
   return settlement;
 }
 

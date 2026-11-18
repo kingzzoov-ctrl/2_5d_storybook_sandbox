@@ -3,6 +3,10 @@
 - **日期**:2026-11-18
 - **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。**2026-11-18 第三批处置**:再关 **3 条**(P2-13 上界 / P3-6 钳制选址 / P3-8 双端同源拦截)+ 订正本文件与代码现状矛盾的措辞(P3-9),判据 `tests/WS-FND-95-gate-and-bounds.test.ts`;详见 §7.5 与 §8。**现存仍登记 4 条**:P2-3 / P3-1 / P3-5 / P3-9。
 - **2026-11-18 第四批处置(第二轮)**:新审计的 **8 条 P1 + 12 条 P2/P3** 全部已修且各有判据(`tests/WS-FND-102..105`,共 42 条判据);逐条见 §9。
+- **2026-11-18 第五批处置(第三轮)**:本轮新审计的 **6 条 P1 + 12 条 P2/P3** 全部已修且各有判据,判据落在
+  `tests/WS-FND-106-connection-lifecycle.test.ts`(13 条)、`tests/WS-FND-107-idempotency-hardening.test.ts`(9 条)、
+  `tests/WS-FND-108-boss-party-bounds.test.ts`(6 条),外加 `tests/WS-FND-98` 的**补正 3 条**(14 → 17);
+  逐条见 §10(含世界侧 `tended` 生产者的五处接线)。
 - **口径**:本文件是交付物,不新增门禁;`docs/` 下其它文件一概未动。
 
 ## 1 覆盖率
@@ -372,3 +376,90 @@ this.expireItemSources();
   连带 HANDOVER §三「同义反复候选 **0 条**(白名单 0)」与实测 1/0 不符。
   修点在 `tests/WS-FND-102`(期望值改字面量 + 留常量锚点)或 `verify.ts` 白名单;本批**未动**。
 - 未跑 `content-lock`(未碰内容表);未 commit、未碰 `.pi/`。
+
+## 10 2026-11-18 第三轮处置(第五批:6 条 P1 + 12 条 P2/P3)
+
+> 判据:`tests/WS-FND-106-connection-lifecycle.test.ts`(13 条)、
+> `tests/WS-FND-107-idempotency-hardening.test.ts`(9 条)、
+> `tests/WS-FND-108-boss-party-bounds.test.ts`(6 条)—— 共 **28 条**,
+> 外加 `tests/WS-FND-98-knockback-and-drops.test.ts` 的**补正 3 条**(14 → 17)。
+> 下面 18 条按**发现**去重计数(同一修法的正/负对照算一条);严重度按 §2 的定义标注,
+> 套件文件头已写明各自的条目归属:**P1 6 条 / P2·P3 12 条**。
+> 关闭口径不变:已修 = 标记 ∧ 可查证据(每条点到判据编号)。
+
+### 10.1 判据 ↔ 条目对照
+
+| 套件 | 条数 | 钉住的条目 |
+|---|---:|---|
+| WS-FND-106 | 13 | P1-A 成员键不一致(1/2/3/4/5)· P1-B 超期回收漏清世界(6/7/8)· P1-C 凭证不续期(9/10/11/12/13) |
+| WS-FND-107 | 9 | P1-D 世界侧重放静默出货(5)· P1-E 炼金键命名空间(4)· P2-1 `@DAY` 负小数撞键(1)· P2-2 结算台账无界(2)· P2-3 牧场零产出占键(3/9)· P2-4 预占索引无界(7)· P2-5 跨玩家顶键(6)· P3-1 `buyOnce` `at` 槽口径(8) |
+| WS-FND-108 | 6 | P2-6 重复召唤重置满血(1)· P2-7 负伤害回血(2)· P2-8 非有限伤害毒化(3)· P3-2 `evaluateBreak` 缺字段抛(4)· P2-9 `settleBridgeRun` 非幂等(5)· P2-10 急单 `tended` 无生产者(6) |
+| WS-FND-98(补正) | +3 | P1-F 击杀掉落丢**实例维**(15/16/17) |
+
+### 10.2 逐条处置(18 条)
+
+**P1(6 条)**
+
+| # | 发现与落点 | 处置(判据) |
+|---|---|---|
+| P1-A | 连接生命周期:入场者的成员键取**凭证里的 `userId`**,而 `onLeave` / `onMessage` 取 Colyseus 的 `client.sessionId` ⇒ 席位与连接旁表**永不回收**、移动等输入**全部落空** —— `server/src/net/room.colyseus.ts` | 已修:两条路径统一到凭证键(重连换新 `sessionId` 时旧键被拆);判据 FND106-1/2/3/4/5(负对照:同一份报文用 `sessionId` 当键仍 `allowed:false`) |
+| P1-B | 超期回收 `reapExpiredDisconnects` 是**唯一**没调 `host.removePlayer` 的移除路径(leave / join 超期都调了)⇒ 宽限超期者世界里留旧刚体,同名重进再 `addPlayer` ⇒ 同一 id 两份刚体 —— `server/src/net/room.ts` | 已修:三条移除路径各调一次;判据 FND106-6/7(负对照:只看房间侧**看不见**这个缺陷)/8(结构守卫:`host.removePlayer(` 与 `purgeSeat(` 的处数) |
+| P1-C | 入场凭证**不续期**:token 只在 join/重连时签发 ⇒ 会话超 `JOIN_TOKEN_TTL_MS` 掉线后,`RECONNECT_GRACE_MS` 内用**同一张**凭证重连**必然**被拒 —— `server/src/net/room.ts` | 已修:宽限内过期凭证放行(三态 + 生效值 = 断线时刻 + 30s,且 TTL > 宽限期);判据 FND106-9/10/11/12/13 |
+| P1-D | 世界侧**重放**拒绝仍回 `ok:true` ⇒ 静默出货 + 预占滞留(重放有副作用) —— `server/src/net/actions/use_alchemy_furnace.ts` | 已修:重放 ⇒ 整笔失败 + 回滚(撤凭证 / 收产物 / 释放预占 / 退材料);非重放拒绝 ⇒ 产物照发;判据 FND107-5 |
+| P1-E | 炼金两套键共用 `ALCHEMY_LAB@ORDER:<串>` 同一个命名空间且不转义 ⇒ 客户端自造 `orderId` 可**顶掉别人的派生键**(服务端事实被客户端改写) —— `server/src/net/actions/use_alchemy_furnace.ts` | 已修:显式订单号与派生键分两个命名空间 + 转义;判据 FND107-4 |
+| P1-F | 击杀掉落只吃 `worldSeed`,丢掉**击杀实例维** ⇒ 同一世界里同种怪要么**全掉**要么**全不掉**(概率维退化成常量;两个世界的逐次序列还会变得一样) —— `server/src/sim/world_sim.ts#settleKill` + `server/src/mobs/drops.ts` | 已修:种子 = 世界身份 + 实例 id(`mob_species#序号`);判据 FND98-15/16/17(补正) |
+
+**P2 / P3(12 条)**
+
+| # | 严重度 | 发现与落点 | 处置(判据) |
+|---|---|---|---|
+| P2-1 | P2 | `@DAY` 键:`Math.trunc(-0.5) === -0` 且 `-0 < 0` 为假 ⇒ 负小数被当成**合法第 0 天**撞键 —— `server/src/systems/idempotency.ts` | 已修:负小数(含负整数 / NaN / -∞)一律 `null`,正小数口径不变;判据 FND107-1 |
+| P2-2 | P2 | 结算台账 `claims` 只增不删 ⇒ 常驻房间进程生命期内无界增长 —— `server/src/systems/idempotency.ts` | 已修:按 `SETTLEMENT_LEDGER_CAPACITY` FIFO 淘汰最老,窗口内仍去重;判据 FND107-2 |
+| P2-3 | P2 | 牧场**零产出**也占该日键 ⇒ 补齐动物/饲料后同一天再也结算不了(静默 no-op) —— `server/src/systems/ranch.ts`(世界侧封装 `settleRanchOnce` 同一条) | 已修:零产出**出账但不占键**;判据 FND107-3/9 |
+| P2-4 | P2 | 炼金**预占索引** `FURNACE_CLAIMS` 只增不删 ⇒ 无界 —— `server/src/net/actions/use_alchemy_furnace.ts` | 已修:FIFO 淘汰最老,最近窗口内仍判重放;判据 FND107-7 |
+| P2-5 | P2 | 跨玩家顶键:动作面 A 自造 `= B` 的派生串 ⇒ **两人各成交一次** —— `server/src/net/actions/use_alchemy_furnace.ts` | 已修:两套键不同命名空间(负对照钉「键不同、各成交一次」);判据 FND107-6 |
+| P3-1 | P3 | `buyOnce` 台账 `at` 槽的口径靠注释(「成交成本」被读成「已结算过 cost / 时刻」) —— `server/src/systems/depot.ts` | 已钉:判据以 `settlementSeenAt === cost` 固定口径;判据 FND107-8 |
+| P2-6 | P2 | `BossRaidRuntime.summon` 自己不查 `states` ⇒ 同 `bossId` 二次召唤把整只 Boss **重置满血**、祭品照扣 —— `server/src/bosses/runtime.ts` | 已修:第二次 `BOSS_ALIVE`、不扣祭品、血量**不被重置**;判据 FND108-1 |
+| P2-7 | P2 | `damageBoss` 无入参边界:`hp -= -50` 等于**回血** —— `server/src/bosses/phases.ts` | 已修:负伤害 ⇒ `{0,0}` 且 `hp ≤ maxHp` 仍成立;判据 FND108-2 |
+| P2-8 | P2 | 非有限伤害 ⇒ `Math.min(hp, NaN)` 把 `hp` **永久毒化**(阶段永不切换) —— `server/src/bosses/phases.ts` | 已修:血量保持有限数、阶段仍算得出来;判据 FND108-3 |
+| P3-2 | P3 | `evaluateBreak` 的「确定结论」承诺只覆盖未知 Boss ⇒ 三条判定对缺字段抛 `TypeError` —— `server/src/bosses/breaks.ts` | 已修:八个 Boss 喂 `{}` 一律 `ok:false`、**不抛**;合法输入语义不变;判据 FND108-4 |
+| P2-9 | P2 | `settleBridgeRun` 每次调用都给未夺旗队 `score += built × 2` 且没有相位门槛 —— `server/src/party/modes.ts` | 已修:`settlement !== null` 直接返回(幂等)+ 未到 `SETTLED` 不发安慰分;判据 FND108-5 |
+| P2-10 | P2 | `tickRushOrder` 的 `opts.tended` 全仓**没有生产者**:`tickPartyStep` 只算 `spraying` ⇒「连续运转 `OVERHEAT_SEC`(12 秒)不翻炒 ⇒ 起火」在生产里退化成**必然起火** —— `server/src/coop/rush_order.ts`(读口)/ `server/src/sim/world_sim.ts`(生产侧) | 已修(两侧):读口 `stationsBeingTendedBy`(只认 `RUNNING`);世界侧补 `tendUntil` 意图窗并喂进 `tickRushOrder`,见 §10.2.1;判据 FND108-6(含负对照:不喂 `tended` ⇒ 必起火) |
+
+### 10.2.1 生产侧补法(本批唯一改到的 `.ts`)
+
+`server/src/sim/world_sim.ts`,五处(语句锚点,行号会漂):
+
+```
+180   import { …, stationsBeingTendedBy } from '../coop/rush_order.ts'
+1146  private readonly tendUntil = new Map<string, number>()      ← 与 sprayUntil 同形
+3737  removePlayer():  this.tendUntil.delete(id)                  ← 与 sprayUntil 同列清
+4895  reset():         this.tendUntil.clear()                     ← 同上
+6288  extinguishDeviceByHand(): itemId === SHOVEL_ITEM_ID(212) ⇒ this.tendUntil.set(actorId, frameCount + FAST_PER_SLOW)
+6064  tickPartyStep(): 与 spraying 同段用 stationsBeingTendedBy(rushRun, { x: b.x, y: b.y }) 收成 tended,
+      再 tickRushOrder(this.rushRun, SIM_SLOW_DT, { spraying, tended })
+```
+
+- 只记**刚用过 212** 的玩家(与 D-13 的 `sprayUntil` 同一取舍):否则「站在工位旁边」= 自动翻炒。
+- 窗口长度 = 一个慢帧(`FAST_PER_SLOW` 快帧),不新增数值常量;`removePlayer` 的 docblock 同步改成**五张**按 id 索引的瞬态表。
+- 未接时的形态就是 FND108-6 的负对照钉住的**必然起火**;接上后「有人翻炒 ⇒ 不起火」在生产里成立。
+
+### 10.3 对前批台账的追加
+
+- §9.1 **P1-A**(击杀掉落落地)追加判据 **FND98-15/16/17** —— 「落得下来」之后**概率维**自己也要有实例维,
+  否则 `dropChance` 退化成「该物种在此世界必掉 / 必不掉」(实测 0% 或 100%,且两个世界序列相同)。本条的落点与 P1-A 同一个函数(`settleKill`)。
+- §3.2 / §4 的 **P2-3 / R3**(击退)状态不变:98 的 3 条新判据属 P1-A 族,`FND98-1..8` 仍钉着击退上界。
+- 本轮清单里**没有**再出现「修法只对了一半」的形态之外的新族;§3.2 末尾的「第四批追加」块不动。
+
+### 10.4 本批验证口径
+
+- `node scripts/verify.ts --all` ⇒ **exit 0 / 行首 ✗ 0 项**(本机 167s,秒数别当基准):
+  `用例汇总:2290 条通过(117 个套件;WS-01..11 共 1014 条 / 14 套件;基座 1276 条 / 103 套件)`,
+  README 与 HANDOVER 的用例数 / 套件数行由门禁逐条比对通过;`HANDOVER §九 sha256 表自洽` 亦通过。
+  唯一的告警是**临时残留 330 个**(审计扫描根之外,按设计只告警、不属三道 strict),不是本批引入。
+- `node scripts/typecheck-baseline-audit.ts` ⇒ 基线 **261 条 / 指纹 129**,实测 **261 / 129**(**未新增**)。
+  `WS-FND-106` 那 3 条 `TS2339`(判别联合上取 `reason`)已由 `reasonOf()` 收窄,不进基线。
+- `docs/HANDOVER.md` §九 sha256 表重算:`README.md` `f7c0030f2fb1 → c3ffd82859ac`;
+  `docs/COMPLETION-CRITERIA.md` 不变(`fc1142dd0afb`)。重算用临时脚本副本跑完即删(LF 归一 = 索引 blob 口径)。
+- 逐套件:`WS-FND-106` 13/13 · `WS-FND-107` 9/9 · `WS-FND-108` 6/6 · `WS-FND-98` 17/17。
+- 未 commit、未碰 `.pi/`、未改 `docs/` 下本轮写权限之外的文件。

@@ -394,8 +394,26 @@ export function applyBreak(state: BossState): { stunSec: number; critBonus: numb
   return { stunSec, critBonus: BREAK_CRIT_BONUS };
 }
 
-/** 造成伤害;护盾存在时先吃护盾。 */
+/**
+ * 造成伤害;护盾存在时先吃护盾。
+ *
+ * ## ★ 入参边界(第三轮实测缺陷)
+ *
+ * 改前本函数对 `amount` 没有任何检查,两条路都能静默毁掉不变量:
+ *   · **负伤害 = 回血**:`remain = -50` ⇒ `toHp = Math.min(hp, -50)` = `-50` ⇒
+ *     `hp -= -50` ⇒ 血量**凭空上涨**(可能越过 `maxHp`,而阶段是按 `hp/maxHp`
+ *     判的 ⇒ 顺手把 Boss 打回上一个阶段);
+ *   · **`NaN` = 永久毒化**:`toHp = Math.min(hp, NaN)` = `NaN` ⇒ `hp` 变 `NaN`;
+ *     此后 `hp <= 阈值` 恒为 `false`(阶段永不切换)、`hp > 0` 恒为 `false`
+ *     (Boss 既不算活也不算死)、`hpRatio` 也是 `NaN` —— 且**不报错**。
+ *
+ * 修法:`amount` 必须是非负**有限**数,否则一律判「这一击不生效」并返回
+ * `{0, 0}`(与「打在 0 血上」同形:调用方拿到的分配总和为 0)。
+ * 于是「`hp` / `shieldHp` 恒为 `[0, maxHp]` 内的有限数」这条不变量**关在本函数里**,
+ * 不必依赖每个调用方自觉。
+ */
 export function damageBoss(state: BossState, amount: number): { toShield: number; toHp: number } {
+  if (!Number.isFinite(amount) || amount < 0) return { toShield: 0, toHp: 0 };
   let remain = amount;
   let toShield = 0;
   if (state.shieldHp > 0) {

@@ -250,8 +250,11 @@ export function buyOnce(ledger: SettlementLedger, input: OrderBuyInput): BuyOnce
     return { accepted: false, key, replayed: false, reason: outcome.reason, result: null };
   }
   /*
-   * 台账里记的时刻用**这笔成交的成本**(本模块零 IO、不读时钟;成本是可复现量),
-   * 于是「已在 X 结算过」这句话仍可手算对账 —— 不引入第二个时间源。
+   * ⚠️ 口径(第三轮实测 P3:注释原先把「存 cost」念成「已结算过 cost」):
+   * 台账 `at` 槽在这里存的是**这笔成交的成本**(本模块零 IO、不读时钟;成本可复现),
+   * **不是时刻**。于是重放时 `claimSettlement` 的措辞「已在 <cost> 结算过」容易被读成
+   * 「已经结算过一次 cost 了」—— 那是**措辞**问题,不是第二个时间源:该值只用于报错
+   * 对账,不参与任何判定(`idempotency.ts` 的 `at` 就是「调用方喂的可复现量」这个槽)。
    */
   const claim = claimSettlement(ledger, key, outcome.cost);
   if (!claim.ok) {

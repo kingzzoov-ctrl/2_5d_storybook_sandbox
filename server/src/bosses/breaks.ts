@@ -398,8 +398,32 @@ export type BreakResult = { ok: boolean; reason: string };
  *
  * 未登记输入类型的 Boss 返回 `ok:false, reason:'unsupported'`,
  * 保证调用方永远拿到一个确定结论而不是异常。
+ *
+ * ## ★ 承诺补齐:缺字段也返回确定结论(第三轮实测缺陷)
+ *
+ * 上行那句「永远拿到一个确定结论」此前**只对未知 Boss 成立**:八条判定里有
+ * 三条直接读入参的下标/长度(`foxBreakReady` 的 `i.clones.length`、
+ * `pullBreakReady` 的 `i.forces.length`、`chronosBreakReady` 的
+ * `i.circuitsOn[k]`)。喂一个形状不全的输入(最小例:`{}`)⇒ 抛 `TypeError`,
+ * 于是「确定结论」在调用方那里变成异常 —— 连本文件的 `breakCoverage()`
+ * (它对每个 Boss 都喂 `{}`)都会被自己抛穿。
+ *
+ * 判定语义**一个都没放宽**:满足条件照样 `ok:true`,差一个条件照样 `ok:false`;
+ * 只有「入参根本读不动」这一档从**抛错**改成 `ok:false, reason:'malformed_input'`。
+ * 形状不对 ≠ 条件不满足,故不复用 `conditions_unmet` —— 那会让判据分不清
+ * 「玩家没做到」与「调用方把输入写坏了」。
  */
 export function evaluateBreak(bossId: string, input: unknown): BreakResult {
+  try {
+    return dispatchBreak(bossId, input);
+  } catch {
+    /* 缺字段 / 形状不对 ⇒ 确定结论,不抛(就是上面那条承诺)。 */
+    return { ok: false, reason: 'malformed_input' };
+  }
+}
+
+/** 分派体;唯一允许它抛的地方是 `evaluateBreak` 的 `try`(形状不对 ⇒ 归一成结论)。 */
+function dispatchBreak(bossId: string, input: unknown): BreakResult {
   switch (bossId) {
     case 'boss_jelly_king': return pass(jellyBreakReady(input as JellyBreakInput));
     case 'boss_beaver_mecha': return pass(beaverBreakReady(input as BeaverBreakInput));
@@ -423,8 +447,19 @@ export function evaluateBreak(bossId: string, input: unknown): BreakResult {
   }
 }
 
+/**
+ * 布尔判定 → 统一结论。
+ *
+ * `Boolean(...)` 是**契约**的一部分,不是装饰:`beaverBreakReady` /
+ * `gingerBreakReady` / `whaleBreakReady` 体内是 `a && b && c`,喂进缺字段的
+ * 输入(如 `{}`)时 `&&` 链返回的是 `undefined` 而不是 `false` —— 于是
+ * `evaluateBreak(id, {}).ok` 会是 `undefined`,而本函数的返回类型写着
+ * `ok: boolean`(`tests/WS-05` 也钉了「返回严格布尔」)。这里收口一次,
+ * 免得每个判定各写一份 `=== true`。
+ */
 function pass(ok: boolean): BreakResult {
-  return { ok, reason: ok ? 'break' : 'conditions_unmet' };
+  const hit = Boolean(ok);
+  return { ok: hit, reason: hit ? 'break' : 'conditions_unmet' };
 }
 
 /**

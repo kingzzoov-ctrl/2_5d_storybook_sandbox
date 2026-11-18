@@ -6,7 +6,7 @@
  * | 1 | 击退**没有上界、也没按质量归一**;`mass = NaN` 会把 `NaN` 冲量写进刚体 | `physics/world.ts#safeMass` + `applyImpulse`;`world_sim.ts#applyKnockback` |
  * | 2 | mob 掉落**没有概率维** —— 「稀有材料」与「必掉材料」在数据上一模一样 | `shared/constants/mobs.ts#dropChance` + `mobs/drops.ts` |
  *
- * ## 判据(14 条,含负对照)
+ * ## 判据(17 条,含负对照)
  *
  * | 编号 | 判据 | 负对照 |
  * |---|---|---|
@@ -24,6 +24,9 @@
  * | FND98-12 | 非法概率 fail-closed | `NaN` / `0` / 负数 ⇒ 一次不掉;`> 1` ⇒ 恒掉 |
  * | FND98-13 | 未知 mobId / 缺省键的取值 | 空表、缺省必掉、件数缺省 1 |
  * | FND98-14 | ★ 生产接线:`damageMob` 打死怪 ⇒ `lastMobDrops` 与纯函数逐位相同 | 两种子:一个掉 753、一个不掉 |
+ * | FND98-15 | ★ P1 修复:同一世界连打 100 次同种稀有怪 ⇒ 掉落次数落在二项分布区间内 | 修前:0 或 100(「恒掉 / 恒不掉」) |
+ * | FND98-16 | ★ 不同种子的两个世界 ⇒ 逐次掉落序列不同(各自又不是恒 0/恒 1) | — |
+ * | FND98-17 | ★ 同 seed 重放逐次逐位一致,且逐次 = 纯函数**同键**结果 | — |
  *
  * ## 注入验证(实测变红后**还原**,逐条已跑;括号是本次实测变红的判据)
  *   1 `world_sim.ts` 的 `KNOCKBACK_MAX_CELLS` 改 `200` ⇒ **FND98-1/2/3/5 红**
@@ -34,6 +37,9 @@
  *     (频率实测 0.49945)。
  *   4 `mobs/drops.ts` 的 `rollMobDrops` 把 `roll` 写死 `0`(恒必掉)⇒ **FND98-10/11/14 红**
  *     (频率实测 1)。
+ *   5 `world_sim.ts#settleKill` 只把 `worldSeed` 传给 `rollMobDrops`(丢掉击杀实例维)
+ *     ⇒ **FND98-14/15/16/17 红**:实测同一世界里 100 次同种怪要么**全掉**要么**全不掉**
+ *     (seed 7 与 seed 8 都是「全不掉」⇒ 两个世界的序列还变得一样)。
  *
  * ⚠️ 断言右侧一律**字面量**(`2` / `0.15` / `753` / 手册行号),不从被测模块取期望值 ——
  * 唯一的例外是 FND98-14 的「与纯函数逐位相同」(那条要证的**就是接线**,不是数值)。
@@ -49,6 +55,7 @@ import {
   mobDropTableOf,
   rollMobDrops,
 } from '../server/src/mobs/drops.ts';
+import { mobInstanceId } from '../server/src/mobs/spawner.ts';
 
 /** D-09 的 2 格(owner 2026-11-16)—— 手册/裁决值,判据用字面量钉住。 */
 const CAP = 2;
@@ -94,6 +101,26 @@ function knockOnce(mass: number, distance: number): ReturnType<typeof knockAndMe
   sim.addPlayer('p1', 12.5, 12.5);
   forceMass(sim, 'p1', mass);
   return knockAndMeasure(sim, 'p1', 10.5, distance); /* 攻击者在西侧 ⇒ 被推向 +x */
+}
+
+/**
+ * 在一个世界里连打 `n` 次同种怪(实例序号 1..n,id 走生产唯一生成器
+ * `mobInstanceId`),返回**每次击杀的掉落物品 id**(itemId 升序,与 `lastMobDrops` 同形)。
+ *
+ * 走真路径 `addMob` → `damageMob`(致死) → `settleKill`。实例序号逐次不同 ⇒ 每一次击杀
+ * 都有自己的**击杀实例维**;同 seed 的世界重放会得到同一串序号(判据 FND98-15/16/17)。
+ */
+function killSeries(seed: number, species: string, n: number): number[][] {
+  const sim = bareSim(seed);
+  sim.addPlayer('p1', 12.5, 12.5);
+  const out: number[][] = [];
+  for (let i = 1; i <= n; i += 1) {
+    const id = mobInstanceId(species, i);
+    sim.addMob(id, 'MEADOW', 14, 12.5);
+    sim.damageMob(id, 999_999, 'PHYSICAL', 0);
+    out.push(sim.lastMobDrops.map((d) => d.itemId));
+  }
+  return out;
 }
 
 /* ══════════════════ 1. 常量锚 ══════════════════ */
@@ -287,7 +314,7 @@ test('FND98-13 未知 mobId / 缺省键:空表、必掉、件数 1', () => {
 
 /* ══════════════════ 7. 生产接线 ══════════════════ */
 
-test('FND98-14 ★ 生产接线:打死怪 ⇒ `lastMobDrops`(同种子同结果,751/753 按概率)', () => {
+test('FND98-14 ★ 生产接线:打死怪 ⇒ `lastMobDrops`(同种子同一次击杀可复现,751/753 按概率)', () => {
   /** 打死一只怪(真走 `damageMob` → `settleKill`),返回世界。 */
   const kill = (seed: number, mobId: string): WorldSim => {
     const sim = bareSim(seed);
@@ -298,34 +325,101 @@ test('FND98-14 ★ 生产接线:打死怪 ⇒ `lastMobDrops`(同种子同结果,
   };
 
   const s7 = kill(7, 'mob_squirrel#1');
-  eq(JSON.stringify(s7.lastMobDrops.map((d) => d.itemId)), '[101]',
-    '★ 种子 7 ⇒ 只掉必掉的 101(稀有树种没抽中;字面量锚:0.15 的概率)');
-  const s11 = kill(11, 'mob_squirrel#1');
-  eq(JSON.stringify(s11.lastMobDrops.map((d) => d.itemId)), '[101,753]',
-    '★ 种子 11 ⇒ 101 与 753 都掉(稀有树种抽中,概率 0.15)');
-  const same = kill(11, 'mob_squirrel#1');
-  eq(JSON.stringify(same.lastMobDrops), JSON.stringify(s11.lastMobDrops),
-    '★ 同种子两次击杀 ⇒ 同一份掉落(可复现)');
+  eq(JSON.stringify(s7.lastMobDrops.map((d) => d.itemId)), '[101,753]',
+    '★ 种子 7 + 实例 #1 ⇒ 101 与 753 都掉(稀有树种抽中;字面量锚:0.15 的概率)');
+  const s17 = kill(17, 'mob_squirrel#1');
+  eq(JSON.stringify(s17.lastMobDrops.map((d) => d.itemId)), '[101]',
+    '★ 种子 17 + 实例 #1 ⇒ 只掉必掉的 101(同一只怪、另一个世界:稀有树种没抽中)');
+  const same = kill(7, 'mob_squirrel#1');
+  eq(JSON.stringify(same.lastMobDrops), JSON.stringify(s7.lastMobDrops),
+    '★ 同种子 + **同一次击杀**(同实例 id)⇒ 同一份掉落(可复现)');
 
-  /* 「接线没接错」的正面证据:与纯函数逐位相同(种子取世界身份)。 */
-  eq(JSON.stringify(s7.lastMobDrops), JSON.stringify(rollMobDrops('mob_squirrel', s7.worldSeed)),
-    '★ 生产结果 = `rollMobDrops(def.id, worldSeed)` 逐位相同');
-  eq(JSON.stringify(s11.lastMobDrops), JSON.stringify(rollMobDrops('mob_squirrel', s11.worldSeed)),
-    '★ 抽中那一次也逐位相同');
+  /* 「接线没接错」的正面证据:与纯函数**同键**逐位相同(种子 = 世界身份,键 = 击杀实例维)。 */
+  eq(JSON.stringify(s7.lastMobDrops),
+    JSON.stringify(rollMobDrops('mob_squirrel', s7.worldSeed, 'mob_squirrel#1')),
+    '★ 生产结果 = `rollMobDrops(def.id, worldSeed, 击杀实例 id)` 逐位相同');
+  eq(JSON.stringify(s17.lastMobDrops),
+    JSON.stringify(rollMobDrops('mob_squirrel', s17.worldSeed, 'mob_squirrel#1')),
+    '★ 没抽中那一次也逐位相同');
 
   const golem = kill(7, 'mob_choco_golem#1');
-  eq(JSON.stringify(golem.lastMobDrops.map((d) => d.itemId)), '[105,603]',
-    '★ 种子 7 的巧克力盾卫 ⇒ 必掉的 105/603 在,稀有甜点食谱 751 不在');
+  eq(JSON.stringify(golem.lastMobDrops.map((d) => d.itemId)), '[105,603,751]',
+    '★ 种子 7 的巧克力盾卫 ⇒ 751 抽中(同一个字段在另一只怪上同样生效)');
   eq(golem.lastMobDrops.find((d) => d.itemId === 105)?.count, 5, '件数按手册 ×5 传下去');
   const golem1 = kill(1, 'mob_choco_golem#1');
-  eq(JSON.stringify(golem1.lastMobDrops.map((d) => d.itemId)), '[105,603,751]',
-    '★ 种子 1 ⇒ 751 抽中(同一个字段在另一只怪上同样生效)');
+  eq(JSON.stringify(golem1.lastMobDrops.map((d) => d.itemId)), '[105,603]',
+    '★ 种子 1 ⇒ 必掉的 105/603 在,稀有甜点食谱 751 不在');
 
   /* 没发生过击杀 ⇒ 空(与 `lastKillSettle === null` 一起可区分)。 */
   const quiet = bareSim();
   quiet.addPlayer('p1', 12.5, 12.5);
   eq(quiet.lastMobDrops.length, 0, '没击杀 ⇒ 空掉落');
   eq(quiet.lastKillSettle, null, '没击杀 ⇒ 结算也是 null(两义可区分)');
+});
+
+/* ══════════════════ 8. P1:击杀实例维(同世界多次击杀的独立性) ══════════════════ */
+
+test('FND98-15 ★ P1:同一世界连打 100 次同种稀有怪 ⇒ 掉落次数落在二项分布内(不是 0 也不是 100)', () => {
+  /* 修前形态(`world_sim.ts` 只传 `worldSeed`):同一世界里同种怪**每次击杀的 roll 完全相同**
+     ⇒ 要么 100 掉要么 100 不掉(=「该物种在这个世界必掉 / 必不掉」)。 */
+  const N = 100;
+  const series = killSeries(7, 'mob_squirrel', N);
+  const hit = (ids: number[]): boolean => ids.includes(RARE_TREE);
+  const hits = series.filter(hit).length;
+  ok(hits > 0, `★ 100 次里必须掉过(实测 ${hits})—— 修前是「要么 0 要么 100」`);
+  ok(hits < N, `★ 100 次里必须也有不掉(实测 ${hits})—— 恒掉同样是退化`);
+  /* 0.15 × 100 = 15、二项分布 sd ≈ 3.6 ⇒ [5, 30] 是 ±3σ 的宽松带,够钉住「独立采样」。 */
+  ok(hits >= 5 && hits <= 30, `★ 掉落次数 ${hits} 应落在 [5,30](0.15 的二项分布)`);
+  /* ★ 更强的**形状**判据:FNV-1a 只吃序号末位时 roll 会成段相关(实测 seed 7 呈
+     「9 掉 / 9 不掉 /…」阶梯,翻转 ≈ 8);真·独立采样的翻转数期望 ≈ 2 × 100 × 0.15 × 0.85 = 25.5。 */
+  let transitions = 0;
+  for (let i = 1; i < N; i += 1) {
+    if (hit(series[i]) !== hit(series[i - 1])) transitions += 1;
+  }
+  ok(transitions >= 15, `★ 掉落序列的翻转次数 ${transitions} 应 ≥15(修前那个「阶梯」只有个位数)`);
+  /* 必掉项在每一条里都在(同一条 roll 路径;实例维不该动必掉项)。 */
+  eq(series.every((ids) => ids.includes(101)), true, '★ 100 次里必掉的 101 一次都没漏');
+});
+
+test('FND98-16 ★ 不同种子的两个世界 ⇒ 逐次掉落序列不同(各自也不是恒 0 / 恒 1)', () => {
+  const a = killSeries(7, 'mob_squirrel', 100);
+  const b = killSeries(8, 'mob_squirrel', 100);
+  const hit = (ids: number[]): boolean => ids.includes(RARE_TREE);
+  const hitsA = a.filter(hit).length;
+  const hitsB = b.filter(hit).length;
+  ok(hitsA > 0 && hitsA < 100, `世界 7:${hitsA}/100(既非恒掉也非恒不掉)`);
+  ok(hitsB > 0 && hitsB < 100, `世界 8:${hitsB}/100(既非恒掉也非恒不掉)`);
+  let diff = 0;
+  for (let i = 0; i < 100; i += 1) if (hit(a[i]) !== hit(b[i])) diff += 1;
+  ok(diff >= 10, `★ 两个不同种子的世界逐次结果不同处数 ${diff} 应 ≥10(修前两边都恒 0 ⇒ 差 0)`);
+});
+
+test('FND98-17 ★ 同 seed 重放逐次逐位一致,且逐次 = 纯函数同键结果', () => {
+  const N = 60;
+  const first = killSeries(7, 'mob_squirrel', N);
+  const replay = killSeries(7, 'mob_squirrel', N);
+  eq(JSON.stringify(replay), JSON.stringify(first), '★ 同 seed 的世界重放 60 次击杀 ⇒ 逐次掉落逐位一致');
+  /* 逐次与纯函数**同键**(seed + 实例 id)逐位相同 ⇒ 「可复现」不是靠世界侧内部状态攒出来的。 */
+  for (let i = 1; i <= N; i += 1) {
+    const key = mobInstanceId('mob_squirrel', i);
+    eq(
+      JSON.stringify(first[i - 1]),
+      JSON.stringify(rollMobDrops('mob_squirrel', 7, key).map((d) => d.itemId)),
+      `第 ${i} 次击杀(键 ${key})应与纯函数同键结果一致`,
+    );
+  }
+  /* 同一次击杀的键重复调用 = 同一个 roll(纯函数、无内部状态);不同次击杀的键 ⇒ 可以不同。 */
+  eq(
+    JSON.stringify(rollMobDrops('mob_squirrel', 7, 'mob_squirrel#1')),
+    JSON.stringify(rollMobDrops('mob_squirrel', 7, 'mob_squirrel#1')),
+    '★ 同键重复调用逐位相同',
+  );
+  eq(
+    JSON.stringify(rollMobDrops('mob_squirrel', 7, 'mob_squirrel#1'))
+      !== JSON.stringify(rollMobDrops('mob_squirrel', 7, 'mob_squirrel#2')),
+    true,
+    '★ 同 seed 下实例 #1 与 #2 的掉落不同(修前两者恒等)',
+  );
 });
 
 report('WS-FND-98-knockback-and-drops');

@@ -219,8 +219,8 @@
 
 | # | 事项 | 影响 | 我的建议 |
 | :- | :--- | :--- | :--- |
-| P-01 | `BossDef.loot` 是 `number[]`,表达不了**数量**(手册写 `703×10`、`117×15`,实际落在 1~3) | 8 个 Boss 里 4 个战利品有偏差 | 扩为带数量的结构;与 P-02 合并成一次 CR(同源) |
-| P-02 | `ItemDef.recipe` 键只能是数字 ID,表达不了手册的「**任意染料**」(`#237`/`#245` 被硬编码成 `#166`) | 玩家手握 167/168/169 时这两个配方**会失败** | 加 `recipeAnyTag`;仓库里已有现成范式(`degrade.ts` 的 `anyTags`) |
-| P-03 | 手册提到的 7 个**抽象奖励**(自动伐木机甲图纸、姜饼人随从、纯金通关纪念碑、稀有甜点食谱、蓬松彩羽、稀有树种、城堡图纸)在 320 项表里都不存在 | 掉落结算无处表达 | 作为「抽象奖励」在结算层表达,**不要**硬塞进物品表(会打破 320 的锁) |
+| ~~P-01~~ | ~~`BossDef.loot` 是 `number[]`,表达不了**数量**(手册写 `703×10`、`117×15`,实际落在 1~3)~~ | **已裁(CR-27,2026-11-17)**:战利品数量归一 —— `shared/types/entities.ts` 新增 `BossLootEntry { id, count }`,`shared/constants/bosses.ts` 新增 `normalizeBossLoot` / `bossLootEntries`,`bosses/raid.ts` 的 `effectiveLoot()` 只在这里归一一次;判据 `tests/WS-FND-79-content-expansion.test.ts` | 已关闭 |
+| ~~P-02~~ | ~~`ItemDef.recipe` 键只能是数字 ID,表达不了手册的「**任意染料**」(`#237`/`#245` 被硬编码成 `#166`)~~ | **已裁(CR-27)**:`ItemDef` 新增可选 `recipeAnyTag?: string[][]`(`shared/types/entities.ts`),`net/actions/craft.ts` / `use_alchemy_furnace.ts` 按留白槽逐槽扣减;判据 `tests/WS-06.test.ts`(G-DYE-*) | 已关闭 |
+| ~~P-03~~ | ~~手册提到的 7 个**抽象奖励**(自动伐木机甲图纸、姜饼人随从、纯金通关纪念碑、稀有甜点食谱、蓬松彩羽、稀有树种、城堡图纸)在 320 项表里都不存在~~ | **已裁(CR-27,与我的建议相反)**:owner 裁 D-19 改为**入表** —— `items.ts` 新增 `748~754` 七件(内容表 320 → **329**,`TOTAL_ITEM_COUNT` 同步),`bosses.ts` 把这些 id 追加进对应 Boss 的 `loot` / `lootQty`;判据 `tests/WS-FND-79-content-expansion.test.ts` | 已关闭 |
 | ~~P-04~~ | ~~微信小游戏 vs 网页~~ | **已裁(D-16)**:双端、**网页优先**;平台相关层可插拔 | 已关闭 |
 | P-05 | 真机 FPS 从未实测 | 渲染选型的基线 | 需要真机;当前只有 headless swiftshader 的 60 FPS(不代表真机) |

@@ -563,6 +563,57 @@ export function stationsBeingSprayedBy(
   }
   return out;
 }
+
+/**
+ * 「玩家站在 `at`、以 `radiusCells` 为半径翻炒,能翻到**哪个**工位」——
+ * `stationsBeingSprayedBy` 的**照看半边**(同坐标口径 / 同顺序 / 同非法输入口径)。
+ *
+ * ## 为什么必须有它(第三轮实测缺陷:生产从不喂 `tended`)
+ *
+ * `tickRushOrder` 的 `opts.tended` 全仓**没有生产者**:`world_sim.ts` 的
+ * `tickPartyStep` 只算 `spraying`(见该文件 `stationsBeingSprayedBy` 那一段),
+ * 而 `spraying` 来自 `sprayUntil` 这张意图表。于是 `tended` 恒 `false` ⇒
+ * `StationRuntime.runningSec` 只增不减 ⇒「连续运转 `OVERHEAT_SEC`(12 秒)
+ * 不翻炒 ⇒ 起火」在生产里退化成**必然起火**:到点必烧,玩家做什么都一样。
+ * (`tendStation` 全仓也只有测试在调,它连会话都进不去。)
+ *
+ * 缺的不是起火规则(`tickStation` 的燃烧/过热两段一律不动),是「有人翻炒」
+ * 这个**观测量的世界侧入口** —— 与 D-13 给灭火补 `stationsBeingSprayedBy`
+ * 是同一个缺口、同一种补法:本函数只回答「站在这个格,能翻到谁」,
+ * 世界侧把「212 大铁铲对着这一格用」换成坐标喂进来即可。
+ *
+ * ## 命中口径(与 `stationsBeingSprayedBy` 逐条对齐)
+ *
+ * 1. 判到**工位所在格的中心**(`cellCenterOf`),不是格索引 —— 否则「站在格中心
+ *    翻炒」会系统性偏 `Math.SQRT1_2 ≈ 0.707` 格;
+ * 2. 距离 `<= radiusCells + EPS`(闭区间);
+ * 3. **只认 `RUNNING`**:`BURNING` / `EXTINGUISHING` 该用 227 灭火,`tickStation`
+ *    的燃烧分支也根本不看 `tended` —— 这里返回它们只会让调用方误以为
+ *    「翻炒能灭火」;
+ * 4. 顺序 = `session.stations` 的工位表顺序(不是映射表键序,不是距离排序);
+ * 5. 非法输入(`null` 会话 / 非有限坐标 / 负半径 / NaN)⇒ 空数组,不抛。
+ *
+ * 会话显式收 `null` 的理由与 `stationStateOf` 逐字相同:接线层用
+ * 「`rushRun === null`」表示本房间没开急单,让本层兜住,判据就不必先分支。
+ */
+export function stationsBeingTendedBy(
+  s: RushOrderSession | null,
+  at: { x: number; y: number },
+  radiusCells: number = STATION_SPRAY_RADIUS,
+): StationKind[] {
+  const out: StationKind[] = [];
+  if (s === null) return out;
+  if (!Number.isFinite(at.x) || !Number.isFinite(at.y)) return out;
+  if (!Number.isFinite(radiusCells) || radiusCells < 0) return out;
+  for (const st of s.stations) {
+    if (st.state !== STATION_STATE.RUNNING) continue;
+    const cell = stationCellOf(s, st.kind);
+    if (cell === null) continue;
+    const center = cellCenterOf(cell);
+    if (Math.hypot(center.x - at.x, center.y - at.y) <= radiusCells + EPS) out.push(st.kind);
+  }
+  return out;
+}
 /* ───────────────────────────────────────────────────────────────────
  * 2c. 工位状态**读口**(D-13 端到端判据缺的那一半)
  *
@@ -1084,7 +1135,15 @@ export function elapsedSec(s: RushOrderSession): number {
 }
 
 export interface RushTickOptions {
-  /** 本步被翻炒的工位 */
+  /**
+   * 本步被翻炒的工位。
+   *
+   * ★ 生产侧此前**从不喂**它(第三轮实测)⇒ 12 秒过热在真房间里退化成
+   *   **必然起火**(见 `stationsBeingTendedBy` 的 docblock)。世界侧的补法:
+   *   `world_sim.ts#extinguishDeviceByHand` 在 `itemId === SHOVEL_ITEM_ID`(212)
+   *   分支上记一条与 `sprayUntil` 同形的 `tendUntil`,慢帧(`tickPartyStep`)用
+   *   `stationsBeingTendedBy(rushRun, 玩家坐标)` 换成种类后传进来。
+   */
   tended?: readonly StationKind[];
   /** 本步被水枪喷射的工位 */
   spraying?: readonly StationKind[];

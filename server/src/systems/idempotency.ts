@@ -28,6 +28,10 @@
  *    否则一次失败会把该订单永久锁死,重试永远被拒(那是比重复结算更坏的缺陷)。
  * 3. **重复不写账**:第二次同键 ⇒ 拒 + **台账一位不动**(`claims.get(key)` 仍是
  *    首次的时刻),判据用「第二次之后的 `seenAt` === 第一次的 `at`」把它钉住。
+ * 4. **台账有界**(第三轮实测):`claims` 恒 ≤ `SETTLEMENT_LEDGER_CAPACITY`,打满按
+ *    入账顺序 FIFO 淘汰最老一条 —— 键的一维(订单号)是**客户端可控**的,只增不删
+ *    会让常驻房间进程的账在世界世代内无界增长。
+ *
  *
  * ## 为什么不做成 class
  *
@@ -67,6 +71,20 @@ export interface OrderSettlementScope {
 export type SettlementScope = DaySettlementScope | OrderSettlementScope;
 
 /**
+ * 台账容量上限(第三轮实测 P2:修前 `claims` 只增不删 ⇒ 世界世代内**无界**)。
+ *
+ * 口径:不是玩法调参,只是「远大于同一次结算里会被二次结算的键数」——
+ * 与 `combat/progression.ts:KILL_LEDGER_CAPACITY` 同一取值口径(4096)。
+ * 键的一维(炼金 / 百货的订单号)是**客户端可控**的,一条 `orderId` 就是一条账,
+ * 不设上限就能被灌满 ⇒ 常驻房间进程生命期内的内存增长。
+ *
+ * 打满之后按**入账顺序**淘汰最老一条(FIFO):同一键的二次结算只可能发生在
+ * 「最近」这一端(报文重放 / 慢帧重入都在本帧附近),越老的账越不需要记;
+ * 而 FIFO 是唯一不引入额外比较规则、也不用重排的取法(与击杀账本同取舍)。
+ */
+export const SETTLEMENT_LEDGER_CAPACITY = 4096;
+
+/**
  * 幂等台账:**幂等键 → 首次成功结算时的逻辑时刻**。
  *
  * 逻辑时刻由调用方喂(本模块不读时钟),于是判据可复现。值只用于**报错信息**
@@ -76,14 +94,21 @@ export interface SettlementLedger {
   /**
    * ⚠️ 只有 `claimSettlement()` 允许写它。别处直接 `set` 会绕过「先查后写」的
    *    唯一实现,重复结算就又回来了(同一纪律见 `depot.buy` 的「副本上算、
-   *    失败原样退回」)。
+   *    失败原样退回」)。容量恒 ≤ `SETTLEMENT_LEDGER_CAPACITY`。
    */
   claims: Map<string, number>;
+  /**
+   * FIFO 入账顺序(有界淘汰用,见 `SETTLEMENT_LEDGER_CAPACITY`)。
+   * 与 `claims` **必须同步增删**;它只决定淘汰谁,`claims` 才是判据。
+   * 缺省(旧夹具只给 `claims`)时由 `claimSettlement` **懒建** —— 不强迫
+   * 每一处 `new Map()` 都补一个字段。
+   */
+  order?: string[];
 }
 
 /** 空台账(每次返回新对象 —— 共享单例会被第一次写入污染)。 */
 export function createSettlementLedger(): SettlementLedger {
-  return { claims: new Map<string, number>() };
+  return { claims: new Map<string, number>(), order: [] };
 }
 
 /**
@@ -102,9 +127,14 @@ export function settleKeyOf(roomKey: string, scope: SettlementScope): string | n
   const room = roomKey.trim();
   if (room === '') return null;
   if (scope.kind === 'DAY') {
+    /* ★ 负数必须在**截断之前**判(第三轮实测 P1):
+       修前先 `Math.trunc(-0.5)` 得 `-0`,而 `-0 < 0` 为 **false** ⇒ 返回
+       `@DAY:0`,与**合法第 0 天**撞同一把键(文件头承诺「负数一律非法」,
+       负小数却伪装成了第 0 天)。现在 `scope.day < 0` 先拒 ⇒ 一切负数
+       (-1 / -0.5 / -1.5 …)都为 `null`;0 与正小数的向下取整口径不变。 */
     if (!Number.isFinite(scope.day)) return null;
+    if (scope.day < 0) return null;
     const day = Math.trunc(scope.day);
-    if (day < 0) return null;
     return `${room}@DAY:${day}`;
   }
   if (typeof scope.orderId !== 'string') return null;
@@ -141,6 +171,15 @@ export function claimSettlement(ledger: SettlementLedger, key: string, at: numbe
   }
   const t = Number.isFinite(at) ? at : 0;
   ledger.claims.set(key, t);
+  /* ★ 有界淘汰(第三轮实测 P2):按入账顺序挤掉最老的一条,`claims` 恒 ≤ 上限。
+     只有**新键**才会扩容,所以「重复不覆盖」的断言(第二次 `seenAt` 仍是首次)
+     不受影响;被淘汰的是**最旧**的键,不影响最近窗口内的重放判定。 */
+  const order = ledger.order ?? (ledger.order = []);
+  order.push(key);
+  while (order.length > SETTLEMENT_LEDGER_CAPACITY) {
+    const oldest = order.shift();
+    if (oldest !== undefined) ledger.claims.delete(oldest);
+  }
   return { ok: true, key, at: t };
 }
 

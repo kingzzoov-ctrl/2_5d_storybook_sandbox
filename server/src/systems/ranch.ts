@@ -301,13 +301,25 @@ export type RanchOnceOutcome =
  * day 非法(-1 / NaN)                 ⇒ 拒,台账不动
  * 该 day 已在台账里(重放 / 慢帧重入)   ⇒ 拒(replayed:true),台账不动
  * 结算天数 = 0                        ⇒ 拒,**不占**该日(否则这一天被永久占掉)
+ * 这一天没有任何账(无进食、无产出)     ⇒ 照常出账(accepted:true),但**不占**该日
  * 否则                                ⇒ 结算 + 占键
  * ```
-
+ *
  * ★ 负对照:`settleRanchDay`(不带台账)连调两次**两次都出账** —— 这正是本函数
  *   存在的理由,判据用它证明「幂等是真的多了一层,而不是原有行为」。
  * ★ 「只有成功才占键」是纪律 2(见 `idempotency.ts` 文件头):`days === 0` 时不占键,
  *   于是同一天随后真的过了一天仍然结得出来。
+ *
+ * ★ **零产出:出账但不占键**(第三轮实测 P2):修前只按 `result.days > 0`(请求天数)判,
+ *   于是「圈里没动物 / 槽里没饲料」时 `produce = []`、`feedConsumed = []`,却照样
+ *   `claimSettlement` 把该日 key **占死** —— 随后补齐动物 / 饲料的那次**真**结算会被
+ *   当重放拒掉,**那一天的产出永久丢失**。现在「这一天有没有账」按**实际结果**判
+ *   (`feedConsumed` 与 `produce` 都空 ⇒ 无账可结),语义选「**不占键**」:照常返回
+ *   `accepted:true` + 空账(调用方要的回执在世界侧就是那一天的报告),但**不写台账**
+ *   ⇒ 同一天之后仍能真结算(与「天数为 0 不占键」同属纪律 2)。
+ *   ★ 不改成「拒」:`WorldSim.settleRanchIfDayChanged` 的慢帧报告按 `accepted` 计数
+ *     (空圈 / 没饲料的那一天也要如实报出来);改成 `accepted:false` 会让 WS-FND-77 的
+ *     空槽负对照 / 跨日整数天 / 花栗鼠跳过三条一起失据。
  */
 export function settleRanchDayOnce(ledger: SettlementLedger, input: RanchDayKeyedInput): RanchOnceOutcome {
   const key = settleKeyOf(SETTLEMENT_ROOMS.ECO_RANCH, { kind: 'DAY', day: input.day });
@@ -339,6 +351,14 @@ export function settleRanchDayOnce(ledger: SettlementLedger, input: RanchDayKeye
       reason: '结算天数为 0 ⇒ 无账可结(不占用结算日)',
       result: null,
     };
+  }
+  /* ★ 零产出**出账但不占键**(第三轮实测 P2):这一拍没有任何账(无饲料被吃、无产出)
+     —— 修前它照样 `claimSettlement` 把该日 key 占死,随后补齐条件的那次真结算被当重放拒。
+     现在照常返回 `accepted:true` + 空账(**不写台账**)⇒ 同一天之后仍能真结算。
+     为什么不是 `accepted:false`:世界侧慢帧报告按 `accepted` 计数(空圈那一天也要报),
+     见函数头「零产出:出账但不占键」。 */
+  if (result.feedConsumed.length === 0 && result.produce.length === 0) {
+    return { accepted: true, key, result };
   }
   const claim = claimSettlement(ledger, key, input.day);
   if (!claim.ok) {

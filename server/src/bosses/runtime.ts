@@ -39,6 +39,7 @@ import { BOSS_BY_ID, type BossDef } from '../../../shared/constants/bosses.ts';
 import {
   summonBossWithOffering,
   rollPersonalLoot,
+  SummonReject,
   type RaidParticipant,
   type LootOrb,
   type OfferingPort,
@@ -106,10 +107,24 @@ export class BossRaidRuntime {
   /**
    * 祭坛召唤(**含祭品消耗**,owner 裁决 D-03)。
    *
+   * ## 在场表自查(第三轮实测缺陷)
+   *
+   * `summonBoss` 只看得见调用方塞进 `req.alreadyAlive` 的那一位 —— 而**本运行时
+   * 自己就持有 `states`**(`:94`),却不查。后果:同一 Boss 召唤两次,第二次
+   * `summonBossWithOffering` 全部校验通过、**再扣一份祭品**,然后把 `states.set`
+   * 成一只**新建的满血 Boss**,连同 `phaseIndex` / `breakAchieved` / `shieldHp`
+   * 一起重置。表现是「Boss 突然回满血 + 玩家白丢一件祭品」,而不报任何错。
+   *
+   * 修法:登记前先查自己的表。已在场 ⇒ 按 `BOSS_ALIVE` 拒绝(**不登记、不扣东西**),
+   * 与「重复召唤」的语义一致(幂等:第二次不改动任何状态)。
+
    * 成功时把 `BossState` 登记进来;失败时**不登记、不扣东西** ——
-   * 顺序保证由 `summonBossWithOffering` 承担,这里只做登记。
+   * 顺序保证由 `summonBossWithOffering` 承担,这里只做登记 + 在场表自查。
    */
   summon(req: SummonWithOfferingRequest, port: OfferingPort): SummonWithOfferingResult {
+    if (this.states.has(req.bossId)) {
+      return { ok: false, reason: SummonReject.BOSS_ALIVE, scaledHp: 0, offeringConsumed: false };
+    }
     const r = summonBossWithOffering(req, port);
     if (r.ok && r.state !== undefined) this.states.set(req.bossId, r.state);
     return r;

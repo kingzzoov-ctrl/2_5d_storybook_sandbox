@@ -174,6 +174,10 @@ import {
   tickRushOrder,
   /* ★ D-13:把玩家坐标换成 `opts.spraying`(工位种类)的唯一函数 —— 半径口径也在那边。 */
   stationsBeingSprayedBy,
+  /* ★ 第三轮:照看(翻炒)半边 —— 与 `stationsBeingSprayedBy` 同坐标口径。
+     修前 `tickRushOrder` 的 `opts.tended` 全仓**无生产者** ⇒ 12 秒过热退化成
+     「必然起火」(见 `rush_order.ts#stationsBeingTendedBy` 的 docblock)。 */
+  stationsBeingTendedBy,
   type StationKind,
   type RushOrderSession,
 } from '../coop/rush_order.ts';
@@ -1127,6 +1131,20 @@ export class WorldSim {
    */
   private readonly sprayUntil = new Map<string, number>();
 
+  /**
+   * ★ **第三轮**:每个玩家"正在翻炒"的意图窗口 —— 与 `sprayUntil` **同形、同列清**。
+   *
+   * ## 为什么必须有它(第三轮实测 P1/P2:生产从不喂 `tended`)
+   * `tickRushOrder` 的 `opts.tended` 修前全仓**没有生产者**:慢帧只算 `spraying`,
+   * 于是 `StationRuntime.runningSec` 只增不减 ⇒「连续运转 `OVERHEAT_SEC`(12 秒)
+   * 不翻炒 ⇒ 起火」在生产里退化成**必然起火**(见 `rush_order.ts#stationsBeingTendedBy`)。
+   *
+   * 判据:`extinguishDeviceByHand` 里 `212`(大铁铲)的那一支记一条;
+   * 慢帧(`tickPartyStep`)与 `spraying` 同段把它换成工位种类喂给 `tickRushOrder`。
+   * 窗口长度同 `sprayUntil` = 一个慢帧(`FAST_PER_SLOW` 快帧),不新增数值常量。
+   */
+  private readonly tendUntil = new Map<string, number>();
+
   /** 最近一次慢帧有没有真正推进急单(1 = 调了 `tickRushOrder`,0 = 没开急单)。 */
   rushTicked = 0;
 
@@ -1172,8 +1190,9 @@ export class WorldSim {
   /**
    * 最近一次击杀结算出的**掉落**(★ WS-FND-98)。
    *
-   * 判定在 `settleKill` 里做,种子取**世界种子**(`worldSeed`)⇒
-   * 「同一个种子的世界,打死同一只怪,掉同一份东西」是可复现的;
+   * 判定在 `settleKill` 里做,种子取**世界种子**(`worldSeed`)+ **击杀实例维**(实例 id)⇒
+   * 「同一个种子的世界,打死**同一只**怪,掉同一份东西」可复现,而同种怪的**不同次击杀**
+   * 各自独立(只吃世界种子会让同种怪每次击杀都掉同一份,见 `mobs/drops.ts` 文件头第 5 条);
    * 同一次击杀被二次结算(`deduped`)时**不给第二次**,与经验/积分的去重口径一致。
    *
    * 空数组有两义:「这只怪没有掉落」与「还没发生过击杀」—— 与 `lastKillSettle` 的 `null`
@@ -2866,11 +2885,15 @@ export class WorldSim {
     }
 
     /* ── ★ WS-FND-98:掉落判定 ──
-       种子取 `worldSeed`(世界身份)⇒ 同一 seed 的世界打死同一物种得到同一份掉落,
-       判据可复现(`rollMobDrops` 是 (seed, mobId, itemId) 的纯函数,见 `mobs/drops.ts`)。
-       ⚠️ `deduped`(= 同一实例被二次结算)时清空:经验/积分都去重,掉落也不能给第二份
+       种子取 `worldSeed`(世界身份)+ **击杀实例维** = `mobId`(实例 id `mob_species#序号`,
+       世界内唯一、由 `mobs/spawner.ts#mobInstanceId` 的单调计数器生成)。
+       ⚠ 第三轮实测 P1:只传 `worldSeed` 时,同一世界里同种怪**每次击杀的掉落完全相同**,
+       `dropChance` 退化成「该物种在这个世界必掉 / 必不掉」(实测 0% 或 100%)。
+       实例维让同种怪的多次击杀在概率上**独立**;同 seed 的世界重放得到同一串实例 id
+       ⇒ 逐次一致(见 `tests/WS-FND-98` FND98-15/16/17)。
+       ⚠ `deduped`(= 同一实例被二次结算)时清空:经验/积分都去重,掉落也不能给第二份
        (姜饼小人复活 / `addMob` 替换旧条目都会走到这条)。 */
-    const drops = result.deduped ? [] : rollMobDrops(def.id, this.worldSeed);
+    const drops = result.deduped ? [] : rollMobDrops(def.id, this.worldSeed, mobId);
     /* ── ★ WS-FND-102:掉落**真的落到地面** ──
        修前这一行只赋给诊断字段 `lastMobDrops`,而它在全仓**没有生产读者**:
        击杀路径从不调 `dropItem` ⇒ 打死怪的地面永远是空的(审计实测)。
@@ -3671,15 +3694,16 @@ export class WorldSim {
    * ## ★ WS-FND-102:瞬态与物理旁表必须一起清(审计实测)
    *
    * 修前这里只清 `playerIds` / `vitals` / `aoi` / `roomEffects` / `forge`
-   * / `afk` / `spawnPoints`,**漏了四张按 id 索引的瞬态表**:
+   * / `afk` / `spawnPoints`,**漏了五张按 id 索引的瞬态表**:
    * ```
    * foodBuffs   料理 buff(602 最大生命 +30 就住在这)—— 漏清 ⇒ 同名重连**继承上轮料理**,
    *             且 `maxHpForLevel` 会把 `hpFlat` 并进上限(上限凭空 +30,不报错)
    * liveBubbles 活人泡泡状态机(227)      —— 漏清 ⇒ 重连时一进场就可能被判"被困在泡泡里"
    * sprayUntil  喷射意图窗口(慢帧时效)  —— 漏清 ⇒ 重连后的一帧窗口对上轮残留依然成立
+   * tendUntil   翻炒意图窗口(慢帧时效)  —— 同上;漏清 ⇒ 重连后还能"隔空翻炒"上轮那把铲子
    * knockbacks  击退位移窗口               —— 漏清 ⇒ 重连后还会被上轮那次击退继续推两格
    * ```
-   * 四张表本就都按**玩家 id** 索引 ⇒ 生命周期必须跟着玩家 id 走(`rebuildWorld` 的
+   * 五张表本就都按**玩家 id** 索引 ⇒ 生命周期必须跟着玩家 id 走(`rebuildWorld` 的
    * 那段注释里也是同一纪律)。这里逐项点名删除,不做"清空一切"。
    *
    * ## 物理刚体走 `PhysicsWorld.remove` 而不是 `bodies.delete`
@@ -3706,10 +3730,12 @@ export class WorldSim {
     /* 出生点一并清掉:留着会让**重新加入**的同名玩家被重置送到上一局的出生点
        (房间把出生点按席位排开,席位是会变的)。与上面两条是同一类残留。 */
     this.spawnPoints.delete(id);
-    /* ★ 四张按 id 索引的瞬态表(见 docblock):漏任何一张都是"重连继承上一轮"。 */
+    /* ★ 五张按 id 索引的瞬态表(见 docblock):漏任何一张都是"重连继承上一轮"。 */
     this.foodBuffs.delete(id);
     this.liveBubbles.delete(id);
     this.sprayUntil.delete(id);
+    this.tendUntil.delete(id);
+    this.knockbacks.delete(id);
     this.knockbacks.delete(id);
     this.syncPlayers();
     return had;
@@ -4863,9 +4889,10 @@ export class WorldSim {
     this.rushRun = null;
     this.rushTicked = 0;
     this.lastPartyTick = { partyTicked: 0, afkTicked: 0, afkDew: 0, events: [] };
-    /* 瞬态:喷射意图窗口 / 击退窗口 / 倒地 / 活人泡泡 / 料理 buff / DoT /
+    /* 瞬态:喷射意图窗口 / 翻炒意图窗口 / 击退窗口 / 倒地 / 活人泡泡 / 料理 buff / DoT /
        厨房锅内状态(含 `fireOut` —— 一份"炉火已浇灭"跨世代留着就是错的)。 */
     this.sprayUntil.clear();
+    this.tendUntil.clear();
     this.knockbacks.clear();
     this.downedStates.clear();
     this.liveBubbles.clear();
@@ -6029,7 +6056,20 @@ export class WorldSim {
           if (!spraying.includes(kind)) spraying.push(kind);
         }
       }
-      events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT, { spraying }));
+      /* ★ 第三轮:`opts.tended` 与 `spraying` **同段、同形**地在这里成形 —— 修前它全仓
+         没有生产者 ⇒「12 秒不翻炒 ⇒ 起火」在生产里退化成**必然起火**
+         (见 `rush_order.ts#stationsBeingTendedBy` 的 docblock)。
+         只认 `RUNNING`(`stationsBeingTendedBy` 的口径):在烧的工位要浇 227,不是翻炒。 */
+      const tended: StationKind[] = [];
+      for (const [pid, until] of this.tendUntil) {
+        if (until < this.frameCount) { this.tendUntil.delete(pid); continue; }
+        const b = this.physics.bodies.get(pid);
+        if (b === undefined) continue;
+        for (const kind of stationsBeingTendedBy(this.rushRun, { x: b.x, y: b.y })) {
+          if (!tended.includes(kind)) tended.push(kind);
+        }
+      }
+      events.push(...tickRushOrder(this.rushRun, SIM_SLOW_DT, { spraying, tended }));
       this.rushTicked = 1;
     } else {
       this.rushTicked = 0;
@@ -6241,6 +6281,12 @@ export class WorldSim {
     /* ★ D-13:记下"这个玩家刚喷过水"—— 工位灭火(`opts.spraying`)只认这个意图,
        不认"站在旁边"。窗口 = 一个慢帧(见 `sprayUntil` 的 docblock)。 */
     this.sprayUntil.set(actorId, this.frameCount + FAST_PER_SLOW);
+    /* ★ 第三轮:212 大铁铲**同时**兼「翻炒」—— 与 `spraying` 同形的意图窗口记一条。
+       只认 `RUNNING` 的工位(`stationsBeingTendedBy` 的口径):它翻不动在烧的工位,
+       那种情况要浇 227;这里记了也无害(读口那边过滤)。 */
+    if (itemId === WorldSim.SHOVEL_ITEM_ID) {
+      this.tendUntil.set(actorId, this.frameCount + FAST_PER_SLOW);
+    }
     return {
       applied: true, consume: true, reason: 'ok',
       effect: {

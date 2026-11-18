@@ -276,7 +276,20 @@ export type RoomTokenVerdict =
   | { ok: true; claims: RoomTokenClaims }
   | { ok: false; reason: string };
 
-/** 默认有效期 5 分钟 —— 覆盖 `RECONNECT_GRACE_MS`(30s)且远小于"永久"。 */
+/**
+ * 默认有效期 5 分钟 —— 覆盖 `RECONNECT_GRACE_MS`(30s)且远小于"永久"。
+ *
+ * ## ★ P1-3(2026-11-19):TTL 的**起算点**有两档,必须分开说
+ * ```
+ * 签发(join / 重连)     ⇒ 起算点 = 签发时刻(本常量即这一档)
+ * 断线中的成员重连时      ⇒ 起算点 = **断线时刻**,且不越过宽限期终点
+ * ```
+ * 第二档不是"另一张凭证",而是**同一个验签入口**里对「过期」这一项的放宽 ——
+ * 口径与实现见 `verifyRoomToken` 的 `expect.expiredOkUntilMs` 与
+ * `RoomRuntime.reconnectTokenGraceUntilMs`。为什么服务端不干脆在断线时
+ * 换发一张新的:装配层(room.colyseus / ws_server)没有可用的下发通道,
+ * 客户端手里那张一出生就被写死了过期时刻 ⇒ 放宽判据是唯一可行的修法。
+ */
 export const JOIN_TOKEN_TTL_MS = 5 * 60_000;
 /** TTL 上限 24 小时(防止调用方传一个"永不过期"的数)。 */
 export const JOIN_TOKEN_MAX_TTL_MS = 24 * 60 * 60 * 1000;
@@ -334,8 +347,14 @@ export function signRoomToken(secret: string, claims: RoomTokenClaims): string {
  * 3 签名不符        ⇒ 拒(**先**验签,再读载荷:否则等于信任未认领的 JSON)
  * 4 userId 绑定不符  ⇒ 拒(拿着 u_evil 的凭证声称自己是 u_owner)
  * 5 房间不符        ⇒ 拒(跨房重放)
- * 6 过期            ⇒ 拒(`nowMs >= expiresAtMs`,含边界)
+ * 6 过期            ⇒ 拒(`nowMs >= expiresAtMs`,含边界)——
+ *                     除非调用方用 `expiredOkUntilMs` 为**该 userId 自己的重连宽限**开门
  * ```
+ * ★ P1-3(2026-11-19):第 6 条是**唯一**可被放宽的一条,放宽方式是把**起算点**
+ *   从签发时刻换成断线时刻(不是删掉过期判据)—— 口径与边界见
+ *   `expect.expiredOkUntilMs` 的注释。
+ * ⚠️ 它排在最后**也是判据的一部分**:宽限回调收到的是**已验签且已绑定**的
+ *   `claims.userId` ⇒ 「签名不对也问一次宽限」的写法不存在(签名在第 3 条就返回)。
  * `expect.userId === ''` 表示**只认声明、不核对绑定** —— 只有"凭证即身份"的
  * 入口(Colyseus 的 `sessionId` 由服务端生成,没有可比的声明)才这么用,
  * 见 `RoomRuntime.decodeJoinToken`。
@@ -343,7 +362,50 @@ export function signRoomToken(secret: string, claims: RoomTokenClaims): string {
 export function verifyRoomToken(
   secret: string,
   token: unknown,
-  expect: { userId: string; roomId: string; nowMs: number },
+  expect: {
+    userId: string;
+    roomId: string;
+    nowMs: number;
+    /**
+     * ★ 重连宽限(P1-3,2026-11-19):**允许已过期凭证**的截止时刻。
+     *
+     * ## 缺陷形态(修前,可算得出,不必实测)
+     * ```
+     * 凭证的 expiresAtMs 在**签发那一刻**就被写死 = 签发时刻 + 5min。
+     * 而客户端手里**只有这一张**:在房里坐满 5 分钟 ⇒ 它已经过期;
+     * 此刻掉线,30s 宽限期内重连 ⇒ 第 1 步 verifyJoinToken 判「已过期」
+     * ⇒ 席位还在、凭证却不能用 ⇒ 明明在宽限期里,却**必然**被拒
+     *  (随后 reapExpiredDisconnects 把席位删掉,进度全丢)。
+     * ```
+     * ⇒ 为什么不去「断线时换发一张新凭证」:服务端在断线时刻**没有任何
+     *   可用的下发通道**(客户端已经走了)。装配层(room.colyseus /
+     *   ws_server)只能验它递上来的那一张 ⇒ 能改的只有**判据的起算点**。
+     *
+     * ## 本项的口径(一句话,与实现逐字对应)
+     * ```
+     * 断线中的成员,其手中那张凭证的有效期**从断线时刻起算**,
+     * 且**不得越过重连宽限期的终点**。
+     * 生效值 = min(断线时刻 + JOIN_TOKEN_TTL_MS, 断线时刻 + RECONNECT_GRACE_MS)
+     *        = 断线时刻 + RECONNECT_GRACE_MS(30s < 5min,故后者总是更紧)
+     * ```
+     * ⇒ **全仓唯一**算它的地方是 `RoomRuntime.reconnectTokenGraceUntilMs`
+     *   (两处调用点:`verifyJoinToken` / `decodeJoinToken`),不许第二份。
+     *
+     * ## 放宽的边界(逐条)
+     * ```
+     * 1 只有「过期」这一项被放宽:签名 / 房间 / userId 绑定 / 载荷格式
+     *   一条都没动(它们排在本判据之前,先返回);
+     * 2 只有**该 userId 自己**处于断线宽限期时才可能得到非 undefined:
+     *   在线成员、宽限期已过、从未入房、查无此人 ⇒ `undefined`
+     *   ⇒ 原判据原样生效(负对照就在这几个态上);
+     * 3 回调拿到的是**已验签**的 `claims.userId`,而不是调用方声明的那个
+     *   (核对绑定时两者相等;`userId === ''` 的入口则完全以凭证为准);
+     * 4 「宽限期已过就不再放宽」由 `reapExpiredDisconnects` 保证:席位只多活
+     *   RECONNECT_GRACE_MS,过了就不再是"断线中的成员" ⇒ 回调恒 `undefined`。
+     * ```
+     */
+    expiredOkUntilMs?: (claimedUserId: string) => number | undefined;
+  },
 ): RoomTokenVerdict {
   if (typeof token !== 'string' || token.length === 0) {
     return { ok: false, reason: '缺少 token(身份未认证)' };
@@ -386,7 +448,12 @@ export function verifyRoomToken(
     return { ok: false, reason: `token 与声明的 userId 不符(token 属于 ${userId},却声称 ${expect.userId})` };
   }
   if (expect.nowMs >= expiresAtMs) {
-    return { ok: false, reason: `token 已过期(过期时刻 ${expiresAtMs} ≤ 当前 ${expect.nowMs})` };
+    /* ★ P1-3:过期**默认**拒;只有调用方为**这个 userId 的重连宽限**开门时才放过
+       (口径、生效值与放宽边界见 `expect.expiredOkUntilMs` 的长注释)。 */
+    const until = expect.expiredOkUntilMs?.(userId);
+    if (until === undefined || expect.nowMs >= until) {
+      return { ok: false, reason: `token 已过期(过期时刻 ${expiresAtMs} ≤ 当前 ${expect.nowMs})` };
+    }
   }
   return { ok: true, claims: { userId, roomId, expiresAtMs } };
 }
@@ -1429,13 +1496,20 @@ export class RoomRuntime {
       const away = stale.disconnectedAtMs === null ? 0 : now - stale.disconnectedAtMs;
       if (away > RECONNECT_GRACE_MS) {
         demotedFromExpiry = true;
+        /* ⚠️ 这一支**刻意不**并进 `purgeSeat()` —— 它必须自己把世界侧那一步
+           写在**分支内**:`tests/WS-07.test.ts` 的 M8 用**代码态窗口**
+           (从 `away > RECONNECT_GRACE_MS` 起 800 字符)钉住「超期分支必须调
+           `removePlayer`」,而代码态窗口无法表达"间接调用"。
+           ⇒ 与本分支逐字相同的四步,在 `leave()` / `reapExpiredDisconnects()`
+           那两条路径上收敛到 `purgeSeat()`(见那里的注释:reap 修前漏了这一支)。
+           三条路径的**行为一致**由 WS-FND-106 的 FND106-6 逐条钉住
+           (它数的是 host 上真实发生的调用,不是源码文本)。
+           ★ 旧注释(仍然成立):世界侧必须**一并**移除 —— 漏了它会让
+           「宽限期超期重进」的玩家在模拟层里**留下旧刚体**,而随后 `addPlayer`
+           又会 spawn 一次(位置 = 出生点)。 */
         this.members.delete(input.userId);
         this.state.players = this.state.players.filter((p) => p.id !== input.userId);
         this.ac.leave(input.userId);
-        /* ⚠️ 世界侧必须**一并**移除 —— 这条路径与 `leave()` 是两处,
-           漏了它会让「宽限期超期重进」的玩家在模拟层里**留下旧刚体**,
-           而随后 `addPlayer` 又会 spawn 一次(位置 = 出生点),
-           表现为「重进后位置被悄悄拉回出生点」。 */
         const hostStale = this.worldSaveHost;
         if (hostStale !== null && typeof hostStale.removePlayer === 'function') {
           hostStale.removePlayer(input.userId);
@@ -1449,7 +1523,14 @@ export class RoomRuntime {
       if (!existing.connected) {
         /* ★ 重连**不豁免**认证:上面那段 `verifyJoinToken` 是唯一的入口,
            所以「带 ?userId=u_owner 重连」和「首次加入冒充房主」是同一条路、同一个门。
-           重连成功后再**换发**一张新凭证(旧的可能已接近过期)。 */
+           ★ P1-3(2026-11-19):**过期不等于被拒** —— 若该成员正处于断线宽限期,
+           上面那次验签会把「过期」的起算点换成**断线时刻**(口径见
+           `reconnectTokenGraceUntilMs`);否则会话一超过 5 分钟,宽限期内重连
+           就**必然**被拒(修前的实测形态)。
+           重连成功后再**换发**一张新凭证:房间侧顺手而已 —— 实测两个装配层
+           调用点(`ws_server.ts:onHello` / `room.colyseus.ts:onJoin`)都**只读**
+           `res.ok` / `res.resumed` / `res.snapshot`,**没有一处**把 `res.token`
+           回给客户端 ⇒「手里那张老凭证还能不能用」只能由上面那条口径决定。 */
         const token = this.issueJoinToken(input.userId);
         existing.token = token;
         existing.connected = true;
@@ -1617,19 +1698,57 @@ export class RoomRuntime {
     return true;
   }
 
-  /** 主动离开(非掉线):立刻回收席位与快照。 */
-  leave(userId: string): boolean {
-    const s = this.members.get(userId);
-    if (!s) return false;
+  /**
+   * ★ P1-2(2026-11-19):把一名成员的**四处痕迹**一次性摘干净。
+   *
+   * ## 缺陷形态(修前)
+   * 「成员被移除」在房间里是**三条**路径,要做的动作**完全相同**:
+   * ```
+   * leave()                     主动退房 / 被踢 / 房主关房      —— 4 步齐全
+   * join() 宽限超期重进(同名重进) 同一个人换了身份回来            —— 4 步齐全
+   * reapExpiredDisconnects()    宽限期到了、房间自己回收         —— ★ 只有 3 步
+   * ```
+   * 第三条只删了 `members` / `state.players` / `ac` 三处,**没调
+   * `host.removePlayer`** ⇒ 超期者的刚体与 `playerIds` 留在模拟层里;
+   * 而它随后重新入场会再 `addPlayer` 一次 ⇒ 世界里同一个 id **两份刚体**
+   * (位置被悄悄拉回出生点、上一轮的进度/生命值被继承 —— 与 `removePlayer`
+   * 注释里记的是同一族症状)。
+   * ⚠️ 三条路径分头写时**漏一步不会有任何报错**:前三步照样成功,
+   *   「`state.players` 少了一个」的断言照样绿 ⇒ 这类缺陷只能靠
+   *   「收敛成一处」消灭,靠"下次仔细点"消灭不掉。
+   *
+   * ## 谁在用(2/3 条路径,第 3 条是**刻意的例外**)
+   * ```
+   * leave()                    → 调本方法
+   * reapExpiredDisconnects()   → 调本方法   ← ★ 修前就是这条漏了世界侧
+   * join() 的宽限超期分支       → **不调**(自己在分支内写那四步)
+   * ```
+   * 例外的理由**不是设计取舍,而是一条外部约束**(逐字记在这里,免得下一个人
+   * 以为它是漏改):`tests/WS-07.test.ts` 的 M8 用**代码态窗口**钉住
+   * 「超期分支必须调 `removePlayer`」—— 它从 `away > RECONNECT_GRACE_MS`
+   * 起取 800 字符,要求窗口里出现 `removePlayer`。代码态窗口**无法表达
+   * 「间接调用」**,把那一支折进本方法会当场让 M8 变红(实测)。
+   * ⇒ 三条路径的**行为一致**由行为级判据兜住:`tests/WS-FND-106-...` 的
+   *   FND106-6(数 host 上真实发生的调用)+ FND106-8(数调用点数量)。
+   */
+  private purgeSeat(userId: string): void {
     this.members.delete(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
     this.ac.leave(userId);
     /* 世界侧一并移除:留着刚体与 `playerIds` 会让**同名玩家重新加入时**
-       继承上一轮的进度/生命值(与 `removePlayer` 注释里「温泉计时被继承」同族)。 */
+       继承上一轮的进度/生命值,并让模拟层里同一个 id 有两份刚体
+       (与 `removePlayer` 注释里「温泉计时被继承」同族)。 */
     const host = this.worldSaveHost;
     if (host !== null && typeof host.removePlayer === 'function') {
       host.removePlayer(userId);
     }
+  }
+
+  /** 主动离开(非掉线):立刻回收席位与快照。 */
+  leave(userId: string): boolean {
+    const s = this.members.get(userId);
+    if (!s) return false;
+    this.purgeSeat(userId);
     if (s.role === RoomRole.OWNER && this.members.size > 0) {
       /* 房主走了:把 OWNER 传给最早的在线 ADMIN/MEMBER。 */
       const next = [...this.members.values()]
@@ -1676,9 +1795,9 @@ export class RoomRuntime {
     for (const m of [...this.members.values()]) {
       if (m.connected || m.disconnectedAtMs === null) continue;
       if (now - m.disconnectedAtMs > RECONNECT_GRACE_MS) {
-        this.members.delete(m.userId);
-        this.state.players = this.state.players.filter((p) => p.id !== m.userId);
-        this.ac.leave(m.userId);
+        /* ★ P1-2:与 `leave()` / `join()` 走**同一个** `purgeSeat()` ——
+           修前这里少了世界侧那一步(见 `purgeSeat` 的注释)。 */
+        this.purgeSeat(m.userId);
         gone.push(m.userId);
       }
     }
@@ -2903,12 +3022,19 @@ export class RoomRuntime {
    * 校验一张加入凭证,并**核对它声明的 userId** —— 运输层与重连调用的是同一个方法。
    * 失败原因原样往上抛(下游把它当 `reject` 帧的 reason),不吞、不归一化:
    * 「缺 token / 伪造 / 过期 / 房的凭证」是四件事,合成一句就没法指认了。
+   *
+   * ★ P1-3(2026-11-19):过期判据的**起算点**在重连态下改为断线时刻 ——
+   *   由 `reconnectTokenGraceUntilMs(userId)` 提供,口径见
+   *   `verifyRoomToken` 的 `expect.expiredOkUntilMs`。
+   *   ⚠️ 这里**只**放宽过期(签名/房间/绑定三判据没动),而且只对
+   *      **这个 userId 自己**的断线宽限生效 —— 在线成员拿到的是 `undefined`。
    */
   verifyJoinToken(userId: string, token: unknown): RoomTokenVerdict {
     return verifyRoomToken(this.authSecret, token, {
       userId,
       roomId: this.id,
       nowMs: this.clock.nowMs(),
+      expiredOkUntilMs: () => this.reconnectTokenGraceUntilMs(userId),
     });
   }
 
@@ -2926,7 +3052,47 @@ export class RoomRuntime {
       userId: '',
       roomId: this.id,
       nowMs: this.clock.nowMs(),
+      /* ★ P1-3:这里**没有**客户端声明的 userId 可比对 ⇒ 只能用凭证自己的
+         `claims.userId` 去问宽限 —— 回调的参数正是它(见 verifyRoomToken 的
+         `expiredOkUntilMs` 注释第 3 条)。 */
+      expiredOkUntilMs: (claimedUserId: string) => this.reconnectTokenGraceUntilMs(claimedUserId),
     });
+  }
+
+  /**
+   * ★ P1-3(2026-11-19):断线中的成员**重连时可用的凭证截止时刻**。
+   *
+   * ## 口径(全仓唯一一处算它 —— 两处调用点共用)
+   * ```
+   * 生效值 = min(断线时刻 + JOIN_TOKEN_TTL_MS, 断线时刻 + RECONNECT_GRACE_MS)
+   *        = 断线时刻 + 30s(因为 30s < 5min,宽限期总是更紧的那个)
+   * ```
+   * 直觉版:**凭证的有效期从断线时刻重新起算,但绝不越过重连宽限期的终点**。
+   * 前一半修的是「会话超过 5 分钟 ⇒ 手里那张已过期 ⇒ 宽限期内必然被拒」;
+   * 后一半保证放宽**不能**比席位本身活得更久(席位一过 30s 就被
+   * `reapExpiredDisconnects` 收回,那时这里恒返回 `undefined`)。
+   *
+   * ## 为什么这样算而不是「断线时换发一张」
+   * 服务端在**断线那一刻**没有任何可用的下发通道(客户端已经走了);
+   * 装配层只能验客户端递上来的那一张 ⇒ 能改的只有**判据的起算点**。
+   * 详见 `verifyRoomToken` 的 `expect.expiredOkUntilMs`。
+   *
+   * ## 三态(负对照的入口都在这里)
+   * ```
+   * 没有这个成员 / 已在线 / 没有断线时刻 ⇒ `undefined` ⇒ 过期凭证照旧被拒
+   * 断线中且仍在宽限期内              ⇒ 断线时刻 + RECONNECT_GRACE_MS
+   * ```
+   * ⚠️ `s.disconnectedAtMs === null` 单独判一次是**必须**的:它在类型上
+   *   是 `number | null`,直接相加会得到 `NaN`,而 `nowMs >= NaN` 恒为
+   *   `false` ⇒ 那会变成一条**无条件的放行**(本仓反复点名的 NaN 形态)。
+   */
+  reconnectTokenGraceUntilMs(userId: string): number | undefined {
+    const s = this.members.get(userId);
+    if (s === undefined || s.connected || s.disconnectedAtMs === null) return undefined;
+    return Math.min(
+      s.disconnectedAtMs + JOIN_TOKEN_TTL_MS,
+      s.disconnectedAtMs + RECONNECT_GRACE_MS,
+    );
   }
 
   private spawnPoint(): { x: number; y: number } {
