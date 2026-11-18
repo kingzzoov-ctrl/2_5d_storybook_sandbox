@@ -223,7 +223,7 @@ const msg = "we lack mobHost here";   ⇒ probe /mobHost/ 命中 ⇒ 判「firin
 
 | 编号 | 条目 | 缺什么 | 影响 | 归属 |
 | :--- | :--- | :--- | :--- | :--- |
-| U12 | 「剥注释」调用方普查 | **已完成** | — | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U12 同题,合并到该条 |
+| U12 | 「剥注释」调用方普查 | **已完成** | — | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U12 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(代码态扫描;同题条已带该判据) |
 | U15 | `backlog.ts` `STALE_PROBES` 代码态化 | 待 Lead 批(S34) | 低(现网 0 例) | Lead | **已关闭(2026-11-17)** | 已过期:`STALE_PROBES` 已代码态化(`stripToCode`),判据 `scripts/backlog.ts` |
-| U13 | 动态 `import()` 不跟踪 | 已知边界 | 零 | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U13 同题,合并到该条 |
-| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条 |
+| U13 | 动态 `import()` 不跟踪 | 已知边界 | 零 | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U13 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(`findDynamicImports`;同题条已带该判据) |
+| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | — | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(`findWhitelistCrossViolations`;同题条已带该判据) |

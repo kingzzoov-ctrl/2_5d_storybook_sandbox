@@ -56,7 +56,14 @@ import {
   type SortFilter,
   type Weather,
 } from './greenhouse.ts';
-import { settleRanchDay, resolveItemByName, type RanchAnimal, type RanchDayResult } from './ranch.ts';
+import {
+  settleRanchDay,
+  settleRanchDayOnce,
+  resolveItemByName,
+  type RanchAnimal,
+  type RanchDayResult,
+  type RanchOnceOutcome,
+} from './ranch.ts';
 import {
   brewAndRecord,
   createGallery,
@@ -65,6 +72,14 @@ import {
   type Gallery,
   type GalleryEntry,
 } from './alchemy_lab.ts';
+import {
+  SETTLEMENT_ROOMS,
+  claimSettlement,
+  createSettlementLedger,
+  settleKeyOf,
+  settlementSeenAt,
+  type SettlementLedger,
+} from './idempotency.ts';
 
 /**
  * 一格耕地的作物状态(**世界侧持有的最小可判定形状**)。
@@ -122,6 +137,14 @@ export interface RoomSystemsState {
   lastRanch: RanchDayResult | null;
   /** 最近一次炼金的首创行(`null` = 还没炼过)。 */
   lastBrew: GalleryEntry | null;
+  /**
+   * ★ WS-FND-96:三个房间系统的**幂等台账**(键 → 首次成功结算的时刻)。
+   *
+   * 与 `gallery` / `harvest` 同住一个状态对象,于是「重置房间系统」时不会漏掉它
+   * (`createRoomSystemsState()` 给一张空表)—— 漏掉的后果是重启后所有订单被当成
+   * 重放而永久拒付。
+   */
+  settled: SettlementLedger;
   /** 累计收下来的作物(按成熟顺序;`sortHarvest` 已判过道)。 */
   harvest: HarvestRow[];
   /** 429 的过滤规则(世界侧配置;空 = 一切 `-1` 原样留在带上)。 */
@@ -138,6 +161,7 @@ export function createRoomSystemsState(): RoomSystemsState {
     ranchPets: [],
     lastRanch: null,
     lastBrew: null,
+    settled: createSettlementLedger(),
     harvest: [],
     sortFilters: [],
     growthTicks: 0,
@@ -297,6 +321,27 @@ export function settleRanch(
 }
 
 /**
+ * **幂等**日结(WS-FND-96 / 审计 P2-3):同一个 `(ECO_RANCH, day)` 只成功一次。
+ *
+ * 与 `settleRanch` 的唯一差别:多一张台账(`st.settled`)。重放时
+ * **不写** `st.lastRanch`(回执仍是那一天成功的那份),饲料与产出都不动 ——
+ * 世界侧把 `accepted: false` 当成「这一拍没有牧场账」整笔跳过。
+ *
+ * @param day 房间内的第几天(0 起);**幂等键的一维**,由调用方喂(不读时钟)
+ */
+export function settleRanchOnce(
+  st: RoomSystemsState,
+  day: number,
+  animals: readonly RanchAnimal[],
+  feed: Readonly<Record<number, number>>,
+  days: number,
+): RanchOnceOutcome {
+  const out = settleRanchDayOnce(st.settled, { animals, feed, days, day });
+  if (out.accepted) st.lastRanch = out.result;
+  return out;
+}
+
+/**
  * 产出物的物品 id(**内容表是唯一事实源**;表里没有 ⇒ `null`)。
  *
  * 转发 `ranch.ts` 的 `resolveItemByName`,而不是自己建一张
@@ -314,6 +359,63 @@ export function brewInLab(st: RoomSystemsState, input: BrewInput): BrewOutcome {
     st.lastBrew = out.entry;
   }
   return out;
+}
+
+/** 带**订单号**的炼金输入(订单号 = 调用方给的权威身份;同一单只出一次账)。 */
+export interface BrewOrderInput extends BrewInput {
+  orderId: string;
+}
+
+/**
+ * 幂等炼金的结果。`accepted: false` ⇒ **陈列馆逐字段不变**(没有新行、没有
+ * `craftCount + 1`),`st.lastBrew` 也仍是上一次成功的那行。
+ */
+export type BrewOnceOutcome =
+  | { accepted: true; key: string; outcome: Extract<BrewOutcome, { ok: true }> }
+  | { accepted: false; key: string | null; replayed: boolean; reason: string };
+
+/**
+ * **幂等**炼金(WS-FND-96 / 审计 P2-3):同一个 `(ALCHEMY_LAB, 订单号)` 只成功一次。
+ *
+ * ★ 与 `brewInLab` 的差别正是审计登记的那一条:`brewInLab` 重复调用会把
+ *   `craftCount` **再加一**(`alchemy_lab.ts` 的 `existing !== undefined` 分支 ——
+ *   那是「玩家真的又炼了一次」的语义),而**报文重放 / 客户端重发**不是又炼了一次
+ *   ⇒ 重放必须被拒,且陈列馆逐字段不变。
+ *
+ * ★ 纪律 2(`idempotency.ts` 文件头):只有 `brewAndRecord` 真的成功才占键,
+ *   材料不合法等失败**不占**订单号 —— 修好材料后用同一单号重试仍然成功。
+ */
+export function brewInLabOnce(st: RoomSystemsState, input: BrewOrderInput): BrewOnceOutcome {
+  const key = settleKeyOf(SETTLEMENT_ROOMS.ALCHEMY_LAB, { kind: 'ORDER', orderId: input.orderId });
+  if (key === null) {
+    return {
+      accepted: false,
+      key: null,
+      replayed: false,
+      reason: `订单号非法(${JSON.stringify(input.orderId)})⇒ 无法判重,不炼`,
+    };
+  }
+  const seenAt = settlementSeenAt(st.settled, key);
+  if (seenAt !== undefined) {
+    return {
+      accepted: false,
+      key,
+      replayed: true,
+      reason: `订单 ${input.orderId} 已在 ${seenAt} 结算过(幂等键 ${key})⇒ 拒绝,陈列不变`,
+    };
+  }
+  const out = brewAndRecord(st.gallery, input);
+  if (!out.ok) {
+    return { accepted: false, key, replayed: false, reason: out.reason };
+  }
+  /* 先占键再落状态:两件事都不抛,顺序只影响「万一占键失败时别写脏馆」。 */
+  const claim = claimSettlement(st.settled, key, input.at);
+  if (!claim.ok) {
+    return { accepted: false, key, replayed: true, reason: claim.reason };
+  }
+  st.gallery = out.gallery;
+  st.lastBrew = out.entry;
+  return { accepted: true, key, outcome: out };
 }
 
 /** 537 陈列投影的一行(**只读**,给网络层/客户端用). */

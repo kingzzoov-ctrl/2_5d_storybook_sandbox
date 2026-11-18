@@ -34,6 +34,13 @@
 
 import { MOB_BY_ID } from '../../../shared/constants/mobs.ts';
 import { ITEM_LIST } from '../../../shared/constants/items.ts';
+import {
+  SETTLEMENT_ROOMS,
+  claimSettlement,
+  settleKeyOf,
+  settlementSeenAt,
+  type SettlementLedger,
+} from './idempotency.ts';
 
 /**
  * 本实现在 `rooms/effects.ts` 的 `ROOM_EFFECT_DECISION` 里登记的身份。
@@ -263,4 +270,79 @@ export function settleRanchDay(input: RanchDayInput): RanchDayResult {
     unresolved,
     notes,
   };
+}
+
+/* ═══════════ 幂等边界(WS-FND-96 / 审计 P2-3):同一 `(房间, 结算日)` 只成功一次 ═══════════ */
+
+/**
+ * 带**结算日**的日结输入。
+ *
+ * `day` = 房间内的第几天(0 起整数),由调用方喂 —— 本模块仍然**不读时钟**,
+ * 于是「这次结算是哪一天」是入参而不是隐含状态(与 `BrewInput.at` 同口径)。
+ */
+export interface RanchDayKeyedInput extends RanchDayInput {
+  day: number;
+}
+
+/**
+ * 幂等日结的结果。
+ *
+ * `accepted: false` ⇒ **本次一位都没结**(`result` 恒 `null`):没有饲料被扣、
+ * 没有产出被算。调用方必须整笔放弃,而不是「拿到空回执再补一次」。
+ */
+export type RanchOnceOutcome =
+  | { accepted: true; key: string; result: RanchDayResult }
+  | { accepted: false; key: string | null; replayed: boolean; reason: string; result: null };
+
+/**
+ * **幂等**日结:同一个 `(ECO_RANCH, day)` **只成功一次**。
+ *
+ * ```
+ * day 非法(-1 / NaN)                 ⇒ 拒,台账不动
+ * 该 day 已在台账里(重放 / 慢帧重入)   ⇒ 拒(replayed:true),台账不动
+ * 结算天数 = 0                        ⇒ 拒,**不占**该日(否则这一天被永久占掉)
+ * 否则                                ⇒ 结算 + 占键
+ * ```
+
+ * ★ 负对照:`settleRanchDay`(不带台账)连调两次**两次都出账** —— 这正是本函数
+ *   存在的理由,判据用它证明「幂等是真的多了一层,而不是原有行为」。
+ * ★ 「只有成功才占键」是纪律 2(见 `idempotency.ts` 文件头):`days === 0` 时不占键,
+ *   于是同一天随后真的过了一天仍然结得出来。
+ */
+export function settleRanchDayOnce(ledger: SettlementLedger, input: RanchDayKeyedInput): RanchOnceOutcome {
+  const key = settleKeyOf(SETTLEMENT_ROOMS.ECO_RANCH, { kind: 'DAY', day: input.day });
+  if (key === null) {
+    return {
+      accepted: false,
+      key: null,
+      replayed: false,
+      reason: `结算日非法(${String(input.day)})⇒ 不结算`,
+      result: null,
+    };
+  }
+  const seenAt = settlementSeenAt(ledger, key);
+  if (seenAt !== undefined) {
+    return {
+      accepted: false,
+      key,
+      replayed: true,
+      reason: `第 ${seenAt} 天已结算过(幂等键 ${key})⇒ 拒绝,饲料与产出都不动`,
+      result: null,
+    };
+  }
+  const result = settleRanchDay(input);
+  if (result.days <= 0) {
+    return {
+      accepted: false,
+      key,
+      replayed: false,
+      reason: '结算天数为 0 ⇒ 无账可结(不占用结算日)',
+      result: null,
+    };
+  }
+  const claim = claimSettlement(ledger, key, input.day);
+  if (!claim.ok) {
+    return { accepted: false, key, replayed: true, reason: claim.reason, result: null };
+  }
+  return { accepted: true, key, result };
 }

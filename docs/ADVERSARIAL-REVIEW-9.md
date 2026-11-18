@@ -189,8 +189,8 @@ eq(ICON_SIZE, 16, 'ICON_SIZE 本身 = 16(设计基线,像素阵 16×16)');
 
 | 编号 | 条目 | 缺什么 | 影响 |
 | :--- | :--- | :--- | :--- |
-| U1 | `WS-06::ICON_SIZE` 的 111/112 | 已确认**应保留**(有牙齿) | 无需动作 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-8.md U1 同题,合并到该条 |
-| **U5** | **WS-01 未复核** | **下一步** | 最后一个未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条 |
-| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条 |
+| U1 | `WS-06::ICON_SIZE` 的 111/112 | 已确认**应保留**(有牙齿) | 无需动作 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-8.md U1 同题,合并到该条。判据 `tests/WS-06.test.ts`(同题条 REVIEW-8 U1:`ICON_SIZE` 已双向锚定) |
+| **U5** | **WS-01 未复核** | **下一步** | 最后一个未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条。判据 `tests/WS-01.test.ts`(同题条 REVIEW-10 U5 的复核判据) |
+| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(`findWhitelistCrossViolations`;同题条已带该判据) |
 | **U12** | `stripCommentsOnly` 其它调用方是否有同类问题 | 待查(S28) | 中:可能还有其它「假依赖」入口 | **已关闭(2026-11-17)** | 已过期:「剥注释」调用方普查已完成(7 处 / 同病 4 处),门禁改代码态扫描,判据 `tests/WS-FND-74-gate-hardening.test.ts` |
 | U13 | 动态 `import()` 不跟踪 | 已知边界 | 零 | **已关闭(2026-11-17)** | 已过期:动态 `import()` 现已跟踪(`findDynamicImports`),判据 `tests/WS-FND-74-gate-hardening.test.ts` |

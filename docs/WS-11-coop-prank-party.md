@@ -803,7 +803,7 @@ node scripts/verify.ts --only WS-11   # 全绿
 
 | # | 议题 | Lead 裁决 | 落地位置 | 验收断言 |
 | :--- | :--- | :--- | :--- | :--- |
-| **U1** | **已解决** ~~叠罗汉伸手高度:第一版 `STACK_REACH_Z = 0.25` 让 3 人梯只差 0.05 格,20Hz 浮点与坐标同步抖动足以误判~~ | **改常量,不改判定逻辑**。`Z2_REACH_TARGET = 2.30`(Z=2 层果实/机关的有效抓取高度,不再是平台面 2.0);`STACK_REACH_Z = 0.30`。3 人梯 `1.70 + 0.30 = 2.00 < 2.30`(差 0.30);4 人梯 `2.55 + 0.30 = 2.85 ≥ 2.30`(余 0.55)。两侧裕度都 > 0.1,设计意图保持 | `coop/rush_order.ts`:`STACK_REACH_Z = 0.30`、`Z2_REACH_TARGET = 2.30`、`Z2_FRUIT_HEIGHT = Z2_REACH_TARGET`、`BOSS_BACK_HEIGHT = Z2_REACH_TARGET`;`canReachHeight` 判定式一行未动 | **E1 / E2 / E3**(含 `gap3 = 0.30`、`gap4 = 0.55` 的 `inRange(0.1, 1.0)` 裕度断言) |
+| **U1** | **已解决** ~~叠罗汉伸手高度:第一版 `STACK_REACH_Z = 0.25` 让 3 人梯只差 0.05 格,20Hz 浮点与坐标同步抖动足以误判~~ | **改常量,不改判定逻辑**。`Z2_REACH_TARGET = 2.30`(Z=2 层果实/机关的有效抓取高度,不再是平台面 2.0);`STACK_REACH_Z = 0.30`。3 人梯 `1.70 + 0.30 = 2.00 < 2.30`(差 0.30);4 人梯 `2.55 + 0.30 = 2.85 ≥ 2.30`(余 0.55)。两侧裕度都 > 0.1,设计意图保持 | `coop/rush_order.ts`:`STACK_REACH_Z = 0.30`、`Z2_REACH_TARGET = 2.30`、`Z2_FRUIT_HEIGHT = Z2_REACH_TARGET`、`BOSS_BACK_HEIGHT = Z2_REACH_TARGET`;`canReachHeight` 判定式一行未动 | **E1 / E2 / E3**(含 `gap3 = 0.30`、`gap4 = 0.55` 的 `inRange(0.1, 1.0)` 裕度断言)。落地 `server/src/coop/rush_order.ts:939`(`STACK_REACH_Z = 0.30`)配 `:951`(`Z2_REACH_TARGET = 2.30`);判据 `tests/WS-11.test.ts:536` |
 | **U10** | **已解决** ~~玩具 243 引雷铁锅头盔自伤:是否让和平盾挡住~~ | **保留自伤,加「不自锁」保护**。和平盾语义是「免疫**队友**的物理整蛊」,自伤不属此列,挡掉会让道具失去代价感并误导玩家预期。做法:① 自伤保留(1.5 秒感电麻痹 + 掉血),但 HP 硬顶 `max(1, ceil(15% × maxHp))`;② 自伤**永不触发**幽灵泡泡倒地;③ 自伤与队友伤害**分开两条代码路径**,注释写清「自伤不受和平盾影响」 | `prank/toys.ts`:`applySelfDamage(hp, maxHp, rawDamage)`(**签名无 `shieldOn`**)、`resolveHelmetSelfStrike`、`selfDamageHpFloor`、`SELF_DAMAGE_HP_FLOOR_RATIO = 0.15`、`HELMET_SELF_PARALYZE_SEC = 1.5`、`HELMET_SELF_DAMAGE = 45`;文档 §4.9b 为独立小节 | **G9**(戴 218 + 戴 243 被自己闪电命中 → HP ≥ 15% 上限、`state ≠ GHOST_BUBBLE`、`shielded === false`、`ghostBubble === false`;另含 5/50/75/76 四点硬顶边界) |
 
 ### 10.2 调参项(10 条,U2 已升级为裁决、见 §10.2a,其余 9 条取值为最终值)
@@ -811,15 +811,15 @@ node scripts/verify.ts --only WS-11   # 全绿
 | # | 最终取值 | 落地位置 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **U2** | 订单单件分改用**望远镜差值** `round(P·dn/N) − round(P·dn−1/N)`(**已裁决:采纳修法**,不做「先乘后除再取整」) | `coop/rush_order.ts` `deliverItem` | 见下方 §10.2a 专节。原「≤2 分可忽略」「需额外余数状态」两条理由经实测**均不成立** | **已关闭(2026-11-17)** | 已过期:望远镜差值已实现(`deliverItem` 的 `awardedBefore`/`awardedAfter`),判据 `tests/WS-11.test.ts` |
-| **U3** | `CHAIN_BREAK_PENALTY = 40`(**Lead 已采纳**:保持固定 40,不做按环递增) | `coop/rush_order.ts` | 单次成功 150 分 / 中断罚 40 分 = 3.75:1,连断 4 次才抵一次成功,惩罚有分量但不劝退;按环递增会让「第 1 环断」几乎无痛、规则难讲解 |
-| **U4** | 河狸偷料 4 秒窗口内**无** `RESCUING` 中间态(**Lead 已采纳**:保持直接扣 `stock[151]`) | `coop/rush_order.ts` `tickBeaver` | 抢救态需 WS-04 提供河狸逐帧位置;当前 `mob_beaver` 的 AI 归 WS-04,跨 WS 同步未定型,先按「4 秒内打断」的简单模型交付 |
-| **U5** | 掉冠冷却与抢冠冷却**共用** `CROWN_PICKUP_COOLDOWN_SEC = 5`(**Lead 已采纳**:不拆分) | `party/modes.ts` | 两个冷却在语义上都是「皇冠不可拾取」,共用常量让调参只有一处;拆分会引入两套计时器的同步问题 |
-| **U6** | 涂色网格 `24×24 = 576` 格,`PAINT_BALL_RADIUS = 1`(3×3)(**Lead 已采纳**) | `party/modes.ts` | 单队满涂约 64 球,120 秒内 4 队争抢的节奏合适;场地放大需同步改半径,否则单球占比过小 |
-| **U7** | 白噪音总增益 `1.12`,逻辑层用 `Math.min(1, t/fade)` 钳制(**Lead 已采纳**:保留逻辑层钳制,WS-09 可再加总线归一化) | `social/afk.ts` `tickVivarium` | 逻辑层钳制保证 `masterGain` 值域 ∈ [0, 1.12] 且淡入曲线单调;WS-09 若在总线加 `masterGain` 归一化,两者不冲突 |
-| **U8** | 售货摊推荐价 `ceil(V_i × 1.6)`(**Lead 已采纳**:统一系数,不按分类分化) | `social/afk.ts` `suggestedPrice` | 统一系数让玩家一眼能算;Boss 遗物 V=250 → 400 偏高的问题交给玩家自主定价(推荐价只是默认值,可改) |
-| **U9** | 急单 S 档时间奖励 `×1.15` 保留(**Lead 已采纳**),`totalPoints` 上限压到 4 位 | `coop/rush_order.ts` `settleRushOrder` | `totalPoints` 由 `V_i × need × 等级系数` 构成,4 单 × 4 件 × V≤85 时约 3400 分,乘 1.15 后 < 4000,4 位数字足够;WS-09 UI 按 4 位设计即可 |
+| **U3** | `CHAIN_BREAK_PENALTY = 40`(**Lead 已采纳**:保持固定 40,不做按环递增) | `coop/rush_order.ts` | 单次成功 150 分 / 中断罚 40 分 = 3.75:1,连断 4 次才抵一次成功,惩罚有分量但不劝退;按环递增会让「第 1 环断」几乎无痛、规则难讲解。落地 `server/src/coop/rush_order.ts:774`(`CHAIN_BREAK_PENALTY = 40`);判据 `tests/WS-11.test.ts:450`(字面量 40) |
+| **U4** | 河狸偷料 4 秒窗口内**无** `RESCUING` 中间态(**Lead 已采纳**:保持直接扣 `stock[151]`) | `coop/rush_order.ts` `tickBeaver` | 抢救态需 WS-04 提供河狸逐帧位置;当前 `mob_beaver` 的 AI 归 WS-04,跨 WS 同步未定型,先按「4 秒内打断」的简单模型交付。落地 `server/src/coop/rush_order.ts:676`(`tickBeaver` 直接扣 `stock[151]`,无 `RESCUING` 态);判据 `tests/WS-11.test.ts:343` |
+| **U5** | 掉冠冷却与抢冠冷却**共用** `CROWN_PICKUP_COOLDOWN_SEC = 5`(**Lead 已采纳**:不拆分) | `party/modes.ts` | 两个冷却在语义上都是「皇冠不可拾取」,共用常量让调参只有一处;拆分会引入两套计时器的同步问题。落地 `server/src/party/modes.ts:446`(`CROWN_PICKUP_COOLDOWN_SEC = 5`)+ `:506`(两处冷却共用同一常量);判据 `tests/WS-11.test.ts` |
+| **U6** | 涂色网格 `24×24 = 576` 格,`PAINT_BALL_RADIUS = 1`(3×3)(**Lead 已采纳**) | `party/modes.ts` | 单队满涂约 64 球,120 秒内 4 队争抢的节奏合适;场地放大需同步改半径,否则单球占比过小。落地 `server/src/party/modes.ts:574`(`PAINT_BALL_RADIUS = 1`)+ `:611`(涂色半径直接用该常量);判据 `tests/WS-11.test.ts` |
+| **U7** | 白噪音总增益 `1.12`,逻辑层用 `Math.min(1, t/fade)` 钳制(**Lead 已采纳**:保留逻辑层钳制,WS-09 可再加总线归一化) | `social/afk.ts` `tickVivarium` | 逻辑层钳制保证 `masterGain` 值域 ∈ [0, 1.12] 且淡入曲线单调;WS-09 若在总线加 `masterGain` 归一化,两者不冲突。落地 `server/src/social/afk.ts:218`(`tickVivarium` 的 `Math.min(1, t/fade)` 钳制);判据 `tests/WS-11.test.ts:1313` |
+| **U8** | 售货摊推荐价 `ceil(V_i × 1.6)`(**Lead 已采纳**:统一系数,不按分类分化) | `social/afk.ts` `suggestedPrice` | 统一系数让玩家一眼能算;Boss 遗物 V=250 → 400 偏高的问题交给玩家自主定价(推荐价只是默认值,可改)。落地 `server/src/social/afk.ts:355`(`suggestedPrice`,系数 `SUGGESTED_PRICE_MUL = 1.6` @`:324`);判据 `tests/WS-11.test.ts:1371` |
+| **U9** | 急单 S 档时间奖励 `×1.15` 保留(**Lead 已采纳**),`totalPoints` 上限压到 4 位 | `coop/rush_order.ts` `settleRushOrder` | `totalPoints` 由 `V_i × need × 等级系数` 构成,4 单 × 4 件 × V≤85 时约 3400 分,乘 1.15 后 < 4000,4 位数字足够;WS-09 UI 按 4 位设计即可。落地 `server/src/coop/rush_order.ts:311`(`settleRushOrder`);判据 `tests/WS-11.test.ts` |
 | **U11** | `Broadcaster.queue` **不加**硬上限(**Lead 已采纳**:由上层限流) | `party/scoring.ts` `pushBroadcast` | 加硬上限会在关键时刻丢掉 `MODE_END` 之类最高优先级播报;改为要求上层每帧调用 `drainBroadcasts(b, 99)`,已在 §7 与 §6.2 写明 |
-| **U12** | 风筝 Boss 跑道惩罚 3 秒**加在成绩上**(**Lead 已采纳**:不改为冻结计时器) | `social/afk.ts` `trackFinish` | 「罚时」比「罚站」对观战者更直观(名次直接反映),且不阻塞玩家操作;冻结计时器会让玩家在跑道上干等 3 秒,手感更差 |
+| **U12** | 风筝 Boss 跑道惩罚 3 秒**加在成绩上**(**Lead 已采纳**:不改为冻结计时器) | `social/afk.ts` `trackFinish` | 「罚时」比「罚站」对观战者更直观(名次直接反映),且不阻塞玩家操作;冻结计时器会让玩家在跑道上干等 3 秒,手感更差。落地 `server/src/social/afk.ts:458`(`trackFinish` 罚时计入成绩);判据 `tests/WS-11.test.ts:1419` |
 
 ### 10.2a U2 裁决专节:**采纳望远镜差值**(含两处数字订正)
 

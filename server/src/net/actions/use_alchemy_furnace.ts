@@ -61,13 +61,17 @@
  * ## 报文契约
  *
  * ```ts
- * { itemId: number }
+ * { itemId: number, orderId?: string }
  * ```
+ *
+ * ★ `orderId` 是**请求号**(WS-FND-96 幂等键的一维):同一单号重发 ⇒ 世界侧按
+ * 「已结算」拒掉,`craftCount` / 冠名 / 537 陈列一位不动。缺省(老客户端没这个
+ * 字段)由世界侧退化成 `(actorId, 材料, 帧)` 派生键 —— 本文件**不发明**订单号。
  */
 import { ITEM_BY_ID, matchRecipeByTags } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { authoritativeStock, bindItemSource, missingItemReadPort } from './item_source.ts';
-import type { ActionOutcome } from '../room.ts';
+import type { ActionOutcome, WorldSaveHost } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /**
@@ -88,6 +92,32 @@ type AlchemyLabReadPort = {
 
 /** `effect` 的声明形状:`ActionOutcome['effect']` 的值只允许基本类型。 */
 type EffectRecord = NonNullable<ActionOutcome['effect']>;
+
+/**
+ * `WorldSaveHost.brewAtFurnace` 的**带请求号**形态。
+ *
+ * `net/room.ts` 的契约仍是 `opts { affinity, suggestedSLogic, at }`(本批只允许改本
+ * 文件),而世界侧 `WorldSim.brewAtFurnace` 已接受 `opts.orderId` 并把它当**幂等键**
+ * (`ALCHEMY_LAB@ORDER:<订单号>`,见 `systems/idempotency.ts`)。
+ * ⇒ 这里收窄一次,只为把请求号透传下去;契约补进 `room.ts` 之后删掉本别名。
+ */
+type FurnaceBrewWithOrder = (
+  actorId: string,
+  itemIds: readonly number[],
+  opts?: { affinity?: number; suggestedSLogic?: number; at?: number; orderId?: string },
+) => ReturnType<NonNullable<WorldSaveHost['brewAtFurnace']>>;
+
+/**
+ * 从 payload 里取**可选的**字符串维:缺项 / 非字符串 / 纯空白 ⇒ `null`。
+ *
+ * 不猜默认值(空串不是订单号),也不拒绝 —— 这是**可选**维,老报文没有它仍合法;
+ * 缺省形态由世界侧给(见文件头)。
+ */
+function orderIdField(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  return s === '' ? null : s;
+}
 
 /** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
@@ -155,6 +185,10 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
   if (itemId === null || !Number.isInteger(itemId)) {
     return { ok: false, kind: 'INVALID', reason: '需要 itemId(整数,内容表里的产物)' };
   }
+  /* ★ WS-FND-96 请求号(**可选**维):报文给了就透传给世界侧当幂等键
+     (`ALCHEMY_LAB@ORDER:<订单号>`);没给由世界侧退化成 `(actorId, 材料, 帧)`。
+     它不是必填项 ⇒ 缺了也不拒(老报文的成功路径逐位不变),但**给了就必须原样用**。 */
+  const orderId = orderIdField((ctx.payload as { orderId?: unknown }).orderId);
   /* ★ 材料明细只认**服务端按件账**(审计 P1):报文里的 `have` 不再参与结算。
      缺读口 ⇒ 显式 NOT_IMPLEMENTED(不退回"信客户端")。 */
   const stock = authoritativeStock(ctx);
@@ -232,13 +266,18 @@ export const useAlchemyFurnace: ActionHandler = (ctx: ActionContext): ActionOutc
     .map(([k]) => Number(k))
     .sort((a, b) => a - b);
   /* `brewAtFurnace` 是 `WorldSaveHost` 的**可选**成员:老世界源没有它就
-     如实标 `gallery: null`(而不是假装陈列已更新)。 */
+     如实标 `gallery: null`(而不是假装陈列已更新)。
+
+     ★ WS-FND-96:把请求号**透传**下去(第三参 `opts.orderId`)—— 世界侧据此
+     判重,同一单号重发 ⇒ `ok:false` + 理由,`craftCount` / 冠名 / 陈列一位不动。
+     这一层**不做**判重(那会是第二份实现):键的归一与台账都在
+     `systems/idempotency.ts` + `WorldSim.brewAtFurnace`。 */
   let certificate: Record<string, unknown> | null = null;
   let display: unknown = [];
   let brewReason: string | null = null;
-  const brew = ctx.host.brewAtFurnace;
+  const brew = ctx.host.brewAtFurnace as FurnaceBrewWithOrder | undefined;
   if (typeof brew === 'function') {
-    const out = brew.call(ctx.host, ctx.actorId, consumedIds);
+    const out = brew.call(ctx.host, ctx.actorId, consumedIds, orderId === null ? undefined : { orderId });
     if (out.ok) {
       certificate = {
         ...(out.entry ?? {}),

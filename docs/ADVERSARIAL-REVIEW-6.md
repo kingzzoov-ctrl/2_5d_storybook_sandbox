@@ -173,8 +173,8 @@ WS-FND-06:944 near(BUDGET_BASE, 8.5, 1e-12, '基数')
 
 | 编号 | 条目 | 缺什么 | 影响 |
 | :--- | :--- | :--- | :--- |
-| U1 | 21 处同义反复修复 | **0/21,尚未开始** | 手册数值全部失去锚点 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U1 同题,合并到该条 |
-| U2 | `PROTOCOL_VERSION` | **已核,未修** | 跨端静默不兼容,优先级最高 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U2 同题,合并到该条 |
+| U1 | 21 处同义反复修复 | **0/21,尚未开始** | 手册数值全部失去锚点 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U1 同题,合并到该条。判据 `tests/WS-FND-76-test-debt.test.ts`(同题条 REVIEW-4 U1 的落地判据) |
+| U2 | `PROTOCOL_VERSION` | **已核,未修** | 跨端静默不兼容,优先级最高 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U2 同题,合并到该条。判据 `tests/WS-FND-76-test-debt.test.ts`(同题条 REVIEW-4 U2 的 `PROTOCOL_VERSION` 字面量锚点) |
 | U3 | `ok(...)` 形态不覆盖 | 已确认保持 | 风险有限 | **已关闭(2026-11-17)** | 由 D-19 落地(门禁覆盖 `eq`/`near` 全实参),判据 `tests/WS-FND-74-gate-hardening.test.ts` |
-| U5 | WS-01 未复核 | coop-party 正在改 | 唯一未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条 |
+| U5 | WS-01 未复核 | coop-party 正在改 | 唯一未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条。判据 `tests/WS-01.test.ts`(同题条 REVIEW-10 U5 的复核判据) |
 | U8 | `WS-10.test.ts` mtime 变动但目标未修 | 已核,属他人 task-16 工作 | 提醒:**mtime ≠ 修复落地** | **已关闭(2026-11-17)** | 已裁为边界(D-19 第 1 条):目标已由 D-09/D-10 修完,关行;见 RULINGS-DRAFT §4.8 REVIEW-6 U8 |

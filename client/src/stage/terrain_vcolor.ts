@@ -259,3 +259,185 @@ export const TERRAIN_VCOLOR_VERT_MANAGED: string =
 export function terrainShaderAttributes(): string[] {
   return parseAttributeDeclarations(TERRAIN_VCOLOR_VERT);
 }
+
+/* ═══════ WS-FND-96 / LOD 合并 × 顶点色 × 法线:**顺序**语义(钉住,不留解释空间)═══════ */
+
+/**
+ * ★ 合并与着色的**唯一顺序**:`MERGE_THEN_COLOR` —— **先合并,再着色**。
+ *
+ * 管线(`tile_mesh.dominantZGrid` → `chunk_geometry.emitChunkGeometry` →
+ * `three/compat.assembleChunkGeometry`)走的是这三步:
+ *
+ * ```
+ * 1. 合并:merge×merge 格压成一个块,块的 z = 块内**最高非空** z
+ *          (空块 = −∞ ⇒ 不建面)。`aLodMerge` 就是这个 merge 边长。
+ * 2. 着色:faceColor(elevLayerOfZ(块.z), isTop) —— 颜色只由**块**与**朝向**决定;
+ *          块内四格各画各的颜色再平均是**另一种语义**,本仓不做。
+ * 3. 法线:只由**面朝向**决定(顶 +Z / 侧 ±X / 侧 ±Y),与 merge 大小无关
+ *          ⇒ 两档 LOD 下同一朝向的法线**逐位相同**。
+ * ```
+ *
+ * 为什么顺序必须写死:两种顺序在**平坦地形**上逐像素相同(块内各格 z 一样 ⇒
+ * 平均等于取值),只有在「块内 z 不一致」时才分叉。也就是说 —— 顺序不定的话,
+ * 门禁全绿、肉眼也看不出,直到某块台阶的边缘出现一条谁都说不出原因的色带。
+ *
+ * ⇒ 可判定性:`lodFaceSemantics` 要求顶点色**恰好**是 `faceColor(...)` 的输出,
+ *   而「先着色再平均」得到的 RGB 一般**不在** `ELEV_BASE_RGB × shade` 这 8 个
+ *   调色板色里(`lodPaletteOf` 返回 `null`)—— 于是两种顺序**可区分**,不是风格问题。
+ */
+export const LOD_MERGE_ORDER = 'MERGE_THEN_COLOR';
+
+/** 一个**面**的 LOD 采样(`emitChunkGeometry` 里一个 quad 的 4 个顶点)。 */
+export interface LodFaceSample {
+  /** 该面 4 个顶点的世界 z(顶面 4 个相同;侧面 2 下 2 上,上沿 = 块 z)。 */
+  vertZ: readonly number[];
+  /** 该面法线(本仓每面一个恒定法线,不做平滑)。 */
+  normal: { x: number; y: number; z: number };
+  /** 该面的顶点色(本仓每面一色)。 */
+  color: FaceColor;
+}
+
+/**
+ * 面的**合并后 z** = 顶点 z 的最大值。
+ *
+ * 与 `tile_mesh.dominantZGrid` 的「块内最高非空 z」是同一规则:
+ * 顶面 4 个顶点都等于块 z;侧面下沿比块 z 低(邻块更低才建侧面),
+ * 所以 `max` 恰好还原块 z —— 不需要额外把 merge 边长传进来。
+ */
+export function mergedZOfFace(vertZ: readonly number[]): number {
+  let best = Number.NEGATIVE_INFINITY;
+  for (const z of vertZ) {
+    if (!Number.isFinite(z)) continue;
+    if (z > best) best = z;
+  }
+  return best;
+}
+
+/**
+ * 颜色**反查**:RGB → 调色板里的 `(层, 是否顶面)`;不在调色板里 ⇒ `null`。
+ *
+ * 调色板 = `ELEV_BASE_RGB` 的 4 层 × `{TOP_FACE_SHADE, SIDE_FACE_SHADE}` 两档
+ * (共 8 色,由 `faceColor()` 唯一产出)。`eps` 默认 1e‑6,因为顶点色经
+ * `Float32Array` 落盘再读回会带上 float32 的舍入。
+ */
+export function lodPaletteOf(rgb: FaceColor, eps = 1e-6): { layer: number; isTop: boolean } | null {
+  const close = (a: number, b: number): boolean => Math.abs(a - b) <= eps;
+  for (let layer = 0; layer < ELEV_BASE_RGB.length; layer += 1) {
+    for (const isTop of [true, false]) {
+      const c = faceColor(layer, isTop);
+      if (close(c.r, rgb.r) && close(c.g, rgb.g) && close(c.b, rgb.b)) return { layer, isTop };
+    }
+  }
+  return null;
+}
+
+/**
+ * **面级** LOD 语义自检:`null` = 自洽;否则返回**具体**原因。
+ *
+ * ```
+ * 块 z = max(顶点 z)                       非法(全空)⇒ 红
+ * 法线必须是单位向量且落在规范集            否则 ⇒ 红(顶 +Z / 侧 ±X±Y)
+ * 顶点色必须落在调色板里                    否则 ⇒ 红(先着色再合并/插值会落在这里)
+ * 着色档必须与法线一致                      顶面朝上 ↔ 亮档;侧面水平 ↔ 暗档
+ * 颜色的层必须 = elevLayerOfZ(块 z)         否则 ⇒ 红(着色用了「某格」而不是「合并块」)
+ * 顶面必须平;侧面至少 2 个顶点在块 z        否则 ⇒ 红(块内混了自己的 z 去着色)
+ * ```
+ */
+export function lodFaceSemantics(sample: LodFaceSample): string | null {
+  const blockZ = mergedZOfFace(sample.vertZ);
+  if (!Number.isFinite(blockZ)) {
+    return `面没有有效顶点 z(${sample.vertZ.map(String).join(',')})⇒ 无块可着色`;
+  }
+  const { x: nx, y: ny, z: nz } = sample.normal;
+  const len = Math.hypot(nx, ny, nz);
+  if (!(Math.abs(len - 1) <= 1e-6)) {
+    return `法线不是单位向量(${nx},${ny},${nz})|len=${len}`;
+  }
+  const isTopByNormal = Math.abs(nz - 1) <= 1e-6;
+  const isHorizontal = Math.abs(nz) <= 1e-6
+    && (Math.abs(Math.abs(nx) - 1) <= 1e-6 || Math.abs(Math.abs(ny) - 1) <= 1e-6);
+  if (!isTopByNormal && !isHorizontal) {
+    return `法线不在这套规范集里(顶 +Z / 侧 ±X±Y):(${nx},${ny},${nz})`;
+  }
+  const hit = lodPaletteOf(sample.color);
+  if (hit === null) {
+    return `顶点色 (${sample.color.r},${sample.color.g},${sample.color.b}) 不在调色板里 `
+      + '⇒ 着色不是 faceColor 的输出(先着色再合并 / 插值会落在这里)';
+  }
+  if (hit.isTop !== isTopByNormal) {
+    return `着色档与法线冲突:法线${isTopByNormal ? '朝上' : '水平'}却用了${hit.isTop ? '亮档' : '暗档'}`;
+  }
+  const wantLayer = elevLayerOfZ(blockZ);
+  if (hit.layer !== wantLayer) {
+    return `颜色层 ${hit.layer} ≠ 合并块 z=${blockZ} 的层 ${wantLayer} ⇒ 着色用了「某格」而不是「合并块」`;
+  }
+  let atBlock = 0;
+  for (const z of sample.vertZ) {
+    if (Number.isFinite(z) && Math.abs(z - blockZ) <= 1e-9) atBlock += 1;
+  }
+  if (isTopByNormal && atBlock !== sample.vertZ.length) {
+    return `顶面不平:只有 ${atBlock}/${sample.vertZ.length} 个顶点在块 z=${blockZ}`;
+  }
+  if (!isTopByNormal && atBlock < 2) {
+    return `侧面上沿不足 2 个顶点在块 z=${blockZ}(实得 ${atBlock})`;
+  }
+  return null;
+}
+
+/**
+ * **两档 LOD** 的对照判据:`null` = 符合规则;否则返回**具体**原因。
+ *
+ * 规则(这就是审计 P2-13 / P3-1 要的那句话):
+ *
+ * ```
+ * 法线  —— 必须**逐位相同**(只由面朝向定,与 merge 无关)
+ * 颜色  —— 块 z 相同 ⇒ 必须**逐位相同**;
+ *          块 z 不同 ⇒ **允许**不同,但必须恰好是 faceColor(elevLayerOfZ(新块 z), 朝向)
+ *                      (即变化只能来自「合并块的主导 z 变了」,不能来自平均/插值)
+ * ```
+ *
+ * ★ 负对照:把某个面的颜色换成两块颜色的平均值 ⇒ 两条都可能撞红
+ *   (不在调色板里 / 不等于 faceColor 的输出),而改成「用块内某格的 z 着色」
+ *   会在 `lodFaceSemantics` 的「颜色层 ≠ 块层」那条上撞红。
+ */
+export function lodTwoLevelDelta(lo: LodFaceSample, hi: LodFaceSample): string | null {
+  const loErr = lodFaceSemantics(lo);
+  if (loErr !== null) return `LOD0 那一面不自洽:${loErr}`;
+  const hiErr = lodFaceSemantics(hi);
+  if (hiErr !== null) return `LOD1 那一面不自洽:${hiErr}`;
+
+  const loTop = Math.abs(lo.normal.z - 1) <= 1e-6;
+  const hiTop = Math.abs(hi.normal.z - 1) <= 1e-6;
+  if (loTop !== hiTop) {
+    return '两档的面朝向不同(一顶一侧)⇒ 这不是「同一个面」的对照,判据不成立';
+  }
+  if (Math.abs(lo.normal.x - hi.normal.x) > 1e-6
+    || Math.abs(lo.normal.y - hi.normal.y) > 1e-6
+    || Math.abs(lo.normal.z - hi.normal.z) > 1e-6) {
+    return `法线随 LOD 变了:(${lo.normal.x},${lo.normal.y},${lo.normal.z}) → `
+      + `(${hi.normal.x},${hi.normal.y},${hi.normal.z}) —— 法线只由面朝向定,与 merge 大小无关`;
+  }
+
+  const zLo = mergedZOfFace(lo.vertZ);
+  const zHi = mergedZOfFace(hi.vertZ);
+  const sameColor = Math.abs(lo.color.r - hi.color.r) <= 1e-6
+    && Math.abs(lo.color.g - hi.color.g) <= 1e-6
+    && Math.abs(lo.color.b - hi.color.b) <= 1e-6;
+  if (Math.abs(zLo - zHi) <= 1e-9) {
+    if (!sameColor) {
+      return `合并块 z 相同(${zLo})却给了不同颜色 `
+        + `(${lo.color.r},${lo.color.g},${lo.color.b}) → (${hi.color.r},${hi.color.g},${hi.color.b})`
+        + ' ⇒ 颜色不是「(块 z, 朝向)」的函数';
+    }
+    return null;
+  }
+  const want = faceColor(elevLayerOfZ(zHi), hiTop);
+  if (Math.abs(want.r - hi.color.r) > 1e-6
+    || Math.abs(want.g - hi.color.g) > 1e-6
+    || Math.abs(want.b - hi.color.b) > 1e-6) {
+    return `块 z 从 ${zLo} 变成 ${zHi} 时,颜色必须恰好是 faceColor(层 ${elevLayerOfZ(zHi)},`
+      + `${hiTop ? '顶面' : '侧面'}) = (${want.r},${want.g},${want.b}),实际 `
+      + `(${hi.color.r},${hi.color.g},${hi.color.b})`;
+  }
+  return null;
+}

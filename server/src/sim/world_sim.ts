@@ -47,8 +47,8 @@ import {
   createRoomSystemsState,
   plantCrop as plantCropIn,
   growCrops,
-  settleRanch,
-  brewInLab,
+  settleRanchOnce,
+  brewInLabOnce,
   galleryDisplay,
   foodPhysicsOf,
   gatherMulOf as gatherMulOfMods,
@@ -61,7 +61,7 @@ import {
 } from '../systems/wiring.ts';
 import { sprinklerCells, type Weather } from '../systems/greenhouse.ts';
 import { feedItemOf, type RanchAnimal, type RanchDayResult } from '../systems/ranch.ts';
-import { buy, CONTENT_PRICE_TABLE, type BuyResult, type PriceTable } from '../systems/depot.ts';
+import { buy, buyOnce, CONTENT_PRICE_TABLE, type BuyResult, type PriceTable } from '../systems/depot.ts';
 /* ★ A-3:炼金的**中性初判**不在这里发明 —— 复用 `alchemy/**` 既有的口径:
    `NEUTRAL_AFFINITY`(0.7 = 不倾斜)与 `S_LOGIC_BASE + SPAN × affinity`
    (`gate.ts:204` 的公式,本文件只照它算默认值,允许调用方显式覆盖)。 */
@@ -1204,6 +1204,15 @@ export class WorldSim {
    * 「天的一部分」推进,同一个累加器同时服务温室(按天生长)与牧场(按天结算)。
    */
   private dayFraction = 0;
+
+  /**
+   * 房间内的**第几天**(0 起整数)—— `settleRanchOnce` 幂等键的一维。
+   *
+   * 由 `advanceRoomSystems` 在 `dayFraction` 里凑出**整数天**时 `+= whole`;
+   * 不从 `frameCount` 反算(那要多除两次,且慢帧不匀速时会跳日)。
+   * ⚠️ 只增不回退:被幂等拒掉的那一拍也算「过了一天」,否则重放能把日结钉死。
+   */
+  private roomDayIndex = 0;
   /** 最近一次四系统慢帧报告(`null` = 还没跑过)。 */
   private lastRoomSystems: {
     grown: number;
@@ -1212,15 +1221,16 @@ export class WorldSim {
     ranchProduced: number;
     ranchDropped: number;
   } | null = null;
-  /** 无人自助售货摊(515)的库存:`物品 id → 件数`(世界世代的一部分)。 */
-  private stallStock: Record<number, number> = {};
   /**
-   * 购买提交的**幂等键**表:键 → 成交时的帧号(`frameCount`)。
+   * 无人自助售货摊(515)的库存:`物品 id → 件数`(世界世代的一部分)。
    *
-   * 键由 `(actorId, 摊位=itemId, tick 或订单号)` 派生(见 `purchaseCommit`)。
-   * 它属于**世界世代**(帧号在 `rebuildWorld` 里归零),所以随 `stallStock` 一起换代。
+   * ⚠️ 与它**成对**的购买幂等键**不在本文件**:修前那张私有表
+   * (`committedPurchaseKeys`,`${actorId}#${itemId}#${frameCount}` 形状)已并入
+   * `roomSystemsState.settled`(键形 `CLOUD_DEPOT@ORDER:<订单号>`,见
+   * `systems/idempotency.ts`)—— 与牧场 / 炼金**同一把键、同一张表**,
+   * 重置时一处清空就够(两张表各清一处、漏一处就是静默拒单)。
    */
-  private committedPurchaseKeys = new Map<string, number>();
+  private stallStock: Record<number, number> = {};
   /** 最近一次牧场日结的**落货**账(哪些产出真的落到地上 / 哪些没物品 id)。 */
   private lastRanchDrop: { dropped: { itemId: number; count: number; x: number; y: number }[]; skipped: string[] } =
     { dropped: [], skipped: [] };
@@ -4667,10 +4677,11 @@ export class WorldSim {
        两者都不报错,只是跨世代残留(与 `killLedger` / `mobOrdinals` 同一纪律)。 */
     this.roomSystemsState = createRoomSystemsState();
     this.stallStock = {};
-    /* ★ 幂等键表同样换代:键里含 `frameCount`,而它在下面被归零 ⇒
-       不一起清,新世界里第 0 帧的一笔会和旧世代同键相撞(静默拒一单)。 */
-    this.committedPurchaseKeys.clear();
+    /* ★ 幂等键表**不再单独清**:三把键(牧场日 / 炼金订单 / 百货订单)都住在
+       `roomSystemsState.settled` 里,而它在上面刚被换成一张空台账 ⇒ 换代即清空。
+       `roomDayIndex` 是键的一维,同样归零(否则新世界第一天被当成旧世界的重放)。 */
     this.dayFraction = 0;
+    this.roomDayIndex = 0;
     this.lastRoomSystems = null;
     this.lastRanchDrop = { dropped: [], skipped: [] };
     /* 天气**不重置**:它是外部输入(天气系统/许愿喷泉 528),不是世界世代的账本;
@@ -6304,6 +6315,10 @@ export class WorldSim {
     let ranchDropped = 0;
     if (whole > 0) {
       this.dayFraction -= whole;
+      /* ★ 幂等键的一维先累加再结算:被 `settleRanchOnce` 拒掉的那一拍
+         (重放 / 慢帧重入)**也是**「过了一天」,键必须往前走 ——
+         回退或不动都会让后续每一天都撞在同一个已结算的键上。 */
+      this.roomDayIndex += whole;
       const res = this.settleRanchIfDayChanged(whole);
       ranchDays = res.days;
       ranchProduced = res.produced;
@@ -6387,16 +6402,32 @@ export class WorldSim {
    * 结算 → 扣地面饲料 → 产出落到饲育槽。三步的顺序是刻意的:
    * 先算出「吃掉多少 / 产出多少」,再动物化 —— 反过来会出现
    * 「饲料扣了但没结算」的半截状态(`depot.buy` 的零副作用纪律同源)。
+   *
+   * ## ★ WS-FND-96:幂等键在这里落地(I2 交回的第 1 处)
+   *
+   * 结算走 `settleRanchOnce(roomSystemsState, roomDayIndex, ...)`:同一个
+   * `(ECO_RANCH, roomDayIndex)` **只成功一次**(键形 `ECO_RANCH@DAY:<n>`)。
+   * `accepted: false`(重放 / 慢帧重入 / `days = 0`)⇒ **整笔跳过**:
+   * 不扣地面饲料、不落货、`lastRanch` 与 `lastRanchDrop` 一位不动 ——
+   * 「拒了但还是扣了一点」正是这一步要消灭的形态。
+   *
+   * `ranch` 因此可以是 `null`:拒掉的那一拍**没有**本次结算回执
+   * (`lastRanchSettle()` 仍是上一次成功的那份,不是本次的空壳)。
    */
   settleRanchIfDayChanged(days: number): {
     days: number;
     produced: number;
     dropped: number;
-    ranch: RanchDayResult;
+    ranch: RanchDayResult | null;
   } {
     const n = Math.max(0, Math.trunc(Number.isFinite(days) ? days : 0));
     const feed = this.ranchFeedStock();
-    const ranch = settleRanch(this.roomSystemsState, this.roomSystemsState.ranchPets, feed, n);
+    const once = settleRanchOnce(this.roomSystemsState, this.roomDayIndex, this.roomSystemsState.ranchPets, feed, n);
+    if (!once.accepted) {
+      /* ★ 整笔跳过:饲料、落货、`st.lastRanch` / `st.lastBrew` 一律不动。 */
+      return { days: 0, produced: 0, dropped: 0, ranch: null };
+    }
+    const ranch = once.result;
 
     /* 饲料按日结的账扣掉(地面上的那几件)。 */
     for (const row of ranch.feedConsumed) {
@@ -6444,12 +6475,22 @@ export class WorldSim {
    * (`NEUTRAL_AFFINITY = 0.7`;`s_logic = clamp(0.75 + 0.45 × affinity)`)——
    * 不在这里发明新的契合度。
    *
+   * ## ★ WS-FND-96:幂等键在这里落地(I2 交回的第 2 处)
+   *
+   * 走 `brewInLabOnce`,键形 `ALCHEMY_LAB@ORDER:<订单号>`。`orderId` 是
+   * **调用方给的请求号**(`use_alchemy_furnace` 把报文里的 `orderId` 透传下来);
+   * 没给的调用点(判据夹具 / 老调用方)在这里**退化成与 `purchaseCommit` 同形状的
+   * 派生键** `${actorId}#<材料升序>#${at}` —— 同一炉同一帧重放时同样被拒,
+   * 而不同材料 / 不同人 / 不同帧不撞键。两种形态都走**同一张台账**
+   * (`roomSystemsState.settled`),没有第二张表。
+   *
    * @returns 成功时 `entry`(冠名证书那一行)+ `display`(537 的完整陈列投影)。
+   *   重放 ⇒ `ok:false` + 理由,且 `craftCount` / 冠名 / `lastBrew` 一位不动。
    */
   brewAtFurnace(
     actorId: string,
     itemIds: readonly number[],
-    opts: { affinity?: number; suggestedSLogic?: number; at?: number } = {},
+    opts: { affinity?: number; suggestedSLogic?: number; at?: number; orderId?: string } = {},
   ): {
     ok: boolean;
     reason?: string;
@@ -6463,20 +6504,26 @@ export class WorldSim {
       ? (opts.suggestedSLogic as number)
       : Math.min(S_LOGIC_CEIL, Math.max(S_LOGIC_FLOOR, span));
     const at = Number.isFinite(opts.at) ? Math.trunc(opts.at as number) : this.frameCount;
-    const out = brewInLab(this.roomSystemsState, {
+    /* 请求号:给了就用它(权威身份);没给 ⇒ 退化形态(见方法头)。 */
+    const given = typeof opts.orderId === 'string' ? opts.orderId.trim() : '';
+    const orderId = given !== ''
+      ? given
+      : `${actorId}#${[...itemIds].sort((a, b) => a - b).join('_')}#${at}`;
+    const once = brewInLabOnce(this.roomSystemsState, {
       itemIds: [...itemIds],
       affinity,
       suggestedSLogic,
       discovererName: actorId,
       at,
+      orderId,
     });
-    if (!out.ok) {
-      return { ok: false, reason: out.reason, display: this.galleryProjection() };
+    if (!once.accepted) {
+      return { ok: false, reason: once.reason, display: this.galleryProjection() };
     }
-    const e = out.entry;
+    const e = once.outcome.entry;
     return {
       ok: true,
-      first: out.first,
+      first: once.outcome.first,
       entry: {
         recipeHash: e.recipeHash,
         discovererName: e.discovererName,
@@ -6537,27 +6584,35 @@ export class WorldSim {
    * 与 `purchaseQuote` 是**同一次**结算的两次调用(`buy` 是纯函数)——
    * 不是两份实现:两边都在调 `systems/depot.ts:buy`。
    *
-   * ## ★ 幂等键(本次新增)
+   * ## ★ 幂等键(WS-FND-96:与牧场 / 炼金**同一把键、同一张台账**)
    *
    * 提交是**有副作用**的那一步,而「报价 → 提交」之间没有任何原子性保证:
-   * 报文重放 / 客户端重发 / 上层重试都会走到这里。⇒ 给每次提交一个由
-   * `(actorId, 摊位 = itemId, tick 或订单号)` 派生的键,同一个键**只准成交一次**:
+   * 报文重放 / 客户端重发 / 上层重试都会走到这里。⇒ 成交走 `depot.buyOnce`,
+   * 键由 `idempotency.ts:settleKeyOf('CLOUD_DEPOT', { kind: 'ORDER', orderId })`
+   * 归一(`CLOUD_DEPOT@ORDER:<orderId>`),同一个键**只准成交一次**:
    * ```
-   * 有 orderId     ⇒ key = `order:${orderId}`(订单号是调用方给的权威身份)
-   * 否则           ⇒ key = `${actorId}#${itemId}#${frameCount}`(退化形态)
+   * 有 orderId  ⇒ orderId = 订单号(调用方给的权威身份)
+   * 否则        ⇒ orderId = `${actorId}#${itemId}#${frameCount}`(退化形态)
    * ```
+   * ★ 两条形态落在**同一个键空间、同一张台账**(`roomSystemsState.settled`)里 ——
+   * 修前这里有一张私有表 `committedPurchaseKeys`,键形 `order:...` / `a#i#t`,
+   * 与牧场(日)/ 炼金(订单)各说一套,重置时三处各清一处;漏一处就是静默拒单。
+   * 现在三处共用一张(单一产出点 `systems/idempotency.ts`),本文件里**没有**
+   * 第二张购买键表。
+   *
    * 第二次(重放)⇒ `ok:false` + `replayed:true`,且**库存一位都不动**。
+   * `buy` 失败(无定价 / 库存不足)**不占键**:补价 / 补货后同单号仍可成交
+   * (先占键再判成败会把订单永久锁死,那是比重复结算更坏的缺陷)。
    *
    * ⚠️ 退化形态里没有 `actorId` 时两个不同玩家在同一帧买同一件会撞键 ——
-   * 那是**上层没传 actorId** 的如实后果(契约:调用方应传 `{ actorId }`),
-   * 不是本方法能猜出来的信息。见交付报告的「需别处改」清单。
+   * 那是**上层没传 actorId** 的如实后果(契约:调用方应传 `{ actorId }`)。
    *
    * ## ★ 返回的 `stock` / `stockOfItem` 是**提交时**的实测值
    *
    * 不是 `purchaseQuote` 那张**旧快照**(它按报价那一刻的库存算)。两者在
    * 「报价之后、提交之前库存又被动过」时会分叉;权威只有一个:`stallStock`。
    *
-   * @param opts.actorId 发起者(幂等键的一维;缺省 ⇒ 退化形态见上)
+   * @param opts.actorId 发起者(退化形态的键的一维;缺省 ⇒ 见上)
    * @param opts.orderId 订单号(给了就以它为准,不再看 actorId / tick)
    * @param opts.table 价格表;缺省 = `CONTENT_PRICE_TABLE`(与 `purchaseQuote` 同一入参)
    */
@@ -6577,29 +6632,25 @@ export class WorldSim {
     replayed: boolean;
   } {
     const tick = this.frameCount;
-    const key = (opts.orderId !== undefined && opts.orderId !== '')
-      ? `order:${opts.orderId}`
-      : `${opts.actorId ?? ''}#${itemId}#${tick}`;
-    const seenAt = this.committedPurchaseKeys.get(key);
-    if (seenAt !== undefined) {
-      /* 重放:拒,且**不做任何写入**(`stallStock` 一位不动)。 */
+    const given = typeof opts.orderId === 'string' ? opts.orderId.trim() : '';
+    const orderId = given !== '' ? given : `${opts.actorId ?? ''}#${itemId}#${tick}`;
+    const once = buyOnce(this.roomSystemsState.settled, {
+      itemId,
+      qty,
+      stock: this.stallStock,
+      table: opts.table ?? CONTENT_PRICE_TABLE,
+      orderId,
+    });
+    if (!once.accepted) {
+      /* 重放 或 `buy` 被拒:两条路都**不做任何写入**(`stallStock` 一位不动)。 */
       return {
-        ok: false, cost: 0, replayed: true,
-        reason: `重复提交(幂等键 ${key} 已在第 ${seenAt} 帧成交过)⇒ 拒绝,库存不变`,
+        ok: false, cost: 0, replayed: once.replayed, reason: once.reason,
         stock: { ...this.stallStock },
         stockOfItem: this.stallStock[itemId] ?? 0,
       };
     }
-    const r = buy({ itemId, qty, stock: this.stallStock, table: opts.table ?? CONTENT_PRICE_TABLE });
-    if (!r.ok) {
-      return {
-        ok: false, cost: 0, replayed: false, reason: r.reason,
-        stock: { ...this.stallStock },
-        stockOfItem: this.stallStock[itemId] ?? 0,
-      };
-    }
+    const r = once.result;
     this.stallStock = r.stock;
-    this.committedPurchaseKeys.set(key, tick);
     return {
       ok: true, cost: r.cost, replayed: false, reason: r.reason,
       /* 实测:提交后的 `stallStock`(权威),不是 `purchaseQuote` 的旧快照。 */

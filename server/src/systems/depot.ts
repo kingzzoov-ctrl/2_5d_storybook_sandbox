@@ -25,6 +25,13 @@
  */
 
 import { ITEM_BY_ID, ITEM_LIST, type ItemDef } from '../../../shared/constants/items.ts';
+import {
+  SETTLEMENT_ROOMS,
+  claimSettlement,
+  settleKeyOf,
+  settlementSeenAt,
+  type SettlementLedger,
+} from './idempotency.ts';
 
 /** 本实现在 `rooms/effects.ts` 的 `ROOM_EFFECT_DECISION` 里登记的身份。 */
 export const DEPOT_SYSTEM = Object.freeze({
@@ -181,4 +188,74 @@ export function buy(input: BuyInput): BuyResult {
   if (left > 0) next[input.itemId] = left;
   else delete next[input.itemId];
   return { ok: true, reason: '成交', cost: price.price * qty, stock: next };
+}
+
+/* ═══════════ 幂等边界(WS-FND-96 / 审计 P2-3):同一 `(房间, 订单)` 只成交一次 ═══════════ */
+
+/** 带**订单号**的购买输入(订单号 = 调用方给的权威身份,不是本模块发明的)。 */
+export interface OrderBuyInput extends BuyInput {
+  orderId: string;
+}
+
+/**
+ * 幂等成交的结果。
+ *
+ * `accepted: false` ⇒ **一位都没成交**(`result` 恒 `null`):库存没动、钱没花。
+ */
+export type BuyOnceOutcome =
+  | { accepted: true; key: string; result: BuyResult }
+  | { accepted: false; key: string | null; replayed: boolean; reason: string; result: null };
+
+/**
+ * **幂等**成交:同一个 `(CLOUD_DEPOT, 订单号)` **只成功一次**。
+ *
+ * `WorldSim.purchaseCommit` 已经有一张自己形状的幂等键表(`order:${orderId}` /
+ * `${actorId}#${itemId}#${frameCount}`);本函数是它在**纯函数层**的同口径对应物 ——
+ * 键的规范形态统一由 `idempotency.ts:settleKeyOf` 给,于是「牧场第 7 天」与
+ * 「百货第 7 单」不会被压成同一个键。
+ *
+ * ```
+ * 订单号空/空白                      ⇒ 拒,台账不动(无从判重 ⇒ 不能假装成功)
+ * 该订单号已在台账里(报文重放)        ⇒ 拒(replayed:true),`buy` 都不调 ⇒ 库存不动
+ * `buy` 拒绝(无定价 / 库存不足)      ⇒ 拒,**不占**订单号(补货/补价后重试仍可成交)
+ * 否则                              ⇒ 成交 + 占键
+ * ```
+ *
+ * ★ 负对照:`buy`(不带台账)连调两次、各自把回执写回库存 ⇒ **扣两次**;
+ *   `buyOnce` 第二次直接拒且不调 `buy`。
+ */
+export function buyOnce(ledger: SettlementLedger, input: OrderBuyInput): BuyOnceOutcome {
+  const key = settleKeyOf(SETTLEMENT_ROOMS.CLOUD_DEPOT, { kind: 'ORDER', orderId: input.orderId });
+  if (key === null) {
+    return {
+      accepted: false,
+      key: null,
+      replayed: false,
+      reason: `订单号非法(${JSON.stringify(input.orderId)})⇒ 无法判重,不成交`,
+      result: null,
+    };
+  }
+  const seenAt = settlementSeenAt(ledger, key);
+  if (seenAt !== undefined) {
+    return {
+      accepted: false,
+      key,
+      replayed: true,
+      reason: `订单 ${input.orderId} 已在 ${seenAt} 结算过(幂等键 ${key})⇒ 拒绝,库存不变`,
+      result: null,
+    };
+  }
+  const outcome = buy(input);
+  if (!outcome.ok) {
+    return { accepted: false, key, replayed: false, reason: outcome.reason, result: null };
+  }
+  /*
+   * 台账里记的时刻用**这笔成交的成本**(本模块零 IO、不读时钟;成本是可复现量),
+   * 于是「已在 X 结算过」这句话仍可手算对账 —— 不引入第二个时间源。
+   */
+  const claim = claimSettlement(ledger, key, outcome.cost);
+  if (!claim.ok) {
+    return { accepted: false, key, replayed: true, reason: claim.reason, result: null };
+  }
+  return { accepted: true, key, result: outcome };
 }

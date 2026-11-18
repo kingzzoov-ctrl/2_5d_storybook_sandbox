@@ -262,6 +262,16 @@ let crossWsPassedCount: number | null = null;
 let frozenInvariantMeasured: number | null = null;
 /** 同义反复候选:命中数 / 白名单数。`null` = 未跑。 */
 let tautMeasured: { hit: number; whitelist: number } | null = null;
+/**
+ * 双端同源命中数(审计 P3-5)。`null` = `checkTautology` 未跑。
+ *
+ * **为什么单独一个模块级变量**:汇总行必须报出这个数(见文件末尾的
+ * `adviseSuffix` 注释)。它不能挤进 `tautMeasured` —— 那个对象的语义是
+ * 「README / HANDOVER 钉住的两个数(候选命中 / 白名单)」,双端同源是
+ * **第三条**测量,混进同一个对象就等于让两个不同定义共用一个名字
+ * (陷阱 27:数字的语义要与事实同强度)。
+ */
+let bothSidesMeasured: number | null = null;
 /** 类型检查基线锁:实测错误数 / 唯一指纹数。`null` = 未跑(或没装 typescript)。 */
 let typecheckMeasured: { errors: number; fingerprints: number } | null = null;
 /** 未决台账:总 / 未关闭 / 阻塞 / 已关闭(`backlog.ts` 口径)。`null` = 未跑。 */
@@ -836,11 +846,19 @@ const advise = (gate: string, msg: string): void => {
   advisedGates.add(gate);
   console.warn(`  ⚠ ${msg}`);
 };
-/** 升级开关清单:汇总行据此告诉读者「怎么让它变红」。 */
+/**
+ * 升级开关清单:汇总行据此告诉读者「怎么让它变红」。
+ *
+ * ⚠️ **值只在 `undefined` 判断里被用到**(`ADVISE_UPGRADE[g] === undefined`)——
+ * 打印的是固定文案「去掉 `--lenient` 才算失败」。所以新增一条**默认就拦**的
+ * 门禁(如 `BOTH_SIDES_GATE`)时,这里只需要**有键**:它的告警只可能出现在
+ * `--lenient` 模式,而那一模式的解除方式恰好就是"去掉 `--lenient`"。
+ */
 const ADVISE_UPGRADE: Record<string, string> = {
   可达性: '--strict-reach',
   同义反复: '--strict-taut',
   入口执行层: '--strict-inert',
+  同义反复·双端同源: '--lenient(默认已拦)',
   '门禁自检': '--strict-selfcheck',
 };
 
@@ -4100,6 +4118,57 @@ export function detectTautologyHits(
   return { hits, anchors };
 }
 
+/* ═══════════════ 2.8 双端同源:从「只告警」并进默认拦截(审计 P3-5)═══════════════
+ *
+ * ## 修前(实测)
+ *
+ * `bothSidesHits`(`actual` **与** `expected` 都取自本仓常量 ⇒ 必然同义反复)
+ * 只走 `advise('同义反复', …)`:告警进 `stderr`、不进退出码、不进汇总行。
+ * 而同一份扫描里的**弱形态**(只有 `expected` 同源)却会因为
+ * `strictTaut = !LENIENT` 被 `fail()` 拦下 —— 于是**更强**的判据反而更宽松,
+ * 这就是审计登记的那条「判据的力度与它的证据强度反向」。
+ *
+ * ## 修后口径:与三道 strict **完全同口径**
+ *
+ * ```
+ * 默认          count > 0 ⇒ fail()   ⇒ 退出码 1
+ * --lenient     count > 0 ⇒ advise() ⇒ 降级为告警(汇总行会点名)
+ * count === 0   什么都不打(与 `pass()` 不重复:该节的 ✓ 已由候选行给出)
+ * ```
+ *
+ * 判据为什么能直接合进默认拦截:升级前实测 `双端同源 = 0 处`
+ * (`node scripts/verify.ts --docs` 的输出:`按槽位: · 双端同源 0 处`),
+ * 也就是说现存的命中已经被前一批清零动作处理完了 —— R21 当时写的
+ * 「必须先把现存命中清掉才敢升级」这个前提**已经满足**。
+ *
+ * ⚠️ 不要把这段逻辑复制到别处:门禁名 / 判定 / 文案都只在这里,
+ * `tests/WS-FND-95-gate-and-bounds.test.ts` FND95-1/2/3 直接 import
+ * `bothSidesVerdict` 做正反对照 + 注入。
+ */
+
+/** 汇总行与 `advisedGates` 用的门禁名(P3-5)。 */
+export const BOTH_SIDES_GATE = '同义反复·双端同源';
+
+/** 双端同源的门禁判定结果。 */
+export interface BothSidesVerdict {
+  /** `true` ⇒ 调用方应 `fail()`,否则 `advise()`。 */
+  block: boolean;
+  /** 给人看的一句话(条数写在里面)。 */
+  message: string;
+}
+
+/**
+ * 双端同源命中的**拦截口径**(纯函数 —— 于是"默认拦 / `--lenient` 降级"
+ * 这件事可被直接断言,而不必真跑一次全量门禁)。
+ *
+ * @param count `bothSides` 命中的条数
+ * @param lenient 是否为 `--lenient` 口径
+ */
+export function bothSidesVerdict(count: number, lenient: boolean): BothSidesVerdict {
+  const message =
+    `双端同源 ${count} 处(actual 与 expected **都**取自本仓常量 ⇒ 必然同义反复)`;
+  return { block: count > 0 && !lenient, message };
+}
 
 function checkTautology(): void {
   console.log('\n[同义反复候选]');
@@ -4307,12 +4376,22 @@ function checkTautology(): void {
   )) {
     console.log(fmtHit(h));
   }
+  /* ★ 审计 P3-5:双端同源**并进默认拦截**(与三道 strict 同口径,`--lenient` 才降级)。
+     修前这里只有 `advise()`,于是比"未登记候选"更强的证据反而更宽松。 */
+  bothSidesMeasured = bothSidesHits.length;
   if (bothSidesHits.length > 0) {
-    advise(
-      '同义反复',
-      `双端同源 ${bothSidesHits.length} 处(actual 与 expected **都**取自本仓常量 ⇒ 必然同义反复):`
-      + bothSidesHits.slice(0, 4).map((h) => `${h.suite} L${h.line} ${h.constName}`).join('; '),
-    );
+    const verdict = bothSidesVerdict(bothSidesHits.length, LENIENT);
+    const where = bothSidesHits
+      .slice(0, 4)
+      .map((h) => `${h.suite} L${h.line} ${h.constName}`)
+      .join('; ');
+    const detail = `${verdict.message}:${where}`
+      + (bothSidesHits.length > 4 ? ` 等 ${bothSidesHits.length} 处` : '');
+    if (verdict.block) {
+      fail(`${detail} —— 默认拦截(与 --strict-reach/taut/inert 同口径);加 --lenient 才降级`);
+    } else {
+      advise(BOTH_SIDES_GATE, `${detail}(--lenient:已降级为告警)`);
+    }
   }
   if (extHitLines.length > 0) {
     /* ⚠️ 这门告警**没有升级开关**(`--strict-taut` 只升级"未登记候选"):
@@ -7472,7 +7551,11 @@ const adviseSuffix = advises === 0
         : `${g}:去掉 --lenient 才算失败`))
       .join('; ')
     + ')';
-console.log(`\n${verdict}${adviseSuffix} · ${Date.now() - t0}ms`);
+/* ★ 审计 P3-5:汇总行必须给出**双端同源**的条数 —— 它现在默认拦截,
+   读者要能从结论行看出这条判据的力度(而不只是「全部通过」四个字)。
+   `?` = `checkTautology` 没跑(理论上不会发生:它在 main 里无条件调用)。 */
+const bothSidesSuffix = ` · 双端同源 ${bothSidesMeasured ?? '?'} 处`;
+console.log(`\n${verdict}${bothSidesSuffix}${adviseSuffix} · ${Date.now() - t0}ms`);
 if (failures > 0) process.exitCode = 1;
 }
 } /* ← 关闭 `if (import.meta.main)` 守卫(理由见该处长注释) */

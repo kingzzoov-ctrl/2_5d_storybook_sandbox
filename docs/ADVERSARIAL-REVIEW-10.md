@@ -194,7 +194,7 @@ WS-01 是全仓最大套件(50 test / 317 断言),此前的「50/50 通过」现
 | 编号 | 条目 | 缺什么 | 影响 |
 | :--- | :--- | :--- | :--- |
 | U5 | WS-01 复核 | **已完成** | — | **已关闭(2026-11-17)** | 已过期:WS-01 复核已完成(无实质缺陷),判据 `tests/WS-01.test.ts` |
-| U12 | `stripCommentsOnly` 其它调用方 | 待查(REVIEW-9 的 S28) | 中 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U12 同题,合并到该条 |
-| U13 | 动态 `import()` 不跟踪 | 已知边界 | 零 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U13 同题,合并到该条 |
+| U12 | `stripCommentsOnly` 其它调用方 | 待查(REVIEW-9 的 S28) | 中 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U12 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(代码态扫描;同题条已带该判据) |
+| U13 | 动态 `import()` 不跟踪 | 已知边界 | 零 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-9.md U13 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(`findDynamicImports`;同题条已带该判据) |
 | U14 | `:740` 冗余清理 | 待 Lead 批(S31) | 低 | **已关闭(2026-11-17)** | 已登记为边界(D-19 第 1 条):`:740` 冗余恒真断言保留(清理会动 README 数字),见 RULINGS-DRAFT §5 |
-| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条 |
+| U9 | 两门禁缺交叉标注 | 仅人工排序 | 低 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-7.md U9 同题,合并到该条。判据 `tests/WS-FND-74-gate-hardening.test.ts`(`findWhitelistCrossViolations`;同题条已带该判据) |

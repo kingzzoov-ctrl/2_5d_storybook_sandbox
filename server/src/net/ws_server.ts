@@ -99,7 +99,13 @@ import type { Socket } from 'node:net';
  * `welcome.protocolVersion` 断言**钉住**;而**解析器**不能重复 ——
  * 它的代价是"两份实现要永远等价",没有断言能钉住那个(见上)。
  * ⇒ 常量可复制(有钉)、**逻辑不可复制**(无钉)。这不是自相矛盾,是判据不同。 */
-import { decodePacket, type DecodedPacket } from '../../../shared/net/delta.ts';
+import {
+  MAX_ACKED_SEQ,
+  ackSlotValue,
+  decodePacket,
+  isValidAckedSeq,
+  type DecodedPacket,
+} from '../../../shared/net/delta.ts';
 
 /* ═══════════════════════════ 1. 帧编解码 ═══════════════════════════ */
 
@@ -476,8 +482,19 @@ export function parseMoveIntent(msg: {
   }
   /* `seq` = 客户端命令序号(D-08 第二步,ack 用)。**可选**,且要求**非负整数**:
      它是"处理到第几条",不是坐标 —— 给 1.5 / NaN / -3 一律当**没给**
-     (与 `speedMul` 同一取舍:坏值不该让整次移动消失,只是这次不带 ack)。 */
-  if (typeof msg.seq === 'number' && Number.isInteger(msg.seq) && msg.seq >= 0) {
+     (与 `speedMul` 同一取舍:坏值不该让整次移动消失,只是这次不带 ack)。
+  *
+  * ★ 审计 P3-6:上界也是这条口径的一部分。修前这里**只查下界** ⇒
+     `seq = 4294967296` 被原样接受,登记进 `c.ackedSeq` 后由
+     `withAckedSeq` 的 `(ackedSeq+1)>>>0` **回绕成 0**(= "服务端什么都没处理"),
+     客户端于是把自己确实被处理过的命令又重发一遍 —— 不报错、只在长跑里表现成延迟。
+  *   上界取 `MAX_ACKED_SEQ`(= `2^32 − 2`):线上存的是 `ackedSeq + 1`,
+     再大就会撞上 u32 回绕。非法 ⇒ 本次**不带 ack**(`seq` 缺席),移动照常应用。 */
+  /* ⚠️ `isValidAckedSeq` 的下界是 **-1**(那是"账本里还没有 ack"的内部哨兵),
+     而上行 `seq` 是**客户端命令序号**,不存在"第 -1 条" ⇒ 这里必须**再加 `>= 0`**。
+     直接把哨兵值当合法输入登记,会让 `c.ackedSeq` 出现一个客户端永远发不出来的数
+     (之后 `intent.seq > c.ackedSeq` 的比较基准被悄悄改掉)。 */
+  if (typeof msg.seq === 'number' && msg.seq >= 0 && isValidAckedSeq(msg.seq)) {
     intent.seq = msg.seq;
   }
   return { ok: true, intent };
@@ -730,7 +747,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   const withAckedSeq = (payload: Uint8Array, ackedSeq: number): Uint8Array => {
     if (payload.byteLength < ACKED_SEQ_OFFSET + 4) return payload;
     const out = Uint8Array.from(payload);
-    const raw = (ackedSeq + 1) >>> 0;
+    /* ★ 审计 P3-6:换算走冻结层的 `ackSlotValue()`(唯一一处 `ackedSeq+1`),
+       它对本连接账本里的非法值**抛错**,而不是 `>>> 0` 静默回绕成 0。
+       可达性:`c.ackedSeq` 只有两个写点(建连接时 `-1`、`onMove` 里经
+       `isValidAckedSeq` 卡的推进)⇒ 这里抛错意味着账本被别处写坏了,
+       那正是必须**出声**的场合(回绕成 0 会让客户端把已处理的命令重发)。 */
+    const raw = ackSlotValue(ackedSeq);
     out[ACKED_SEQ_OFFSET] = raw & 0xff;
     out[ACKED_SEQ_OFFSET + 1] = (raw >>> 8) & 0xff;
     out[ACKED_SEQ_OFFSET + 2] = (raw >>> 16) & 0xff;
@@ -1174,7 +1196,16 @@ function onMove(c: WsConn, msg: {
     /* ack 只在**应用成功之后**推进 —— 抛错那条路径不该被记成"服务端处理过了",
        否则客户端会把一条从未生效的命令剪掉(那段位移再也补不回来)。
        ★ 推进的是**本连接**的账(`c.ackedSeq`):多连接不许互相冒充。 */
-    if (intent.seq !== undefined && intent.seq > c.ackedSeq) c.ackedSeq = intent.seq;
+    /* ★ 审计 P3-6:推进前**再拒一次**非法 seq(不是重复 parse 的检查,而是
+       给"绕开 `parseMoveIntent` 的调用方"兜底 —— 例如将来另一个入口直接组 intent)。
+       非法 ⇒ 不推进(账本保持不变),并在日志里点名;绝不把回绕值记成 ack。 */
+    if (intent.seq !== undefined) {
+      if (!(intent.seq >= 0 && isValidAckedSeq(intent.seq))) {
+        log(`ack 拒收:seq=${String(intent.seq)} 不在 0..${MAX_ACKED_SEQ}(不推进 ack,移动已应用)`);
+      } else if (intent.seq > c.ackedSeq) {
+        c.ackedSeq = intent.seq;
+      }
+    }
   } catch (e) {
     log(`applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
   }

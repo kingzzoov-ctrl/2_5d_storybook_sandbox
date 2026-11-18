@@ -196,11 +196,11 @@ Lead 批准在 `scripts/verify.ts` 加门禁,要求与 R6 同构。已实施 `ch
 
 | 编号 | 条目 | 缺什么 | 影响 |
 | :--- | :--- | :--- | :--- |
-| U1 | 21 处同义反复修复(各 owner) | 进行中 | 完成后 S11 白名单需同步收缩 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U1 同题,合并到该条 |
-| U2 | `PROTOCOL_VERSION` 已换字面量?(待核) | net-persist | 白名单该项届时必须移出 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U2 同题,合并到该条 |
+| U1 | 21 处同义反复修复(各 owner) | 进行中 | 完成后 S11 白名单需同步收缩 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U1 同题,合并到该条。判据 `tests/WS-FND-76-test-debt.test.ts`(同题条 REVIEW-4 U1 的落地判据) |
+| U2 | `PROTOCOL_VERSION` 已换字面量?(待核) | net-persist | 白名单该项届时必须移出 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U2 同题,合并到该条。判据 `tests/WS-FND-76-test-debt.test.ts`(同题条 REVIEW-4 U2 的 `PROTOCOL_VERSION` 字面量锚点) |
 | U3 | S11 只覆盖第二实参 | 需排期 | 漏报风险有限 | **已关闭(2026-11-17)** | 由 D-19 落地(门禁覆盖 `eq`/`near` 全实参),判据 `tests/WS-FND-74-gate-hardening.test.ts` |
-| U4 | 3 个死导入(REVIEW-4) | 整洁性 | 无功能影响 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U4 同题,合并到该条 |
-| U5 | WS-01 未复核 | coop-party 正在改 | 唯一未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条 |
+| U4 | 3 个死导入(REVIEW-4) | 整洁性 | 无功能影响 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-4.md U4 同题,合并到该条。判据 `tests/WS-FND-76-test-debt.test.ts`(同题条 REVIEW-4 U4 的落地判据) |
+| U5 | WS-01 未复核 | coop-party 正在改 | 唯一未做注入的活跃套件 | **已关闭(2026-11-17)** | 与本仓 ADVERSARIAL-REVIEW-10.md U5 同题,合并到该条。判据 `tests/WS-01.test.ts`(同题条 REVIEW-10 U5 的复核判据) |
 | ~~U6~~ | ~~`WS-FND-03` 空套件~~ | **已查清,见 §5.1,结论是我判断错了** | **撤销** |
 | U7 | U3 剩余 3 项未注入(有区间/字面量锚点) | 可选择性补做 | 价值低 | **已关闭(2026-11-17)** | 由 D-19 落地(34 套件全补独立注入,原先未注入的 3 项已复验),判据 `tests/WS-FND-76-test-debt.test.ts` |
 

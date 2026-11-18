@@ -1,7 +1,7 @@
 # AUDIT-W34 · 八路审计汇编(第 2/8 组)
 
 - **日期**:2026-11-18
-- **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。
+- **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。**2026-11-18 第三批处置**:再关 **3 条**(P2-13 上界 / P3-6 钳制选址 / P3-8 双端同源拦截)+ 订正本文件与代码现状矛盾的措辞(P3-9),判据 `tests/WS-FND-95-gate-and-bounds.test.ts`;详见 §7.5 与 §8。**现存仍登记 4 条**:P2-3 / P3-1 / P3-5 / P3-9。
 - **口径**:本文件是交付物,不新增门禁;`docs/` 下其它文件一概未动。
 
 ## 1 覆盖率
@@ -68,7 +68,7 @@ foreach ($d in 'server/src','shared','client','scripts') {
 | P1-10 | P1 | `content-lock` 只哈希手挑字段 ⇒ 改别的字段指纹不变:`scripts/content-lock.ts` | 已修(判据 v2 整字段指纹;`node scripts/content-lock.ts --audit`) |
 | P1-11 | P1 | 判据「自己比自己」:actual 与 expected 同取自被测模块:`scripts/verify.ts` 同义反复检测 | 已修(判据 `tests/WS-FND-90-gate-truth.test.ts`) |
 
-### 3.2 P2 / P3(2026-11-18 第二批:15 条已修 / 7 条仍登记)
+### 3.2 P2 / P3(2026-11-18 第二批 + 第三批:18 条已修 / 4 条仍登记)
 
 | 编号 | 严重度 | 位置 | 状态 |
 |---|---|---|---|
@@ -84,22 +84,27 @@ foreach ($d in 'server/src','shared','client','scripts') {
 | P2-10 | P2 | `snapshot_blob` 写库无上限:`server/src/db/repo.ts`(快照写入点) | 已修(判据 `tests/WS-FND-94-storage-invariants.test.ts` FND94-2a/2b) |
 | P2-11 | P2 | `fluid.clone()` 丢活跃集:`server/src/world/fluid.ts:727` | 已修(判据 `tests/WS-FND-94` FND94-4a/4b/4c) |
 | P2-12 | P2 | `physics.spawn()` 覆盖同 id 不清旁表:`server/src/physics/world.ts:265` | 已修(判据 `tests/WS-FND-94` FND94-5a/5b) |
-| P2-13 | P2 | `ticks` / `seq` 无上界:`shared/net/delta.ts` 帧头 `w.u32(tick)` / `ackedSeq` | 登记(理由 R13;第二批未动 `shared/net/delta.ts`) |
+| P2-13 | P2 | `ticks` / `seq` 无上界:`shared/net/delta.ts` 帧头 `w.u32(tick)` / `ackedSeq`;上行 `seq` 在 `server/src/net/ws_server.ts`(只查下界) | 已修(2026-11-18 第三批,见 §8.1;判据 `tests/WS-FND-95-gate-and-bounds.test.ts` FND95-4/5/6/7:越界/非有限整数**抛错或拒**,不再 `>>>0` 静默回绕) |
 | P3-1 | P3 | `applyRestore` 的 chunk 解码在闸后且无 `try`:`server/src/sim/world_sim.ts:6553` | 登记(理由 R14;第二批改的是玩家/上限/hp 序列,chunk 解码段未动) |
 | P3-2 | P3 | `setRoof` 静默截 16 位:`server/src/world/chunk.ts:613` / `server/src/world/grid.ts:136` | 已修(判据 `tests/WS-FND-94` FND94-6) |
 | P3-3 | P3 | `decodeRoofRle` 的 `tag=0xff` 越界:`server/src/world/chunk.ts:890` | 已修(判据 `tests/WS-FND-94` FND94-7) |
 | P3-4 | P3 | `fluid.setCell` 可写进实心格:`server/src/world/fluid.ts:258` | 已修(判据 `tests/WS-FND-94` FND94-8a/8b) |
 | P3-5 | P3 | 水位预算在极端情况下全丢:流体预算分派点(`server/src/world/fluid.ts` / `sim/world_sim.ts`) | 登记(理由 R18;第二批对该文件只改了 `setCell` / `clone`) |
-| P3-6 | P3 | `ws/hp` 的钳制选址在 `vitals` 而非编码器:`server/src/combat/vitals.ts` + `shared/net/delta.ts` | 登记(理由 R19;分层位置问题,行为正确) |
+| P3-6 | P3 | `ws/hp` 的钳制选址在 `vitals` 而非编码器:`server/src/combat/vitals.ts` + `shared/net/delta.ts` | 已关闭(2026-11-18 第三批:写成**单点约定**,见 §7.5;判据 `tests/WS-FND-95` FND95-8:编码器对越界 hp **抛错**、vitals 出边一定 `0 ≤ hp ≤ maxHp`) |
 | P3-7 | P3 | `node:sqlite` 事务不支持嵌套:`server/src/db/driver.sqlite.ts:233`(`transaction` 直接转发) | 已修(判据 `tests/WS-FND-94` FND94-1a/1b/1c) |
-| P3-8 | P3 | 双端同源检测仍只告警:`scripts/verify.ts`(`advise('同义反复', ...)`,不进退出码) | 登记(理由 R21;要先清现存命中,与 P1-9 同源) |
+| P3-8 | P3 | 双端同源检测仍只告警:`scripts/verify.ts`(`advise('同义反复', ...)`,不进退出码) | 已修(2026-11-18 第三批:并进**默认拦截**,与三道 strict 同口径、`--lenient` 才降级,汇总行给出条数;见 §8.2;判据 `tests/WS-FND-95` FND95-1/2/3) |
 | P3-9 | P3 | client 顶点色与 `aLodMerge` 的 LOD 合并语义未定:`client/src/three/compat.ts`(属性与几何生成)、`client/src/stage/terrain_vcolor.ts` | 登记(理由 R22;要视觉裁决) |
 
 ## 4 未修项(逐条理由)
 
-**P2(13 条,按「会不会被常规游玩踩到 + 修法是否已定型」排序)**
+> **2026-11-18 第三批之后的读法**:下面这份 R1..R22 是**第二批收尾时**的账本。
+> 其中 4 条已被第三批关闭 —— 本文件已在**原地**标注(~~删除线~~ + 处置),
+> 未标注的仍然成立。最终仍登记的 4 条:**P2-3 / P3-1 / P3-5 / P3-9**
+> (理由见 R3 / R14 / R18 / R22)。
 
-- **R1 / R2 元素抗性整条链没接线**:抗性表在 `vitals` 里可写可读,但生产路径两处(写入侧 `setElementResist`、读取侧 `applyHit`)都没有调用点 ⇒ 现在只是 no-op,不是错值。修法要一起定「哪些生物/元素吃抗性」的内容口径,属设计面,不是一行的 bug。
+**P2(原 13 条,现 1 条仍登记:按「会不会被常规游玩踩到 + 修法是否已定型」排序)**
+- ~~**R1 / R2 元素抗性整条链没接线**~~ **已关闭(2026-11-18 第二批,本行是第三批的措辞订正)**:生产路径两处**都已经接上** —— 写入侧 `server/src/rooms/effects.ts` 的 `pushRoomElementResist`(调用点在 `sim/world_sim.ts` 的 `tickRoomEffects`)写 `setElementResist`,读取侧 `applyHit` 的 `element` 参数因此才有输入。判据 `tests/WS-FND-93-element-resist-wired.test.ts` FND93-1..6。⚠️ 措辞订正的原因:本行此前仍写着「现在只是 no-op」,而 §3.2 的 P2-1/P2-2 已标已修 —— **同一份文件里两个相反的结论**,读者只能靠猜。数值仍是待平衡默认值(§7.2 第 2 条),那是**另一个**问题(平衡),不是接线。
+
 - **R3 击退无上界 + `mass=NaN`**:NaN 只在客户端自报质量且未经 `sanitize` 的路径上才可能出现(常规路径 `spawn` 给 `MASS_PLAYER`),击退上界需要先定「最大冲量」的玩法上限。
 - **R4 `resetWorld` 不按等级重算上限**:重置后玩家 HP 上限沿用旧值,下一帧 `maxHpForLevel` 投影会覆盖回来,窗口只有一个 tick;修法要动 `world_sim` 的重置序列。
 - **R5 玩家→生物无视线闸**:越墙打怪能刷,但要接视线就要在热路径上跑 `hasLineOfSight`(每帧 O(格)),与性能预算冲突,需要先量成本。
@@ -110,16 +115,16 @@ foreach ($d in 'server/src','shared','client','scripts') {
 - **R10 `snapshot_blob` 无上限**:单行快照体积随背包/等级增长,极端账号会把库撑大;上限值要配合存档版本迁移一起定。
 - **R11 `fluid.clone()` 丢活跃集**:存档/回放路径读回的流体不再自己流动(要等下一次扰动),属「读回后行为与存档前不一致」,修法要定活跃集是否属于存档内容。
 - **R12 `physics.spawn()` 覆盖同 id 不清旁表**:只有同 id 重生(换图/重置)才触发,现状由调用方自行保证 id 唯一;清哪几张旁表(`belt`/`carry`/`carrySlot`)需要一次普查。
-- **R13 `ticks` / `seq` 无上界**:`u32` 帧号在 20Hz 下约 6.8 年回绕,`ackedSeq` 同量级;修法是加回绕比较,属长跑健壮性。
+- ~~**R13 `ticks` / `seq` 无上界**~~ **已关闭(2026-11-18 第三批)**:上界门落在两处 —— `shared/net/delta.ts` 的 `assertU32('tick', …)` / `assertAckedSeq` / `ackSlotValue`(帧头两字段),`server/src/net/ws_server.ts` 的 `parseMoveIntent`(上行 `seq`,上界 `MAX_ACKED_SEQ`)+ `onMove` 推进 ack 前的复检。口径是**抛错 / 拒**,不是「加回绕比较」:回绕比较只能让比较结果对,写出来的**字节**仍然是错的。判据 FND95-4/5/6/7。注:R7 里「要靠 seq 拦重放」那句的前提(seq 无上界)已不成立,但 R7 本身(P3? 见 P2-7 已修)以幂等键解决,不依赖本行。
 - **R14–R22(P3)**:
   - R14 `applyRestore` 的 chunk 解码在闸后且无 `try` ⇒ 坏档会把异常抛到闸门之后,不会静默,但错误分类不干净。
   - R15 `setRoof` 静默截 16 位 ⇒ 只影响 `roofId ≥ 65536` 的内容,内容基线目前最大号远低于此。
   - R16 `decodeRoofRle` 的 `tag=0xff` 越界 ⇒ 需要构造畸形字节流才触发,属解码健壮性。
   - R17 `fluid.setCell` 可写进实心格 ⇒ 现有调用点都先判了地形,属「口子开着但没人用错」。
   - R18 水位预算极端情况全丢 ⇒ 只在预算被单帧打满时出现,影响的是「这一帧水不动」而不是错值。
-  - R19 `ws/hp` 钳制选址在 `vitals` 而非编码器 ⇒ 分层位置问题,行为正确。
+  - ~~R19 `ws/hp` 钳制选址在 `vitals` 而非编码器~~ **已关闭(2026-11-18 第三批)**:选址写成**单点约定**(§7.5)——钳制唯一落点是 `server/src/combat/vitals.ts`,编码器只负责**抛错**;判据 FND95-8 同时钉两侧(编码器遇越界 hp 抛错 + vitals 出边恒合法)。
   - R20 `node:sqlite` 事务不支持嵌套 ⇒ 现状没有嵌套调用点;要支持需自带 savepoint,收益低于风险。
-  - R21 双端同源检测仍只告警 ⇒ 升级为硬门禁前必须先清掉现存命中(与 P1-9 的 37 条同源),否则只会逼人加白名单。
+  - ~~R21 双端同源检测仍只告警~~ **已关闭(2026-11-18 第三批)**:它的前提是「先把现存命中清零」,而实测已是 **0 处**(`node scripts/verify.ts --docs` 打印 `· 双端同源 0 处`)⇒ 前提满足,已并进默认拦截(§8.2)。判据 FND95-1/2/3。
   - R22 顶点色 + `aLodMerge` 的 LOD 合并语义 ⇒ 视觉语义未定(合并阈值与顶点色的插值口径要先出裁决),今天的判据只钉「属性存在且长度对」。
 
 ## 5 本轮代码改动(唯一一处)
@@ -192,3 +197,94 @@ this.expireItemSources();
 - `node scripts/verify.ts --docs`:见本批交接报告;`node scripts/content-lock.ts` 指纹仍为
   `v2-76694a25`(本批未碰内容表)。`node scripts/backlog.ts`:133 条 / 37 未关闭 / 0 阻塞 / 96 已关闭(未变)。
 - `npm run typecheck`:261 条(与基线一致,**未新增**)。
+
+### 7.5 ★ 钳制选址的**单点约定**(审计 P3-6 / 交接单 P3-8)
+
+> 这一节是**约定本身**,不是记录一次改动。同一段话在代码里只出现一次
+> (`server/src/combat/vitals.ts` 的「单点约定」块),别处只引用,不复制。
+
+```
+钳制(写进状态)   server/src/combat/vitals.ts
+                 不变量 0 ≤ hp ≤ maxHp 只在那里成形
+                 写点  register / applyDamage / applyHit / heal / revive / syncMaxHp / stepTimers
+报错(写出字节)   shared/net/delta.ts 的 toUint
+                 越界 hp(> 65535 / 负 / NaN / 非数值)⇒ throw,**不钳**
+```
+
+- **为什么钳在 vitals 而不是编码器**:钳在编码器 ⇒ 世界状态里仍然是 `hp=535` / `hp=NaN`,
+  只是"发出去的字节"好看;读档、判死、回血、DB 落库全都还错。钳制是**状态不变量**,
+  属于状态的唯一持有者(`VitalsSystem`);序列化器只回答「这个值能不能上线」。
+- **为什么不能两边都钳**:两份实现日后必然漂移(陷阱 31/41),而且会掩盖上游钳制失效
+  —— 编码器一旦替越界值圆场,绕过 vitals 的调用方就再也不会被任何人发现。
+- **判据(不是说明)**:`tests/WS-FND-95-gate-and-bounds.test.ts` FND95-8 ——
+  同一条越界 hp 喂两条路:编码器**抛错**(负对照:`hp=65535` 端点仍可编码);
+  同一个病态输入喂 `VitalsSystem.revive()`,出来的一定落在 `[0, maxHp]` 且能正常编码。
+- **边界(要人盯)**:`VitalsSystem.get(id)` 返回同一引用,调用方有权直接改字段。
+  那是刻意的读口;写法约定是「写 hp 只经本类的方法」。`world_sim.importVitals`
+  曾经自带的那份钳制已摘除(见 `revive()` 的注释)。
+
+## 8 2026-11-18 第三批处置(P3-5 / P3-6 / P3-8 / P3-9 口径)
+
+> 说明:交接单把这四条叫 P3-5 / P3-6 / P3-8 / P3-9,而本文件台账用的是
+> **P3-8(双端同源)/ P2-13(ticks·seq)/ P3-6(hp 钳制选址)**。下表按**条目内容**
+> 对齐,不按编号猜。
+
+### 8.1 `ticks` / `seq` 上界(P2-13)
+
+- `shared/net/delta.ts` 新增 §0:`MAX_U32` / `MIN_ACKED_SEQ` / `MAX_ACKED_SEQ` /
+  `isU32` / `assertU32` / `isValidAckedSeq` / `assertAckedSeq` / `ackSlotValue`。
+  `encodeDelta` 的 `w.u32(tick)` 改为 `w.u32(assertU32('tick', tick))`。
+- `server/src/net/ws_server.ts`:`parseMoveIntent` 的 `seq` 上界改走 `isValidAckedSeq`
+  (修前只查 `>= 0`);`onMove` 推进 ack 前再复检一次,非法 ⇒ **不推进**并记日志;
+  `withAckedSeq` 的 `(ackedSeq+1)>>>0` 换成 `ackSlotValue()`(唯一的内部域→线上域换算,
+  非法即抛错,**不再回绕成 0**)。
+- 刻意**不**做「回绕比较」:回绕比较只让比较结果对,写出去的字节仍然是错的。
+  解码侧不需要新门:`r.u32()` 的返回值结构上就在 `[0, MAX_U32]`。
+
+### 8.2 双端同源并进默认拦截(P3-8)
+
+- `scripts/verify.ts` 新增 `BOTH_SIDES_GATE` / `bothSidesVerdict(count, lenient)`:
+  默认 `count > 0 ⇒ fail()`,`--lenient ⇒ advise()`(与 `strictReach/Taut/Inert` 同口径)。
+  旧行是 `advise('同义反复', …)` —— 比"未登记候选"**更强**的证据反而更宽松。
+- 汇总行新增 `· 双端同源 N 处`(`bothSidesMeasured`,由 `checkTautology` 填)。
+  `ADVISE_UPGRADE` 补键,否则汇总行会把 `--lenient` 下的这条告警说成「不属三道 strict」。
+- 升级的前提已验证:`node scripts/verify.ts --docs` 打印 `· 双端同源 0 处`
+  ⇒ 现存命中已由前一批清零动作处理完,R21 当时担心的"只会逼人加白名单"不成立。
+
+### 8.3 文档措辞订正(P3-9)
+
+本文件内**自相矛盾**处已逐条改掉(这是本批唯一允许改的 `.md`):
+
+| 位置 | 修前 | 与代码现状的矛盾 |
+|---|---|---|
+| §4 R1/R2 | 「元素抗性整条链没接线 ⇒ 现在只是 no-op」 | §3.2 已把 P2-1/P2-2 标已修;**同一文件两个相反结论** |
+| §4 R13 | 「修法是加回绕比较」 | 见 §8.1:实际口径是抛错 / 拒 |
+| §4 R19 | 「钳制选址…登记」 | 见 §7.5:已写成单点约定 |
+| §4 R21 | 「升级前必须先清掉现存命中」 | 实测 0 处,前提已满足,见 §8.2 |
+
+**仍未改、需文档 owner 处理的矛盾(不在本批写权限内)**:
+
+1. `docs/DAMAGE-LOOP.md:26`「复活流程与重生点 | 服务器层(未实现)」——
+   `server/src/combat/revive.ts` 与 `sim/world_sim.ts` 的复活序列早已在跑
+   (判据 `tests/WS-FND-62` / `WS-FND-83`)。该行是**只改了一半的旧账**。
+2. `docs/DAMAGE-LOOP.md:27`「PvP 结算 | 未实现(见 §8 U3)」——
+   同文件 `:319` 的 D3 已写「已关闭(2026-11-17)」,`pvpVerdict` 是唯一授权判定
+   (判据 `tests/WS-FND-71` FND71-5..8)。**同一文件两条互斥陈述**。
+3. `docs/AUTHORITY-MAP.md:162` / `:331-334`、`docs/ARCH-GAPS.md:573-575` 里的
+   `vitals.ts:NNN` 行号取自**更早的版本**:例如 `vitals.ts:345` 现在是
+   `warnHitsPlayer` 里的 `const dist = Math.hypot(dx, dy);`,而文档说它是
+   `v.hp = hp ?? v.maxHp`(那个写法已挪进 `revive()` 并改成两步钳制)。属行号陈旧,不是结论错。
+4. `docs/DAMAGE-LOOP.md:320`(D4 元素抗性"已关闭")现在的**结论**是对的,
+   但它引的判据 `tests/WS-FND-71` FND71-9 只钉「系数在玩家侧出现」,
+   钉不住"生产侧有写入点"—— 后者由 `tests/WS-FND-93` FND93-6 提供。
+   建议把 D4 行的判据改成「FND71-9 + FND93-6」。
+
+### 8.4 本批验证口径
+
+- 未跑 `scripts/verify.ts --all`(硬约束)。跑过的:`node scripts/verify.ts --docs`
+  (它**包含** `checkTautology` 与本批新汇总行)、`node tests/WS-FND-95-gate-and-bounds.test.ts`、
+  `npm run typecheck`(261 条基线,未新增)、`node scripts/verify.ts --frozen`。
+- 判据套件:`tests/WS-FND-95-gate-and-bounds.test.ts`(FND95-1..9,含负对照 + 注入)。
+- 已知的**非本批**红:`--docs` 有 2 条 HANDOVER 数字红(生产可达性 132/144 vs 实测 133/145、
+  生产 .ts 合计 144 vs 145),根因是并行批次新增了 `server/src/systems/idempotency.ts`,
+  不是本批四条改动。

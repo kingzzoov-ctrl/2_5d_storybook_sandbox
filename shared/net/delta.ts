@@ -83,6 +83,99 @@ import {
  */
 export const PROTOCOL_VERSION = 3;
 
+/* ═══════════════ 0. u32 上界(审计 P3-6:帧号 / ack 序号)═══════════════════
+ *
+ * ## 修前的洞(实测口径)
+ *
+ * 帧头两个 u32 字段(`tick` 与 `ackedSeq`)**没有任何取值门**:
+ * ```
+ * encodeFull(state, 4294967296)        ⇒ 线上写 0        ← 静默回绕(u32 截断)
+ * encodeFull(state, Infinity)          ⇒ 线上写 0        ← 同上
+ * withAckedSeq(payload, 4294967296)    ⇒ (v+1)>>>0 回绕  ← 服务端侧同一形态
+ * ```
+ * 回绕**不报错**,而解码侧同样读不出异常(u32 读回来永远是"合法"的),
+ * 于是「帧号跳变 / ack 归零」在两端都表现为**正常数字** —— 与本文件 §1
+ * 已经修掉的字段静默钳位(P1-2)是同一形态,只是发生在包头。
+ *
+ * ## 口径:u32 线上量必须**显式合法**,非法一律抛错
+ *
+ * ```
+ * 合法   [0, MAX_U32] 内的有限整数  ⇒ 原样
+ * 非法   非数值 / NaN / Infinity / 小数 / 负数 / > MAX_U32 ⇒ **抛错**
+ * ```
+ * 不做截断、不做回绕、不做钳位:截断会让「客户端伪造的 ackedSeq」变成
+ * 一个看似合理的小数字,而钳位会让超长帧号与真实帧号撞值。
+ * 三种宽度(P1-2)与两个包头字段(P3-6)现在共用同一条口径:**报错**。
+ *
+ * `ackedSeq` 内部域是 `[-1, MAX_ACKED_SEQ]`(`-1` = 该连接还没带过 seq),
+ * 线上存 `ackedSeq + 1` ⇒ `0` 天然表示无 ack,与解码侧的还原互为逆运算。
+ */
+
+/** 线上 u32 的取值上界(`2^32 − 1`)。 */
+export const MAX_U32 = 4_294_967_295;
+
+/** 内部 `ackedSeq` 的下界:`-1` = 本连接还没收到过 `seq`。 */
+export const MIN_ACKED_SEQ = -1;
+
+/**
+ * 内部 `ackedSeq` 的上界。
+ *
+ * 为什么是 `MAX_U32 − 1` 而不是 `MAX_U32`:线上存的是 `ackedSeq + 1`,
+ * 上界 `MAX_U32` 会写成 `4294967296` ⇒ 回绕成 `0`(即"没有 ack")
+ * —— 一个**最坏**的静默错值:客户端会以为服务端什么都没处理。
+ */
+export const MAX_ACKED_SEQ = MAX_U32 - 1;
+
+/**
+ * 一个值能否作为**线上 u32** 写入(帧号 tick / ack 槽位)。
+ *
+ * 单独成谓词是为了让「拒绝」与「抛错」两种调用形态共用**同一份**判据:
+ * 运输层要求"拒掉这条输入"(连接必须活下去),编码器要求"当场抛错"(不许写出坏包)。
+ */
+export function isU32(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= MAX_U32;
+}
+
+/**
+ * 线上 u32 的**唯一**校验口:非法即抛错(带字段名与原值)。
+ * @returns 原值(合法时),便于写成 `w.u32(assertU32('tick', tick))`。
+ */
+export function assertU32(field: string, v: unknown): number {
+  if (!isU32(v)) {
+    throw new Error(
+      `${field} 非法取值:${String(v)}(要求 0..${MAX_U32} 的有限整数 —— 协议不做静默截断/回绕)`,
+    );
+  }
+  return v;
+}
+
+/** 内部 `ackedSeq` 是否合法(见 `MAX_ACKED_SEQ` 的注释)。 */
+export function isValidAckedSeq(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= MIN_ACKED_SEQ && v <= MAX_ACKED_SEQ;
+}
+
+/** 内部 `ackedSeq` 的校验口:非法即抛错。@returns 原值 */
+export function assertAckedSeq(v: unknown): number {
+  if (!isValidAckedSeq(v)) {
+    throw new Error(
+      `ackedSeq 非法取值:${String(v)}(要求 ${MIN_ACKED_SEQ}..${MAX_ACKED_SEQ} 的整数;`
+      + `线上存 ackedSeq+1 ⇒ 上界比 u32 少 1)`,
+    );
+  }
+  return v;
+}
+
+/**
+ * 线上 ack 槽位(4 字节)该写的值 = `ackedSeq + 1`。
+ *
+ * **不在这里钳/截断**:非法 `ackedSeq` 由 `assertAckedSeq` 抛错。
+ * 运输层(`server/src/net/ws_server.ts` 的 `withAckedSeq`)只用本函数,
+ * 于是"内部域 → 线上域"只有一处换算。
+ */
+export function ackSlotValue(ackedSeq: unknown): number {
+  return assertAckedSeq(ackedSeq) + 1;
+}
+
 export const PacketOp = {
   FULL: 0,
   DELTA: 1,
@@ -296,6 +389,13 @@ const UINT_MAX: Readonly<Record<string, number>> = {
  *
  * 改后口径:**非数值 / 非有限 / 负数 / 超上限 ⇒ 抛错**(带字段名与原值),
  * 三种宽度统一 `Math.round`。
+ *
+ * ★ 审计 P3-8(钳制选址的**单点约定**的编码器一侧):本函数**只报错,不钳**。
+ * 「越界 hp 该在哪里被钳」的唯一答案是 `server/src/combat/vitals.ts`
+ * (`0 ≤ hp ≤ maxHp` 只在那里成形,见该文件的「单点约定」块与
+ * `docs/AUDIT-W34.md` §7.5);本文件遇到越界 hp 的唯一正确行为是**抛错** ——
+ * 若哪天有调用方绕过 vitals 把越界 hp 塞进来,这里应当**红**,而不是替它圆场。
+ * 判据:`tests/WS-FND-95-gate-and-bounds.test.ts` FND95-8。
  */
 function toUint(spec: FieldSpec, value: unknown): number {
   const max = UINT_MAX[spec.type];
@@ -431,11 +531,14 @@ export function encodeDelta(
   const w = new ByteWriter();
   w.u8(PROTOCOL_VERSION);
   w.u8(prev ? PacketOp.DELTA : PacketOp.FULL);
-  w.u32(tick);
+  /* ★ 审计 P3-6:`tick` 是线上 u32 —— 越界/非有限整数**抛错**,不静默回绕。
+     修前 `w.u32(tick)` 对 `4294967296` / `Infinity` / `-1` 全部写成 0,
+     而解码侧读回来永远是"合法数字" ⇒ 两端都看不出帧号跳过了一大段。 */
+  w.u32(assertU32('tick', tick));
   /* ── ackedSeq 槽位(4 字节,小端)──
      编码 = `ackedSeq + 1`(内部 `-1` ⇒ 线上 `0`)。**这里只写占位 0**:
      它是**每连接**的量,真值由运输层逐连接覆写(冻结层不需要知道
-     ack 属于哪条连接)。 */
+     ack 属于哪条连接)。覆写走 `ackSlotValue()`(同一份换算 + 校验)。 */
   w.u32(0);
 
   const removed: { kind: number; id: string }[] = [];
@@ -545,7 +648,10 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
   const op = r.u8() as PacketOp;
   if (op !== PacketOp.FULL && op !== PacketOp.DELTA) throw new Error(`未知 op:${op}`);
   const tick = r.u32();
-  /* ackedSeq:线上 = 内部 + 1 ⇒ 这里减 1 还原(占位 0 ⇒ -1 = 无 ack)。 */
+  /* ackedSeq:线上 = 内部 + 1 ⇒ 这里减 1 还原(占位 0 ⇒ -1 = 无 ack)。
+     ★ 解码侧**不需要**再校验上界:`r.u32()` 的返回值结构上就落在 `[0, MAX_U32]`,
+     ⇒ 还原后恒在 `[MIN_ACKED_SEQ, MAX_ACKED_SEQ]`(见 §0)。上界门只在**写入侧**:
+     编码器(本文件 `assertU32('tick', …)`)与运输层的 `ackSlotValue()`。 */
   const ackedSeq = r.u32() - 1;
 
   const removedCount = r.u16();
