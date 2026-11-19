@@ -26,8 +26,13 @@
  *     回执(`effect.stacks` / `effect.total`)是**唯一**的可见出口,而那要客户端自己解析;
  *   2 容器状态**只活在进程内存里** —— 不落盘、不随 `room.ts` 的存档走,
  *     房间重建即清空(与背包的 `inventoryTotals` 退路缓存同一性质);
- *   3 世界里**没有**真实箱子实体:`registerChest()` 是登记箱子的**唯一**入口
- *     (测试与将来的放置动作都用它)。没登记过的格子 ⇒ `INVALID`「不是箱子」。
+ *   3 世界里**没有**真实箱子实体:登记箱子的入口有**两条**,都指向同一份容器模型 ——
+ *     · `registerChest()`(显式登记:测试、将来的地图载入);
+ *     · **生产路径**:那一格的 obj 层真的放着箱子块(`ITEM_LIST` 里带
+ *       `储物` 标签的 513 / 514,由 `PLACE_BLOCK` 写进 obj 层)⇒ 取放时
+ *       **就地登记**(见 `runChestAction` 里的 `worldBlockAt`)。
+ *     修前只有第一条 ⇒ 全仓零生产调用点 ⇒ 线上恒 INVALID「不是箱子」。
+ *     两条都**不是**客户端可伪造的:一条来自服务端调用方,一条来自世界地形。
  *
  * ## 取放的顺序纪律(与 `material.ts` 同一套)
  *
@@ -93,6 +98,22 @@ const chestsByRoom = new Map<string, Map<string, ChestCell>>();
  * 同一 `itemId` 的多次存入合并进**同一档**,不占新格 ⇒ 「满」= 24 个不同的物品。
  */
 export const CHEST_SLOTS = 24;
+
+/**
+ * 箱子(一整格容器)的**件数**上界 —— 与 `CHEST_SLOTS` 正交的那一维。
+ *
+ * `CHEST_SLOTS` 管的是「有几**档**」(不同 `itemId`),它**管不到**「同一档堆了多少件」:
+ * 报文里的 `count` 是客户端自报的正整数,只受**背包**约束 ⇒ 同一个 `itemId`
+ * 可以一直往里堆(实测:24 档 × 每档 N 件,**无上界**),箱子于是变成一件
+ * 「不会满的仓库」—— 与「容器有容量」这句话相抵。
+ *
+ * 取值 = `CHEST_SLOTS × 8`(= 192),8 是 **Lv1 背包容量**
+ * (`carrySlots = 8 + (level-1)`,见 `net/room.ts:carryCapacityOf` 与
+ * `combat/progression.ts:statsAtLevel`)—— 口径是「一格箱子至多装下
+ * **一个新手背包**的量」。与 `CHEST_REACH` 同一处境:仓库里**没有**现成的
+ * 「容器件数上界」,本常量就是那条裁决的落点;将来若内容层给出出处,改这一个数即可。
+ */
+export const CHEST_MAX_ITEMS = CHEST_SLOTS * 8;
 
 /**
  * 箱子**交互半径**(格)。
@@ -195,6 +216,34 @@ export function ownChestContents(
 
 /** 冻结内容表里的合法物品 id。用于拒绝「编号空投」(不在表里的 id 一律不认)。 */
 const ITEM_ID_SET: ReadonlySet<number> = new Set(ITEM_LIST.map((i) => i.id));
+
+/**
+ * 内容层里**哪些 obj 是箱子** —— 从 `ITEM_LIST` 的 `储物` 标签取,不另手写 id 表。
+ *
+ * 为什么需要它:`PLACE_BLOCK` 把 **itemId 直接写进 obj 层**(两者共用编号空间,
+ * 见 `world_sim.ts:placeBlock` 的注释;生物 AI 也是这么干的),所以「世界里
+ * 哪一格是箱子」只能由**内容表**回答。手写 `[513, 514]` 会在内容表增项时静默过期
+ * —— 这正是「第二份事实源」的形态。今天的命中:513 分类图标储物箱、514 云端保险箱。
+ */
+const CHEST_BLOCK_IDS: ReadonlySet<number> = new Set(
+  ITEM_LIST.filter((i) => i.tags.includes('储物')).map((i) => i.id),
+);
+
+/**
+ * 读**世界侧**那一格的 obj id。没有世界源 / 世界源没有 `blockAt` ⇒ `0`(= 空)。
+ *
+ * ⚠️ 这是「这一格是不是箱子」的**权威**读数:客户端改不动地形
+ * (与 `CHEST_REACH` 的距离闸读 `hostPositionOf` 同一取向)。
+ * `Number.isFinite` 门与 `checkMove` 的值域门同族:坏值不得让 `CHEST_BLOCK_IDS.has`
+ * 之外的分支悄悄成立。
+ */
+function worldBlockAt(ctx: ActionContext, x: number, y: number): number {
+  if (typeof ctx.materialsOf !== 'function') return 0;
+  const mat = ctx.materialsOf();
+  if (mat === null || typeof mat.blockAt !== 'function') return 0;
+  const id = mat.blockAt(x, y);
+  return typeof id === 'number' && Number.isFinite(id) && id > 0 ? Math.trunc(id) : 0;
+}
 
 /**
  * 从 action payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。
@@ -323,8 +372,30 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
   }
 
   const roomId = ctx.state.roomId;
-  const view = containers.read(roomId, x, y);
-  if (view === null) return { ok: false, kind: 'INVALID', reason: `格 (${x},${y}) 不是箱子` };
+  let view = containers.read(roomId, x, y);
+  if (view === null) {
+    /* ── ★ **生产注册路径**(P2:修前 `registerChest` 只有测试调用 ⇒ 线上恒 INVALID)──
+     *
+     * 修前的病:`registerChest` 是全仓**唯一**的登记入口,而它**零生产调用点**
+     * ⇒ 生产上 `chestsByRoom` 永远是空的 ⇒ `OPEN_CHEST` / `USE_OWN_CHEST`
+     * **恒**返回 INVALID「不是箱子」,三个 CV 测起来全绿、线上一次都开不了。
+     *
+     * 判据取自**世界侧地形**(`blockAt`,obj 层;`PLACE_BLOCK` 把 itemId 写进 obj 层),
+     * 于是「放下的箱子」自动成为可开的箱子 —— 建筑/放置路径不需要再记得**多调一次**
+     * 登记(那正是「靠调用方自觉」的形态:漏了就静默失效)。
+     *
+     * ⚠️ 只在**没登记过**的格子上做这一次读;登记过的格子仍以登记为准
+     * (测试与将来的地图载入可以预登记)。客户端改不动地形 ⇒ 不是可伪造面。 */
+    const blockId = worldBlockAt(ctx, x, y);
+    if (!CHEST_BLOCK_IDS.has(blockId)) {
+      return { ok: false, kind: 'INVALID', reason: `格 (${x},${y}) 不是箱子` };
+    }
+    registerChest(roomId, x, y);
+    view = containers.read(roomId, x, y);
+    if (view === null) {
+      return { ok: false, kind: 'INVALID', reason: `格 (${x},${y}) 不是箱子(登记后仍读不到)` };
+    }
+  }
 
   const itemId = numField(ctx.payload.itemId);
   /* 只带 x/y = 「打开看」:只读,不动任何一侧。 */
@@ -352,6 +423,19 @@ export function runChestAction(ctx: ActionContext, containers: ChestContainers):
       return {
         ok: false, kind: 'INVALID',
         reason: `箱子已满(${CHEST_SLOTS} 格)⇒ 放不下新的一档 ${itemId}`,
+      };
+    }
+    /* ── ★ 容器**件数**上界(P2:同一 `itemId` 可堆任意件)──
+       `CHEST_SLOTS` 管的是「有几档」,管不到「某一档有多少件」;而 `count` 是
+       客户端自报的正整数 ⇒ 没有这条判据时,同一个 `itemId` 可以一直往里堆,
+       箱子成为「不会满的仓库」(实测:只受背包约束)。判据在**扣背包之前**,
+       被拒 ⇒ 容器与背包**一个字都没动**。 */
+    const inChest = totalOf(view);
+    if (inChest + count > CHEST_MAX_ITEMS) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `箱子装不下:现有 ${inChest} 件 + 本次 ${count} 件 > 上界 ${CHEST_MAX_ITEMS}`
+          + `(容器有件数上界,见 CHEST_MAX_ITEMS)`,
       };
     }
     /* ★ 按件权威读口(审计 P1):`itemId` 是报文里**客户端自报**的,总量守恒挡不住

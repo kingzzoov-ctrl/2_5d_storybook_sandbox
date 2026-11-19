@@ -233,6 +233,43 @@ function countAnchor(src: string, anchor: string): { n: number; normalized: bool
   return { n: nSrc.split(nAnchor).length - 1, normalized: true };
 }
 
+/**
+ * ★ D1 的锚点**自取**:返回汇点 `this.ac.inventory(userId, {...})` 整段调用文(含 `(`,不含 `;`)。
+ *
+ * ## 为什么不能再靠「注入一个未闭合的 `/*`」
+ * 旧版锚点是 `this.ac.inventory(userId, {` ⇒ 替换成
+ * `this.ac.inventory(userId, input as never, /*`,靠**末尾那个未闭合块注释**把后面整个对象
+ * 字面量吞掉,好让门禁看到「实参里一个字面字段都没有」⇒ 回退接口级。这个惯用法**位置敏感**:
+ * ```
+ * server/src/net/room.ts:2784-2788  新增了一条内层块注释(「★ 按件判据」的说明)
+ *   ⇒ 注入的 `/*` 在**那里**就被闭合(块注释不嵌套)
+ *   ⇒ 其后的 `capacity` 又变成活的实参 ⇒ matched=1 ⇒ D1 不再回退接口级
+ *   ⇒ 用例红在「契约表失真」而不是「整体透传」,即**探针**坏了,不是门禁坏了
+ * ```
+ * ⇒ 探针不该依赖「后面有没有闭注释符、它在哪一行」。改为**括号配平取出整段调用**,
+ *   再整段换成 `this.ac.inventory(userId, input as never)`:
+ *   注入结果是**恰好**「对象整体递下去、字段名不出现」这一种形态 ——
+ *   形态由替换后的文本本身决定,与注释位置无关;**判据强度一分不降**(反而更强:
+ *   旧版连 `tick/ops` 都一起消失,新版把它们所在的整段实参换成了裸标识符)。
+ */
+function pickInventoryCall(src: string): string {
+  /* `{` 只是定位用(汇点实参是对象字面量);真正返回的是**括号配平**的整段调用。 */
+  const head = 'this.ac.inventory(userId, {';
+  const at = src.indexOf(head);
+  if (at < 0) return '';
+  const open = at + 'this.ac.inventory'.length;
+  if (src[open] !== '(') return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    if (src[i] === '(') depth += 1;
+    else if (src[i] === ')') {
+      depth -= 1;
+      if (depth === 0) return src.slice(at, i + 1);
+    }
+  }
+  return '';
+}
+
 const CASES: Case[] = [
   /* ═══ T37:新增的「入口执行层」门禁必须能检测漂移 ═══
    *
@@ -329,13 +366,19 @@ const CASES: Case[] = [
     mark: 'orphan-blank-reason',
   } as Case,
 
-  /* ═══ D1:整体透传必须回退接口级并报红 ═══ */
+  /* ═══ D1:整体透传必须回退接口级并报红 ═══
+     ⚠️ 锚点**自取**(`pickInventoryCall`,理由见该函数头):
+     旧版靠「注入 `input as never, /*` 让后面的对象字面量被注释吞掉」,
+     而同侪在 `room.ts:2784-2788` 新增内层块注释后,那个 `/*` 提前闭合 ⇒
+     探针静默退化成「缺 2 个受管字段」⇒ 用例红在**错的**消息上。
+     ⇒ 现在整段实参**整个换成** `inventory(userId, input as never)`:
+       形态由替换文本决定,与注释位置无关;注入的就是最纯粹的「整体透传」。 */
   {
     group: 'D1',
     name: '汇点实参整体透传 inventory(userId, input)',
     file: 'server/src/net/room.ts',
-    from: 'this.ac.inventory(userId, {',
-    to: 'this.ac.inventory(userId, input as never, /*',
+    from: (src) => pickInventoryCall(src),
+    to: 'this.ac.inventory(userId, input as never)',
     expect: 'red',
     wantMsg: /整体透传|取自客户端/,
     args: ['--frozen'],
@@ -344,8 +387,8 @@ const CASES: Case[] = [
     group: 'D1',
     name: '汇点实参别名透传 inventory(userId, pkt)',
     file: 'server/src/net/room.ts',
-    from: 'this.ac.inventory(userId, {',
-    to: 'this.ac.inventory(userId, pkt as never, /*',
+    from: (src) => pickInventoryCall(src),
+    to: 'this.ac.inventory(userId, pkt as never)',
     expect: 'red',
     wantMsg: /整体透传|取自客户端/,
     args: ['--frozen'],

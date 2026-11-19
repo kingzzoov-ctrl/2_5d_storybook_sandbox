@@ -472,6 +472,16 @@ export class NetPersistRoom extends Room<RoomSchema> {
       client.leave(4000, res.reason ?? 'join rejected');
       return;
     }
+    /* ★ WS-FND-131(P1):**装配层的交叉核对** —— `runtime.join()` 说 ok,
+       就必须**真的**在席位上。两者不一致(= runtime 侧已回滚,或将来有人让
+       join 返回 ok 却没落席位)时,这条连接**什么都不该做**:它会继续发 move /
+       attack,而服务端每一条都会落空(反作弊查无此人),外部表现是「连上了但
+       按键没反应」—— 那正是本仓反复记的「静默成功」形态。
+       ⇒ 出声拒绝(4002),并且**不建绑定**(否则旁表会留下一条房间从没收过的键)。 */
+    if (!this.runtime.isSeated(userId)) {
+      client.leave(4002, '入场未生效(runtime 侧没有这个席位,已按失败处理)');
+      return;
+    }
     /* ★ P1-1:入场**成功之后**才建绑定 —— 被拒的连接不许在表里留键,
        否则 `unbindSeat` 会把一个房间从没收过的 userId 交给 leave/disconnect。 */
     this.bindSeat(client.sessionId, userId);
@@ -587,7 +597,14 @@ export class NetPersistRoom extends Room<RoomSchema> {
       ops: { itemId: number; delta: number; source?: string }[];
     }) => {
       const r = this.runtime.applyInventory(this.seatKeyOf(client), { ops: msg.ops });
-      if (!r.allowed) client.send('reject', { kind: 'INVENTORY' });
+      if (!r.allowed) {
+        /* ★ **不隐藏归因**(P2:`ITEM_NEGATIVE` / `ITEM_OVERFLOW` / `ITEM_FROM_NOTHING`
+           此前被入口一律折叠成 `INVENTORY`):客户端与诊断据此分不出
+           「这一件不够扣」与「容量不够」—— 而这两件事的修法完全不同。
+           判据仍在**唯一汇点**(`RoomRuntime.applyInventory` 的四个服务端派生入参,
+           含按件账 `beforeByItem`),这里只把汇点给出的拒因码**如实带出去**。 */
+        client.send('reject', { kind: 'INVENTORY', code: r.rejectCode ?? null });
+      }
     });
     /* ── action:授权 → 执行 → **回执**(2026-11-14 接线)──
      *

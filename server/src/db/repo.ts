@@ -769,9 +769,61 @@ export function consumeItem(db: DbLike, instanceId: string, n: number, nowMs: nu
   return true;
 }
 
-/** 单玩家物品总量(守恒断言的观测口径)。 */
+/**
+ * `ai_item_instances` 里 `quantity` **不可用**的行数(累计,只增)。
+ *
+ * 为什么要有它:坏行被**跳过**是该有的行为(见 `totalItemsOf`),但「跳过」
+ * 若无声,它就变成又一处**静默降级** —— 账面悄悄少算几件,而没有任何地方
+ * 看得出发生过。`badQuantityRowCount() > 0` ⇒ 持久层里有脏数据,需要人看。
+ */
+let badQuantityRows = 0;
+
+/** 坏 `quantity` 行数。**正常路径必须为 0**。 */
+export function badQuantityRowCount(): number {
+  return badQuantityRows;
+}
+
+/** 归零(测试用)。 */
+export function resetBadQuantityRowCount(): void {
+  badQuantityRows = 0;
+}
+
+/**
+ * 单玩家物品总量(守恒断言的观测口径)。
+ *
+ * ## ⚠️ 只累加**有限非负**的 `quantity`(不是 `reduce((s,r) => s + r.quantity)`)
+ *
+ * 一行坏数据(`quantity: NaN` / `'abc'` / `Infinity`)会让整个和变成 `NaN`,
+ * 而下游的守恒判定是**比较**:
+ * ```
+ * after > capacity   ⇒   NaN > 8   = false   (容量闸静默失效)
+ * after < 0          ⇒   NaN < 0   = false   (负库存闸静默失效)
+ * ```
+ * 与 `anticheat.sanitizeMul` 兜 `speedMul` 是**同一族的坑**:`NaN` 让比较恒 false。
+ * 它是真实可达面:`quantity` 是库里的数字列,而 `addItemInstance` 只校验
+ * 「< 0 抛错」、不校验「是不是有限数」(`addItemInstance(db, {quantity: NaN})`
+ * 一路进去 ⇒ 该玩家之后**所有**物品判据失效)。
+ *
+ * ## 为什么是「整行跳过」而不是「夹到 0」或「抛错」
+ * ```
+ * 夹到 0  ⇒ 把「这一行坏了」伪装成「这一行是 0」——又一个静默降级(本仓反复记的形态)
+ * 抛错    ⇒ 一行脏数据让**整个房间**的物品路径崩掉(比少算更不安全;与
+ *           `mergeLimits` 取 fail-closed 而非 fail-fast 同一条理由)
+ * 跳过    ⇒ 少算这一行、**并且可观测**(`badQuantityRowCount`),判据仍在
+ * ```
+ * 数值上「跳过」只会**低估**总量(低估 ⇒ 容量闸更保守),不会让判据失效。
+ */
 export function totalItemsOf(db: DbLike, ownerId: string): number {
-  return listItems(db, ownerId).reduce((s, r) => s + r.quantity, 0);
+  let sum = 0;
+  for (const r of listItems(db, ownerId)) {
+    const q = r.quantity;
+    if (typeof q !== 'number' || !Number.isFinite(q) || q < 0) {
+      badQuantityRows += 1;
+      continue;
+    }
+    sum += q;
+  }
+  return sum;
 }
 
 /* ═══════════════════════════ 10. room_events ═══════════════════════════ */

@@ -117,6 +117,81 @@ export const OP_CLOSE = 0x8;
 export const OP_PING = 0x9;
 export const OP_PONG = 0xa;
 
+/* ═══════════ ★★★ WS-FND-132(P1):WS 层的**帧大小上界** ═══════════
+ *
+ * ## 修前的洞(第八轮实测)
+ * ```ts
+ * // parseFrame 里**只有**「数据够不够」这一条判据:
+ * if (buf.byteLength < off + len) return null;   // ← 对端不补满 ⇒ 恒 null
+ * ```
+ * 对端只要在长度域里宣告 `len = 2^40`(它是 `Number.isSafeInteger` 认可的值),
+ * 然后**一个字节都不补**:
+ * ```text
+ * · parseFrame **恒返回 null** ⇒ 调用方的 `for(;;)` 立刻 break;
+ * · conn.buf **永不消费** ⇒ 每个 data 事件都为它做一次「整份旧缓冲 + 新块」
+ *   的 Uint8Array 重拷 ⇒ **O(n^2)**;
+ * · 内存与 CPU **都没有上界**,而**没有任何东西会红**
+ *   —— `shared/net/delta.ts` 的三道(MAX_STR_BYTES / need() / 计数越界)
+ *   全在**载荷层**,而这里连一个载荷字节都还没解出来。
+ * ```
+ * 控制帧同病:§5.5 要求 ≤ 125 字节,修前**一条判据都没有**。
+ *
+ * ## 口径:**在读到长度域的那一刻**判上界,不等"补满"
+ * ```text
+ * 非控制帧  len > MAX_FRAME_BYTES          ⇒ FrameTooBigError ⇒ 关连接 + 记账
+ * 控制帧    len > MAX_CONTROL_FRAME_BYTES  ⇒ 同上(§5.5 的 125)
+ * 残帧缓冲  isBufOverflow(conn.buf.length) ⇒ 关连接 + 记账
+ * ```
+ * ★ 为什么必须"读到就判"、而不是"等数据够了再判":后者**不可能成立** ——
+ *   攻击者的全部手法就是**永远不够**。上界晚一步,它就形同不存在。
+ *   判据:`tests/WS-FND-132-protocol-bounds.test.ts` 的 FND132-1..4。
+ */
+/** 单帧**载荷**上界(字节)。1 MiB 远高于任何真实报文(稳态帧 ~40B;
+ *  `tests/WS-13` 那条 70000 字节的压测大帧也过得了)。 */
+export const MAX_FRAME_BYTES = 1024 * 1024;
+/** 控制帧载荷上界:RFC 6455 §5.5 —— 控制帧 ≤ 125 字节且**不可分片**。 */
+export const MAX_CONTROL_FRAME_BYTES = 125;
+/** 单帧头的最大字节数:2B 基础头 + 8B 扩展长度 + 4B 掩码键 = 14。 */
+export const MAX_FRAME_HEADER_BYTES = 14;
+/**
+ * 单连接**残帧缓冲**上界 = 一个尚未补满的帧的理论最大值(头 + 上界长度的载荷)。
+ *
+ * ⚠️ 如实记:在 `parseFrame` 的上界正确的前提下,这条门**构造不出来**
+ *   (不完整的帧必然 `已收 < 14 + MAX_FRAME_BYTES`:要么帧完成被消费,
+ *    要么宣告的长度本身就超界并当场抛)。
+ *   ⇒ 它是**两个机制共同的断言**,不是"第二道防线"。
+ *   故它只做两件事:(1) 帧上界万一被改坏时**当场出声**;
+ *   (2) 把"`conn.buf` 有上界"写成一个**可断言**的量(`isBufOverflow`)——
+ *      否则这件事只有"读代码"一条判据。
+ */
+export const MAX_CONN_BUF_BYTES = MAX_FRAME_HEADER_BYTES + MAX_FRAME_BYTES;
+
+/**
+ * 帧超界**专用**错误类 —— 运输层据此回 **1009**(message too big),
+ * 而不是把超界与协议错一律回 1002。
+ *
+ * 为什么单独一个类:调用方要按**类别**分流。若用文案判据
+ * (`message.includes('超界')`),一次文案修订就会让它**静默退化**成 1002
+ * (本仓反复记的形态:判据盯在会变的字串上)。
+ */
+export class FrameTooBigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FrameTooBigError';
+  }
+}
+
+/**
+ * 残帧缓冲是否越界(纯判据)。
+ *
+ * 为什么抽成函数而不是写成内联条件:它**不可能**从网络侧构造出来
+ * (见 `MAX_CONN_BUF_BYTES`),所以只有抽出来才**断得了** —— 否则这条门
+ * 就只剩"读代码"一条判据,而那正是本仓不要的东西。
+ */
+export function isBufOverflow(bufBytes: number): boolean {
+  return bufBytes > MAX_CONN_BUF_BYTES;
+}
+
 /** 握手用的魔法串(RFC 6455 §1.3)—— 固定值,不是可配置项。 */
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -223,6 +298,21 @@ export function parseFrame(buf: Uint8Array): ParsedFrame | null {
     len = hi * 0x100000000 + lo;
     off += 8;
     if (!Number.isSafeInteger(len)) throw new Error(`帧长超安全整数:${len}`);
+  }
+
+  /* ★★★ WS-FND-132(P1):上界**在这里**判 —— 长度域刚解析完,不等到"补满"。
+     放在 `masked` 检查之前是有意的:一个宣告了 2^40 的帧连掩码键都还没发到,
+     此时唯一正确的动作就是**当场断掉**它(理由见文件里 MAX_FRAME_BYTES 块)。 */
+  if ((op & 0x08) !== 0) {
+    if (len > MAX_CONTROL_FRAME_BYTES) {
+      throw new FrameTooBigError(
+        `控制帧载荷超界:${len} > ${MAX_CONTROL_FRAME_BYTES}(RFC 6455 §5.5:控制帧 ≤ 125 字节)`,
+      );
+    }
+  } else if (len > MAX_FRAME_BYTES) {
+    throw new FrameTooBigError(
+      `帧载荷超界:${len} > ${MAX_FRAME_BYTES}(MAX_FRAME_BYTES)`,
+    );
   }
 
   if (!masked) {
@@ -620,6 +710,16 @@ export type WsServerHandle = {
   /** 最近一次解析失败的原因原文(null = 没失败过)。 */
   lastParseError(): string | null;
   /**
+   * ★ WS-FND-132(P1):**帧层**被拒的累计次数(超界 / 未掩码 / 残帧缓冲越界)。
+   *
+   * 与 `uplinkRejected` 分开计:那是"载荷解不开",这是"连一帧都没读出来"。
+   * 两边的**处置也不同**(帧层当场关连接,载荷层只丢这一包)⇒
+   * 合并成一个数就再也分不出是哪一边在响。
+   */
+  frameRejected(): number;
+  /** 最近一次帧层被拒的原因原文(null = 没拒过)。 */
+  lastFrameError(): string | null;
+  /**
    * ★ 某条连接**已应用成功的最高客户端命令序号**(`-1` = 该连接还没带过 `seq`)。
    *
    * 这就是下行包头 `ackedSeq` 的**服务端那一半**(D-14 / 方案 A):客户端拿它剪
@@ -732,6 +832,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let uplinkRejected = 0;
   let lastParsedPacket: DecodedPacket | null = null;
   let lastParseError: string | null = null;
+  /* ★ WS-FND-132(P1):**帧层**被拒的累计次数与最近原因 —— 与上面的 uplink*
+     分开计:那是"载荷解析",这是"连一帧都没能读出来"(超界 / 未掩码 /
+     残帧缓冲越界)。合并成一个数就分不出"该拦的拦住了"与"该解的没解开"。
+     ⚠️ 它必须**单调累加**:一次拒收就能把它推起来的写法是"能变绿的假判据"。 */
+  let framesRejected = 0;
+  let lastFrameError: string | null = null;
   /* ★ 审计 P0-1:`nextConnSeq` 已删除。
      旧代码在"既没有 hello.userId 也没有 ?userId="时退化为 `c${nextConnSeq++}` ——
      那是**服务端替客户端编一个身份**;现在这条路整段不存在(没凭证 ⇒ 拒),
@@ -837,12 +943,32 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       for (;;) {
         let f: ParsedFrame | null;
         try { f = parseFrame(conn.buf); } catch (e) {
-          log(`帧解析失败:${(e as Error).message}`);
-          write(conn, encodeClose(1002, 'protocol error'));
+          /* ★ WS-FND-132(P1):帧层拒收**按类别分流**,而且一定要**出声**:
+             超界 ⇒ 1009(message too big);未掩码/其余协议错 ⇒ 1002。
+             ⚠️ 不许"记一条日志然后继续等" —— 那正是修前的形态:
+                对端宣告 2^40 且不补满时,`parseFrame` 连抛都不抛,缓冲无限长。 */
+          const tooBig = e instanceof FrameTooBigError;
+          framesRejected += 1;
+          lastFrameError = e instanceof Error ? e.message : String(e);
+          log(`帧解析失败(${tooBig ? '超界' : '协议错'}):${lastFrameError}`);
+          write(conn, encodeClose(tooBig ? 1009 : 1002,
+            tooBig ? 'message too big' : 'protocol error'));
           try { socket.destroy(); } catch { /* 已断 */ }
           return;
         }
-        if (f === null) break;
+        if (f === null) {
+          /* ★ WS-FND-132(P1):残帧缓冲的**累积上界**(见 `isBufOverflow`)。
+             ⚠️ 只在"解析不出完整帧"这一刻判:若缓冲里还有完整帧,它会被
+                上面的循环消费掉,那时判上界会**误伤**正常粘包/大帧。 */
+          if (isBufOverflow(conn.buf.byteLength)) {
+            framesRejected += 1;
+            lastFrameError = `残帧缓冲超界:${conn.buf.byteLength} > ${MAX_CONN_BUF_BYTES} 字节`;
+            log(`残帧缓冲超界 ⇒ 关连接:${lastFrameError}`);
+            write(conn, encodeClose(1009, 'message too big'));
+            try { socket.destroy(); } catch { /* 已断 */ }
+          }
+          break;
+        }
         conn.buf = conn.buf.subarray(f.consumed);
         handleFrame(conn, f);
         if (conn.closed) return;
@@ -1308,6 +1434,9 @@ function onMove(c: WsConn, msg: {
     uplinkRejected: (): number => uplinkRejected,
     lastParsedPacket: (): DecodedPacket | null => lastParsedPacket,
     lastParseError: (): string | null => lastParseError,
+    /* ★ WS-FND-132(P1):帧层拒收的累计计数 + 最近原因(见 handle 类型上的说明)。 */
+    frameRejected: (): number => framesRejected,
+    lastFrameError: (): string | null => lastFrameError,
     /* ★ D-14(2026-11-17):**每连接**的"已应用成功的最高客户端命令序号"。
        与 `uplinkParsed`(报文解析成功)分开计 —— 这是"这条命令生效了"。
        它同时是下行包头 `ackedSeq` 的真值来源(见广播循环)。

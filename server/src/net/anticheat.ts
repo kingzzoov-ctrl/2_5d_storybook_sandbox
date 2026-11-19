@@ -872,6 +872,27 @@ export interface InventoryCheckInput {
   allowedSources: ReadonlySet<string>;
   /** 当前背包总量(用于总量守恒)。 */
   beforeTotal: number;
+  /**
+   * ★ **按件权威账**(`itemId → 件数`,可选)。
+   *
+   * ## 为什么必须有它(只有总量判不住「扣一件自己没有的东西」)
+   *
+   * 只给 `beforeTotal` 时,判据只到**总量**这一维。报文
+   * `{"ops":[{"itemId":733,"delta":-5}]}` 在玩家**只有 2 件 733**(而总量够)时:
+   * 总量判据 `5 + (-5) = 0 ≥ 0` 放行,随后按件账被**静默夹零**
+   * (`room.ts:applyItemCountDelta` 的 `next > 0 ? next : 0`)—— 凭空消耗了
+   * 不存在的 3 件,一条违规都不记:「总量守恒」在这条路上**恒成立**,
+   * 因为它守恒的是**别人**的件数。
+   *
+   * 给了这张表 ⇒ 负 delta **逐件**判「够不够」,不够即 `ITEM_NEGATIVE`
+   * **拒绝**(不夹零:夹零把「扣超了」伪装成「扣到零」,正是本节要堵的形态)。
+   *
+   * ## 为什么是「可选」而不是「必填」
+   * 单元夹具与 `AntiCheatRoom.inventory` 的直调用方只构造旧字段;不传 ⇒
+   * 退回**只判总量的旧口径**,行为逐位不变。生产汇点
+   * (`room.ts:applyInventory`)**总是**传它 —— 由 `tests/WS-FND-129` 钉住。
+   */
+  beforeByItem?: ReadonlyMap<number, number>;
   capacity: number;
 }
 /**
@@ -882,7 +903,10 @@ export const InventoryReject = {
   FROM_NOTHING: 'ITEM_FROM_NOTHING',
   /** 单帧净变化超过 `MAX_ITEM_DELTA_PER_TICK`。 */
   BURST: 'ITEM_BURST',
-  /** 扣减后总量为负 —— 消耗了不存在的东西。 */
+  /**
+   * 扣减后**总量为负**,或(给了 `beforeByItem` 时)**某一件不够扣**
+   * —— 两者都是「消耗了不存在的东西」,共用同一个拒因码。
+   */
   NEGATIVE: 'ITEM_NEGATIVE',
   /** 超出背包容量。 */
   OVERFLOW: 'ITEM_OVERFLOW',
@@ -913,7 +937,7 @@ export type InventoryReject = (typeof InventoryReject)[keyof typeof InventoryRej
 const INVENTORY_REJECT_LABEL: Readonly<Record<string, string>> = {
   ITEM_FROM_NOTHING: '凭空产出',
   ITEM_BURST: '单帧脉冲',
-  ITEM_NEGATIVE: '总量为负',
+  ITEM_NEGATIVE: '总量或件数为负',
   ITEM_OVERFLOW: '容量溢出',
   ITEM_FRACTIONAL: '非整数增量',
   ITEM_MALFORMED: '操作数组格式非法',
@@ -935,7 +959,14 @@ export interface InventoryCheckResult {
  *  a) 单帧净变化量绝对值 ≤ MAX_ITEM_DELTA_PER_TICK;
  *  b) 任何**产出**(delta > 0)必须带服务端登记过的凭证;
  *  c) 凭证若是**绑定令牌**,必须属于**这个人、这一件、这个 tick,且只用一次**;
- *  d) 消耗后的总量不得为负,且不得超过容量 —— 即「总和守恒」。
+ *  d) 消耗后的总量不得为负,且不得超过容量 —— 即「总和守恒」;
+ *  e) ★ **按件**守恒(给了 `beforeByItem` 时):每一条负 delta 都要有**这一件**
+ *     垫底。只判 (d) 的量**判不住**「扣一件自己没有的东西」—— 扣 5 件 733 而
+ *     只有 2 件,总量够就放行,按件账随后被静默夹零(见
+ *     `InventoryCheckInput.beforeByItem` 的实测)。
+ *
+ * ⚠️ (d) 与 (e) 是**两个维度**,不能互相替代:总量够 ⇏ 每件都够(本节的形态),
+ *    每件都够 ⇏ 总量不超(容量闸管的是另一个方向)。
  *
  * 检查顺序刻意把**凭证**放在最前:凭空产出是最严重的一类,不应被
  * 后面的量级检查抢先命中而失去归因。
@@ -977,6 +1008,13 @@ export function checkInventory(
   const used = s.usedSourceTick === input.tick ? s.usedSourceTokens : null;
   /** 本批次要提交的一次性标记(整批通过后才落账)。 */
   const fresh: string[] = [];
+  /**
+   * 本批的**按件运行视图**:只在调用方给了 `beforeByItem` 时建立。
+   *
+   * 逐条推进(而不是只读一次初始值),于是批内「先加后扣」与「同一件扣两次」
+   * 都按**当时的**件数判 —— 判据不能因为批内顺序而被绕开。
+   */
+  const byItem = input.beforeByItem === undefined ? null : new Map(input.beforeByItem);
   let net = 0;
   for (const op of input.ops) {
     if (!op || typeof op !== 'object' || !Number.isFinite(op.itemId)) {
@@ -1020,6 +1058,18 @@ export function checkInventory(
         }
         if (!fresh.includes(source)) fresh.push(source);
       }
+    }
+    /* ── 按件判据(调用方给了 `beforeByItem` 时;见 `InventoryCheckInput.beforeByItem`)──
+       ⚠️ 这条**不能**用 `Math.max(0, ...)` 夹:夹零会把「扣超了」变成「扣到零」,
+       与写账路径的静默夹零是同一个病 —— 判据要**拒绝**,不要**修正**。 */
+    if (byItem !== null) {
+      const id = Math.trunc(op.itemId);
+      const owned = byItem.get(id) ?? 0;
+      if (op.delta < 0 && owned < -op.delta) {
+        return rejectInv(s, input, InventoryReject.NEGATIVE,
+          `物品 ${id} 只持有 ${owned} 件,本次要扣 ${-op.delta}(按件判据:不足即拒,不夹零)`);
+      }
+      byItem.set(id, owned + op.delta);
     }
     net += op.delta;
   }

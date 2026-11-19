@@ -70,6 +70,10 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lookupActionHandler } from './actions/action_table.ts';
 import { tameOwnerOf } from './actions/breed_tame.ts';
 import { notImplemented } from './actions/not-implemented.ts';
+/* ★ WS-FND-131:世界换代时**顺带**给玩家睡眠登记换代(唯一的换代点在
+   `dispatchAction` 的 RESET_WORLD 成功那一刻,见那里的注释)。
+   ⚠️ 不引入运行时环:`actions/sleep.ts` 只 `import type` 本文件的类型(擦除)。 */
+import { bumpSleepGeneration } from './actions/sleep.ts';
 import type { ActionContext } from './actions/types.ts';
 /* 物质层的模块级常量(`PICKUP_RADIUS` / `ITEM_ID_SET`)与 `numField` 随那 4 个动作
    一起搬去了 `net/actions/material.ts` —— 它们只为那 4 个 case 存在,留在这里就是死代码。 */
@@ -491,7 +495,6 @@ export interface MemberSession {
   afkSinceMs: number | null;
   joinedAtMs: number;
   lastSeenMs: number;
-  seq: number;
   /**
    * 本次 join 从存档恢复出的**权威坐标**;未恢复(首次进入/无存档)时为 `null`。
    *
@@ -1744,6 +1747,37 @@ export class RoomRuntime {
    * ⇒ 这个区分是刻意的:两类混在一起会让「读坏了」看起来像「首次进入」。
    */
   lastRestoreError: string | null = null;
+
+  /**
+   * ★ WS-FND-131(P2 移除侧):最近一次「世界侧移除」是否**真的落地**;
+   * `null` = 从未尝试过移除(与 `lastRestoreApplied` 同一处置)。
+   *
+   * ```
+   * true   世界侧确实移除了(或本来就没有世界源 —— 没有残留可留)
+   * false  两次尝试都抛 ⇒ 已进 `pendingWorldRemovals`,下一帧重试
+   * ```
+   * 缺陷形态见 `removeFromWorld()`:修前 `host.removePlayer` 排在最后且无 try,
+   * 抛了就整条 `leave()` 被吞、`members` 已删 ⇒ 世界侧**没有任何重试点**,
+   * 而外部**看不出**这次移除失败了。
+   */
+  lastRemoveApplied: boolean | null = null;
+  /** 最近一次世界侧/反作弊清理的错因;null = 无错。 */
+  lastRemoveError: string | null = null;
+  /** 世界侧移除失败、等待下一帧重试的 userId(见 `retryPendingWorldRemovals`)。 */
+  private readonly pendingWorldRemovals = new Set<string>();
+
+  /**
+   * ★ WS-FND-131(P1):最近一次入场的**三方交叉校验**结果;null = 还没入场过。
+   *
+   * `world` 是**三态**:`unknown` = 该世界源没有 `playerPosition` 读口
+   * (不冒充 ok,见 `auditJoin`)。
+   */
+  lastJoinAudit: {
+    userId: string;
+    members: boolean;
+    state: boolean;
+    world: 'ok' | 'missing' | 'unknown';
+  } | null = null;
   /** 每 tick 累计的违规,由外层写 room_events。 */
   private pendingViolations: Violation[] = [];
 
@@ -1990,8 +2024,15 @@ export class RoomRuntime {
       return { ok: false, reason: '该用户已在线' };
     }
 
-    if (this.members.size >= this.maxPlayers) return { ok: false, reason: '房间已满' };
-    /* 人数上限按「当前在线」算,断线占位不计。 */
+    /* ★ WS-FND-131(P2):容量按「**活着**的席位」算 = 在线 + 仍在宽限期内的断线占位。
+       修前第一句用的是 `members.size`(含**宽限期已过、只是还没被 reap 掉**的席位)
+       ⇒ 全员断线的房间(SLEEPING)会对第一个新玩家误报「房间已满」。
+       宽限期内的断线席位**继续占位**(他随时可能回来,那条席位必须给他留着);
+       超期的不再占位 —— 它随后会被 `reapExpiredDisconnects()` 真正收掉。 */
+    const liveSeats = [...this.members.values()].filter((m) => m.connected
+      || (m.disconnectedAtMs !== null && now - m.disconnectedAtMs <= RECONNECT_GRACE_MS)).length;
+    if (liveSeats >= this.maxPlayers) return { ok: false, reason: '房间已满' };
+    /* 人数上限按「当前在线」算,断线占位不计(与上面那句**不重复**:它管总数,这句管在线)。 */
     const online = [...this.members.values()].filter((m) => m.connected).length;
     if (online >= this.maxPlayers) return { ok: false, reason: '房间已满' };
 
@@ -2021,98 +2062,218 @@ export class RoomRuntime {
       afkSinceMs: null,
       joinedAtMs: now,
       lastSeenMs: now,
-      seq: 0,
     };
-    this.members.set(input.userId, session);
+    /* ══ ★ WS-FND-131(P1 加入侧非原子)════════════════════════════════════
+       ## 修前形态(实测可复现)
+       ```
+       members.set → state.players.push → host.addPlayer
+                   → restoreFromSnapshot(可抛) → encodeFull(可抛)   ← 调用方无 try/catch
+       ```
+       中途抛会**同时**发生三件事,而它不报给任何人:
+         1 `members` 里留下一条 `connected=true` 的**幽灵席位**;
+         2 `c.userId` 还没写回去 ⇒ 装配层的 close/leave 都**不知道该清谁**;
+         3 `reapExpiredDisconnects` 只收 `connected=false` ⇒ 这条席位**永不过期**
+           ⇒ 该 id **永久占 maxPlayers**。
 
-    /* 玩家实体进场:同位置已有玩家则做最小偏移,避免叠在一起。 */
-    if (!this.state.players.some((p) => p.id === input.userId)) {
-      const spawn = this.spawnPoint();
-      this.state.players.push(createPlayerState(input.userId, {
-        name: input.userId,
-        x: spawn.x, y: spawn.y, z: 0,
-      }));
+       ## 现在的契约:整段是**一件事**
+       任何一步抛 ⇒ `rollbackJoin()` 把房间侧与世界侧**逐项还原**
+       (有旧实体行就放回去,没有就删干净),返回 `ok:false` 并带上回滚结果。
+       调用方拿到的永远是「完整成功」或「一行痕迹都不留」。
+
+       ## 三方交叉校验(成功路径上再核一次)
+       `auditJoin()` 核「成员表 / 权威 state / 世界」三者是否同时认这个人
+       (`lastJoinAudit` 留证);`members` 或 `state` 任一不一致就按**失败**回滚。
+       `world` 有 `ok`/`missing`/`unknown` 三态 —— 没有 `playerPosition` 读口的
+       世界源**不谎报**成 ok(与 `lastSaveReport` 同一纪律)。 */
+    const prevPlayerRow = this.state.players.find((p) => p.id === input.userId) ?? null;
+    let worldAdded = false;
+    try {
+      this.members.set(input.userId, session);
+
+      /* 玩家实体进场:同位置已有玩家则做最小偏移,避免叠在一起。 */
+      if (!this.state.players.some((p) => p.id === input.userId)) {
+        const spawn = this.spawnPoint();
+        this.state.players.push(createPlayerState(input.userId, {
+          name: input.userId,
+          x: spawn.x, y: spawn.y, z: 0,
+        }));
+      }
+      /* 反作弊状态以**实际出生坐标**播种,否则会把出生点位移误判成瞬移。 */
+      const body = this.state.players.find((p) => p.id === input.userId);
+
+      /* ★ 把玩家登记进**世界**(task-58):`sim.addPlayer` 此前生产调用者为 0,
+         于是模拟层不知道有这个玩家 ⇒ `applyPlayerMove` 静默无效,
+         距离开闸读刚体 ⇒ 永久 `OUT_OF_AOI`。
+         ⚠️ 用**同一个** `body.x/y` 播种,保证反作弊与刚体**同源** ——
+         两者不同会让第一次移动被判瞬移(实测差 13.649 格)。
+         没有世界时整段跳过(与 `saveToDb`/`levelOf` 同一 null 契约)。 */
+      const host = this.worldSaveHost;
+      if (host !== null && typeof host.addPlayer === 'function') {
+        host.addPlayer(input.userId, body?.x ?? 0, body?.y ?? 0);
+        /* ★ WS-FND-131:只有**真的**登记成功才记 —— 回滚时据此决定要不要
+           世界侧移除(否则会把「本来就在世界里的人」误踢掉)。 */
+        worldAdded = true;
+      }
+
+      /* ★★ 读档恢复(task-70 / 契约 §4.1)。**必须在 `ac.join` 之前** ——
+       * 反作弊要用**恢复后**的实际坐标播种。
+       *
+       * ## 顺序:**登记 → 读档 → 反作弊播种 → 落库**
+       *
+       * `addPlayer` 必须在读档**之前**:`restoreFromProfile` 内部要
+       * `applyPlayerMove` 与 `importVitals`,两者对未登记的玩家都是静默 no-op。
+       * (与契约 §4.1.1 同一条,理由不同:blob 路要的是「刚体/生命已存在」。)
+       *
+       * ## 为什么失败时**不报错、只不恢复**
+       *
+       * 与 `saveToDb`/`levelOf` 同一 null 契约:没有 db、没有存档
+       * 都是**正常**情况(首次进入),不是错误。
+       * ⚠️ 但**不静默**:返回值与错误分别记在 `restoreApplied` / `restoreError`,
+       * 测试可读 ⇒ 让「恢复无效」与「没有存档」可区分(陷阱 89)。 */
+      let restoredPose: { x: number; y: number } | null = null;
+      if (host !== null && typeof host.restoreFromProfile === 'function' && this.db) {
+        restoredPose = this.restoreFromSnapshot(host, input.userId);
+        if (restoredPose !== null) session.restoredFrom = restoredPose;
+      }
+
+      /* 反作弊播种:优先用**恢复后**的实际权威坐标;没有存档则用出生点。
+         ⚠️ 不用 blob 里的坐标 —— 刚体可能因碰撞被推开,
+            两者不同会被判瞬移(实测差 13.649 格)。 */
+      this.ac.join(
+        input.userId,
+        this.state.meta.tick,
+        restoredPose?.x ?? body?.x ?? 0,
+        restoredPose?.y ?? body?.y ?? 0,
+        body?.z ?? 0,
+      );
+
+      /* ★★ 恢复后**立刻投影一次**(task-70 实测抓到的一环)。
+       *
+       * ## 为什么不能等到下一帧的 `step()`
+       *
+       * `step()` 里的 `projectAllPlayers()` 是常规投影点,但它最早也要**50ms 后**
+       * 才跑。而本方法下面那行 `encodeFull(this.state, ...)` 会把
+       * **当前**投影编成 join 的初始快照**发给客户端**:
+       * ```
+       * 不立刻投影 ⇒ 客户端收到的首帧是 level=1 / hp=100 / maxHp=100
+       *            ⇒ HUD 先显示 1 级 100 血,50ms 后才跳成 30 级 535 血
+       * ```
+       * ⇒ 实测确认:`join` 后、`step` 前读 `state.players[].maxHp` 得 **100**,
+       *   `step` 后得 535 —— 中间那一帧的错**真的存在**。
+       *
+       * ## 为什么这不是"第二处投影"(不违反 §4.3 单一写者)
+       *
+       * 调的**就是** `projectAllPlayers()`,同一个唯一写者,没有第二份实现。
+       * ⇒ 「唯一写者」约束的是**谁写 state**,不是**何时写**。
+       *   在这里调只是把**本该在下一帧发生的同一次投影**提前到发快照之前。
+       *
+       * ⚠️ 必须先于 `ac.join` 吗?**不必** —— 反作弊读的是刚体(`playerPosition`),
+       *   而投影只写 `state`。两件事互不依赖,故顺序无关;
+       *   放在 `ac.join` 之后是为了让「反作弊播种」与「读档」贴在一起更好读。 */
+      if (restoredPose !== null) this.projectAllPlayers();
+
+      this.touch(now);
+
+      const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
+      if (this.db) {
+        upsertRoomPlayer(this.db, this.id, input.userId, role, now, snapshot);
+      }
+
+      /* ★ WS-FND-131:三方交叉校验(见上面那段契约说明)。 */
+      const audit = this.auditJoin(input.userId);
+      this.lastJoinAudit = { userId: input.userId, ...audit };
+      if (!audit.members || !audit.state) {
+        /* 房间侧两方自己都不一致 ⇒ 这次入场**没成** ⇒ 按失败回滚,
+           不留「连带状态的幽灵席位」。 */
+        throw new Error(
+          `入场后三方不一致(members=${audit.members} state=${audit.state} world=${audit.world})`,
+        );
+      }
+      return { ok: true, role, token, snapshot, resumed: false };
+    } catch (e) {
+      const rb = this.rollbackJoin(input.userId, prevPlayerRow, worldAdded);
+      const why = (e as Error).message.slice(0, 120);
+      return {
+        ok: false,
+        reason: `加入失败(已回滚:world=${rb.world}${rb.restoredRow ? ',旧实体行已还原' : ''}):${why}`,
+      };
     }
-    /* 反作弊状态以**实际出生坐标**播种,否则会把出生点位移误判成瞬移。 */
-    const body = this.state.players.find((p) => p.id === input.userId);
+  }
 
-    /* ★ 把玩家登记进**世界**(task-58):`sim.addPlayer` 此前生产调用者为 0,
-       于是模拟层不知道有这个玩家 ⇒ `applyPlayerMove` 静默无效,
-       距离开闸读刚体 ⇒ 永久 `OUT_OF_AOI`。
-       ⚠️ 用**同一个** `body.x/y` 播种,保证反作弊与刚体**同源** ——
-       两者不同会让第一次移动被判瞬移(实测差 13.649 格)。
-       没有世界时整段跳过(与 `saveToDb`/`levelOf` 同一 null 契约)。 */
+  /**
+   * ★ WS-FND-131(P1):**三方交叉校验** —— 一次入场之后,「成员表 / 权威 state /
+   * 世界」三者必须同时认这个人。
+   *
+   * ## 为什么是三方,而不是「看 `members` 就够了」
+   * 修前的缺陷恰恰是**只看其中一方**就会得出\"入场成功\":`members` 有、`state`
+   * 有一行,而世界侧 `addPlayer` 若静默 no-op(宿主没有该方法),玩家在模拟层
+   * 不存在 ⇒ 每条移动都 `allowed:false`。反过来,世界有刚体而 `members` 没有
+   * 就是那条**永久占位**的幽灵席位。
+   *
+   * ## `world` 的三态
+   * ```
+   * ok      宿主有 playerPosition 且查得到 ⇒ 世界真的认这个人
+   * missing 宿主有 playerPosition 但查不到 ⇒ 世界侧没登记(缺陷信号)
+   * unknown 宿主没有 playerPosition 读口 ⇒ **不知道**,不冒充 ok
+   * ```
+   * `unknown` 不是失败:那是「结构上读不到」,与 `WS-FND-12` 的 host 三态同族。
+   */
+  private auditJoin(userId: string): {
+    members: boolean;
+    state: boolean;
+    world: 'ok' | 'missing' | 'unknown';
+  } {
+    const members = this.members.get(userId)?.connected === true;
+    const state = this.state.players.some((p) => p.id === userId);
     const host = this.worldSaveHost;
-    if (host !== null && typeof host.addPlayer === 'function') {
-      host.addPlayer(input.userId, body?.x ?? 0, body?.y ?? 0);
+    let world: 'ok' | 'missing' | 'unknown' = 'unknown';
+    if (host !== null && typeof host.playerPosition === 'function') {
+      try {
+        world = host.playerPosition(userId) !== null ? 'ok' : 'missing';
+      } catch {
+        world = 'unknown';
+      }
     }
+    return { members, state, world };
+  }
 
-    /* ★★ 读档恢复(task-70 / 契约 §4.1)。**必须在 `ac.join` 之前** ——
-     * 反作弊要用**恢复后**的实际坐标播种。
-     *
-     * ## 顺序:**登记 → 读档 → 反作弊播种 → 落库**
-     *
-     * `addPlayer` 必须在读档**之前**:`restoreFromProfile` 内部要
-     * `applyPlayerMove` 与 `importVitals`,两者对未登记的玩家都是静默 no-op。
-     * (与契约 §4.1.1 同一条,理由不同:blob 路要的是「刚体/生命已存在」。)
-     *
-     * ## 为什么失败时**不报错、只不恢复**
-     *
-     * 与 `saveToDb`/`levelOf` 同一 null 契约:没有 db、没有存档
-     * 都是**正常**情况(首次进入),不是错误。
-     * ⚠️ 但**不静默**:返回值与错误分别记在 `restoreApplied` / `restoreError`,
-     * 测试可读 ⇒ 让「恢复无效」与「没有存档」可区分(陷阱 89)。
-     */
-    let restoredPose: { x: number; y: number } | null = null;
-    if (host !== null && typeof host.restoreFromProfile === 'function' && this.db) {
-      restoredPose = this.restoreFromSnapshot(host, input.userId);
-      if (restoredPose !== null) session.restoredFrom = restoredPose;
+  /**
+   * ★ WS-FND-131(P1):入场失败时的**回滚**。返回可读的回滚结果(进 `reason`)。
+   *
+   * 三件事,一件都不能少:
+   * ```
+   * 1 房间侧痕迹走 `clearSeatTraces()`(members / state.players / 反作弊)——
+   *   它是**唯一**一处做这三步的地方,回滚不另写一份;
+   * 2 旧实体行若在入场前就存在,放回去(而不是\"反正删了\");
+   * 3 世界侧**只在真的 `addPlayer` 过**时才移除(`worldAdded`)——
+   *   否则会把「本来就在世界里的人」误踢掉。
+   * ```
+   */
+  private rollbackJoin(
+    userId: string,
+    prevPlayerRow: PlayerState | null,
+    worldAdded: boolean,
+  ): { world: 'skipped' | 'removed' | 'pending'; restoredRow: boolean } {
+    this.clearSeatTraces(userId);
+    let restoredRow = false;
+    if (prevPlayerRow !== null && !this.state.players.some((p) => p.id === userId)) {
+      this.state.players.push(prevPlayerRow);
+      restoredRow = true;
     }
+    if (!worldAdded) return { world: 'skipped', restoredRow };
+    const removed = this.removeFromWorld(userId);
+    return { world: removed ? 'removed' : 'pending', restoredRow };
+  }
 
-    /* 反作弊播种:优先用**恢复后**的实际权威坐标;没有存档则用出生点。
-       ⚠️ 不用 blob 里的坐标 —— 刚体可能因碰撞被推开,
-          两者不同会被判瞬移(实测差 13.649 格)。 */
-    this.ac.join(
-      input.userId,
-      this.state.meta.tick,
-      restoredPose?.x ?? body?.x ?? 0,
-      restoredPose?.y ?? body?.y ?? 0,
-      body?.z ?? 0,
-    );
-
-    /* ★★ 恢复后**立刻投影一次**(task-70 实测抓到的一环)。
-     *
-     * ## 为什么不能等到下一帧的 `step()`
-     *
-     * `step()` 里的 `projectAllPlayers()` 是常规投影点,但它最早也要**50ms 后**
-     * 才跑。而本方法下面那行 `encodeFull(this.state, ...)` 会把
-     * **当前**投影编成 join 的初始快照**发给客户端**:
-     * ```
-     * 不立刻投影 ⇒ 客户端收到的首帧是 level=1 / hp=100 / maxHp=100
-     *            ⇒ HUD 先显示 1 级 100 血,50ms 后才跳成 30 级 535 血
-     * ```
-     * ⇒ 实测确认:`join` 后、`step` 前读 `state.players[].maxHp` 得 **100**,
-     *   `step` 后得 535 —— 中间那一帧的错**真的存在**。
-     *
-     * ## 为什么这不是"第二处投影"(不违反 §4.3 单一写者)
-     *
-     * 调的**就是** `projectAllPlayers()`,同一个唯一写者,没有第二份实现。
-     * ⇒ 「唯一写者」约束的是**谁写 state**,不是**何时写**。
-     *   在这里调只是把**本该在下一帧发生的同一次投影**提前到发快照之前。
-     *
-     * ⚠️ 必须先于 `ac.join` 吗?**不必** —— 反作弊读的是刚体(`playerPosition`),
-     *   而投影只写 `state`。两件事互不依赖,故顺序无关;
-     *   放在 `ac.join` 之后是为了让「反作弊播种」与「读档」贴在一起更好读。
-     */
-    if (restoredPose !== null) this.projectAllPlayers();
-
-    this.touch(now);
-
-    const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
-    if (this.db) {
-      upsertRoomPlayer(this.db, this.id, input.userId, role, now, snapshot);
-    }
-    return { ok: true, role, token, snapshot, resumed: false };
+  /**
+   * ★ WS-FND-131:这个 id 现在是否**真的**在房间里(成员表里有且 connected)。
+   *
+   * 装配层用它做**第四方**核对:`runtime.join()` 说 ok 而这里说 false
+   * 就是「幽灵席位/被回滚」的现场 —— 那时必须出声拒绝连接,而不是让一个
+   * 「连着但不在房里」的客户端继续发报文(见 `room.colyseus.ts` 的 onJoin)。
+   */
+  isSeated(userId: string): boolean {
+    return this.members.get(userId)?.connected === true;
   }
 
   /** 幂等唤醒:SLEEPING → OPEN。 */
@@ -2182,16 +2343,86 @@ export class RoomRuntime {
    *   FND106-6(数 host 上真实发生的调用)+ FND106-8(数调用点数量)。
    */
   private purgeSeat(userId: string): void {
+    /* ★ WS-FND-131(P2):修前世界侧(`host.removePlayer`)排在**最后**且没有
+       try — 它一抛就整条 `leave()` 被吞,而 `members` 已删 ⇒ **没有重试点**
+       (席位没了、刚体/AOI/vitals 还在,同名重进会在世界里叠出第二份刚体)。
+       现在:房间侧痕迹与**可重试**的世界侧移除各走各的,任一侧失败都留证据。 */
+    this.clearSeatTraces(userId);
+    this.removeFromWorld(userId);
+  }
+
+  /**
+   * ★ WS-FND-131:席位在**房间侧**的痕迹(`members` / `state.players` / 反作弊)。
+   *
+   * 反作弊那一步单独 try:它失败**不该**阻断席位与实体的回收(否则又回到
+   * 「一步抛 ⇒ 整条路径没做完」的老形态),但要留下 `lastRemoveError`。
+   */
+  private clearSeatTraces(userId: string): void {
     this.members.delete(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
-    this.ac.leave(userId);
-    /* 世界侧一并移除:留着刚体与 `playerIds` 会让**同名玩家重新加入时**
-       继承上一轮的进度/生命值,并让模拟层里同一个 id 有两份刚体
-       (与 `removePlayer` 注释里「温泉计时被继承」同族)。 */
-    const host = this.worldSaveHost;
-    if (host !== null && typeof host.removePlayer === 'function') {
-      host.removePlayer(userId);
+    try {
+      this.ac.leave(userId);
+    } catch (e) {
+      this.lastRemoveError = `反作弊回收失败(${userId}):${(e as Error).message.slice(0, 80)}`;
     }
+  }
+
+  /**
+   * ★ WS-FND-131(P2):世界侧移除的**唯一实现** —— 一次立即重试 + 待重试队列。
+   *
+   * ## 为什么要有它(修前形态)
+   * ```
+   * purgeSeat 最后才调 host.removePlayer,抛则:
+   *   房间侧前 3 步已经做完(席位已删)⇒ 没有任何一处还会再调它
+   *   世界侧刚体 / AOI / vitals / 玩法表**留着** ⇒ 同名重进 = 同一 id 两份刚体
+   * ```
+   * ⇒ 两件事都要:①**重试**(同一处最多 2 次);②失败**入队**
+   *   (`pendingWorldRemovals`),由 `retryPendingWorldRemovals()` 在下一帧再试 ——
+   *   这样「世界侧抛错」不再是终态,而是一个**可观测量 + 可重试点**。
+   *
+   * ## 可观测量
+   * `lastRemoveApplied`:`true` = 这次移除世界侧**确实**成功(或本来就没世界源);
+   * `false` = 两次都抛 ⇒ 已入队待重试。`lastRemoveError` 记最后一次的错因。
+   */
+  private removeFromWorld(userId: string): boolean {
+    const host = this.worldSaveHost;
+    if (host === null || typeof host.removePlayer !== 'function') {
+      /* 没有世界源 ⇒ 没有「世界侧残留」这件事,如实算成功(与 saveToDb 同一 null 契约)。 */
+      this.pendingWorldRemovals.delete(userId);
+      this.lastRemoveApplied = true;
+      this.lastRemoveError = null;
+      return true;
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        host.removePlayer(userId);
+        this.pendingWorldRemovals.delete(userId);
+        this.lastRemoveApplied = true;
+        this.lastRemoveError = null;
+        return true;
+      } catch (e) {
+        this.lastRemoveError =
+          `世界侧移除失败(${userId},第 ${attempt + 1} 次):${(e as Error).message.slice(0, 80)}`;
+      }
+    }
+    this.pendingWorldRemovals.add(userId);
+    this.lastRemoveApplied = false;
+    return false;
+  }
+
+  /**
+   * 重试所有「世界侧移除失败」的 id。返回本轮真的移除成功的 id 列表。
+   *
+   * 调用点:`step()` 的**最顶部**(早于 status 早退)⇒ 休眠房里也会推进;
+   * 队列为空时是 O(1) 早退。
+   */
+  retryPendingWorldRemovals(): string[] {
+    if (this.pendingWorldRemovals.size === 0) return [];
+    const done: string[] = [];
+    for (const userId of [...this.pendingWorldRemovals]) {
+      if (this.removeFromWorld(userId)) done.push(userId);
+    }
+    return done;
   }
 
   /** 主动离开(非掉线):立刻回收席位与快照。 */
@@ -2454,6 +2685,11 @@ export class RoomRuntime {
        `START_PARTY` 的处理器只写 `PartyRecord`,世界的 contest 必须由这条钩子开
        —— 否则账本在、比分永远是 0(`addScore` 有账可记但没有对局事件)。 */
     if (outcome.ok && action === RoomAction.START_PARTY) this.startWorldPartyRun(actorId);
+    /* ★ WS-FND-131(P2):世界**换代** ⇒ 玩家睡眠登记一并换代。
+       `actions/sleep.ts` 的 `SLEEPERS[roomId][playerId]` 原无世代维 ⇒ 重置世界后
+       `beginSleep` 仍可能把**上一世代**的窗口原样返回(「刚上床就已睡了一半」)。
+       换代点是**唯一**的:RESET_WORLD 成功这一刻(与 `startWorldPartyRun` 同一位置)。 */
+    if (outcome.ok && action === RoomAction.RESET_WORLD) bumpSleepGeneration(this.id);
     /* ★ WS-FND-123(P1-4/P1-5):回执出口。只在**成功**回执上加新键,
        失败回执的形状一个字节都不动(既有断言不受影响)。 */
     return outcome.ok ? this.withPartyReceipt(outcome) : outcome;
@@ -2755,12 +2991,19 @@ export class RoomRuntime {
    * `beforeTotal` 由本帧 ops 反推使 `NEGATIVE` 分支恒不可达。
    *
    * 现在只接受客户端的 `ops`(它**本就该**来自客户端:玩家要买/卖什么),
-   * 其余三个由本方法从服务端状态算:
+   * 其余四个由本方法从服务端状态算:
    *
    * - `allowedSources`:本 tick 服务端认可的合法产出集合 —— 由 `grantedSources`
    *   显式授予(掉落/合成在授予时登记),**客户端无法自行扩集**;
-   * - `beforeTotal`:来自 `db`(`totalItemsOf`)的**权威库存总量**,
-   *   `db === null`(纯内存模式)时回退到 `inventoryTotals` 本地记账;
+   * - `beforeTotal`:★ **已落盘基线 + 本房间账**。`db` 侧的 `ai_item_instances`
+   *   全仓**没有生产写入口**(`addItemInstance` 只有测试调用),故它单独用只能是
+   *   一个恒 0 的基准 —— 那会让容量闸在 db 模式下**恒失效**(连发 N 次每批都判
+   *   `0 + net`,累不到上限;而单批 ≥ 容量 反被误判 `OVERFLOW`)。
+   *   ⇒ 基准由**同一批 ops 的产物**给出:`inventoryTotals`(本房间账,见
+   *   `applyItemTotalDelta` / `projectInventoryTotalFor`),库值只当**已落盘**那部分。
+   * - `beforeByItem`:★ **按件**权威账(`itemCounts`,与 `authoritativeItemCount`
+   *   同一份)。只有它才判得住「扣一件自己没有的东西」—— 总量判据守恒的是**别人**的
+   *   件数(见 `InventoryCheckInput.beforeByItem`)。
    * - `capacity`:来自等级(`carrySlotsAt`),不是客户端自报值。
    *
    * @param input.ops 客户端提交的增减操作(唯一可信来自客户端的部分)
@@ -2774,6 +3017,12 @@ export class RoomRuntime {
       ops: input.ops,
       allowedSources: this.grantedSourcesFor(userId),
       beforeTotal: this.authoritativeItemTotal(userId),
+      /* ★ 按件判据(唯一汇点):`itemCounts` 是同一批 ops 的产物,和
+         `authoritativeItemTotal`/`authoritativeItemCount` 同源。
+         ⚠️ 这一行是**判据本身**,不是可选项:去掉它,负 delta 就只剩总量判据,
+         `{"itemId":733,"delta":-5}`(实际只有 2 件)会被放行并被静默夹零
+         (由 `tests/WS-FND-129` 的 A/B 钉住)。 */
+      beforeByItem: new Map(this.itemCounts.get(userId) ?? []),
       capacity: this.carryCapacityOf(userId),
     });
     if (r.violation) this.pendingViolations.push(r.violation);
@@ -2838,22 +3087,45 @@ export class RoomRuntime {
   }
 
   /**
-   * 权威库存总量。
+   * 权威库存总量 = **已落盘基线 + 本房间账**。
    *
-   * 有 `db` 时读库(`totalItemsOf`),这是**唯一的服务端事实源**;
-   * `db === null`(纯内存/测试模式)时用本地记账 —— 那时没有持久层可查,
-   * 但记账仍由服务端维护,**绝不取自客户端**。
+   * ## ★ 为什么不是「有 db 就读 db」(db 模式容量闸失效的修点)
+   *
+   * 修前这里是 `if (this.db) return totalItemsOf(this.db, userId)`。
+   * 而 `totalItemsOf` 读的是 `ai_item_instances`,这张表**全仓没有生产写入口**
+   * (`addItemInstance` 只有测试调用;生产只在内存里记 `inventoryTotals` /
+   * `itemCounts`)⇒ db 模式下基准**恒为 0**:
+   * ```
+   * 连发 20 条 +1  每批都判 (0 + 1) ≤ capacity ⇒ **全部放行**,累不到上限
+   * 单批 +9(capacity 8)⇒ 0 + 9 > 8 ⇒ **误判 OVERFLOW**(明明背包里没几件)
+   * ```
+   * ⇒ 判据用的基准与写账路径更新的是**两份不同的账**,这就是那条「容量闸失效」。
+   *
+   * ## 修法:基准取**同一权威源**(与写入路径同源),库值只当已落盘那部分
+   *
+   * `db` 侧是**已落盘**基线(载荷 = 本房间之前存下来的量),`inventoryTotals`
+   * 是本房间**未落盘**的增量账 —— 两者相加才是「现在真实的持有量」。
+   * `db === null`(纯内存/测试模式)时没有任何已落盘部分,退化为纯房间账。
+   *
+   * ⚠️ 如实记录边界:今天生产**没有**把 ops 写进 `ai_item_instances` 的路径,
+   * 故 db 那一项在生产上恒为 0(两账相加 = 房间账);若将来补上写库,
+   * 本式的语义正好变成「持久 + 增量」,不需要改判据 —— 但**必须**同时保证
+   * 写库与写房间账是同一批 ops(否则这里会变成双重计数)。这条由
+   * `tests/WS-FND-129` 的「基准与写入同源」判据钉住。
+   *
+   * 记账仍由服务端维护,**绝不取自客户端**。
    */
   authoritativeItemTotal(userId: string): number {
+    const local = this.inventoryTotals.get(userId) ?? 0;
     if (this.db) {
       try {
-        return totalItemsOf(this.db, userId);
+        return totalItemsOf(this.db, userId) + local;
       } catch {
         /* 库不可用(如未建表)时退回本地记账。刻意不抛:网络层不该因
            持久层故障而拒掉全部合法操作;但记账仍走服务端口径。 */
       }
     }
-    return this.inventoryTotals.get(userId) ?? 0;
+    return local;
   }
 
   /** 把本次 ops 的净变化记到服务端总量上(仅供 `authoritativeItemTotal` 用)。 */
@@ -2944,7 +3216,11 @@ export class RoomRuntime {
         this.itemCounts.set(userId, m);
       }
       const next = (m.get(id) ?? 0) + op.delta;
-      /* 不允许负件数 —— 与总量记账的 `next < 0 ? 0` 同一取舍(账面异常夹到 0)。 */
+      /* 不允许负件数 —— 与总量记账的 `next < 0 ? 0` 同一取舍(账面异常夹到 0)。
+         ★ 经入口(`applyInventory` → `checkInventory` 的按件判据)时**这里已不可达**:
+         不足件的负 delta 在 `checkInventory` 就被 `ITEM_NEGATIVE` 拒掉,本函数只处理
+         **已放行**的 ops。留着它是给「账面本来就不一致」的兜底,不是判据 ——
+         判据在入口,**不要**把这里当「扣超了也无所谓」的依据(那就是修前的静默夹零)。 */
       m.set(id, next > 0 ? next : 0);
     }
   }
@@ -2961,6 +3237,17 @@ export class RoomRuntime {
    * `prev` 由调用方持有(通常是「上一帧已发给该客户端的快照」)。
    */
   step(prevSnapshot: RoomState | null = null): Uint8Array {
+    /* ★ WS-FND-131(P2/SLEEPING):回收**不受 status 限制**。
+       修前这条早退写在 `reapExpiredDisconnects()` **之前** ⇒ 全员断线 → 房间
+       SLEEPING ⇒ 到期席位与世界刚体一直挂着(step 根本走不到回收那一行);
+       而新玩家加入时先 `wake()`、再按 `members.size` 判满 ⇒ **对零在线房间
+       误报「房间已满」**。⇒ 现在休眠房里也把两件清理做掉:
+         · `retryPendingWorldRemovals()` 推进上一次抛错的世界侧移除(见 purgeSeat);
+         · `reapExpiredDisconnects()` 回收宽限期已过的席位。
+       `CLOSED` 例外:房间已销毁,回收没有意义(席位由装配层 onDispose 收)。
+       这两步**都不推进 `meta.tick`** ⇒ F07「休眠房不推进帧号」照旧成立。 */
+    this.retryPendingWorldRemovals();
+    if (this.status !== RoomStatus.CLOSED) this.reapExpiredDisconnects();
     if (this.status !== RoomStatus.OPEN) return new Uint8Array(0);
     this.state.meta.tick += 1;
     /* ★ WS-FND-123:世界总线订阅必须在**第一次 advance 之前**接上 ——
@@ -3018,7 +3305,6 @@ export class RoomRuntime {
        `syncPartyHud` 只写有变化的字段 ⇒ 重复调用无副作用。 */
     this.syncPartyHud();
 
-    this.reapExpiredDisconnects();
     this.checkIdleSleep();
     if (this.db) {
       /* 世界帧号低频落盘(每 20 帧 = 1 秒),避免 20Hz 写库。 */
@@ -3784,9 +4070,10 @@ export class RoomRuntime {
    * 编码是确定性的(`encodeFull` 遍历顺序固定、定点量化),因此只要世界状态未变,
    * 同一 tick 下重复调用逐字节一致 —— 重连一致性的基础。
    */
-  snapshotFor(userId: string): Uint8Array {
-    const s = this.members.get(userId);
-    if (s) s.seq = this.state.meta.tick;
+  snapshotFor(_userId: string): Uint8Array {
+    /* ★ WS-FND-131:此处原本写 `s.seq = this.state.meta.tick` —— 那条 `MemberSession.seq`
+       全仓**0 读取**,而且它把**房间帧号**混写进**成员会话**字段(两个时钟混写)。
+       字段已删;快照本身按整房编码,逐字节一致性不受影响(见 docblock)。 */
     return encodeFull(this.state, this.state.meta.tick).bytes;
   }
 

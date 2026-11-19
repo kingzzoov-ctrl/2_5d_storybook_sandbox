@@ -60,6 +60,90 @@ export function safeMass(mass: number): number {
   return Number.isInteger(mass) && mass > 0 ? mass : DEFAULT_BODY_MASS;
 }
 
+/* ═══════════════════════ 0b. 状态写入的唯一口(互斥) ═══════════════════════ */
+
+/**
+ * 带计时状态的**优先级**(状态互斥表的唯一事实源)。
+ *
+ * ## 为什么需要它(第八轮实测 P1)
+ *
+ * 修前每个写入点各写各的:`carry.ts:451` 的击退**无条件**把 `state` 覆盖成
+ * `STUNNED`,而物理层的计时到点只把 `STUNNED / FROZEN` 放回 `NORMAL`
+ * (`BUBBLED` 不在那一对里)⇒ 两件事叠加的后果是:
+ * ```text
+ * BUBBLED(带 5 秒计时)被击退 ⇒ 状态被顶成 STUNNED(泡泡的剩余时间丢了)
+ * BUBBLED 的计时到点        ⇒ 不在"放回 NORMAL"那一对里 ⇒ 状态**永远**停在 BUBBLED
+ * ```
+ * 于是「泡泡困住」与「眩晕」既可能并存、也可能永不解除,两种都错。
+ *
+ * 口径:数值只表示**谁不许被谁顶掉**(大者胜),不是"多严重"的平衡裁决。
+ * `GHOST_BUBBLE`(倒地泡泡)排在最上面 —— 它与 `DownedState` 是同一件事的两面,
+ * 被眩晕顶掉等于「倒地的人站起来被打晕」。
+ */
+export const BODY_STATE_PRIORITY: Readonly<Record<BodyState, number>> = {
+  NORMAL: 0,
+  SLIPPING: 1,
+  STUNNED: 2,
+  BUBBLED: 3,
+  FROZEN: 4,
+  GHOST_BUBBLE: 5,
+  AFK_SHIELD: 5,
+};
+
+/**
+ * **由本层计时器管**的状态:计时到点自动回 `NORMAL`。
+ *
+ * `GHOST_BUBBLE` / `AFK_SHIELD` **不在**里面 —— 它们的生命周期由 `combat/revive.ts`
+ * 的 `DownedState` / AFK 层管,物理层擅自放回 `NORMAL` 会把「倒地中」抹掉。
+ */
+export const TIMED_BODY_STATES: readonly BodyState[] = [
+  BodyState.SLIPPING,
+  BodyState.STUNNED,
+  BodyState.BUBBLED,
+  BodyState.FROZEN,
+];
+
+/** 该状态是否由本层的计时器负责归零(见 `TIMED_BODY_STATES`)。 */
+export function isTimedBodyState(state: BodyState): boolean {
+  return TIMED_BODY_STATES.includes(state);
+}
+
+/** 冲量击退造成的眩晕时长(秒)。修前这个 `0.4` 是 `carry.ts` 里的字面量。 */
+export const KNOCKBACK_STUN_SEC = 0.4;
+
+/**
+ * **带计时状态的唯一写入口**(纯函数:无 world 引用,`carry.ts` 直接可用)。
+ *
+ * 互斥规则(第八轮 P1 的修法):
+ * ```text
+ * 1 新状态是 NORMAL            ⇒ 无条件清(计时归零);
+ * 2 已有状态优先级 **≥** 新状态 ⇒ **不覆盖**:保留原状态(泡泡不被眩晕顶掉),
+ *                                且原状态是"本层计时"时把计时取 max(不缩短);
+ * 3 否则                        ⇒ 写入新状态 + 新计时。
+ * ```
+ *
+ * @returns 写入之后**实际生效**的状态(被互斥拦下就是原来的那个)。
+ */
+export function applyTimedBodyState(b: DynamicBody, state: BodyState, sec: number): BodyState {
+  const secLeft = Number.isFinite(sec) && sec > 0 ? sec : 0;
+  if (state === BodyState.NORMAL) {
+    b.state = BodyState.NORMAL;
+    b.stateTimer = 0;
+    return BodyState.NORMAL;
+  }
+  const cur = b.state;
+  const curRank = BODY_STATE_PRIORITY[cur];
+  const newRank = BODY_STATE_PRIORITY[state];
+  if (cur !== BodyState.NORMAL && curRank >= newRank) {
+    /* 只推**计时**、不换状态:泡泡的剩余时间不会因为挨了一下就被抹掉。 */
+    if (isTimedBodyState(cur)) b.stateTimer = Math.max(b.stateTimer, secLeft);
+    return cur;
+  }
+  b.state = state;
+  b.stateTimer = secLeft;
+  return state;
+}
+
 /* ═══════════════════════ 1. 地形接口(结构化匹配 WorldGrid) ═══════════════════════ */
 
 export interface PhysTerrain {
@@ -182,6 +266,64 @@ export const SUBSTEP_SPEED_THRESHOLD = 6.0;
 
 /** 位置兜底钳制:任何坐标超出这个量级都视为数值异常并复位。 */
 export const FINITE_LIMIT = 1e6;
+
+/**
+ * 扫掠位移的**二分细化次数**:每次折半 ⇒ 精度 = 1/2^n 格。
+ * 12 次 ≈ 0.00024 格(远小于任何半径),且只在"终点不合法"时才跑。
+ */
+export const SWEEP_REFINE_STEPS = 12;
+
+/**
+ * 落点校验的**回退搜索半径**(格,切比雪夫环数)。
+ *
+ * 8 环 = 最多 17×17 格:足够跨过本仓最厚的实心墙(地图边缘 + 1~2 格厚墙),
+ * 又不至于让一次失败的落点校验变成全图扫描(20Hz 下每次被挡都要跑一遍)。
+ */
+export const CLAMP_RING_MAX = 8;
+
+/**
+ * **沿位移退回到最后一个合法点**(★ WS-FND-130 P1 的**纯函数**形态)。
+ *
+ * 把圆心从 `(x, y)` 沿 `(dx, dy)` 推进:
+ * - 终点合法 ⇒ **原样返回终点**(`blocked: false`,不做任何中间算术 ——
+ *   无遮挡时位移必须与修前**逐位相同**,`WS-FND-98` 用 `1e-9` 精度钉着它);
+ * - 终点不合法 ⇒ 在 `[起点, 终点]` 上二分 `steps` 次,返回**最后一个合法比例**
+ *   对应的点;起点本身就不合法时二分不前进 ⇒ 原地不动(`moved: 0`)。
+ *
+ * ## 为什么是纯函数
+ *
+ * 「哪些格实心 / 圆能不能站」是 `PhysicsWorld` 的事实(`isBlockedAt`),但
+ * 「沿位移退到最后一个合法点」是**几何**,与地形无关。把它做成收 `isBlocked`
+ * 回调的纯函数有两个好处:`sweepCircle` 与测试/别的调用方共用**同一份**二分
+ * (两份实现必然漂);而且可以**注入**一个恒假/恒真的 `isBlocked` 直接验证
+ * 「这道判据的牙长在哪」。
+ *
+ * 非法 `dx/dy`(`NaN` / `±Infinity`)⇒ fail-closed:原地不动 + `blocked: true`。
+ */
+export function lastFreeAlong(
+  x: number, y: number, dx: number, dy: number,
+  isBlocked: (x: number, y: number) => boolean,
+  steps: number = SWEEP_REFINE_STEPS,
+): { x: number; y: number; blocked: boolean; moved: number } {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+    return { x, y, blocked: true, moved: 0 };
+  }
+  const targetX = x + dx;
+  const targetY = y + dy;
+  const len = Math.hypot(dx, dy);
+  if (!isBlocked(targetX, targetY)) {
+    return { x: targetX, y: targetY, blocked: false, moved: len };
+  }
+  let lo = 0;
+  let hi = 1;
+  const n = Number.isFinite(steps) && steps > 0 ? Math.floor(steps) : SWEEP_REFINE_STEPS;
+  for (let i = 0; i < n; i += 1) {
+    const mid = (lo + hi) / 2;
+    if (isBlocked(x + dx * mid, y + dy * mid)) hi = mid;
+    else lo = mid;
+  }
+  return { x: x + dx * lo, y: y + dy * lo, blocked: true, moved: len * lo };
+}
 
 export const PhysStats = {
   NORMAL: 'NORMAL',
@@ -309,6 +451,52 @@ export class PhysicsWorld {
   }
 
   /**
+   * 全部**按刚体 id 索引**的旁表:`表名 → 键集合`(审计的**唯一**读口)。
+   *
+   * `openedTraps` 刻意不在里面:它的键是格 `"cx,cy"`,不是刚体 id
+   * (与 `reclaimSideTables` 同一条口径)。新增旁表时**必须**在这里登记,
+   * 否则 `sideTableLeaks()` 对它是瞎的 —— 这正是本口存在的意义。
+   */
+  private sideTableKeys(): { table: string; keys: string[] }[] {
+    return [
+      { table: 'trapTimers', keys: [...this.trapTimers.keys()] },
+      { table: 'muMuls', keys: [...this.muMuls.keys()] },
+      { table: 'speedCaps', keys: [...this.speedCaps.keys()] },
+      { table: 'gravityMuls', keys: [...this.gravityMuls.keys()] },
+      { table: 'jumpMuls', keys: [...this.jumpMuls.keys()] },
+    ];
+  }
+
+  /**
+   * **悬空条目**清单:旁表里有、`bodies` 里已经没有的 id(★ WS-FND-130 P2)。
+   *
+   * ## 为什么这是判据而不是「顺手清一下」
+   *
+   * 悬空条目**读不到也清不掉**(读口按 id 查,`remove()` 已经过去了),它会一直
+   * 躺着直到同名刚体重生才"诈尸"—— 而那一刻新刚体会**继承上一条命**的乘子。
+   * 静默清理会把「是谁写进来的」这条线索一起抹掉,所以这里只**报**,由 setter
+   * 的存在性闸(`setMuMul` / `setSpeedCap` / `setGravityMul` / `setJumpMul` 对
+   * 不存在 id 返回 `false`)+ `reclaimSideTables`(remove/clear/spawn 三条路径)
+   * 保证这条清单在生产中**恒空**;`sideTableLeaks()` 是它的**判据**。
+   *
+   * @returns `[]` = 旁表键 ⊆ bodies 键(不变量成立)。
+   */
+  sideTableLeaks(): { table: string; id: string }[] {
+    const out: { table: string; id: string }[] = [];
+    for (const t of this.sideTableKeys()) {
+      for (const id of t.keys) {
+        if (!this.bodies.has(id)) out.push({ table: t.table, id });
+      }
+    }
+    return out;
+  }
+
+  /** 「旁表键 ⊆ bodies 键」这条不变量是否成立(`sideTableLeaks()` 的布尔包装)。 */
+  sideTablesSubsetOfBodies(): boolean {
+    return this.sideTableLeaks().length === 0;
+  }
+
+  /**
    * 生成(或**覆盖**)一个刚体。
    *
    * 覆盖同 id 与新建走同一条路:`remove()` 能回收的,`spawn()` 也必须回收 ——
@@ -348,6 +536,64 @@ export class PhysicsWorld {
     this.elapsed = 0;
   }
 
+  /* ── 格占用查询(★ WS-FND-130 P2:格位唯一)──
+   *
+   * ## 为什么需要「口」而不是让调用方自己 `Math.floor` 遍历
+   *
+   * 「两个不同 id 落在同一格」在物理上**允许**发生(两两碰撞只做圆的分离,半径
+   * 0.35 的两个圆可以完全重合;传送 / 读档 / 出生点也可以是同一格),所以物理层
+   * 不该擅自拒绝 —— 但**不可观测**意味着「真的撞在一起了」与「压根没发生过」
+   * 在外面分不开(本仓反复点名的「不可判定的失败」)。于是这里只提供**查询口**:
+   * 计数(`occupantsAt`)与冲突清单(`sharedCellGroups`),是否强制由编排层裁决
+   * (`world_sim#addPlayer` 那一侧决定「同格就挪开 / 只记一笔」)。
+   */
+
+  /**
+   * 该格里**所有**刚体 id(格 = `floor(x), floor(y)`),按 id 排序。
+   *
+   * 排序是刻意的:`Map` 的迭代序在增删之后不可复现,而「同一格里有谁」是一份
+   * 要拿去断言/留痕的事实,必须稳定。
+   */
+  occupantsAt(cx: number, cy: number): string[] {
+    if (!Number.isFinite(cx) || !Number.isFinite(cy)) return [];
+    const out: string[] = [];
+    for (const b of this.bodies.values()) {
+      if (Math.floor(b.x) === cx && Math.floor(b.y) === cy) out.push(b.id);
+    }
+    return out.sort();
+  }
+
+  /**
+   * **同格冲突**清单:同一格里挤了 ≥2 个**不同 id** 的组(按格坐标排序)。
+   *
+   * 口径(两条都必须写清,否则判据会误报):
+   * - **被举起的实体不算**:`carry.syncChain` 故意把第 k>0 层的 x/y 吸附到底层
+   *   (叠罗汉就是「人站在人肩上」),那是**设计**而不是冲突。
+   * - **坐标非有限的实体不算**:它们归 `ensureFinite` 管,塞进格清单只会让
+   *   真正的冲突淹没在噪声里。
+   */
+  sharedCellGroups(): { cx: number; cy: number; ids: string[] }[] {
+    const byCell = new Map<string, { cx: number; cy: number; ids: string[] }>();
+    for (const b of this.bodies.values()) {
+      if (b.carriedBy !== null) continue;
+      if (!Number.isFinite(b.x) || !Number.isFinite(b.y)) continue;
+      const cx = Math.floor(b.x);
+      const cy = Math.floor(b.y);
+      const key = `${cx},${cy}`;
+      const g = byCell.get(key);
+      if (g === undefined) byCell.set(key, { cx, cy, ids: [b.id] });
+      else g.ids.push(b.id);
+    }
+    const out: { cx: number; cy: number; ids: string[] }[] = [];
+    for (const g of byCell.values()) {
+      if (g.ids.length < 2) continue;
+      g.ids.sort();
+      out.push(g);
+    }
+    out.sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
+    return out;
+  }
+
   /* ── 摩擦乘子(裁决 D-12)── */
 
   /**
@@ -361,10 +607,17 @@ export class PhysicsWorld {
    * 看上去像卡进墙里;负数更会让速度每帧反向并指数增长(直接飞走)。
    * 于是非法输入必须是 no-op,而不是写一个"看起来夹过了"的值。
    *
+   * ★ 第八轮 P2:刚体 id **必须已存在**(`bodies` 里有它),否则**拒绝并返回 `false`**。
+   * 修前对任何 id 都返回 `true` 并留一条记录 —— 而生产侧的输入是 `vitals.ids()`
+   * (不是 `physics.bodies`)⇒ 任何「有 vitals 但没有刚体」的 id 都会立刻造出一条
+   * **悬空条目**:它永远读不到、也永远清不掉,直到同名刚体重生才"诈尸"。
+   *
    * @returns `true` = 已接受;`false` = 被拒(状态未变)。
    */
   setMuMul(id: string, mul: number): boolean {
     if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
+    /* ★ 存在性闸:悬空条目比"拒绝"难收拾得多(见 docblock)。 */
+    if (!this.bodies.has(id)) return false;
     if (mul === MU_MUL_NEUTRAL) {
       /* 回到中性 = 删记录,不留一条 1(见 `MU_MUL_NEUTRAL` 的注释)。 */
       this.muMuls.delete(id);
@@ -422,9 +675,13 @@ export class PhysicsWorld {
    * 只接受有限正数:非法输入是 **no-op**(与 `setMuMul` 同一取舍 ——
    * 写一个「看起来夹过了」的 0 会让刚体原地定住,表现像卡进墙里)。
    *
+   * ★ 第八轮 P2:刚体 id 必须已存在,否则拒(悬空条目永远读不到也清不掉 ——
+   * 口径与 `setMuMul` 的 docblock 逐字同源)。
+   *
    * @returns `true` = 已接受;`false` = 被拒(状态未变)。
    */
   setSpeedCap(id: string, cap: number): boolean {
+    if (!this.bodies.has(id)) return false;
     if (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0) return false;
     this.speedCaps.set(id, cap);
     return true;
@@ -447,6 +704,9 @@ export class PhysicsWorld {
    * 负数会把重力翻成向上 —— 两者都是「看起来夹过了」的坏值,故一律拒。
    */
   setGravityMul(id: string, mul: number): boolean {
+    /* ★ 存在性闸(第八轮 P2):与 `setMuMul` 的 docblock 同一口径 —— 对不存在的
+       刚体写乘子只会留一条**悬空条目**,而生产侧的输入是 `vitals.ids()`。 */
+    if (!this.bodies.has(id)) return false;
     if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
     if (mul === 1) {
       this.gravityMuls.delete(id);
@@ -474,6 +734,8 @@ export class PhysicsWorld {
    *   这样物理层没有第二个「跳跃高度」事实源。
    */
   setJumpMul(id: string, mul: number): boolean {
+    /* ★ 存在性闸(第八轮 P2):与 `setMuMul` 的 docblock 同一口径。 */
+    if (!this.bodies.has(id)) return false;
     if (typeof mul !== 'number' || !Number.isFinite(mul) || mul <= 0) return false;
     if (mul === 1) {
       this.jumpMuls.delete(id);
@@ -513,6 +775,24 @@ export class PhysicsWorld {
     return vz;
   }
 
+  /**
+   * **带计时状态的写入口**(第八轮 P1:统一状态源)。
+   *
+   * 实现完全委托给纯函数 `applyTimedBodyState`(互斥规则与优先级表在那边的
+   * docblock 里),这里只补一层「刚体不存在 ⇒ 不写、返回 `NORMAL`」的闸 ——
+   * 与四个旁表 setter 同一口径。
+   *
+   * ⚠️ **别处不许再直接写 `body.state`**:那正是 `carry.ts:451` 的旧形态
+   * (无条件覆盖 ⇒ 带计时的 `BUBBLED` 被顶成 `STUNNED`、泡泡的计时丢掉)。
+   *
+   * @returns 写入之后**实际生效**的状态。
+   */
+  applyTimedState(id: string, state: BodyState, sec: number): BodyState {
+    const b = this.bodies.get(id);
+    if (b === undefined) return BodyState.NORMAL;
+    return applyTimedBodyState(b, state, sec);
+  }
+
   /* ── 地形查询 ── */
 
   private cellX(b: DynamicBody): number {
@@ -546,12 +826,148 @@ export class PhysicsWorld {
     return o >= 351 && o <= 371;
   }
 
+  /**
+   * 圆心在 `(x, y)`、半径 `radius` 的圆**能不能站**:不许与任何实心格相交,也不许出界。
+   *
+   * ## 为什么不能只查"圆心所在格"
+   *
+   * 圆心在自由格里、圆边却已经压进邻格时,那半个身位**也在墙里**
+   * (这正是 `resolveTerrainWalls` 用 `x - cx < r` 去兜的那件事)。所以判据是
+   * 「圆 ↔ 格矩形」的距离 `< radius`,与半径无关的部分(圆心所在格)自然也被它覆盖
+   * (距离 0 < radius)。
+   *
+   * ## 越界
+   *
+   * 边界口径与 `clampBounds` **同一个**(圆心必须落在 `[minX, maxX] × [minY, maxY]`)——
+   * 不另立一套"带半径的边界",否则同一张地图会有两条边界事实。
+   *
+   * 非法入参一律 fail-closed(`true` = 不可站):`NaN` 坐标放行等于让
+   * `NaN` 顺着位置传播(第八轮 P1 的穿墙与出界就是这一类)。
+   */
+  isBlockedAt(x: number, y: number, radius: number = DEFAULT_PLAYER_RADIUS): boolean {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+    if (!Number.isFinite(radius) || radius <= 0) return true;
+    const { minX, minY, maxX, maxY } = this.bounds;
+    if (x < minX || x > maxX || y < minY || y > maxY) return true;
+    const cx = Math.floor(x);
+    const cy = Math.floor(y);
+    /* 半径 ≤ 1 格 ⇒ 圆最多跨 3×3 格;邻格逐格查(与 `resolveTerrainWalls` 同口径)。 */
+    for (let gy = cy - 1; gy <= cy + 1; gy += 1) {
+      for (let gx = cx - 1; gx <= cx + 1; gx += 1) {
+        if (!this.isSolidCell(gx, gy)) continue;
+        const nx = Math.min(Math.max(x, gx), gx + 1);
+        const ny = Math.min(Math.max(y, gy), gy + 1);
+        if (Math.hypot(x - nx, y - ny) < radius) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * **扫掠位移**(第八轮 P1 的修法):把圆心从 `(x, y)` 沿 `(dx, dy)` 推进,
+   * 遇到实心格 / 出界就**退到最后一个合法点**,绝不把刚体搬进墙里。
+   *
+   * ## 为什么必须是扫掠,不能只校验终点
+   *
+   * 击退是一次 1~2 格的**位置搬家**(`world_sim.ts#tickKnockback`),不是速度积分 ⇒
+   * 物理步的子步拆分拦不住它。只判终点也会错:1 格厚的墙在终点之外时,
+   * "起点合法、终点合法"仍可能中途穿过去(贴着墙被推、终点落在墙的另一侧)。
+   *
+   * ## 为什么终点合法就**原样返回**(不做任何中间算术)
+   *
+   * 无遮挡时位移必须与修前**逐位相同**(`WS-FND-98` 的 `min(2, 伤害/20)` 判据
+   * 用 `1e-9` 精度钉着它)⇒ 只有终点不合法时才走二分细化。
+   *
+   * @returns 实际落点 + `blocked`(是否被挡下 = 还有剩余位移没推完)。
+   */
+  sweepCircle(
+    x: number, y: number, dx: number, dy: number,
+    radius: number = DEFAULT_PLAYER_RADIUS,
+  ): { x: number; y: number; blocked: boolean; moved: number } {
+    /* ★ WS-FND-130 P1:二分细化搬去**纯函数** `lastFreeAlong`(唯一事实源),
+       本方法只剩「把 `isBlockedAt` 包成回调」这一件事。
+       两份二分实现必然会漂(本仓反复踩过的「同一算式两处写」),而这里的语义
+       (终点合法 ⇒ 原样返回、起点不合法 ⇒ 原地不动)必须只有一份。 */
+    return lastFreeAlong(x, y, dx, dy, (px, py) => this.isBlockedAt(px, py, radius));
+  }
+
+  /**
+   * **落点校验 / 回退到最近合法格**(★ WS-FND-130 P1 的第二个口)。
+   *
+   * 给定圆心 `(x, y)`:合法就**原样返回**(`blocked: false`,逐位不变);
+   * 与实心格相交 / 越界就挪到**最近的合法格中心**,并报 `blocked: true`。
+   *
+   * ## 为什么还需要它(`sweepCircle` 不够)
+   *
+   * `sweepCircle` 的隐含前提是**起点合法**:它在 `[起点, 终点]` 上二分,起点本身
+   * 不合法时 `lo` 停在 0 ⇒ 原样不动(`world_sim#tickKnockback` 正是这种情况:
+   * 上一帧已经落进墙格的刚体再被击退,扫掠救不出来)。击退 / 传送 / 读档搬位置
+   * 都是**一步到位**的搬家,需要的不是「再扫一次」,而是「这个落点还算不算数,
+   * 不算就退到最近的合法点」。这就是本口。
+   *
+   * ## 判据与取舍
+   *
+   * - 候选只用**格中心** `(gx+0.5, gy+0.5)`:`isBlockedAt` 的判据是
+   *   `dist < radius`,而 `RADIUS_PLAYER = 0.35` 的圆在自由格中心必然合法
+   *   (距任何格边 0.5 > 0.35)。半径大到整格塞不下(`> 0.5`)时本口**不猜** ——
+   *   找不到合法点就返回 `blocked: true` 且**原地不动**,绝不挑一个更坏的落点。
+   * - 搜索按**切比雪夫环**由近及远(`CLAMP_RING_MAX` 环),每一环只取本环的边、
+   *   并取**欧氏距离最小**的合法格中心;同环内扫描顺序固定 ⇒ 结果可复现
+   *   (不依赖 `Map` 迭代序)。
+   * - 非法入参 **fail-closed**:非有限坐标退到 `fallback`(给了才用)或世界中心;
+   *   连它们都不合法就返回原点 + `blocked: true`(`NaN` 放行等于让 `NaN` 顺着
+   *   位置传播 —— 第八轮 P1 的穿墙与出界正是这一类)。
+   *
+   * @param fallback 调用方手里的**最后合法点**(通常是上一帧位置)。
+   * @returns 实际落点 + `blocked`(请求点非法 ⇒ 被搬过)。
+   */
+  clampToFreeCell(
+    x: number, y: number,
+    radius: number = DEFAULT_PLAYER_RADIUS,
+    fallback?: { x: number; y: number },
+  ): { x: number; y: number; blocked: boolean } {
+    const r = Number.isFinite(radius) && radius > 0 ? radius : DEFAULT_PLAYER_RADIUS;
+    const fb = fallback !== undefined && Number.isFinite(fallback.x) && Number.isFinite(fallback.y)
+      ? fallback
+      : undefined;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      if (fb !== undefined) return { x: fb.x, y: fb.y, blocked: true };
+      const hx = clampNum((this.bounds.minX + this.bounds.maxX) / 2, this.bounds.minX, this.bounds.maxX);
+      const hy = clampNum((this.bounds.minY + this.bounds.maxY) / 2, this.bounds.minY, this.bounds.maxY);
+      return { x: hx, y: hy, blocked: true };
+    }
+    if (!this.isBlockedAt(x, y, r)) return { x, y, blocked: false };
+    const cx = Math.floor(x);
+    const cy = Math.floor(y);
+    for (let ring = 0; ring <= CLAMP_RING_MAX; ring += 1) {
+      let best: { x: number; y: number } | null = null;
+      let bestD = Infinity;
+      for (let gy = cy - ring; gy <= cy + ring; gy += 1) {
+        for (let gx = cx - ring; gx <= cx + ring; gx += 1) {
+          /* 只看本环的**边**:环内的格在更近的一环里已经试过。 */
+          if (Math.max(Math.abs(gx - cx), Math.abs(gy - cy)) !== ring) continue;
+          const px = gx + 0.5;
+          const py = gy + 0.5;
+          if (this.isBlockedAt(px, py, r)) continue;
+          const d = Math.hypot(px - x, py - y);
+          if (d < bestD) {
+            best = { x: px, y: py };
+            bestD = d;
+          }
+        }
+      }
+      if (best !== null) return { x: best.x, y: best.y, blocked: true };
+    }
+    if (fb !== undefined && !this.isBlockedAt(fb.x, fb.y, r)) return { x: fb.x, y: fb.y, blocked: true };
+    return { x, y, blocked: true };
+  }
+
   /* ── 主循环 ── */
 
   /**
    * 20Hz 推进一帧。
    * 顺序:机关外力 → 拆分子步 → 水平积分 → 垂直积分 → 地形碰撞 →
-   *       两两碰撞 → 边界钳制 → 有限性兜底。
+   *       两两碰撞 → **墙体反卡** → 边界钳制 → 有限性兜底。
    */
   step(dt: number = DT): StepReport {
     const t0 = performance.now();
@@ -588,8 +1004,13 @@ export class PhysicsWorld {
       if (this.pairwise) this.resolvePairs(report);
     }
 
-    /* 2. 边界与有限性兜底 */
+    /* 2. 墙体反卡 → 边界 → 有限性兜底 */
     for (const b of this.bodies.values()) {
+      /* ★ 第八轮 P1:`resolveTerrainWalls` 只兜「圆心仍自由、圆边越界」那一档,
+         所以被 `applyImpulse`(大锤 / 击退)一步推进墙里、或被位置路径搬家落进
+         墙里的刚体会**滞留在墙内**(圆心在实心格 ⇒ 四条边判定全不成立)。
+         这里主动把它推回最近的一个合法点 —— 位置是唯一权威,不留"卡住"态。 */
+      this.unstickFromSolid(b, report);
       this.clampBounds(b);
       this.ensureFinite(b, report);
     }
@@ -621,14 +1042,18 @@ export class PhysicsWorld {
       return;
     }
 
-    /* 状态计时 */
+    /* 状态计时(★ 第八轮 P1:到点回 `NORMAL` 的状态由 `TIMED_BODY_STATES` 决定,
+       不再只认 `STUNNED / FROZEN` —— 修前 `BUBBLED` 的计时到点**没人放它回 NORMAL**,
+       于是"泡泡困住"在归零后永远留着)。
+
+       `GHOST_BUBBLE` / `AFK_SHIELD` 刻意不在表里:它们的生命周期由
+       `combat/revive.ts` 的 `DownedState` / AFK 层持有,物理层放它回 NORMAL
+       等于把「倒地中」抹掉(见 `TIMED_BODY_STATES` 的注释)。 */
     if (b.stateTimer > 0) {
       b.stateTimer -= dt;
       if (b.stateTimer <= 0) {
         b.stateTimer = 0;
-        if (b.state === BodyState.STUNNED || b.state === BodyState.FROZEN) {
-          b.state = BodyState.NORMAL;
-        }
+        if (isTimedBodyState(b.state)) b.state = BodyState.NORMAL;
       }
     }
 
@@ -704,7 +1129,11 @@ export class PhysicsWorld {
     }
 
     /* — 水平积分(冻结层) — */
-    const nv = integrateHorizontal(b.vx, b.vy, mu, 0, 0, 0, 0, beltX, beltY, b.mass, dt);
+    /* ★ WS-FND-130 P2:质量一律经 `safeMass`(§0)。冻结层 `integrateHorizontal` 里的
+       `mass === 0 ? 1 : mass` 只挡 `0`:`NaN` 质量会让 `(fx + beltX) / m` 变 `NaN`
+       ⇒ 下面那道有限性守卫把速度**每帧清零**(表现是「这个刚体在传送带上纹丝不动」,
+       而不是任何报错)。合法质量(正整数)经 `safeMass` **逐位不变**。 */
+    const nv = integrateHorizontal(b.vx, b.vy, mu, 0, 0, 0, 0, beltX, beltY, safeMass(b.mass), dt);
     if (Number.isFinite(nv.x) && Number.isFinite(nv.y)) {
       b.vx = nv.x;
       b.vy = nv.y;
@@ -750,7 +1179,15 @@ export class PhysicsWorld {
     b.z = vs.z;
     b.vz = vs.vz;
 
-    /* 落地判定:地面高度 gz 可能 < 0(深沟)或 > 0(高台) */
+    /* 落地判定。★ 第八轮:按**现状**订正这段注释(原文写「gz 可能 < 0(深沟)或
+       > 0(高台)」,但 `< 0` 那一支是**死代码**)。
+
+       `groundZAt` 返回 `(elev & 3) - 1 ∈ {-1, 0, 1, 2}`,而冻结层
+       `integrateVertical` 把 z **硬钳在 ≥ 0**(`if (nz <= 0) return { z: 0, ... }`)⇒
+       `b.z <= gz` 在 `gz = -1`(elev 0 的深沟格)时**永不成立**。
+       能走到的只有 `gz ≥ 0`(平地 0 / 高台 1~2)。
+       深沟"掉进去"的观感来自落穴倍率(`TRAP_FALL_MUL`)让 z 更快归 0,
+       不是真的落到 -1 —— 这一点如实记在这里,不假装那个分支还活着。 */
     if (b.z <= gz) {
       b.z = gz;
       const landingSpeed = Math.abs(vzBefore);
@@ -834,6 +1271,57 @@ export class PhysicsWorld {
       report.wallHits += 1;
       this.fx.push({ kind: 'WALL_HIT', id: b.id, x: b.x, y: b.y, z: b.z, magnitude: Math.abs(v.y) });
     }
+  }
+
+  /**
+   * **墙体反卡**(第八轮 P1):圆心已经落在实心格内 / 圆与实心格相交时,
+   * 把它推回**最近的一个合法点**。
+   *
+   * ## 为什么 `resolveTerrainWalls` 兜不住这一档
+   *
+   * 那个方法逐边判「`b.x - cx < r` 且**邻格**实心」;可圆心一旦已经在实心格内,
+   * 四条边判定用的都是"当前格 / 邻格"的组合,可能全不成立 ⇒ 刚体**留在墙里**。
+   * 实测表现:贴着 1 格厚实心墙被击退 1~2 格 ⇒ 落进墙格后出不来;地图边缘同理。
+   * 物理层必须有一处「从墙里出来」的通道。
+   *
+   * ## 为什么是「最小平移」的四选一
+   *
+   * 候选是圆心所在格的**四条边外侧**(距离各为 `radius`),取位移最小且
+   * `isBlockedAt` 判为合法的那一个;四个都不合法 ⇒ **不动**(留给下一次 step
+   * 继续试),绝不挑一个更坏的落点。
+   *
+   * @returns 是否真的推出来了。
+   */
+  private unstickFromSolid(b: DynamicBody, report: StepReport): boolean {
+    if (!this.isBlockedAt(b.x, b.y, b.radius)) return false;
+    const r = b.radius;
+    const cx = Math.floor(b.x);
+    const cy = Math.floor(b.y);
+    const candidates: readonly { x: number; y: number }[] = [
+      { x: cx - r, y: b.y },
+      { x: cx + 1 + r, y: b.y },
+      { x: b.x, y: cy - r },
+      { x: b.x, y: cy + 1 + r },
+    ];
+    let best: { x: number; y: number } | null = null;
+    let bestDist = Infinity;
+    for (const c of candidates) {
+      if (this.isBlockedAt(c.x, c.y, r)) continue;
+      const d = Math.hypot(c.x - b.x, c.y - b.y);
+      if (d < bestDist) {
+        best = c;
+        bestDist = d;
+      }
+    }
+    if (best === null) return false;
+    b.x = best.x;
+    b.y = best.y;
+    /* 从墙里出来的那一下不该带着"墙里的速度"继续跑(否则下一帧又冲回去)。 */
+    b.vx = 0;
+    b.vy = 0;
+    report.wallHits += 1;
+    this.fx.push({ kind: 'WALL_HIT', id: b.id, x: b.x, y: b.y, z: b.z, magnitude: 0 });
+    return true;
   }
 
   /* ── 两两碰撞(O(n²),n 小;文档给出网格加速的替换点) ── */

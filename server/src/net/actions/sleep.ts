@@ -15,7 +15,7 @@
  *
  * ⇒ 本动作的职责被刻意收窄成一份**状态登记**:
  * ```ts
- *   入睡 ⇒ SLEEPERS[roomId][userId] = { sinceMs, untilMs }
+ *   入睡 ⇒ SLEEPERS[roomId].players[userId] = { sinceMs, untilMs }(随房间世代作废)
  *   睡着时再 SLEEP ⇒ 幂等(不叠加计时)
  *   离开卧室 / 被打断 / 时间到 ⇒ 结束
  * ```
@@ -82,12 +82,28 @@ export interface SleepState {
 }
 
 /**
- * 房间 → (玩家 → 睡眠记录)。
+ * 一个房间的睡眠登记 = **世代号 + 记录表**。
+ *
+ * ## 为什么必须带世代维(★ WS-FND-131 P2)
+ * 修前是 `SLEEPERS[roomId][playerId]`,**没有世代**:世界重置(`RESET_WORLD` 换代)
+ * 之后 `beginSleep` 仍会命中上一世代留下的记录并**原样返回它的 `untilMs`**
+ * ⇒ 表现是「刚上床就已经睡了一半 / 立刻睡醒」,而且**不报错、测试也可能照绿**。
+ * ⇒ 换代时 `bumpSleepGeneration` 把 `players` 整表作废;`gen` 只增不减,
+ *   任何查询都只会看到**当前世代**的记录。
+ */
+interface SleepBucket {
+  /** 世代号(每次世界换代 +1;本模块是唯一写者)。 */
+  gen: number;
+  players: Map<string, SleepRecord>;
+}
+
+/**
+ * 房间 → (世代 + 玩家 → 睡眠记录)。
  *
  * 按 `roomId` 分桶:两个房间的 `playerId` 可以重名,不分开就会互相覆盖。
  * 本模块是**唯一写者**;没有世界源时动作会显式拒绝,不会写出「无人消费」的孤儿记录。
  */
-const SLEEPERS = new Map<string, Map<string, SleepRecord>>();
+const SLEEPERS = new Map<string, SleepBucket>();
 
 /** 可注入时钟(毫秒)。默认墙钟;测试注入假时钟并推进它。 */
 let clockMs: () => number = () => Date.now();
@@ -102,14 +118,37 @@ export function resetSleepClock(): void {
   clockMs = () => Date.now();
 }
 
-/** 取(必要时创建)某房间的睡眠登记表。 */
-function bucketOf(roomId: string): Map<string, SleepRecord> {
-  let m = SLEEPERS.get(roomId);
-  if (m === undefined) {
-    m = new Map();
-    SLEEPERS.set(roomId, m);
+/** 取(必要时创建)某房间的睡眠登记桶。 */
+function bucketOf(roomId: string): SleepBucket {
+  let b = SLEEPERS.get(roomId);
+  if (b === undefined) {
+    b = { gen: 0, players: new Map() };
+    SLEEPERS.set(roomId, b);
   }
-  return m;
+  return b;
+}
+
+/**
+ * 该房间睡眠登记的**世代号**(从未换过代 = 0)。**不改任何状态。**
+ *
+ * 这个读口的存在理由:只看 `sleepingCount` 区分不出「换过代、刚好没人睡」与
+ * 「从没换过代」—— 而判据必须能区分这两种态,否则「换代」不可断言。
+ */
+export function sleepGenerationOf(roomId: string): number {
+  return SLEEPERS.get(roomId)?.gen ?? 0;
+}
+
+/**
+ * 世界**换代**:世代号 +1,并把该房间上一世代的睡眠窗口**全部作废**。
+ *
+ * 唯一调用点:`RoomRuntime.dispatchAction()` 里 `RESET_WORLD` 成功那一刻
+ * (见 `server/src/net/room.ts` 的同段注释)。返回新世代号(便于回执/断言)。
+ */
+export function bumpSleepGeneration(roomId: string): number {
+  const b = bucketOf(roomId);
+  b.gen += 1;
+  b.players.clear();
+  return b.gen;
 }
 
 /**
@@ -120,10 +159,13 @@ function bucketOf(roomId: string): Map<string, SleepRecord> {
  * 在外部完全一样(本仓陷阱 89 的形态)。
  */
 export function endSleep(roomId: string, userId: string): boolean {
-  const m = SLEEPERS.get(roomId);
-  if (m === undefined) return false;
-  const existed = m.delete(userId);
-  if (m.size === 0) SLEEPERS.delete(roomId);
+  const bucket = SLEEPERS.get(roomId);
+  if (bucket === undefined) return false;
+  const existed = bucket.players.delete(userId);
+  /* 房间桶只在「从没换过代」时才回收:换过代的桶要继续带着 `gen`,
+     否则世代号会**回退**,下一轮 `bumpSleepGeneration` 会给出一个已经用过的号
+     (那时「旧世代窗口」与「新世代窗口」又分不开了)。 */
+  if (bucket.players.size === 0 && bucket.gen === 0) SLEEPERS.delete(roomId);
   return existed;
 }
 
@@ -137,13 +179,13 @@ export function beginSleep(
   userId: string,
   nowMs: number = clockMs(),
 ): { record: SleepRecord; alreadySleeping: boolean } {
-  const m = bucketOf(roomId);
-  const cur = m.get(userId);
+  const bucket = bucketOf(roomId);
+  const cur = bucket.players.get(userId);
   if (cur !== undefined && cur.untilMs > nowMs) {
     return { record: cur, alreadySleeping: true };
   }
   const record: SleepRecord = { sinceMs: nowMs, untilMs: nowMs + SLEEP_DURATION_MS };
-  m.set(userId, record);
+  bucket.players.set(userId, record);
   return { record, alreadySleeping: false };
 }
 
@@ -158,7 +200,7 @@ export function sleepStateOf(
   userId: string,
   nowMs: number = clockMs(),
 ): SleepState {
-  const rec = SLEEPERS.get(roomId)?.get(userId);
+  const rec = SLEEPERS.get(roomId)?.players.get(userId);
   if (rec === undefined) {
     return { sleeping: false, sinceMs: null, untilMs: null, remainingMs: 0 };
   }
@@ -176,11 +218,12 @@ export function sleepStateOf(
 
 /** 该房间当前在睡的玩家数(断言「失败路径没写状态」用)。 */
 export function sleepingCount(roomId: string): number {
-  return SLEEPERS.get(roomId)?.size ?? 0;
+  return SLEEPERS.get(roomId)?.players.size ?? 0;
 }
 
 /** 清空全部登记(测试隔离用;生产不需要)。 */
 export function clearSleepRegistry(): void {
+  /* 连**世代号**一起清(清掉房间桶 ⇒ gen 归零)⇒ 测试之间不带着上一轮的 gen 起跑。 */
   SLEEPERS.clear();
 }
 

@@ -65,6 +65,7 @@ const REBASE = process.argv.includes('--baseline');
  * 理由必须 ≥8 字符且说清**卡在哪**,否则自检报「未写明理由」。
  */
 export const ORPHAN_KNOWN = new Map<string, string>([
+  ['server/src/invariants.ts', '门禁侧快照不变量检查器(WS-FND-128):8 条纯函数不变量 + 手工快照反例/注入自检的 SSoT。属 gate-only 家族:门禁 `runSelfcheck()` 真消费(进程内调用,算进 pass/fail 与退出码),生产侧真 importer = 0(只被 scripts/invariants.ts 与 tests/WS-FND-128 消费)⇒ **不是欠账**。措辞与 `verify.ts` 的 UNREACHABLE_EXEMPT 同条一致(2026-11-19 门禁接上后登记)。接入条件:**不接** —— 生产侧 import 它只会把门禁专属校验拖进运行时闭包。'],
   /* ── 已接线的组(entries 保留在此仅作历史记录,不再列于表中)──
    *
    * 2026-11-12 两批接线,本表从 25 条收缩到 14 条:

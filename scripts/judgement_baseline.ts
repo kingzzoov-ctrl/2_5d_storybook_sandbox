@@ -118,6 +118,18 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
       + '`stripCommentsAndStrings` 会**静默变成恒真** —— 该风险已由 FND9-14 的'
       + '单一来源断言看住。挂 CR-18。',
   },
+  {
+    detector: 'B',
+    file: 'tests/WS-FND-132-protocol-bounds.test.ts',
+    needle: 'src.replace(/\\/\\*[\\s\\S]*?\\*\\//g, \'\').replace(/\\/\\/',
+    verdict: '挂账待修',
+    reason:
+      '与 WS-07 / WS-FND-09 同族(同一个「先剥块注释再剥行注释」惯用法)。'
+      + '该 strip 只服务于「去注释后对 ws_server.ts / delta.ts 做**包含式**标记查找」,'
+      + '而被扫文本是本仓源码,`//` 只出现在真注释里 ⇒ 当前无触发点。'
+      + '★ 方向安全:剥多了只会让 `hasAll` 变**假** ⇒ 用例变红(可见),不会静默变绿;'
+      + '边界另有负对照钉住(只改注释的注入不该让判据红)。挂 CR-18 同批处理。',
+  },
 
   /* ─────────── C:import 探测只认 from(10 处)─────────── */
   {

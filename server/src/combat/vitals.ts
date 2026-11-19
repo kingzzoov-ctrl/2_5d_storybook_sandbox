@@ -624,8 +624,17 @@ export class VitalsSystem {
     return { applied, blockedByIframe: false, downed };
   }
 
-  /** 移除一个玩家。 */
+  /**
+   * 移除一个玩家。
+   *
+   * ★ WS-FND-131(P2):**抗性表也按 id 索引**,而它此前**全仓没有删除点**
+   * (`this.resists` 只有写与读)⇒ 同名玩家重连会**继承上一轮的元素抗性**
+   * (表现:`elementResistOf` 一进场就返回 0.5 而不是中性 1.0)。
+   * 房间效果那条读侧(`pushRoomElementResist`)要等到下一次**慢帧**才会把它
+   * 推回中性值 —— 而「移除世界 → 下一慢帧」之间的那段窗口仍是错的。
+   */
   unregister(id: string): boolean {
+    this.resists.delete(id);
     return this.players.delete(id);
   }
 

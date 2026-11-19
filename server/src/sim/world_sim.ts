@@ -2213,13 +2213,46 @@ export class WorldSim {
       if (b === undefined) return rawGet(id);
       const cached = rawGet(id);
       /* 缓存 key 存在但 body 换了(重生/替换)时也要返回最新的 body */
-      if (cached !== undefined && cached.body === b) return cached;
-      const actor: CarryActor = { body: b, shield: cached?.shield ?? false };
+      if (cached !== undefined && cached.body === b && cached.unavailable === this.liftVetoOf(id)) return cached;
+      /* ★ 第八轮 P1:`unavailable` 必须**每次读都重算**(倒地 / 泡泡 / 打盹都是
+         活状态),否则一次缓存就会把"三秒前还不能动"判到三秒后。 */
+      const actor: CarryActor = {
+        body: b,
+        shield: cached?.shield ?? false,
+        unavailable: this.liftVetoOf(id),
+      };
       view.set(id, actor);
       return actor;
     };
     view.has = (id: string): boolean => bodies.has(id) || rawGet(id) !== undefined;
     return view;
+  }
+
+  /**
+   * **能不能被举起 / 能不能举人**的统一状态源(第八轮 P1)。
+   *
+   * ## 修前为什么等于没判
+   *
+   * `carry.ts#canLift` 只读 `body.state`,而生产里 `body.state` **恒 `NORMAL`**
+   * (`WorldSim` 从不写它;倒地 / 泡泡 / 打盹三套事实住在
+   * `vitals.downed` / `liveBubbles` / `afkRuns`)。于是
+   * `lift('a','b')` 能把倒地者、被 227 泡泡困住者、打盹者一起举起来,
+   * `syncChain` 还会给他们打上 `STUNNED` —— 三种状态同时成立。
+   *
+   * ## 为什么只覆盖玩家
+   *
+   * 这三套表都是**玩家**维度(`vitals` 只登记玩家)。生物走 `body.state`
+   * (FROZEN 等由物理/内容层写)⇒ 返回 `null` 即"按修前语义处理",不改变
+   * 「生物可以互相举」这条既有行为(WS-02 的判据都直接 `new CarrySystem` 测)。
+   */
+  private liftVetoOf(actorId: string): string | null {
+    if (!this.playerIds.has(actorId)) return null;
+    if (this.vitals.get(actorId)?.downed === true) return 'DOWNED';
+    if (isTrapped(this.liveBubbleOf(actorId))) return 'TRAPPED';
+    if (this.vitals.stunOf(actorId) > 0) return 'STUNNED';
+    /* 打盹 = 站在那儿睡着(`afkRuns` 是玩法表,与连接态的 `afkPlayers` 不是一张)。 */
+    if (this.afkRuns.has(actorId)) return 'DOZING';
+    return null;
   }
 
   /**
@@ -2229,6 +2262,11 @@ export class WorldSim {
    * 与「每帧推进」区分:玩家按键才调用,不是每帧都试。
    */
   lift(carrierId: string, targetId: string): CarryReject {
+    /* ★ 第八轮 P1:施术者自己也得能自主行动 —— 倒地 / 被 227 泡泡困住 / 眩晕 /
+       打盹的人不该"伸手扛人"(与 `applyPlayerMove` 的行动权闸同一处状态源)。
+       目标侧的同一条闸在 `canLift` 里(读 `CarryActor.unavailable`,由 `carryActors`
+       投影进来)。 */
+    if (this.liftVetoOf(carrierId) !== null) return CarryReject.UNAVAILABLE;
     return this.carry.tryLift(carrierId, targetId);
   }
 
@@ -4087,10 +4125,43 @@ export class WorldSim {
    * ★ D-06 起**顺带记住出生点**(只在首次登记时写):`resetWorld` 要把玩家
    *   送回「他们进入这个世界时的位置」,而那个位置只有调用方知道一次。
    *   见 `spawnPoints` 的 docblock。
+   *
+   * ## ★ 第八轮实测 P2:同一个 id **再次 add** 的语义在这里写死
+   *
+   * 修前:无条件 `physics.spawn`(刚体**搬到新格** + 旁表被回收)再
+   * `vitals.register`(**满血**、清 iframe / 眩晕计时)⇒ 一次"重入"顺手把血量与
+   * 状态重置掉,而**不抛错、不告警**;调用方以为只是登记,实际语义是重生。
+   *
+   * 现在只有两档,且返回值可判定:
+   * ```text
+   * 'CREATED'    首次登记      —— 全套(刚体 / AOI / playerIds / vitals / 出生点)
+   * 'RELOCATED'  已登记过玩家   —— **只搬位置**(+ AOI 刷新);不动 vitals 的血与状态,
+   *                              也不覆盖出生点
+   * ```
+   * 为什么**保留**"搬位置"而不是整个 no-op:本仓既有用法就是把 `addPlayer`
+   * 当**传送**(测试夹具与 `net/room.ts` 的重连都这么用,几十处
+   * `addPlayer('p1', …)` 直接改坐标)—— 改成 no-op 会静默改掉那些调用点。
+   * 于是"去掉副作用 + 让重入可观测"是这里的修法:`playerAddDuplicates` 计数 +
+   * 返回 `'RELOCATED'`(不再"自认不抛错不告警")。
    */
-  addPlayer(id: string, x: number, y: number): void {
+  addPlayer(id: string, x: number, y: number): 'CREATED' | 'RELOCATED' {
+    const hadPlayer = this.playerIds.has(id);
+    const hadBody = this.physics.bodies.has(id);
     this.physics.spawn(id, { x, y, z: 0 });
+    /* ★ 格位唯一(WS-FND-130 P2):出生 / 传送的落点与**别的**刚体同格时**记账**。
+       只记不挪 —— `occupantsAt` 是查询口,「同格就强制挪开」属玩法裁决,这里不替它决定
+       (口径见 `spawnCellClash` 的 docblock)。 */
+    if (this.physics.occupantsAt(Math.floor(x), Math.floor(y)).some((o) => o !== id)) this.spawnCellClash += 1;
     this.aoi.registerMob(id, x, y);
+    if (hadPlayer) {
+      /* 重入(重连 / 读档 / 测试传送):只搬位置 —— **不**重新 register vitals。 */
+      this.playerAddDuplicates += 1;
+      this.syncPlayers();
+      return 'RELOCATED';
+    }
+    /* 撞号(刚体在、但没登记过玩家 ⇒ 那是生物刚体):登记照旧(否则玩家"看不见"),
+       但同样留痕 —— 这种 id 冲突正是"生物冒充玩家"那一族判据的输入。 */
+    if (hadBody) this.playerAddDuplicates += 1;
     /* 记账 —— 供 syncPlayers 区分玩家与生物(两者都在 physics.bodies 里) */
     this.playerIds.add(id);
     /* 登记生命值 —— 漏了这一步的表现是「生物打玩家永远不掉血」,
@@ -4100,7 +4171,27 @@ export class WorldSim {
        覆盖它会让「重置回出生点」把玩家送到上一次断线的地方。 */
     if (!this.spawnPoints.has(id)) this.spawnPoints.set(id, { x, y });
     this.syncPlayers();
+    return 'CREATED';
   }
+
+  /**
+   * **已登记玩家被再次 `addPlayer`** 的次数(诊断与断言用)。
+   *
+   * 为什么要有它:"重入"在修前是完全不可观测的(位置会被改、还会满血),
+   * 而"看不见的语义变更"正是本仓反复点名的病灶 ⇒ 至少要让**次数**可读。
+   */
+  playerAddDuplicates = 0;
+
+  /**
+   * **出生 / 传送落点与别的刚体同格**的次数(`addPlayer` 与 `addMob` 各记一笔)。
+   *
+   * 为什么**只记不挪**(口径写清,否则下一个人会以为这里是漏了实现):
+   * 物理层**允许**同格 —— 两两碰撞只做圆的分离(半径 0.35 的两个圆可以完全重合),
+   * 传送 / 读档 / 出生点也常指向同一格;所以「同格要不要强制挪开」是**玩法裁决**,
+   * 不是物理事实。没有这个数时,「真的撞在一起了」与「压根没发生过」在外面
+   * **分不开**(本仓反复点名的「不可判定的失败」)⇒ 先把事实变成可读的数。
+   */
+  spawnCellClash = 0;
 
   /**
    * 最后一次 `applyPlayerMove` **被拒**的理由;`null` = 未发生拒绝。
@@ -4214,8 +4305,28 @@ export class WorldSim {
    * 那正是 DAMAGE-LOOP D1 记录的「被野猪撞中,位置不变」。
    * ⇒ 击退 = **剩余位移** + **搬家窗口**:位移推完前 `applyPlayerMove` 一律拒绝
    * (`lastMoveRejection = 'KNOCKBACK'`),客户端不会把击退抹掉。
+   *
+   * ## ★ 第八轮实测 P1:位置搬家**必须扫掠**(修前是纯赋值)
+   *
+   * 修前 `tickKnockback` 直接 `b.x += stepX; b.y += stepY` —— 一次 1~2 格、
+   * 完全不看地形。贴着 1 格厚的实心墙被击退 ⇒ 圆心直接落进墙格;而
+   * `resolveTerrainWalls` 的四条边判定要求"圆的**邻格**实心",圆心已在墙里时
+   * 可能一条都不成立 ⇒ **滞留在墙内**。地图边缘同理(出界后只能靠 `clampBounds`
+   * 拉回一格,那已经不是原来的击退方向了)。
+   *
+   * 现在位移统一走 `PhysicsWorld.sweepCircle`(落点实心 / 越界 ⇒ **退到最后一个
+   * 合法点**),被挡下就**立刻关窗**并记一次 `knockbackBlockedCount`
+   * (窗口不关的后果是"之后所有移动报文都被拒",见 `tickKnockback` 里的注释)。
    */
   private readonly knockbacks = new Map<string, { dx: number; dy: number; left: number }>();
+
+  /**
+   * 因**撞墙 / 出界**而提前结束的击退次数(诊断与断言用)。
+   *
+   * 为什么要有它:"被墙拦住"这个事实若不可观测,「击退真的被墙挡下了」与
+   * 「击退压根没发生」在外面**分不开**(本仓反复点名的"不可判定的失败")。
+   */
+  knockbackBlockedCount = 0;
 
   private static readonly KNOCKBACK_STEPS = 2;
 
@@ -4229,7 +4340,13 @@ export class WorldSim {
   private static readonly KNOCKBACK_DAMAGE_PER_CELL = 20;
   /**
    * 受击击退的**总位移上限**(格)。**必须有上限**:`applyKnockback` 一次性把位移写进位置,
-   * 没有上限时一次 100 伤害会推 5 格(穿墙/出界由 physics 兜,但观感与救援半径都崩)。
+   * 没有上限时一次 100 伤害会推 5 格(观感与救援半径都崩)。
+   *
+   * ★ 第八轮订正:这里原写「穿墙/出界由 physics 兜」—— **那句话不是事实**。
+   *   `physics` 只在「圆心仍自由、圆边越界」时推回,而位置路径的击退是
+   *   **一步到位**的搬家(不走速度积分、不过子步拆分)⇒ 落点进墙就滞留墙内。
+   *   兜住它的是 `tickKnockback` 里的 `sweepCircle`(见 `knockbacks` 的 docblock),
+   *   不是物理步的下游;物理步只补一条"已经从墙里出来"的通道(`unstickFromSolid`)。
    *
    * 取 `2` = **D-09 裁决的同量级值**(`min(2, 实际伤害 / 20)` 格,owner 2026-11-16);
    * 位移上界只能是**格**,不能用武器的格/秒。
@@ -4478,8 +4595,24 @@ export class WorldSim {
          这条由 WS-FND-49 的 FND49-6/FND49-7 钉住。 */
       const stepX = k.dx / k.left;
       const stepY = k.dy / k.left;
-      b.x += stepX;
-      b.y += stepY;
+      /* ★ 第八轮 P1:这一步**扫掠**过去,不许直接搬家(见 `knockbacks` 的 docblock)。
+         无遮挡时 `sweepCircle` 原样返回终点 ⇒ 位移与修前逐位相同(WS-FND-98 用
+         `1e-9` 精度钉着 `min(2, 伤害/20)`)。 */
+      /* ★ 起点合法性:`sweepCircle` 的隐含前提是起点合法(起点已在墙格时二分的 `lo`
+         停在 0 ⇒ 原样不动、救不出来)。先用 `clampToFreeCell` 把起点拉回最近合法格;
+         起点合法时它**逐位原样**返回 ⇒ 下面的位移仍与修前逐位相同。 */
+      const from = this.physics.clampToFreeCell(b.x, b.y, b.radius);
+      const s = this.physics.sweepCircle(from.x, from.y, stepX, stepY, b.radius);
+      b.x = s.x;
+      b.y = s.y;
+      /* 落点被墙 / 边界挡下 ⇒ **退到最后一个合法点**、剩下的一次性作废,**并且立刻关窗**。
+         窗口必须关:位置已经到头了,留着它只会让"之后所有移动报文都被拒"
+         (`lastMoveRejection = 'KNOCKBACK'`),那正是下面那条注释说的老症状。 */
+      if (s.blocked) {
+        this.knockbackBlockedCount += 1;
+        this.knockbacks.delete(id);
+        continue;
+      }
       const left = k.left - 1;
       if (left <= 0) this.knockbacks.delete(id);
       else this.knockbacks.set(id, { dx: k.dx - stepX, dy: k.dy - stepY, left });
@@ -4727,6 +4860,23 @@ export class WorldSim {
        会继承上一轮的**开盾状态**(凭空免疫整蛊)与**起跳冷却**。 */
     this.shieldOn.delete(id);
     this.jumpReadyFrame.delete(id);
+    /* ★ WS-FND-131(P2):**五张按玩家 id 索引的「玩家世代」表**此前一张都没清 ——
+       它们都靠 `rebuildWorld` 刻意保留(那是**世界换代**,不是玩家离场),
+       而「这条 id 已经不在房间里」是另一件事:
+       ```
+       progresses   等级/经验  漏清 ⇒ 同名重连**继承上轮的等级**(一进场就 30 级)
+       profiles     装备档案  漏清 ⇒ 继承上轮的 wearing(凭空拿着上轮的武器)
+       baseMaxHp    上限基准  漏清 ⇒ 与 `vitals` 重新 register 的 100 打架
+       partyTeams   队籍      漏清 ⇒ 新一局一进场就**算进上一局的红/蓝队**
+       downedStates 倒下态    漏清 ⇒ 重连后继承「已倒下/救援计时」
+       ```
+       ⇒ 五张都是**按 id** 的玩家数据,生命周期必须跟着 id 走(与上面那批同一条纪律)。
+       ⚠️ `vitals.unregister` 里也补了 `resists`(元素抗性)的删除点,见那个方法。 */
+    this.progresses.delete(id);
+    this.profiles.delete(id);
+    this.baseMaxHp.delete(id);
+    this.partyTeams.delete(id);
+    this.downedStates.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -4925,6 +5075,12 @@ export class WorldSim {
    */
   private syncFoodFriction(): void {
     for (const id of this.vitals.ids()) {
+      /* ★ 第八轮 P2:旁表只对**有刚体**的 id 写。
+         `vitals.ids()` 是「有生命值的人」,`physics.bodies` 是「有刚体的人」——
+         两者在正常情况下同集合,但"有 vitals 无刚体"的 id(半注册 / 已卸载的刚体)
+         会让 `setMuMul` 造出一条**悬空条目**。物理层的 setter 现在会拒(`false`),
+         世界侧就不该再把它们喂进去(拒绝是兜底,不是流程)。 */
+      if (!this.physics.bodies.has(id)) continue;
       const mu = mergeFoodBuffs(this.foodBuffs.get(id) ?? []).muOverride;
       if (mu > 0) this.physics.setMuMul(id, mu);
       else this.physics.clearMuMul(id);
@@ -5300,14 +5456,22 @@ export class WorldSim {
          与「倒下不回血」两条边界,不在这里重写一遍。 */
       if (r.healHp > 0) this.vitals.heal(id, r.healHp);
 
-      /* 锻造解锁:记录 `stepRoomEffects` 的**返回判定**,不在此重判。 */
-      if (r.forgeUnlocked) this.forgeUnlockedIds.add(id);
+      const sleeping = this.sleepSource?.(id) === true ? 1 : 0;
+
+      /* 锻造解锁:记录 `stepRoomEffects` 的**返回判定**,不在此重判房间归属;
+         但★第八轮 P1 加一条**状态互斥**:站着睡着(`sleeping === 1`)的人不可能
+         同时"正在大师锻造房解锁中" —— 修前这两个事实可以同时为真
+         (`forgeUnlocked: true` + `sleeping: 1`),而它们各自的消费者
+         (`forgeUnlocked()` 的打造闸 / 打盹的经验与露水)会同时生效。
+         口径:睡觉**胜过**房间 —— 醒来后下一个慢帧自然重新判定(房间判定没被改,
+         只是这一帧的结论被"人在睡"覆盖)。 */
+      const forgeUnlocked = r.forgeUnlocked && sleeping === 0;
+      if (forgeUnlocked) this.forgeUnlockedIds.add(id);
       else this.forgeUnlockedIds.delete(id);
 
-      const sleeping = this.sleepSource?.(id) === true ? 1 : 0;
       out.push({
         playerId: id, roomKey: key, healHp: r.healHp, maxHpMul: r.maxHpMul,
-        forgeUnlocked: r.forgeUnlocked, sleeping, mealMul: r.mealMul,
+        forgeUnlocked, sleeping, mealMul: r.mealMul,
       });
     }
     this.lastRoomEffects = out;
@@ -6076,9 +6240,29 @@ export class WorldSim {
       });
   }
 
-  /** 注册一只生物:物理刚体 + AOI 记录 + 刷怪计数 + **宿主登记**。 */
-  addMob(id: string, biome: string, x: number, y: number): void {
+  /**
+   * 注册一只生物:物理刚体 + AOI 记录 + 刷怪计数 + **宿主登记**。
+   *
+   * ## ★ 第八轮实测 P2:同一个实例 id 再注册 = **替换**,这件事写死在返回值里
+   *
+   * 已在册的 id 再次 `addMob` 时:`physics.spawn` 覆盖刚体(**搬到新格** + 旁表回收)、
+   * `mobHost.addMob` 换一条**满血、FSM 归零**的运行时。这个"替换"语义**是刻意的**
+   * (`WS-FND-19` 的 FND19-9 直接钉它:序号重复 = 同一个实例 ⇒ 只应有一条;
+   * 姜饼小人复活也走它),所以这里**不改行为**。
+   *
+   * 改的是"不可观测":返回值 + `mobAddDuplicates` 让「这一次是新建还是替换」
+   * 可判定 —— 修前两者在外面**完全一样**(不抛错、不告警、没有返回值),
+   * 而"撞号"是有真实后果的(`killLedger` 按实例 id 去重 ⇒ 同号的那只打死
+   * **不再结算经验**,见 `bumpMobOrdinal` 的 docblock)。
+   *
+   * @returns `'CREATED'` = 新建;`'REPLACED'` = 覆盖了同 id 的已有刚体。
+   */
+  addMob(id: string, biome: string, x: number, y: number): 'CREATED' | 'REPLACED' {
+    const hadBody = this.physics.bodies.has(id);
     this.physics.spawn(id, { x, y, z: 0 });
+    /* ★ 格位唯一(WS-FND-130 P2):与 `addPlayer` 同一条口径 —— 落点与**别的**刚体
+       同格就记账,不强制挪开(理由见 `spawnCellClash` 的 docblock)。 */
+    if (this.physics.occupantsAt(Math.floor(x), Math.floor(y)).some((o) => o !== id)) this.spawnCellClash += 1;
     this.aoi.registerMob(id, x, y);
     this.spawner.add(biome, 1);
     /* 登记到宿主 —— 漏了这一步的表现是「AOI 唤醒了它,但宿主不认识,
@@ -6086,7 +6270,21 @@ export class WorldSim {
     const def = mobDefOf(id);
     if (def) this.mobHost.addMob(id, def, x, y, { anchorX: x, anchorY: y });
     else this.unknownMobs.push(id);
+    if (hadBody) {
+      this.mobAddDuplicates += 1;
+      return 'REPLACED';
+    }
+    return 'CREATED';
   }
+
+  /**
+   * **同 id 覆盖式注册**发生的次数(`addMob` 的 `'REPLACED'` 档)。
+   *
+   * 它是"格位唯一"这条判据的可观测量:同一个 id 世界里**永远只有一条刚体**
+   * (`physics.bodies` 是 Map),但"有人用同一个号注册了第二次"这件事只有这个计数
+   * 说得出来 —— 修前它是**静默**的(序号水位那一族缺陷就靠它现形)。
+   */
+  mobAddDuplicates = 0;
 
   /**
    * 某物种的实例序号**水位**(已经发到几号;从没发过 = 0)。
@@ -6572,8 +6770,14 @@ export class WorldSim {
         const bossEffect = this.bossEffectOf(h.attackerId, this.bossPhaseOf(h.attackerId));
         const warnSec = this.bossWarnSecOf(h.attackerId);
         if (bossEffect === 'STUN' && warnSec > 0) {
-          this.vitals.applyStun(res.playerId, warnSec);
-          this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'STUN' });
+          /* ★ 第八轮 P1:与整蛊路径**同一个闸**(`stunVetoReason`)—— Boss 的定身
+             也不许写到倒地者 / 已被泡泡困住者身上(否则 `BUBBLED + STUNNED` 并存)。
+             被拦下时**不进 `lastBossEffects`**:那个台账记的是"真的发生了什么"
+             (`applyPlayerMove` 的 `lastMoveRejection` 同一口径:不谎报)。 */
+          if (this.stunVetoReason(res.playerId) === null) {
+            this.vitals.applyStun(res.playerId, warnSec);
+            this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'STUN' });
+          }
         } else if (bossEffect === 'BLIND' && warnSec > 0) {
           this.vitals.applyBlind(res.playerId, warnSec);
           this.lastBossEffects.push({ bossId: h.attackerId, playerId: res.playerId, effect: 'BLIND' });
@@ -7150,6 +7354,17 @@ export class WorldSim {
   /** 某玩家已攒的露水(诊断与断言用)。未登记返回 0。 */
   dewOf(playerId: string): number {
     return this.afkRuns.get(playerId)?.dew ?? 0;
+  }
+
+  /**
+   * 某玩家**是否在打盹**(玩法表 `afkRuns` 的按 id 读口)。
+   *
+   * 为什么要有它:`dozingCount()` 只说"有几个人在睡",而判断"这个人现在能不能被举 /
+   * 能不能举人"(`liftVetoOf`)需要**按 id** 的事实;没有这个读口,判据就只能去数总数
+   * (数总数在多人世界里对不上人)。
+   */
+  dozingOf(playerId: string): boolean {
+    return this.afkRuns.has(playerId);
   }
 
   /** 已登记的打盹玩法态玩家数(诊断用)。 */
@@ -8804,6 +9019,9 @@ export class WorldSim {
    */
   private syncFoodPhysics(): void {
     for (const id of this.vitals.ids()) {
+      /* ★ 第八轮 P2:与 `syncFoodFriction` 同一条闸 —— 只对**有刚体**的 id 写旁表
+         (`vitals.ids()` 里多出来的 id 只会在物理层留一条悬空条目)。 */
+      if (!this.physics.bodies.has(id)) continue;
       const t = foodPhysicsOf(this.buffsOf(id));
       if (t.speedCapMul !== null) this.physics.setSpeedCap(id, BASE_MOVE_SPEED * t.speedCapMul);
       else this.physics.clearSpeedCap(id);
@@ -8889,6 +9107,16 @@ export class WorldSim {
     const t = this.physics.bodies.get(targetId);
     if (a === undefined || t === undefined) return { ...none, reason: 'NO_BODY' };
     if (!this.playerIds.has(targetId)) return { ...none, reason: 'NOT_A_PLAYER' };
+    /* ★ 第八轮实测 P1:状态互斥闸。
+       修前这条整蛊路径**不查**倒地 / 被困,于是「倒地者挨一发带 `stunSec` 的整蛊」
+       ⇒ `vitals.downed === true` 与 `stunnedSec > 0` 同时成立;目标已被 227 泡泡
+       困住时再补一发 ⇒ `BUBBLED + STUNNED` 并存(与 `STATE_EXCLUSION` 那条不变量
+       直接冲突)。两种组合的后果都是逻辑分支互相抵消:移动闸先报 `DOWNED`、
+       晕眩计时却在后台烧完。
+       判据来源与移动闸 / 攻击闸**同一处**(`vitals.downed` / `liveBubbleOf`),
+       不新造第二套"是否倒地" —— 见 `applyPlayerMove` 那三条闸的注释。 */
+    const veto = this.stunVetoReason(targetId);
+    if (veto !== null) return { ...none, reason: veto };
     const stun = Number.isFinite(p.stunSec) && p.stunSec > 0 ? p.stunSec : 0;
     if (stun > 0) this.vitals.applyStun(targetId, stun);
     /* 击退方向:施术者 → 目标(权威坐标),长度归一;两人重叠 ⇒ 不推(不造 NaN)。 */
@@ -8904,6 +9132,34 @@ export class WorldSim {
       applied: true, reason: 'ok', stunSec: stun,
       moveTiles: Number.isFinite(p.moveTiles) ? p.moveTiles : 0, flag: p.flag,
     };
+  }
+
+  /**
+   * **眩晕写入的统一闸**(第八轮 P1):目标当前是否"不该再被写眩晕"。
+   *
+   * ```text
+   * 'DOWNED'   vitals.downed === true          —— 倒地者不需要再被打晕
+   * 'TRAPPED'  isTrapped(liveBubbleOf(id))     —— 227 泡泡(这就是 BUBBLED 那一半)
+   * 'STUNNED'  vitals.stunOf(id) > 0           —— 已经在眩晕里,不叠第二份计时
+   * null       可以写
+   * ```
+   *
+   * ## 为什么必须集中在**一个**函数里
+   *
+   * 写 `stunnedSec` 的点有两个(`applyPrankToTarget` 的整蛊路径、`stepCombat` 的
+   * Boss `STUN` 效果)。两个点各写各的判据 ⇒ 迟早只堵住一条(修前两条都没堵)——
+   * 而"堵没堵住"这件事本身**不可观测**。所以判据只有这一份,两个写入点都调它;
+   * 真值来源与移动闸 / 攻击闸**逐条同源**(`vitals.downed` / `liveBubbleOf` /
+   * `vitals.stunOf`),不新造第二套状态。
+   *
+   * ⚠️ 它与「`STATE_EXCLUSION` 不变量(BUBBLED + STUNNED 不许并存)」是同一件事的
+   *   两侧:不变量负责在快照上**抓**,这里负责在写入点**防**。
+   */
+  private stunVetoReason(playerId: string): 'DOWNED' | 'TRAPPED' | 'STUNNED' | null {
+    if (this.vitals.get(playerId)?.downed === true) return 'DOWNED';
+    if (isTrapped(this.liveBubbleOf(playerId))) return 'TRAPPED';
+    if (this.vitals.stunOf(playerId) > 0) return 'STUNNED';
+    return null;
   }
 
   /** 采集乘子(602「伐木与采矿速度 +20%」)—— 归属到**发起采集的玩家**。 */

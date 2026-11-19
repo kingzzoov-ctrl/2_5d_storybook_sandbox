@@ -27,7 +27,16 @@ import {
   type DynamicBody,
 } from '../../../shared/types/physics.ts';
 /* 弹跳初速必须与物理世界共用同一份离散反解,否则两处会得出不同数值 */
-import { launchSpeedForApex } from './world.ts';
+/* 弹跳初速必须与物理世界共用同一份离散反解,否则两处会得出不同数值 */
+/* ★ 第八轮:质量归一(`safeMass`)与状态写入(`applyTimedBodyState`)也**只**取
+   `physics/world.ts` 那一份 —— 本文件不再自己写 `mass === 0 ? 1 : mass` 之类的
+   局部兜底(它对 `NaN` / `+Infinity` 都漏)。 */
+import {
+  KNOCKBACK_STUN_SEC,
+  applyTimedBodyState,
+  launchSpeedForApex,
+  safeMass,
+} from './world.ts';
 
 /* ═══════════════════════ 1. 配表与常量 ═══════════════════════ */
 
@@ -49,6 +58,12 @@ export const PASS_WINDOW = 0.25;
 /** 叠罗汉上层被甩落时的水平散开速度(格/秒)。 */
 export const STACK_SHED_SPEED = 2.0;
 
+/**
+ * 拒绝理由。末尾的 `UNAVAILABLE` 是**第八轮 P1 新增**的:
+ * 「这个人现在不能自主行动」(倒地 / 被 227 泡泡困住 / 眩晕 / 打盹)。
+ * 它与 `HEAVY_BOSS`(太重、有盾、已背负)**分开留痕** —— 排查时
+ * 「举不动」与「人躺在地上」不能混成一个值(与本仓 `lastMoveRejection` 同取舍)。
+ */
 export const CarryReject = {
   OK: 'OK',
   TOO_FAR: 'TOO_FAR',
@@ -58,6 +73,7 @@ export const CarryReject = {
   ALREADY_CARRIED: 'ALREADY_CARRIED',
   SELF: 'SELF',
   HEAVY_BOSS: 'HEAVY_BOSS',
+  UNAVAILABLE: 'UNAVAILABLE',
 } as const;
 export type CarryReject = (typeof CarryReject)[keyof typeof CarryReject];
 
@@ -70,6 +86,23 @@ export interface CarryActor {
   body: DynamicBody;
   /** 平安盾(物品 218)是否开启 */
   shield: boolean;
+  /**
+   * **不能自主行动**的权威标记(`null` / 缺省 = 可以自主行动)。
+   *
+   * ## 为什么必须有这个字段(第八轮 P1)
+   *
+   * `canLift` 原来只读 `body.state`,而**生产里 `body.state` 恒 `NORMAL`**:
+   * `spawn` 造出来就是 `NORMAL`,此后 `sim/world_sim.ts` 一个字节都没写过它
+   * (倒地 / 泡泡 / 打盹三套事实分别住在 `vitals.downed` / `liveBubbles` /
+   * `afkRuns`)。⇒ 只读 `body.state` 的检查在生产中**恒不成立**:
+   * 倒地者、被泡泡困住者、打盹者照样被举起来,并被打上 `STUNNED`
+   * (`syncChain` 干的那件事)—— 三个人状态同时成立。
+   *
+   * ⇒ 由**编排层**(`WorldSim.carryActors()`)把真实状态**投影**进来,本模块按它判定。
+   * 值只用于留痕(拒绝理由),判据是"非空即不可举"。
+   * 单测直接 `new CarrySystem(map)` 时缺省不填 ⇒ 与接线前逐字一致。
+   */
+  unavailable?: string | null;
 }
 
 export interface ChainNode {
@@ -127,6 +160,13 @@ export function canLift(carrier: CarryActor, target: CarryActor, dist: number): 
   if (carrier.body.id === target.body.id) return CarryReject.SELF;
   if (target.body.state === BodyState.FROZEN) return CarryReject.HEAVY_BOSS;
   if (target.body.state === BodyState.GHOST_BUBBLE) return CarryReject.HEAVY_BOSS;
+  /* ★ 第八轮 P1:**真实状态**的闸(倒地 / 泡泡困住 / 眩晕 / 打盹)。
+     上面两条读的是 `body.state`,而生产里它恒 `NORMAL` ⇒ 单靠它们等于没判
+     (见 `CarryActor.unavailable` 的注释)。顺序放在「物理状态」之后、
+     「已在链上 / 质量 / 距离」之前:它与位置无关,与上两条同一档。 */
+  if (target.unavailable !== undefined && target.unavailable !== null && target.unavailable !== '') {
+    return CarryReject.UNAVAILABLE;
+  }
   if (target.body.carriedBy !== null) return CarryReject.ALREADY_CARRIED;
   if (isKnockbackImmune(target)) return CarryReject.SHIELDED;
   /* 太重且没带扁担(216)也举不动 —— 先判质量,再判距离:
@@ -306,7 +346,12 @@ export class CarrySystem {
         a.body.vx = base.body.vx;
         a.body.vy = base.body.vy;
       }
-      a.body.state = k === 0 ? a.body.state : BodyState.STUNNED;
+      /* ★ 第八轮 P1:链上第 k>0 层统一打 `STUNNED`(肩上的人动不了),但**不覆盖**
+         优先级更高的状态(`BUBBLED` / `FROZEN` / `GHOST_BUBBLE`)—— 旧写法是无条件
+         赋值,被泡泡困住的人一被举起来就会被改写成 `STUNNED`。
+         计时传 0 是刻意的:链上托管期间由本系统管,不该被物理层的计时器放回
+         `NORMAL`(与修前逐字同行为:那 0.4 秒的旧逻辑只属于冲量路径)。 */
+      if (k > 0) applyTimedBodyState(a.body, BodyState.STUNNED, 0);
       nodes.push({ id: a.body.id, index: k, z: a.body.z });
     }
     return nodes;
@@ -431,6 +476,20 @@ export class CarrySystem {
   /**
    * 施加冲量 J(单位:格·质量/秒),质量 m → 速度变化 Δv = J/m。
    * 平安盾开启者直接免疫,并把冲量原样返回 0。
+   *
+   * ## ★ 第八轮 P2:质量一律经 `safeMass`
+   *
+   * 修前这里是 `a.body.mass === 0 ? 1 : a.body.mass` —— 那份局部兜底只挡住 `0`
+   * (`NaN` 与 `+Infinity` 都漏):`Δv = J / NaN = NaN` 会写进 `vx`,而 `NaN`
+   * 顺着积分器每帧传播,位置随即变 `NaN`。全仓的归一规则只有 `physics/world.ts`
+   * 的 `safeMass` 一个入口(它把 `NaN` / `±Infinity` / `0` / 负数 / 小数都拒掉)。
+   *
+   * ## ★ 第八轮 P1:状态写入走 `applyTimedBodyState`
+   *
+   * 修前无条件 `state = STUNNED; stateTimer = 0.4`,把**带计时的 `BUBBLED`**
+   * 顶掉(泡泡的剩余时间直接丢),而物理层的"计时到点回 NORMAL"又不认 `BUBBLED`
+   * ⇒ 泡泡状态既可能被抹掉、也可能永远解不开。现在按优先级互斥:
+   * 优先级不低于 `STUNNED` 的状态(BUBBLED / FROZEN / GHOST_BUBBLE)保留原状。
    */
   applyImpulse(id: string, jx: number, jy: number, jz: number): { dvx: number; dvy: number; dvz: number; blocked: boolean } {
     const a = this.actors.get(id);
@@ -439,7 +498,7 @@ export class CarrySystem {
       this.shieldBlocks += 1;
       return { dvx: 0, dvy: 0, dvz: 0, blocked: true };
     }
-    const m = a.body.mass === 0 ? 1 : a.body.mass;
+    const m = safeMass(a.body.mass);
     const dvx = jx / m;
     const dvy = jy / m;
     const dvz = jz / m;
@@ -448,8 +507,7 @@ export class CarrySystem {
     a.body.vx += dvx;
     a.body.vy += dvy;
     a.body.vz += dvz;
-    a.body.state = BodyState.STUNNED;
-    a.body.stateTimer = 0.4;
+    applyTimedBodyState(a.body, BodyState.STUNNED, KNOCKBACK_STUN_SEC);
     return { dvx, dvy, dvz, blocked: false };
   }
 

@@ -29,6 +29,7 @@ import {
 } from './items-baseline.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
+import { runSelfcheck } from './invariants.ts';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -1854,7 +1855,7 @@ const CLIENT_HTML_ENTRY = './src/main.ts';
  *
  * ## 本表的两个条数是**可被代码算出来的数** —— 故必须写成「自称」
  *
- * 可达性白名单 10 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(9)(生产零引用清单,
+ * 可达性白名单 11 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(10)(生产零引用清单,
  * 定义在 `scripts/orphan-audit.ts`)写在这里,由 `scripts/count-audit.ts` 与
  * **运行时** `Map.size` 双向比对:改了名单却忘了同步这两处 ⇒ 当场红在
  * 「文档自称与代码正解不一致」上,而不是让两条注释各自腐烂。
@@ -2159,6 +2160,7 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['shared/types/cooking.ts', '契约先行(D-19 第 2 条):FoodBuffParams 6 槽 + 中性默认。**差集条目**:生产侧 importer 只有 shared/constants/cooking.ts,而它自己也不可达 ⇒ 归入非欠账、不是缺接线动作。(2026-11-18 订正:旧文本说「按 basename 匹配还会算进 server/src/combat/cooking.ts 的 importer」—— 判据已改成**解析后的绝对路径**,那条撞名不再发生;本条判据结果不变,理由按新口径重写。)判据真消费(WS-FND-66 9 条);生产侧本批只接了 defFlat/expMul,其余 4 槽等编排层接线。'],
   ['shared/constants/cooking.ts', '契约先行(D-19 第 2 条):FOOD_PARAM_SLOTS 中性值表(刻意不含平衡数字,只留待平衡注记)。属 **gate-only 型**:生产侧真 importer = **0**(它只被 shared/types/cooking.ts 反向类型引用 —— 那是**别人 import 它**,方向相反),门禁/判据真消费、生产暂不消费,**不是欠账**。(2026-11-18 订正:旧理由把本条归入「非欠账」的依据是 basename 撞名;判据改成解析后的绝对路径后该依据不再成立,`isDiffSet()` 对本条返回 false ⇒ 按新口径重写为 gate-only 型,分类结果不变。)判据真消费(WS-FND-66)。'],
   ['shared/types/events.ts', '契约先行(D-19 第 2 条 / RULINGS-DRAFT EVENT-BUS U6):29 种事件名的命名空间 SSoT。属 gate-only 家族:判据反向扫生产文本防过期(WS-FND-66 第 7 组);生产侧事件名仍是扁平字符串 ⇒ 等编排层接线。'],
+  ['server/src/invariants.ts', '门禁侧快照不变量检查器(WS-FND-128):8 条纯函数不变量 + 手工快照的反例/注入自检。属 **gate-only 家族** —— 生产侧真 importer = 0(它只被 `scripts/invariants.ts` 与 tests/WS-FND-128 消费),而门禁 `runSelfcheck()` **真消费**它(进程内调用,算进 pass/fail 与退出码)⇒ **不是欠账**。接线条件是「两侧都不该接」:它守的是手工快照的形状,生产侧若 import 它反而是把门禁专属的校验逻辑拖进运行时闭包。'],
 ]);
 
 /**
@@ -5150,6 +5152,11 @@ export const CROSS_ANNOTATION: ReadonlyMap<string, string> = new Map<string, str
    + '相容原因:它是 gate-only 的中性值表(判据 WS-FND-66 真消费),生产侧只由 '
    + '`shared/types/cooking.ts` 的合并函数间接消费 ⇒ 不在生产闭包内、也没有生产直接 importer —— '
    + '同一处契约先行的两个投影。'],
+  ['server/src/invariants.ts',
+   '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
+   + '相容原因:它是 **gate-only** 的手工快照不变量检查器(只被 tests/WS-FND-128 与脚本消费,'
+   + '生产侧 0 消费)⇒ 既不在生产闭包里、也没有生产 importer —— '
+   + '同一处豁免的两个投影,不是两条欠账。'],
 ]);
 
 /** `findWhitelistCrossViolations` 的入参(全部可注入 ⇒ 判据可被单独验证)。 */
@@ -8095,6 +8102,15 @@ if (allFlag && (only || frozenOnly || docsOnly || integrationOnly || contentOnly
  * ⇒ ⇒ 判据:**一个"会让别的检查报出误导性错误"的前置条件,必须最先检查。**
  *   检测它的成本越低,就越没有理由把它排在后面。 */
 if (!frozenOnly && !only) checkBomGuard();
+/* ★ WS-FND-128(2026-11-19):**不变量自检** —— 进程内调用纯函数,算进 pass/fail 与退出码。
+   用进程内而不是 spawnSync:`scripts/invariants.ts` 是纯函数(不读盘、不启子进程),
+   进程内调用会把它算进 `pass`/`fail` 计数;子进程形态在"脚本被删"时会静默变成「没跑」。
+   `--frozen` / `--only` 下跳过(与 `checkBomGuard()` 同一守卫口径)。 */
+if (!frozenOnly && !only) {
+  const inv = runSelfcheck();
+  if (!inv.ok) fail(`不变量自检 ${inv.summaryLine}`);
+  else pass(`不变量自检 ${inv.summaryLine}`);
+}
 if (!docsOnly && !only && !integrationOnly && !contentOnly) await checkFrozen();
 /* ⚠️ `runTests()` 必须排在 `checkDocs()` **之前**:
    `checkDocs()` 要用各套件的实测断言数校验 README 表格,

@@ -348,7 +348,7 @@ class ByteReader {
 function writeField(w: ByteWriter, spec: FieldSpec, value: unknown): void {
   switch (spec.type) {
     case FieldType.POS:
-      w.i32(typeof value === 'number' ? quantizePos(value) : 0);
+      w.i32(toPosInt32(spec, value));
       return;
     case FieldType.U8:
       w.u8(toUint(spec, value));
@@ -360,7 +360,7 @@ function writeField(w: ByteWriter, spec: FieldSpec, value: unknown): void {
       w.u32(toUint(spec, value));
       return;
     case FieldType.I16:
-      w.i16(typeof value === 'number' ? value | 0 : 0);
+      w.i16(toI16(spec, value));
       return;
     case FieldType.STR:
     case FieldType.HASH:
@@ -425,11 +425,94 @@ function toUint(spec: FieldSpec, value: unknown): number {
   return n;
 }
 
+/* ═══════════ 定点坐标(pos)与 i16 的取值门(WS-FND-132 / P2 + P3)═══════════
+ *
+ * ## P2:pos 的**静默钳位**(第八轮实测)
+ * `shared/types/wire.ts` 的 `quantizePos` 对越界值**静默钳位**、非有限值 → `0`:
+ * ```text
+ * quantizePos(1e12)      ⇒ 2147483647   ← 静默钳到 i32 max
+ * quantizePos(Infinity)  ⇒ 0            ← 静默吞掉
+ * ```
+ * 而本文件开头 §1 自称「字段取值**一律不钳位**…越界、非有限、非数值 ⇒ **抛错**」——
+ * 旧的 `POS` 分支却直接调 `quantizePos`、**一个 assert 都没有**:
+ * ```text
+ * 修前:writeField(POS) 收到 x=1e12 ⇒ 线上写 2147483647
+ *       ⇒ 解码回 ~2.1e6 格 —— 两端都**不报错**,客户端只是"人突然跑到 200 万格外"
+ * ```
+ * ★ 为什么**不**改 `quantizePos` 本身:它是 `wire.ts` 的**纯量化工具**,
+ *   其「越界钳到端点 / NaN → 0」被 `tests/WS-07` 的 B04 **逐值钉住**
+ *   (那是"量化"这一层应有的语义)。要修的是**协议路径**:本文件是 pos 字段
+ *   上线的**唯一出口**,它必须与自己声明的口径一致。
+ *   判据:`tests/WS-FND-132-protocol-bounds.test.ts` 的 FND132-5/6。
+ *
+ * ## P3:i16 的 `value | 0`(第八轮实测)
+ * 旧 `I16` 分支只做 `value | 0` ⇒ 40000 → 回绕成 **-25536**、NaN → 0、
+ * `Infinity | 0` → 0,**全都不报错**。今日四张字段表**没有** I16 字段
+ * (⇒ 今天是不可达的),但这正是"一旦新增 I16 字段就静默回绕"的形态。
+ * ⇒ 补上与 `toUint` 同规的校验(判据 FND132-11)。
+ */
+/** pos 定点线上是 **i32**(见 `FIELD_TYPE_BYTES.pos === 4`)。 */
+export const POS_INT32_MIN = -2147483648;
+export const POS_INT32_MAX = 2147483647;
+
+/**
+ * pos 字段取值的**唯一**校验口(与 `toUint` 同规:非法即抛错)。
+ *
+ * 合法 = 量化后落在 i32 内的**有限数**;非数值 / NaN / ±Inf / 量化后越界 ⇒ 抛。
+ * 与 `toUint` 一样,它**只报错、不钳**:钳位会把「越界坐标」变成一个
+ * 看似正常的坐标(2.1e6 格)—— 那正是本仓最忌的静默错值。
+ */
+function toPosInt32(spec: FieldSpec, value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(
+      `字段 ${spec.key} 非法取值:${String(value)}(pos 只接受有限数值 —— `
+      + `非有限值一律抛错,协议不做静默钳位)`,
+    );
+  }
+  const exact = Math.round(value * POS_SCALE);
+  if (exact > POS_INT32_MAX || exact < POS_INT32_MIN) {
+    throw new Error(
+      `字段 ${spec.key} 越界:${value}(量化后 ${exact} 超出 i32 定点 `
+      + `${POS_INT32_MIN}..${POS_INT32_MAX})—— 协议不做静默钳位`,
+    );
+  }
+  /* 上面已判过界 ⇒ `quantizePos` 的钳位分支不可达,逐位等价于它的直算结果 */
+  return quantizePos(value);
+}
+
+/** i16 可取的最值(`FIELD_TYPE_BYTES.i16 === 2`)。 */
+export const I16_MIN = -32768;
+export const I16_MAX = 32767;
+
+/**
+ * i16 字段取值的**唯一**校验口(与 `toUint` 同规:非法即抛错)。
+ *
+ * 修前这一路只做 `value | 0`:40000 → **-25536**(回绕)、NaN/±Inf → 0,
+ * 而解码侧读回来永远是"合法"的 i16 ⇒ 两端都看不出错值。
+ * 判据:FND132-11(含"四张表今日无 I16 ⇒ 断言是新增防线"这条前提)。
+ */
+export function toI16(spec: FieldSpec, value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(
+      `字段 ${spec.key} 非法取值:${String(value)}(i16 只接受 ${I16_MIN}..${I16_MAX} 的有限数值)`,
+    );
+  }
+  const n = Math.round(value);
+  if (n < I16_MIN || n > I16_MAX) {
+    throw new Error(
+      `字段 ${spec.key} 越界:${value} 不在 ${I16_MIN}..${I16_MAX}(i16)—— 协议不做静默回绕`,
+    );
+  }
+  return n;
+}
+
 /** 量化的字段取值(比较用),保证「量化后相同即等于没变」,避免浮点抖动刷帧。 */
 function normalized(kind: EntityKind, spec: FieldSpec, value: unknown): unknown {
   switch (spec.type) {
     case FieldType.POS:
-      return typeof value === 'number' ? quantizePos(value) : 0;
+      /* 与 writeField 走**同一个** toPosInt32:比较口径 = 上线口径 ⇒ 不会出现
+         「本帧判为没变、真要写时却抛错」这种半截状态。 */
+      return toPosInt32(spec, value);
     case FieldType.U8:
     case FieldType.U16:
     case FieldType.U32:
@@ -437,7 +520,7 @@ function normalized(kind: EntityKind, spec: FieldSpec, value: unknown): unknown 
          「本帧判为没变、真要写时却抛错」这种半截状态。 */
       return toUint(spec, value);
     case FieldType.I16:
-      return typeof value === 'number' ? value | 0 : 0;
+      return toI16(spec, value);
     case FieldType.STR:
     case FieldType.HASH:
       return typeof value === 'string' ? value : '';
@@ -667,6 +750,32 @@ export interface DecodedPacket {
   bytesConsumed: number;
 }
 
+/* ═══════════ `removed` 的 kind **白名单**(WS-FND-132 / P2)═══════════
+ *
+ * ## 洞(第八轮实测)
+ * 伪造一条 `removedCount = 1` + `{ kind: 9, id: 'p1' }`,**三处都不出声**:
+ * ```text
+ * 编码侧:removed 只由本文件的 EntityKind 循环产出 ⇒ 伪造不了(但也没人挡)
+ * 解码侧:`kind` 原样收下(r.u8()),**不查白名单**
+ * 合入侧:`applyPacket` 的 removed 循环只有 if / else-if ⇒ `kind = 9`
+ *        **一条都不命中** ⇒ `p1` 留在客户端状态里 = **幽灵实体**(两端都不报错)
+ * ```
+ * ⇒ 校验必须落在**解码侧**:它是唯一能挡住伪造的地方。合入侧"不报错"是它的
+ *   设计(未知 kind 只能被忽略),所以不能指望那里出声。
+ * 判据:FND132-7(未知 kind 抛)与 FND132-8(ROOM 也不算可删种类)。
+ */
+/**
+ * 能被 `removed` 表达的种类 —— 只有 PLAYER / WILDLIFE / BOSS。
+ *
+ * 为什么 **ROOM 不算**:房间级 meta 没有"删除"语义(`applyPacket` 从不删它),
+ * 于是 `{ kind: ROOM }` 是一条**会被静默忽略**的条目 —— 正是要拦的形态。
+ * 为什么抽成函数:编码侧(产出 removed)与解码侧(校验 removed)共用**同一份**
+ * 白名单,而不是各写一遍(两份必漂移 —— CR-20)。
+ */
+export function isRemovableKind(kind: unknown): boolean {
+  return kind === EntityKind.PLAYER || kind === EntityKind.WILDLIFE || kind === EntityKind.BOSS;
+}
+
 export function decodePacket(bytes: Uint8Array): DecodedPacket {
   const r = new ByteReader(bytes);
   const version = r.u8();
@@ -682,7 +791,20 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
 
   const removedCount = r.u16();
   const removed: { kind: number; id: string }[] = [];
-  for (let i = 0; i < removedCount; i += 1) removed.push({ kind: r.u8(), id: r.str() });
+  /* ★ WS-FND-132(P2):kind 走**白名单**(理由见上面的说明块)。
+     ⚠️ 必须在 push **之前**判:伪造的 kind 一旦进了 `pkt.removed`,
+        `applyPacket` 会静默忽略它 ⇒ 实体永远留着,而没有任何东西会红。 */
+  for (let i = 0; i < removedCount; i += 1) {
+    const kind = r.u8();
+    const id = r.str();
+    if (!isRemovableKind(kind)) {
+      throw new Error(
+        `removed 的 kind 非法:${kind}(只允许 player/wildlife/boss —— `
+        + `未知 kind 会被合入侧静默忽略 ⇒ 幽灵实体)`,
+      );
+    }
+    removed.push({ kind, id });
+  }
 
   const upsertCount = r.u16();
   const upserts: DecodedPacket['upserts'] = [];
@@ -731,10 +853,73 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
  * (它是唯一同时知道 op 与 base 的地方),而不是指望编码侧列出 removed。
  * `DELTA` 分支**不受影响**:它仍然只按 `pkt.removed` 删、按 upsert 合。
  */
+/* ═══════════ FULL 的帧号**回退** = 世代重置(WS-FND-132 / P2)═══════════
+ *
+ * ## 洞(第八轮实测)
+ * 服务端重启后重发 FULL(`tick = 3`),而客户端手里的 `meta.tick` 已经是 5000:
+ * ```text
+ * 1 FULL 是**自包含快照** ⇒ applyPacket 无条件接受(这是对的:重连时服务端
+ *   的 tick 小于断线前的值是常态;按 tick 丢掉唯一的恢复快照会让客户端**永久冻结**);
+ * 2 ⇒ `meta.tick` 被**拉回** 3;
+ * 3 客户端的单调门(`client/src/net/state_store.ts` 的 apply)只拦 DELTA
+ *   ⇒ 此后 `tick ∈ (3, 5000]` 的**迟到 DELTA** 一律**放行**
+ *   (旧世代的迟到帧与新世代的头几帧**帧号同名**,光看 tick 无法区分);
+ * 4 而三个计数(`decodeErrors` / `emptyFrames` / `staleFrames`)**一个都不涨**
+ *   ⇒ 这条链上没有任何指标会红。
+ * ```
+ * ## 为什么必须**显式标记**,而不是就地丢 / 就地拉平
+ * ```text
+ * 丢 FULL        ⇒ 客户端永久冻结(连恢复快照都没了)
+ * 把 tick 拉平到 5000 ⇒ 新世代的 DELTA(4,5,6…)会被当旧帧丢掉,
+ *                     直到新世代自己涨过 5000 —— 20Hz 下 = 250 秒冻结
+ * ⇒ 唯一正确的表达:接受 FULL,并**说出**"这是新世代,老世代的迟到上界是 X"。
+ * ```
+ * 「回退」这件事因此是一个**具名判据**,而不是调用方从"tick 变小了"自己猜。
+ * 判据:FND132-9(判据本身)/ FND132-10(接受 FULL 与迟到区间)。
+ */
+/** `ruleFullTick` 的结果。(判别字段是 `generationReset`。) */
+export interface FullTickRuling {
+  /** `true` = 这份 FULL 把帧号**拉回**了 ⇒ 服务端换了世代(重启 / 回档)。 */
+  generationReset: boolean;
+  /** 接受这份 FULL 之后应使用的帧号基线(= FULL 自己的 tick;**绝不冻结**)。 */
+  tick: number;
+  /**
+   * 老世代迟到的上界(**含**):`tick ∈ (tick, staleCeiling]` 的 **DELTA**
+   * 属于**老世代** ⇒ 必须丢。未重置时它等于 `tick`(区间为空)。
+   */
+  staleCeiling: number;
+}
+
+/**
+ * FULL 帧的**世代判据** —— 解码侧/合入侧唯一同时知道 op、base 与 pkt 的地方。
+ *
+ * @param baseTick 客户端**已经到过**的 tick(FULL 之前的 `meta.tick`)
+ * @param fullTick 这一份 FULL 包头里的 tick
+ *
+ * ⚠️ 消费者接线点:`client/src/net/state_store.ts` 的 `apply()` —— 那条单调门
+ *   今天只拦 DELTA;要区分"新世代开头"与"老世代迟到",它需要本判据的
+ *   `staleCeiling`(**那是另一个分片的文件**)。本文件只保证这条判据**只有一份**,
+ *   而不是让第二个人再写一个"tick 变小的阈值"。
+ */
+export function ruleFullTick(baseTick: number, fullTick: number): FullTickRuling {
+  const generationReset = fullTick < baseTick;
+  return {
+    generationReset,
+    tick: fullTick,
+    staleCeiling: generationReset ? baseTick : fullTick,
+  };
+}
+
 export function applyPacket(base: RoomState, pkt: DecodedPacket): RoomState {
   const out = cloneRoomState(base);
-  /* 帧号来自报文头,无条件覆盖 —— 它是单调时钟,不是 diff 字段。 */
-  out.meta.tick = pkt.tick;
+  /* 帧号来自报文头,无条件覆盖 —— 它是单调时钟,不是 diff 字段。
+     ★ WS-FND-132(P2):FULL 的覆盖走**具名判据** `ruleFullTick` ——
+       它顺带把"帧号回退"记成**世代重置**并给出老世代的迟到上界,
+       而不是让这条分支悄悄把基线拉低、把这件事留给下游猜(见上面那块说明)。
+     `ruling.tick` 恒等于 `pkt.tick`:判据**不改**帧号(改它就会冻结,理由同上),
+       它只是把"这一帧属于哪个世代"这件事**说出来**。 */
+  const ruling = ruleFullTick(base.meta.tick, pkt.tick);
+  out.meta.tick = ruling.tick;
   if (pkt.op === PacketOp.FULL) {
     /* 自包含快照:实体表与房间级 meta 一律从零开始。
        (`encodeFull` 一定带一条覆盖全部 5 个 ROOM 字段的 upsert,所以下面
