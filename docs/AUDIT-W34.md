@@ -699,23 +699,26 @@ this.expireItemSources();
 > 一个子系统**实现完整、判据全绿、`verify.ts` 全绿**,却**没有第二个调用者** ——
 > 除了测试与门禁,生产路径上没人调它。
 >
-> 逐条的符号级台账、位置、现状、理由、判据,全部落在 **`docs/WIRING-LEDGER.md`**(34 行)。
-> 本节只登记**处置**与**结论**;不重复那 34 行正文(两处各写一遍必然发散)。
+> 逐条的符号级台账、位置、现状、理由、判据,全部落在 **`docs/WIRING-LEDGER.md`**(**36 行**)。
+> 本节只登记**处置**与**结论**;不重复那 36 行正文(两处各写一遍必然发散)。
+> ★ 第七轮订正:上一版写「34 行」,而表体实测 **37 行**(算术错),且 `R6-CL-6`(§2.9)整条是**错的**(`#hint` 有读点)
+> ⇒ 撤回该条后 **36 行**;`§13.2` / `§13.3` 的三处计数已按 36 重算。
 
 ### 13.1 判据 ↔ 条目对照
 
 | 来源 | 覆盖的 R6 条目 | 说明 |
 |---|---|---|
-| `tests/WS-10.test.ts` | R6-CBT-1..6 | 技能 / 天赋 / 反伤 / 幽灵 / 整蛊菜 / 飘字:表与算法各有断言,**没有一条**断言「它在生产里被谁调」 |
-| `tests/WS-11.test.ts` · `WS-FND-108` | R6-PARTY-S1..S5 · A1..A3 · PRANK-1 · SOC-1..4 | 派对 / 玩具 / 社交四段:结算与动作函数逐个测过,调用者是测试 |
+| `tests/WS-10.test.ts` · `WS-FND-118` | R6-CBT-1..6 | 技能 / 天赋 / 反伤 / 幽灵 / 整蛊菜 / 飘字:表与算法各有断言;**「生产里谁在调」改由 `combat/wiring_ledger.ts` 双向判据钉住**(FND118) |
+| `tests/WS-11.test.ts` · `WS-FND-108` · `WS-FND-120` | R6-PARTY-S1..S5 · A1..A3 · PRANK-1 · SOC-1..4 | 派对 / 玩具 / 社交四段:结算与动作函数逐个测过;接线后 FND120 **反向断言** `PARTY_ACTION_LEDGER` / `RUSH_ACTION_LEDGER` 的 `WIRED:` 行真有调用点 |
 | `tests/WS-04.test.ts` · `WS-FND-29/41/46` | R6-TAME | 驯服整模块 27 export 全测过,模块级在可达性白名单里 |
 | `tests/WS-07.test.ts` | R6-SH-1..3/7 | 协议表与差量函数:编解码两侧都有判据,客户端只用了名字表(`STATE_FLAG_NAMES`) |
 | `tests/WS-FND-66` | R6-SH-4/5/6 | 三条契约先行模块(gate-only / 差集型) |
-| `tests/WS-09.test.ts` · `WS-FND-73/89/113` | R6-CL-1..6 | 客户端:渲染视图与 UI 控制器逐个测过;`drop()` / `tooltipFor` / `stepZoom` / `#hint` 无生产调用者 |
-| `tests/WS-FND-61/109/56` | R6-SIM-1..3 | world_sim 三个喂料口:`tended`/`spraying` 已接,**但喂给一个恒为 `null` 的会话** |
+| `tests/WS-09.test.ts` · `WS-FND-73/89/113/121` | R6-CL-1..5 | 客户端:渲染视图与 UI 控制器逐个测过;`drop()` / `tooltipFor` / `stepZoom` 的接线由 `client/src/wiring_ledger.ts` 的**见证片段**钉住(`CL-6` 已撤回 —— `#hint` 有读写点) |
+| `tests/WS-FND-61/109/56` · `WS-FND-120` | R6-SIM-1..3 | world_sim 三个喂料口:`tended`/`spraying` 已接,且会话**不再恒 `null`**(`stepRushEntry` 是生产入口) |
 
-⚠️ **第六轮的 4 套件(`WS-FND-118/119/120/121`)撰写时不在磁盘上** —— 见 §13.4。
-上表列的是**当前真能把条目点开**的那些套件;不拿没落盘的编号当判据。
+> ★ 第七轮订正:上一版这里写着「第六轮 4 套件(`118/119/120/121`)撰写时不在磁盘上」——
+> **四套件都在 `tests/` 里**(`Get-ChildItem tests -Filter 'WS-FND-1*.test.ts'` 可复算),
+> 故本表已把它们当判据来源引用。撤回原句,不保留「没落盘」的说法。
 
 ### 13.2 逐条处置
 
@@ -724,37 +727,37 @@ this.expireItemSources();
 
 | R6 条目 | 处置 | 一句话 |
 |---|---|---|
-| CBT-1 技能 | **未接** | `skillOf` / `planSkillHits` 生产 0;攻击只走 `computeDamage`,技能形状不存在 |
-| CBT-2 天赋 | **部分接** | 只有 `isTalentUnlocked` 1 处(梦境天赋);`activeTalents` 生产 0 |
-| CBT-3 反伤 | **未接** | 结果里有 `reflectDamage`,没人把它打到攻击者身上(`world_sim.ts:2546-2552` 明写不扣) |
-| CBT-4 幽灵 | **部分接** | 漂移已推进;`ghostControl`/`ghostDamageMul` 生产 0 ⇒ 同一规则两个真值来源 |
-| CBT-5 整蛊菜 | **部分接** | `cookSoup` 已接(craft 动作);`cleansePrankBuffs` 生产 0 |
-| CBT-6 飘字 | **未接** | `FloatSpec` 有完整规格,客户端零读者 |
-| SIM-1 `startRushRun` | **未接** | 急单唯一创建入口 0 调用者 ⇒ 会话恒 `null` |
-| SIM-2 `roomLevel`/`stock` | **未接** | 只被 SIM-1 消费,而 SIM-1 没人调 ⇒ 无来源 |
-| SIM-3 `tended`/`spraying` | **已接** | 慢帧派生并喂入;但它喂的是恒 `null` 的会话 ⇒ 不构成「急单可用」 |
-| TAME 整模块 | **已登记** | `verify.ts:2086` + 交叉表 `:5116` + `orphan-audit.ts:139`;缺宿主(无 TAME 动作) |
-| PARTY-S1..S5 五个 settle | **未接** | 同一成因:没有「本局结束」的调用者(`tickPartyMode` 到点只发广播) |
-| PARTY-A1..A3 三个动作 | **未接** | `crownPickup`/`bridgeCapture`/`submitDelivery` 生产 0(`world_sim.ts:137` 已自陈) |
-| PRANK-1 玩具表 | **已登记** | `verify.ts:2123`(差集型);缺 `applyPrank` 施加端 |
+| CBT-1 技能 | **已接** | `world_sim.ts#attackMob`(`useSkill`)读 `skillOf` / `planSkillHits`;台账 `COMBAT_WIRING_LEDGER` 两行 = WIRED。剩余缺口不在战斗侧(net 无 [Q] 报文 / PvP 仍 `skill: null`) |
+| CBT-2 天赋 | **部分接** | 只有 `isTalentUnlocked` 1 处(梦境天赋);`TALENTS` / `activeTalents` 台账 = UNWIRED |
+| CBT-3 反伤 | **已接** | `world_sim.ts#resolveMobStrikes` 把反伤经 `damageMob` 打回攻击者;台账 `reflectFrom` = WIRED |
+| CBT-4 幽灵 | **已接** | `ghostControl` 由 `canActAsPlayer` 消费(台账 WIRED);`ghostDamageMul` 台账 UNWIRED **且按设计不接**(规则归 `vitals`) |
+| CBT-5 整蛊菜 | **已接** | `cookSoup` 1 处(craft 动作);`cleansePrankBuffs` 由 `useItem` 料理分支按 `flags.cleanse` 触发(台账 WIRED);`PRANK_PRIORITY` 仍只本模块内读 |
+| CBT-6 飘字 | **未接** | `FloatSpec` 有完整规格,客户端零读者(台账 = RESERVED) |
+| SIM-1 `startRushRun` | **已接** | `stepRushEntry`(慢帧)按「食堂建成 + 三工位 + 有人站工位」开工;`RUSH_ACTION_LEDGER` 的 `START` = WIRED |
+| SIM-2 `roomLevel`/`stock` | **已接**(半) | `roomLevel` 取 `RUSH_ENTRY_ROOM_LEVEL` 并由 `stepRushEntry` 传入;`stock` 仍传 `{}`(`ROOM_LEVEL` 行仍是 `EXTRA`) |
+| SIM-3 `tended`/`spraying` | **已接** | 慢帧派生并喂入;★ 「喂给恒 `null` 的会话」已不成立(SIM-1 接线后会话真的存在) |
+| TAME 整模块 | **已登记** | `verify.ts:2086` + 交叉表 `:5129` + `orphan-audit.ts:143`;缺宿主(无 TAME 动作),`feedPet` 生产调用点仍 0 |
+| PARTY-S1..S5 五个 settle | **已接** | 五个 `mode.settleHook` 由 `settlePartyRun` ← `tickPartyMode` ← 世界慢帧驱动(`modes.ts:284/417/552/677/749`) |
+| PARTY-A1..A3 三个动作 | **已接** | `world_sim.ts#stepPartyContest` → `contestCrownPickup` / `contestCapture`;`stepRushDelivery` → `submitDelivery`(台账 WIRED) |
+| PRANK-1 玩具表 | **已接** | 表被真消费(`party/actions.ts` 值导入 `prank/actions.ts`,`toyOf` + 由表生成的 `PRANK_ACTION_LEDGER`);35 件里只有 222/224/225 走到生产;`verify.ts:2119-2127` 已把 toys/immunity 从白名单摘除 |
 | PRANK-2 `applyPrank` | **未接** | 全仓不存在 —— 这是上一条的**真缺口**,不是「等接线」 |
 | SOC-1 水族箱 | **未接** | 镜头序列/混音表齐备,客户端宿主不读它 |
 | SOC-2 信箱 | **未接** | 需离线存档容器 + 信箱 UI;`net/room` 只有 world/player 两块 |
 | SOC-3 摊位 | **未接** | 与 `stallStock` 同名异义;无 BUY/LIST 动作 |
-| SOC-4 赛道 | **未接** | 与 `party/modes.ts::RaceRuntime` 是两套实现,**都没接** |
-| SH-1 `EncodeStats`(网络) | **已登记** | `verify.ts:4611` 同名异义;生产出现的 2 次是蓝图那个 |
+| SOC-4 赛道 | **未接** | 与 `party/modes.ts::RaceRuntime` 是两套实现;竞技那套已接,**社交这套仍 0 调用者** |
+| SH-1 `EncodeStats`(网络) | **已登记** | `verify.ts:4615` 同名异义;生产里真实消费的全是蓝图那个 |
 | SH-2 `StateFlagIndex` | **未接** | 客户端只 import 名字表 ⇒ 状态位解码只做一半 |
 | SH-3 `FSM_NAMES` | **未接** | 同上,`wildlife.fsm` 离线索引 0 消费者 |
-| SH-4 `types/events.ts` | **已登记** | `verify.ts:2158` + `:5131`(gate-only) |
-| SH-5 `types/cooking.ts` | **已登记** | `verify.ts:2156`(差集型) |
-| SH-6 `constants/cooking.ts` | **已登记** | `verify.ts:2157` + `:5135`(gate-only) |
+| SH-4 `types/events.ts` | **已登记** | `verify.ts:2161` + `:5144`(gate-only) |
+| SH-5 `types/cooking.ts` | **已登记** | `verify.ts:2159`(差集型;`isDiffSet()` 自检在 `:3269`) |
+| SH-6 `constants/cooking.ts` | **已登记** | `verify.ts:2160` + `:5148`(gate-only) |
 | SH-7 `diffChunkVersions` | **未接** | 生产 0 调用者 ⇒ 每个 chunk 都当新档收 |
-| CL-1 `renderPos` 系列 | **已接** | `main.ts:441-442` / `boot.ts:1582`;`poseView` 另两个字段仍 0 读者 |
+| CL-1 `renderPos` 系列 | **已接** | `main.ts` / `boot.ts` 消费;`poseView` 另两个字段仍 0 读者 |
 | CL-2 `stage_assembly` | **部分接** | 14 export 里接了 4;`createStage`/`buildBillboard`/`applyDyeUniforms` 等 9 个零消费者 |
-| CL-3 `DragController.drop()` | **未接** | 松手走 `cancel()`(`boot.ts:1159`)⇒ **拖拽永远放不下** |
-| CL-4 `slotTooltip`/`tooltipFor` | **未接** | Canvas2D 覆盖层不接 hover ⇒ 无呈现面 |
-| CL-5 `isoCam.zoom`/`stepZoom` | **未接** | 无输入绑定 ⇒ 生产 `zoom` 恒 1,6 档只在测试里走 |
-| CL-6 `#hint` | **未接** | 代码从不读该元素;`PITCH_BOTTOM_CLEARANCE = 56` 是写死的猜测 |
+| CL-3 `DragController.drop()` | **已接** | `boot.ts:1306` `dragCtl.drop(hover)`(客户端台账 `drop` = wired,含见证片段) |
+| CL-4 `slotTooltip`/`tooltipFor` | **已接** | `ui_binding.ts:629` `this.tooltipFor(...)`(台账 `tooltipFor` = wired) |
+| CL-5 `isoCam.zoom`/`stepZoom` | **已接** | `boot.ts:1351` 键盘 `[` / `]` 调 `stepZoom`(台账 `stepZoom` = wired) |
+| ~~CL-6 `#hint`~~ | **整条撤回** | 实测**有**读点/写点(`boot.ts:574` `getElementById('hint')`、`:593` `textContent = ...`)⇒「代码从不读它」是错的,不再是符号级未接 |
 
 ### 13.3 ★ 本轮的定性结论(**这一句是本轮唯一的结论**)
 
@@ -767,7 +770,10 @@ this.expireItemSources();
 >
 > **判据纪律(本轮唯一新增的一条)**:写「X 可用」之前先回答「X 的生产非自身调用点是多少」;
 > 答不出就只能写「X 已实现」。这两个词的差别不是修辞 ——
-> 34 行台账里 **20 行是全未接、5 行是部分接**,而它们**全部**在现有门禁下是绿的。
+> **36 行**台账里 **9 行是全未接、2 行是部分接、20 行已接、5 行已登记**,
+> 而其中的未接部分**全部**在现有门禁下是绿的。
+> ★ 第七轮订正:上一版写「34 行里 20 行全未接、5 行部分接」—— 三个数都错(表体 37 行、
+> 撤回 `CL-6` 后 36 行;按符号逐条复核后,全未接只剩 9 行)。
 
 ### 13.4 本批验证口径(以及**没跑什么**)
 
@@ -778,11 +784,13 @@ this.expireItemSources();
     WS-04(56/57) · WS-FND-90(6/7) · WS-FND-99(7/8) · WS-FND-103(12/13)
     WS-FND-109 · WS-FND-117
   ```
-  六条全是**另一位写者**同一时刻未收尾的接线,不是本轮产物(抽样复核:
-  WS-04 断言的「feedPet 生产调用点 0」实测 **1** ⇒ 驯服正在被接;
-  FND-99 的合法镜像表缺新增的 `WiringStatus`;FND-90 的 orphan 清单多 1 个新文件)。
-- **第六轮 4 套件:只有 `WS-FND-119-systems-fed`(8/8)已落盘**,`118/120/121` 撰写时仍不在磁盘上
-  (`Get-ChildItem tests -Filter *.test.ts`:126 → 128)。
+ 六条全是**另一位写者**同一时刻未收尾的接线,不是本轮产物(抽样复核:
+ FND-99 的合法镜像表缺新增的 `WiringStatus`;FND-90 的 orphan 清单多 1 个新文件)。
+ ★ 第七轮撤回上一版这里的一句「WS-04 断言的『feedPet 生产调用点 0』实测 **1**」——
+ **实测仍是 0**:`server/src/**` 对 `mobs/taming.ts` 的 import = 0,`feedPet` 只有定义
+ (`taming.ts:125`)与一处注释(`intake.ts:44`)。⇒ 驯服**没有**在被接,那句话是错的。
+- **第六轮 4 套件都在磁盘上**(`WS-FND-118/119/120/121`,`Get-ChildItem tests -Filter 'WS-FND-1*.test.ts'` 可复算)。
+  ★ 第七轮撤回上一版「只有 `WS-FND-119` 已落盘,`118/120/121` 仍不在磁盘上」—— 四个都在,故 §13.1 已把它们当判据来源。
   ⇒ README `:62-66` 与 HANDOVER `:27/:96` **本轮不改数**:第一次读数与现值逐字一致(126/2381),
     第二次读数**带 6 个红**,把 2402 写进「N/N ✅ 共 M 个用例」那一行 = **把 6 个红标成绿**。
   ⇒ 这一条比「数字不准」更要紧:本轮审的正是「全绿」这个词值多少钱,

@@ -468,3 +468,123 @@ export function validateIconRows(rows: readonly string[]): { ok: boolean; errors
   }
   return { ok: errors.length === 0, errors };
 }
+
+/* ───────────────────── 实体立牌**计划**(第七轮审计 P1) ───────────────────── */
+
+/**
+ * ## 修的是什么
+ * 修前屏幕上只有**两块**东西跟实体有关:本地玩家的 `player_marker` 与 4 个固定图集立牌。
+ * `RoomState.wildlife` / `RoomState.players` 在 `client/src` 里**没有渲染出口** ⇒
+ * ```
+ * 服务端下发 3 只怪 + 1 个队友 ⇒ 屏幕上一个新东西都没有
+ * ```
+ * 而且这种缺陷在自检口径里也看不出来(`spriteCount` 只数那 4 个图集立牌)。
+ *
+ * ## 为什么"计划"是纯函数
+ * `three/boot.ts` 顶层 `import three`、还碰 `document` ⇒ node 里加载不了。
+ * 于是"哪些实体应该被画、画在哪、什么颜色"这一层判定放这里(node 可直接断言),
+ * `boot.ts` 只剩"按计划建/改/删 `THREE.Sprite`"这一段胶水。
+ *
+ * ## 本地玩家为什么**不在**计划里
+ * 它已经有 `player_marker`(带预测位置、屋顶淡出、相机跟随那一整条链)。
+ * 在这里再列一遍会让同一局出现**两个自己**,而且两个会随预测/权威不同步抖动。
+ */
+export interface EntitySpriteSpec {
+  /** 精灵在场景里的唯一名字(`mob:<id>` / `player:<id>`) */
+  key: string;
+  kind: 'player' | 'mob' | 'pet';
+  /** 实体 id(线上 `PlayerState.id` / `WildlifeState.id`) */
+  entityId: string;
+  /** 显示名(玩家名 / mobId) */
+  label: string;
+  /** 格坐标(权威值,**不**做预测;预测只属于本地玩家) */
+  cx: number;
+  cy: number;
+  z: number;
+  /** 立牌高度(像素,来自 `spriteHeightPx`) */
+  heightPx: number;
+  /** 立牌色(占位色块;真图集映射是独立一件) */
+  colorHex: string;
+  hp: number;
+  maxHp: number;
+  /** 恒为 `false` —— 本地玩家不在这份计划里(见上) */
+  isLocal: boolean;
+}
+
+/** 实体种类 → 占位色。 */
+export const ENTITY_SPRITE_COLOR: Readonly<Record<string, string>> = {
+  player: '#7fd1ff',
+  mob: '#ff8a5c',
+  pet: '#9ef07a',
+};
+
+function finite(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * 由**权威快照**算出这一帧该画哪些实体立牌。
+ *
+ * 覆盖:`wildlife`(含已驯服的宠物)与**其他** `players`。
+ * `bosses` 不在内:boss 的身位要等服务端投影出坐标(线上 `BossState` 只有预警圆心),
+ * 现在画只能把 boss 钉在预警圈圆心 —— 那是一个看起来合法的错误位置。
+ */
+export function planEntitySprites(
+  state: {
+    players?: readonly { id: string; name?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number }[];
+    wildlife?: readonly {
+      id: string; mobId?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number;
+      tameOwnerId?: string;
+    }[];
+  },
+  localPlayerId: string,
+): EntitySpriteSpec[] {
+  const out: EntitySpriteSpec[] = [];
+  for (const p of state.players ?? []) {
+    if (p.id === localPlayerId) continue;         /* 本地玩家有 player_marker */
+    if (!finite(p.x) || !finite(p.y)) continue;   /* 坐标坏了 ⇒ 不画(不是画到 0,0) */
+    out.push({
+      key: `player:${p.id}`,
+      kind: 'player',
+      entityId: p.id,
+      label: typeof p.name === 'string' && p.name !== '' ? p.name : p.id,
+      cx: p.x,
+      cy: p.y,
+      z: finite(p.z) ? p.z : 0,
+      heightPx: spriteHeightPx('player'),
+      colorHex: ENTITY_SPRITE_COLOR.player,
+      hp: finite(p.hp) ? p.hp : 0,
+      maxHp: finite(p.maxHp) ? p.maxHp : 0,
+      isLocal: false,
+    });
+  }
+  for (const w of state.wildlife ?? []) {
+    if (!finite(w.x) || !finite(w.y)) continue;
+    const tame = typeof w.tameOwnerId === 'string' && w.tameOwnerId !== '';
+    const kind: 'mob' | 'pet' = tame ? 'pet' : 'mob';
+    out.push({
+      key: `${kind}:${w.id}`,
+      kind,
+      entityId: w.id,
+      label: typeof w.mobId === 'string' && w.mobId !== '' ? w.mobId : w.id,
+      cx: w.x,
+      cy: w.y,
+      z: finite(w.z) ? w.z : 0,
+      heightPx: spriteHeightPx(kind),
+      colorHex: tame ? ENTITY_SPRITE_COLOR.pet : ENTITY_SPRITE_COLOR.mob,
+      hp: finite(w.hp) ? w.hp : 0,
+      maxHp: finite(w.maxHp) ? w.maxHp : 0,
+      isLocal: false,
+    });
+  }
+  /* 稳定顺序:同一份快照两次调用逐字段相同(自检口径可比对) */
+  out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return out;
+}
+
+/** 计划里某类实体的条数(自检口径:wildlife 与远端玩家**分开**报)。 */
+export function countByKind(specs: readonly EntitySpriteSpec[], kind: EntitySpriteSpec['kind']): number {
+  let n = 0;
+  for (const s of specs) if (s.kind === kind) n += 1;
+  return n;
+}

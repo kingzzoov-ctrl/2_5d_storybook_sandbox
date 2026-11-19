@@ -345,6 +345,29 @@ export const startParty: ActionHandler = (ctx: ActionContext): ActionOutcome => 
   };
   PARTIES.set(roomId, record);
 
+  /* ★ 5 WS-FND-122:**把本局模式交给世界侧的 436 哨台**(`params.mode`)。
+   *
+   * ## 修前是什么样
+   * 四模式九闸全部依赖 `ARENA_REFEREE_DESK.params.mode`,而**全仓没有任何写点**:
+   * `net` 层写 `params` 的地方 **0 处**,世界电路图在生产里也恒空 ⇒
+   * `stepRefereeDesk` 的 `desks.length === 0` 永远成立 ⇒ 开局入口**结构上不可达**,
+   * 而且不报错(没有任何断言会红)。
+   *
+   * ## 为什么是这一处(而不是新造一条 SET_COMPONENT_PARAM 报文)
+   * `START_PARTY` 已经把「本局用哪个模式」定下来了,而 436 的 `params.mode`
+   * **就是同一套下标**(1=BRIDGE_CTF … 4=PAINT_WAR,见 `deskModeKey`)⇒
+   * 直接把那个数交过去,不另立第二张模式表、也不新增协议动词。
+   *
+   * ⚠️ **世界侧写失败不推翻开局**:赛局记录是房间层的账(计分/结算),
+   *    哨台是竞技场层的物理入口。两者失败必须**分别可见** ⇒
+   *    `deskApplied` / `deskReason` 进回执,而不是让整个 `START_PARTY` 变成
+   *    一个「看起来成功但其实没开局」的 OK。
+   */
+  const deskMode = PARTY_MODE_VALUES.indexOf(res.mode);
+  const desk = ctx.host !== null && typeof ctx.host.setRefereeDeskMode === 'function'
+    ? ctx.host.setRefereeDeskMode(deskMode)
+    : { applied: false, reason: 'NO_WORLD_DESK_WRITER', deskId: null as string | null, mode: deskMode };
+
   return {
     ok: true,
     kind: 'OK',
@@ -353,7 +376,11 @@ export const startParty: ActionHandler = (ctx: ActionContext): ActionOutcome => 
       startedAtMs: record.startedAtMs,
       participants: participants.length,
       state: PartyPhase.RUNNING,
-      note: '本动作只维护赛局记录:分数不动血量与背包',
+      /* ★ 436 哨台的写入结果(与上面那条 note 分开:一个说「记了账」,一个说「世界收到命令」)。 */
+      deskApplied: desk.applied,
+      deskMode: desk.mode,
+      deskReason: desk.reason,
+      note: '本动作只维护赛局记录:分数不动血量与背包;deskMode 交给世界侧 436 哨台',
     },
   };
 };

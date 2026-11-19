@@ -153,6 +153,20 @@ export function feedPet(pet: PetRecord, itemId: number): TameResult {
 export function commandPet(pet: PetRecord, cmd: TameCommand): boolean {
   if (pet.stage !== TameStage.TAMED) return false;
   pet.command = cmd;
+  /*
+   * ★ 第七轮 P1:`carryLoad` 以前**全仓只写 0** ⇒ `carrySpeedMul` 恒 1,
+   *   「背物资减速」是一条永远不成立的分支。现在它有一个真实生产者:
+   *   接下 CARRY 的那一步按 `carrySlots` 装货,任何别的指令都卸货。
+   *
+   * ⇒ 三个事实连着:`commandPet(CARRY)` → `carryLoad > 0` → `carrySpeedMul = 0.9`。
+   *
+   * ⚠️ 仍然**没有生产调用方**:本模块是 `scripts/verify.ts` 的
+   *   `UNREACHABLE_EXEMPT` 成员(宠物容器未接线,见 `systems/intake.ts` 文件头
+   *   第 0 节)。从 `systems/**` import 它会让那条白名单变成陈旧条目,
+   *   而 `scripts/verify.ts` 不在本线写域 ⇒ 这里只把**模块内**的恒假分支消掉,
+   *   跨模块接线仍等 owner 裁决「宠物容器住哪」。
+   */
+  pet.carryLoad = cmd === TameCommand.CARRY ? carrySlots(pet.mobId) : 0;
   return true;
 }
 
@@ -191,6 +205,8 @@ export function deployPet(pets: PetRecord[], pet: PetRecord, wearing: readonly n
 export function undeployPet(pets: PetRecord[], pet: PetRecord): void {
   pet.deployed = false;
   pet.command = TameCommand.STAY;
+  /* 卸下指令 ⇒ 卸货(否则 0.9 的减速会跟着这只宠物一辈子)。 */
+  pet.carryLoad = 0;
 }
 
 /** 送入牧场。 */
@@ -201,6 +217,8 @@ export function sendToRanch(pets: PetRecord[], pet: PetRecord): boolean {
   pet.inRanch = true;
   pet.deployed = false;
   pet.command = TameCommand.STAY;
+  /* 进圈 = 回 STAY ⇒ 背上的货卸掉(`carrySpeedMul` 的判据随之回到 1)。 */
+  pet.carryLoad = 0;
   return true;
 }
 
@@ -233,10 +251,21 @@ export function tickRanch(pets: PetRecord[], now: number): RanchYield[] {
 }
 
 /**
- * 背物资指令的负载计算。
+ * 背物资指令的负载计算与减速。
  *
- * 负载 = 4 + floor(生物等级 / 5),上限 12 格;
- * 负载 > 0 时生物移速乘 `CARRY_SLOWDOWN^1` 之外的额外 0.9 惩罚。
+ * 负载 = 4 + floor(生物等级 / 5),上限 12 格(`carrySlots`,内容表 `MobDef.level`)。
+ *
+ * ## ★ 第七轮 P1:`carryLoad` 曾经**全仓只写 0**
+ *
+ * 修前:唯一写 `carryLoad` 的地方是 `createPetRecord`(写 0),`carrySpeedMul`
+ * 里的 `carryLoad > 0` 因此**永远为假** ⇒ 减速永不生效,而门禁全绿
+ * (「恒真/恒假分支」家族)。现在有生产者了:`commandPet(CARRY)` 按
+ * `carrySlots` 装货,`commandPet(别的指令)` / `sendToRanch` / `undeployPet` 卸货。
+ * 判据 `tests/WS-FND-125` 用「CARRY ⇒ 0.9 / STAY ⇒ 1」双向钉住这对字段。
+ *
+ * ⚠️ 它仍**没有跨模块消费方**:本模块整体在 `scripts/verify.ts` 的不可达白名单里
+ *   (宠物容器未接线)。这不是「留着恒假分支」,而是「等宿主」——
+ *   登记在 `systems/intake.ts` 文件头第 0 节,不另立第二份措辞。
  */
 export const CARRY_BASE_SLOTS = 4;
 export const CARRY_MAX_SLOTS = 12;
@@ -248,6 +277,7 @@ export function carrySlots(mobId: string): number {
   return Math.min(CARRY_MAX_SLOTS, CARRY_BASE_SLOTS + Math.floor(def.level / 5));
 }
 
+/** 背物资时的移速乘子(CARRY 且真的背着货 ⇒ 0.9;否则 1)。 */
 export function carrySpeedMul(pet: PetRecord): number {
   return pet.command === TameCommand.CARRY && pet.carryLoad > 0 ? CARRY_SPEED_PENALTY : 1;
 }

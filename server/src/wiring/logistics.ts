@@ -145,8 +145,19 @@ export const ROUTE_SIDE: Record<SorterRoute, number> = { LEFT: -1, FORWARD: 0, R
 
 export interface SorterState {
   conveyor: ConveyorState;
-  /** 过滤物品 ID 白名单(命中 → 直行) */
+  /**
+   * 老口径:过滤物品 ID 白名单(命中 → `matchRoute`;见 `pickRoute`)。
+   *
+   * 只在**没有** 429 过滤表(`lanes` 空/缺省)时生效 —— 那一形态对应
+   * 组件参数 `filterId`(单件 + 直行),不是房间侧的 `SortFilter` 表。
+   */
   filterIds: number[];
+  /**
+   * **429 过滤表**(世界侧那张规则表在本分拣器上的投影;空/缺省 = 走老口径)。
+   *
+   * ★ 第七轮 P1:`pickRoute` 现在读它 —— 「过滤规则真的改变搬运目标」。
+   */
+  lanes?: SorterLaneRule[];
   /** 未命中过滤的默认去向 */
   defaultRoute: SorterRoute;
   /** 命中过滤的去向 */
@@ -165,9 +176,104 @@ export function createSorterState(dir = 1, filterIds: readonly number[] = []): S
   };
 }
 
-/** 判定某物品走哪条路。 */
+/**
+ * 一条 **429 过滤规则**(与 `server/src/systems/greenhouse.ts:SortFilter` **同形**:
+ * `lane` 0 = 左 / 1 = 前 / 2 = 右,`itemIds` = 这一道收哪几件)。
+ *
+ * 为什么用结构化类型而不是 `import type { SortFilter }`:
+ * `wiring/**` 与 `systems/**` 是两条并列的实现层,本文件只需要那个**形状**,
+ * 不需要把 `systems` 拉进 `wiring` 的依赖边。判据(`tests/WS-FND-125`)钉两件事:
+ * 两个形状逐字段兼容 + 道号↔三路的换算只有 `LANE_ROUTE` 一处。
+ */
+export interface SorterLaneRule {
+  lane: number;
+  itemIds: readonly number[];
+}
+
+/**
+ * **道号 → 三路**的**唯一**换算表(429 的过滤规则用它决定货往哪走)。
+ *
+ * ```txt
+ * 0 左  → LEFT     (dir − 1)
+ * 1 前  → FORWARD  (dir    )
+ * 2 右  → RIGHT    (dir + 1)
+ * ```
+ *
+ * ⚠️ 这张表是 `greenhouse.ts:191` 那句「0 = 左 / 1 = 前 / 2 = 右,与
+ * `wiring/logistics.ts` 的三路**同口径**」的落地处 —— 两处不再各自猜一套映射。
+ * 表外的道号(负数 / 3+)不是「某一路的别名」,`routeOfLane` 返回 `null`
+ * (分拣时退回 `defaultRoute`,不把未知道号猜成某一路)。
+ */
+export const LANE_ROUTE: Readonly<Record<number, SorterRoute>> = Object.freeze({
+  0: SorterRoute.LEFT,
+  1: SorterRoute.FORWARD,
+  2: SorterRoute.RIGHT,
+});
+
+/** 道号 → 三路;表外道号 ⇒ `null`(不猜)。 */
+export function routeOfLane(lane: number): SorterRoute | null {
+  if (!Number.isInteger(lane)) return null;
+  return LANE_ROUTE[lane] ?? null;
+}
+
+/**
+ * 把世界侧的 429 过滤表**灌进**分拣器(单一事实源)。
+ *
+ * ★ 第七轮 P1(实测):`sortFilters`(世界侧 429 的规则表)与
+ *   `SorterState.filterIds/matchRoute` 是**两套互不相通**的模型 ——
+ *   前者只在收获时算一个道号,后者只在分拣时决定往哪拐,于是「设定过滤物品 ID
+ *   ⇒ 自动分流」在搬运那一侧**从未生效**。
+ *
+ * 现在:`SorterState.lanes` 就是那张表的**投影**,`pickRoute` 读它;
+ * `filterIds/matchRoute` 退化为**没有规则表时的老口径**(组件 `filterId` 参数),
+ * 两种来源都收口到 `pickRoute` 一个判定点。
+ *
+ * `lane` 非有限数 ⇒ 丢弃这一条(与 `WorldSim.setSortFilters` 同一条纪律);
+ * `itemIds` 去重并只留整数(非整数 id 不是「某件物品」)。
+ *
+ * @returns 生效的规则条数(`0` = 规则表为空 ⇒ `pickRoute` 走老口径)
+ */
+export function applySorterFilters(state: SorterState, filters: readonly SorterLaneRule[]): number {
+  const out: SorterLaneRule[] = [];
+  for (const f of filters) {
+    if (!Number.isFinite(f.lane)) continue;
+    const itemIds: number[] = [];
+    for (const raw of f.itemIds) {
+      const id = raw | 0;
+      if (id === 0 || itemIds.includes(id)) continue;
+      itemIds.push(id);
+    }
+    if (itemIds.length === 0) continue;
+    out.push({ lane: Math.trunc(f.lane), itemIds });
+  }
+  state.lanes = out;
+  return out.length;
+}
+
+/**
+ * 判定某物品走哪条路(**唯一判定点**)。
+ *
+ * ```txt
+ * 有 429 过滤表(state.lanes 非空) ⇒ 第一条命中规则的 lane → LANE_ROUTE
+ *                                   一条都不命中 / 道号在表外 ⇒ defaultRoute
+ * 没有过滤表                       ⇒ 老口径:filterIds 命中 ⇒ matchRoute
+ * ```
+ *
+ * 「第一条命中」与 `greenhouse.ts:sortHarvest` 逐字同义:同一条带上的规则按
+ * 安装顺序生效,后装的**不覆盖**先装的。
+ */
 export function pickRoute(state: SorterState, itemId: number): SorterRoute {
-  return state.filterIds.includes(itemId | 0) ? state.matchRoute : state.defaultRoute;
+  const id = itemId | 0;
+  const lanes = state.lanes;
+  if (lanes !== undefined && lanes.length > 0) {
+    for (const f of lanes) {
+      if (!f.itemIds.includes(id)) continue;
+      const route = routeOfLane(f.lane);
+      if (route !== null) return route;
+    }
+    return state.defaultRoute;
+  }
+  return state.filterIds.includes(id) ? state.matchRoute : state.defaultRoute;
 }
 
 export interface SorterStepResult {
@@ -263,6 +369,14 @@ export interface ArmWorld {
    * 此时调用方会退回原格而不是销毁。
    */
   drop?(x: number, y: number, item: Stack): boolean;
+  /**
+   * 世界侧的 **429 过滤表**(可选)。给了 ⇒ `tickLogistics` 每次 tick 把它灌进
+   * 每一台分拣器(`applySorterFilters`),于是「设定过滤物品 ID」**真的改变
+   * 搬运目标**;缺省(老宿主 / 测试桩)⇒ 分拣器沿用 `filterIds` 老口径。
+   *
+   * ★ 第七轮 P1:没有这一口时,分拣规则只在收获时算一个道号,搬运侧对它一无所知。
+   */
+  sortFilters?(): readonly SorterLaneRule[];
 }
 
 export interface ArmStepResult {
@@ -535,6 +649,13 @@ export function tickLogistics(
    * 收集后再交付,保证「同一帧内货物只被搬运一次」这个原有约定不被破坏。
    */
   const exits: { x: number; y: number; dx: number; dy: number; item: Stack; from: ConveyorState }[] = [];
+
+  /* ★ 第七轮 P1:世界侧的 429 过滤表 → 每台分拣器(单一事实源)。
+     必须在 `stepSorter` 之前灌:否则这一帧仍然按老 `filterIds` 拐弯。 */
+  const laneRules = world.sortFilters?.();
+  if (laneRules !== undefined) {
+    for (const s of line.sorters) applySorterFilters(s.state, laneRules);
+  }
 
   for (const b of line.belts) {
     const r = stepConveyor(b.state, powered.belt);

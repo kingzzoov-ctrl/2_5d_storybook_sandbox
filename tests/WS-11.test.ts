@@ -1810,9 +1810,18 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
       '跑过阈值后露水按 tickAfk 的速率真的累积 ⇒ 挂机玩法被每帧驱动');
   }
 
-  /* immunity.ts:施加整蛊的宿主不存在。 */
-  ok(!wildSim.includes('resolveShield'), 'world_sim 不调 resolveShield');
-  ok(!room.includes('resolveShield'), 'room.ts 也不调 resolveShield');
+  /* immunity.ts:施加整蛊的宿主不存在 —— 判据是「world_sim 里没有这处**引用**」。
+   *
+   * ⚠️ 必须先**剥注释**再匹配(与 `judgement_audit.ts` 的 B 检测器同一教训):
+   *   修前这里直接对**全文**做 `includes`,而 `world_sim.ts` 里有一行注释在解释
+   *   「`resolveShield` 永远收到没开盾」(那是缺陷修复的说明文字)⇒ 判据被自己的
+   *   文档字符串打红。禁的是**调用/引用**,不是解释它为什么重要。
+   *   剥法是 `deadcode-audit.ts:stripCommentsOnly` 的老口径:先抹块注释,再抹行注释
+   *   且避开 `://`(URL / 路径里的双斜杠不是注释起点)。 */
+  const stripComments = (src: string): string =>
+    src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+  ok(!stripComments(wildSim).includes('resolveShield'), 'world_sim 不调 resolveShield(剥注释后)');
+  ok(!stripComments(room).includes('resolveShield'), 'room.ts 也不调 resolveShield(剥注释后)');
 
   /* taming.ts:宠物容器不存在。 */
   ok(!/interface WorldPlayer[\s\S]{0,600}?\bpets?\b/.test(wildSim),

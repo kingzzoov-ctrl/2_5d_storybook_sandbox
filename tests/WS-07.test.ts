@@ -156,6 +156,10 @@ import {
    ⚠️ 只依赖 `index.ts`(它刻意不 import colyseus 壳),故本套件仍可在 Node 下加载。 */
 import { assemble } from '../server/src/index.ts';
 
+/* 第七轮:`syncPartyHud` 的两个字段判据需要把「赛局时钟」与「房间时钟」对齐
+   —— 两者都注入同一个 `fixedClock`,否则差值就是漂移(见 `syncPartyHud` 的注释)。 */
+import { resetPartyClock, setPartyClock } from '../server/src/net/actions/start_party.ts';
+
 import {
   BASE_ATTACK_INTERVAL_S,
   DEFAULT_LIMITS,
@@ -4158,23 +4162,35 @@ test('task-38 【已改向】authorize 是纯判定;而 action 的**执行层**�
     `applyMove 把 x 从 ${x0} 改到 ${x1} ⇒ 快照机制是敏感的,`
     + `所以上面的「零变化」是真结论,不是断言写错`);
 
-  /* ④ 第二个敏感性对照:`meta` 分区也在快照里,且真能被驱动。
-   *    这同时是 task-38 的另一条证据:`partyMode` **可驱动**,
-   *    而 `partyTimer` / `scoreA` / `scoreB` **从不被驱动**(全仓只在
-   *    schema.ts 内出现,无任何赋值点)。 */
+  /* 4 第二个敏感性对照:`meta` 分区也在快照里,且真能被驱动。
+   *    ★ 第七轮订正(本条此前是**陈旧断言,已翻面**):`partyTimer` / `scoreA` / `scoreB`
+   *    早就不再是「全仓只在 schema.ts 里出现、无任何赋值点」了 ——
+   *    它们有**唯一写口** `RoomRuntime.syncPartyHud()`(`server/src/net/room.ts`,
+   *    由每帧的 `step()` 与 `SET_PARTY_MODE` 各调一次)。⇒ 本条改为断言「**有**代码驱动」。 */
   type Meta = { meta: { partyMode: number; partyTimer: number; scoreA: number; scoreB: number } };
   const metaBefore = (rt.cloneState() as unknown as Meta).meta;
   eq(metaBefore.partyMode, 0, '初始 partyMode = 0(NONE)');
-  eq(metaBefore.partyTimer, 0, 'partyTimer 初始 0');
+  eq(metaBefore.partyTimer, 0, 'partyTimer 初始 0(没开局 ⇒ 如实 0)');
   rt.setPartyModeBy('owner', PartyMode.PAINT_WAR);
   const metaAfter = (rt.cloneState() as unknown as Meta).meta;
   eq(metaAfter.partyMode, Object.values(PartyMode).indexOf(PartyMode.PAINT_WAR),
     `setPartyModeBy 真的改了快照里的 partyMode(${metaBefore.partyMode} → ${metaAfter.partyMode})`
     + ` ⇒ meta 分区也在快照覆盖内`);
-  /* ★ 但计分与计时**从来不跟着动** —— 这就是「有字段、无运行时」的实证。 */
-  eq(metaAfter.partyTimer, 0, 'partyTimer 仍为 0 ⇒ 从无代码驱动它');
-  eq(metaAfter.scoreA, 0, 'scoreA 仍为 0 ⇒ 从无代码驱动它');
-  eq(metaAfter.scoreB, 0, 'scoreB 仍为 0 ⇒ 从无代码驱动它');
+  /* ★ 判据必须是**可观测事实**,不是「源码里有 syncPartyHud 这个名字」:
+     真的开一局 ⇒ `partyTimer` 被写成该模式的权威时长(PAINT_WAR = 0 + 120s)。 */
+  setPartyClock(() => c.clock.nowMs());   /* 赛局钟与房间钟对齐(否则差值就是漂移) */
+  const started = rt.dispatchAction('owner', RoomAction.START_PARTY, {});
+  eq(started.ok, true, '前置:START_PARTY 成功(本房确实有一局可驱动 HUD)');
+  /* 同一帧对齐的写点(`step()` 是另一个):SET_PARTY_MODE ⇒ syncPartyHud。 */
+  rt.setPartyModeBy('owner', PartyMode.PAINT_WAR);
+  const driven = (rt.cloneState() as unknown as Meta).meta;
+  eq(driven.partyTimer, 120,
+    '★ partyTimer 被写成 PAINT_WAR 的权威时长 120s ⇒ **有代码驱动**(修前恒 0)');
+  /* 比分仍 0,但**理由变了**:不是"无写点",而是本房没有世界源(没有 `partyTeamOf`
+     ⇒ 分不出红/蓝 ⇒ `syncPartyHud` 的第 3 条分支如实写 0)。 */
+  eq(driven.scoreA, 0, 'scoreA 0 = 本房没有 partyTeamOf(分支 3),不是"无写点"');
+  eq(driven.scoreB, 0, '同上;比分口径的端到端判据见 WS-FND-127');
+  resetPartyClock();
 });
 
 /* ═══════════════ ACT:动作执行层(2026-11-14 接线)═══════════════ */

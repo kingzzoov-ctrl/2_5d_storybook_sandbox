@@ -550,7 +550,15 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
       正是本检测器输出里已注明的那类「层间有意传递」。
   ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
      那时要做的仍是先看是哪一对容器,而不是接着抬。 */
-export const G_CANDIDATE_WATERMARK = 73; /* 2026-11-19(第六轮):`node scripts/verify.ts --all` 实测 **73** > 水位 72
+export const G_CANDIDATE_WATERMARK = 74; /* 2026-11-19(第七轮):`node scripts/judgement_audit.ts --baseline` 实测 **74** > 水位 73
+   —— 增量 2 对,逐条核对为「层间有意传递」那一类(两条都是**本轮并行接线的运行时快照**):
+   1) `server/src/net/actions/start_party.ts:106` `PartySnapshot` ↔ `PartySettlement`@:124
+      共享[mode,startedAtMs,endedAtMs] / 独有 A[state,participants,scores] / 独有 B[ranking]
+      —— 「派对运行时快照」与「结算回执」是同一批数据的两个时点,各带自己的独有字段;
+   2) `server/src/net/room.colyseus.ts:72` `NetPersistRoomOptions` ↔ `RoomRuntimeOptions`@`room.ts:523`
+      共享[ownerId,host,requireJoinToken] / 独有 A[db] / 独有 B[roomId,name,accessMode,...]
+      —— 持久层建房间的入参与对局运行时的入参(网络层给持久层,不是两份实现)。
+   ⇒ 按**实测**重钉 73 → 74。 */ /* 2026-11-19(第六轮):实测 **73** > 水位 72
    —— 判定同上一批:增量是「层间有意传递」那一类(本轮并行接线的类型容器:
    派对/急单的运行时快照、战斗回执、接线台账各多一对),逐条核对后按**实测**重钉 72 → 73。
    ⚠️ 抬水位不是关告警:守卫比的仍是**总命中数**,而且主判据是 `judgement_audit.ts` 的**逐条明细**

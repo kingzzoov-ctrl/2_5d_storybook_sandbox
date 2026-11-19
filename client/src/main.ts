@@ -21,13 +21,21 @@
 import { boot, type BootHandle } from './three/boot.ts';
 import { createSession, type SessionHandle } from './net/session.ts';
 import {
-  ACTION_KEYS, cellInFront, cellUnder, describeActionResult, keyHints, type Facing,
+  ACTION_KEYS, FACING_DEFAULT, cellInFront, cellUnder, describeActionResult,
+  facingLabel, keyHints, nextFacing, type Facing,
 } from './net/action_target.ts';
 /* ★ 2026-11-15:动作入口层(合成 / 睡觉 / 开箱 / 派对开局)。
    纯逻辑在 `net/action_entry.ts`(0 import、可单测),键位薄绑定在 `net/action_binding.ts`;
    本文件只做**装配根**:把真 `SessionHandle` 注进端口,再挂到 `window`。 */
 import { ActionEntry } from './net/action_entry.ts';
 import { createActionBinding, entryKeyHints, sessionPorts } from './net/action_binding.ts';
+/* ★ 第七轮审计 P2:输入避让 —— 搜索框里打字时动作键必须让路。
+   判定在 `net/key_guard.ts`(纯、可单测):修前搜索态下打 `e` 会**同时**
+   追加查询字符并发出 `BREAK_BLOCK`,两条监听各自都"工作正常"。 */
+import { ActionKeyGuard } from './net/key_guard.ts';
+/* ★ 第七轮审计 P2:合成(`CRAFT`)的 `have` 明细账本。
+   修前 `have: undefined` ⇒ `craftRequest` 必判 INVALID ⇒ 按 N **永远发不出去**。 */
+import { applyReceiptToHave, haveEntryCount, type HaveDetail } from './net/have_ledger.ts';
 import { InputSource, attachKeyboard } from './net/input.ts';
 import { LocalPredictor, predictParamsOf } from './net/predictor.ts';
 /* ★ 2026-11-16(D-08 第一步):虚拟摇杆的**判定**住在这里(零 DOM、可单测)。
@@ -111,7 +119,30 @@ function main(): void {
      (声明在后面会 TDZ —— 回执回调是异步的,但键处理不是)。 */
   let lastAction = `按 ${keyHints()} —— 动作入口 ${entryKeyHints()}`;
   let lastItemId = 0;
-  const facing: Facing = { dx: 0, dy: 1 };
+  /**
+   * ★ 第七轮审计 P1:**朝向**。
+   *
+   * 修前是 `const facing: Facing = { dx: 0, dy: 1 }` —— 写死的"向下",而且 `const`。
+   * 于是 `cellInFront(me, facing)` 恒等于「脚下南侧一格」:
+   * **Q 放置与 E 拆除永远作用于同一格**,不管角色朝哪走。
+   * 现在它每 tick 由 `nextFacing()` 更新(本地输入优先,其次权威位移)。
+   */
+  let facing: Facing = { ...FACING_DEFAULT };
+  /** 上一帧的权威位置(`nextFacing` 的位移来源;`null` = 还没见过权威值) */
+  let lastAuthPos: { x: number; y: number } | null = null;
+  /**
+   * ★ 第七轮审计 P2:背包**明细**账本(`CRAFT` 的 `have`)。
+   *
+   * 快照里没有明细,但每条回执都带增量(`gained/produced/consumed/...`)⇒
+   * `net/have_ledger.ts` 把它们累成一份估计值。修前这里是常量 `undefined`,
+   * 于是 `craftRequest` 必判"需要 have"⇒ 按 N 永远发不出去(死键)。
+   */
+  let haveDetail: HaveDetail = {};
+  /**
+   * ★ 第七轮审计 P2:动作键守卫(搜索框里打字时让路)。
+   * 每次按键前用 `handle.textInputActive()` 同步一次 —— 那一头是 `boot.ts` 的 `searchMode`。
+   */
+  const keyGuard = new ActionKeyGuard();
 
   /* ── 动作入口(2026-11-15):让「合成 / 睡觉 / 开箱 / 派对开局」在浏览器里**真能按** ──
      ⚠️ 判定**不在本文件**:构建载荷、三类分支(参数不对 / 未连接 / 发)、回执文案
@@ -123,10 +154,11 @@ function main(): void {
     entry: actionEntry,
     inputs: {
       /* 合成:`lastItemId` 是"**最近真的碰过的那件**"(回执 `effect` 带回来的)。
-         `have`(背包明细)客户端**拿不到** —— 快照里只有总量、没有明细
-         (见 `action_entry.ts` 的 `craftRequest`)。这里如实给 `undefined`
-         ⇒ 入口会**不发**并给出可读原因,而不是发一条注定被拒的报文。 */
-      craft: () => ({ itemId: lastItemId, have: undefined }),
+         ★ 第七轮审计 P2:`have` 修前恒 `undefined`,而 `craftRequest` 判它**必填**
+         (服务端 `craft.ts` 没有按明细的读口)⇒ 「按 N」永远走不到发送 = 死键。
+         现在给的是 `net/have_ledger.ts` 按回执增量累出来的**估计值** ——
+         漂了就发一条、服务端回 INVALID + 可读理由,总比"按了没有任何反应"强。 */
+      craft: () => ({ itemId: lastItemId, have: haveDetail }),
       /* 开箱:取**脚下**那格 —— 箱子是地面实体,站着就能开。 */
       chestCell: () => {
         const me = handle.store.state.players.find((p) => p.id === handle.store.localPlayerId);
@@ -139,6 +171,15 @@ function main(): void {
          `partyMode === 0`(房间还没选模式)⇒ `undefined` ⇒ 省略这个键 = 不核对
          (不知道就**不声称**,与接线前同一条纪律)。 */
       partyModeEcho: () => partyModeName(handle.store.state.meta.partyMode) ?? undefined,
+      /**
+       * ★ 第七轮审计 P2:`USE_ITEM`(按 T)此前**没有端口**。
+       *
+       * `net/action_binding.ts` 的 `EntryInputs.useItem` 是**可选**的,而本文件从没给过它
+       * ⇒ 键盘路径按 `{}` 调构建器 ⇒ 恒回"需要 itemId" ⇒ 按 T **永远不发**(死键)。
+       * 与 `CRAFT` 同理,物品 id 用「最近真的碰过的那件」(`lastItemId`,来源是回执的 `effect`)。
+       * 一件都没有时仍然是"有话说"的拒绝(`actionEntry.status` 会写出来),不是静默。
+       */
+      useItem: () => ({ itemId: lastItemId }),
     },
   });
   /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */
@@ -185,6 +226,9 @@ function main(): void {
             const id = e.objId ?? e.itemId;
             if (typeof id === 'number' && Number.isFinite(id)) lastItemId = id;
           }
+          /* ★ 第七轮审计 P2:回执里的**增量**落进明细账本 —— `CRAFT` 的 `have` 就是它。
+             被拒的回执(`ok === false`)不落账:它没有改动背包(见 `have_ledger.ts`)。 */
+          haveDetail = applyReceiptToHave(haveDetail, { action: r.action, ok: r.ok, effect: r.effect });
         },
       },
     });
@@ -228,6 +272,10 @@ function main(): void {
   };
   window.addEventListener('mousedown', (ev) => { if (ev.button === 0) attackNearest(); });
   window.addEventListener('keydown', (ev) => {
+    /* ★ 第七轮审计 P2:搜索框里打空格应当是"空格",不是"挥一刀"。
+       判定走 `net/key_guard.ts`(纯),源是 `boot` 的 `searchMode`(拉,不是回调)。 */
+    keyGuard.setTextInput(handle.textInputActive());
+    if (keyGuard.textInputActive) return;
     if (ev.key === ' ' || ev.code === 'Space') { ev.preventDefault(); attackNearest(); }
   });
 
@@ -263,6 +311,23 @@ function main(): void {
         见 `tests/WS-FND-22`)。本文件只做"读键 → 调它 → 发报文 → 显示回执"。
         ——判定留在不可测的入口里,就是本仓反复记的那种"改坏了没人知道"。 */
   window.addEventListener('keydown', (ev) => {
+    /* ── ★ 第七轮审计 P2:搜索态下**动作键必须让路** ──
+     *
+     * 修前这条监听不知道 `boot.ts` 有个搜索框 ⇒ 在背包搜索里打 "e":
+     * ```
+     * 查询串多一个 e(对) + 一条 BREAK_BLOCK 发出(错)
+     * ```
+     * 两条监听各自都"工作正常",所以没有任何断言会红。
+     * 判定在 `net/key_guard.ts`(纯函数、可在 node 里断言),来源是 `handle.textInputActive()`
+     * —— `boot` 的 keydown 监听比本监听先注册,同一次按键里它已经更新过 `searchMode`。 */
+    keyGuard.setTextInput(handle.textInputActive());
+    if (!keyGuard.handles(ev.key)) {
+      /* 只报"被文本输入挡掉"的那一类(非动作键本来就该静默返回,两种原因必须分开) */
+      if (keyGuard.blockedByTextInput(ev.key)) {
+        lastAction = `输入中 ⇒ ${ev.key} 不触发动作(先按 Enter 结束搜索)`;
+      }
+      return;
+    }
     const spec = ACTION_KEYS[ev.key.toLowerCase()];
     if (spec === undefined) return;
     if (session === null) { lastAction = `${spec.label} ✗ 未联机`; return; }
@@ -287,7 +352,9 @@ function main(): void {
       ...(needItem ? { itemId: lastItemId } : {}),
       ...(spec.action === 'DROP_ITEM' ? { count: 1 } : {}),
     });
-    lastAction = `${spec.label} → 格(${cell.x},${cell.y})`;
+    /* 格坐标与朝向一起报:`facing` 修前恒向下,而"格坐标"看起来永远正常 ——
+       只有把朝向写进提示,"Q 永远放脚下南侧"才是一个玩家/脚本都读得出来的事实。 */
+    lastAction = `${spec.label} → 格(${cell.x},${cell.y}) 朝向 ${facingLabel(facing)}`;
   });
   const input = new InputSource();
   const detachInput = attachKeyboard(window, input);
@@ -388,6 +455,17 @@ function main(): void {
     /* 权威姿态喂回预测器。第一次先**播种** —— 预测器必须从权威值起步,
        否则它从 (0,0) 出发一路追,表现是「角色从世界原点滑过来」。 */
     const pose = playerId === null ? null : telegraphCenterOf(handle.store.state, playerId);
+    /* ── ★ 第七轮审计 P1:**朝向**每 tick 更新一次(修前是写死的常量) ──
+     * 优先级在 `net/action_target.nextFacing` 里(纯函数、可单测):
+     * 本地输入非零 ⇒ 立刻转向;否则权威位置动了 ⇒ 按位移转向;都没有 ⇒ 保持。
+     * ⚠️ 只在**这一处**写 `facing`:分散到按键回调里会让"松开方向键之后朝向回哪"没人说得清。 */
+    facing = nextFacing({
+      prev: facing,
+      input: { moveX: cmd.moveX, moveY: cmd.moveY },
+      from: lastAuthPos,
+      to: pose === null ? null : { x: pose.cx, y: pose.cy },
+    });
+    if (pose !== null) lastAuthPos = { x: pose.cx, y: pose.cy };
     /* ★ WS-FND-113 第 3 处:上行 `z` 的**真实来源**。
        修前播种与回喂都写死 `z: 0` ⇒ predictor 恒把 0 当高度,而上行又照发 `p.z`
        ⇒ 服务端 `applyPlayerMove` 每帧把 `b.z` 抹成 0,**权威高度被抹平**。
@@ -471,6 +549,21 @@ function main(): void {
     actionStatus: actionEntry.status,
     actionSent: actionEntry.sentCount,
     actionKeys: entryKeyHints(),
+    /* ── ★ 第七轮审计 P1:朝向进自检口径 ──
+     * 修前 `facing` 是写死的常量,而"格坐标"永远看起来正常 ⇒
+     * 「Q 永远放脚下南侧」这件事**读不出来**。三个字段一起读:
+     *   `facing`       当前朝向(本地输入优先,其次权威位移)
+     *   `facingLabel`  人读的方向名
+     *   `facingCell`   ▶ 现在按 Q/E 会作用于哪一格(与 `cellInFront(me, facing)` 同一个入口)
+     */
+    facing: { ...facing },
+    facingLabel: facingLabel(facing),
+    facingCell: cellInFront(predictor.pos, facing),
+    /* ── ★ 第七轮审计 P2:`CRAFT` 的 `have` 到底有没有内容(死键的出口) ── */
+    haveEntries: haveEntryCount(haveDetail),
+    have: haveDetail,
+    /* 搜索框里打字时动作键是否被挡掉(拉 `boot` 的 searchMode) */
+    textInputActive: handle.textInputActive(),
   });
   window.addEventListener('beforeunload', () => {
     detachInput();

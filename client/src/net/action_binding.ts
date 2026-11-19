@@ -24,12 +24,21 @@
  * 必须**避开**已经有人占的键,否则一次按键会同时触发两件事(而两边都不报错):
  * ```
  * net/action_target.ts 的 ACTION_KEYS  q / e / g / f
- * three/boot.ts 的面板快捷键          i / r / e / p / b / z / y / x / c / escape
- * main.ts                             ' '(空格) = 攻击
- * net/input.ts 的 MOVE_KEYS           w / a / s / d(+ 四个方向键)
+ * ui/panel_keys.ts 的面板键(唯一一处) i / r / h / p
+ * ui/panel_keys.ts 的其他键             b / z / y / x / c / [ / ] / / / escape
+ * main.ts                               ' '(空格) = 攻击
+ * net/input.ts 的 MOVE_KEYS             w / a / s / d(+ 四个方向键)
  * ⇒ 本层用 n / k / o / u / v / t(六个都不在以上任何一个集合里)
  * ```
- * `tests/WS-FND-35-client-entry.test.ts` 的 FND35-8 有一条判据钉住「与以上集合不重叠」。
+ * ★ 第七轮审计 P1(『e』双绑):上面第二行**修前是 `i / r / e / p / b / …`** ——
+ *   `e` 同时出现在 `ACTION_KEYS`(拆除)与面板键(开画架)里,于是**一次按键两件事**:
+ *   画架打开了(看不见的副作用)+ `BREAK_BLOCK` 发到服务端。这段注释当时还写着
+ *   「互不重叠」,所以照着注释读代码也查不出来。修法:面板键搬进 `ui/panel_keys.ts`
+ *   并把画架改到 `h`,键集互斥性从此**可被断言**:
+ * ```
+ * tests/WS-FND-35-client-entry.test.ts  FND35-8   与既有键位不重叠(手写清单)
+ * tests/WS-FND-126-client-chain.test.ts FND126-2  panel_keys.keyCollisions() 为空(读四张真表)
+ * ```
  */
 
 import {

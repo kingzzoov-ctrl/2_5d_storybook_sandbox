@@ -163,9 +163,11 @@ export const WIRING_LEDGER: readonly WiringEntry[] = [
     definedIn: 'client/src/three/stage_assembly.ts',
     status: WiringStatus.BLOCKED,
     callSites: 0,
-    reason: '光环发射器要挂在**实体**节点上,而客户端只有玩家立牌一个实体节点'
-      + '(野生/首领实体在屏幕上完全不画 —— 见本台账的 `bossHudFrom` 只驱动 HUD 文本)。'
-      + '没有实体节点就没有挂点;先补实体渲染,再挂发射器。',
+    reason: '光环发射器要挂在**实体**节点上,而客户端的实体节点只有 `player_marker` 与'
+      + '`entitySprites`(野生 / 远端玩家的占位色块,见第七轮 P1)。'
+      + '`stage/particles.ts` 的发射器要按 aura 种类建粒子池并每帧推进,'
+      + '那需要一个带纹理/尺寸契约的真立牌(现在是 Sprite + 纯色),'
+      + '硬接只会得到"看不见的粒子"。先补真图集立牌,再挂发射器。',
   },
   {
     symbol: 'applyDyeUniforms',

@@ -53,9 +53,20 @@ import { UiPanel, UiStateMachine, DragController } from '../ui/state_machine.ts'
 import {
   type InventoryView,
   SortKey,
+  applySlotMove,
   buildView,
+  defaultSlotItemIds,
+  slotFingerprint,
   usedSlotRatio,
 } from '../ui/inventory.ts';
+/* ★ 第七轮审计 P1(『e』双绑):面板键位表搬到 `ui/panel_keys.ts`。
+   留在本文件里的话「键集互不重叠」这条判据读不到它(本文件顶层 import three + 碰 document,
+   node 里加载不了)⇒ 判据只能靠手写清单,而手写清单正是这次漏掉 `e` 的地方。 */
+import { BOSS_DEMO_KEY, CLOSE_PANEL_KEY, SEARCH_KEY, ZOOM_KEYS, panelKeyHints, panelKeyOf } from '../ui/panel_keys.ts';
+/* ★ 第七轮审计 P1:`wildlife` / 其他 `players` 此前**零渲染出口** ——
+   判定(该画谁、画在哪、什么颜色)在 `stage/entity_sprites.planEntitySprites`(纯函数、可单测),
+   本文件只做「按计划建/改/删 Sprite」这一段。 */
+import { countByKind, planEntitySprites } from '../stage/entity_sprites.ts';
 import {
   type RecipeTree,
   buildRecipeTree,
@@ -197,6 +208,20 @@ export interface BootHandle {
    * —— 一个看起来合法的错误位置(与 `telegraphCenterOf` 的 `null` 同一条理由)。
    */
   setPoseSource: (fn: (() => PredictedPose | null) | null) => void;
+  /**
+   * ★ 第七轮审计 P2:当前是否处于**文本输入态**(背包/配方搜索框)。
+   *
+   * ## 为什么必须是宿主读得到的
+   * `searchMode` 是本文件闭包里的一位状态,而"要不要让路"的判定在 `main.ts` 的
+   * `keydown` 里(`ACTION_KEYS` / 空格攻击)。修前两处互不知情 ⇒
+   * 搜索框里打 `e` 会**同时**追加查询字符并发出 `BREAK_BLOCK`。
+   *
+   * ## 为什么是"拉"而不是装一个回调
+   * 装回调要多维护一份同步(谁在什么时候通知谁),而**漏通知**的症状与修前完全一样
+   * (会误发、且不报错)。拉取只读当下这一位,不存在过期问题:
+   * 本文件的 `keydown` 监听比 `main.ts` 先注册,所以同一次按键里它已经更新过 `searchMode`。
+   */
+  textInputActive: () => boolean;
 }
 
 /**
@@ -503,6 +528,73 @@ export function boot(container: HTMLElement): BootHandle {
   playerMarker.visible = false;
   scene.add(playerMarker);
 
+  /* ══════════════ ★ 第七轮审计 P1:野生 / 远端玩家的可见实体 ══════════════
+   *
+   * ## 修的是什么
+   * 修前屏幕上与实体有关的只有**两样**:本地玩家的 `playerMarker`(上面)与 4 个固定图集立牌。
+   * `RoomState.wildlife` 与"别的玩家"在 `client/src` 里**没有渲染出口** ⇒
+   * 服务端下发三只怪、来了个队友,屏幕上一个新东西都没有,而任何断言都不会红。
+   *
+   * ## 谁决定画什么
+   * `stage/entity_sprites.planEntitySprites(state, localPlayerId)` —— 纯函数、可被 node 断言
+   * (`wildlife` 与远端玩家分开计数,本地玩家**不在**计划里:它已经有 player_marker)。
+   * 本文件只做三件事:缺的建、有的挪、多的删(见 `reconcileEntitySprites`)。
+   *
+   * ## 为什么复用 `playerMarkerPlacement`
+   * 立牌的落点规则(格心 +0.5、脚踩地形高程、锚点 0.15)已经被实测校准过一次
+   * (WS-09 的脚底对齐判据)。这里**再算一份**就会得到两套口径,
+   * 而两套口径的偏差只会在像素上看出来。
+   */
+  const entitySprites = new Map<string, THREE.Sprite>();
+  /** 建/挪/删的累计计数(自检口径:实体渲染到底有没有在跑) */
+  const entitySpriteOps = { spawns: 0, moves: 0, removes: 0 };
+  /** 本帧的计划摘要(由 tick 写入,summary 读) */
+  let entityPlan = { wildlife: 0, players: 0, total: 0 };
+
+  const reconcileEntitySprites = (): void => {
+    const specs = planEntitySprites(authority.state, authority.localPlayerId);
+    const seen = new Set<string>();
+    for (const spec of specs) {
+      seen.add(spec.key);
+      const base = playerMarkerPlacement({ cx: spec.cx, cy: spec.cy }, zAt);
+      const mount = placementForHeight({ x: base.gx, y: base.gy, z: spec.z }, base.gz);
+      let sp = entitySprites.get(spec.key);
+      if (sp === undefined) {
+        sp = new THREE.Sprite(new THREE.SpriteMaterial({
+          color: new THREE.Color(spec.colorHex),
+          transparent: true,
+          opacity: 0.9,
+          depthTest: true,
+        }));
+        sp.name = spec.key;
+        /* 与图集立牌/玩家立牌同一锚点约定(距底 15%)—— 否则脚会陷进地里 */
+        sp.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
+        const scale = playerMarkerScale(SPRITE_CELL_WORLD);
+        sp.scale.set(scale.x, scale.y, 1);
+        sp.userData.kind = spec.kind;
+        sp.userData.label = spec.label;
+        scene.add(sp);
+        entitySprites.set(spec.key, sp);
+        entitySpriteOps.spawns += 1;
+      }
+      sp.position.set(mount.sprite.x, mount.sprite.y, mount.sprite.z);
+      sp.visible = base.visible;
+      entitySpriteOps.moves += 1;
+    }
+    /* 快照里没有的 ⇒ 必须真的从场景里删掉,否则退房/死亡会留下幽灵 */
+    for (const [key, sp] of [...entitySprites]) {
+      if (seen.has(key)) continue;
+      scene.remove(sp);
+      entitySprites.delete(key);
+      entitySpriteOps.removes += 1;
+    }
+    entityPlan = {
+      wildlife: countByKind(specs, 'mob') + countByKind(specs, 'pet'),
+      players: countByKind(specs, 'player'),
+      total: specs.length,
+    };
+  };
+
   /**
    * 自检钩子:切换立牌可见性。
    *
@@ -619,9 +711,25 @@ export function boot(container: HTMLElement): BootHandle {
   let searchMode = false;
   let invCategory: string | null = null;
   let invPage = 0;
-  let invView: InventoryView = buildView({ page: 0 });
+  /**
+   * ★ 第七轮审计 P1:背包的**格位状态**(下标 = 格位,值 = 物品 id)。
+   *
+   * 修前 `buildView()` 每帧从静态 `ITEM_LIST` 重建 ⇒ 格子内容与玩家操作无关,
+   * 于是拖拽成交只改了 `lastMove` 那一行提示,**格子一件都没动**。
+   * 现在搬运(`applySlotMove`)写的是这份状态,`buildView({ slotItemIds })` 读它。
+   */
+  let slotItemIds: number[] = defaultSlotItemIds();
+  /** 真的成交过几次(自检口径;`lastMove` 只是最近那一条文案) */
+  let slotMoveCount = 0;
+  let invView: InventoryView = buildView({ page: 0, slotItemIds });
   const refreshInventory = (): void => {
-    invView = buildView({ page: invPage, category: invCategory, query: invQuery, sort: SortKey.SLOT });
+    invView = buildView({
+      page: invPage,
+      category: invCategory,
+      query: invQuery,
+      sort: SortKey.SLOT,
+      slotItemIds,
+    });
   };
   refreshInventory();
 
@@ -1162,7 +1270,7 @@ export function boot(container: HTMLElement): BootHandle {
          接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。
          ★ 缩放档位(`[` / `]`,6 档)与搜索(`/`)也必须写进提示 —— 否则
            "存在但没人知道能按"的键位等于不存在。 */
-      keysHint: `I 背包 · R 配方 · E 画架 · P 音高 · B Boss · [ ] 缩放 ${isoCam.zoom}×`
+      keysHint: `${panelKeyHints()} · B Boss · [ ] 缩放 ${isoCam.zoom}×`
         + ` · / 搜索${searchMode ? `("${invQuery}")` : ''} · 拖拽框选蓝图 · WASD 移动角色(相机跟随)`,
     };
   };
@@ -1305,8 +1413,34 @@ export function boot(container: HTMLElement): BootHandle {
       const hover = dragCtl.hover;
       const moved = hover >= 0 ? dragCtl.drop(hover) : null;
       if (moved !== null) {
-        /* 成交凭证进 `#hint` 与自检口径:玩家能看见,脚本能读到 */
-        lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格(${moved.itemId} ×${moved.count})`;
+        /* ── ★ 第七轮审计 P1:`drop()` 的返回值必须被**消费**,不只是拿去拼一句话 ──
+         *
+         * 修前:`moved` 只用了 `fromSlot/toSlot/itemId` 拼 `lastMove`,
+         * 而 `invView` 每帧由静态 `ITEM_LIST` 重建 ⇒
+         * ```
+         * #hint   : '第 3 格 → 第 9 格'      ← 变了
+         * 格子内容: ITEM_LIST[i]             ← 一件都没动
+         * ```
+         * 现在把它写进**格位状态**(`slotItemIds`)+ 立刻重建视图 ⇒ 格子内容真的换位,
+         * 而 `slotFingerprint` 让"真的变了"成为自检口径里的一个可读值。
+         *
+         * ⚠️ `drop()` 给的是**页内下标**(拾起时用的是 `hit.indexInPage`),
+         * 而格位状态用**全局格位** ⇒ 必须经 `invView.slots[i].slot` 换算。
+         * 直接用页内下标会让第 2 页之后的搬运落到错误的格子(而且不报错)。
+         */
+        const fromGlobal = invView.slots[moved.fromSlot]?.slot ?? -1;
+        const toGlobal = invView.slots[moved.toSlot]?.slot ?? -1;
+        const applied = applySlotMove(slotItemIds, fromGlobal, toGlobal);
+        if (applied !== null) {
+          slotItemIds = applied.itemIds;
+          slotMoveCount += 1;
+          refreshInventory();
+          lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格`
+            + `(${moved.itemId} ×${moved.count};格位 ${fromGlobal} ⇄ ${toGlobal})`;
+        } else {
+          /* 越界 / 同一格:如实说"没生效",不假装搬了 */
+          lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格 未生效(格位 ${fromGlobal}/${toGlobal})`;
+        }
         clickSound();
       } else {
         dragCtl.cancel();
@@ -1337,41 +1471,45 @@ export function boot(container: HTMLElement): BootHandle {
       return;
     }
     /* 面板快捷键 —— **走 state_machine 的合法迁移**,不是自己存字符串。
-     * 这里也是 `state_machine` 的最直接接入点:按 I 打开背包,再按 I 关闭。 */
-    switch (e.key.toLowerCase()) {
-      case 'i': setPanel(UiPanel.INVENTORY); break;
-      case 'r': setPanel(UiPanel.RECIPE_TREE); break;
-      case 'e': setPanel(UiPanel.PIXEL_EASEL); break;
-      case 'p': setPanel(UiPanel.PITCH_EDITOR); break;
+     * 键位表在 `ui/panel_keys.ts`(**唯一一处**;本文件只做转发)。
+     *
+     * ★ 第七轮审计 P1(『e』双绑):这里修前是 `case 'e': setPanel(UiPanel.PIXEL_EASEL)`,
+     *   而 `net/action_target.ts` 的 `ACTION_KEYS` 把 `e` 绑成「拆除面前那格」⇒
+     *   **一次按键两件事**(画架打开 + BREAK_BLOCK 发出),两边都不报错。
+     *   画架已改到 `h`(空闲字母),键集互斥性见 `panel_keys.keyCollisions()`。 */
+    const key = e.key.toLowerCase();
+    const panel = panelKeyOf(key);
+    if (panel !== null) { setPanel(panel); return; }
+    switch (key) {
       /* ★ 6 档缩放:`[` 缩小 / `]` 放大。两个键都只调 `stepZoom`(端点不越界),
          然后重建相机 —— 只写 `isoCam.zoom` 而不 `syncCamera()` 的话,
          画面不会变(而数字"看起来对了")。 */
-      case '[':
-      case ']': {
-        const next = stepZoom(isoCam, e.key === ']' ? 1 : -1);
+      case ZOOM_KEYS[0]:
+      case ZOOM_KEYS[1]: {
+        const next = stepZoom(isoCam, key === ZOOM_KEYS[1] ? 1 : -1);
         isoCam.zoom = next.zoom;
         syncCamera();
         clickSound();
         break;
       }
       /* `/` 进搜索态(背包/配方面板时才有效 —— 那份 view 才有 query 语义) */
-      case '/':
+      case SEARCH_KEY:
         if (uiFsm.activePanel === 'INVENTORY' || uiFsm.activePanel === 'RECIPE_TREE') {
           searchMode = true;
           e.preventDefault();
         }
         break;
-      case 'b':
+      case BOSS_DEMO_KEY:
         /* demo Boss 召唤/遣返 —— 只影响**没有权威 boss**时的演示血条 */
         bossActive = !bossActive;
         clickSound();
         break;
-      /* 画架工具键(仅画架打开时有效) */
+      /* 画架工具键(仅画架打开时有效;键集见 `panel_keys.EASEL_TOOL_KEYS`) */
       case 'z': if (uiFsm.activePanel === 'PIXEL_EASEL') easel.undo(); break;
       case 'y': if (uiFsm.activePanel === 'PIXEL_EASEL') easel.redo(); break;
       case 'x': if (uiFsm.activePanel === 'PIXEL_EASEL') easel.clear(); break;
       case 'c': if (uiFsm.activePanel === 'PIXEL_EASEL') easel.floodFill(8, 8, paletteIndex); break;
-      case 'escape': if (uiFsm.state !== 'CLOSED') uiFsm.transition('CLOSED', 'escape'); break;
+      case CLOSE_PANEL_KEY: if (uiFsm.state !== 'CLOSED') uiFsm.transition('CLOSED', 'escape'); break;
       default: break;
     }
   };
@@ -1593,6 +1731,12 @@ export function boot(container: HTMLElement): BootHandle {
     const cell = { gx: mount.sprite.x, gy: mount.sprite.y, gz: mount.sprite.z, visible: base.visible };
     playerMarker.position.set(cell.gx, cell.gy, cell.gz);
     playerMarker.visible = cell.visible;
+    /* ── ★ 第七轮审计 P1:野生 / 远端玩家的立牌,每帧按**同一份**权威快照对齐 ──
+     *
+     * 修前 `RoomState.wildlife` / 其他 `players` 在屏幕上**零输出**(只有本地 marker
+     * 与 4 个固定图集立牌)⇒ 怪和队友都看不见,而没有任何断言会红。
+     * 判定在 `stage/entity_sprites.planEntitySprites`(纯函数),这里只调一次。 */
+    reconcileEntitySprites();
 
     /* ── ★ 相机跟随**权威位置**(WS-FND-23)──
      *
@@ -1718,6 +1862,8 @@ export function boot(container: HTMLElement): BootHandle {
     store: authority,
     /* ★ WS-FND-113:把预测姿态源接进来(`main.ts` 注入 `predictor.poseView`)。 */
     setPoseSource: (fn) => { poseSource = fn; },
+    /* ★ 第七轮审计 P2:`main.ts` 的动作键监听靠它判断"现在是不是在打字" */
+    textInputActive: () => searchMode,
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.length,
@@ -1887,6 +2033,10 @@ export function boot(container: HTMLElement): BootHandle {
           query: invQuery,
           searchMode,
           lastMove,
+          /* ★ 第七轮审计 P1:`lastMove` 只是**文案** —— 文案对了格子仍可能没动(修前就是这样)。
+             成交次数与格位指纹一起读,才分得清"提示变了"与"背包真的搬了"。 */
+          slotMoves: slotMoveCount,
+          slotFingerprint: slotFingerprint(slotItemIds),
           /* `UiOverlay.invLayout` 的读点:命中测试与绘制共用同一份布局,这里把它的
              实际几何报出来(自检可据此判断"格子是不是按布局画的")。 */
           layout: {
@@ -1897,6 +2047,25 @@ export function boot(container: HTMLElement): BootHandle {
           },
           /* `UiOverlay.hasAtlas`:图集真的挂上去了吗(没有时格子画的是色块占位) */
           atlasReady: ui.hasAtlas,
+        },
+        /* ── ★ 第七轮审计 P1:实体渲染(野生 / 远端玩家)──
+         *
+         * 修前这一块**完全不存在**:`wildlife` 与别的玩家在屏幕上零输出,
+         * 而 `spriteCount` 只数那 4 个固定图集立牌 ⇒ 自检读起来一切正常。
+         * 三个数必须**分开**报:`wildlife` 与远端玩家是两条不同的数据源,
+         * 混成一个数就分不清"只接了怪"还是"只接了队友"。
+         * `spawns/moves/removes` 是累计操作数 —— `moves === 0` 而 `wildlife > 0`
+         * 说明计划里有人、但场景里没动过(又是"算好了没人画")。
+         */
+        entities: {
+          wildlife: entityPlan.wildlife,
+          players: entityPlan.players,
+          total: entityPlan.total,
+          sceneSprites: entitySprites.size,
+          keys: [...entitySprites.keys()].slice(0, 8),
+          spawns: entitySpriteOps.spawns,
+          moves: entitySpriteOps.moves,
+          removes: entitySpriteOps.removes,
         },
         /* recipe_tree:节点数/叶子数/缺料提示来自 buildRecipeTree + checkCraft */
         recipe: recipeTree
@@ -2032,6 +2201,13 @@ export function boot(container: HTMLElement): BootHandle {
         s.material.map?.dispose();
         s.material.dispose();
       }
+      /* ★ 第七轮审计 P1:实体立牌也是场景里的对象 —— dispose 不摘它们,
+         `__stageReady` 与截图脚本会读到一个已经不存在的渲染器上的残留精灵。 */
+      for (const sp of entitySprites.values()) {
+        scene.remove(sp);
+        sp.material.dispose();
+      }
+      entitySprites.clear();
       mat.dispose();
       renderer.dispose();
     },

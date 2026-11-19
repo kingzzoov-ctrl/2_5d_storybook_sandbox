@@ -36,6 +36,7 @@
  *   那正是「播种零成本」的形态。
  */
 
+import { cropProductIdOf } from '../../systems/greenhouse.ts';
 import { roomSystemsPortOf, sowableReasonOf } from '../../systems/intake.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { bindItemSource, missingItemReadPort, ownedItemCount, unbindItemSource } from './item_source.ts';
@@ -109,16 +110,30 @@ export function plantSeedAt(
     };
   }
 
-  /* ── 9 回执:种的是哪一件、哪一格、几天成熟(成熟天数**读回来**,不是本文件给的)。 */
+  /* ── 9 回执:种的是哪一件、哪一格、几天成熟(成熟天数**读回来**,不是本文件给的)。 ── */
   const cell = typeof port.cropAt === 'function' ? port.cropAt(x, y) : undefined;
+  /*
+   * ★ 第七轮 P1:回执里带上**产物 id**(`作物 → 产物` 映射,内容表查名字)。
+   *
+   * 429 的过滤表按**产物**写才会命中(`systems/greenhouse.ts:sortHarvest` 的判据
+   * 就是产物 id)。修前回执只有 `cropId`,玩家按回执里的 id 去配 429,等于把
+   * 「作物 id」当成了「产物 id」—— 分拣链看起来接好了,规则一条都不生效。
+   * `null` = 内容表没有这件作物的产物(如实浮缺口,不编 id;此时收获按
+   * 「收的就是它自己」这一老口径分拣)。
+   */
+  const productItemId = cropProductIdOf(itemId);
   return {
     ok: true, kind: 'OK',
     effect: {
       x, y,
       cropId: itemId,
       seedItemId: itemId,
+      productItemId,
       matureDays: cell?.matureDays ?? null,
-      note: '播种成功:温室/露天按内容表成熟天数在慢帧生长(见 systems/greenhouse.ts)',
+      note: '播种成功:温室/露天按内容表成熟天数在慢帧生长(见 systems/greenhouse.ts);'
+        + (productItemId === null
+          ? '★ 内容表没有该作物的产物 ⇒ 429 过滤表只能按作物 id 配(缺口已如实浮出)'
+          : `429 过滤表按**产物** id ${productItemId} 配(不是种子 id)`),
     },
   };
 }

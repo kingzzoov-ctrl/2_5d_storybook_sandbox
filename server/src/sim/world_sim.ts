@@ -74,11 +74,15 @@ import type { RestorePlan } from '../world/archive.ts';
 import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
 /* ★ WS-FND-98:`safeMass` 是「质量归一 / 非法质量拒绝」的**唯一入口**(见 `physics/world.ts` §0)。 */
 import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
-import { CarrySystem, CarryReject, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
+import { CarrySystem, CarryReject, JUMP_VZ, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, mobSpeciesId, MOB_INSTANCE_SEP, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
 import { rollMobDrops, type MobDropResult } from '../mobs/drops.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
+/* ★ WS-FND-123:`TelegraphShape` 是**线上几何词表**(0=无 1=圆 2=扇 3=矩 4=环)。
+   世界侧 `WarnGeom.kind` 是另一套词(WarnShape);投影 boss 时用下面
+   `wireTelegraphShapeOf()` 做显式映射 —— 不在这里另抄一张数字表(CR-20)。 */
+import { TelegraphShape } from '../../../shared/types/wire.ts';
 import { SignalGraph, type ComponentNode } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
    只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
@@ -281,7 +285,7 @@ import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, 
    生物 → 玩家的打击在**结算前**过一次射线遮挡 —— 修前隔着 1 格墙也能打中
    (`docs/DAMAGE-LOOP.md` D2),因为这条判定在仓库里**根本不存在**。 */
 import { losBlocked } from '../world/vision.ts';
-import type { GroundItem, WorldPlayer, DamageResult } from '../mobs/behaviors.ts';
+import type { GroundItem, WorldPlayer, DamageResult, MobRuntime } from '../mobs/behaviors.ts';
 import { DamageKind } from '../mobs/behaviors.ts';
 /* 玩家 → 生物 方向的伤害管线(task-33 接线)。
    `damage.ts` 与 `weapons.ts` 此前只在 `tests/**` 里被引用,生产闭包中没有它们;
@@ -302,6 +306,10 @@ import {
   ARMOR_K,
   /* ★ 第六轮 P0 [Q] 技能段数 + P1 反伤折算:两条都是既有实现、生产零调用。 */
   planSkillHits,
+  /* ★ 第七轮 P2:技能时序(前摇 + 逐段时刻)与辅助技的零伤害结果。 */
+  skillTiming,
+  dueSkillTicks,
+  skillZeroResult,
   reflectFrom,
   pvpVerdict,
   targetFromStats,
@@ -440,6 +448,10 @@ import type { BreakResult } from '../bosses/breaks.ts';
    阶段产出(每阶段半径/角度/时长都是内容值,`phases.ts:156`)。编排层拿它当
    第三条 strike 通道 ⇒ 此前 Boss 的招式只对着空气(没有任何玩家侧结算)。 */
 import { skillWarnGeoms } from '../bosses/phases.ts';
+/* ★ WS-FND-123:Boss 预警几何的**世界词**与**线上词**之间的唯一映射点。
+   `WarnShape` 是 `mobs/geometry.ts` 的五值词表(POINTER 是其中一个),`TelegraphShape`
+   是 wire 的五值数字表(0..4);两侧都**不在这里重抄数字**。 */
+import { WarnShape, type WarnGeom } from '../mobs/geometry.ts';
 
 /** 快帧与慢帧的固定比例:20Hz / 2Hz = 10。 */
 export const FAST_PER_SLOW = TICK_HZ / SLOW_TICK_HZ;
@@ -896,6 +908,67 @@ type RestoreGate =
       chunks: { cx: number; cy: number; chunk: Chunk }[];
     }
   | { ok: false; code: RestoreFailCode; reason: string };
+/* ═══════════ ★ WS-FND-123:Boss 预警几何「世界词 → 线上词」的唯一映射 ═══════════ */
+
+/**
+ * `WarnGeom.kind`(`mobs/geometry.ts` 的五值词) → `TelegraphShape`(wire 的数字表)。
+ *
+ * | WarnShape | TelegraphShape | 依据 |
+ * | :--- | :--- | :--- |
+ * | CIRCLE / SECTOR / RECT / RING | 同名 | wire 的四值就是这四种几何 |
+ * | POINTER | RECT | wire **没有**「旋转指针」;它有长有宽 ⇒ 按矩形下发 |
+ * | 未知词 | RECT | 不兜底成 CIRCLE:零半径圆会让「几何丢了」看起来像正常画面 |
+ */
+export function wireTelegraphShapeOf(kind: string): number {
+  switch (kind) {
+    case WarnShape.CIRCLE: return TelegraphShape.CIRCLE;
+    case WarnShape.SECTOR: return TelegraphShape.SECTOR;
+    case WarnShape.RECT: return TelegraphShape.RECT;
+    case WarnShape.RING: return TelegraphShape.RING;
+    default: return TelegraphShape.RECT;
+  }
+}
+
+/**
+ * 一条预警几何的**线上半径**(`telegraphR` 的口径:圆/扇/环取半径,
+ * 矩/指针取长宽里的较大者 —— 它是「这块地面预警有多大」的单一标量)。
+ */
+export function warnRadiusOf(g: WarnGeom): number {
+  if (g.kind === WarnShape.RECT || g.kind === WarnShape.POINTER) {
+    return Math.max(g.halfLen, g.halfWidth);
+  }
+  return g.radius;
+}
+
+/**
+ * ★ 第七轮 P2:一段**还没到生效时刻**的技能结算(世界时钟驱动)。
+ *
+ * 为什么要有队列:`planSkillHits` 给出的 `ticks` 是「第 i 段在几秒后生效」,
+ * 修前编排层把 6 段**同帧**连发(716 箭雨 3.3 倍率瞬发、718 的 1 秒前摇不存在)。
+ * 现在本帧只结算「时刻 ≤ 0」的段,其余按 `dueAtSec` 排队,由 `tickSkillCasts`
+ * 在到期帧逐段结算。
+ *
+ * ## 为什么存快照而不是闭包
+ *
+ * 队列里存的都是**施法瞬间**的权威输入(`attacker` 面板 / 武器 / 技能 / 距离),
+ * 但不存 HP 与护盾 —— 那两项在到期时**现取**(`mobTargetProfileOf`),
+ * 否则第 2 段会拿第 1 段之前的血量结算。
+ */
+type PendingSkillTick = {
+  /** 世界时钟上的生效时刻(秒,单调)。 */
+  dueAtSec: number;
+  mobId: string;
+  kind: DamageKind;
+  /** 反伤/正面判定用的方向(度)。 */
+  fromDeg: number;
+  /**
+   * 施法瞬间的八步入参 —— **直接复用管线的 `AttackInput` 口径**(不再抄一份字段,
+   * 那会长出第二个「同名不同物」的容器)。受击方档案与两个随机 roll 刻意不在里面:
+   * 它们到期时现取(`mobTargetProfileOf` / `combatRng`)。
+   */
+  attack: Omit<PipelineAttackInput, 'target' | 'critRoll' | 'dodgeRoll'>;
+};
+
 /**
  * 可运行的世界。
  *
@@ -1008,6 +1081,26 @@ export class WorldSim {
   private readonly spawnBudgetMax: number;
 
   private frameCount = 0;
+
+  /* ══════════ ★ WS-FND-122:两条「能力已有、出口没有」的状态(生产写/读口)══════════
+   *
+   * 1 `shieldOn`  —— 218 和平盾的**真实开关**。修前 `contestCrownDrop` 里写死
+   *    `shieldOn: false`(见下方那处注释),于是「和平盾免疫香蕉皮」这条手册条款
+   *    在生产里**恒不成立**:`resolveShield` 永远收到「没开盾」。
+   * 2 `jumpReadyFrame` —— 起跳冷却。`jumpPlayer` 本身不判「能不能起跳」,
+   *    修前 `jumpPlayer` 生产 **0 调用**(客户端发的 `jump:true` 被
+   *    `parseMoveIntent` 静默丢弃)。地面/冷却两道闸收在 `tryPlayerJump`,
+   *    判据只在那里一次(与 `applyPlayerMove` 的「反作弊只在房间层判」同分工)。
+   */
+  private readonly shieldOn = new Set<string>();
+  private readonly jumpReadyFrame = new Map<string, number>();
+  /** 起跳冷却(快帧数):24 帧 = 1.2s(20Hz 快帧,不引挂钟)。
+   *
+   * ⚠️ 必须**大于一次跳跃的滞空帧数**(`JUMP_VZ ≈ 6.0`、`GRAVITY = 18` ⇒
+   * 滞空 ≈ 0.67s ≈ 13 帧),否则「落地后仍在冷却」这一支**永远不可达** ——
+   * 那会是一条写了但判不到的红线(本仓点名的「不能变红的说明」)。
+   * `tests/WS-FND-122` 的 FND122-4 钉住「落地后立刻再跳 ⇒ COOLDOWN」。 */
+  private static readonly JUMP_COOLDOWN_FRAMES = 24;
   private players: AoiPlayer[] = [];
   /**
    * 每慢帧重新施加的驱动态。
@@ -1183,6 +1276,16 @@ export class WorldSim {
 
   /** 最近一次结算发放的奖励合计(证明 rewards 真的落账,不只是躺在对象里)。 */
   lastPartyRewards: { exp: number; items: number; players: number } = { exp: 0, items: 0, players: 0 };
+
+  /* ── ★ WS-FND-123:结算/发奖的**可观测计数**(第七轮 P1-3 与 P1-6 的判据) ──
+     · `partyRewardGrantCount`: `grantPartyRewards` 真的被执行的次数。
+       自然结算一次 + 收局再来一次 = 2 ⇒ 同一 settlement 被发了**两遍**
+       (修前 `clearPartyRun` 不查 `lastPartySettlement`,那条路径必然二次发奖)。
+     · `partyRewardUnattributed`:**归属不明**而一分不发的奖励行数。
+       修前 `settleRace` 的 4 行 `rewards` 全是 `team=null / playerId=null`
+       ⇒ 世界侧 `targets=[]` **静默**跳过(既不报错也不发东西)。 */
+  partyRewardGrantCount = 0;
+  partyRewardUnattributed = 0;
 
   /** 累计交付进急单的件数(= `submitDelivery` 被真调用的次数)。 */
   rushDeliveryCount = 0;
@@ -1508,6 +1611,8 @@ export class WorldSim {
   private lastRoomSystems: {
     grown: number;
     matured: HarvestRow[];
+    /** 本帧成熟但**没落进世界**的份数(`> 0` ⇒ 那一份只活在收获账里)。 */
+    unlanded: number;
     ranchDays: number;
     ranchProduced: number;
     ranchDropped: number;
@@ -2444,7 +2549,10 @@ export class WorldSim {
       /**
        * ★ [Q] 意图(生产形态):`true` ⇒ 技能从**当前武器**取(`skillOf`)。
        * 客户端只表达「我按了 Q」,不带任何数值 —— 与 `weaponId` 的自报纪律同源。
-       * ⚠️ `net/**` 还没有这个动作报文(不在本轮写域),见 `combat/wiring_ledger.ts`。
+       * ★ WS-FND-122 起有报文出口:`{t:'attack', mobId, useSkill:true}`
+       * → `ws_server.onAttack` → `room.applyAttack(..., useSkill)`
+       * → 本方法的 `opts.useSkill`(见 `tests/WS-FND-122`)。
+       * ⚠️ 没有技能可放时**显式拒**(闸 0e 的 `NO_SKILL`),不静默退回普攻。
        */
       useSkill?: boolean;
     } = {},
@@ -2469,8 +2577,13 @@ export class WorldSim {
      * 为什么要这个字段:`outcome` 只有两个值,装不下「为什么没结算」——
      * 而「被打成幽灵泡泡 ⇒ 不能攻击」与「目标在 32 格外」是**两件事**,
      * 混成一个值就是**谎报**(本文件反复强调的取舍)。
+     *
+     * ★ WS-FND-122 新增 `NO_SKILL`:`useSkill:true` 但当前武器没有技能
+     *   (空手 / 该武器没配 `[Q]`)⇒ 显式拒绝。理由不能塞进 `OUT_OF_AOI`
+     *   (那是「打不到」,这里是「没得放」),也不能静默退回普攻
+     *   (客户端会以为技能生效了)。
      */
-   rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'STUNNED' | 'TRAPPED' | 'LOS_BLOCKED' | 'OUT_OF_AOI' | null;
+    rejected: 'NOT_A_PLAYER' | 'DOWNED' | 'STUNNED' | 'TRAPPED' | 'LOS_BLOCKED' | 'NO_SKILL' | 'OUT_OF_AOI' | null;
   } {
     /* 闸 0:`playerId` 必须是**登记过的玩家**,不是生物。
        否则攻击者可用一只生物当「玩家」去打另一只(它同样在
@@ -2513,6 +2626,24 @@ export class WorldSim {
     }
     if (isTrapped(this.liveBubbleOf(playerId))) {
       return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'TRAPPED' };
+    }
+
+    /* ★ 闸 0e(WS-FND-122):**[Q] 意图的前置** —— 按下 Q 但没有任何技能可放时
+       **显式拒绝,零副作用**(修前:一路落到 `attackMob`,`skillOf` 回 null ⇒ 静默
+       退化成普攻,客户端以为自己放了技能)。
+
+       判据的来源只有一处:`skillOf(weaponOf(playerId))` —— 与 `attackMob` 取技能
+       (`opts.skill ?? (useSkill ? skillOf(weaponId) : null)`)是**同一条**推导,
+       这里不另写一张「哪些 id 有技能」的表。
+       ⚠️ 放在 `mobHost.runtimeOf(mobId)` **之前**:没有技能的玩家不该因为
+          「目标不存在 / 不在活跃区」而得到另一条拒因(那会把客户端错误
+          报成网络问题)。 */
+    if (opts.useSkill === true) {
+      const weaponId = this.weaponOf(playerId);
+      const skill = weaponId === undefined ? null : skillOf(weaponId);
+      if (skill === null) {
+        return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'NO_SKILL' };
+      }
     }
 
     const rt = this.mobHost.runtimeOf(mobId);
@@ -2666,8 +2797,11 @@ export class WorldSim {
     /* ⚠️ 判据是「**这次真的打进去了**」(`out.applied > 0`),不是「公式算出了反伤」:
        被无敌帧/护盾全额挡下的那一击没有造成承伤,反伤也就无从谈起(与「命中才附加」同口径)。 */
     if (out.applied > 0 && result.reflectDamage > 0) {
+      /* ★ 第七轮 P2:反伤累计记「**实际扣除**」—— `vitals.applyDamage` 的 `applied`
+         是公式侧额度(斩杀时超额),`reflectTotalDamage()` 若照记就是虚高。 */
+      const attackerHpBefore = this.vitals.get(attackerId)?.hp ?? 0;
       const back = this.vitals.applyDamage(attackerId, result.reflectDamage);
-      this.reflectTotal += back.applied;
+      this.reflectTotal += Math.min(back.applied, Math.max(0, attackerHpBefore));
       if (back.applied > 0) {
         this.bus.emit('player_hit', {
           playerId: attackerId, attacker: targetId, damage: back.applied,
@@ -2795,6 +2929,17 @@ export class WorldSim {
     segments: number;
     /** 各段 `finalDamage` 之和(= 公式侧的合计;**不等于** `hpLoss`)。 */
     totalDamage: number;
+    /**
+     * ★ 第七轮 P2:每段的**生效时刻**(相对施法瞬间的秒数,含前摇)。
+     *
+     * 普攻 `[0]`;715 三连散射 `[0,0,0]`;716 箭雨 `[0,0.5,1.0,1.5,2.0,2.5]`;
+     * 718 陨石 `[1.0]`(1 秒前摇)。**时序的唯一出处** —— 修前 `plan.ticks`
+     * 只被读了个 `length`(段数)、`telegraphSec` 一个字都没读,
+     * 于是 6 段同帧连发、前摇不存在。
+     */
+    tickScheduleSec: readonly number[];
+    /** 本次调用**没有**结算、已排进世界时钟的剩余段数(见 `tickSkillCasts`)。 */
+    pendingTicks: number;
   } | null {
     const rt = this.mobHost.runtimeOf(mobId);
     if (rt === null) return null;
@@ -2843,8 +2988,8 @@ export class WorldSim {
     /* 2 距离:超出 reach 容差时九步里的第 0a 步会短路(此处如实传入)。 */
     const distance = this.mobDistance(playerId, mobId);
 
-    /* 3 受击方档案 —— 由冻结层 MobDef 派生(缺的字段见 mobCombatProfile)。 */
-    const target = mobCombatProfile(rt.def, { hp: rt.hp });
+    /* 3 受击方档案 —— **每段**由 `mobTargetProfileOf` 现取(冻结层 MobDef + AI 运行时)。
+       修前这里只建一份 `{ hp }` 档案 ⇒ 护盾/晶甲恒空(第七轮 P1)。 */
 
     /* ★ D5:致盲对**命中**的实际影响。
        机制:看不见 ⇒ 只能打到**贴身**的东西。判据用 `TOUCH_RADIUS`
@@ -2876,26 +3021,58 @@ export class WorldSim {
           召唤/护盾类 `extras` 仍未接线 —— 见 `combat/wiring_ledger.ts`。 */
     const skill = opts.skill ?? (opts.useSkill === true ? skillOf(weaponId) : null);
     const plan = skill === null ? null : planSkillHits(skill);
+    /* ★ 第七轮 P2:时序来自 `plan.ticks` + `telegraphSec`(修前两半都被丢掉)。 */
+    const timing = skill === null ? null : skillTiming(skill);
+    /** 每段生效时刻(普攻 1 段、时刻 0)。 */
+    const tickScheduleSec: readonly number[] = timing === null ? [0] : timing.impactAtSec;
     /** 段数 = `planSkillHits` 的结算帧数(例:715 三连散射 = 3,716 箭雨 = 6)。 */
-    const segments = plan === null ? 1 : Math.max(1, plan.ticks.length);
-
-    const rollSegment = (): PipelineDamageResult => computeDamage({
-      attacker,
-      target,
-      weapon,
-      skill,
-      comboMul: opts.comboMul,
-      critRoll: this.combatRng(),
-      dodgeRoll: this.combatRng(),
-      distance: blindMiss ? Number.POSITIVE_INFINITY : distance,
-      source: skill !== null ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
-      ...(damageMul !== undefined ? { damageMul } : {}),
-    });
-
-    /* 5 落账:公式给出通用伤害,生物 AI 再叠个体特性(格挡/反弹/晶甲)。
-       一律走 `damageMob`,**不直接改 rt.hp** —— 否则绕过个体特性。 */
+    const segments = Math.max(1, tickScheduleSec.length);
     const kind = opts.kind ?? this.damageKindOf(weapon);
     const fromDeg = opts.fromDeg ?? this.facingOf(playerId);
+
+    /* ★ 第七轮 P2:**倍率为 0 的辅助技不落伤害**。
+       `computeDamage` 第 6 步的 `Math.max(MIN_DAMAGE, …)` 会把 0 抬成 1 点,
+       再经 `damageMob` 落账 ⇒ 治疗/护盾技会补刀、挂 DoT、结算击杀经验。
+       辅助技不进伤害管线:只施加 `healHp` / `stunSec` / `freezeSec`。 */
+    if (skill !== null && timing !== null && skill.damageMul === 0) {
+      const healed = this.applyUtilitySkill(playerId, skill);
+      const events = [`skill:${skill.key}:utility`];
+      if (skill.healHp > 0) events.push(`skill:${skill.key}:heal=${healed}`);
+      if (skill.stunSec > 0) events.push(`skill:${skill.key}:stun=${skill.stunSec}`);
+      if (skill.freezeSec > 0) events.push(`skill:${skill.key}:freeze=${skill.freezeSec}`);
+      if (plan !== null) events.push(`skill:${skill.key}:${plan.area}`);
+      return {
+        result: skillZeroResult(
+          this.mobTargetProfileOf(rt), skill,
+          '辅助技倍率 0 ⇒ 不落伤害(修前被 MIN_DAMAGE 抬成 1 点并经 damageMob 落账)',
+        ),
+        hpLoss: 0, events, segments: 0, totalDamage: 0,
+        tickScheduleSec, pendingTicks: 0,
+      };
+    }
+
+    /* 5 每段结算:公式给出通用伤害,生物 AI 再叠个体特性(格挡/反弹/晶甲)。
+       一律走 `damageMob`,**不直接改 rt.hp** —— 否则绕过个体特性。
+       ★ 第七轮 P1:`target` **每段重新取**(`mobTargetProfileOf`)—— 修前整次攻击
+       只建一份 `{ hp }` 档案:护盾 / 晶甲两项恒 0 ⇒ 破盾与 `CRYSTAL_ARMOR_MUL`
+       永不生效,段与段之间的护盾余量也看不到。 */
+    const rollSegment = (): PipelineDamageResult => {
+      const rolled = computeDamage({
+        attacker,
+        target: this.mobTargetProfileOf(rt),
+        weapon,
+        skill,
+        comboMul: opts.comboMul,
+        critRoll: this.combatRng(),
+        dodgeRoll: this.combatRng(),
+        distance: blindMiss ? Number.POSITIVE_INFINITY : distance,
+        source: skill !== null ? DamageSource.SKILL : DamageSource.NORMAL_ATTACK,
+        ...(damageMul !== undefined ? { damageMul } : {}),
+      });
+      /* AI 的护盾池账本跟着公式走,否则「盾破了」下一刀又是满盾。 */
+      this.settleMobShield(rt, rolled);
+      return rolled;
+    };
 
     /* ⚠ 已死生物:`hpLoss` 必须归零,不能照抄 AI 的返回值。
      *
@@ -2920,27 +3097,56 @@ export class WorldSim {
      * 注意**这句冗余本身测不住**——注入实验里去掉它,断言全绿完全相同,
      * 属等价变异体,不是断言盲区。 */
     const hpBefore = rt.hp;
-    /* 首段结算 */
-    const result = rollSegment();
+    /* ★ 第七轮 P2:本帧**到期**的段数。
+       `timing === null` ⇒ 普攻(1 段、时刻 0);技能 ⇒ 只有 `impactAtSec ≤ 0`
+       的段当场结算:715 三连(三段同在 0)⇒ 3 段;716 箭雨 ⇒ 只有第 1 段;
+       718 陨石(前摇 1.0 秒)⇒ **一段都没有**(它在排队等前摇走完)。 */
+    const dueCount = timing === null ? 1 : dueSkillTicks(timing, 0).length;
+    let result: PipelineDamageResult | null = null;
     let rawLossSum = 0;
-    let totalDamage = result.finalDamage;
+    let totalDamage = 0;
     const events: string[] = [];
-    const aiFirst = this.damageMob(mobId, result.finalDamage, kind, fromDeg);
-    rawLossSum += aiFirst?.hpLoss ?? 0;
-    if (aiFirst !== null) events.push(...aiFirst.events);
-    /* ★ 多段(715 三连 / 716 箭雨 / 722 流沙 / 723 力场):**同帧连发**。
-       目标中途死掉就停 —— 给尸体结算第 2、3 段会把 `hpLoss` 与击杀账算花。
-       每段都是**独立**一次 `computeDamage`(暴击/破盾/击退各自结算),
-       段数只由 `planSkillHits` 决定,不在这里另定段数。 */
-    for (let seg = 1; seg < segments; seg += 1) {
-      if (!rt.alive || rt.hp <= 0) break;
+    for (let seg = 0; seg < dueCount; seg += 1) {
+      /* 目标中途死掉就停 —— 给尸体结算后续段会把 `hpLoss` 与击杀账算花。 */
+      if (seg > 0 && (!rt.alive || rt.hp <= 0)) break;
       const r = rollSegment();
+      if (result === null) result = r;
       totalDamage += r.finalDamage;
       const ai = this.damageMob(mobId, r.finalDamage, kind, fromDeg);
       rawLossSum += ai?.hpLoss ?? 0;
       if (ai !== null) events.push(...ai.events);
+      /* 技能的控制效果(712/714 眩晕、719/723 冻结、204 震晕)按段施加。 */
+      if (skill !== null && (ai?.hpLoss ?? 0) > 0) this.applySkillControl(rt, skill);
     }
     const hpLoss = Math.max(0, Math.min(rawLossSum, hpBefore));
+    /* ★ 第七轮 P2:剩下的段进世界时钟(`tickSkillCasts` 逐帧取到期段),
+       **不再同帧连发** —— 修前 716 的 6×0.55 在一帧里打完(3.3 倍率瞬发)。 */
+    let queued = 0;
+    for (let seg = dueCount; seg < tickScheduleSec.length; seg += 1) {
+      this.skillTickQueue.push({
+        dueAtSec: this.worldSec + (tickScheduleSec[seg] as number),
+        mobId,
+        kind,
+        fromDeg,
+        attack: {
+          attacker,
+          weapon,
+          skill: skill as SkillDef,
+          comboMul: opts.comboMul,
+          distance: blindMiss ? Number.POSITIVE_INFINITY : distance,
+          source: DamageSource.SKILL,
+          ...(damageMul !== undefined ? { damageMul } : {}),
+        },
+      });
+      queued += 1;
+    }
+    if (result === null) {
+      /* 前摇期:零伤害占位(`skillZeroResult`),不落伤害也不动护盾。 */
+      result = skillZeroResult(
+        this.mobTargetProfileOf(rt), skill as SkillDef,
+        `技能前摇 ${(timing as { telegraphSec: number }).telegraphSec}s 未到 ⇒ 本帧不结算(${queued} 段排队)`,
+      );
+    }
 
     /* 6 灼烧 DoT(task-44 接线)—— 命中带 `dot` 的武器则点燃目标。
      *
@@ -2961,7 +3167,165 @@ export class WorldSim {
     /* ★ `plan` 的另一半产出(命中区域)进事件流:它是 `planSkillHits` 除段数之外
        唯一可被消费者读到的信息(客户端飘字 / 战斗日志)。 */
     if (skill !== null && plan !== null) events.push(`skill:${skill.key}:${plan.area}`);
-    return { result, hpLoss, events, segments, totalDamage };
+    return { result, hpLoss, events, segments, totalDamage, tickScheduleSec, pendingTicks: queued };
+  }
+
+  /* ═══════ 第七轮 P1/P2:受击方档案(AI 运行时)+ 技能时序 ═══════ */
+
+  /**
+   * 世界时钟(秒)。**唯一来源是 `frameCount`** —— 不另造累加器:
+   * 两份时钟必然漂移,而漂移的表现是「技能偶尔晚一帧」,不会报错。
+   */
+  private get worldSec(): number {
+    return this.frameCount * SIM_FAST_DT;
+  }
+
+  /**
+   * 受击方档案 —— 冻结层 `MobDef` **加上** AI 运行时的那两项。
+   *
+   * ## 第七轮 P1:修前只传 `{ hp }`
+   *
+   * `TargetProfile` 的 `shield` / `crystalArmor` 于是恒 0/false ⇒
+   * `computeDamage` 第 4 步的破盾分支(`target.shield > 0`)**永远走不到**、
+   * `CRYSTAL_ARMOR_MUL` 与 `ignoresCrystal` **永不生效**(204 的 4.0、
+   * 712 的 3.0 破盾倍率全是死数)。
+   *
+   * ## 两项的真值来源
+   *
+   * ```
+   * shield        ← rt.mem.shield        (AI 自己的护盾池账本;读口 = mobShieldOf)
+   * crystalArmor  ← rt.mem.crystalArmor  (AI 声明「全身晶甲」)
+   * ```
+   * ⚠️ **不按 `MobDef.id` 硬开 `crystalArmor`**:紫晶重甲虫的「正面 80%」
+   * 带朝向扇区、归 `BeetleAi.onDamage`;在这里硬开会让它变成全身减伤,
+   * 并与 AI 的 0.8 叠乘(0.2 × 0.2 = 0.04)—— 那就是双重结算。
+   *
+   * ⚠️ 仍缺的生产者(不在本任务写域):`LAVA_SHIELD_HP = 400` 在
+   * `mobs/behaviors.ts` 里**只有定义、没有写点**(`rt.mem.shield` 只在固化时被置 0)。
+   * 即管线现在是通的,但火灵的盾没人初始化。
+   */
+  private mobTargetProfileOf(rt: MobRuntime): ReturnType<typeof mobCombatProfile> {
+    const shield = this.mobShieldOf(rt);
+    return mobCombatProfile(rt.def, {
+      hp: rt.hp,
+      maxHp: rt.maxHp > 0 ? rt.maxHp : rt.def.hp,
+      shield,
+      shieldMax: shield,
+      crystalArmor: rt.mem.crystalArmor === 1,
+      /* 生物不反伤 ⇒ 反伤**单跳不成环**(`mobCombatProfile` 里也写死 0)。 */
+      reflectMul: 0,
+    });
+  }
+
+  /** AI 侧护盾池的读口:非数字 / 非正 / 非有限一律按 0(`NaN` 不许进公式)。 */
+  private mobShieldOf(rt: MobRuntime): number {
+    const raw: unknown = rt.mem.shield;
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  /**
+   * 把公式算出的护盾消耗**写回 AI 账本**。
+   *
+   * 不写回的后果是静默的:`computeDamage` 只在一份**入参副本**上扣盾,
+   * 下一刀又读到满盾 ⇒「一击敲碎晶甲类护盾」(204)永远不成立,
+   * 而且 `shieldBroken` 每次都重新为真。
+   */
+  private settleMobShield(rt: MobRuntime, result: PipelineDamageResult): void {
+    const current = this.mobShieldOf(rt);
+    if (current <= 0) return;
+    rt.mem.shield = result.shieldBroken ? 0 : Math.max(0, current - result.shieldDamage);
+  }
+
+  /** 技能的控制效果(眩晕 / 冻结):按段施加,**取最大值**(不叠加时长)。 */
+  private applySkillControl(rt: MobRuntime, skill: SkillDef): void {
+    if (skill.stunSec > 0) rt.mem.stunSec = Math.max(rt.mem.stunSec ?? 0, skill.stunSec);
+    if (skill.freezeSec > 0) rt.mem.freezeSec = Math.max(rt.mem.freezeSec ?? 0, skill.freezeSec);
+  }
+
+  /**
+   * 辅助技(倍率 0)的**唯一**效果落点:治疗半径内的玩家。
+   *
+   * 口径取内容表:`radius` 是作用半径(717 愈合春风圈 = 5 格)、`healHp` 是
+   * 每人治疗量(60)。施法者也包含在内(「周围」的半径从 0 起算)。
+   * 返回**实际**治疗总量(`vitals.heal` 的返回值,已按 maxHp 截断)。
+   */
+  private applyUtilitySkill(playerId: string, skill: SkillDef): number {
+    if (skill.healHp <= 0) return 0;
+    const caster = this.physics.bodies.get(playerId);
+    if (caster === undefined) return 0;
+    const radius = skill.radius > 0 ? skill.radius : 0;
+    let healed = 0;
+    for (const id of this.playerIds) {
+      const body = this.physics.bodies.get(id);
+      if (body === undefined) continue;
+      if (Math.hypot(body.x - caster.x, body.y - caster.y) > radius) continue;
+      healed += this.vitals.heal(id, skill.healHp);
+    }
+    return healed;
+  }
+
+  /**
+   * 结算一段**已到期**的技能(见 `PendingSkillTick`)。
+   *
+   * 与首帧走同一条八步管线、同一个 `damageMob` 收口,只是受击方档案与
+   * 随机源都在**到期这一刻**现取 —— 段与段之间生物的血/盾/存活都会变。
+   * @returns 这一段**实际**掉了多少血(已按本段前的 HP 钳制)。
+   */
+  private landSkillTick(t: PendingSkillTick): number {
+    const rt = this.mobHost.runtimeOf(t.mobId);
+    if (rt === null || !rt.alive || rt.hp <= 0) return 0;
+    const result = computeDamage({
+      ...t.attack,
+      target: this.mobTargetProfileOf(rt),
+      critRoll: this.combatRng(),
+      dodgeRoll: this.combatRng(),
+    });
+    this.settleMobShield(rt, result);
+    const hpBefore = rt.hp;
+    const ai = this.damageMob(t.mobId, result.finalDamage, t.kind, t.fromDeg);
+    const loss = Math.max(0, Math.min(ai?.hpLoss ?? 0, hpBefore));
+    if (loss > 0) {
+      const skill = t.attack.skill ?? null;
+      if (skill !== null) this.applySkillControl(rt, skill);
+      const weapon = t.attack.weapon ?? null;
+      if (weapon !== null && weapon.dot !== null && rt.alive) {
+        this.applyDot(t.mobId, weapon.dot, t.fromDeg);
+      }
+    }
+    return loss;
+  }
+
+  /**
+   * 每**快帧**把到期的技能段结算掉 —— 技能时序的唯一执行点。
+   *
+   * 放在快帧(20Hz)而不是慢帧:716 的段间隔是 0.5 秒,慢帧刚好等于 0.5 秒,
+   * 放在慢帧会让「每 0.5 秒一段」变成帧率巧合;而且与 `tickDots` 同为
+   * 「按秒记账」的东西,同处快帧更不容易漂移。
+   */
+  private tickSkillCasts(): void {
+    if (this.skillTickQueue.length === 0) return;
+    const now = this.worldSec;
+    const due = this.skillTickQueue.filter((t) => t.dueAtSec <= now + 1e-9);
+    if (due.length === 0) return;
+    this.skillTickQueue = this.skillTickQueue.filter((t) => t.dueAtSec > now + 1e-9);
+    for (const t of due) {
+      this.skillTicksLanded += 1;
+      this.skillTickDamage += this.landSkillTick(t);
+    }
+  }
+
+  /** 排队中、尚未结算的技能段数(诊断 / 判据用,不是玩法状态)。 */
+  pendingSkillTicks(): number {
+    return this.skillTickQueue.length;
+  }
+
+  /** 技能段的落账面(只读):已结算段数 / 实际掉血合计 / 仍在排队的段数。 */
+  skillTickStats(): { landed: number; damage: number; pending: number } {
+    return {
+      landed: this.skillTicksLanded,
+      damage: this.skillTickDamage,
+      pending: this.skillTickQueue.length,
+    };
   }
 
   /**
@@ -2997,12 +3361,21 @@ export class WorldSim {
   /** 反伤累计(只增;诊断与判据用,不是玩法状态)。 */
   private reflectTotal = 0;
 
+  /* ★ 第七轮 P2:未到生效时刻的技能段(世界时钟驱动,见 `tickSkillCasts`)。 */
+  private skillTickQueue: PendingSkillTick[] = [];
+  private skillTicksLanded = 0;
+  private skillTickDamage = 0;
+
   /**
    * 生产里**真的施加出去**的反伤总量。
    *
    * 存在的理由:修前反伤算到第 7 步就被丢,reflectDamage 只有单测读过 ⇒
    * 「反伤接了没有」在外部**不可观测**。有它之后,WS-FND-118 才能把
    * 「接了」与「恰好在这次为 0」分开。
+   *
+   * ★ 第七轮 P2:口径统一成「**实际扣除**」—— 两条通道都记 `min(公式额度, 受击前 HP)`
+   * (怪打人那条还再取生物 AI 的 `hpLoss`,因为反伤本身也会被格挡/正面减伤)。
+   * 修前这里记的是折前额度 ⇒ 斩杀时读数虚高(与 `res.applied` 未钳同源)。
    */
   reflectTotalDamage(): number {
     return this.reflectTotal;
@@ -3602,6 +3975,91 @@ export class WorldSim {
     return this.bossRaid.snapshots();
   }
 
+  /**
+   * ★ WS-FND-123:在场 Boss 的**线格式**投影(`BOSS_FIELD_TABLE` 的 10 个字段)。
+   *
+   * ## 修前:10 个字段 0 个写端
+   * `BossRaidRuntime.snapshots()` 只产 12 个内部字段(`hpRatio` / `phaseName` /
+   * `stunnedSec` …),**不含** `id` / `telegraphShape/X/Y/R/EndTick`;
+   * 而 `net/schema.ts#upsertBoss` 是 `state.bosses` 的唯一容器写口、全仓零调用
+   * ⇒ 客户端拿到的 `bosses` 恒为 `[]`,血条与地面预警只能走 demo 兜底。
+   *
+   * ## 为什么几何在这里补,而不是让网络层自己算
+   * 预警几何的**唯一来源**是 `bosses/phases.ts#skillWarnGeoms`(内容层按阶段给定),
+   * 网络层拿不到 `BossState`(`hudStates` 的私有表)。⇒ 本方法是「世界事实 → 线格式」
+   * 的唯一转换点,房间只做搬运(`projectBosses`),不重算任何几何。
+   *
+   * ## 三处显式约定(都不是猜的)
+   * 1 目标点 = 最近玩家(与 `bossStrikes` 同源:招式本来就是朝人放的);
+   * 2 多条几何时取 **`warnSec` 最大**的那一条 —— 它是「这一阶段主招」的时长
+   *   (`bossWarnSecOf` 用的是同一判据);同长取先出现的(内容层顺序固定 ⇒ 确定);
+   * 3 `telegraphEndTick` 是**绝对世界帧** = `frameCount + ceil(warnSec / DT)`,
+   *   与 `applyPacket` 里 tick 的语义一致(帧号,不是秒)。
+   */
+  bossHudSnapshots(): {
+    id: string;
+    bossId: string;
+    phase: number;
+    hp: number;
+    maxHp: number;
+    telegraphShape: number;
+    telegraphX: number;
+    telegraphY: number;
+    telegraphR: number;
+    telegraphEndTick: number;
+  }[] {
+    const out: {
+      id: string;
+      bossId: string;
+      phase: number;
+      hp: number;
+      maxHp: number;
+      telegraphShape: number;
+      telegraphX: number;
+      telegraphY: number;
+      telegraphR: number;
+      telegraphEndTick: number;
+    }[] = [];
+    const t = (this.frameCount * DT) as number;
+    /* 目标点集合:只取**玩家**刚体(vitals.ids())—— 生物刚体也在 `physics.bodies`
+       里,按 `bodies` 全表扫会让「一只怪站在 boss 旁边」决定招式朝向。 */
+    const players: { x: number; y: number }[] = [];
+    for (const pid of this.vitals.ids()) {
+      const b = this.physics.bodies.get(pid);
+      if (b !== undefined) players.push({ x: b.x, y: b.y });
+    }
+    for (const snap of this.bossSnapshots()) {
+      const st = this.bossRaid.stateOf(snap.bossId);
+      let best: WarnGeom | null = null;
+      if (st !== undefined) {
+        let target = { x: st.x, y: st.y };
+        let bestD = Infinity;
+        for (const p of players) {
+          const d = Math.hypot(p.x - st.x, p.y - st.y);
+          if (d < bestD) { bestD = d; target = { x: p.x, y: p.y }; }
+        }
+        for (const g of skillWarnGeoms(st, target, t)) {
+          if (best === null || g.warnSec > best.warnSec) best = g;
+        }
+      }
+      out.push({
+        /* 实体 id 与 `bossId` 分开:`id` 是这一只在场实体,`bossId` 是内容层定义
+           (同一 `bossId` 被召唤两次时,id 仍然唯一)。格式固定 ⇒ 可断言。 */
+        id: `boss:${snap.bossId}`,
+        bossId: snap.bossId,
+        phase: snap.phaseIndex,
+        hp: snap.hp,
+        maxHp: snap.maxHp,
+        telegraphShape: best === null ? TelegraphShape.NONE : wireTelegraphShapeOf(best.kind),
+        telegraphX: best === null ? 0 : best.cx,
+        telegraphY: best === null ? 0 : best.cy,
+        telegraphR: best === null ? 0 : warnRadiusOf(best),
+        telegraphEndTick: best === null ? 0 : this.frameCount + Math.ceil(best.warnSec / DT),
+      });
+    }
+    return out;
+  }
+
   /** 按 ID 取玩家(位置实时从物理刚体读,不是缓存快照)。 */
   private playerById(id: string): WorldPlayer | undefined {
     if (!this.playerIds.has(id)) return undefined;
@@ -4033,6 +4491,30 @@ export class WorldSim {
     return this.knockbacks.has(playerId);
   }
 
+  /* ══════════ ★ WS-FND-122:218 和平盾的**真实开关**(写口 + 读口)══════════
+   *
+   * 修前 `prank/actions.ts#resolvePrankAction` 的 `shieldOn` 参数在生产里
+   * **只有一个值**:`false`(写死在 `contestCrownDrop` 里)⇒ 「和平盾免疫
+   * 香蕉皮」这条手册条款恒不成立,而且不报错。
+   *
+   * 写口只给一处:`net/actions/use_item.ts` 的 218 分支
+   * (即「玩家用了那件装备」);读口给两处:`contestCrownDrop` 与
+   * `use_item` 的玩具分支(队友免疫判定)。
+   * ⚠️ 开关是**每个玩家**的(`Set<string>`),不是房间级布尔:和平盾是装备。
+   */
+  setShieldOn(playerId: string, on: boolean): boolean {
+    if (!this.playerIds.has(playerId)) return false;
+    const had = this.shieldOn.has(playerId);
+    if (on === true) this.shieldOn.add(playerId);
+    else this.shieldOn.delete(playerId);
+    return had !== on;
+  }
+
+  /** 该玩家的 218 和平盾是否开着(没开 / 没有这个玩家 ⇒ `false`)。 */
+  shieldOnOf(playerId: string): boolean {
+    return this.shieldOn.has(playerId);
+  }
+
   /**
    * 玩家 `FLAG_REVIVE_RADIUS` 内最近的**复活旗**(435)。`null` = 半径内没有旗。
    *
@@ -4241,6 +4723,10 @@ export class WorldSim {
     /* ★ 第四条:打盹玩法表(与上面那条连接态标记**不是**同一张,见 docblock)。 */
     this.afkRuns.delete(id);
     this.knockbacks.delete(id);
+    /* ★ WS-FND-122:和平盾开关与起跳冷却同样按 id 索引 —— 漏清 ⇒ 同名重连
+       会继承上一轮的**开盾状态**(凭空免疫整蛊)与**起跳冷却**。 */
+    this.shieldOn.delete(id);
+    this.jumpReadyFrame.delete(id);
     this.syncPlayers();
     return had;
   }
@@ -5414,6 +5900,9 @@ export class WorldSim {
     this.rushDeliveryCount = 0;
     this.lastRushSettlement = null;
     this.dozeEntryCount = 0;
+    /* ★ WS-FND-123:结算/发奖计数随世界重建一起归零(不跨代)。 */
+    this.partyRewardGrantCount = 0;
+    this.partyRewardUnattributed = 0;
     this.lastPartyTick = { partyTicked: 0, afkTicked: 0, afkDew: 0, events: [] };
     /* 瞬态:喷射意图窗口 / 翻炒意图窗口 / 击退窗口 / 倒地 / 活人泡泡 / 料理 buff / DoT /
        厨房锅内状态(含 `fireOut` —— 一份"炉火已浇灭"跨世代留着就是错的)。 */
@@ -5998,6 +6487,8 @@ export class WorldSim {
       /* ★ D4 抗性 + 烹饪 `defFlat`(护甲曲线)两个乘区进同一次结算:
          - `element` → `vitals.elementResistOf` 在 `applyHit` 内部折算;
          - `defFlat` → `mobDamageMulFor` 作为等级伤害的乘数。 */
+      /* ★ 第七轮 P2:记下受击前 HP —— 反伤按**实际扣除**折算(见下面的 `taken`)。 */
+      const hpBeforeHit = this.vitals.get(h.playerId)?.hp ?? 0;
       const res = this.vitals.applyHit(
         h.attackerId,
         h.playerId,
@@ -6021,14 +6512,24 @@ export class WorldSim {
           this.levelOf(res.playerId), [...this.wearingOf(res.playerId)],
           foodCombatInput(this.buffsOf(res.playerId)),
         ).reflectMul;
-        const refl = reflectFrom(reflectMul, res.applied);
+        /* ★ 第七轮 P2:反伤口径统一成「**实际扣除**」——
+           1 `res.applied` 是公式侧承伤(**没有**按剩余 HP 钳制):斩杀那一击
+             `applied` 可能远超目标剩余血量(实测残血 1 挨 14 ⇒ `applied=14`),
+             拿它折算反伤会凭空放大;
+           2 折出来的额度还要过生物 AI(`damageMob` 有格挡/正面减伤),`reflectTotal`
+             若记折前值就是**虚高**(本仓把可观测值当验收项)。
+           ⇒ 折算用 `min(applied, 受击前 HP)`,累计用 `damageMob` 返回的 `hpLoss`。
+           **反伤不再回打玩家**:生物档案的 `reflectMul` 恒 0(`mobCombatProfile` 写死),
+           所以这一跳不会生出第二跳(单跳不成环)。 */
+        const taken = Math.min(res.applied, Math.max(0, hpBeforeHit));
+        const refl = reflectFrom(reflectMul, taken);
         if (refl.reflectDamage > 0 && this.mobHost.runtimeOf(h.attackerId) !== null) {
-          this.reflectTotal += refl.reflectDamage;
           /* 反伤的方向 = 玩家 → 生物(供生物 AI 的正面/背面判定)。 */
           const deg = from !== null && to !== undefined
             ? (Math.atan2(from.y - to.y, from.x - to.x) * 180) / Math.PI
             : 0;
-          this.damageMob(h.attackerId, refl.reflectDamage, DamageKind.PHYSICAL, deg);
+          const back = this.damageMob(h.attackerId, refl.reflectDamage, DamageKind.PHYSICAL, deg);
+          this.reflectTotal += Math.max(0, back?.hpLoss ?? 0);
         }
         /* ★ D-09(owner,2026-11-16):受击击退 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**。
            裁决给了数值(伤害折算 + 上限 2 格)⇒ 按它接,且**位移仍走 `applyKnockback`**
@@ -6270,6 +6771,17 @@ export class WorldSim {
         } as GroundItem);
         return true;
       },
+      /*
+       * ★ 第七轮 P1 补口:世界侧的 **429 过滤表**交给物流。
+       *
+       * 没有这一口时 `tickLogistics` 无从知道玩家设的规则 —— 分拣器只剩
+       * `filterIds` 老口径,于是「设定过滤物品 ID」在世界里**不改变搬运目标**
+       * (规则只在收获时算过一个道号,搬运侧对它一无所知)。
+       *
+       * 传的是 `roomSystemsState.sortFilters` 的**同一份引用**:`tickLogistics`
+       * 只读它,不写回;而 `setSortFilters` 每次整体替换,下一拍自动生效。
+       */
+      sortFilters: () => this.roomSystemsState.sortFilters,
     };
   }
 
@@ -6478,12 +6990,26 @@ export class WorldSim {
    *
    * ★ WS-FND-120:清空**之前**先结算一次(若还没结算)—— 否则「裁判按 -1 收局」
    * 会把这一局的名次与奖励整份丢掉,而那种丢法**不报错**:相位照样回 `IDLE`。
+   *
+   * ★ WS-FND-123(第七轮 P1-3):**同一 settlement 只发一次奖**。
+   * 修前这里无条件走 `settlePartyRun` + `grantPartyRewards`,于是两条路会叠加:
+   * ```
+   *   自然结算:stepPartyActions 里 settlement 首次出现 ⇒ 发奖(记 lastPartySettlement)
+   *   然后裁判按 -1 ⇒ clearPartyRun ⇒ contestSettlement 仍返回**同一份对象**
+   *                ⇒ 再发一遍(经验二次入账、物品二次落地,且不报错)
+   * ```
+   * ⇒ 判据不在「contest 是否还在」,而在**这份 settlement 发过没有**:
+   * 只有 `lastPartySettlement === null`(本局还没发过)时才结算 + 发奖。
+   * 本方法也写 `lastPartySettlement`,与 `stepPartyActions` 共用同一个幂等键。
    */
   clearPartyRun(): void {
     const contest = this.partyContest;
-    if (contest !== null) {
+    if (contest !== null && this.lastPartySettlement === null) {
       const settlement = contestSettlement(contest) ?? settlePartyRun(contestMode(contest));
-      if (settlement !== null) this.grantPartyRewards(settlement);
+      if (settlement !== null) {
+        this.lastPartySettlement = settlement;
+        this.grantPartyRewards(settlement);
+      }
     }
     this.partyRun = null;
     this.partyContest = null;
@@ -6551,6 +7077,45 @@ export class WorldSim {
   /** 当前对局相位(诊断与断言用)。未开局返回 `'IDLE'`。 */
   partyPhase(): string {
     return this.partyRun === null ? 'IDLE' : this.partyRun.phase;
+  }
+
+  /**
+   * ★ WS-FND-123:本局采用的模式键(`PARTY_MODE_KEY` 的四值);未开局 ⇒ `null`。
+   *
+   * 为什么房间需要它:两套开局此前互不通 —— 436 哨台只建**赛局**(contest),
+   * `START_PARTY` 只建**记分账**(`PartyRecord`),而记账那条要的正是模式键。
+   * ⇒ 房间每帧用 `partyPhase()` + 本方法把「世界开了哪一局」读成「记账该开哪一局」,
+   *   `null` 是显式的「没开局」,不是猜一个默认模式。
+   */
+  partyModeKey(): string | null {
+    return this.partyContest === null ? null : contestMode(this.partyContest).key;
+  }
+
+  /**
+   * ★ WS-FND-123:结算的**线格式视图**(房间/回执用;不暴露 `PartySettlement` 类型)。
+   *
+   * 为什么要一个视图:房间(`net/`)不 import `party/` 的类型(依赖方向),
+   * 而回执要往客户端送三件事:**终场文案** / **前三名** / **各队名次**。
+   * 三者都是标量或字符串数组 ⇒ 在回执 `effect` 里合法(`EffectValue`)。
+   */
+  partySettlementView(): {
+    modeName: string;
+    broadcastText: string;
+    top: string[];
+    standing: { rank: number; team: string | null; value: number }[];
+  } | null {
+    const s = this.lastPartySettlement;
+    if (s === null) return null;
+    return {
+      modeName: s.modeName,
+      broadcastText: s.broadcastText,
+      /* 前三名:个人赛(`settleRace` / 持冠榜)按 `personal` 的 rank 取,已含 DNF 标记。
+         团队赛没有个人名次 ⇒ 空数组(不是编出来的三行)。 */
+      top: s.personal.slice(0, 3).map((r) => (
+        `${r.rank}. ${r.playerId} ${r.dnf ? 'DNF' : `${r.elapsedMs}ms`}`
+      )),
+      standing: s.standing.map((row) => ({ rank: row.rank, team: row.team, value: row.value })),
+    };
   }
 
   /**
@@ -6788,6 +7353,43 @@ export class WorldSim {
     for (const k of seen) this.reachLatch.add(k);
   }
 
+  /* ══════════ ★ WS-FND-122:436 哨台 `params.mode` 的**报文写入口**══════════
+   *
+   * ## 修前是什么样
+   * 四模式九闸全部依赖 `desk.params.mode`,而**全仓没有任何写点**:
+   * `net` 层写 `params` 的地方 0 处,世界电路图(`wiring.components`)在生产里
+   * 也恒空 ⇒ `stepRefereeDesk` 的 `desks.length === 0` 永远成立
+   * ⇒ 开局入口**结构上不可达**,不报错。
+   *
+   * ## 为什么是这个形状
+   * 「写组件参数」不新造一条报文语义更窄:`net/actions/start_party.ts` 的
+   * `START_PARTY` 已经把「本局用哪个模式」定下来了(`meta.partyMode` 的下标,
+   * 1=BRIDGE_CTF ... 4=PAINT_WAR),而 436 的 `params.mode` **正是同一套下标**
+   * (`deskModeKey` 的既有映射)⇒ 直接把那个数交过来,不另立第二张模式表。
+   *
+   * @returns `applied:false` + `reason` ⇒ 这一栏写不了(没有哨台 / 模式越界);
+   *          调用方必须把它写进回执,**不许**当成写成功。
+   */
+  setRefereeDeskMode(mode: number): {
+    applied: boolean;
+    reason: string;
+    deskId: string | null;
+    mode: number;
+  } {
+    const desks = this.componentCells('ARENA_REFEREE_DESK');
+    if (desks.length === 0) return { applied: false, reason: 'NO_REFEREE_DESK', deskId: null, mode: 0 };
+    const desk = desks[0];
+    if (!Number.isFinite(mode)) return { applied: false, reason: 'BAD_MODE', deskId: desk.id, mode: 0 };
+    const m = Math.trunc(mode);
+    /* 合法域 = `-1`(收局)或 `deskModeKey` 认得的 1..4;其余不写(写进去会让
+       `stepRefereeDesk` 静默无视,而调用方以为命令已下达)。 */
+    if (m !== REFEREE_DESK_STOP_MODE && deskModeKey(m) === null) {
+      return { applied: false, reason: 'BAD_MODE', deskId: desk.id, mode: m };
+    }
+    desk.params.mode = m;
+    return { applied: true, reason: 'ok', deskId: desk.id, mode: m };
+  }
+
   /**
    * 436 哨台:**开局 / 收局**的唯一生产入口。
    *
@@ -7000,9 +7602,12 @@ export class WorldSim {
     /* ④ 掉冠:持冠者进入击退窗口 ⇒ 过整蛊掉冠判定(218 盾可拦)。 */
     const holder = contestCrownHolder(contest);
     if (holder !== null && this.knockbackOf(holder)) {
-      /* ⚠️ 218 和平盾的**开关**还没有生产者(`useItem` 的 218 分支不在本任务写域),
-         故这里按「没开」传;台账 `prank/actions.ts#PRANK_ACTION_LEDGER` 已登记。 */
-      const { gate } = gateCrownKnock({ knockback: true, shieldOn: false });
+      /* ★ WS-FND-122:218 和平盾的开关**从世界侧真实状态读**(`shieldOnOf`),
+         不再写死 `false`。写口在 `net/actions/use_item.ts` 的 218 分支
+         (`useItem` 218 ⇒ `setShieldOn`)。
+         ⚠️ 仍然保留 `gateCrownKnock` 这一层:它同时承载「三件候选玩具逐个过免疫」
+         (手册 §3.4「和平盾免疫香蕉皮」),判定不搬到本文件。 */
+      const { gate } = gateCrownKnock({ knockback: true, shieldOn: this.shieldOnOf(holder) });
       if (gate.ok && contestCrownDrop(contest)) events.push('CROWN_DROP');
     }
 
@@ -7023,18 +7628,37 @@ export class WorldSim {
    * · 物品 → `dropItem(x, y, …)`(地面的唯一写口)。
    * 团队奖励发给**该队在本局登记过的玩家**(`partyTeams`,来自 435 旗);
    * 一名队员都没登记 ⇒ 不发明受益者(计数里看得见)。
+   *
+   * ★ WS-FND-123(第七轮 P1-6):**归属不明时按结算自己声明的名次补**。
+   * `party/modes.ts#settleRace` 的 4 行 `rewards` 全是 `rewardForRank(rank)` 原样
+   * (即 `team=null` / `playerId=null`),修前这里 `targets=[]` ⇒ **一分不发、
+   * 一句不报**,而"发了 0 份"与"这名次没人"在读数上完全一样。
+   * ⇒ 归属的三级取法(逐级显式,不猜):
+   * ```
+   *   1 line.playerId 非空        ⇒ 就发给他
+   *   2 line.team     非空        ⇒ 发给该队登记的玩家
+   *   3 两者都空                  ⇒ 查 settlement.standing 里**同名次**那一行的 team
+   *                                  (那是结算自己写下的归属),仍取不到 ⇒ 记未归属
+   * ```
+   * ⚠️ 第 3 级**不**兜底成「全体玩家」:那会把 4 个名次的奖励叠成 4 倍经验,
+   * 而那种多发自**不报错**。
    */
   grantPartyRewards(settlement: PartySettlement): { exp: number; items: number; players: number } {
     const lines = [...settlement.rewards, ...settlement.personalRewards];
     const paid = new Set<string>();
     let exp = 0;
     let items = 0;
+    this.partyRewardGrantCount += 1;
     for (const line of lines) {
+      const team = line.team !== null ? line.team : this.rankingTeamOf(settlement, line.rank);
       const targets = line.playerId !== null
         ? [line.playerId]
-        : line.team !== null
-          ? this.vitals.ids().filter((pid) => this.partyTeams.get(pid) === line.team)
+        : team !== null
+          ? this.vitals.ids().filter((pid) => this.partyTeams.get(pid) === team)
           : [];
+      /* 归属不明的行**计数**(显式),而不是静默跳过:否则「这名次没人」与
+         「归属字段丢了」在同一组读数里不可区分。 */
+      if (line.playerId === null && team === null) this.partyRewardUnattributed += 1;
       for (const pid of targets) {
         if (line.exp > 0) {
           /* `gainExp` 是**纯函数**(返回新档案)⇒ 必须写回,否则经验只活在返回值里。 */
@@ -7060,6 +7684,17 @@ export class WorldSim {
     }
     this.lastPartyRewards = { exp, items, players: paid.size };
     return this.lastPartyRewards;
+  }
+
+  /**
+   * 结算里**同名次**那一行声明的队伍(归属补全的第 3 级,见 `grantPartyRewards`)。
+   * 没有该名次 ⇒ `null`(调用方据此记「归属不明」)。
+   */
+  private rankingTeamOf(settlement: PartySettlement, rank: number): TeamKey | null {
+    for (const row of settlement.standing) {
+      if (row.rank === rank) return row.team;
+    }
+    return null;
   }
 
   /**
@@ -7758,6 +8393,8 @@ export class WorldSim {
   advanceRoomSystems(dayFraction: number = SIM_SLOW_DT / WorldSim.WORLD_DAY_SEC): {
     grown: number;
     matured: HarvestRow[];
+    /** 本帧成熟但**没落进世界**的份数(与收获账同源,见 `wiring.ts:GrowResult`)。 */
+    unlanded: number;
     ranchDays: number;
     ranchProduced: number;
     ranchDropped: number;
@@ -7767,6 +8404,7 @@ export class WorldSim {
     /* ── A-2 温室 ── */
     let grown = 0;
     let matured: HarvestRow[] = [];
+    let unlanded = 0;
     if (frac > 0 && this.roomSystemsState.crops.size > 0) {
       /* 房间识别是慢帧产物;地形刚变过就先刷一次(脏标记由 `setCell` 维护)。 */
       if (this.roomsDirty) this.refreshRooms();
@@ -7778,10 +8416,19 @@ export class WorldSim {
         weather: this.weatherNow,
         isGreenhouse: (x: number, y: number) => house.has(`${x},${y}`),
         hasSprinkler: (x: number, y: number) => cover.has(`${x},${y}`),
+        /* ★ FND125-11 世界侧落货口:产物**真的落到地面**(`dropItem` 是地面的
+           唯一写口)。`productId === null` = 内容表没有这件作物的产物 ⇒ 如实回
+           `'NONE'`,由 `wiring.ts` 记进 `unlanded` 而不是编一件物品出来。 */
+        deliverHarvest: (h) => {
+          if (h.productId === null) return 'NONE';
+          this.dropItem(h.x, h.y, h.productId, h.count);
+          return 'GROUND';
+        },
       };
       const r = growCrops(this.roomSystemsState, input);
       grown = r.grown;
       matured = r.matured;
+      unlanded = r.unlanded;
     }
 
     /* ── A-1 牧场:跨日结算(整数天)──
@@ -7804,7 +8451,7 @@ export class WorldSim {
       ranchDropped = res.dropped;
     }
 
-    this.lastRoomSystems = { grown, matured, ranchDays, ranchProduced, ranchDropped };
+    this.lastRoomSystems = { grown, matured, unlanded, ranchDays, ranchProduced, ranchDropped };
     return this.lastRoomSystems;
   }
 
@@ -7812,6 +8459,7 @@ export class WorldSim {
   lastRoomSystemsReport(): {
     grown: number;
     matured: HarvestRow[];
+    unlanded: number;
     ranchDays: number;
     ranchProduced: number;
     ranchDropped: number;
@@ -8177,6 +8825,87 @@ export class WorldSim {
     return this.physics.jump(playerId, baseVz);
   }
 
+  /**
+   * ★ WS-FND-122:**起跳的生产入口**(地面闸 + 冷却闸 + `jumpMul`)。
+   *
+   * ## 修前是什么样
+   * 客户端(`client/src/net/input.ts`)对空格做**锁存**,`main.ts` 把它放进
+   * `MoveIntent.jump` 发上来;而服务端 `parseMoveIntent` 的字段白名单里
+   * **没有 `jump`** ⇒ 报文被静默丢弃(`jumpPlayer` 生产 0 调用)。
+   *
+   * ## 两道闸(判据只在这里一次)
+   * ```
+   * 地面  body.z === 0 且 body.vz === 0   ← 权威(physics.bodies),不看报文
+   * 冷却  frameCount − lastJumpFrame ≥ JUMP_COOLDOWN_FRAMES
+   * ```
+   * 冷却用**快帧计数**(`frameCount`)而不是挂钟:与 `D-07` 的
+   * 「世界时钟由帧序派生」同源,挂钟会让同一串输入在不同机器上不同步。
+   *
+   * @returns `jumped:false` + `reason` ⇒ **一个字都没改**(零副作用)。
+   *          `reason` 取值:`NOT_A_PLAYER` / `NO_BODY` / `AIRBORNE` / `COOLDOWN`。
+   */
+  tryPlayerJump(playerId: string): {
+    jumped: boolean;
+    reason: string;
+    /** 实际写进 `vz` 的值(`jumped:false` ⇒ `null`)。 */
+    vz: number | null;
+  } {
+    if (!this.playerIds.has(playerId)) return { jumped: false, reason: 'NOT_A_PLAYER', vz: null };
+    const b = this.physics.bodies.get(playerId);
+    if (b === undefined) return { jumped: false, reason: 'NO_BODY', vz: null };
+    if (b.z > 0 || b.vz !== 0) return { jumped: false, reason: 'AIRBORNE', vz: null };
+    const ready = this.jumpReadyFrame.get(playerId) ?? 0;
+    if (this.frameCount < ready) return { jumped: false, reason: 'COOLDOWN', vz: null };
+    const vz = this.jumpPlayer(playerId, JUMP_VZ);
+    if (vz === null) return { jumped: false, reason: 'NO_BODY', vz: null };
+    this.jumpReadyFrame.set(playerId, this.frameCount + WorldSim.JUMP_COOLDOWN_FRAMES);
+    return { jumped: true, reason: 'ok', vz };
+  }
+
+  /**
+   * ★ WS-FND-122:**把整蛊玩具的效果施加到目标**(`use_item` 的 221..255 分支落点)。
+   *
+   * ## 分工(为什么判定不在这里)
+   * 「这一下该不该生效」(表内 / 半径 / 自伤 / 218 盾免疫)全在
+   * `party/actions.ts#gatePrank` → `prank/actions.ts#resolvePrankAction`。
+   * 世界侧只做它做不到的那一半:**把通过判定的效果落到权威状态上**:
+   * ```
+   * vitals.applyStun      → 眩晕计时(攻击 / 移动两条闸都读它)
+   * physics.applyImpulse  → 击退(Δv = J/m,方向 = 施术者→目标,读权威坐标)
+   * ```
+   * ⚠️ 队友侧**零伤害**是玩具表的不变量(`assertAllyZeroDamage`),所以这里
+   * **没有**伤害参数:整蛊不扣血。给一个 `damage` 形参就是把那条不变量
+   * 变成「调用方记得传 0」。
+   *
+   * @returns `applied:false` ⇒ 世界侧一个字都没改(目标不存在 / 施术者不存在)。
+   */
+  applyPrankToTarget(
+    actorId: string,
+    targetId: string,
+    p: { toyId: number; stunSec: number; impulse: number; moveTiles: number; flag: string },
+  ): { applied: boolean; reason: string; stunSec: number; moveTiles: number; flag: string } {
+    const none = { applied: false, reason: '', stunSec: 0, moveTiles: 0, flag: '' };
+    const a = this.physics.bodies.get(actorId);
+    const t = this.physics.bodies.get(targetId);
+    if (a === undefined || t === undefined) return { ...none, reason: 'NO_BODY' };
+    if (!this.playerIds.has(targetId)) return { ...none, reason: 'NOT_A_PLAYER' };
+    const stun = Number.isFinite(p.stunSec) && p.stunSec > 0 ? p.stunSec : 0;
+    if (stun > 0) this.vitals.applyStun(targetId, stun);
+    /* 击退方向:施术者 → 目标(权威坐标),长度归一;两人重叠 ⇒ 不推(不造 NaN)。 */
+    const dx = t.x - a.x;
+    const dy = t.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (Number.isFinite(p.impulse) && p.impulse > 0 && len > 1e-6) {
+      /* 量纲:玩具表给的是**格/秒**,`applyImpulse` 里 `Δv = J / m` ⇒ 乘 mass。 */
+      const j = p.impulse * t.mass;
+      this.physics.applyImpulse(targetId, (dx / len) * j, (dy / len) * j, 0);
+    }
+    return {
+      applied: true, reason: 'ok', stunSec: stun,
+      moveTiles: Number.isFinite(p.moveTiles) ? p.moveTiles : 0, flag: p.flag,
+    };
+  }
+
   /** 采集乘子(602「伐木与采矿速度 +20%」)—— 归属到**发起采集的玩家**。 */
   gatherMulOfPlayer(playerId: string): number {
     return gatherMulOfMods(this.buffsOf(playerId));
@@ -8508,6 +9237,8 @@ export class WorldSim {
      * 位置在物理之后:AoI 的存活判定已由物理步同步,`tickDots` 才能看到
      * 本帧的准确坐标与存活状态(见那里的 `!rt.alive` 清账分支)。 */
     this.tickDots();
+    /* ★ 第七轮 P2:技能未走完的段(716 箭雨 6 段 / 718 陨石前摇)按世界时钟结算。 */
+    this.tickSkillCasts();
 
     if (this.mobsOn) {
       /* ── 慢帧 2Hz:AOI 唤醒 / 休眠 ──

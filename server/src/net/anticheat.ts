@@ -303,6 +303,18 @@ export interface MoveIntent {
    * (见 `sanitizeMul`),而不是「声明的大小」。
    */
   speedMul?: number;
+  /**
+   * ★ WS-FND-122:**起跳意图位**(`true` = 这一条命令带「按了空格」)。
+   *
+   * 为什么加在 `MoveIntent` 而不是新开一条上行:`jump` 与移动**同源**
+   * (客户端 `input.ts` 的空格锁存就是随移动命令发出来的,见
+   * `client/src/net/input.ts` 与 `main.ts`),拆成两条报文会造出
+   * 「跳了但没走 / 走了但没跳」两种时序,而锁存语义本来就是「这一条命令」。
+   *
+   * ⚠️ 它**不参与**反作弊的位移运算(`checkMove` 只读 x/y/z/tick):
+   *    「能不能起跳」(地面 / 冷却)由世界侧 `tryPlayerJump` 判 —— 一处判据。
+   */
+  jump?: boolean;
 }
 
 export interface PlayerAntiCheatState {

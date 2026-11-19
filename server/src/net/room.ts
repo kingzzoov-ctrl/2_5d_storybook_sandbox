@@ -22,8 +22,11 @@ import {
   decodePacket,
   PROTOCOL_VERSION,
 } from '../../../shared/net/delta.ts';
-import { EntityKind } from '../../../shared/types/wire.ts';
-import { removeWildlife, upsertWildlife } from './schema.ts';
+import { EntityKind, TelegraphShape, type BossState } from '../../../shared/types/wire.ts';
+/* ★ WS-FND-123:Boss 投影的两个容器写口。修前 `upsertBoss` 是全仓**唯一**定义且
+   **零调用**(`room.ts` 没有 `projectBosses`,`bossSnapshots()` 只有测试调)⇒
+   `state.bosses` 恒空,客户端血条与地面预警只能走 demo 兜底。 */
+import { removeBoss, removeWildlife, upsertBoss, upsertWildlife } from './schema.ts';
 import {
   AntiCheatRoom,
   type Clock,
@@ -61,7 +64,7 @@ import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
 /* ★ 第六轮:`meta.partyTimer/scoreA/scoreB` 的**数据源**在本房间的派对赛局记录里
    (`START_PARTY` 写的那份,单例模块)。只读两个导出,不碰它的写口。 */
-import { PartyPhase, partyStateOf } from './actions/start_party.ts';
+import { PartyPhase, endParty, partyStateOf } from './actions/start_party.ts';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { lookupActionHandler } from './actions/action_table.ts';
@@ -587,6 +590,37 @@ export interface AttackReport {
   hit: boolean;
   outOfReach: boolean;
   dodged: boolean;
+  /**
+   * ★ WS-FND-122:本次是否**按了 [Q]**(报文里的意图位)。
+   *
+   * 为什么回执要带它:没有这一位,「普攻」与「按了 Q 但没有技能 ⇒ 被拒」
+   * 在客户端看起来都是一段伤害 —— 那正是本仓反复记的静默形态。
+   */
+  useSkill: boolean;
+  /**
+   * ★ WS-FND-122:世界侧给出的**显式拒绝理由**;`null` = 未被拒绝。
+   *
+   * 为什么是 `string` 而不是联合类型:`net` 刻意**不 import** 模拟层类型
+   * (见 `WorldSaveHost` 的 docblock),在这里照抄一份词表就是第二份口径。
+   */
+  rejected: string | null;
+}
+
+/**
+ * ★ WS-FND-122:一次**起跳意图**的结果(供断言与排查)。
+ *
+ * 与 `AttackReport` 同一取舍:字段全是基本类型(要跨 `net` → 传输层边界被
+ * 序列化),且**拒绝也要有记录** —— `jumped:false` + `reason` 让
+ * 「按了空格但没跳」与「空格根本没到」在断言里可区分。
+ * `reason` 由世界侧给(`NOT_A_PLAYER` / `NO_BODY` / `AIRBORNE` / `COOLDOWN`),
+ * 房间另外补一个 `NO_WORLD`(宿主没实现 `jumpPlayer`)。
+ */
+export interface JumpReport {
+  playerId: string;
+  jumped: boolean;
+  reason: string;
+  /** 实际写进权威 `vz` 的值;没跳 ⇒ `null`。 */
+  vz: number | null;
 }
 
 /**
@@ -698,6 +732,14 @@ export interface WorldSaveHost {
   attackMobAuthorized(
     playerId: string,
     mobId: string,
+    /**
+     * ★ WS-FND-122:**意图位**,不是面板数据。
+     * `useSkill:true` = 「我按了 Q」⇒ 技能由模拟层从**当前武器**取
+     * (`skillOf`),这里不传任何技能定义/数值(与 `weaponId` 的自报纪律同源)。
+     * 可选:`{useSkill:true}` 与「不传」必须可区分 —— 前者会**显式拒**
+     * 没有技能的情况(`NO_SKILL`),后者是普攻。
+     */
+    opts?: { useSkill?: boolean },
   ): {
     outcome: 'OK' | 'OUT_OF_AOI';
     /**
@@ -720,6 +762,53 @@ export interface WorldSaveHost {
         dodged: boolean;
       };
     } | null;
+    /**
+     * ★ WS-FND-122:世界侧的**显式拒绝理由**(`null` = 未被拒绝)。
+     *
+     * 为什么加它:`outcome` 只有两个值,装不下「为什么没结算」——
+     * 而「按了 Q 但这把武器没有技能」必须与「打到了」可区分
+     * (修前那种情况会静默退回普攻)。词表由世界层拥有,这里只搬运。
+     */
+    rejected?: string | null;
+  };
+  /* ══════════ ★ WS-FND-122:四条「世界侧有能力、网络侧没有出口」的声明 ══════════
+   *
+   * 与 `setPlayerAfk` / `resetWorld` 同一取舍:**可选**(`?`)。手写 host 假件
+   * (`tests/**` / `scripts/**`)不实现它们本来就合法 —— 那种宿主走动作层的
+   * 「能力缺失」分支(显式 `NOT_IMPLEMENTED`),**不许**静默成功。
+   *
+   * ⚠️ 为什么必须在这里声明:`createHost()` 的返回类型标注是 `WorldSaveHost`,
+   * `WorldSim` **有**而本接口**没声明**的成员会被**结构化裁掉** ⇒ 房间侧
+   * `typeof host.xxx` 在**编译期**恒假(task-70 的实测形态)。
+   */
+  /**
+   * ★ 起跳(`jump` 报文位的落点)。
+   *
+   * 为什么判据在世界侧而不是房间:地面/冷却要读**权威刚体**(`physics.bodies`),
+   * 房间手里没有它。签名只回 `{jumped, reason}` —— 房间不重判。
+   */
+  tryPlayerJump?(playerId: string): { jumped: boolean; reason: string; vz: number | null };
+  /** ★ 218 和平盾的**真实开关**(读口)。见 `WorldSim.shieldOnOf`。 */
+  shieldOnOf?(playerId: string): boolean;
+  /** ★ 218 和平盾的**写口**(唯一生产调用点:`actions/use_item.ts` 的 218 分支)。 */
+  setShieldOn?(playerId: string, on: boolean): boolean;
+  /**
+   * ★ 整蛊玩具(221..255)的**效果落点**。判定(`gatePrank`)在动作层,
+   * 这里只落到权威状态(眩晕计时 + 击退冲量);队友侧零伤害由玩具表保证。
+   */
+  applyPrankToTarget?(
+    actorId: string,
+    targetId: string,
+    p: { toyId: number; stunSec: number; impulse: number; moveTiles: number; flag: string },
+  ): { applied: boolean; reason: string; stunSec: number; moveTiles: number; flag: string };
+  /**
+   * ★ 436 哨台 `params.mode` 的**唯一写口**(`START_PARTY` 的落点)。
+   *
+   * `applied:false` + `reason` ⇒ 这一栏写不了(世界里没有哨台 / 模式越界)。
+   * ⚠️ 调用方必须把它写进回执 —— 静默当成成功会让「四模式九闸」看起来接好了。
+   */
+  setRefereeDeskMode?(mode: number): {
+    applied: boolean; reason: string; deskId: string | null; mode: number;
   };
   /**
    * 当前**存活**生物的快照(权威 → 投影,每帧一次)。
@@ -990,6 +1079,86 @@ export interface WorldSaveHost {
    * 不报错、不影响推进,只把名次算错。
    */
   partyTeamOf?(playerId: string): string | null;
+
+  /* ══════════ ★ WS-FND-123:boss / party 的四个读口 + 一个写口 ══════════
+   *
+   * 修前这五条**一条都没有**,于是两条链路在两端各自"正常"、中间断着:
+   * ```
+   *   bosses :world 有 bossRaid.snapshots()  room 有 upsertBoss()    ⇒ 无人调 ⇒ 客户端 bosses=[]
+   *   party  :436 哨台建 contest        START_PARTY 建 PartyRecord   ⇒ 两套开局互不通 ⇒ HUD 恒 0
+   * ```
+   * 全部**可选**(与 `partyTeamOf?` 同一取舍):手写 host 假件(测试/脚本)不实现
+   * 它们本来就合法 —— 缺哪个读口,对应那一款行为**如实不做**(不猜值、不兜底)。
+   */
+
+  /** 在场 Boss 的只读快照(`bosses/runtime.ts` 的 12 个内部字段);无 ⇒ `undefined`。 */
+  bossSnapshots?(): readonly {
+    bossId: string;
+    hp: number;
+    maxHp: number;
+    phaseIndex: number;
+  }[];
+
+  /**
+   * 在场 Boss 的**线格式**投影(`BOSS_FIELD_TABLE` 的 10 个字段)。
+   *
+   * 为什么不复用 `bossSnapshots()`:它**不含** `telegraphShape/X/Y/R/EndTick` 与 `id`,
+   * 那五格是客户端画地面预警的唯一来源(`bossHudFrom`)。
+   * 房间只做搬运(`projectBosses`),几何由世界侧算 —— 这里**不许**再算一遍。
+   */
+  bossHudSnapshots?(): readonly {
+    id: string;
+    bossId: string;
+    phase: number;
+    hp: number;
+    maxHp: number;
+    telegraphShape: number;
+    telegraphX: number;
+    telegraphY: number;
+    telegraphR: number;
+    telegraphEndTick: number;
+  }[];
+
+  /** 派对相位(`IDLE` / `BUILD` / `RACE` / `PLAY` / `SETTLED`);没有派对 ⇒ `'IDLE'`。 */
+  partyPhase?(): string;
+
+  /** 本局模式键(`BRIDGE_CTF` / `JELLY_BALL` / `CROWN_BR` / `PAINT_WAR`);未开局 ⇒ `null`。 */
+  partyModeKey?(): string | null;
+
+  /** 本局裁判的玩家 id(站在 436 哨台上的人);未开局 ⇒ `''`。 */
+  partyReferee?(): string;
+
+  /**
+   * **开一局派对**(★ 两套开局的另一半)。
+   *
+   * `START_PARTY` 只建**记分账**(`actions/start_party.ts` 的 `PartyRecord`),
+   * 世界侧的 contest 只能由这里开 —— 修前两条路各开一半,于是:
+   * `addScore` 永不调用(没账本)/ `partyPhase()` 恒 `IDLE`(没赛局)。
+   *
+   * 返回 `false` = 世界拒绝(未知模式键 / 空裁判 id),调用方如实记录,**不**当成功。
+   */
+  startPartyRun?(key: string, refereeId: string): boolean;
+
+  /** 最近一次派对结算的**线格式视图**(终场文案 / 前三名 / 各队名次);无 ⇒ `null`。 */
+  partySettlementView?(): {
+    modeName: string;
+    broadcastText: string;
+    top: string[];
+    standing: { rank: number; team: string | null; value: number }[];
+  } | null;
+
+  /** 急单结算回执(`RUSH_GRADE` 在这里);未结算 ⇒ `null`。 */
+  rushSettlement?(): { grade: string; score: number } | null;
+
+  /**
+   * 世界总线(**只订阅**,不 emit)。
+   *
+   * 播报此前只 `bus.emit('party_broadcast')`,而 `server/src` 里 `.bus.on(` 是 **0 处**
+   * ⇒ 比分播报 / 终场文案 / 前三名堆在总线里没人取。房间订阅它是这条链的第一段消费。
+   */
+  bus?: {
+    on(pattern: string, handler: (e: { kind: string; payload?: Record<string, unknown> }) => void): unknown;
+  };
   /* ⚠️ 此处**刻意没有** `inventoryTotalOf(): {used, cap}` —— 契约 §3.1 列了它,
      但实测它在本仓是**三无**:零实现(WorldSim 没有)、零消费者(step/applyInventory
      都不读)、零断言引用。而它给的又是**总量**,与 W5 的裁定
@@ -1577,6 +1746,44 @@ export class RoomRuntime {
   lastRestoreError: string | null = null;
   /** 每 tick 累计的违规,由外层写 room_events。 */
   private pendingViolations: Violation[] = [];
+
+  /* ══════════ ★ WS-FND-123:boss 投影 / 派对记账打通 / 播报下发 ══════════
+   *
+   * 这四组状态全部是**可观测量**(计数或最近一次的副本),不是第二份真值:
+   * 真值仍在世界(`bossRaid` / `partyContest`)与 `actions/start_party.ts` 的
+   * `PartyRecord` 里。这里的每一格都由下面那几个方法从真值搬运而来。
+   */
+
+  /** 累计投影过的 boss 实体帧数(证明 `upsertBoss` 每帧真的被调)。 */
+  bossProjectionCount = 0;
+
+  /** 世界总线订阅是否已接上(幂等;`close()` 会退订)。 */
+  private worldBusAttached = false;
+
+  /** 总线订阅的退订函数(`close()` 调;`EventBus.on` 返回它)。 */
+  private worldBusOff: (() => void) | null = null;
+
+  /** 从世界总线收到的播报(**未下发**的积压;`drainPartyBroadcasts()` 取走)。 */
+  private partyBroadcastOutbox: { kind: string; text: string; atTick: number }[] = [];
+
+  /** 累计收到的播报条数(含已取走的)。 */
+  partyBroadcastTotal = 0;
+
+  /** `START_PARTY` 真的建出记账并开出赛局的次数 / 世界开局后补建记账的次数。 */
+  partyRecordStartCount = 0;
+  partyRecordAdoptCount = 0;
+  /** 建账失败/跳过的次数(模式键是契约外取值等),显式计数而不是静默。 */
+  partyRecordSkips = 0;
+  /** `endParty` 被真调用(赛局收束)的次数。 */
+  partyRecordEndCount = 0;
+
+  /** 世界开局 → 记账的锁:同一局只补建一次(键 = 模式键 + 裁判;世界回 IDLE 即释放)。 */
+  private partyRecordLatch: string | null = null;
+
+  /** 回执里已经送过的数据指纹(播报条数 / 结算 / 急单评级),避免每帧重复塞。 */
+  private receiptSeenBroadcast = 0;
+  private receiptSeenSettlement = '';
+  private receiptSeenRush = '';
   /**
    * 本房**签名私钥**(32 字节随机)。从不离开服务端进程,也不进任何下行帧。
    *
@@ -1930,6 +2137,13 @@ export class RoomRuntime {
   close(): boolean {
     if (this.status === RoomStatus.CLOSED) return false;
     this.status = RoomStatus.CLOSED;
+    /* ★ WS-FND-123:退订世界总线 —— 房间关闭后世界可能还活着(装配层可能复用
+       host),留着订阅会让播报继续堆进一个已关闭房间的 outbox(纯泄漏)。 */
+    if (this.worldBusOff !== null) {
+      this.worldBusOff();
+      this.worldBusOff = null;
+    }
+    this.worldBusAttached = false;
     if (this.db) setRoomStatus(this.db, this.id, RoomStatus.CLOSED, this.clock.nowMs());
     return true;
   }
@@ -2235,7 +2449,14 @@ export class RoomRuntime {
        `NO_SUCH_ACTION_NAME`)。理由文本与拆分前那个 `default:` 分支**逐字相同**
        (唯一出处:`actions/not-implemented.ts`)。 */
     if (handler === undefined) return notImplemented(action);
-    return handler(this.actionContextFor(actorId, action, payload));
+    const outcome = handler(this.actionContextFor(actorId, action, payload));
+    /* ★ WS-FND-123(P1-2):记账建好之后,把**赛局**也开起来。
+       `START_PARTY` 的处理器只写 `PartyRecord`,世界的 contest 必须由这条钩子开
+       —— 否则账本在、比分永远是 0(`addScore` 有账可记但没有对局事件)。 */
+    if (outcome.ok && action === RoomAction.START_PARTY) this.startWorldPartyRun(actorId);
+    /* ★ WS-FND-123(P1-4/P1-5):回执出口。只在**成功**回执上加新键,
+       失败回执的形状一个字节都不动(既有断言不受影响)。 */
+    return outcome.ok ? this.withPartyReceipt(outcome) : outcome;
   }
 
   /**
@@ -2385,6 +2606,17 @@ export class RoomRuntime {
       host.applyPlayerMove(userId, intent.x, intent.y, intent.z);
     }
 
+    /* ★ 1b WS-FND-122:**起跳**. 报文里的 `jump:true` 此前**没有消费者**
+       (`parseMoveIntent` 直接丢字段,`jumpPlayer` 生产 0 调用)。
+       判据(地面 / 冷却)在世界侧 `jumpPlayer` 的入口一处判 —— 房间只搬运意图,
+       并把**结果**(含拒绝理由)记进 `lastJumpReport`:不记的话「按了空格没反应」
+       与「空格没到」在断言里不可区分。
+       ⚠️ 放在位置写入**之后**:起跳要在地面(`z === 0`),先写位置再判,
+          语义才是「站在这一格起跳」。 */
+    if (intent.jump === true) {
+      this.lastJumpReport = this.applyJumpIntent(userId);
+    }
+
     /* 2 再把**权威值**投影到 state。
        有世界就从权威读回(含击退/搬运的结果);没有世界就只有声明值可写。
        ★ z 也从权威读回(2026-11-16 接通):`applyPlayerMove` 已把 z 写进刚体,
@@ -2400,6 +2632,36 @@ export class RoomRuntime {
     this.touch(this.clock.nowMs());
     return v;
   }
+
+  /**
+   * ★ WS-FND-122:把一条**起跳意图**交给世界侧,并把它回的形态**原样**记下。
+   *
+   * 为什么这一段单独抽出来(而不是三行 inline):
+   * 「宿主没实现」这条分支必须有一句**可读的理由**(`NO_WORLD`),
+   * 否则 `jumped:false` 会同时表示「跳不了」与「这条链没接」——
+   * 正是本仓反复记的静默形态。
+   */
+  private applyJumpIntent(userId: string): JumpReport {
+    const host = this.worldSaveHost;
+    if (host === null || typeof host.tryPlayerJump !== 'function') {
+      return { playerId: userId, jumped: false, reason: 'NO_WORLD', vz: null };
+    }
+    const out = host.tryPlayerJump(userId);
+    return {
+      playerId: userId,
+      jumped: out.jumped === true,
+      reason: out.reason ?? 'UNKNOWN',
+      vz: out.vz ?? null,
+    };
+  }
+
+  /**
+   * 最近一次**起跳意图**的结果;`null` = 还没有带 `jump` 的移动报文。
+   *
+   * 与 `lastAttackReport` 同一取舍:`null` 让「没接线 / 没按空格」与
+   * 「按了但被拒」在断言里可区分。
+   */
+  lastJumpReport: JumpReport | null = null;
 
   /**
    * 攻击报文 → 反作弊闸 → **模拟层结算**(US2/task-47 接线)。
@@ -2431,9 +2693,15 @@ export class RoomRuntime {
    * ⇒ 客户端的自由度只剩「选择目标」,而**目标的合法性与可达性全在服务端**。
    * 这是 CR-14 U1/U2 那族纪律在网络入口上的兑现。
    *
+   * ★ WS-FND-122:**`useSkill`(按了 Q)是报文里唯一的第二个意图位**。
+   *   它只表达「我按了 Q」,技能定义/倍率/段数一律由模拟层从**当前武器**取
+   *   (`skillOf` / `planSkillHits`)—— 与上面「不传面板数据」同一条纪律。
+   *   没有技能可放 ⇒ 世界侧回 `rejected:'NO_SKILL'`,回执照实带上,**零副作用**。
+   *
    * @param mobId 客户端指定的目标;缺省/非法时按「无目标」处理(不结算)。
+   * @param useSkill `true` = 本次是 `[Q]` 技;只接受字面 `true`(运输层已收窄)。
    */
-  applyAttack(userId: string, claimedBonus = 0, mobId?: string): Verdict {
+  applyAttack(userId: string, claimedBonus = 0, mobId?: string, useSkill = false): Verdict {
     const v = this.ac.attack(userId, this.state.meta.tick, claimedBonus);
     if (v.violation) this.pendingViolations.push(v.violation);
     if (!v.allowed) {
@@ -2448,7 +2716,11 @@ export class RoomRuntime {
       return v;
     }
 
-    const authorized = host.attackMobAuthorized(userId, mobId);
+    /* ★ 第三个实参只在**按了 Q** 时给:老世界源不认它时,「普攻」这条路上的
+       结构化调用保持不变(少一个可选实参 ⇒ 不会因为多一层而改变行为)。 */
+    const authorized = useSkill
+      ? host.attackMobAuthorized(userId, mobId, { useSkill: true })
+      : host.attackMobAuthorized(userId, mobId);
     const hit = authorized.hit;
     this.lastAttackReport = {
       tick: this.state.meta.tick,
@@ -2460,6 +2732,8 @@ export class RoomRuntime {
       hit: hit !== null,
       outOfReach: hit?.result.outOfReach ?? false,
       dodged: hit?.result.dodged ?? false,
+      useSkill,
+      rejected: authorized.rejected ?? null,
     };
     return v;
   }
@@ -2689,6 +2963,10 @@ export class RoomRuntime {
   step(prevSnapshot: RoomState | null = null): Uint8Array {
     if (this.status !== RoomStatus.OPEN) return new Uint8Array(0);
     this.state.meta.tick += 1;
+    /* ★ WS-FND-123:世界总线订阅必须在**第一次 advance 之前**接上 ——
+       播报是在 `advance()` 内部 `bus.drain()` 时投递的,晚一帧接就丢掉第一帧的
+       开局播报(`MODE_START`)。幂等。 */
+    this.attachWorldBus();
     /* ★ 第六轮:派对 HUD 的三个字段与 `meta.tick` **同一个写点**(每帧一次)——
        放在这里而不是 `worldSaveHost.advance()` 里,是因为它读的两份事实
        (房间赛局记录 / 世界队伍)在**任何**宿主下都存在,而 `advance` 是可选成员。 */
@@ -2732,6 +3010,13 @@ export class RoomRuntime {
     if (host !== null && typeof host.advance === 'function') {
       host.advance(1);
     }
+    /* ★ WS-FND-123:两套开局**打通**的落点(见 `syncPartyRecord`)。
+       必须在 `advance(1)` **之后**:世界的 `partyPhase()/partyModeKey()` 是本帧
+       推进后的事实(哨台入口在 `tickPartyStep` 里跑),早一帧读会差一整局。 */
+    this.syncPartyRecord();
+    /* 结算/开局会在上面这一行里改变记账 ⇒ HUD 三个字段用**同一帧**的新值重算一次。
+       `syncPartyHud` 只写有变化的字段 ⇒ 重复调用无副作用。 */
+    this.syncPartyHud();
 
     this.reapExpiredDisconnects();
     this.checkIdleSleep();
@@ -2772,6 +3057,9 @@ export class RoomRuntime {
        (「权威一变,投影随即一致」),而且必须与下面的 `encodeDelta` 同帧 ——
        否则客户端比世界晚一帧才看到生物(表现为「走过去才发现它在动」)。 */
     this.projectWildlife();
+    /* ★ WS-FND-123:boss 投影。与生物投影**同帧同理由**(权威一变,投影随即一致),
+       且必须与下面的 `encodeDelta` 同帧 —— 否则客户端晚一帧才看到 boss 换阶段/换预警。 */
+    this.projectBosses();
     /* ★ 审计 P0-2 要求:过期凭证必须真的被回收。
        修前 `expireItemSources()` **全仓零调用**(见 `anticheat.ts` §5.0 的「修前」段),
        而 `grantItemSource` 只增不减 ⇒ 未消费的令牌一直留到房间销毁。
@@ -2827,6 +3115,240 @@ export class RoomRuntime {
       const id = this.state.wildlife[i]!.id;
       if (!seen.has(id)) removeWildlife(this.state, id);
     }
+  }
+
+  /**
+   * ★ WS-FND-123(P1-1):把世界**在场 Boss** 单向投影进 `state.bosses`(10 字段)。
+   *
+   * ## 它补的是一条两头都断的链(与 `projectWildlife` 同一形态)
+   * ```
+   *   世界侧  BossRaidRuntime.snapshots()        ← 12 个内部字段(hp/phase/hpRatio…)
+   *   网络侧  schema.ts#upsertBoss               ← 全仓**唯一**容器写口,零调用
+   *   ⇒ 客户端 RoomState.bosses 恒 []  ⇒ bossHudFrom() 恒 null ⇒ 血条/地面预警走 demo 兜底
+   * ```
+   * 修前没有任何一处报错:boss 在世界里正常被打、正常进阶段,只是**从未出进程**。
+   *
+   * ## 为什么优先 `bossHudSnapshots()`
+   * `bossSnapshots()` 不含 `id` 与五个预警字段(`telegraphShape/X/Y/R/EndTick`),
+   * 而 `BOSS_FIELD_TABLE` 要求 10 格全给。线格式由世界侧算(= 唯一能拿到
+   * `BossState` 的地方),本方法只搬运,**不重算几何**。
+   *
+   * ## 老世界源(只有 `bossSnapshots()`)怎么办:如实降级
+   * 投影阶段与血量,预警五格写 `TelegraphShape.NONE / 0` —— 客户端据此**不画**预警圈,
+   * 而不是拿一个默认圆兜底(那会让「几何丢了」看起来像正常画面)。
+   */
+  private projectBosses(): void {
+    const host = this.worldSaveHost;
+    if (host === null) return;
+    let list: readonly BossState[] | null = null;
+    if (typeof host.bossHudSnapshots === 'function') {
+      list = host.bossHudSnapshots() as readonly BossState[];
+    } else if (typeof host.bossSnapshots === 'function') {
+      list = host.bossSnapshots().map((b) => ({
+        id: `boss:${b.bossId}`,
+        bossId: b.bossId,
+        phase: b.phaseIndex,
+        hp: b.hp,
+        maxHp: b.maxHp,
+        telegraphShape: TelegraphShape.NONE,
+        telegraphX: 0,
+        telegraphY: 0,
+        telegraphR: 0,
+        telegraphEndTick: 0,
+      }));
+    }
+    /* 一个读口都没有 ⇒ **不投影**(也不清空既有投影:那是「世界不认识 boss」,
+       不是「boss 全死了」)。 */
+    if (list === null) return;
+    const seen = new Set<string>();
+    for (const b of list) {
+      seen.add(b.id);
+      upsertBoss(this.state, { ...b });
+      this.bossProjectionCount += 1;
+    }
+    /* 清账:不在场的一律移除,理由与 `projectWildlife` 逐字相同 ——
+       否则被打死的 Boss 会永远留在客户端快照里(一条打不动的血条)。 */
+    for (let i = this.state.bosses.length - 1; i >= 0; i -= 1) {
+      const id = this.state.bosses[i]!.id;
+      if (!seen.has(id)) removeBoss(this.state, id);
+    }
+  }
+
+  /**
+   * ★ WS-FND-123(P1-4):接上世界总线的**第一段消费**(幂等)。
+   *
+   * 修前:`sim/world_sim.ts` 只 `bus.emit('party_broadcast', …)`,而 `server/src`
+   * 里 `.bus.on(` 是 **0 处** ⇒ 比分播报 / 终场文案 / 前三名堆在总线里没人取,
+   * 两端的类型都是对的、测试也是绿的(`WS-FND-120` 只断言「总线收到了」)。
+   *
+   * ## 为什么订阅必须早于第一次 `advance()`
+   * 总线在 `advance()` 内部 `drain()` 时投递 ⇒ 晚一帧接就丢掉第一帧的开局播报。
+   * 故 `step()` 在 `meta.tick += 1` 之后、`host.advance(1)` 之前调本方法。
+   *
+   * ## 没有 `bus` 的老世界源
+   * 不订阅、也**不假装订阅**(`partyBroadcastTotal` 保持 0)。
+   */
+  private attachWorldBus(): void {
+    if (this.worldBusAttached) return;
+    const host = this.worldSaveHost;
+    const bus = host === null ? undefined : host.bus;
+    if (bus === undefined) return;
+    this.worldBusAttached = true;
+    const off = bus.on('party_broadcast', (e) => {
+      const payload = e.payload ?? {};
+      const text = typeof payload.text === 'string' ? payload.text : '';
+      const kind = typeof payload.kind === 'string' ? payload.kind : e.kind;
+      this.partyBroadcastOutbox.push({ kind, text, atTick: this.state.meta.tick });
+      /* 上界:回执/下发只需要最近几条;无界数组会随着对局无限增长。 */
+      if (this.partyBroadcastOutbox.length > 64) this.partyBroadcastOutbox.shift();
+      this.partyBroadcastTotal += 1;
+    });
+    this.worldBusOff = typeof off === 'function' ? (off as () => void) : null;
+  }
+
+  /** 已收到、尚未下发的播报(只读视图;供传输层/诊断读)。 */
+  partyBroadcasts(): readonly { kind: string; text: string; atTick: number }[] {
+    return this.partyBroadcastOutbox;
+  }
+
+  /** 取走积压播报(下发出口;`drainViolations` 同一形态)。 */
+  drainPartyBroadcasts(): { kind: string; text: string; atTick: number }[] {
+    const out = this.partyBroadcastOutbox;
+    this.partyBroadcastOutbox = [];
+    return out;
+  }
+
+  /**
+   * ★ WS-FND-123(P1-2):**两套开局打通** —— 记账(`PartyRecord`)与赛局(contest)。
+   *
+   * ## 修前是两条各开一半的路
+   * ```
+   *   436 哨台(世界):createPartyContest ⇒ contest 在跑,但 PARTIES 里没有记录
+   *   START_PARTY(网络):写 PartyRecord      ⇒ 账本有了,但世界没有赛局
+   *   ⇒ partyStateOf() 恒 null(哨台开的局)/ addScore 永不调用 / meta.scoreA/B 恒 0
+   *      / endParty 零生产调用
+   * ```
+   *
+   * ## 现在这一帧做什么(三种情形,都不猜)
+   * ```
+   *   世界有局 + 账本 RUNNING            ⇒ 什么都不做(已经在同一条路上)
+   *   世界有局 + 账本没有/已结算          ⇒ 补建账本(走真正的 START_PARTY 动作)
+   *   世界回 IDLE + 账本仍 RUNNING       ⇒ endParty 收束(名次定格,addScore 停止计分)
+   * ```
+   *
+   * ## 为什么必须走 `dispatchAction(START_PARTY)` 而不是自己写 Map
+   * 账本的单例 `PARTIES` 只有 `actions/start_party.ts` 能写(`addScore`/`endParty`
+   * 也都在那里)。房间这边再写一份就是第二份真值,那正是要消灭的形态。
+   * ⇒ 房间只负责「找到**有权限**的演员 + 把世界的模式键投进去」。
+   *
+   * ## 演员怎么选(无权限时**如实跳过**,不静默冒充)
+   * 候选序:裁判(哨台上站的人) → 房主。`START_PARTY` 要 `party` 权限位
+   * (OWNER/ADMIN 有,MEMBER/GUEST 没有)—— 所以裁判是 MEMBER 而房主不在线时,
+   * 本帧**建不出**账本,计入 `partyRecordSkips`(可断言,而不是看起来一切正常)。
+   */
+  private syncPartyRecord(): void {
+    const host = this.worldSaveHost;
+    if (host === null || typeof host.partyPhase !== 'function') return;
+    const phase = host.partyPhase();
+    const snap = partyStateOf(this.id);
+    if (phase === 'IDLE' || phase === '') {
+      this.partyRecordLatch = null;
+      if (snap !== null && snap.state === PartyPhase.RUNNING) {
+        const done = endParty(this.id, this.clock.nowMs());
+        if (done !== null) this.partyRecordEndCount += 1;
+      }
+      return;
+    }
+    if (snap !== null && snap.state === PartyPhase.RUNNING) return;
+    const key = typeof host.partyModeKey === 'function' ? host.partyModeKey() : null;
+    if (key === null) { this.partyRecordSkips += 1; return; }
+    if (this.partyRecordLatch === key) return;
+    const idx = Object.values(PartyMode).indexOf(key as PartyMode);
+    if (idx <= 0) { this.partyRecordSkips += 1; return; }
+    /* 演员:裁判优先,其次房主;两者都无 `party` 权限 ⇒ 本帧不建账。 */
+    const referee = typeof host.partyReferee === 'function' ? host.partyReferee() : '';
+    const candidates: string[] = [];
+    if (referee !== '') candidates.push(referee);
+    if (this.ownerId !== referee) candidates.push(this.ownerId);
+    const actor = candidates.find((id) => this.authorize(id, RoomAction.START_PARTY).allowed);
+    if (actor === undefined) { this.partyRecordSkips += 1; return; }
+    /* 哨台的模式命令**就是**房间已选模式(同一格 `meta.partyMode`)——
+       走 `setPartyModeBy`(唯一写口,自带授权闸),不在这里直写字段。 */
+    this.setPartyModeBy(actor, key as PartyMode);
+    const res = this.dispatchAction(actor, RoomAction.START_PARTY, { partyMode: key as PartyMode });
+    if (res.ok) {
+      this.partyRecordLatch = key;
+      this.partyRecordAdoptCount += 1;
+    } else {
+      this.partyRecordSkips += 1;
+    }
+  }
+
+  /**
+   * ★ WS-FND-123(P1-2 的另一半):`START_PARTY` 成功 ⇒ **真的开出赛局**。
+   *
+   * 修前这里零调用 ⇒ 账本建出来了,世界却一场都没跑:`partyPhase()` 恒 `IDLE`、
+   * 比分永远为 0、`partySettlement()` 恒 `null`。
+   *
+   * ⚠️ 幂等守卫:`partyPhase() !== 'IDLE'` 时**不重开** —— `startPartyRun` 每次都会
+   * `createPartyContest` 一个新容器,重开等于把正在跑的那一局连同比分丢掉(不报错)。
+   */
+  private startWorldPartyRun(actorId: string): void {
+    const host = this.worldSaveHost;
+    if (host === null || typeof host.startPartyRun !== 'function') return;
+    if (typeof host.partyPhase === 'function' && host.partyPhase() !== 'IDLE') return;
+    const snap = partyStateOf(this.id);
+    if (snap === null || snap.state !== PartyPhase.RUNNING) return;
+    if (host.startPartyRun(String(snap.mode), actorId)) this.partyRecordStartCount += 1;
+  }
+
+  /**
+   * ★ WS-FND-123(P1-4 / P1-5):**回执出口** —— 把比分播报、终场文案、前三名、
+   * 急单 `RUSH_GRADE` 搭在**成功回执**的 `effect` 上。
+   *
+   * ## 为什么走回执(而不是新开一条下行通道)
+   * 客户端只认两条下行:`delta` 二进制包(字段由 `wire.ts` 冻结,房间改不了)
+   * 与 `actionResult` 回执(`client/src/net/action_entry.ts` 的
+   * `inlinePayload(r.effect)` 会把每个键渲染成一行)。⇒ 在 `effect` 里加键是
+   * **不改协议、不动客户端**就能送达的那条路。值域按 `EffectRecord` 只放字符串/数字。
+   *
+   * ## 为什么带指纹(`receiptSeen*`)
+   * 同一条播报/同一份结算在**每次**动作回执里重复出现会被读成「刚刚又发生了一次」。
+   * ⇒ 只在世界侧出现**新**数据时挂上去;没有新数据时**一个键都不加**(回执形状不变,
+   * 既有 `WS-07`/`WS-FND-*` 的 effect 断言不受影响)。
+   */
+  private withPartyReceipt(outcome: ActionOutcome): ActionOutcome {
+    const host = this.worldSaveHost;
+    if (host === null) return outcome;
+    const extra: Record<string, string | number> = {};
+    if (this.partyBroadcastTotal !== this.receiptSeenBroadcast && this.partyBroadcastOutbox.length > 0) {
+      const last = this.partyBroadcastOutbox[this.partyBroadcastOutbox.length - 1]!;
+      extra.partyBroadcast = last.text;
+      extra.partyBroadcastTotal = this.partyBroadcastTotal;
+      this.receiptSeenBroadcast = this.partyBroadcastTotal;
+    }
+    const view = typeof host.partySettlementView === 'function' ? host.partySettlementView() : null;
+    if (view !== null) {
+      const fp = `${view.modeName}:${view.broadcastText}`;
+      if (fp !== this.receiptSeenSettlement) {
+        this.receiptSeenSettlement = fp;
+        extra.partyEnd = view.broadcastText;
+        extra.partyModeName = view.modeName;
+        /* 前三名只对**个人赛**存在(`personal` 有排序);团队赛为空 ⇒ 不加这个键。 */
+        if (view.top.length > 0) extra.partyTop3 = view.top.join(' | ');
+      }
+    }
+    const rush = typeof host.rushSettlement === 'function' ? host.rushSettlement() : null;
+    if (rush !== null) {
+      const fp = `${rush.grade}:${rush.score}`;
+      if (fp !== this.receiptSeenRush) {
+        this.receiptSeenRush = fp;
+        extra.rushGrade = rush.grade;
+        extra.rushScore = rush.score;
+      }
+    }
+    if (Object.keys(extra).length === 0) return outcome;
+    return { ...outcome, effect: { ...(outcome.effect ?? {}), ...extra } };
   }
   /**
    * 把 SSOT 的 **8 个交集字段**单向投影到 `state.players[]`(契约 §2.3;裁决 2 + 3)。

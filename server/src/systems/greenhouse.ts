@@ -23,6 +23,8 @@
  * `night: boolean`。同理 `weather` 由世界侧的天气状态喂进来。
  */
 
+import { ITEM_LIST } from '../../../shared/constants/items.ts';
+
 /**
  * 本实现在 `rooms/effects.ts` 的 `ROOM_EFFECT_DECISION` 里登记的身份。
  * `module` 是仓库相对路径(判据用 `existsSync` 核它真的存在)。
@@ -212,4 +214,61 @@ export function sortHarvest(itemId: number, filters: readonly SortFilter[]): num
     if (f.itemIds.includes(itemId)) return f.lane;
   }
   return SORT_PASS_THROUGH;
+}
+
+/* ═══════════ 作物 → 产物(429 的过滤表写的是**产物** id)═══════════ */
+
+/**
+ * 一格作物收一次给几件。
+ *
+ * ⚠️ **中性锚 + 待平衡**:内容表与手册 §3.8 都只写「耕地播种收获」,
+ *   没有任何产量数字。一格一株收 1 件是唯一不含平衡假设的口径(1:1),
+ *   与 `CROP_MATURE_DAYS = 4` 同一姿态:**待 owner 裁决后由内容表接管**。
+ */
+export const HARVEST_YIELD = 1;
+
+/**
+ * 作物(播种的那件物品)→ **产物名**(手册/内容表的字面量,不是 id)。
+ *
+ * ## 这个表修的是什么(第七轮实测 P1)
+ *
+ * 修前 `systems/wiring.ts` 直接拿 `cell.cropId` 去 `sortHarvest`,于是
+ * 「作物 id」与「产物 id」被当成同一个东西:玩家在 429 上按**产物**写过滤规则
+ * (内容表里作物与产物本可以是两件东西)永远不命中,分拣链看起来接好了、
+ * 实际一条规则都不生效。
+ *
+ * ## 口径(照 `ranch.ts:78` 的 `RANCH_PRODUCE_BY_SPECIES` 同一姿态)
+ *
+ * 名字是**内容表的字面量**,ID 由内容表查(`cropProductIdOf`)——
+ * 表里没有这件东西就返回 `null`(如实浮缺口,不编 id)。名字与 id 分开之后,
+ * 内容表将来补一件「某作物的产物」,只改这里一行,分拣/落地自动跟上。
+ *
+ * 当前只登记内容表 `note` 自称「耕地播种收获 / 耕种收获」的两种
+ * (`intake.ts` 的 `SOWABLE_ITEM_IDS` 现算集合 = {123, 126}):
+ * `123 黄金小麦` → 收获的仍是黄金小麦;`126 爆裂火椒` → 收获的仍是爆裂火椒。
+ * ⇒ **今天是恒等映射**,但它是**一件事实的落点**,不是「id 就是 id」的隐式假设:
+ *   未登记的第 3 种作物返回 `null`(负对照见 `tests/WS-FND-125`)。
+ */
+export const CROP_PRODUCT_NAME_BY_CROP: Readonly<Record<number, string>> = Object.freeze({
+  123: '黄金小麦',
+  126: '爆裂火椒',
+});
+
+/** 内容表的「名字 → ID」索引(模块加载时建一次,与 `ranch.ts:84` 同源)。 */
+const ITEM_ID_BY_NAME: ReadonlyMap<string, number> = new Map(ITEM_LIST.map((i) => [i.name, i.id]));
+
+/** 该作物收获的产物**名**;没登记 ⇒ `null`。 */
+export function cropProductNameOf(cropId: number): string | null {
+  if (!Number.isInteger(cropId)) return null;
+  return CROP_PRODUCT_NAME_BY_CROP[cropId] ?? null;
+}
+
+/**
+ * 该作物收获的产物**物品 id**;内容表里没有这件东西(或该作物没登记)⇒ `null`。
+ *
+ * ★ 唯一允许的产物 id 来源 —— 不查内容表就不许有 id(同 `ranch.ts:91`)。
+ */
+export function cropProductIdOf(cropId: number): number | null {
+  const name = cropProductNameOf(cropId);
+  return name === null ? null : (ITEM_ID_BY_NAME.get(name) ?? null);
 }

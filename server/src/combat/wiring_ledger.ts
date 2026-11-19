@@ -94,7 +94,9 @@ export const COMBAT_WIRING_LEDGER: readonly CombatWiringRow[] = Object.freeze([
     wiredAt: 'server/src/sim/world_sim.ts#attackMob(段数 + 命中区域)',
     reason:
       '段数取 plan.ticks.length(715 三连 = 3 / 716 箭雨 = 6),命中区域进 events。'
-      + '时序(telegraphSec / tickSec 的逐段调度)仍未接 —— 同帧连发,见 SkillDef.tickSec 行。',
+      + '★ 第七轮 P2 起**时序也接了**:telegraphSec + tickSec 进 `skillTiming`,'
+      + '本帧只结算「到期」的段,其余进 `WorldSim.tickSkillCasts`(716 的 6 段分布在 2.5 秒、'
+      + '718 的 1 秒前摇真的存在)。'
   },
   {
     symbol: 'reflectFrom',
@@ -103,7 +105,9 @@ export const COMBAT_WIRING_LEDGER: readonly CombatWiringRow[] = Object.freeze([
     wiredAt: 'server/src/sim/world_sim.ts#resolveMobStrikes(怪打人 ⇒ 反伤回打生物)',
     reason:
       '第六轮 P1:728 反伤甲在「怪打人」方向完全无效。现在按承伤 × 玩家 reflectMul 折算,'
-      + '经 damageMob 施加回攻击者(反伤也能击杀,击杀照常结算)。',
+      + '经 damageMob 施加回攻击者(反伤也能击杀,击杀照常结算)。'
+      + '★ 第七轮 P2 起口径统一成「**实际扣除**」:折算基数是 min(applied, 受击前 HP),'
+      + '累计读 damageMob 的 hpLoss;生物 reflectMul 恒 0 ⇒ 反伤单跳不成环。'
   },
   {
     symbol: 'ghostControl',

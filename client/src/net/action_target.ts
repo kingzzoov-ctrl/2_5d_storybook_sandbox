@@ -21,6 +21,9 @@
  * 而快照里**没有**可用的朝向字段(`PlayerState.dir` 的语义在 wire 里没有
  * 写明,不确定是象限还是角度)⇒ 所以朝向由调用方传**运动方向向量**
  * (客户端本来就知道自己按了什么键),缺省向下。这是显式取舍,不是猜。
+ * ★ 第七轮审计 P1 补:`main.ts` 修前把朝向写死成常量(恒向下)⇒ 放置/拆除永远作用于
+ * 脚下南侧那格。现在朝向由 `nextFacing()` 每 tick 算一次(本地输入优先、其次权威位移),
+ * `cellInFront` 仍只做"翻译",不自己判方向。
  */
 
 /** 一格(整数坐标)。 */
@@ -62,6 +65,76 @@ export function cellInFront(pos: { x: number; y: number }, facing: Facing = FACI
   if (facing.dy > 0) return { x: base.x, y: base.y + 1 };
   if (facing.dy < 0) return { x: base.x, y: base.y - 1 };
   return base;
+}
+
+/**
+ * 一次朝向更新要看的两个来源 —— 本地输入 **与** 权威位移。
+ *
+ * ★ 第七轮审计 P1:修前 `main.ts` 是
+ * ```ts
+ * const facing: Facing = { dx: 0, dy: 1 };   // 恒「向下」,而且是 const
+ * ```
+ * ⇒ 「面前那格」**永远是脚下南侧一格**:Q 放置与 E 拆除不管朝哪走都动同一格,
+ * 而屏幕上没有任何提示(`lastAction` 里那行格坐标看起来"很正常")。
+ * 朝向必须随移动/权威更新,而且**只能有一处算**(见本函数)。
+ */
+export interface FacingStep {
+  /** 上一个朝向(没有输入、也没有权威位移时原样返回) */
+  prev: Facing;
+  /** 本地输入方向(未归一化;`InputSource.nextCmd()` 的 moveX/moveY) */
+  input?: { moveX: number; moveY: number } | null;
+  /** 权威位移:上一帧的位置(格) */
+  from?: { x: number; y: number } | null;
+  /** 权威位移:本帧的位置(格) */
+  to?: { x: number; y: number } | null;
+}
+
+/** 位移 → 四向单位向量(主分量优先 x,与 `cellInFront` 的"只取一个"同口径)。 */
+function cardinalOf(dx: number, dy: number): Facing | null {
+  if (dx === 0 && dy === 0) return null;
+  if (Math.abs(dx) >= Math.abs(dy)) return { dx: Math.sign(dx), dy: 0 };
+  return { dx: 0, dy: Math.sign(dy) };
+}
+
+/**
+ * 算出**这一帧**的朝向。
+ *
+ * 优先级(刻意只有三级,多了就再也说不清"到底是谁改的"):
+ * ```
+ * 1 本地输入非零  ⇒ 立刻转向(按了方向键就该马上生效)
+ * 2 权威位置动了  ⇒ 按位移转向(被推 / 被传送 / 纯服务端驱动时也有朝向)
+ * 3 都没有        ⇒ 保持上一次(不前摇、不回落到默认向下)
+ * ```
+ * `prev` 绝不被就地修改 —— 返回的要么是新对象,要么就是 `prev` 本身。
+ */
+export function nextFacing(step: FacingStep): Facing {
+  const input = step.input;
+  if (input !== null && input !== undefined) {
+    const fromInput = cardinalOf(input.moveX, input.moveY);
+    if (fromInput !== null) return fromInput;
+  }
+  const from = step.from;
+  const to = step.to;
+  if (from !== null && from !== undefined && to !== null && to !== undefined) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    /* 阈值取 1e-6:浮点抖动不该被算成"动了" */
+    if (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6) {
+      const fromDelta = cardinalOf(dx, dy);
+      if (fromDelta !== null) return fromDelta;
+    }
+  }
+  return step.prev;
+}
+
+/** 朝向的可读文案(提示行/自检口径用;`cellInFront` 是它的唯一消费者)。 */
+export function facingLabel(facing: Facing): string {
+  const f = cardinalOf(facing.dx, facing.dy);
+  if (f === null) return '无';
+  if (f.dx > 0) return '东(+x)';
+  if (f.dx < 0) return '西(-x)';
+  if (f.dy > 0) return '南(+y)';
+  return '北(-y)';
 }
 
 /** 一条键位定义。 */

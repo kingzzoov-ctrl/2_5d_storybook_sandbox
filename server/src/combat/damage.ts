@@ -208,7 +208,7 @@ export function targetFromStats(
  * | :--- | :--- | :--- |
  * | `def` / `element` | **本函数**(派生) | 冻结层完全没有这两项 |
  * | `dmgReduce` / `reflectMul` / `dodgeRate` | **留 0,交给 AI** | 见下 |
- * | `shield` / `crystalArmor` | **留空,交给 AI** | 见下 |
+ * | `shield` / `crystalArmor` | **调用方从 AI 运行时喂**(`patch`) | 见下(第七轮 P1) |
  *
  * 实测:**手册/行为里记载的个体特性,全部已经在各生物的 `onDamage` 里实现了** ——
  * 竹林剑客傀儡的正面 100% 格挡(`samurai_block`)、远古发条重骑的正面减伤
@@ -218,6 +218,23 @@ export function targetFromStats(
  * 若这里**再**把 `crystalArmor` 或 `dmgReduce` 也设上,同一次攻击会被减两遍
  * (公式减一次、AI 的 `onDamage` 再减一次)—— 那是**静默的数值错误**:
  * 不抛异常、只是伤害莫名其妙偏低,而且「减伤 80%」会变成 96%。
+ *
+ * ## 第七轮 P1:`shield` / `crystalArmor` **必须由调用方喂进来**
+ *
+ * 修前 `WorldSim.attackMob` 只传 `{ hp }` ⇒ 本函数里这两项恒为 0/false,于是
+ * 第 4 步的破盾分支(`target.shield > 0`)**永远走不到**、`CRYSTAL_ARMOR_MUL`
+ * 与 `ignoresCrystal` 也**永不生效**(204 的 4.0 破盾倍率、712 的 3.0 都是
+ * 死数)。这不是「交给 AI」,是**整条规则没有入参**。
+ *
+ * 现在调用方从 AI 运行时(`MobRuntime.mem`)取真值填进 `patch`:
+ * ``` 
+ * shield        ← rt.mem.shield(AI 自己的护盾池账本)
+ * crystalArmor  ← rt.mem.crystalArmor === 1(AI 声明「全身晶甲」)
+ * ``` 
+ * ⚠️ **紫晶重甲虫的「正面 80%」仍归 `BeetleAi.onDamage`**(它带朝向扇区,
+ * 本字段没有朝向概念)。所以不要按 `MobDef.id` 在这里硬开 `crystalArmor`
+ * —— 那会让正面减伤变成全身减伤,并且和 AI 的 0.8 叠成 0.04(双重结算,
+ * 正是上一段警告的那件事)。
  *
  * 所以本函数只补**通用、无个体差异**的两项(`def`/`element`),
  * 个体特性一律留给生物自己的 AI。调用链:
@@ -239,6 +256,14 @@ export function mobCombatProfile(
     def: MOB_DEF_BASE + MOB_DEF_PER_LEVEL * (level - 1),
     element: MOB_ELEMENT_BY_ID.get(def.id) ?? Element.NONE,
     mass: MOB_MASS_DEFAULT,
+    /* ★ 第七轮 P2:生物**不反伤**(没有 728 那种甲)。写死 0 不只是缺省,
+       它还是「反伤单跳不成环」的那道保证:玩家打生物 ⇒ `reflectDamage` 恒 0
+       ⇒ 编排层回打玩家的那条腿不会被生物触发(反伤只可能来自玩家侧装备)。 */
+    reflectMul: 0,
+    /* AI 的护盾池与晶甲声明由调用方喂进来(缺省 0 / false,理由见上面的注释)。 */
+    shield: 0,
+    shieldMax: 0,
+    crystalArmor: false,
     ...patch,
   });
 }
@@ -722,6 +747,89 @@ export function planSkillHits(skill: SkillDef): SkillHitPlan {
     telegraphSec: skill.telegraphSec,
     area,
     totalMul: r2(skill.damageMul * hits),
+  };
+}
+
+/* ────────────────── 技能时序(第七轮 P2:telegraphSec / tickSec 的落点)────────────────── */
+
+/**
+ * 一次技能施放的**时序**(纯数据)。
+ *
+ * ## 为什么需要它(第七轮 P2)
+ *
+ * `planSkillHits` 一直返回 `ticks` / `telegraphSec`,但编排层只读了
+ * `ticks.length`(段数)与 `area`,**时序两半都被丢掉** ⇒ 716 箭雨的
+ * 「每 0.5 秒 0.55 倍率,共 6 段」在**同一帧**全部结算(实测 3.3 倍率瞬发),
+ * 718 的「1 秒地面预警」也从来没有前摇。段数对、节奏错 —— 数值上像,
+ * 玩起来完全不是那个东西。
+ *
+ * ## 口径
+ *
+ * `impactAtSec[i]` 是**第 i 段相对施法瞬间**的生效时刻,前摇已经加进去:
+ *
+ * | 技能 | 参数 | impactAtSec |
+ * | :--- | :--- | :--- |
+ * | 715 三连散射 | hits 3 / tick 0 / 无前摇 | `[0, 0, 0]` |
+ * | 716 箭雨天降 | hits 6 / tick 0.5 / 无前摇 | `[0, 0.5, 1.0, 1.5, 2.0, 2.5]` |
+ * | 718 陨石星落 | hits 1 / 无 tick / 前摇 1.0 | `[1.0]` |
+ *
+ * 段间距仍只由 `planSkillHits` 算(不在这里再写一遍 i × tickSec)。
+ */
+export interface SkillTiming {
+  /** 前摇秒数:第一段生效前的地面预警时间(0 = 瞬发) */
+  telegraphSec: number;
+  /** 每段生效时刻(相对施法瞬间的秒数,含前摇) */
+  impactAtSec: readonly number[];
+}
+
+export function skillTiming(skill: SkillDef): SkillTiming {
+  const plan = planSkillHits(skill);
+  const telegraphSec = Math.max(0, skill.telegraphSec);
+  return { telegraphSec, impactAtSec: plan.ticks.map((t) => r2(telegraphSec + t)) };
+}
+
+/** 时序号差容限:防浮点在边界上抖动。 */
+const SKILL_TICK_EPS = 1e-9;
+
+/**
+ * 施法后 `elapsedSec` 秒时**已经到期**的段下标(升序)。
+ *
+ * 编排层按此把「本帧该结算的段」挑出来,其余排队 —— 由此
+ * 716 的 6 段分布在 2.5 秒里而不是同帧、718 的 1 秒前摇真的存在。
+ * 判据:`impactAtSec[i] <= elapsedSec + ε`。
+ */
+export function dueSkillTicks(timing: SkillTiming, elapsedSec: number): number[] {
+  const elapsed = Number.isFinite(elapsedSec) ? elapsedSec : 0;
+  const out: number[] = [];
+  timing.impactAtSec.forEach((t, i) => {
+    if (t <= elapsed + SKILL_TICK_EPS) out.push(i);
+  });
+  return out;
+}
+
+/**
+ * 「本段不落伤害」的零伤害结果(辅助技 / 前摇未到 / 多段未走完)。
+ *
+ * ## 为什么必须有它(第七轮 P2)
+ *
+ * 倍率为 0 的辅助技(717 治愈春风圈 / 720 落英幻境 / 721 绝对防御紫晶盾)
+ * 修前**照样走 `computeDamage`**:`skillMul = 0` ⇒ 基础 0 ⇒ 第 6 步
+ * `Math.max(MIN_DAMAGE, 0)` 把它抬成 **1 点真实伤害**,再经 `damageMob`
+ * 落账 —— 于是「治疗 60 HP 的辅助技」会补刀、会挂灼烧、会结算击杀经验。
+ * 1 点伤害在血条上看不见,在账上(击杀/DoT/DPS)却是真事件。
+ *
+ * ⇒ 辅助技不进伤害管线:返回本对象(`finalDamage = 0`、`source = SKILL`、
+ * `steps` 写明原因),由编排层只施加 `healHp` / `stunSec` / `freezeSec`。
+ */
+export function skillZeroResult(target: TargetProfile, skill: SkillDef, detail: string): DamageResult {
+  return {
+    targetId: target.id, base: 0, levelMul: 1, weaponMul: 1, elementMulValue: 1, afterElement: 0,
+    flatPen: 0, pctPen: 0, effectiveDef: 0, crystalMul: 1, shieldBreakMul: 1, shieldDamage: 0,
+    shieldBroken: false, critRolled: false, critRate: 0, critMul: 1, mitigationMul: 1,
+    takenMul: target.takenMul, externalMul: 1, finalDamage: 0, reflectDamage: 0,
+    knockbackImpulse: 0, dodged: false, outOfReach: false, source: DamageSource.SKILL,
+    float: { text: '0', color: FloatColor.NULLIFIED, sizeScale: 0.9 },
+    steps: [{ step: `技能 ${skill.key}`, value: 0, detail }],
   };
 }
 

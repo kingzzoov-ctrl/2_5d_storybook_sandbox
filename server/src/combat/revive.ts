@@ -209,12 +209,29 @@ export function ghostDamageMul(d: DownedState): number {
 }
 
 /**
- * 幽灵泡泡期间位移乘数与动作权限。
+ * 倒地期间位移乘数与动作权限 —— 「倒地 = 不能动 / 不能打 / 不能被治」的**唯一**
+ * 具名规则。
  *
  * ★ 第六轮实测 P1:本条**已接线**(动作权限那一半)—— `WorldSim` 的攻击闸
  *   (`attackMobAuthorized` / `attackPlayerAuthorized`)不再自己手判 `downed`,
  *   而是经 `WorldSim#canActAsPlayer` → 本函数的 `canAttack`。
  *   修前那两处是「手判一套 + 本函数一套」两份规则,谁也没读过这里。
+ *
+ * ## ★ 第七轮实测 P1:判据从「是不是幽灵泡泡」改成「有没有倒下」
+ *
+ * 修前 `canAttack` 只判 `state === GHOST_BUBBLE`。而 227 泡泡水枪打幽灵泡泡
+ * 三发会把**倒地者**的状态改成 `BUBBLED`(`bubbleGunHit`)—— 移动侧读的是
+ * `vitals.downed`(仍然为真 ⇒ 不能走),本函数却因为「不是 GHOST_BUBBLE」返回
+ * `canAttack: true` ⇒ **倒地者被封了腿却还能挥刀**。实测:`bubbleGunHit` 三次后
+ * `attackMobAuthorized` 放行,同一具身体 `applyPlayerMove` 拒绝。
+ *
+ * 口径统一成:**`DownedState` 只在下倒时存在,所以「非 `NORMAL` 就是倒下」**。
+ * `GHOST_BUBBLE`(幽灵泡泡)、`BUBBLED`(水枪把倒地者装进泡泡)、`FROZEN` /
+ * `STUNNED`(倒地后又被控)一律不放行。移动侧 `vitals.downed` 与它同真值。
+ *
+ * ⚠️ 复活后 `tickDowned` 会把状态写回 `NORMAL`,`canActAsPlayer` 的第一道
+ *   (`vitals.downed !== true` ⇒ 放行)也先于本函数 ⇒ 「刚被救起来立刻能打」
+ *   的既有判据(WS-FND-118 FND118-7)不受影响。
  *
  * ⚠️ `moveMul` 的消费点(慢帧位移)与 `canBeHealed`(`vitals.heal` 的
  *   `if (v.downed) return 0`)都**不在本模块**:前者仍读 `vitals.downed`、
@@ -222,11 +239,12 @@ export function ghostDamageMul(d: DownedState): number {
  *   `vitals` 有)。已在台账里写明,不要把那两条读成「经这里判定」。
  */
 export function ghostControl(d: DownedState): { moveMul: number; canAttack: boolean; canBeHealed: boolean } {
-  const ghost = d.state === BodyState.GHOST_BUBBLE;
+  /* 单一口径:倒地记录里的**任何非 NORMAL 态**都算倒下(见上面第七轮那段)。 */
+  const down = d.state !== BodyState.NORMAL;
   return {
-    moveMul: ghost ? GHOST_MOVE_MUL : 1,
-    canAttack: !ghost,
-    canBeHealed: !ghost,
+    moveMul: down ? GHOST_MOVE_MUL : 1,
+    canAttack: !down,
+    canBeHealed: !down,
   };
 }
 /* ───────────────────────────── 手动触摸救援(1 秒半血) ───────────────────────────── */

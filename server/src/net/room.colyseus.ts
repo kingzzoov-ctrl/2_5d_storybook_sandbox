@@ -543,11 +543,16 @@ export class NetPersistRoom extends Room<RoomSchema> {
        派生(`applyAttack` → `attackMobAuthorized` 的签名里根本没有它们);
        报文若仍带这四个字段会被**忽略**(不是报错:老客户端仍能连)。
        这与 `inventory` 通道同一形态(见 CR-14 U1)。 */
-    this.onMessage('attack', (client, msg: { claimedBonus?: number; mobId?: string }) => {
+    /* ★ WS-FND-122:`useSkill` 是 **[Q] 意图位**(只认字面 `true`)。
+       ⚠️ 这条通道与 `ws_server` 的 `t:'attack'` 是**两个运输层**,
+          但两者都只表达同一个意图、都走同一个 `applyAttack` —— 判据不在运输层。 */
+    this.onMessage('attack', (client, msg: { claimedBonus?: number; mobId?: string; useSkill?: boolean }) => {
+      const useSkill = msg?.useSkill === true;
       const verdict = this.runtime.applyAttack(
         this.seatKeyOf(client),
         msg?.claimedBonus ?? 0,
         typeof msg?.mobId === 'string' ? msg.mobId : undefined,
+        useSkill,
       );
       if (!verdict.allowed) {
         client.send('reject', { kind: 'ATTACK' });
@@ -570,6 +575,8 @@ export class NetPersistRoom extends Room<RoomSchema> {
         finalDamage: rep.finalDamage,
         outOfReach: rep.outOfReach,
         dodged: rep.dodged,
+        useSkill: rep.useSkill,
+        rejected: rep.rejected,
       });
     });
     /* ⚠️ 报文里**只接受 ops**。`allowedSources` / `capacity` / `beforeTotal`

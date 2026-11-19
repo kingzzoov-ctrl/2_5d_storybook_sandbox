@@ -249,6 +249,93 @@ export function isEmptySlot(slot: number): boolean {
   return Number.isInteger(slot) && slot >= 0 && slot < INVENTORY_SLOTS && itemAt(slot) === null;
 }
 
+/* ───────────────────── 背包格位**状态**(第七轮审计 P1) ───────────────────── */
+
+/**
+ * ## 为什么"谁在哪一格"必须是一份**状态**,而不是 `ITEM_LIST` 的下标
+ *
+ * 修前:`buildView()` 每帧从静态 `ITEM_LIST` 重建 ⇒ 格子内容 = `ITEM_LIST[i]`,
+ * 与玩家的任何操作**无关**。于是 `DragController.drop()` 成交之后:
+ * ```
+ * lastMove = '第 3 格 → 第 9 格'   ← 提示行变了
+ * invView.slots[9].item            ← 还是原来那件(什么都没搬)
+ * ```
+ * 「提示说搬了、格子没动」比"没搬"更坏:它让玩家以为功能正常。
+ *
+ * ⇒ 布局(每行几格 / 容量 / 分页)仍由内容数量推导(那是 `computeSlotLayout` 的事),
+ *   但**每一格里放哪件**是独立的可变状态:`slotItemIds`(下标 = 格位,值 = 物品 id)。
+ *   初始时它就是 `ITEM_LIST` 的 id 序列 ⇒ 未操作前的表现与修前逐字段相同。
+ */
+const ITEM_BY_ID: Map<number, ItemDef> = new Map<number, ItemDef>(
+  ITEM_LIST.map((it) => [it.id, it] as [number, ItemDef]),
+);
+
+/** 物品 id → 定义(内容表里没有则为 `null`)。 */
+export function itemById(itemId: number): ItemDef | null {
+  return ITEM_BY_ID.get(itemId) ?? null;
+}
+
+/** 初始格位状态:`slotItemIds[i] = ITEM_LIST[i].id`(可变副本,不是内容表的别名)。 */
+export function defaultSlotItemIds(): number[] {
+  return ITEM_LIST.map((it) => it.id);
+}
+
+/** 一次格位搬运的结果(与 `DragController.drop()` 的返回同形)。 */
+export interface SlotMove {
+  fromSlot: number;
+  toSlot: number;
+  /** 被搬走的**物品 id**(搬之前那一格里的东西) */
+  itemId: number;
+  /** 搬了几件(两格内容互换,故这里恒 1;留着是为了与 `drop()` 同形) */
+  count: number;
+}
+
+/**
+ * 把 `fromSlot` 的**内容**搬到 `toSlot`(两格内容互换)。
+ *
+ * ## 为什么是"互换"而不是"覆盖"
+ * 覆盖会**销毁**目标格里的东西 —— 背包里凭空少一件,而没有任何东西会报错。
+ * 互换是唯一可逆、且不需要服务端确认就能自洽的做法(真正的归属仍以服务端为准,
+ * 这一步只是**视图层**的搬运;调用点在 `three/boot.ts` 的 `onUiPointerUp`)。
+ *
+ * ## 非法输入返回 `null`(不改任何东西)
+ * 越界 / 同一格 / 空格 → `null`。空格搬运在 UI 上应当表现为"取消",
+ * 而不是"把空气搬到另一格"。
+ */
+export function applySlotMove(
+  itemIds: readonly number[],
+  fromSlot: number,
+  toSlot: number,
+): { itemIds: number[]; moved: SlotMove } | null {
+  if (!Number.isInteger(fromSlot) || !Number.isInteger(toSlot)) return null;
+  if (fromSlot < 0 || toSlot < 0) return null;
+  if (fromSlot >= itemIds.length || toSlot >= itemIds.length) return null;
+  if (fromSlot === toSlot) return null;
+  const itemId = itemIds[fromSlot];
+  if (itemId === undefined || itemId <= 0) return null;
+  const next = [...itemIds];
+  next[fromSlot] = itemIds[toSlot] ?? 0;
+  next[toSlot] = itemId;
+  return { itemIds: next, moved: { fromSlot, toSlot, itemId, count: 1 } };
+}
+
+/** 格位状态里某一格现在放着什么(`null` = 空)。 */
+export function slotItemOf(itemIds: readonly number[], slot: number): ItemDef | null {
+  if (!Number.isInteger(slot) || slot < 0 || slot >= itemIds.length) return null;
+  const id = itemIds[slot];
+  return id === undefined || id <= 0 ? null : itemById(id);
+}
+
+/**
+ * 格位状态的**指纹**(自检口径用)。
+ *
+ * 只报"成交了没有"是不够的:`lastMove` 是文案,文案对了格子仍可能没动(修前就是这样)。
+ * 指纹让"格子内容真的变了"成为一个**可读的数**。
+ */
+export function slotFingerprint(itemIds: readonly number[], take = 8): string {
+  return itemIds.slice(0, Math.max(0, take)).join(',');
+}
+
 export function categoryOf(itemId: number): string | null {
   const s = slotOf(itemId);
   return s < 0 ? null : ITEM_LIST[s].category;
@@ -324,6 +411,11 @@ export interface FilterOptions {
   query?: string;
   tag?: string;
   minValue?: number;
+  /**
+   * 格位状态(下标 = 格位,值 = 物品 id)。省略 ⇒ 退回 `ITEM_LIST` 的下标口径
+   * (未操作前的表现与修前逐字段相同;见 `applySlotMove`)。
+   */
+  slotItemIds?: readonly number[];
 }
 
 /** 关键词匹配:命中中文名、ID 字符串、任一词条或说明 */
@@ -342,8 +434,12 @@ export function filterItems(opts: FilterOptions = {}): InventorySlot[] {
   const tag = opts.tag ?? '';
   const minV = opts.minValue ?? Number.NEGATIVE_INFINITY;
   const out: InventorySlot[] = [];
+  const arrangement = opts.slotItemIds;
   for (let i = 0; i < ITEM_LIST.length; i += 1) {
-    const item = ITEM_LIST[i];
+    /* ★ 第七轮 P1:这一格现在放的是哪件 —— 有格位状态时**它才是真值**
+       (否则拖拽成交之后格子内容还是 `ITEM_LIST[i]`,提示说搬了、格子没动)。 */
+    const item = arrangement === undefined ? ITEM_LIST[i] : slotItemOf(arrangement, i);
+    if (item === null) continue;
     const ok = (!cat || item.category === cat)
       && matchesQuery(item, q)
       && (!tag || item.tags.includes(tag))

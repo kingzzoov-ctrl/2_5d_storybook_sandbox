@@ -438,7 +438,10 @@ export type WsServerOptions = {
 export type MoveIntentParse =
   | {
     ok: true;
-    intent: { tick: number; x: number; y: number; z: number; speedMul?: number; seq?: number };
+    intent: {
+      tick: number; x: number; y: number; z: number;
+      speedMul?: number; seq?: number; jump?: boolean;
+    };
   }
   | { ok: false; reason: string };
 
@@ -459,7 +462,8 @@ export type MoveIntentParse =
  * 理由:它是乘数,不是坐标 —— 一个坏乘数不该让整次移动消失。
  */
 export function parseMoveIntent(msg: {
-  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown; seq?: unknown;
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown;
+  speedMul?: unknown; seq?: unknown; jump?: unknown;
 }): MoveIntentParse {
   const fields: Array<[string, unknown]> = [
     ['tick', msg.tick], ['x', msg.x], ['y', msg.y], ['z', msg.z],
@@ -470,7 +474,8 @@ export function parseMoveIntent(msg: {
     }
   }
   const intent: {
-    tick: number; x: number; y: number; z: number; speedMul?: number; seq?: number;
+    tick: number; x: number; y: number; z: number;
+    speedMul?: number; seq?: number; jump?: boolean;
   } = {
     tick: msg.tick as number,
     x: msg.x as number,
@@ -497,6 +502,16 @@ export function parseMoveIntent(msg: {
   if (typeof msg.seq === 'number' && msg.seq >= 0 && isValidAckedSeq(msg.seq)) {
     intent.seq = msg.seq;
   }
+  /* ★ WS-FND-122:**`jump` 意图位**。修前它**不在字段白名单里** ⇒
+     客户端(`input.ts` 的空格锁存 → `main.ts` 的 `session.sendMove({jump})`)
+     发上来的 `jump:true` 在这里被**静默丢弃**,服务端 `jumpPlayer` 生产 0 调用。
+  *
+  * 判据:只接受**字面 `true`**(与 `clear` / `confirm` 同一取舍:报文是外部
+  * 输入,`1` / `'true'` / `{}` 一律当作「没按」)。不用 `!== false` ——
+  * 那会让任何垃圾值都被当成「按了跳跃」,而跳跃是能改权威 `vz` 的动作。
+  * ⚠️ 「能不能起跳」(地面 / 冷却)不在这里判:它要权威刚体状态,
+  *    判据在世界侧 `tryPlayerJump`(一处)。 */
+  if (msg.jump === true) intent.jump = true;
   return { ok: true, intent };
 }
 
@@ -542,12 +557,18 @@ export type WsRoomLike = {
    */
   applyMove?(userId: string, intent: {
     tick: number; x: number; y: number; z: number; speedMul?: number;
+    /** ★ WS-FND-122:空格锁存的意图位(能不能起跳由房间/世界侧判)。 */
+    jump?: boolean;
   }): unknown;
   /**
    * 应用一条攻击意图(`RoomRuntime.applyAttack` 的形状)。
    * 可选,理由同 `applyMove`。
+   *
+   * ★ WS-FND-122:`useSkill` 是 **[Q] 意图位**(只表达「我按了 Q」)。
+   * 技能本身由世界侧从**当前武器**取(`skillOf`),报文里不带任何数值 ——
+   * 与 `mobId` 的自报纪律同源(`weaponId` / `level` / `wearing` 仍一律不传)。
    */
-  applyAttack?(userId: string, claimedBonus?: number, mobId?: string): unknown;
+  applyAttack?(userId: string, claimedBonus?: number, mobId?: string, useSkill?: boolean): unknown;
   /**
    * 应用一条**动作意图**(`RoomRuntime.dispatchAction` 的形状)。
    *
@@ -897,12 +918,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
               客户端的 hello 帧历史上不带 `t` 也能工作,不能因为加了一条新分支
               就把它判死(那是"顺手放宽/收紧"的另一半)。 */
         if (parsed.t === 'move') {
-          onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown; seq?: unknown });
+          onMove(c, parsed as { tick?: unknown; x?: unknown; y?: unknown; z?: unknown; seq?: unknown; jump?: unknown });
           return;
         }
         /* ★ 2026-11-14:`t:'attack'` —— 打怪的落点。判据同 `move`。 */
         if (parsed.t === 'attack') {
-          onAttack(c, parsed as { mobId?: unknown; bonus?: unknown });
+          onAttack(c, parsed as { mobId?: unknown; bonus?: unknown; useSkill?: unknown });
           return;
         }
         /* ★ 2026-11-14:`t:'action'` —— 通用动作通道(放置/破坏/丢弃/拾取/...)。
@@ -1097,7 +1118,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
  * 成功时把 `lastAttackReport` 回给客户端(`t:'attackResult'`)——
  * 否则「打中了」与「什么都没发生」在客户端**不可区分**(本仓反复记的静默形态)。
  */
-function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown }): void {
+function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown; useSkill?: unknown }): void {
   if (!c.helloDone || c.userId === null) {
     log('攻击意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
     return;
@@ -1113,13 +1134,22 @@ function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown }): void {
     return;
   }
   const bonus = typeof msg.bonus === 'number' && Number.isFinite(msg.bonus) ? msg.bonus : 0;
+  /* ★ WS-FND-122:**[Q] 意图位**。只接受字面 `true`(同 `clear` / `confirm`):
+     `1` / `'true'` / `{}` 一律当作「没按 Q」—— 技能是能改结算段数的动作,
+     不能靠宽松真值判定放行。
+     ⚠️ 「这把武器有没有技能」**不在这里判**(这里没有内容表):判据在世界侧
+        `attackMobAuthorized` 的闸 0e(没有技能 ⇒ `rejected:'NO_SKILL'`,
+        零副作用),回执里照实带回去。 */
+  const useSkill = msg.useSkill === true;
   try {
-    apply.call(opts.room, c.userId, bonus, mobId);
+    apply.call(opts.room, c.userId, bonus, mobId, useSkill);
   } catch (e) {
     log(`applyAttack 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
     return;
   }
-  sendJson(c, { t: 'attackResult', report: opts.room.lastAttackReport ?? null, mobId });
+  sendJson(c, {
+    t: 'attackResult', report: opts.room.lastAttackReport ?? null, mobId, useSkill,
+  });
 }
 
 /**
@@ -1170,7 +1200,8 @@ function onAction(c: WsConn, msg: { action?: unknown }): void {
   sendJson(c, { t: 'actionResult', action, ...(out as Record<string, unknown>) });
 }
 function onMove(c: WsConn, msg: {
-  tick?: unknown; x?: unknown; y?: unknown; z?: unknown; speedMul?: unknown; seq?: unknown;
+  tick?: unknown; x?: unknown; y?: unknown; z?: unknown;
+  speedMul?: unknown; seq?: unknown; jump?: unknown;
 }): void {
   /* ⚠️ 两个条件都要查,而不是只查 `helloDone`:类型上 `c.userId` 是 `string | null`,
      而 `applyMove` 要 `string`。只查前者会让类型检查多一条 TS2345

@@ -54,6 +54,20 @@ import { ItemSourcePurpose } from '../anticheat.ts';
 import { bindItemSource, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome, ActionPayload, ItemReadPort } from '../room.ts';
 import type { ActionHandler } from './types.ts';
+/* ★ WS-FND-122:整蛊玩具表与 218 和平盾的**唯一事实源**。
+ *
+ * ## 为什么在这里 import(而不是让世界侧再分派一次)
+ * `use_item` 的语义门读的是世界侧 `itemUseKind`,而那张表**不认** 221..255
+ * (`itemUseKind` 只覆盖 733/227/212/料理)⇒ 玩家对着队友用整蛊玩具时,
+ * 动作层在**扣道具之前**就回「没有使用语义」,而 `prank/actions.ts` 的
+ * `resolvePrankAction` / `gatePrank` 生产零调用 ⇒ 「玩家→玩家整蛊」不存在。
+ *
+ * `PRANK_TOYS`(35 件,含 `radius` / `stunSec` / `impulse` / 队友侧效果)本来
+ * 就是那张**唯一**表 ⇒ 玩具分支读它,不另写白名单。
+ * 判定(表内 / 半径 / 自伤 / 218 盾免疫)一律走 `gatePrank`,本文件不重判。
+ */
+import { PRANK_TOY_BY_ID, SAFE_SHIELD_ITEM_ID } from '../../prank/toys.ts';
+import { gatePrank } from '../../party/actions.ts';
 
 /** 本动作的报文(`itemId` / `targetId` 已在 `ActionPayload` 里声明,这里只做窄化)。 */
 type UseItemPayload = ActionPayload & {
@@ -129,13 +143,38 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     };
   }
 
+  /* ★ 3a WS-FND-122:**两类道具的语义不在世界侧那张表里**。
+   *
+   * ```
+   * 整蛊玩具 221..255  →  prank/toys.ts#PRANK_TOYS(35 件,含半径/眩晕/冲量)
+   * 218 和平盾          →  穿戴件:开关状态在世界侧(`setShieldOn` / `shieldOnOf`)
+   * ```
+   * ⚠️ 这两类**不能**交给 `itemUseKind` 判:它只覆盖 733/227/212/料理,
+   *    `null` 分支会让「对队友用整蛊玩具」在扣道具之前就回「没有使用语义」——
+   *    而那不是「没有语义」,是**语义在另一张表里**。
+   *
+   * ★★ **重叠件:227**(WS-FND-122 实测到的回归)
+   * ```ts
+   * 227 = 泡泡连发水枪 → prank/toys.ts 的 221..255 表里**也有**它(radius 5, BUBBLED)
+   * 227 = 世界侧 itemUseKind 的 'BUBBLE'(连中 3 发才困人 —— 比玩具表更具体)
+   * ```
+   * 若玩具分支先跑,227 会退化成「一发就 STUNNED」⇒ `WS-FND-53` 的
+   * 「第 3 发才困住」当场红。⇒ **世界侧已认的语义优先**,玩具分支只接
+   * 「世界侧那张表说 null」的那些 id。
+   */
+  const toy = PRANK_TOY_BY_ID.get(itemId) ?? null;
+  const isShield = itemId === SAFE_SHIELD_ITEM_ID;
+
   /* ★ 3b **语义门**(纯读):这件道具真的有使用语义吗?
-     - 有读口 ⇒ 用世界侧那张**唯一**的语义表(`itemUseKind`);
-     - 没读口 ⇒ 跳过这一步,让世界侧自己拒(它们的分支仍然会说"没有使用语义")。
-     这一步放在**扣道具之前**:没有语义的 id 不该先被扣一件再退回
-     (退回虽正确,但会让"被拒"与"用过又退了"在账面上留下痕迹)。 */
+    - 有读口 ⇒ 用世界侧那张**唯一**的语义表(`itemUseKind`);
+    - 没读口 ⇒ 跳过这一步,让世界侧自己拒(它们的分支仍然会说"没有使用语义")。
+    这一步放在**扣道具之前**:没有语义的 id 不该先被扣一件再退回
+    (退回虽正确,但会让"被拒"与"用过又退了"在账面上留下痕迹)。 */
   const semantic = (host as ItemSemanticPort).itemUseKind;
-  if (typeof semantic === 'function' && semantic.call(host, itemId) === null) {
+  const semanticKind = typeof semantic === 'function' ? semantic.call(host, itemId) : null;
+  /* 玩具分支的判据 = 「在玩具表里」∧「世界侧没有更具体的语义」(见上面 227 那段)。 */
+  const prankToy = toy !== null && (typeof semantic !== 'function' || semanticKind === null);
+  if (!prankToy && !isShield && typeof semantic === 'function' && semanticKind === null) {
     return { ok: false, kind: 'INVALID', reason: `${ctx.action} 的道具 ${itemId} 没有使用语义` };
   }
 
@@ -177,6 +216,89 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     }
   }
 
+  /* ══════════ ★ WS-FND-122:整蛊玩具(221..255)的**前置判定** ══════════
+   *
+   * 判定一律走 `party/actions.ts#gatePrank`(→ `prank/actions.ts#resolvePrankAction`),
+   * 本文件只提供它要的两个**权威输入**:
+   * ```
+   * distance  两个玩家的权威坐标差(`hostPositionOf` → physics.bodies)
+   * ally      两队归属是否相同(`host.partyTeamOf`,435 复活旗是唯一来源)
+   * shieldOn  目标身上 218 和平盾的**真实开关**(`host.shieldOnOf`)
+   * ```
+   * 位置/队伍拿不到 ⇒ `ally=false`(按敌对算)但**距离必须拿得到**:
+   * 拿不到距离就无从判「在不在半径内」⇒ 显式拒(不许当成 0 格放行)。
+   *
+   * ⚠️ 判序:这一整段在**扣道具之前**且全部是纯读 ⇒ 被拒时**零副作用**
+   *    (背包、世界、buff 一个字都没动)。
+   */
+  let prank: ReturnType<typeof gatePrank> | null = null;
+  let prankTarget = '';
+  if (prankToy && toy !== null) {
+    if (targetDeviceId !== undefined) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `${ctx.action} 的整蛊玩具 ${itemId} 只能对**玩家**用(targetDeviceId 不适用)`,
+      };
+    }
+    if (targetId === undefined) {
+      /* 整蛊是「对别人」的动词:缺目标时**不**退回「对自己」——
+         那会让一次报文失误变成自伤(而 218 盾不免疫自伤)。 */
+      return { ok: false, kind: 'INVALID', reason: `${ctx.action} 的整蛊玩具 ${itemId} 需要 targetId(玩家)` };
+    }
+    prankTarget = targetId;
+    const atActor = ctx.hostPositionOf(ctx.actorId);
+    const atTarget = ctx.hostPositionOf(prankTarget);
+    if (atActor === null || atTarget === null) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `${ctx.action} 拿不到 ${atActor === null ? ctx.actorId : prankTarget} 的权威位置 ⇒ 无法判定整蛊半径`,
+      };
+    }
+    const distance = Math.hypot(atTarget.x - atActor.x, atTarget.y - atActor.y);
+    const teamOf = host.partyTeamOf;
+    const teamA = typeof teamOf === 'function' ? teamOf.call(host, ctx.actorId) : null;
+    const teamB = typeof teamOf === 'function' ? teamOf.call(host, prankTarget) : null;
+    const ally = teamA !== null && teamB !== null && teamA === teamB;
+    const shieldOf = host.shieldOnOf;
+    const shieldOn = typeof shieldOf === 'function' ? shieldOf.call(host, prankTarget) === true : false;
+    prank = gatePrank({
+      actorId: ctx.actorId, targetId: prankTarget, toyId: itemId, distance, ally, shieldOn,
+    });
+    if (!prank.accepted || prank.blocked) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `${ctx.action} 整蛊未施加(${prank.reason}):toy=${itemId}`
+          + ` target=${prankTarget} 距离=${distance.toFixed(2)} 半径=${toy.radius}`
+          + `${prank.blocked ? '(218 和平盾)' : ''}`,
+      };
+    }
+  }
+
+  /* ══════════ ★ WS-FND-122:218 和平盾(**穿戴件,不消耗**)══════════
+   *
+   * 修前 `contestCrownDrop` 里写死 `shieldOn: false` ⇒ 盾的「免疫队友整蛊」
+   * 恒不成立。这里补的是**生产者**:用一下 218 ⇒ 世界侧的开关真的置真,
+   * 之后 `gatePrank` / `gateCrownKnock` 都从 `shieldOnOf` 读到它。
+   *
+   * ⚠️ **不扣道具**:它是安全帽(穿在身上),不是消耗品。别的道具走
+   *    「先扣后生效」,这里**没有**扣减动作 —— 所以也没有退款分支。
+   *    权威读口(第 4 步)仍然要求「背包里真的有这件」,凭空开盾不行。
+   */
+  if (isShield) {
+    const setShield = host.setShieldOn;
+    if (typeof setShield !== 'function') {
+      return {
+        ok: false, kind: 'NOT_IMPLEMENTED',
+        reason: `${ctx.action} 的世界侧不支持 218 和平盾开关`,
+      };
+    }
+    const changed = setShield.call(host, ctx.actorId, true) === true;
+    return {
+      ok: true, kind: 'OK',
+      effect: { itemId, shieldOn: true, changed, consumed: 0 },
+    };
+  }
+
   /* 5 **先扣后生效**。扣不动 ⇒ 世界侧**根本没跑**。 */
   const take = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -1 }] });
   if (!take.allowed) {
@@ -203,6 +325,51 @@ export const useItem: ActionHandler = (ctx): ActionOutcome => {
     unbindItemSource(ctx, src);
     return `退回也被拒:${back.rejectCode ?? '被拒'} ⇒ 这一件没能回到背包`;
   };
+
+  /* ══════════ ★ WS-FND-122:整蛊玩具的**效果落点**(判定已在 4b 过完)══════════
+   *
+   * 顺序仍是「先扣后生效」:道具已经扣了 1 件,世界侧**没施加**就退回并如实
+   * 写进回执(退回失败也写 —— 与下面 733 那条同一口径)。
+   *
+   * ⚠️ 效果**不在这里算数值**:`stunSec` / `moveTiles` / `flag` 来自
+   *    `gatePrank` 的裁定(玩具表 + 218 盾 + 敌我),`impulse` 来自玩具表本身。
+   *    世界侧只负责落到权威状态(`vitals.applyStun` / `physics.applyImpulse`)。
+   */
+  if (prankToy && toy !== null && prank !== null) {
+    const applyPrank = host.applyPrankToTarget;
+    if (typeof applyPrank !== 'function') {
+      const refundNote = refund();
+      return {
+        ok: false, kind: 'NOT_IMPLEMENTED',
+        reason: `${ctx.action} 的世界侧不支持整蛊效果`
+          + (refundNote === null ? '(道具已退回)' : `(${refundNote})`),
+      };
+    }
+    const applied = applyPrank.call(host, ctx.actorId, prankTarget, {
+      toyId: itemId,
+      stunSec: prank.stunSec,
+      impulse: toy.impulse,
+      moveTiles: prank.moveTiles,
+      flag: prank.flag ?? 'NONE',
+    });
+    if (applied.applied !== true) {
+      const refundNote = refund();
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `${ctx.action} 整蛊未生效:${applied.reason}`
+          + (refundNote === null ? '(道具已退回)' : `(${refundNote})`),
+      };
+    }
+    return {
+      ok: true, kind: 'OK',
+      effect: {
+        itemId, toyId: itemId, targetId: prankTarget,
+        flag: applied.flag, moveTiles: applied.moveTiles, stunSec: applied.stunSec,
+        ally: prank.origin === 'ALLY', shield: prank.shield !== null,
+        consumed: 1,
+      },
+    };
+  }
 
   /* 缺省字段**不塞 `undefined`**:世界侧用 `in` 语义判"这次有没有给器件目标"。 */
   const req: { itemId: number; targetId?: string; targetDeviceId?: number } = { itemId };

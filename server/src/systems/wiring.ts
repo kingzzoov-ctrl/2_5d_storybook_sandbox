@@ -47,10 +47,27 @@
  *   import 它,那条白名单就变成**陈旧条目**(门禁会报「白名单里的文件现在可达」),
  *   而 `scripts/verify.ts` 不在本线写域。⇒ 圈养名单由世界侧注入
  *   (`WorldSim.setRanchPets`),唯一的权威仍是 `taming.ts:PetRecord.inRanch`。
+ *
+ * ## ★ WS-FND-125(第七轮实测):收获链路的两处「半截」
+ *
+ * ```txt
+ * P0  成熟即 delete + harvest.push ⇒ 产物只活在内存(地面/背包/428/430 都拿不到)
+ *     ⇒ 现在成熟必须**交付**:产物 id 由 `greenhouse.ts:cropProductIdOf` 定,
+ *        交给 `GrowInput.deliverHarvest`(世界侧注入,落到 `mobGround` 或背包);
+ *        世界没接住 ⇒ `landed: 'NONE'` + `unlanded`,**账与世界不许不一致**。
+ * P1  分拣拿 `cell.cropId` 当产物 id ⇒ 429 过滤表按产物写永远不命中
+ *     ⇒ 现在分拣用产物 id(未登记的作物退回「收的就是它自己」这一老口径)。
+ * ```
+ *
+ * ⚠️ `deliverHarvest` 目前由世界侧接线(`sim/world_sim.ts` **不在本线写域**,
+ *   它正被另一条线改)⇒ 缺口由 `unlanded` 计数**出声**,不会静默。
+ *   判据:`tests/WS-FND-125-systems-chain.ts`(FND125-2/3/4 用注入桩钉机制)。
  */
 
 import {
   cellGrowth,
+  cropProductIdOf,
+  HARVEST_YIELD,
   morningMoisture,
   sortHarvest,
   type SortFilter,
@@ -116,13 +133,42 @@ export function cropKey(x: number, y: number): string {
   return `${Math.floor(x)},${Math.floor(y)}`;
 }
 
-/** 一次「成熟并收下来」的账:哪一格、什么产物、429 把它分到哪条道。 */
-export interface HarvestRow {
+/** 一份产物交给世界之后的去向(`NONE` = 世界没接住,不假装落进去了)。 */
+export const HarvestLanding = {
+  GROUND: 'GROUND',
+  INVENTORY: 'INVENTORY',
+  NONE: 'NONE',
+} as const;
+export type HarvestLanding = (typeof HarvestLanding)[keyof typeof HarvestLanding];
+
+/**
+ * 交给世界的**那一份产物**(落货口的入参)。
+ *
+ * `productId` 由「作物 → 产物」映射决定(`greenhouse.ts:cropProductIdOf`);
+ * `null` = 内容表没有这件作物的产物 ⇒ 世界侧**无货可落**(不许自己编 id)。
+ */
+export interface HarvestDelivery {
   x: number;
   y: number;
   cropId: number;
+  productId: number | null;
+  count: number;
   /** 分拣结果:`-1` = 没命中任何过滤规则(不从带上分出去)。 */
   lane: number;
+}
+
+/**
+ * 一次「成熟并收下来」的账:哪一格、什么作物/产物、429 把它分到哪条道、
+ * 以及**它真的落到哪里去了**。
+ *
+ * ★ 第七轮 P0:修前这张账是收获链路的**终点**(`st.harvest.push(row)` 之后
+ *   再没有任何一步),于是「收获」= 作物被删掉、产物只活在这个数组里。
+ *   现在每一行都是**一次真实交付的回执**(`landed` 由世界侧回报);
+ *   `landed: 'NONE'` 的行是**没落地的欠账**,与 `GrowResult.unlanded` 同源。
+ */
+export interface HarvestRow extends HarvestDelivery {
+  /** 这一份产物落到哪里去了(`NONE` = 世界没接住,账上如实记)。 */
+  landed: HarvestLanding;
 }
 
 /** 四系统在世界侧的全部状态(**一个对象**,便于一次性重置/审阅)。 */
@@ -145,7 +191,13 @@ export interface RoomSystemsState {
    * 重放而永久拒付。
    */
   settled: SettlementLedger;
-  /** 累计收下来的作物(按成熟顺序;`sortHarvest` 已判过道)。 */
+  /**
+   * 累计收下来的作物 = **交付台账**(按成熟顺序;`sortHarvest` 已判过道)。
+   *
+   * ★ WS-FND-125:每行都是一次**真实交付**(`landed` 由世界回报),所以
+   *   「账上有几行」与「世界上多了几件货」是同一件事(没落地的那些记 `NONE`
+   *   并同时进 `GrowResult.unlanded`,两处同源)。
+   */
   harvest: HarvestRow[];
   /** 429 的过滤规则(世界侧配置;空 = 一切 `-1` 原样留在带上)。 */
   sortFilters: SortFilter[];
@@ -231,15 +283,30 @@ export interface GrowInput {
   /** 该格是否在温室里(`AUTO_GREENHOUSE` 房间识别结果)。 */
   isGreenhouse(x: number, y: number): boolean;
   /** 该格是否在「通水的自动洒水器(426)」覆盖范围内。 */
+  /** 该格是否在「通水的自动洒水器(426)」覆盖范围内。 */
   hasSprinkler(x: number, y: number): boolean;
+  /**
+   * 产物**落货口**(世界侧注入):把这一份产物真的写进世界。
+   *
+   * - `'GROUND'`   已落到地面 / `'INVENTORY'` 已进背包 ⇒ 账上记 `landed`;
+   * - `'NONE'`     世界收不下 ⇒ 记 `unlanded`(绝不假装落进去了);
+   * - **缺省**(老调用方 / 纯函数判据)⇒ `'NONE'`:成熟仍会摘走作物并记账,
+   *   但账上写明「这一份没落地」—— 于是「产物只进内存」是**可观测**的,
+   *   而不是修前那种「账上是好消息、世界是空的」。
+   */
+  deliverHarvest?(h: HarvestDelivery): HarvestLanding;
 }
 
 /** 一次温室推进的回执。 */
 export interface GrowResult {
   /** 今天真的长了(或该长)的格数。 */
   grown: number;
-  /** 本帧成熟并被收下来的作物(带 429 分拣道号)。 */
+  /** 本帧成熟并被收下来的作物(带 429 分拣道号与**落地去向**)。 */
   matured: HarvestRow[];
+  /** 本帧成熟、但**没能落进世界**的份数(`> 0` ⇒ 那一份只存在于收获账里)。 */
+  unlanded: number;
+  /** 每一份没落地的理由(坐标 / 作物 / 为什么落不下)。 */
+  unlandedReasons: string[];
 }
 
 /**
@@ -248,8 +315,15 @@ export interface GrowResult {
  * ```
  * 水分 = morningMoisture(温室内有洒水器 ⇒ 浇到 1;否则维持原值)
  * 生长 = cellGrowth(...).growthPerDay × dayFraction
- * 成熟 = progress + 生长 ≥ 1  ⇒ 收下来,道号 = sortHarvest(cropId, filters)
+ * 成熟 = progress + 生长 ≥ 1
+ *   ⇒ 作物→产物(`greenhouse.ts:cropProductIdOf`)→ 道号 = sortHarvest(产物 id, filters)
+ *   ⇒ 交给落货口 `deliverHarvest`(世界侧注入)⇒ 记 `landed` / `unlanded`
  * ```
+ *
+ * ★ WS-FND-125(P0):修前到这里就结束了 —— `st.harvest.push(row)` 是链路的**终点**,
+ *   作物被删掉而产物只活在数组里(地面没有、背包没有、428/430 都抓不到)。
+ *   现在「摘走」与「交付」是同一件事:`landed` 由世界回报,`unlanded` 把没接住的
+ *   那一份**摆到账上**(而不是静默消失)。
  *
  * ⚠️ 成熟判据**在这里**(而不是直接用 `cellGrowth` 的 `ready`):后者按
  *   「整整一天」算,而本函数要支持 `dayFraction < 1` 的慢帧。`dayFraction === 1`
@@ -259,7 +333,7 @@ export interface GrowResult {
  *   (温室的「全天候透光」是唯一的差别,见 `greenhouse.ts` 文件头)。
  */
 export function growCrops(st: RoomSystemsState, input: GrowInput): GrowResult {
-  const out: GrowResult = { grown: 0, matured: [] };
+  const out: GrowResult = { grown: 0, matured: [], unlanded: 0, unlandedReasons: [] };
   const frac = Number.isFinite(input.dayFraction) ? input.dayFraction : 0;
   if (frac <= 0 || st.crops.size === 0) return out;
 
@@ -284,14 +358,35 @@ export function growCrops(st: RoomSystemsState, input: GrowInput): GrowResult {
     if (grown > 0) out.grown += 1;
     const progress = cell.progress + grown;
     if (progress >= 1 - 1e-9) {
-      /* 成熟:从耕地上摘走,并按 429 的过滤规则分道。 */
+      /* 成熟:从耕地上摘走,并按 429 的过滤规则分道;产物由下面交给世界。 */
       st.crops.delete(key);
-      const row: HarvestRow = {
+      /* ★ 产物 id 由「作物 → 产物」映射决定(内容表查名字),**不是** `cropId`:
+         否则 429 的过滤表按产物 id 写就永远不命中(见 greenhouse.ts 该表头)。 */
+      const productId = cropProductIdOf(cell.cropId);
+      /* 没登记产物的作物:退回「收获的就是它自己」这一口径(`sortHarvest` 的
+         既有语义 —— 判据 WS-FND-77 的露水甜莓就是这种)。 */
+      const sortId = productId === null ? cell.cropId : productId;
+      const delivery: HarvestDelivery = {
         x: cell.x,
         y: cell.y,
         cropId: cell.cropId,
-        lane: sortHarvest(cell.cropId, st.sortFilters),
+        productId,
+        count: HARVEST_YIELD,
+        lane: sortHarvest(sortId, st.sortFilters),
       };
+      /* ★ P0 修点:产物**真的落进世界**(落货口由世界侧注入;没有产物 id 的
+         作物无处可落,如实记 `unlanded`,不编一件物品出来)。 */
+      const landed: HarvestLanding = productId === null
+        ? 'NONE'
+        : (input.deliverHarvest !== undefined ? input.deliverHarvest(delivery) : 'NONE');
+      if (landed === 'NONE') {
+        out.unlanded += 1;
+        out.unlandedReasons.push(`(${cell.x},${cell.y}) 作物 #${cell.cropId}:`
+          + (productId === null
+            ? '内容表没有这件作物的产物(`greenhouse.ts:CROP_PRODUCT_NAME_BY_CROP`)'
+            : '世界没有落货口 `deliverHarvest`'));
+      }
+      const row: HarvestRow = { ...delivery, landed };
       st.harvest.push(row);
       out.matured.push(row);
       continue;
