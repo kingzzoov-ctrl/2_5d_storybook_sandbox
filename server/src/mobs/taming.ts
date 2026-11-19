@@ -4,6 +4,23 @@
  * 流程:喂食(达标次数)→ 驯化 → 三指令(跟随 / 留守 / 背物资)→ 牧场产出 → 出战上限。
  *
  * 出战上限:默认 1 只;装备 `628 繁花鹿角园艺冠` 后解锁第 2 只。
+ * ## 接线状态(2026-11-19 定案「接上」,本模块不再是 orphan)
+ *
+ * 生产唯一入口 = `server/src/net/actions/breed_tame.ts` 的 `BREED_TAME`。宠物容器
+ * (**唯一事实源**)住本文件第 6 节,按玩家存(`roomId → ownerId → petId`);动作层
+ * 不再自带第二份容器,各子操作各自调本模块:
+ *
+ * ```
+ * FEED   createPetRecord(首次登记)+ feedPet(该物种自己的食物才推进驯化)
+ * TAME   认主后 commandPet(FOLLOW)
+ * RANCH  sendToRanch(在圈标记 = 权威)+ systems/intake.ts 的名单判定(投影)
+ * ```
+ *
+ * ⚠️ 仍**没有**协议入口的导出:`deployPet` / `undeployPet` / `commandIntent` /
+ *   `carrySpeedMul` / `tickRanch`。理由是客户端的 op 表被 `tests/WS-FND-138`
+ *   逐字钉死为四个(FEED / TAME / BREED / RANCH)—— 加第五个要同时改客户端与判据,
+ *   那是**协议变更**,不是接线。它们留在本文件是因为各自的判据(`tests/WS-FND-125`)
+ *   在钉模块内语义;这里如实写「没入口」,而不是继续写「等宠物容器」。
  */
 
 import { MOB_LIST } from '../../../shared/constants/mobs.ts';
@@ -160,11 +177,11 @@ export function commandPet(pet: PetRecord, cmd: TameCommand): boolean {
    *
    * ⇒ 三个事实连着:`commandPet(CARRY)` → `carryLoad > 0` → `carrySpeedMul = 0.9`。
    *
-   * ⚠️ 仍然**没有生产调用方**:本模块是 `scripts/verify.ts` 的
-   *   `UNREACHABLE_EXEMPT` 成员(宠物容器未接线,见 `systems/intake.ts` 文件头
-   *   第 0 节)。从 `systems/**` import 它会让那条白名单变成陈旧条目,
-   *   而 `scripts/verify.ts` 不在本线写域 ⇒ 这里只把**模块内**的恒假分支消掉,
-   *   跨模块接线仍等 owner 裁决「宠物容器住哪」。
+   * ★ 生产调用点(2026-11-19 定案「接上」):`net/actions/breed_tame.ts` 的 `TAME`
+   *   子操作在认主成功后下第一条指令 `commandPet(record, FOLLOW)` ⇒ 本函数不再只在
+   *   测试里被调用,也不再是 `scripts/verify.ts` 的 `UNREACHABLE_EXEMPT` 成员
+   *   (容器已搬进本文件第 6 节,动作层只留投影)。`CARRY` 那一路仍只有判据
+   *   (`tests/WS-FND-125` 第 9 组)—— 加「背物资」子操作要动协议(见文件头)。
    */
   pet.carryLoad = cmd === TameCommand.CARRY ? carrySlots(pet.mobId) : 0;
   return true;
@@ -263,9 +280,9 @@ export function tickRanch(pets: PetRecord[], now: number): RanchYield[] {
  * `carrySlots` 装货,`commandPet(别的指令)` / `sendToRanch` / `undeployPet` 卸货。
  * 判据 `tests/WS-FND-125` 用「CARRY ⇒ 0.9 / STAY ⇒ 1」双向钉住这对字段。
  *
- * ⚠️ 它仍**没有跨模块消费方**:本模块整体在 `scripts/verify.ts` 的不可达白名单里
- *   (宠物容器未接线)。这不是「留着恒假分支」,而是「等宿主」——
- *   登记在 `systems/intake.ts` 文件头第 0 节,不另立第二份措辞。
+ * ★ 生产消费方(2026-11-19):容器(`roomId → ownerId → petId`)把 `carryLoad` /
+ *   `command` 一起带着走,`sendToRanch` 因此在生产路径上真的会卸货(RANCH 子操作)。
+ *   `commandPet(CARRY)` 本身仍没有协议入口 —— 客户端 op 表只有四个(见文件头)。
  */
 export const CARRY_BASE_SLOTS = 4;
 export const CARRY_MAX_SLOTS = 12;
@@ -303,4 +320,133 @@ export function commandIntent(pet: PetRecord, owner: { x: number; y: number }, p
 /** 自检:配表覆盖度(24 种里可驯养的条目数)。 */
 export function tamingCoverage(): { tameable: number; total: number } {
   return { tameable: tameableDefs().length, total: MOB_LIST.length };
+}
+
+/* ═══════════════════ 6. 宠物容器(唯一事实源;按玩家存)═══════════════════ */
+
+/**
+ * 一条宠物槽:`petId`(客户端手里那一只)+ 归属 + 亲密度 + 驯化记录。
+ *
+ * ## 「按玩家存」落在哪 —— 外层键就是玩家
+ *
+ * ```
+ *   PET_BOX: roomId → ownerId(无主 = '') → petId → 槽
+ *   ⇒ 「某玩家的全部宠物」是一次直接查表(出战名额 / 送进牧场都按玩家算);
+ *   ⇒ 「房间里有没有这只 petId」是跨玩家的反查(去重键:同一只宠物不许两条记录);
+ *   ⇒ `roomId` 在最外层:同一进程的两个房间不共享宠物(测试因此可以按房间隔离)
+ * ```
+ *
+ * ⚠️ `ownerId` 同时出现在键上和槽里,但**只有键是权威**:换主人(TAME)必须走
+ *   `putPetSlot` 搬格。若绕过它直接改槽里的 `ownerId`,同一只宠物会同时留在
+ *   「无主」与「p1 的」两格(两次出战名额、两份牧场产出),而任何断言都看不出来。
+ *   ⇒ 写口只有 `putPetSlot`,读口三个(单查 / 整房 / 按玩家)。
+ *
+ * ## 两个计数器,不是两份进度
+ *
+ * ```
+ *   slot.bond        玩家侧口径:每一次**被接受**的投喂 +1(BREED_TAME 的 FEED 累计),
+ *                    认主门槛用它(`net/actions/breed_tame.ts` 的 AFFECTION_REQUIRED)
+ *   record.fedCount  驯化口径:`feedPet` **只数该物种自己的食物**,`stage` 由它推
+ * ```
+ *
+ * 为什么必须分开:喂**任何**东西都让玩家与它更熟(动作层契约:背包里有那一件就能喂),
+ * 但「驯化」在内容层是**该物种吃哪件**(`MobDef.tameItem`)—— 拿黄金小麦喂花栗鼠
+ * (它吃 121)只会更熟,不会驯化。两个数合成一个,必然有一边的语义是假的。
+ */
+export interface PetSlot {
+  petId: string;
+  ownerId: string | null;
+  /** 亲密度(玩家侧口径,见上面「两个计数器」;动作层的 `affection` 就是它)。 */
+  bond: number;
+  record: PetRecord;
+}
+
+/** 无主记录的键(不新造第二个哨兵值:空串即「无主」,与 `tameOwnerId` 的约定同源)。 */
+const UNOWNED = '';
+
+/** `roomId → ownerId → petId → 槽`。**唯一事实源。** */
+const PET_BOX = new Map<string, Map<string, Map<string, PetSlot>>>();
+
+/** 取/建一个玩家的那一格。⚠️ 只有**写路径**调它 —— 读路径不许 materialize。 */
+function playerBox(roomId: string, ownerKey: string): Map<string, PetSlot> {
+  let owners = PET_BOX.get(roomId);
+  if (owners === undefined) {
+    owners = new Map<string, Map<string, PetSlot>>();
+    PET_BOX.set(roomId, owners);
+  }
+  let box = owners.get(ownerKey);
+  if (box === undefined) {
+    box = new Map<string, PetSlot>();
+    owners.set(ownerKey, box);
+  }
+  return box;
+}
+
+/**
+ * **唯一的写口**:把槽挂到 `(roomId, slot.petId)` 下,并按 `slot.ownerId` 选格。
+ *
+ * 换主人时先把 petId 从**别的**格子里摘掉(等于搬格)⇒「同一只宠物两条记录」
+ * 在结构上不可能出现,而不是靠每个调用方记得删。
+ */
+export function putPetSlot(roomId: string, slot: PetSlot): void {
+  const owners = PET_BOX.get(roomId);
+  const ownerKey = slot.ownerId ?? UNOWNED;
+  if (owners !== undefined) {
+    for (const [key, box] of owners) {
+      if (key === ownerKey) continue;
+      if (!box.delete(slot.petId)) continue;
+      /* 搬空了就把整格丢掉:否则空 Map 会随「驯服过又搬走的宠物」一直长下去。 */
+      if (box.size === 0) owners.delete(key);
+    }
+  }
+  playerBox(roomId, ownerKey).set(slot.petId, slot);
+}
+
+/**
+ * 只读单查:某房间某只宠物的槽。
+ *
+ * 没有 ⇒ `null`(**不是** `undefined`),与 `tameOwnerOf` 的返回口径一致;且**不**
+ * materialize 空登记(对任何房间问一次都不留痕)。
+ */
+export function petSlotOf(roomId: string, petId: string): PetSlot | null {
+  const owners = PET_BOX.get(roomId);
+  if (owners === undefined) return null;
+  for (const box of owners.values()) {
+    const slot = box.get(petId);
+    if (slot !== undefined) return slot;
+  }
+  return null;
+}
+
+/**
+ * 某房间的全部宠物槽(**新数组**,元素是活槽 —— 动作层要就地改它;
+ * 只读投影请自己拷成 `PetEntry`,别把活引用交给调用方)。
+ */
+export function petSlotsOfRoom(roomId: string): PetSlot[] {
+  const owners = PET_BOX.get(roomId);
+  if (owners === undefined) return [];
+  const out: PetSlot[] = [];
+  for (const box of owners.values()) for (const slot of box.values()) out.push(slot);
+  out.sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
+  return out;
+}
+
+/** 按玩家取(外层键就是玩家 ⇒ 一次查表;出战名额与送圈数都按它算)。 */
+export function petsOfPlayer(roomId: string, ownerId: string): PetSlot[] {
+  const box = PET_BOX.get(roomId)?.get(ownerId);
+  if (box === undefined) return [];
+  const out = [...box.values()];
+  out.sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
+  return out;
+}
+
+/**
+ * 丢弃某房间的全部宠物。
+ *
+ * 生产调用点:`net/actions/breed_tame.ts` 的 `forgetRoom`(房间侧账回收,
+ * `RESET_WORLD` 走它);测试用它做房间隔离。不调它 ⇒ 进程里的 Map 随建过的
+ * 房间数单调增长 —— 这是登记,不是「理论上会回收」。
+ */
+export function forgetRoomPets(roomId: string): void {
+  PET_BOX.delete(roomId);
 }

@@ -1341,23 +1341,25 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
     ['server/src/content/registry.ts', 'server/src/mobs/taming.ts', 'server/src/systems/ranch.ts', 'shared/constants/mobs.ts'],
     `全仓读 .tameItem 的文件共 ${tameReaderFiles.length} 个 ⇒ tameItem **有**消费者(「无人消费」不成立)`);
 
-  /* 5b `feedPet` 的接线现状(★ 第六轮:按**实测**写,不冒充已接)。
+  /* 5b `feedPet` 的接线现状(★ 第八轮 S4 把它**接上**了 ⇒ 判据按实测翻面 1 → 3)。
    *
    * 原判据是 `eq(feedPetCalls, 0)`,而它把 `systems/intake.ts:44` 的**台账注释**
-   * (「… 的六个导出(`feedPet` / …)全仓 0 import …」)也算成一个调用点(实测 1)
+   * (「... 的六个导出(`feedPet` / ...)全仓 0 import ...」)也算成一个调用点(实测 1)
    * ⇒ 读数是「1 ≠ 0」,而事实是「0 import / 0 调用」。判据的锚与它要判的事不对齐
    * (与 task-73 在这里修掉的那一类同形)。
    *
-   * 本轮的翻面目标是「调用点 ≥1 且被调用时有效果」。实测**做不到**:
-   * `feedPet` 至今 **0 import**(生产里唯一的命中是上面那条注释),缺的仍是宿主
-   * (宠物容器 + 驯服交互)。⇒ 这里不写「已接」,按现状钉住三件事:
+   * 第六轮钉的是「剥注释后 **1** 处(只有定义行)」,并写明「接上那天这条必红」。
+   * 2026-11-19 定案「接上」⇒ 它确实红了(期望 1 / 实测 3),本轮按**实测**改成 3:
    * ```
-   * 1 剥掉注释后,生产代码里 `feedPet` 只剩 **1** 处 —— 就是 `mobs/taming.ts:125` 的定义行;
-   * 2 「效果未接」的台账锚点在册(`intake.ts` 的「全仓 0 import」登记)⇒ 接上那天这条必红;
-   * 3 函数本身**有真效果**(喂食真推 `stage` / `fedCount`)⇒ 缺的是宿主,不是实现。
+   * 1 剥注释后,生产代码里 `feedPet` 共 **3** 处 ——
+   *   `mobs/taming.ts` 的定义行 + `net/actions/breed_tame.ts` 的 import 与调用各 1;
+   * 2 台账锚点(`intake.ts` 的「全仓 0 import」**原文**保留)与 `breed_tame.ts` 的接线注记
+   *   在册 ⇒ 两处说法必须同时成立(前者写明「已作废」,后者写明「已接上」);
+   * 3 函数本身**有真效果**(喂食真推 `stage` / `fedCount`)⇒ 缺的从来不是实现。
    * ```
-   * ⚠️ 第 1 条的「剥注释」是**必要**的:不剥的话注释行会让「≥1」恒真(本套件在
-   * task-73 修过同一个病,见 5a 上方)。第 3 条是它的负对照 —— 若函数变空壳,两条一起红。 */
+   * ⚠️ 第 1 条的「剥注释」是**必要**的:不剥的话注释行会让计数从 3 涨到 5(本套件在
+   * task-73 修过同一个病,见 5a 上方)。第 3 条是它的负对照 —— 若函数变空壳,两条一起红。
+   * 这条仍是「按实测写」:往后再动 feedPet 的接线,数字跟着实测改,但注释要说明为什么变。 */
   const isCommentLine = (text: string): boolean => /^(\*|\/\/|\/\*)/.test(text.trim());
   const feedPetCode: { rel: string; line: number; text: string }[] = [];
   for (const p of prod) {
@@ -1367,11 +1369,22 @@ test('task-38 taming 是**真欠账**,但缺的是两个不存在的宿主(不�
       if (!isCommentLine(text)) feedPetCode.push({ rel: p.rel, line: ln, text });
     }
   }
-  eq(feedPetCode.length, 1,
-    'feedPet 生产调用点 0(0 import + 0 调用;剥注释后只剩 1 处定义行)⇒ 无人消费的是**函数**');
-  ok(feedPetCode[0]!.rel.endsWith('mobs/taming.ts') && /export function feedPet/.test(feedPetCode[0]!.text),
-    `剥注释后唯一那处命中必须是定义行(实测 ${feedPetCode[0]!.rel}:${feedPetCode[0]!.line})`
-    + ' ⇒ 扫描器看得见它,上面那条不是恒空');
+  eq(feedPetCode.length, 3,
+    `feedPet 生产代码 3 处(taming.ts 定义 + breed_tame.ts 的 import 与调用)⇒ 已被消费,不再是欠账:`
+    + ` 实测 ${feedPetCode.length} 处 ${feedPetCode.map((h) => `${h.rel}:${h.line}`).join(' / ')}`);
+  /* 3 处里**恰好 1 处**是定义行,且必须落在 taming.ts(顺序无关:上面 eq 只钉条数)。 */
+  const feedPetDefs = feedPetCode.filter((h) => /export function feedPet/.test(h.text));
+  eq(feedPetDefs.length, 1,
+    `剥注释后恰有 1 处定义行(实测 ${feedPetDefs.length})⇒ 扫描器看得见它,上面那条不是恒空`);
+  ok(feedPetDefs[0]!.rel.endsWith('mobs/taming.ts'),
+    `定义行必须落在 mobs/taming.ts(实测 ${feedPetDefs[0]!.rel}:${feedPetDefs[0]!.line})`);
+  /* 另 2 处必须都在**生产动作层**的同一文件(import + 调用),不能被别的文件顺手提及冒充。 */
+  const feedPetUse = feedPetCode.filter((h) => !/export function feedPet/.test(h.text));
+  eq(feedPetUse.length, 2, `定义行之外应恰有 2 处(import + 调用),实测 ${feedPetUse.length}`);
+  ok(feedPetUse.every((h) => h.rel === 'server/src/net/actions/breed_tame.ts'),
+    `另 2 处必须都在 net/actions/breed_tame.ts(实测 ${feedPetUse.map((h) => `${h.rel}:${h.line}`).join(' / ')})`);
+  ok(/feedPet,/.test(feedPetUse.map((h) => h.text).join('\n')) && /feedPet\(\w/.test(feedPetUse.map((h) => h.text).join('\n')),
+    '那 2 处一处是 import(`feedPet,`)一处是调用(`feedPet(x)`)—— 只 import 不调用不算接上');
   const intakeSrc = readFileSync(join(ROOT_DIR, 'server', 'src', 'systems', 'intake.ts'), 'utf8');
   ok(/feedPet/.test(intakeSrc) && /全仓 0 import/.test(intakeSrc),
     '效果未接的台账锚点在册(intake.ts 登记 taming 六个导出「全仓 0 import」)⇒ 接上那天这条会红,必须一并改写');

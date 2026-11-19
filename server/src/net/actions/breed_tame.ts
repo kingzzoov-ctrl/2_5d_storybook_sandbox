@@ -1,10 +1,8 @@
 /**
- * `BREED_TAME` —— **投喂 / 驯服 / 繁殖**。
+ * `BREED_TAME` —— **投喂 / 驯服 / 繁殖 / 送进牧场**。
  *
  * 接线前本文件是 `notImplemented(...)`(`docs/TASK-96-action-landing-gaps.md`:
  * 「`mobs/taming.ts` 存在但为 **orphan**:缺宠物容器与驯服交互(它的喂食出口零生产调用)」)。
- * 本轮把那条欠账里**属于动作层**的两件补上:宠物归属容器 + 三个子动作。
- * 只改本文件 —— `action_table.ts` / `room.ts` / `world_sim.ts` / `mobs/**` 一个字没动。
  *
  * ## 分支口径:一个动作、四个子操作,由 `payload.op` 选
  *
@@ -12,71 +10,70 @@
  * `BREED` / `SEND_TO_RANCH`),所以子操作只能是**同一动作的几种 payload**:
  *
  * ```ts
- * { op: 'FEED',  petId, itemId, mobId? }   // 投喂:扣 1 件、好感 +1
- * { op: 'TAME',  petId }                   // 驯服:好感达标 + 无主 ⇒ 记主人
+ * { op: 'FEED',  petId, itemId, mobId? }   // 投喂:扣 1 件、亲密度 +1(物种食物另算驯化)
+ * { op: 'TAME',  petId }                   // 驯服:亲密度达标 + 无主 ⇒ 记主人并下 FOLLOW
  * { op: 'BREED', petId, mateId }           // 繁殖:两只都归自己且都达标 ⇒ 记一条记录
  * { op: 'RANCH', petId }                   // ★ WS-FND-119 送进牧场 ⇒ host.setRanchPets
  * ```
  *
- * ★ `RANCH` 是三个「喂料口」之一:修前 `WorldSim.setRanchPets` 在 `server/**` 内
- *   **零调用**(唯一调用方是 `tests/**`)⇒ 牧场日结每慢帧空跑而校验全绿。
- *   判定在 `systems/intake.ts`(`addPetToRanch`),世界写入仍是宿主的那个方法。
+ * `op` / `petId` / `mobId` / `mateId` **不在** `ActionPayload`(`room.ts`)里 ——
+ * 那条接口是别的动作的字段表;本模块的键照 `craft.ts` 的先例**局部**收窄读取
+ * (见 `BreedTamePayload`),`room.ts` 不用动。
  *
- * `op` / `petId` / `mobId` / `mateId` **不在** `ActionPayload`(`room.ts:828-853`)里 ——
- * 那条接口是别的动作的字段表;本模块的键照 `craft.ts:63` 的先例**局部**收窄读取
- * (见 `BreedTamePayload`),`room.ts` 不用动(它不在本文件的写域)。
+ * ## ★ 定案(2026-11-19):宠物容器**不在本模块**,唯一事实源是 `mobs/taming.ts` 第 6 节
  *
- * ## 宠物容器为什么住在**本模块**,而不是 `mobs/taming.ts`
- *
- * `taming.ts` 的 `PetRecord`(`:54-70`)有 `stage` / `fedCount` / `requiredFeeds` /
- * `command` / `saddle` / `inRanch` / `deployed` —— **没有主人字段**。而本动作的
- * 判据之一是「同一只宠物只能有一个主人」。要给它加一个 `ownerId` 就得改
- * `server/src/mobs/taming.ts`(不在本文件写域)⇒ 归属 / 好感 / 已投喂次数
- * 三者住在本模块的 `Map<roomId, Map<petId, PetEntry>>` 里。
- *
- * ⚠️ 容器按 `roomId` 分片,而 `roomId` **只能**从 `ctx.state.roomId` 取:
- *   `ActionContext`(`types.ts:26-82`)没有 `room`/`roomId` 成员,`state` 是唯一
- *   带房间身份的入参(`schema.ts:104-112` 的 `createRoomState(roomId)`)。
- *   同一进程里两个 `RoomRuntime` 用同一 id 会共享这份状态 —— 而 `RoomRegistry.create`
- *   对重复 id 直接抛(`room.ts:2387`)⇒ 该前提由注册表兜住。
- *
- * ## 为什么**没有**复用 `mobs/taming.ts`(三条路都实测过,不是推测)
- *
- * 三条复用路径各自撞上一个**不在本文件写域**的门禁:
+ * 本模块此前自带 `Map<roomId, Map<petId, PetEntry>>`(归属 / 好感 / 已投喂三件全在
+ * 这里),而 `mobs/taming.ts` 另有 `PetRecord` + 它自己的容器 ⇒ **两份宠物状态**。
+ * 现在容器搬进 `mobs/taming.ts`(按玩家存:`roomId → ownerId → petId`),本模块只留
+ * **投影 + 动作语义**:
  *
  * ```
- * 1 import 它的任何导出
- *   ⇒ scripts/verify.ts:2696 的不可达白名单自检报
- *      `server/src/mobs/taming.ts(已可达,应移出白名单)` ⇒ 门禁 fail
- *      docs/TASK-94-action-layer-landing-plan.md:207-210 预告的正是这一条
- *      (同时要摘 verify.ts 白名单 + 改 README.md:64 —— 两处都不在本文件写域);
- * 2 调 `taming.ts:118` 那个喂食出口
- *   ⇒ tests/WS-04.test.ts:1336-1345 钉「生产侧对它的调用点必须 0」
- *      (判据读**原始文本**,注释里写出函数名也算一个调用点 ⇒ 本文件只引行号)
- * 3 读物种食物字段(MobDef 的 tameItem,即「该物种吃哪件」)
- *   ⇒ tests/WS-04.test.ts:1331-1334 钉「全仓以点号形式读该字段的文件恰好这 3 个」
- *      ⇒ 实测本文件会成为第 4 个:WS-04 56/57,失败信息
- *        `[2]:期望 "shared/constants/mobs.ts" / 实际 "server/src/net/actions/breed_tame.ts"`。
+ * 权威(唯一)   taming.ts  PET_BOX —— { petId, ownerId, bond, record: PetRecord }
+ * 投影(本模块)  petsOfRoom / tameOwnerOf / tamedPetsOfRoom —— 算出来的只读视图
  * ```
  *
- * ⇒ 复用要改的是**别的门禁的事实快照**,而修正它们要动 `tests/` `scripts/` `docs/`
- * (全部不在本文件写域)。故本模块自带等价逻辑,并把与内容层的共享面收窄到一处:
- * `tameableMobs()`(`shared/constants/mobs.ts:186` —— 内容层自己的「哪些生物可驯」名单)。
- *
- * ⚠️ 由此**故意不复制** `TAME_FEED_COUNT`(按物种的难度表):复制它就是本仓反复点名的
- *   「两份实现」。本模块用**统一**好感阈值 `AFFECTION_REQUIRED`(喂几次算达标)。
- *   「按物种难度」是**未实现**的部分 —— 写在这里,而不是让它静默不存在。
- *
- * ## 事务性(两侧都不留痕)
- *
- * 三个子操作的形状都是「**先验完所有条件 → 再动一处 → 没有第二步**」:
+ * 各子操作调的是 `mobs/taming.ts` 的**同一批函数**(不是复制一份等价逻辑):
  *
  * ```
- * 所有前置校验(权限 / op / petId / 物种 / 物品 / 好感 / 归属)
- *   ⇒ 任何一条不过:直接返回,**背包与宠物两边都没被碰过**;
+ * FEED   createPetRecord(首次登记,顺带判「这物种可驯服吗」)
+ *        + feedPet(该物种**自己**的食物才推进 stage/fedCount)
+ * TAME   commandPet(FOLLOW) —— 认主那一刻宠物开始跟随(该函数唯一的生产调用点)
+ * RANCH  sendToRanch(在圈标记 = 权威;圈养上限也在这里判)
+ *        + systems/intake.ts 的 addPetToRanch(名单投影:牧场物种 / 亲和下限 / petId 去重)
+ * ```
+ *
+ * ## 两个计数器,不是两份进度(读这条才不会误以为「又并存两份」)
+ *
+ * ```
+ * slot.bond        玩家侧口径:每一次**被接受**的投喂 +1(不论那件是不是物种食物);
+ *                  认主门槛 `AFFECTION_REQUIRED` 用它 —— 这是**动作层契约**
+ *                  (tests/WS-FND-29 / WS-FND-41 / WS-FND-105 / WS-FND-119 都钉着
+ *                  「背包里有那一件就能喂」,不验食谱)
+ * record.fedCount  驯化口径:`feedPet` 只数「该物种自己的食物」(`MobDef` 的 tameItem 字段),`stage` 由它推
+ *                  (`requiredFeeds` 按物种,见 `TAME_FEED_COUNT`)
+ * ```
+ *
+ * ⇒ 拿黄金小麦(123)喂花栗鼠(它吃 121):亲密度 +1(**接受**),但 `stage` 仍是
+ *   `WILD` —— 它更熟,却还没被驯化。两个数合成一个,必然有一边的语义是假的。
+ * ⚠️ 本模块**不读** `MobDef` 的 tameItem 字段(那条规则只存在于 `mobs/taming.ts`)——
+ *   否则 `tests/WS-04` 的「全仓 dot 读该字段的文件恰好 4 个」会多出第 5 个。
+ *
+ * ## `RANCH` 为什么还要过 `systems/intake.ts`
+ *
+ * 圈养名单进世界那一步(`WorldSim.setRanchPets`)在修前于 `server/**` 内**零调用**
+ * ⇒ 牧场日结每慢帧空跑而校验全绿。判定(谁能进圈 / 亲和下限 / 去重)在
+ * `intake.ts`(纯函数);**在圈这个事实**的权威是 `taming.ts` 的
+ * `PetRecord.inRanch` —— 本模块只把两者按顺序接起来,不另立第三个地方记「在圈」。
+ *
+ * ## 事务性(失败路径两侧都不留痕)
+ *
+ * ```
+ * 所有前置校验(权限 / op / petId / 物种 / 物品 / 亲密度 / 归属)
+ *   ⇒ 任何一条不过:直接返回,**背包与容器两边都没被碰过**;
+ * 喂食在**副本**上试算(`feedPet` 改的是 `{ ...record }`),过了才写回容器;
  * 唯一可能失败的写入 = ctx.applyInventory(负 delta)
- *   ⇒ 被拒(背包里没有那件)⇒ 返回 INVALID,宠物状态仍未动;
- * 之后只剩 Map 上的赋值(不可能失败)⇒ 不存在「扣了东西却没长好感」。
+ *   ⇒ 被拒(背包里没有那件)⇒ 容器仍未动(副本没提交);
+ * 之后只剩容器赋值(不可能失败)⇒ 不存在「扣了东西却没涨亲密度」。
  * ```
  *
  * 繁殖**不产出任何物品、不造任何生物实体**(那两样是别处的权威):只往
@@ -84,62 +81,56 @@
  *
  * ## 权限
  *
- * `ACTION_PERMISSION.BREED_TAME = 'baseline'`(`room.ts:183`)⇒ 只要在房里就能做
- * (GUEST 也行 —— `PERMISSION_MATRIX.GUEST.baseline = true`,`room.ts:169-172`)。
- * 闸写在这里,不写在别处:世界/内容方法没有「谁」这个参数(与 `material.ts` 同一例外)。
+ * `ACTION_PERMISSION.BREED_TAME = 'baseline'`(`room.ts`)⇒ 只要在房里就能做
+ * (GUEST 也行)。闸写在这里,不写在别处:世界/内容方法没有「谁」这个参数
+ * (与 `material.ts` 同一例外)。
  *
  * ## 宠物归属**世界侧今天还看不见**(边界 + 那一行接线)
  *
- * 归属 / 好感 / 已投喂次数住在本文件的 `ROOM_PETS`(上面的 §2),**世界与 AI 完全
- * 不知道**这条记录存在。投影链实测如下:
+ * 归属住在 `mobs/taming.ts` 的容器里,**世界与 AI 完全不知道**这条记录存在:
  *
  * ```
- * 权威(本模块)  ROOM_PETS: roomId → petId → { ownerId, affection, feeds }
- * 投影链(今天)   world_sim.ts:4329 listWildlife() 把 tameOwnerId **硬编码 `''`**
- *                 ⇒ room.ts:1914 projectWildlife() 经 room.ts:1925 抄进 state.wildlife
- *                 ⇒ 客户端快照恒为「野生」
+ * 权威(本模块可查)  tameOwnerOf(roomId, petId) / tamedPetsOfRoom(roomId)
+ * 投影链(今天)      world_sim.ts listWildlife() 把 tameOwnerId **硬编码 `''`**
+ *                    ⇒ room.ts projectWildlife() 抄进 state.wildlife
+ *                    ⇒ 客户端快照恒为「野生」
  * ```
  *
- * ⇒ 投影点的写入者只有 `world_sim.ts:4344`(`tameOwnerId: ''`)与 `room.ts:1925`
- *   (`tameOwnerId: w.tameOwnerId`),**都不在本文件写域**。本文件这一侧给出的是一条
- *   **可被取走的权威登记 + 只读查询**(`tameOwnerOf` / `tamedPetsOfRoom`);接线由
- *   世界/房间侧补 —— 给 owner 的就是下面这一行:
- *
+ * 建议接线(一行;归属以 `taming.ts` 的容器为权威):
  * ```
- * 建议接线(一行;归属以本模块为权威):
  *   room.ts:1925   tameOwnerId: w.tameOwnerId,
  *              ⇒   tameOwnerId: tameOwnerOf(this.state.roomId, w.id) ?? '',
- *   并在 room.ts 顶部加 import { tameOwnerOf } from './actions/breed_tame.ts';
+ *   并在 room.ts 顶部 import { tameOwnerOf } from './actions/breed_tame.ts';
  * ```
- *
- * **本条今天到哪一步 / 由谁做**:动作层(本文件)已给出**可查的权威归属** —— 判据
- * `tests/WS-FND-41-tame-world.test.ts`(7 条);但世界侧**仍未接线**(`state.wildlife`
- * 的 `tameOwnerId` 今天仍恒为 `''`,客户端看到的仍是「野生」)。**剩下那一行由房间/
- * 世界侧的 owner 补**(`room.ts` / `world_sim.ts` 都不在本文件写域),补完即闭环 ——
- * 本文件这一侧**无需再动**。
- *
- * 选 `room.ts:1925` 而非 `world_sim.ts:4344` 的理由:`WorldSim` **没有** `roomId`
- * 实例字段(`world_sim.ts` 只在存档方法签名里收它),而 `RoomRuntime` 手里有
- * `this.state.roomId`。在投影点按 `(roomId, petId)` 反查一次即得,不必把房间身份
- * 线程进模拟层。⚠️ 本模块**绝不**自己写 `state.wildlife` —— 那会与投影层争同一个
- * 字段(两份写者)。世界侧存活清单的权威只属于 `world_sim`,本模块只提供归属。
+ * ⚠️ 本模块**绝不**自己写 `state.wildlife` —— 那会与投影层争同一个字段(两份写者)。
+ * 世界侧存活清单的权威只属于 `world_sim`,本模块只提供归属。
  *
  * ## 取走后**不清除**(关键口径)
  *
  * `tameOwnerOf` / `tamedPetsOfRoom` 是**纯读**:投影**每帧**都会问一次,若「取走
- * 即清」则主人只能在一帧里被看见(下一帧又变回野生)。⇒ 查询**不**消费登记,同一
- * `(roomId, petId)` 可无限次问、答案恒定(判据 7「无副作用」钉这一条)。
- *
- * ## `schema.ts` 的字段够不够 —— 核对结论:**够,故不改它**
- *
- * `WildlifeState.tameOwnerId` 是 `string`(`schema.ts:85` 默认 `''`;wire 注释
- * `shared/types/wire.ts:133` 明写「空串=野生」)⇒ 语义 = 「主人 id,空串表示无主」。
- * 本模块的 `ownerId` 是 `string | null`(`null` = 未驯服)⇒ 两者只差一步**哨兵转写**,
- * 那一步就落在上面那行接线的 `?? ''`。字段形态**足以**表达「已驯服」⇒ 不动
- * `schema.ts`(它不是冻结层,但这里确实没有必须改的理由)。
+ * 即清」则主人只能在一帧里被看见(下一帧又变回野生)。⇒ 查询**不**消费登记,
+ * 同一 `(roomId, petId)` 可无限次问、答案恒定(`tests/WS-FND-41` 第 7 条钉这一条)。
  */
 import { tameableMobs } from '../../../../shared/constants/mobs.ts';
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
+/* ★ 唯一事实源:宠物容器、喂食/驯化规则、在圈标记、三指令全在这里。 */
+import {
+  RANCH_CAPACITY,
+  TameCommand,
+  commandPet,
+  createPetRecord,
+  feedPet,
+  forgetRoomPets,
+  petSlotOf,
+  petSlotsOfRoom,
+  petsOfPlayer,
+  putPetSlot,
+  sendToRanch,
+  type PetRecord,
+  type PetSlot,
+} from '../../mobs/taming.ts';
+/* ★ 实例 id → 物种 id 的唯一规则在 `mobs/spawner.ts`;这里只用来对账客户端带来的 mobId。 */
+import { mobSpeciesId } from '../../mobs/spawner.ts';
 /* ★ WS-FND-119:圈养名单的判定在 systems 层(纯函数);本文件只把结果交给宿主。 */
 import { addPetToRanch, roomSystemsPortOf } from '../../systems/intake.ts';
 import { ownedItemCount } from './item_source.ts';
@@ -148,7 +139,7 @@ import type { ActionContext, ActionHandler } from './types.ts';
 
 /* ═══════════════════════ 1. 常量与报文形状 ═══════════════════════ */
 
-/** 好感阈值:喂满这么多次算「达标」(驯服与繁殖共用同一条线)。 */
+/** 认主门槛:亲密度到这个数才算「养熟」(驯服与繁殖共用同一条线)。 */
 export const AFFECTION_REQUIRED = 3;
 
 /** 每个房间保留的繁殖记录条数上限(超出丢最旧的)。 */
@@ -160,11 +151,10 @@ export const TameOp = {
   TAME: 'TAME',
   BREED: 'BREED',
   /**
-   * ★ WS-FND-119:送进牧场(第七轮补的**第一个**真实入口)。
+   * ★ WS-FND-119:送进牧场(第七轮补的第一个真实入口)。
    *
-   * 修前实测:`WorldSim.setRanchPets` 在 `server/**` 内**零调用**(唯一调用方是
-   * `tests/**`)⇒ 生产里 `ranchPets` 恒空 ⇒ 牧场日结每慢帧空跑而校验全绿。
-   * 报文只多用两个**契约里已有**的键(`op` + `petId`),不新增协议字段。
+   * 修前实测:`WorldSim.setRanchPets` 在 `server/**` 内**零调用** ⇒ 生产里
+   * `ranchPets` 恒空 ⇒ 牧场日结每慢帧空跑而全部校验是绿的。
    */
   RANCH: 'RANCH',
 } as const;
@@ -176,9 +166,8 @@ const TAME_OPS: readonly string[] = Object.values(TameOp);
 /**
  * 本动作的报文键。
  *
- * `ActionPayload` 只声明了别的动作的字段(`x` / `y` / `itemId` / `count` / ...),
- * 而这条通道本就是泛型的(`ws_server` 把客户端 JSON 原样递进来)⇒ 在自己的模块里
- * 局部读自己的键,`room.ts` 一个字不用动。照 `craft.ts:63` 的同一手法。
+ * `ActionPayload` 只声明了别的动作的字段,而这条通道本就是泛型的(`ws_server` 把
+ * 客户端 JSON 原样递进来)⇒ 在自己的模块里局部读自己的键。照 `craft.ts` 的同一手法。
  */
 type BreedTamePayload = ActionPayload & {
   op?: unknown;
@@ -187,27 +176,35 @@ type BreedTamePayload = ActionPayload & {
   mateId?: unknown;
 };
 
-/** 冻结内容表里的合法物品 id(拒绝「编号空投」,同 `material.ts:37`)。 */
+/** 冻结内容表里的合法物品 id(拒绝「编号空投」,同 `material.ts`)。 */
 const ITEM_ID_SET: ReadonlySet<number> = new Set(ITEM_LIST.map((i) => i.id));
 
 /**
- * 内容层的「可驯服生物」名单。
+ * 内容层的「可驯服生物」名单(有 `tameItem` 的那些)。
  *
- * ⚠️ 只调 `tameableMobs()`,**不**在这里读 `MobDef` 的 `tameItem` 字段 —— 理由见文件头第 3 条
- *   (那个读法会让 `tests/WS-04` 的事实快照当场变红)。
+ * ⚠️ 只调 `tameableMobs()`,**不**在这里读 `MobDef` 的 `tameItem` 字段 —— 那个读法
+ *   会让 `tests/WS-04` 的事实快照当场变红(它会成为第 5 个读者)。
+ *   第二道闸是 `createPetRecord`(`canTame`:行为类别必须是 TAMEABLE / MOUNT /
+ *   PASSIVE_UNKILLABLE)—— 两道都在,因为两个集合**不相等**(例如 `mob_pangolin`
+ *   有 `tameItem` 但行为是 MISCHIEVOUS)。
  */
 const TAMEABLE_MOB_IDS: ReadonlySet<string> = new Set(tameableMobs().map((m) => m.id));
 
-/* ═══════════════════════ 2. 宠物容器(本模块的归属状态)═══════════════════════ */
+/* ═══════════ 2. 容器投影(权威在 `mobs/taming.ts` 第 6 节)═══════════ */
 
-/** 一只宠物在这个模块里的全部状态。`ownerId === null` = 无主(野外 / 待驯)。 */
+/**
+ * 一只宠物在这个模块里的**投影**形状。
+ *
+ * 保留它是因为它是回执与判据的既有形状(`affection` / `feeds` 是两个读数),但它
+ * 现在是**算出来的**,不是存下来的 —— 存下来的只有 `taming.ts` 容器里的那一条。
+ */
 export interface PetEntry {
   petId: string;
   mobId: string;
   ownerId: string | null;
-  /** 好感(每次投喂 +1;达 `AFFECTION_REQUIRED` 才算达标)。 */
+  /** 亲密度(= 容器里的 `bond`)。 */
   affection: number;
-  /** 已投喂次数;与 `affection` 同值递增,分开存是为了回执能直说「喂了几次」。 */
+  /** 已投喂次数;与 `affection` 同源同值(分成两个字段是回执的既有形状)。 */
   feeds: number;
 }
 
@@ -223,21 +220,10 @@ export interface BreedRecord {
   seq: number;
 }
 
-/** `roomId → (petId → PetEntry)`。房间销毁时不会自动回收(见 `forgetRoom`)。 */
-const ROOM_PETS = new Map<string, Map<string, PetEntry>>();
-/** `roomId → 繁殖记录(最旧在最前)`。 */
+/** `roomId → 繁殖记录(最旧在最前)`。宠物本身**不**在这里(见文件头定案)。 */
 const ROOM_BREEDS = new Map<string, BreedRecord[]>();
 /** 记录序号(仅用于生成可读且唯一的 `recordId`)。 */
 let breedSeq = 0;
-
-function roomPetsOf(roomId: string): Map<string, PetEntry> {
-  let m = ROOM_PETS.get(roomId);
-  if (m === undefined) {
-    m = new Map<string, PetEntry>();
-    ROOM_PETS.set(roomId, m);
-  }
-  return m;
-}
 
 function roomBreedsOf(roomId: string): BreedRecord[] {
   let list = ROOM_BREEDS.get(roomId);
@@ -252,15 +238,16 @@ function roomBreedsOf(roomId: string): BreedRecord[] {
  * 观测口:某房间当前的宠物状态(**只读快照**,不参与任何判定)。
  *
  * 为什么要有它:本动作的回执(`effect`)只带这一次的增量,而「失败路径两侧都不变」
- * 这类断言要看**连续两次操作之间的差**。宿主没有任何宠物读口(`ActionContext` 里
- * 没有),故由本模块自己给出 —— 与 `room.lastSaveReport` / `lastRestoreApplied`
- * 同一处置:把「做了没有、生效几条」显式暴露,而不是让调用方猜。
+ * 这类断言要看**连续两次操作之间的差**。宿主没有任何宠物读口(ActionContext 里
+ * 没有),故由本模块给出 —— 与 `room.lastSaveReport` 同一处置:把「做了没有、
+ * 生效几条」显式暴露,而不是让调用方猜。
  */
 export function petsOfRoom(roomId: string): PetEntry[] {
-  const m = ROOM_PETS.get(roomId);
-  if (m === undefined) return [];
-  return [...m.values()]
-    .map((p) => ({ petId: p.petId, mobId: p.mobId, ownerId: p.ownerId, affection: p.affection, feeds: p.feeds }))
+  return petSlotsOfRoom(roomId)
+    .map((s) => ({
+      petId: s.petId, mobId: s.record.mobId, ownerId: s.ownerId,
+      affection: s.bond, feeds: s.bond,
+    }))
     .sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
 }
 
@@ -286,32 +273,22 @@ export interface TameOwnerRecord {
  * ```
  *
  * ⚠️ 返回类型是 `string | null`,**永远不是 `undefined`** —— 宿主/投影层若用
- *   `=== undefined` 判失败,会把「未驯服」与「查错了」混为一谈;这里把它压成一条
- *   `null`(判据 6)。
- *
- * ⚠️ **纯读、不消费**:调用它**不会**清空或改动 `ROOM_PETS`(理由见文件头
- *   「取走后不清除」)。投影**每帧**都会问 ⇒ 必须幂等(判据 7)。
+ *   `=== undefined` 判失败,会把「未驯服」与「查错了」混为一谈。
+ * ⚠️ **纯读、不消费**:调用它**不会**清空或改动容器(投影**每帧**都会问 ⇒ 必须幂等)。
  */
 export function tameOwnerOf(roomId: string, petId: string): string | null {
-  /* 刻意**不**走 `roomPetsOf` —— 那个 helper 会「没有就建一个空 Map」,于是对任何
-     房间问一次就留下一份空登记(副作用)。这里只读,不 materialize。 */
-  const pet = ROOM_PETS.get(roomId)?.get(petId);
-  if (pet === undefined) return null;
-  return pet.ownerId;
+  /* 刻意**不**走任何「没有就建一个」的 helper —— 对不存在的房间问一次不许留痕。 */
+  return petSlotOf(roomId, petId)?.ownerId ?? null;
 }
 
 /**
  * 只读查询:某房间**全部有主宠物**的归属(每个元素都是**新副本**)。
- *
- * 用途同 `tameOwnerOf`,但一次给全量(投影层若要按宠物批量对齐时用它)。
- * ⚠️ 返回的是**快照**:调用方改数组或改元素**都不会**回写内部(判据 5)。
+ * ⚠️ 返回的是**快照**:调用方改数组或改元素**都不会**回写内部。
  */
 export function tamedPetsOfRoom(roomId: string): TameOwnerRecord[] {
-  const m = ROOM_PETS.get(roomId);
-  if (m === undefined) return [];
   const out: TameOwnerRecord[] = [];
-  for (const p of m.values()) {
-    if (p.ownerId !== null) out.push({ petId: p.petId, ownerId: p.ownerId });
+  for (const s of petSlotsOfRoom(roomId)) {
+    if (s.ownerId !== null) out.push({ petId: s.petId, ownerId: s.ownerId });
   }
   out.sort((a, b) => (a.petId < b.petId ? -1 : a.petId > b.petId ? 1 : 0));
   return out;
@@ -323,14 +300,13 @@ export function breedRecordsOfRoom(roomId: string): readonly BreedRecord[] {
 }
 
 /**
- * 丢弃某房间的全部状态。
+ * 丢弃某房间的全部状态(宠物容器 + 繁殖记录)。
  *
- * 房间被回收(`RoomRegistry` 的 `onEvict`)时**应**调它,否则进程里的 Map 会随
- * 创建过的房间数单调增长。接线只到动作层 ⇒ 现在**没有任何调用点**(显式说明,
- * 而不是假装它会自动回收);测试用它做隔离。
+ * 生产调用点:`RESET_WORLD` 的房间侧账回收(`tests/WS-FND-105` 钉着「只清本房间」);
+ * 测试用它做房间隔离。宠物那一半委派给 `forgetRoomPets` —— 容器的主人。
  */
 export function forgetRoom(roomId: string): void {
-  ROOM_PETS.delete(roomId);
+  forgetRoomPets(roomId);
   ROOM_BREEDS.delete(roomId);
 }
 
@@ -349,17 +325,17 @@ function strField(v: unknown): string | null {
 /* ═══════════════════════ 4. 处理器 ═══════════════════════ */
 
 /**
- * `BREED_TAME`:投喂 / 驯服 / 繁殖(按 `payload.op` 分支)。
+ * `BREED_TAME`:投喂 / 驯服 / 繁殖 / 送进牧场(按 `payload.op` 分支)。
  *
  * ⚠️ 显式写返回类型:`effect` 的每支字段集不同,让 TS 去推会把它们并成一个
- *   带 `undefined` 的联合,而 `effect` 的值类型不含 `undefined`(同 `material.ts:81-84`)。
+ *   带 `undefined` 的联合(同 `material.ts`)。
  */
 export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   /* ── 1 权限闸:越权在此返回,且**未产生任何副作用** ── */
   const gate = ctx.authorize(ctx.actorId, ctx.action);
   if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
 
-  /* ── 2 分支选择:op 必须显式给足(缺项不猜) ── */
+  /* ── 2 分支选择:op / petId 必须显式给足(缺项不猜) ── */
   const p = ctx.payload as BreedTamePayload;
   const op = strField(p.op);
   if (op === null || !TAME_OPS.includes(op)) {
@@ -372,41 +348,38 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   if (petId === null) {
     return { ok: false, kind: 'INVALID', reason: '需要 petId(非空字符串)' };
   }
-  /* 房间身份只从 `state` 取(ActionContext 没有 roomId,见文件头)。 */
+  /* 房间身份只从 `state` 取(ActionContext 没有 roomId)。 */
   const roomId = ctx.state.roomId;
-  const pets = roomPetsOf(roomId);
-  const pet = pets.get(petId);
+  /* 只读查:没有记录 ⇒ null(**不** materialize 空登记)。 */
+  const slot: PetSlot | null = petSlotOf(roomId, petId);
 
   /* ── 2b ★ WS-FND-119「送进牧场」:写 `roomSystemsState.ranchPets`(生产里的**唯一**入口) ──
    *
-   * 修前实测:`WorldSim.setRanchPets` 在 `server/**` 内**零调用**,唯一调用方是
-   * `tests/**` ⇒ 生产里 `ranchPets` 恒空 ⇒ `settleRanchIfDayChanged` 每慢帧**空跑**
-   * (牧场没有产出、槽里有没有饲料都一样),而全部校验是绿的。
-   * ⇒ 本分支就是那一口的真实路径:判定在 `systems/intake.ts`(`addPetToRanch`),
-   *   世界写入仍是宿主的 `setRanchPets`(本文件不 import 模拟层)。
-   *
    * 前置(任何一条不过 ⇒ 零副作用,名单一位不动):
-   *   · 有记录、**主人是本人**、好感达标(与驯服共用 `AFFECTION_REQUIRED`);
-   *   · 物种必须进得了牧场(手册 529 只写云朵绵羊与水豚 ⇒ `ranch.ts` 的登记表说了算);
-   *   · 宿主必须有圈养名单的读 + 写口(缺 ⇒ `NOT_IMPLEMENTED`,不假装送成了)。
+   *   · 有记录、**主人是本人**、亲密度达标(与驯服共用 `AFFECTION_REQUIRED`);
+   *   · 宿主必须有圈养名单的读 + 写口(缺 ⇒ `NOT_IMPLEMENTED`,不假装送成了);
+   *   · 物种必须进得了牧场(`systems/intake.ts` 的 `RANCH_PRODUCE_BY_SPECIES` 说了算);
+   *   · `taming.ts` 的 `sendToRanch` 判「已驯化」与圈养上限(`RANCH_CAPACITY`)。
    *
-   * 亲和度换算只用**既有常量**:`affection / AFFECTION_REQUIRED` 钳到 0..1
-   * (达标即 1.0 ≥ `RANCH_AFFINITY_MIN`,未达标的分支上面已经拒掉)—— 不新造阈值。
+   * ★ 顺序是判据的一部分:物种拒绝(intake)排在驯化拒绝(sendToRanch)之**前**,
+   *   否则花栗鼠会先被「还没驯化」拒掉,拿到的理由就不再是「不进牧场」那条。
+   *   亲和度换算只用既有常量:`affection / AFFECTION_REQUIRED` 钳到 0..1
+   *   (达标即 1.0 ≥ `RANCH_AFFINITY_MIN`,未达标的分支上面已经拒掉)。
    */
   if (op === TameOp.RANCH) {
-    if (pet === undefined) {
+    if (slot === null) {
       return { ok: false, kind: 'INVALID', reason: `宠物 ${petId} 没有记录 ⇒ 先投喂(FEED)、再驯服(TAME)` };
     }
-    if (pet.ownerId !== ctx.actorId) {
+    if (slot.ownerId !== ctx.actorId) {
       return {
         ok: false, kind: 'INVALID',
-        reason: `宠物 ${petId} 的主人不是 ${ctx.actorId}(实为 ${pet.ownerId ?? '无主'})⇒ 不能送别人的宠物进牧场`,
+        reason: `宠物 ${petId} 的主人不是 ${ctx.actorId}(实为 ${slot.ownerId ?? '无主'})⇒ 不能送别人的宠物进牧场`,
       };
     }
-    if (pet.affection < AFFECTION_REQUIRED) {
+    if (slot.bond < AFFECTION_REQUIRED) {
       return {
         ok: false, kind: 'INVALID',
-        reason: `好感 ${pet.affection}/${AFFECTION_REQUIRED} 未达标 ⇒ 还没养熟,不进牧场`,
+        reason: `好感 ${slot.bond}/${AFFECTION_REQUIRED} 未达标 ⇒ 还没养熟,不进牧场`,
       };
     }
     const port = roomSystemsPortOf(ctx.host);
@@ -418,22 +391,35 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
         reason: '宿主没有圈养名单写口(`setRanchPets` / `ranchPets`)⇒ 没有牧场可送(零副作用)',
       };
     }
-    const affinity = Math.min(1, Math.max(0, pet.affection / AFFECTION_REQUIRED));
-    const merged = addPetToRanch(port.ranchPets(), { petId, speciesId: pet.mobId, affinity });
+    const affinity = Math.min(1, Math.max(0, slot.bond / AFFECTION_REQUIRED));
+    const merged = addPetToRanch(port.ranchPets(), { petId, speciesId: slot.record.mobId, affinity });
     if (!merged.ok) {
       return { ok: false, kind: 'INVALID', reason: `送不进牧场:${merged.reason}` };
+    }
+    /* 在圈标记 = 本模块的权威(`PetRecord.inRanch`),圈养上限也在那里判。
+       失败 ⇒ 名单一个字都没写(merged 是纯函数算出来的新数组)。 */
+    const inRanch = sendToRanch(
+      petsOfPlayer(roomId, ctx.actorId).map((s) => s.record),
+      slot.record,
+    );
+    if (!inRanch) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `宠物 ${petId} 进不了圈:还没驯化(该物种的食物 ${slot.record.fedCount}/${slot.record.requiredFeeds})或牧场已满(${RANCH_CAPACITY})`,
+      };
     }
     port.setRanchPets(merged.next);
     return {
       ok: true, kind: 'OK',
       effect: {
-        op, petId, mobId: pet.mobId, affinity,
+        op, petId, mobId: slot.record.mobId, affinity,
         ranchPets: merged.next.length,
         note: '已进牧场:慢帧跨日时按 ranch.ts 的「自动进食 + 每日产出」结算(见 world_sim 的 settleRanchIfDayChanged)',
       },
     };
   }
-  /* ── 3a 投喂:扣 1 件 → 好感 +1 ── */
+
+  /* ── 3a 投喂:扣 1 件 → 亲密度 +1(物种食物另算驯化进度) ── */
   if (op === TameOp.FEED) {
     const itemId = numField(p.itemId);
     if (itemId === null || !Number.isInteger(itemId)) {
@@ -443,7 +429,7 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
       return { ok: false, kind: 'INVALID', reason: `物品 ${itemId} 不在冻结内容表里` };
     }
     const mobId = strField(p.mobId);
-    if (pet === undefined) {
+    if (slot === null) {
       /* 首次投喂即「登记」:没有物种就无从判断它是否可驯服 ⇒ 显式要求。 */
       if (mobId === null) {
         return {
@@ -451,32 +437,54 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
           reason: `宠物 ${petId} 还没有记录 ⇒ 首次投喂必须带 mobId`,
         };
       }
-      if (!TAMEABLE_MOB_IDS.has(mobId)) {
+      if (!TAMEABLE_MOB_IDS.has(mobSpeciesId(mobId))) {
         return {
           ok: false, kind: 'INVALID',
           reason: `${mobId} 不是可驯服的生物(内容层 tameableMobs 名单里没有)`,
         };
       }
     } else {
-      if (mobId !== null && mobId !== pet.mobId) {
+      if (mobId !== null && mobSpeciesId(mobId) !== slot.record.mobId) {
         return {
           ok: false, kind: 'INVALID',
-          reason: `宠物 ${petId} 的物种已是 ${pet.mobId} ⇒ 不能按 ${mobId} 投喂`,
+          reason: `宠物 ${petId} 的物种已是 ${slot.record.mobId} ⇒ 不能按 ${mobId} 投喂`,
         };
       }
-      if (pet.ownerId !== null && pet.ownerId !== ctx.actorId) {
+      if (slot.ownerId !== null && slot.ownerId !== ctx.actorId) {
         return {
           ok: false, kind: 'INVALID',
-          reason: `宠物 ${petId} 已是 ${pet.ownerId} 的 ⇒ 别人不能投喂`,
+          reason: `宠物 ${petId} 已是 ${slot.ownerId} 的 ⇒ 别人不能投喂`,
         };
       }
     }
-    /* ★ 按件权威读口(审计 P1):能投喂的只有**背包里真的有的那一件**。
-       `itemId` 是报文里自报的,总量守恒挡不住「拿别的道具当 `itemId` 投喂」。
-       ⚠️ 缺读口时**退回**下面那条 `applyInventory` 总量守恒路径,而不是把投喂整体关掉:
-       生产路径的 `ctx` 一定带读口(`room.ts` 的 `actionContextFor` 无条件绑定
-       `itemCountOf` / `itemIdsOf`)⇒ 这条 fallback 只可能被**手搓 ctx 的桩**走到
-       (见 `tests/WS-FND-41` 的 `makeCtx`),客户端触不到。 */
+    /* ★ 驯养前置(负对照):`createPetRecord` 是**唯一**判定 ——
+       行为类别不是 TAMEABLE / MOUNT / PASSIVE_UNKILLABLE 的物种返回 null ⇒ 这里拒绝,
+       且**不**留下任何记录(FEED 是「首次登记」的唯一入口)。 */
+    const base: PetRecord | null = slot === null
+      ? createPetRecord(mobSpeciesId(mobId as string), 0)
+      : slot.record;
+    if (base === null) {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `${mobId} 不可驯养(createPetRecord 拒绝:行为类别不是 TAMEABLE/MOUNT/PASSIVE_UNKILLABLE)`,
+      };
+    }
+    /* ★ 喂食在**副本**上试算:任何一条不过 ⇒ 容器里一字未改(半步事务的地基)。
+     * 本模块的三种结论各有出处:
+     *   ok(该物种自己的食物)⇒ stage/fedCount 前进(驯化口径)
+     *   wrong_item          ⇒ **接受**这一口(亲密度 +1),但不推进驯化
+     *   already_tamed       ⇒ 同样接受(只补 lastProduceAt)
+     */
+    const next: PetRecord = { ...base };
+    const fed = feedPet(next, itemId);
+    if (!fed.ok && fed.reason !== 'wrong_item' && fed.reason !== 'already_tamed') {
+      return {
+        ok: false, kind: 'INVALID',
+        reason: `宠物 ${petId} 这一口喂不进去(${fed.reason})`,
+      };
+    }
+    /* ★ 按件权威读口:能投喂的只有**背包里真的有的那一件**。缺读口时退回下面的
+       总量守恒路径(生产路径的 `ctx` 一定带读口;这条 fallback 只可能被手搓桩走到)。 */
     const owned = ownedItemCount(ctx, itemId);
     if (owned !== null && owned < 1) {
       return {
@@ -484,7 +492,7 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
         reason: `背包里没有可投喂的 ${itemId}(服务端账面 ${owned} 件)⇒ 好感未变`,
       };
     }
-    /* 唯一的失败写入点。**先扣、再改宠物**:扣失败 ⇒ 宠物状态原封不动。 */
+    /* 唯一的失败写入点。**先扣、再提交容器**:扣失败 ⇒ 容器原封不动。 */
     const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId, delta: -1 }] });
     if (!spend.allowed) {
       return {
@@ -492,44 +500,59 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
         reason: `背包里没有可投喂的 ${itemId}(${spend.rejectCode ?? '被拒'})⇒ 好感未变`,
       };
     }
-    const entry: PetEntry = pet ?? { petId, mobId: mobId as string, ownerId: null, affection: 0, feeds: 0 };
-    entry.affection += 1;
-    entry.feeds += 1;
-    if (pet === undefined) pets.set(petId, entry);
+    const placed: PetSlot = slot ?? { petId, ownerId: null, bond: 0, record: base };
+    placed.record = next;
+    placed.bond += 1;
+    /* 首次投喂才真的落盘(`putPetSlot` 是容器的唯一写口;旧格会被摘掉)。 */
+    putPetSlot(roomId, placed);
     return {
       ok: true, kind: 'OK',
       effect: {
-        op, petId, mobId: entry.mobId, itemId,
-        affection: entry.affection,
-        feeds: entry.feeds,
+        op, petId, mobId: placed.record.mobId, itemId,
+        affection: placed.bond,
+        feeds: placed.bond,
         required: AFFECTION_REQUIRED,
-        tamed: entry.ownerId !== null,
+        tamed: placed.ownerId !== null,
+        /* 这一口有没有推进**驯化**(与亲密度是两件事,见文件头「两个计数器」)。 */
+        stage: placed.record.stage,
+        fedCount: placed.record.fedCount,
+        requiredFeeds: placed.record.requiredFeeds,
       },
     };
   }
 
-  /* ── 3b 驯服:好感达标 + 无主 ⇒ 记下这唯一的主人 ── */
+  /* ── 3b 驯服:亲密度达标 + 无主 ⇒ 记下这唯一的主人 ── */
   if (op === TameOp.TAME) {
-    if (pet === undefined) {
+    if (slot === null) {
       return { ok: false, kind: 'INVALID', reason: `宠物 ${petId} 没有记录 ⇒ 先投喂(FEED)` };
     }
-    if (pet.ownerId !== null) {
+    if (slot.ownerId !== null) {
       /* ★「同一只宠物只能有一个主人」:第二次驯服**明确拒绝**,不静默改成新主人。 */
       return {
         ok: false, kind: 'INVALID',
-        reason: `宠物 ${petId} 已是 ${pet.ownerId} 的 ⇒ 一只宠物只能有一个主人`,
+        reason: `宠物 ${petId} 已是 ${slot.ownerId} 的 ⇒ 一只宠物只能有一个主人`,
       };
     }
-    if (pet.affection < AFFECTION_REQUIRED) {
+    if (slot.bond < AFFECTION_REQUIRED) {
       return {
         ok: false, kind: 'INVALID',
-        reason: `宠物 ${petId} 好感 ${pet.affection}/${AFFECTION_REQUIRED} 未达标 ⇒ 不能驯服`,
+        reason: `宠物 ${petId} 好感 ${slot.bond}/${AFFECTION_REQUIRED} 未达标 ⇒ 不能驯服`,
       };
     }
-    pet.ownerId = ctx.actorId;
+    slot.ownerId = ctx.actorId;
+    /* 换主人 = 搬格(唯一写口):槽里同时改 ownerId 与键,靠 `putPetSlot` 保证一致。 */
+    putPetSlot(roomId, slot);
+    /* 认主那一刻宠物开始跟随 —— 三指令的第一条。未驯化(只有亲密度没吃到物种
+       食物)的宠物 `stage` 仍是 WILD ⇒ `commandPet` 返回 false,如实回执。 */
+    const following = commandPet(slot.record, TameCommand.FOLLOW);
     return {
       ok: true, kind: 'OK',
-      effect: { op, petId, mobId: pet.mobId, ownerId: ctx.actorId, affection: pet.affection },
+      effect: {
+        op, petId, mobId: slot.record.mobId, ownerId: ctx.actorId,
+        affection: slot.bond,
+        command: slot.record.command,
+        following,
+      },
     };
   }
 
@@ -541,24 +564,24 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   if (mateId === petId) {
     return { ok: false, kind: 'INVALID', reason: `同一只宠物(${petId})不能与自己繁殖` };
   }
-  if (pet === undefined) {
+  if (slot === null) {
     return { ok: false, kind: 'INVALID', reason: `宠物 ${petId} 没有记录` };
   }
-  const mate = pets.get(mateId);
-  if (mate === undefined) {
+  const mate = petSlotOf(roomId, mateId);
+  if (mate === null) {
     return { ok: false, kind: 'INVALID', reason: `宠物 ${mateId} 没有记录` };
   }
-  for (const x of [pet, mate]) {
+  for (const x of [slot, mate]) {
     if (x.ownerId !== ctx.actorId) {
       return {
         ok: false, kind: 'INVALID',
         reason: `宠物 ${x.petId} 的主人不是 ${ctx.actorId}(实为 ${x.ownerId ?? '无主'})⇒ 不能代它繁殖`,
       };
     }
-    if (x.affection < AFFECTION_REQUIRED) {
+    if (x.bond < AFFECTION_REQUIRED) {
       return {
         ok: false, kind: 'INVALID',
-        reason: `宠物 ${x.petId} 好感 ${x.affection}/${AFFECTION_REQUIRED} 未达标`,
+        reason: `宠物 ${x.petId} 好感 ${x.bond}/${AFFECTION_REQUIRED} 未达标`,
       };
     }
   }
@@ -569,7 +592,7 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     ownerId: ctx.actorId,
     petId,
     mateId,
-    parentsMobIds: [pet.mobId, mate.mobId],
+    parentsMobIds: [slot.record.mobId, mate.record.mobId],
     seq: breedSeq,
   };
   const log = roomBreedsOf(roomId);
@@ -579,7 +602,7 @@ export const breedTame: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     ok: true, kind: 'OK',
     effect: {
       op, recordId: record.recordId, petId, mateId,
-      mobId: pet.mobId, mateMobId: mate.mobId,
+      mobId: slot.record.mobId, mateMobId: mate.record.mobId,
       breedRecords: log.length,
       /* 回执里**显式**说清这次成功没产出东西,免得读回执的人以为漏了。 */
       note: '只登记繁殖记录:不产出物品、不生成生物实体(那是别处的权威)',

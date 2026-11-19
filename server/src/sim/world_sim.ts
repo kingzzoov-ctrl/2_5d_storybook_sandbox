@@ -346,6 +346,11 @@ import {
    可达性/孤儿门禁只认**生产**引用 —— 只被测试引用的新模块会被判成「未登记孤儿」。
    ⚠️ 本模块**不做任何运行时动作**(纯数据 + 纯函数),import 它不会把「未接线」变成「接线」。 */
 import { COMBAT_WIRING_LEDGER, type CombatWiringRow } from '../combat/wiring_ledger.ts';
+/* ★ WS-FND-147:世界侧**跨层欠账台账**(z 权威 / 元素表 / 两个待平衡数值 / gz<0 死代码)。
+   为什么由世界侧 import:与上一行 `combat_wiring_ledger` 同一条纪律 —— 账本模块只被测试引用
+   会被孤儿门禁判红,而它回答的正是「本世界跑的这套东西里哪些还是占位」。
+   ⚠️ 纯数据 + 纯函数,**不改变任何结算**(见该文件头「这个文件不做什么」)。 */
+import { WORLD_DEBTS, type WorldDebtRow } from './world_debts.ts';
 import { statsAtLevel } from '../../../shared/types/entities.ts';
 import {
   createDowned,
@@ -1124,6 +1129,18 @@ export class WorldSim {
    */
   private readonly shieldOn = new Set<string>();
   private readonly jumpReadyFrame = new Map<string, number>();
+  /**
+   * ★ WS-FND-147:玩家 → **上一次报文之后本方法观察到的权威 z**。
+   *
+   * 它只服务一件事:分辨「`b.z` 变了是因为**服务端**动了它(物理积分 / 落地 / 蹦床 /
+   * 落穴倍率 / 地形台阶)、还是因为**我们自己**刚按客户端声明写过」。
+   * 前者 ⇒ 本条报文里的 z **不许**覆盖权威(否则服务端的高度变化会被回拖一个 RTT,
+   * 见 `applyPlayerMove` 的 z 段);后者 ⇒ 沿用旧口径写声明值。
+   *
+   * 初值在 `addPlayer` 里落(刚体出生 z = 0)⇒ 第一名玩家的第一条报文就有基线,
+   * 不会出现「基线缺失 ⇒ 回拖窗口恰好落在开局」。
+   */
+  private readonly zSeen = new Map<string, number>();
   /** 起跳冷却(快帧数):24 帧 = 1.2s(20Hz 快帧,不引挂钟)。
    *
    * ⚠️ 必须**大于一次跳跃的滞空帧数**(`JUMP_VZ ≈ 6.0`、`GRAVITY = 18` ⇒
@@ -3498,6 +3515,22 @@ export class WorldSim {
     return COMBAT_WIRING_LEDGER;
   }
 
+  /**
+   * ★ WS-FND-147:世界侧**跨层欠账台账**(只读快照)。
+   *
+   * 与上面 `combatWiringLedger()` 同一条纪律,由世界侧读它有两个**真实**理由:
+   * ```text
+   * 一 可达性:账本模块只被测试引用会被孤儿门禁判成「未登记孤儿」;
+   * 二 可观测:断言要从**生产入口**也读得到(「台账存在」与「本世界读的是这份台账」
+   *    是两件事 —— 后者才是接线)。
+   * ```
+   * ⚠️ 它**不是**玩法状态,也不改变任何结算:纯数据 + 纯函数快照,
+   *    五条账的口径与 owner 都在 `sim/world_debts.ts`(判据 `tests/WS-FND-147`)。
+   */
+  worldDebtLedger(): readonly WorldDebtRow[] {
+    return WORLD_DEBTS;
+  }
+
   private wearingOf(playerId: string): readonly number[] {
     /* `?? []` 不是洁癖:档案里 `wearing` 可能是 `undefined`(外部构造),
        直接返回会让调用方在 `[...wearing]` 处抛 `TypeError: wearing is not iterable`。
@@ -4220,6 +4253,10 @@ export class WorldSim {
     const hadPlayer = this.playerIds.has(id);
     const hadBody = this.physics.bodies.has(id);
     this.physics.spawn(id, { x, y, z: 0 });
+    /* ★ WS-FND-147:`zSeen` 的**基线**。刚体出生即 z=0 ⇒ 必须在这里落基线,
+       否则「服务端动过 z 没有」在**第一条报文**上无从判断,而那个窗口恰好是开局
+       (玩家一落地就会被回拖)。重入(spawn 覆盖)同样重置:那时 z 又回到 0。 */
+    this.zSeen.set(id, 0);
     /* ★ 格位唯一(WS-FND-130 P2):出生 / 传送的落点与**别的**刚体同格时**记账**。
        只记不挪 —— `occupantsAt` 是查询口,「同格就强制挪开」属玩法裁决,这里不替它决定
        (口径见 `spawnCellClash` 的 docblock)。 */
@@ -4279,6 +4316,15 @@ export class WorldSim {
    * `VitalsSystem.downed`(见方法内注释)。
    */
   lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | 'STUNNED' | null = null;
+  /**
+   * ★ WS-FND-147:最近一次 `applyPlayerMove` 对 **z 的裁决**(`null` = 报文没带 z)。
+   *
+   * 为什么要有它:`applyPlayerMove` 返回的是 `boolean`(「写没写」),而 z 这条有三种
+   * 结局 —— 写声明值 / 拒写并保留权威 / 根本没带 z。只看 `playerPosition()` 的数值,
+   * 在「客户端说的恰好等于权威」时**分不出**前两种 ⇒ 断言会退化成同义反复。
+   * 有了 `source`,FND147-1(空中不许被回拖)与 FND147-2(静止仍接受声明)才不会互相抵消。
+   */
+  lastZAuthority: { declared: number; applied: number; source: 'CLIENT' | 'SERVER' } | null = null;
   /**
    * **玩家移动的权威写入点**(task-58)。把一次已获准的移动写进 `physics.bodies`。
    *
@@ -4344,6 +4390,24 @@ export class WorldSim {
    * 为什么算**规则**而不是反作弊(与上面那一段不冲突):它判的是
    * 「**这个人当前有没有行动权**」,不是「这次位移合不合法」—— 与
    * `checkMove` 的量纲无关,故不构成第二份实现。
+   *
+   * ## ★ z 由谁拥有(WS-FND-147:不再「照抄客户端声明」)
+   *
+   * 修前本方法无条件 `b.z = z`。而 `physics/world.ts` 的**物理积分每帧都会改 `b.z`**
+   * (重力 / 落地 / 蹦床 / 落穴倍率 / 地形台阶),房间又在同一处把**权威 z 读回**投影给
+   * 客户端 ⇒ 服务端这一次高度变化会被客户端**下一包里的旧 z** 覆盖,最多被回拖一个 RTT
+   * (跳起来 0.2 秒、服务端已到 z ≈ 0.84,客户端那一包还报着 z = 0 ⇒ 刚体被写回 0,人像被按回地面)。
+   *
+   * 现在按**谁拥有 z** 分段判(判据 `tests/WS-FND-147` FND147-1..5):
+   * ```text
+   * 空中(b.vz !== 0)或 服务端自上次报文以来动过 b.z ⇒ z 归服务端:声明值**不写入**
+   *                                                    `lastZAuthority.source = 'SERVER'`
+   * 静止且服务端没动过                             ⇒ 沿用旧口径写声明值('CLIENT')
+   * ```
+   * 为什么**保留**第二段(而不是一律服务端说了算):`tests/WS-FND-49` 的 FND49-3
+   * (「带 z 的移动必须被接受」)与 FND49-5(「省略 z 不改高度」)已把这两条钉成**对外契约**,
+   * 一并改属契约变更、要 owner 裁决(`sim/world_debts.ts` 的 D1 登记了这段剩余口径)。
+   * ⇒ 本批只切断**回拖**那一段:既不静默放宽,也不静默收紧。
    */
   /* ══════════════════ 击退(玩家受伤后的位移)══════════════════ */
 
@@ -4743,6 +4807,9 @@ export class WorldSim {
 
   applyPlayerMove(playerId: string, x: number, y: number, z?: number): boolean {
     this.lastMoveRejection = null;
+    /* 与 `lastMoveRejection` 同一条纪律:每次进入都清。省略 z 的报文 ⇒ 保持 `null`
+       (「这条报文没对高度表态」与「裁决结果恰好等于权威值」在断言里必须分得开)。 */
+    this.lastZAuthority = null;
     /* 闸 0:身份。`physics.bodies` 里玩家与生物**混在一起**(`addPlayer` 与
        `addMob` 都调 `physics.spawn`)⇒ 不查这一条就能用一只生物冒充玩家改坐标。
        判据是「**是不是玩家**」,与「位移合不合法」正交(不构成反作弊的第二份实现)。 */
@@ -4799,7 +4866,24 @@ export class WorldSim {
     }
     b.x = x;
     b.y = y;
-    if (z !== undefined) b.z = z;
+    /* ★ WS-FND-147:z 的**服务端权威判定**(修前这里是 `if (z !== undefined) b.z = z;`)。
+       两段判,依据与代价都写在方法 docblock 的「z 由谁拥有」一节:
+       - 空中(`vz !== 0`)或服务端自上次报文以来动过 `b.z` ⇒ **不写**声明值
+         (否则物理刚积分出来的高度会被客户端旧报文回拖一个 RTT);
+       - 静止且权威没变 ⇒ 照旧写声明值(WS-FND-49 的 FND49-3/FND49-5 契约)。
+       ⚠️ 不做成「一律拒绝」:那会静默撕掉两条既有对外契约,属 owner 裁决范围。 */
+    if (z !== undefined) {
+      const last = this.zSeen.get(playerId);
+      const serverOwnsZ = b.vz !== 0 || (last !== undefined && b.z !== last);
+      if (serverOwnsZ) {
+        this.lastZAuthority = { declared: z, applied: b.z, source: 'SERVER' };
+      } else {
+        b.z = z;
+        this.lastZAuthority = { declared: z, applied: b.z, source: 'CLIENT' };
+      }
+      /* 基线**在写入之后**取:下次进来时 `b.z !== last` 就只可能是物理动过它。 */
+      this.zSeen.set(playerId, b.z);
+    }
     return true;
   }
 

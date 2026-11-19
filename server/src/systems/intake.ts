@@ -38,25 +38,33 @@
 import { ITEM_LIST } from '../../../shared/constants/items.ts';
 import type { SortFilter } from './greenhouse.ts';
 
-/* ═════════════════ 0. P1 登记:本接线**不使用** `mobs/taming.ts` ═════════════════ */
+/* ════════ 0. 定案(2026-11-19):宠物容器的唯一事实源在 `mobs/taming.ts`;本文件只判「谁能进圈」 ════════ */
 
 /**
- * 第六轮 P1:`server/src/mobs/taming.ts` 的六个导出(`feedPet` / `tickRanch` /
- * `deployPet` …)全仓 0 import,它是 `scripts/verify.ts` 的 `UNREACHABLE_EXEMPT`
- * 成员。**本轮的接线没有用它,故白名单项保持原样**(不移除、不改 `verify.ts` ——
- * 那不在本线写域)。登记理由:
+ * 第六轮 P1 的登记**原文**是:`server/src/mobs/taming.ts` 的六个导出(`feedPet` /
+ * `tickRanch` / `deployPet` ...)**全仓 0 import**,而它是 `scripts/verify.ts` 的
+ * `UNREACHABLE_EXEMPT` 成员。
+ *
+ * ⇒ 那句「全仓 0 import」**现在已作废**(原文保留,只为让后来的人对得上旧台账):
+ *   本轮定案 **接上** —— 容器搬进 `mobs/taming.ts` 第 6 节(**按玩家存**:
+ *   `roomId → ownerId → petId`),生产唯一入口是 `net/actions/breed_tame.ts` 的
+ *   `BREED_TAME`(`FEED` → `createPetRecord` + `feedPet`;`TAME` → `commandPet`;
+ *   `RANCH` → `sendToRanch`)。两处白名单(`verify.ts` 的 `UNREACHABLE_EXEMPT` 与
+ *   `scripts/orphan-audit.ts` 的 `ORPHAN_KNOWN`)已**同时**摘除 —— 否则「文件已可达」
+ *   与「登记说它不可达」会互相矛盾(`tests/WS-FND-90` 的登记↔实测互校钉着这条)。
+ *
+ * 本文件与它的分工(**这一条不变,也不该变**):
  *
  * ```
- * 1 圈养名单缺的不是「taming.ts 的实现」,而是「谁把在圈事实写进世界」;
- *   本轮补的正是那一步(BREED_TAME 的 RANCH 子操作 → setRanchPets)。
- * 2 它的容器是按玩家存的(没有世界/房间键),而 ranchPets 要的是**每房间**的
- *   一份投影 ⇒ 直接搬过来还得再造一层房间键,那是一份新设计,不是接线。
- * 3 一旦 import 它,UNREACHABLE_EXEMPT 就变成**陈旧条目**(门禁会报「白名单
- *   里的文件现在可达」),而修那条要动 scripts/verify.ts 与 README.md。
+ * 权威(唯一)   taming.ts 的容器:在圈标记 `PetRecord.inRanch` + 归属 + 亲密度
+ * 投影           WorldSim.ranchPets(RanchAnimal[]);`RANCH` 子操作把在圈宠物合进名单
+ * 判定(本文件) 谁能进牧场 / 亲和下限 / 同 petId 去重 —— 纯函数、零 IO
  * ```
  *
- * ⇒ 它仍然是「实现存在 + 宿主缺失」。要真正接上,需要 owner 裁决「宠物容器住哪」
- *   (房间侧一份?世界侧一份?),改完再把白名单项一并摘掉。
+ * ⚠️ 本文件**不 import** `mobs/taming.ts`:systems 层只吃 `shared/**` 与自身
+ *   (理由见下面 `roomSystemsPortOf` 的注释)。故 `RanchIntakePet` 仍是**结构化**
+ *   入参(`petId` / `speciesId` / `affinity`),由动作层从容器里取出来传进来 ——
+ *   这是「一份事实 + 一次投影」,不是第二份容器。
  */
 import { RANCH_AFFINITY_MIN, RANCH_PRODUCE_BY_SPECIES, type RanchAnimal } from './ranch.ts';
 

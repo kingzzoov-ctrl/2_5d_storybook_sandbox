@@ -138,10 +138,14 @@ export const ORPHAN_KNOWN = new Map<string, string>([
    *   ⇒ 与「理由文本里的错误不会红」同族:**登记的形态本身也是要审计的对象**。
    *   已回报 Lead(见 task-84 报告),但**修复不在我的写域**(`verify.ts` 是 Lead 的)。 */
   ['server/src/build/wiring_view.ts', 'WS-08 四色电路暗线视图(**实现测试在 WS-03,非 WS-08**)。服务端侧**根本不该接**(纯视图计算、非世界状态;挂 tick = 每帧丢弃的假可达);客户端侧卡点是**宿主不存在** —— 缺 WireView 下发报文(协议层 tiles/Tile/grid 实测各 0 次)+ 铺线 UI 面板,且跨层守卫禁止 client 相对说明符落到 server 之下(task-81 注入实测可拦)'],
-  /* ⚠️ 2026-11-14 顺带补实测细节(归属不变,仍是 orphan):
-     旧文案「待交互系统调用」方向对但太笼统。实测卡点是**两样都不存在** ——
-     宠物容器 + 驯服交互;而 `tameItem` 字段**有**消费者(旧措辞「无人消费」已订正)。 */
-  ['server/src/mobs/taming.ts', 'WS-04 牧场驯服;等**宠物容器 + 驯服交互**(feedPet 零生产调用;tameItem 字段**有**消费者,旧措辞「无人消费」已订正)'],
+  /* ═══ ★ 2026-11-19:`server/src/mobs/taming.ts` **已可达 ⇒ 摘除** ═══
+    摘除方式:宠物容器搬进 `mobs/taming.ts` 第 6 节(**按玩家存**:`roomId → ownerId → petId`),
+    生产入口是 `net/actions/breed_tame.ts` 的 `BREED_TAME`(`createPetRecord` / `feedPet` /
+    `commandPet` / `sendToRanch` / `forgetRoomPets`)⇒ 它有了**生产 importer**,不再是孤儿。
+    ⚠️ 两处白名单必须同步摘(`verify.ts` 的 `UNREACHABLE_EXEMPT` 已摘):否则
+    `verify.ts` 的 `orphan ⊆ 可达性白名单` 与「登记 ↔ 实测」互校会互相矛盾
+    (`tests/WS-FND-90` 钉着 登记 == 实测 + 死文件)。旧措辞「等宠物容器 + 驯服交互」
+    正是那种**事实一变就继续豁免**的笼统理由 —— 与 `wiring_view.ts` 那条同一教训。 */
   /* ★ 2026-11-14(task-83 选乙):`client/src/net/prediction.ts` **已从本表摘除**。
      旧理由写的是「等客户端网络层 —— 服务端侧不该接」。前半句早就不成立
      (网络层在岗,卡的是**输入端**),而输入端已补:见 `net/input.ts` +

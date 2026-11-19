@@ -383,6 +383,11 @@ export interface ClientEntryRow {
  * 第十轮补上的是最后四条 `wired`:`BREED_TAME` / `BUY_ITEM` /
  * `USE_ALCHEMY_FURNACE` / `PLACE_AUTOMATION`(键位 `net/action_binding.ts`
  * 的 `HOTBAR_KEYS`:1 / 2 / 3 / 4)。**修前它们是 `missing`**。
+ *
+ * ★ WS-FND-145:剩下的 8 条**全部**是房间管理类动作,裁决为「服务端已实现、客户端
+ *   **刻意不提供**」—— 状态仍是 `missing`(它描述的是"玩家按不到"这个事实),
+ *   但每一条都**必须**在 `CLIENT_ENTRY_HOLDS` 里有 `why` / `unblock` / `today` 三段,
+ *   否则 `validateClientEntryLedger()` 当场红。台账因此没有"没有说明的 missing"。
  */
 export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
   {
@@ -457,50 +462,185 @@ export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
     reason: '★ 第十轮补:键盘走**播种形态**(只给 itemId);组件形态(kind)由按钮路径给 ——'
       + '客户端不持有 wiring 的 kind 名单(见 CLIENT_ENTRY_GAPS 的 lane 行)',
   },
+  /* ── ★ WS-FND-145:剩下的 8 条**全部**裁决为「服务端已实现、客户端刻意不提供」──
+     逐条的「为什么」与「解锁它的那一件事」在 `CLIENT_ENTRY_HOLDS`(同一份数据;
+     别在这里再写一遍 —— 两处写同一段理由,迟早漂成两句不同的话)。 */
   {
     action: 'SET_ROOM_ACCESS', serverPath: 'net/room.ts RoomRuntime.setAccess', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '房间管理动作(密码/容量):需要一个房主面板(表单 + 回执展示),而客户端现在'
-      + '**没有任何房间管理 UI**。硬接一个键会把「改密码」变成一次误触 ⇒ 登记,'
-      + '出路:与 KICK_MEMBER / SET_MEMBER_ROLE 一起做成「房间面板」一件独立任务。',
+    reason: '刻意不提供(见 CLIENT_ENTRY_HOLDS):改口令/容量要一个房主表单 + 口令输入口,'
+      + '而客户端**没有任何房间管理 UI** ⇒ 裸键 = 一次误触改掉全房访问。',
   },
   {
     action: 'SET_PARTY_MODE', serverPath: 'net/room.ts RoomRuntime.setPartyModeBy', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '赛前选模式(四选一)。`START_PARTY` 的 partyMode 只是**回声核对**,不设模式'
-      + ' ⇒ 客户端今天只能开「房间已选的模式」。出路:派对面板(模式列表 + 当前模式高亮)。',
+    reason: '刻意不提供:`V`(派对开局)只把**房间已选**的模式开成一局、它不设模式;'
+      + '四选一要选择器 + 权限位,而它影响全房(含正在跑的那一局)⇒ 不接裸键。',
   },
   {
     action: 'KICK_MEMBER', serverPath: 'net/room.ts RoomRuntime.kick', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '成员管理:要一份成员列表(玩家名 + 角色)才能安全地踢人,'
-      + '而客户端只有 `state.players`(位置/血量),没有角色列 ⇒ 一起进「房间面板」。',
+    reason: '刻意不提供:踢人不可逆,而快照里**没有成员角色**(`PlayerState` 无 role 字段)'
+      + ' ⇒ 凭猜出来的列表接键,最可能踢掉的是房主或你自己。',
   },
   {
     action: 'SET_MEMBER_ROLE', serverPath: 'net/room.ts RoomRuntime.setMemberRole', entry: 'missing',
-    status: ClientEntryStatus.MISSING, reason: '同 KICK_MEMBER:成员列表 + 角色下拉,属「房间面板」。',
+    status: ClientEntryStatus.MISSING,
+    reason: '刻意不提供:同 KICK_MEMBER —— `role` 是服务端权限位枚举,'
+      + '快照里没有这个字段 ⇒ 连"把谁改成什么"都表达不出来。',
   },
   {
     action: 'RESET_WORLD', serverPath: 'net/actions/reset_world.ts', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '破坏性动作,服务端要求**显式二次确认**(`confirm: true`)。客户端不给一个'
-      + '「确认对话框」就接键 = 一次误触重置世界 ⇒ 登记;出路:房间面板 + 二次确认。',
+    reason: '刻意不提供:不可逆,服务端要求 `confirm: true` 字面量(= 二次确认的机器形态);'
+      + '没有确认对话框就接键 = 一次误触重置世界。',
   },
   {
     action: 'CLOSE_ROOM', serverPath: 'net/room.ts RoomRuntime.close', entry: 'missing',
-    status: ClientEntryStatus.MISSING, reason: '同 RESET_WORLD(不可逆 + 需要确认对话框)。',
+    status: ClientEntryStatus.MISSING,
+    reason: '刻意不提供:不可逆(全房被踢)+ 服务端要权限位与显式请求;'
+      + '与 RESET_WORLD 同一条:没有确认对话框就不给键。',
   },
   {
     action: 'MODIFY_TOWN', serverPath: 'net/actions/modify_town.ts', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '要**选格子 + 输入名字/半径**(`radius` / `name` / `totemCell`),客户端没有'
-      + '任何拾取坐标的 UI 也没有文本输入口 ⇒ 登记;出路:城镇面板(点格取坐标)。',
+    reason: '刻意不提供:要 `radius` / `name` / `totemCell` 三个**自由输入**,'
+      + '客户端没有拾取坐标的 UI,也没有接到动作上的文本输入口。',
   },
   {
     action: 'WIRE_EDIT', serverPath: 'net/actions/wire_edit.ts', entry: 'missing',
     status: ClientEntryStatus.MISSING,
-    reason: '服务端**不下发线框数据**(`build/wiring_view.ts` 拿不到),客户端因此画不出'
-      + '任何一条已存在的导线 ⇒ 没有"编辑哪个方向"的可见对象。出路:先加 WireView 下发报文。',
+    reason: '刻意不提供:服务端**不下发线框数据** ⇒ 客户端画不出任何一条已存在的导线,'
+      + '没有"编辑哪一个方向"的可见对象。',
+  },
+];
+
+/* ══════════════ 2. 客户端「刻意不提供」的登记(★ WS-FND-145) ══════════════ */
+
+/**
+ * ## 为什么剩下的 8 条仍然写 `missing`,而不是硬接几个键
+ *
+ * 第十轮之后 `CLIENT_ENTRY_LEDGER` 里没有入口的 8 条**全是房间管理类**:
+ * ```
+ * SET_ROOM_ACCESS / SET_PARTY_MODE / KICK_MEMBER / SET_MEMBER_ROLE
+ * RESET_WORLD / CLOSE_ROOM / MODIFY_TOWN / WIRE_EDIT
+ * ```
+ * 它们的共同形态是:
+ * ```
+ * 服务端有执行层(dispatchAction 真的会做)
+ * 缺的不是"一行转发",而是它需要的那块 UI(表单 / 成员表 / 确认框 / 线框数据)
+ * 而这块 UI 缺席时,接一个裸键 = 一次误触改掉**整个房间**的状态(其中一半不可逆)
+ * ```
+ * ⇒ 本轮的裁决是**第二个选项**:不接键,登记为「服务端已实现、客户端**刻意不提供**」,
+ *   并把「为什么」「解锁它的那一件事」「玩家今天能做到哪一步」写成**可断言的数据**(本表)。
+ *
+ * ⚠️ 两条纪律,别弄反:
+ *   · `missing` 描述的是**玩家按不到**这件事本身,不是欠账清单 —— 所以不因为"登记了"
+ *     就改成 `wired`;
+ *   · 「登记」也**不等于**"什么都不做":`validateClientEntryHolds()` 要求每一条 `missing`
+ *     都在本表里,且 `why` / `unblock` / `today` 三段**全部非空** ⇒ 台账从此不可能出现
+ *     "一条 missing 没有任何说明"。反向也查:`wired` 的行**不许**还留在本表里。
+ *
+ * 判据:`tests/WS-FND-145-client-entry-rest.test.ts`(逐条;含负对照)。
+ */
+export const ClientHoldKind = {
+  /** 服务端已实现;客户端**刻意**不给键位/按钮(理由见 `why`)。 */
+  DELIBERATE: 'deliberate',
+} as const;
+export type ClientHoldKind = (typeof ClientHoldKind)[keyof typeof ClientHoldKind];
+
+/** 一条「刻意不提供」的登记。 */
+export interface ClientHoldRow {
+  /** 与 `CLIENT_ENTRY_LEDGER` 的 `action` **逐字**一致(那条必须是 `missing`)。 */
+  action: string;
+  /** 判定档位(今天只有「刻意不提供」一档 —— 接了线就该删掉这一行)。 */
+  kind: ClientHoldKind;
+  /** 为什么**刻意**不提供(不是"还没排期")。 */
+  why: string;
+  /** 解锁它的**那一件事**(一件独立任务;不是"以后再说")。 */
+  unblock: string;
+  /** 玩家**今天**能做到哪一步(做不到就如实写"做不到")。 */
+  today: string;
+}
+
+export const CLIENT_ENTRY_HOLDS: readonly ClientHoldRow[] = [
+  {
+    action: 'SET_ROOM_ACCESS',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '改访问模式是**房主表单**的一格:三选一 + 口令输入 + 回执回读,而客户端'
+      + '**没有任何房间管理 UI**,也没有口令输入口(唯一的文本框是背包/配方搜索,它只喂过滤)'
+      + '⇒ 接一个裸键就是"按一下改掉全房口令/容量",而状态条里**没有任何回读** ——'
+      + '玩家看不到改成了什么,只会把队友关在门外。',
+    unblock: '房间面板:访问模式单选 + 口令输入 + `effect.mode` 回读 + 权限位显示;'
+      + '与 KICK_MEMBER / SET_MEMBER_ROLE 同一件任务(共用成员表)。',
+    today: '做不到:口令/容量只能在**建房那一侧**定,客户端内改不了(如实写,不假装)。',
+  },
+  {
+    action: 'SET_PARTY_MODE',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '赛前选模式(四选一)。模式名客户端**有**(`ui/party_hud.ts` 走冻结层 `PARTY_MODES`),'
+      + '所以缺的不是名单而是**选择器 + 权限位**:这个字段影响**全房所有人**(包括正在跑的那一局),'
+      + '而一个裸键只能"轮到下一档"、没有任何确认 ⇒ 一次误触就把赛制改掉。'
+      + '`V`(`START_PARTY`)只把**房间已选**的模式开成一局,它不设模式。',
+    unblock: '派对面板:模式列表(名字来自 `PARTY_MODES`,不手抄)+ 当前档高亮 + 只给 OWNER/ADMIN;'
+      + '与房间面板同一件任务。',
+    today: '只能开**房间已选**的模式(`V`);"选模式"这一格做不到。',
+  },
+  {
+    action: 'KICK_MEMBER',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '踢人不可逆,而且要一份**带角色的成员表**(谁是 OWNER/ADMIN)才踢得安全;'
+      + '而快照的 `PlayerState` 只有 id/名字/位置/血量,**没有 role 字段** ⇒'
+      + '凭一份"猜出来的"列表接键,最可能踢掉的是房主或你自己。',
+    unblock: '先让快照下发成员角色(`PlayerState.role`),再做房间面板的成员表 + 踢人按钮。',
+    today: '做不到(客户端既没有成员角色,也没有踢人入口)。',
+  },
+  {
+    action: 'SET_MEMBER_ROLE',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '`role` 是服务端**权限位枚举**(`RoomRole`),而快照里没有这个字段 ⇒'
+      + '连"把谁改成什么"都表达不出来;在客户端硬编码一份角色名单又是第二份实现'
+      + '(服务端加一档,客户端会静默发一个不存在的值)。',
+    unblock: '同 KICK_MEMBER:成员表(数据来自快照)+ 角色下拉,而不是手抄的名单。',
+    today: '做不到。',
+  },
+  {
+    action: 'RESET_WORLD',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '不可逆。服务端要求 `confirm: true` **字面量**(`net/actions/reset_world.ts`),'
+      + '那正是"二次确认"的机器形态;客户端没有确认对话框,接一个裸键 = 一次误触'
+      + '把世界、存档与所有人的进度一起重置。',
+    unblock: '确认对话框(显示当前种子与新种子 + 明确的"重置"按钮),挂在房间面板里;'
+      + '先做面板,再做这一格。',
+    today: '做不到:没有确认对话框就不给键(PLAY.md 同一条)。',
+  },
+  {
+    action: 'CLOSE_ROOM',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '不可逆(房间关掉,所有人被踢)。`close()` 是**生命周期方法**(`onDispose` /'
+      + '`reapEvictions` 也会调),所以权限闸写在 `actions/admin.ts` 里、要求显式请求 ⇒'
+      + '没有确认对话框就接键,一次误触关掉全房的局。',
+    unblock: '同 RESET_WORLD:房间面板 + 二次确认 + 权限位显示。',
+    today: '做不到。',
+  },
+  {
+    action: 'MODIFY_TOWN',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '要三个**自由输入**:`radius`(整数)、`name`(文本)、`totemCell`(选一格或 `null` 清掉)。'
+      + '客户端没有拾取坐标的 UI,也没有接到动作上的文本输入口(搜索框只喂背包过滤)'
+      + '⇒ 三个字段里能给的只有"你脚下那格",半径与名字编不出来。',
+    unblock: '城镇面板:点格取 `totemCell` + 半径滑杆 + 名字输入(长度上限取冻结常量,不手抄)。',
+    today: '做不到(客户端既不能改城名/半径,也不能改图腾格)。',
+  },
+  {
+    action: 'WIRE_EDIT',
+    kind: ClientHoldKind.DELIBERATE,
+    why: '服务端**不下发线框数据** ⇒ 客户端拿不到任何一条已存在的导线(快照里没有这类字段),'
+      + '连"编辑哪一个方向"的对象都画不出来;而 `dir` / `color` / `channel` / `clear`'
+      + '四个键都是相对**已存在的那条线**才有意义的。',
+    unblock: '先让服务端下发 WireView(节点 / 方向 / 颜色 / 频道),再做接线面板 ——'
+      + '与 `PLACE_AUTOMATION` 的 `lane` 配置同一块 UI。',
+    today: '做不到(看不到已有导线 ⇒ 没有可编辑的对象)。',
   },
 ];
 
@@ -508,29 +648,51 @@ export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
  * **不是 `RoomAction` 的入口缺口** —— 同样如实登记,因为它们与上面同形
  * (服务端/世界侧有实现,客户端没有入口或只有一部分),而 `RoomAction` 那张表
  * 覆盖不到它们。
+ *
+ * ★ WS-FND-145:两条都补上 `kind` / `unblock` / `today` —— 与 `CLIENT_ENTRY_HOLDS`
+ *   同一套口径(「刻意不提供」也要写清**解锁它的那一件事**与**今天能做到哪一步**)。
  */
 export interface ClientEntryGap {
   /** 缺什么(人读的一句话)。 */
   what: string;
-  /** 现状 + 出路(必填且非空)。 */
+  /** 现状 + 为什么(必填且非空)。 */
   reason: string;
+  /** 判定档位(与 `CLIENT_ENTRY_HOLDS` 同一档)。 */
+  kind: ClientHoldKind;
+  /** 解锁它的**那一件事**。 */
+  unblock: string;
+  /** 玩家**今天**能做到哪一步。 */
+  today: string;
 }
 
 export const CLIENT_ENTRY_GAPS: readonly ClientEntryGap[] = [
   {
-    what: '急单(rush)开工:客户端**没有也不该有**专门入口',
-    reason: '急单由**世界侧**自动开工(`world_sim.tickPartyStep` → `startRushRun`,'
-      + '条件:食堂建成 + 三工位在场 + 有人站在工位格上,见 `coop/rush_actions.ts` 的'
-      + 'START 行),客户端能做的是**把工位建出来并站上去**(Q/E 建造 + WASD 走过去)'
-      + '⇒ 没有键位缺口。玩家读到的评级走**成功回执**的 `effect.rushGrade`'
-      + '(客户端 `action_target.ts` 的 `describeActionResult` 展示),这也是入口',
+    what: '急单(rush)开局与交付:客户端**没有也不该有**专门入口',
+    reason: '急单三段全在**世界侧**(`world_sim.tickPartyStep`):START → `startRushRun`'
+      + '(食堂建成 + 三工位在场 + 有人站在工位格上),DELIVER → `submitDelivery`'
+      + '(脚下 1 格内有订单点名的地面货),SETTLE → `settleSession`(状态变 SETTLED 那一慢帧)'
+      + '—— 见 `server/src/coop/rush_actions.ts` 的 `RUSH_ACTION_LEDGER`,三条都是 `WIRED:`,'
+      + '但**没有一条**要客户端发报文 ⇒ 不存在"少一个键"的缺口;'
+      + '评级走**成功回执**的 `effect.rushGrade`(`net/action_entry.ts` 的'
+      + '`describeEntryReceipt` 把它内联进状态条那一行),这也是入口。',
+    kind: ClientHoldKind.DELIBERATE,
+    unblock: '不需要新键:玩家侧要补的是**工位**(`Q` 放块 + WASD 站上去)与把货丢到**脚下**'
+      + '(`G`,`RUSH_DELIVERY_RADIUS = 1` 与 `DROP_ITEM` 的 `target: under` 同口径)。'
+      + '真要做"急单面板"(还剩几件 / 交了几件),那是 UI 任务,不是键位任务。',
+    today: '建造工位(`Q`)→ 站上去(WASD)= 开工;把订单点名的货丢在**脚下**(`G`)+'
+      + ' 站在工位格 = 交付;评级在状态条的**动作回执**那一行。',
   },
   {
     what: 'PLACE_AUTOMATION 的分拣带配置形态(`kind: LOGISTICS_SORTER` + `lane` + `itemId`)',
-    reason: '键盘路径只给**播种形态**;`lane`(第几道收哪件)需要一个配置 UI'
+    reason: '键盘路径只给**播种形态**(`x` / `y` / `itemId`);`lane`(第几道收哪件)需要一个配置 UI'
       + '(选组件 → 选道号 → 选目标物品),而报文键 `lane` **不在** `ActionPayload` 契约里'
-      + '(见 `actions/place_automation.ts` 文件头的形态清单)⇒ 客户端不替它发明一个字段。'
-      + '出路:接线面板(与 WIRE_EDIT 的线框下发一起做,否则用户看不到自己配的是什么)',
+      + '(`server/src/net/room.ts` 那一格只有 `kind`)⇒ 客户端不替它发明一个字段。'
+      + '判据:`tests/WS-FND-145` 逐字读那份契约,`lane` 一出现就红(那时才可以接线)。',
+    kind: ClientHoldKind.DELIBERATE,
+    unblock: '先给 `lane` 一个**契约位置**(`ActionPayload`),再做接线面板'
+      + '(与 WIRE_EDIT 的线框下发一起做,否则用户看不到自己配的是什么)。',
+    today: '键盘 `4` 只走**播种形态**;组件形态的 `kind` 只能由调用方给 ——'
+      + '客户端界面上今天没有这个调用方。',
   },
 ];
 
@@ -575,7 +737,75 @@ export function clientEntryWitnessOf(action: string): string {
   return CLIENT_ENTRY_WITNESS[action] ?? '';
 }
 
-/** 客户端入口台账自检:`missing` 必须给出非空理由;动作名不许重复。 */
+/**
+ * 取某动作的**登记**(`null` = 没登记 —— 对一条 `missing` 来说这就是"没有说明")。
+ */
+export function clientHoldRow(action: string): ClientHoldRow | null {
+  return CLIENT_ENTRY_HOLDS.find((h) => h.action === action) ?? null;
+}
+
+/**
+ * **只查一个方向**:`missing` 的行必须有登记。
+ *
+ * 为什么单独导出(而不是把整张 `CLIENT_ENTRY_HOLDS` 塞进下面那个函数):
+ * `validateClientEntryLedger()` 允许调用方传**一小撮假行**(负对照用),
+ * 而"登记里有孤儿"这件事只有在**整张台账**上才有意义 —— 两个方向混在一起,
+ * 一个只传一行的负对照会被 8 条"无主登记"淹没,报错就失去指向性。
+ */
+export function missingRowsWithoutHold(
+  rows: readonly ClientEntryRow[] = CLIENT_ENTRY_LEDGER,
+  holds: readonly ClientHoldRow[] = CLIENT_ENTRY_HOLDS,
+): string[] {
+  const held = new Set(holds.map((h) => h.action));
+  return rows
+    .filter((r) => r.status === ClientEntryStatus.MISSING && !held.has(r.action))
+    .map((r) => r.action);
+}
+
+/**
+ * 登记自检(★ WS-FND-145)。三条,每条都配一条负对照(见 `tests/WS-FND-145`):
+ * ```
+ * missing 必须有登记,且 why(unblock/today)三段全非空  ⇒ 台账不可能"留 missing 而无说明"
+ * 登记的必须是**当前仍然 missing** 的动作            ⇒ 接了线却忘了删登记 ⇒ 红
+ * 登记不许重复、不许指向台账里没有的动作              ⇒ 无主登记 ⇒ 红
+ * ```
+ */
+export function validateClientEntryHolds(
+  rows: readonly ClientEntryRow[] = CLIENT_ENTRY_LEDGER,
+  holds: readonly ClientHoldRow[] = CLIENT_ENTRY_HOLDS,
+): { ok: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  for (const h of holds) {
+    if (seen.has(h.action)) errors.push(`${h.action} 在登记表里出现了两次`);
+    seen.add(h.action);
+    if (h.kind !== ClientHoldKind.DELIBERATE) {
+      errors.push(`${h.action} 的登记档位不是 deliberate(${String(h.kind)})`);
+    }
+    if (h.why.trim().length < 20) {
+      errors.push(`${h.action} 的 why 太短(必须说清"为什么刻意不提供",而不是"还没做")`);
+    }
+    if (h.unblock.trim() === '') errors.push(`${h.action} 没写 unblock(解锁它的那一件事)`);
+    if (h.today.trim() === '') errors.push(`${h.action} 没写 today(玩家今天能做到哪一步)`);
+    const row = rows.find((r) => r.action === h.action) ?? null;
+    if (row === null) {
+      errors.push(`登记表里的 ${h.action} 不在客户端入口台账里(无主登记)`);
+    } else if (row.status !== ClientEntryStatus.MISSING) {
+      errors.push(`${h.action} 已接线(${row.status})却还登记为"刻意不提供" ⇒ 删掉那条登记`);
+    }
+  }
+  for (const action of missingRowsWithoutHold(rows, holds)) {
+    errors.push(`★ ${action} 标为 missing 却没有登记(台账不许留"没有说明的 missing")`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * 客户端入口台账自检:`missing` 必须给出非空理由 + **有登记**;动作名不许重复。
+ *
+ * ⚠️ 这里只串"missing 必须有登记"这一个方向;整张登记表的自检在
+ * `validateClientEntryHolds()`(理由见 `missingRowsWithoutHold` 的注释)。
+ */
 export function validateClientEntryLedger(
   rows: readonly ClientEntryRow[] = CLIENT_ENTRY_LEDGER,
 ): { ok: boolean; errors: string[] } {
@@ -602,6 +832,9 @@ export function validateClientEntryLedger(
     if (r.status === ClientEntryStatus.MISSING && w !== '') {
       errors.push(`${r.action} 标为 missing 却有见证片段:${w}`);
     }
+  }
+  for (const action of missingRowsWithoutHold(rows)) {
+    errors.push(`★ ${action} 标为 missing 却没有登记(见 CLIENT_ENTRY_HOLDS)`);
   }
   return { ok: errors.length === 0, errors };
 }

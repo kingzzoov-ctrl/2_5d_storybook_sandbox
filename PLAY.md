@@ -115,28 +115,43 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
   现在 `WASD` 只驱角色,相机由**权威位置**驱动。
   (删掉它的理由:相机与角色共用一批按键时,跟随会退化成**巧合** —— 输入一变就失效,且不报错。)
 
-### 服务端**已实现**、客户端**按不到**的动作(逐条,不许当成已支持)
+### 服务端**已实现**、客户端**刻意不提供**的动作(逐条,不许当成已支持)
 
-这条清单是**如实登记**,出处是 `client/src/wiring_ledger.ts` 的 `CLIENT_ENTRY_LEDGER`
-(逐动作覆盖 `RoomAction` 的 24 条;判据 `WS-FND-138`)。
-**第十轮补上的四条**(此前它们只活在服务端):`1` 驯养 / `2` 购买 / `3` 炼金台 / `4` 放自动化件。
-**仍然没有入口的八条**(服务端都有执行层):
+出处只有一处:`client/src/wiring_ledger.ts` —— **台账** `CLIENT_ENTRY_LEDGER`
+(逐动作覆盖 `RoomAction` 的 24 条)+ **登记** `CLIENT_ENTRY_HOLDS`(八条管理类)
++ 非 `RoomAction` 的 `CLIENT_ENTRY_GAPS`(急单 / 分拣带道号)。
+第十轮补上的四条入口:`1` 驯养 / `2` 购买 / `3` 炼金台 / `4` 放自动化件。
 
-| 动作 | 为什么客户端没入口 |
-|---|---|
-| `SET_ROOM_ACCESS` | 改房间密码/容量:要一个房主表单,而现在**没有任何房间管理 UI** |
-| `SET_PARTY_MODE` | 赛前选模式:`V`(派对开局)只把**房间已选**的模式开成一局,它**不设**模式 |
-| `KICK_MEMBER` / `SET_MEMBER_ROLE` | 成员管理:要一份带**角色**的成员列表,快照里只有位置/血量 |
-| `RESET_WORLD` / `CLOSE_ROOM` | 不可逆 + 服务端要求**二次确认**;没有确认对话框就接键 = 一次误触 |
-| `MODIFY_TOWN` | 要"选格子 + 输入名字/半径",客户端没有取坐标的 UI 也没有文本输入口 |
-| `WIRE_EDIT` | 服务端**不下发线框数据** ⇒ 客户端画不出任何一条已有导线,没有可编辑的对象 |
+**剩下八条全部裁决为「服务端已实现、客户端刻意不提供」**(不是"还没做")。它们都是
+**房间管理类**动作:缺的不是一行转发,而是那块 UI(表单 / 成员表 / 确认框 / 线框数据);
+UI 缺席时接一个裸键 = 一次误触改掉**整个房间**的状态,其中一半**不可逆**。
+⇒ **0 条 `missing` 没有说明**:每一条都必须在这张登记表里写清 `why` / `unblock` / `today`,
+否则 `validateClientEntryLedger()` 当场红(`node tests/WS-FND-145-client-entry-rest.test.ts`)。
 
-**急单(rush)是个特例**:它**不是** `RoomAction`,客户端也**不该**有专门入口 ——
-它由**世界侧自动开工**(食堂建成 + 三工位在场 + 有人站在工位格上,
-见 `server/src/coop/rush_actions.ts` 的 START 行)。玩家能做的就是**把工位建出来并站上去**;
-评级走**成功回执**的 `effect.rushGrade`(显示在状态条那行动作回执里)。
-**分拣带(`kind: LOGISTICS_SORTER`)的 `lane` 配置**同样没有入口:
-报文键 `lane` **不在** `ActionPayload` 契约里,客户端不替它发明一个字段。
+| 动作 | 为什么**刻意**不提供 | 解锁它的那一件事 | 你今天能做到哪一步 |
+|---|---|---|---|
+| `SET_ROOM_ACCESS` | 要房主表单(三选一 + 口令输入 + 回执回读),而客户端没有任何房间管理 UI;裸键 = 一次误触改掉全房口令/容量,状态条里**没有回读** | 房间面板:访问模式单选 + 口令输入 + `effect.mode` 回读 + 权限位 | 做不到(口令/容量只能在建房那一侧定) |
+| `SET_PARTY_MODE` | 四选一要**选择器 + 权限位**;模式影响全房(含正在跑的那局),裸键只能"轮到下一档"、没有确认。`V` 只开**房间已选**的模式,不设模式 | 派对面板:模式列表(名字来自冻结层 `PARTY_MODES`)+ 当前档高亮 + 只给 OWNER/ADMIN | 只能开房间已选的模式(`V`) |
+| `KICK_MEMBER` | 踢人不可逆,且要一份**带角色**的成员表;快照的 `PlayerState` 只有 id/名字/位置/血量,**没有 role** | 快照先下发成员角色,再做房间面板的成员表 + 踢人按钮 | 做不到 |
+| `SET_MEMBER_ROLE` | `role` 是服务端权限位枚举,快照里没有这个字段 ⇒ 连"把谁改成什么"都表达不出来 | 成员表(数据来自快照)+ 角色下拉,不手抄名单 | 做不到 |
+| `RESET_WORLD` | 不可逆,服务端要 `confirm: true` 字面量(= 二次确认);没有确认对话框就接键 = 一次误触重置世界 | 确认对话框(当前种子 / 新种子 / 明确的"重置")挂在房间面板里 | 做不到 |
+| `CLOSE_ROOM` | 不可逆(全房被踢);`close()` 是生命周期方法,权限闸在 `actions/admin.ts`,要求显式请求 | 同 `RESET_WORLD`:房间面板 + 二次确认 + 权限位 | 做不到 |
+| `MODIFY_TOWN` | 要 `radius` / `name` / `totemCell` 三个**自由输入**;客户端没有拾取坐标的 UI,也没有接到动作上的文本输入口 | 城镇面板:点格取 `totemCell` + 半径滑杆 + 名字输入 | 做不到 |
+| `WIRE_EDIT` | 服务端**不下发线框数据** ⇒ 画不出任何一条已有导线,没有"编辑哪个方向"的对象(`dir` / `color` / `channel` / `clear` 都相对它才有意义) | 先下发 WireView(节点 / 方向 / 颜色 / 频道),再做接线面板 | 做不到 |
+
+**急单(rush)不是 `RoomAction`,客户端也不该有专门入口**:三段全在**世界侧**
+(`world_sim.tickPartyStep`):START = `startRushRun`(食堂建成 + 三工位在场 + 有人站在
+工位格上)、DELIVER = `submitDelivery`(脚下 1 格内有订单点名的地面货)、SETTLE =
+`settleSession`(状态变 SETTLED 那一慢帧)。见 `server/src/coop/rush_actions.ts` 的
+`RUSH_ACTION_LEDGER`(三条都是 `WIRED:`)。玩家侧没有"少一个键":**建造工位(`Q`)→ 站上去
+(WASD)= 开工;把订单点名的货丢在脚下(`G`,`RUSH_DELIVERY_RADIUS = 1` 与 `DROP_ITEM` 的
+`target: 'under'` 同口径)+ 站在工位格 = 交付**。评级走**成功回执**的 `effect.rushGrade`,
+由 `client/src/net/action_entry.ts` 的 `describeEntryReceipt` 内联进状态条那一行。
+
+**分拣带(`kind: LOGISTICS_SORTER`)的 `lane` 配置**同样**刻意不提供**:
+键盘 `4` 只走**播种形态**(`x` / `y` / `itemId`),而报文键 `lane` **不在** `ActionPayload`
+契约里(`server/src/net/room.ts` 那一格只有 `kind`)⇒ 客户端不替它发明一个字段。
+解锁它要先给 `lane` 一个契约位置,再做接线面板(与 `WIRE_EDIT` 的线框下发同一块 UI)。
 
 ### 背包拖拽 = **本地整理视图**
 
@@ -169,6 +184,9 @@ node tests/WS-FND-19-spawn.test.ts   # 只跑「生物真的刷出来了吗」
   已接线 / 专用通道 / 显式未实装三分,新增动作而不作决定会**当场红**。
   同一个问题在**客户端**那一侧的判据是 `tests/WS-FND-138-client-entry-parity.test.ts`
   (入口键 → 真的发出报文;`missing` 的动作必须逐条有理由)。
+- 「八条管理类动作**刻意不提供**」由 `tests/WS-FND-145-client-entry-rest.test.ts` 钉住:
+  逐条查 `CLIENT_ENTRY_HOLDS` 的 `why` / `unblock` / `today` 非空、客户端源码里**零出现**
+  (剥注释)，并逐字读 `ActionPayload` 契约确认 `lane` 还不存在(它一出现就红)。
 
 ---
 

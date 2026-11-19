@@ -550,6 +550,13 @@ export type MoveIntentParse =
  *
  * `speedMul` 是可选:给了但非法(字符串 / NaN)⇒ **当作没给**,而不是整条拒绝。
  * 理由:它是乘数,不是坐标 —— 一个坏乘数不该让整次移动消失。
+ *
+ * ## ★ `z` 只是**建议值**(WS-FND-147)
+ *
+ * 运输层对 z 只判**值域**(有限数),**不判语义**:高度归谁说了算是世界侧的裁决
+ * (`WorldSim.applyPlayerMove` —— 空中 / 落地 / 蹦床 / 落穴这些**服务端**产生的高度变化
+ * 不会被客户端旧报文回拖;静止时仍采纳声明值,见该方法的「z 由谁拥有」一节)。
+ * ⇒ 这里**不许**加「z ≤ N」之类的玩法上界:那是第二份判定,必然与世界侧漂移。
  */
 export function parseMoveIntent(msg: {
   tick?: unknown; x?: unknown; y?: unknown; z?: unknown;

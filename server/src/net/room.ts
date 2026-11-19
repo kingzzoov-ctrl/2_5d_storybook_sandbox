@@ -3035,8 +3035,12 @@ export class RoomRuntime {
 
     /* 2 再把**权威值**投影到 state。
        有世界就从权威读回(含击退/搬运的结果);没有世界就只有声明值可写。
-       ★ z 也从权威读回(2026-11-16 接通):`applyPlayerMove` 已把 z 写进刚体,
-       这里读回它 ⇒ 客户端声明的 z **不再是最终值**(与 x/y 同一口径)。
+       ★ z 也从权威读回(2026-11-16 接通;**WS-FND-147 起口径更严格**):
+       `applyPlayerMove` 只在「刚体静止且服务端没动过 z」时才采纳 `intent.z`,
+       空中 / 落地 / 蹦床 / 落穴 / 台阶这些**服务端自己产生的高度变化**一律以刚体为准
+       (裁决见 `WorldSim.lastZAuthority`)。⇒ 客户端声明的 z **只是建议值**:
+       `room.ts` 只搬运它、**不判**它,也不把它当最终值(与 x/y 同一口径 ——
+       判定只在世界侧一处,理由见 `applyPlayerMove` 的「不制造第二份等效实现」)。
        `host.playerPosition` 的 `z` 是**可选**的(老世界源只回 x/y)⇒ 回退到声明值。 */
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {

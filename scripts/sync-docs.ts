@@ -41,7 +41,15 @@
  *   (b) **核对**汇总表与表体 —— 不符即红(exit 1、不写盘)。
  * 为什么值得单列:那一行第十轮实测**四个数字全反**(README 写「34 行:20/5/2/6」,表体是
  * 「36 行:9/2/20/5」),而两个来源都绿了很多轮 ⇒ 与本文开头同一条根因:**同一份事实不许有两个来源**。
+ *
  * ⚠️ 「仍含未接的一半」那一列**不进**自检:它是语义判断,不是分类计数(见 `measureWiring` 的口径段)。
+ *
+ * ## 告警:锚点之外的手工实测数字(第十轮补)
+ *
+ * 锚点只覆盖 `README.md` / `docs/HANDOVER.md` 的**那几行**;其余散文仍是人抄的。
+ * `reportManualNumbers()` 扫 `README.md` + `docs/*.md`,把「有数字 + 带测量口径词 + 没被锚点
+ * 覆盖 + 不在已声明历史的地方」的行按 `文件:行` 列出来。**只告警**(不进退出码):
+ * 处置是**加锚点**或**在抬头标「历史快照 / 逐轮台账」**,不是加白名单。
  *
  * **未测量 ≠ 通过**:某个字段这次没测到,就打印「未校验」并**不参与比对**,
  * 而不是当成 0 比(那会报假红)或当成对(那是静默绿)。
@@ -1126,6 +1134,158 @@ function processAnchors(file: DocFile, text: string, n: Numbers): AnchorScan {
   return { text: next, findings, skipped: [...skipped], errors };
 }
 
+/* ──────── 手工实测数字:锚点**没覆盖**到哪儿(告警,不参与退出码) ──────── */
+
+/**
+ * 「文档里有一处手工维护的实测数字,而锚点没覆盖它」。
+ *
+ * 来历:`sync-docs` 的锚点只管住 `README.md` / `docs/HANDOVER.md` 的**那几行**;
+ * 锚点之外的散文仍是人写的 —— 实测两例:`HANDOVER` §一 的「工具 `scripts/*.ts` 37 个」
+ * 与「`verify.ts`(8241 行)」都不在任何锚点里;§14.4 记过的「基座(FND-01..132)」
+ * 在 134..137 落盘后仍写 ..132(**锚点只捕获数字,不捕获号段**)。
+ *
+ * ⇒ 本扫描**只告警**(进 stdout、不进 exit code、不改盘):
+ *   · 命中 = 这一行**有数字**且带一个测量口径词(用例 / 套件 / 台账 / 自检 / 万行 / `.ts` / 指纹 / 哈希 …);
+ *   · 排除 1:被锚点覆盖的行(`ANCHORS` 命中的区间)+ §九 sha256 行;
+ *   · 排除 2:行内自报来源(`sync-docs` / `勿手改`)或行内标了历史 / 快照;
+ *   · 排除 3:文档抬头(前 40 行)声明了「历史快照 / 逐轮台账」⇒ 整份按历史读,只报总数;
+ *   · 排除 4:所在 `##` 节的标题里带「历史 / 快照 / 逐轮」⇒ 该节整体是历史。
+ *
+ * ⚠️ 为什么不升级成 exit 1:`docs/` 下几十份审计稿 / 任务稿 / WS 设计稿天然带旧数,
+ * 一升级就变成「要么别报数,要么加白名单」—— 那正是 §13.3 记过的那条路。
+ * 于是它保持告警:**要么加锚点(变成生成物),要么在抬头标一句「历史快照」(变成历史)。**
+ */
+/** 「这一行在报一个**量**」:数字 + 量词 / 比值 / 指纹 / 12 位哈希。 */
+/** 「这一行在报一个**量**」:数字 + 量词,或指纹 / 12 位哈希。比值(3/4/5)不算 —— 那是条目号。 */
+const MANUAL_NUM_VALUE_RE = /\d+\s*(?:条|个|份|行|处)|v\d+-[0-9a-f]{8}|(?<![0-9a-z])[0-9a-f]{12}(?![0-9a-z])/;
+/** 「量的是**测量口径**」:只认这几类词,别的数字(物品 id / 格数 / 等级)不算。 */
+const MANUAL_NUM_KEY_RE = /(用例|套件|通过|可达性|不可达|自检|万行|指纹|sha256|哈希|欠账|同义反复|双端同源|未关闭|台账|白名单)/;
+/** 行内已经写明来源 / 已经标了历史 ⇒ 这一行不算「手工维护的现值」。 */
+const MANUAL_NUM_LINE_OK = /(sync-docs|勿手改|历史快照|逐轮台账|历史值|快照)/;
+/** 抬头(前 40 行)声明性质:整份是历史 ⇒ 只计数、不逐行点名。 */
+const DOC_SNAPSHOT_DECL = /(历史快照|逐轮台账)/;
+/** 抬头声明「当前状态 / 活文档」⇒ 这份文档**自称**现值,逐行点名。 */
+const DOC_CURRENT_DECL = /(当前状态|活文档)/;
+/** `##` 节标题声明性质:该节整体是历史。 */
+const SECTION_HISTORY_DECL = /(历史|快照|逐轮)/;
+const MANUAL_NUM_MAX_FILES = 8;
+const MANUAL_NUM_MAX_SAMPLES = 3;
+
+interface ManualNumHit { file: string; line: number; text: string }
+interface ManualNumReport {
+  /** 真扫了几份 `.md`(README + `docs/*.md`)。 */
+  scanned: number;
+  /** **声明为当前状态**的文档里,锚点未覆盖且不在历史节的命中 —— 要点名的就是这些。 */
+  hits: ManualNumHit[];
+  /** 已声明历史的文档里有多少处(只计数)。 */
+  histTotal: number;
+  /** 既没声明当前状态、也没声明历史(审计稿 / 任务稿 / 设计稿)⇒ 只计数。 */
+  undecTotal: number;
+  undecFiles: number;
+}
+
+/** 被锚点覆盖的行号集合(1 起,含整段匹配跨行的情况)。 */
+function anchorCoveredLines(file: DocFile, text: string): Set<number> {
+  const out = new Set<number>();
+  const mark = (index: number, len: number): void => {
+    const start = text.slice(0, index).split('\n').length;
+    const end = text.slice(0, index + len).split('\n').length;
+    for (let i = start; i <= end; i += 1) out.add(i);
+  };
+  for (const a of ANCHORS.filter((x) => x.file === file)) {
+    for (const m of text.matchAll(a.re)) mark(m.index ?? 0, m[0].length);
+  }
+  /* §九 sha256 表由 `processHashes()` 生成,同样算「已被锚点覆盖」。 */
+  if (file === 'docs/HANDOVER.md') {
+    for (const m of text.matchAll(/^[0-9a-f]{12}[ \t]+\S+\.md[ \t]*$/gm)) mark(m.index ?? 0, m[0].length);
+  }
+  return out;
+}
+
+function scanManualNumbers(root: string): ManualNumReport {
+  const files: string[] = [];
+  if (existsSync(join(root, 'README.md'))) files.push('README.md');
+  const docsDir = join(root, 'docs');
+  if (existsSync(docsDir)) {
+    for (const e of readdirSync(docsDir, { withFileTypes: true })) {
+      if (e.isFile() && e.name.endsWith('.md')) files.push(`docs/${e.name}`);
+    }
+  }
+  files.sort();
+  const hits: ManualNumHit[] = [];
+  let histTotal = 0;
+  let undecTotal = 0;
+  let undecFiles = 0;
+  for (const rel of files) {
+    const text = readFileSync(join(root, rel), 'utf8');
+    if (text === '') continue;
+    const lines = text.split('\n');
+    const header = lines.slice(0, 40).join('\n');
+    /* 文档自己说了它是什么,就按它说的算:
+       · 声明「历史快照 / 逐轮台账」⇒ 整份按历史读(旧数本来就在那儿);
+       · 声明「当前状态 / 活文档」,或它就是锚点两头(README / HANDOVER)⇒ 逐行点名;
+       · 什么都没声明(审计稿 / 任务稿 / 设计稿)⇒ 只计数 —— 它们本来就是历史,只是没人写下来。 */
+    const history = DOC_SNAPSHOT_DECL.test(header);
+    const current = !history
+      && (rel === 'README.md' || rel === 'docs/HANDOVER.md' || DOC_CURRENT_DECL.test(header));
+    const covered = rel === 'README.md' || rel === 'docs/HANDOVER.md'
+      ? anchorCoveredLines(rel as DocFile, text)
+      : new Set<number>();
+    let section = '';
+    let hist = 0;
+    let undec = 0;
+    lines.forEach((ln, i) => {
+      const h = /^##\s+(.*)$/.exec(ln);
+      if (h !== null) section = h[1] ?? '';
+      if (!MANUAL_NUM_VALUE_RE.test(ln) || !MANUAL_NUM_KEY_RE.test(ln)) return;
+      if (covered.has(i + 1)) return;
+      if (MANUAL_NUM_LINE_OK.test(ln)) return;
+      if (history || SECTION_HISTORY_DECL.test(section)) { hist += 1; return; }
+      if (!current) { undec += 1; return; }
+      hits.push({ file: rel, line: i + 1, text: ln.trim().slice(0, 72) });
+    });
+    histTotal += hist;
+    if (undec > 0) { undecTotal += undec; undecFiles += 1; }
+  }
+  return { scanned: files.length, hits, histTotal, undecTotal, undecFiles };
+}
+
+/**
+ * 打印告警。**不返回退出码、不改任何文件** —— 它回答的是「下一步该给谁加锚点」。
+ * ⚠️ 输出里刻意不出现「未校验」三个字:`verify.ts` 会把含该词的行原样转述,
+ * 而本扫描不是「没比对」,是「比对过了、这处没人管」。
+ */
+function reportManualNumbers(root: string): void {
+  const r = scanManualNumbers(root);
+  if (r.scanned === 0) return;
+  const byFile = new Map<string, ManualNumHit[]>();
+  for (const h of r.hits) {
+    const list = byFile.get(h.file);
+    if (list === undefined) byFile.set(h.file, [h]);
+    else list.push(h);
+  }
+  console.log(
+    `  · 手工实测数字扫描:${r.scanned} 份文档 · 声明为当前状态的里面,锚点未覆盖 ${r.hits.length} 处`
+    + ` / ${byFile.size} 个文件(告警,不改盘)`,
+  );
+  if (r.histTotal > 0 || r.undecTotal > 0) {
+    console.log(
+      `  · 历史类文档按历史读 ⇒ 已声明 ${r.histTotal} 处 · 未声明性质 ${r.undecFiles} 份 / ${r.undecTotal} 处(只计数)`,
+    );
+  }
+  const shown = [...byFile.entries()].slice(0, MANUAL_NUM_MAX_FILES);
+  for (const [file, list] of shown) {
+    const refs = list.slice(0, MANUAL_NUM_MAX_SAMPLES).map((h) => `${file}:${h.line}`).join(' ');
+    console.log(
+      `  ⚠ ${refs} —— 该文件共 ${list.length} 处手工实测数字没有锚点`
+      + '(处置:加锚点,或把这段挪进「历史」节)',
+    );
+  }
+  if (byFile.size > shown.length) {
+    console.log(`  ⚠ 另有 ${byFile.size - shown.length} 个文件未列出(同一条处置)`);
+  }
+}
+
 /* ───────────────────────── CLI ───────────────────────── */
 
 const REPO_ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
@@ -1206,6 +1366,11 @@ function main(): void {
   /* §九 的 README 行必须算「写回后的 README」:否则一次写入会同时报
      「数字不一致」与「哈希不一致」,而它们其实是同一件事。 */
   const hs = processHashes(h.text, root, r.text);
+
+  /* ★ 告警:锚点**以外**的手工实测数字(不参与 exit code,也不改盘)。
+     位置在这里是有意的 —— 必须在结论行之前打印,否则 `verify.ts` 用「最后一个非空行」
+     当结论时会把告警当成结论。 */
+  reportManualNumbers(root);
 
   const findings = [...r.findings, ...h.findings, ...hs.findings];
   /* 台账自检的错误与锚点错误同级:都进同一张表 ⇒ 同一句报错、同一个 exit 1(且**都不写盘**)。

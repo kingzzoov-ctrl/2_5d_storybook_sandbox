@@ -1557,7 +1557,7 @@ const CLIENT_HTML_ENTRY = './src/main.ts';
  *
  * ## 本表的两个条数是**可被代码算出来的数** —— 故必须写成「自称」
  *
- * 可达性白名单 11 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(10)(生产零引用清单,
+ * 可达性白名单 10 条(= 本 `Map` 的 `size`)与 `ORPHAN_KNOWN`(9)(生产零引用清单,
  * 定义在 `scripts/orphan-audit.ts`)写在这里,由 `scripts/count-audit.ts` 与
  * **运行时** `Map.size` 双向比对:改了名单却忘了同步这两处 ⇒ 当场红在
  * 「文档自称与代码正解不一致」上,而不是让两条注释各自腐烂。
@@ -1777,18 +1777,23 @@ const UNREACHABLE_EXEMPT = new Map<string, string>([
   ['server/src/db/memory_db.ts',
     '驱动按 DbLike 结构化类型注入,生产入口尚未注入(**测试专用**:'
     + '生产入口若也 import 它,会与 driver.sqlite 并存两份实现)'],
-  /* ⚠️ 本条的措辞在 2026-11-13 被订正 —— 原文写「(tameItem 无人消费)」,**事实不成立**:
-     `taming.ts:81`(tameableDefs 过滤)、`:124`/`:127`(feedPet 校验物品)都在读该字段;
-     `shared/constants/mobs.ts` 里 7 处赋值也说明它有生产者。
-     ⇒ 真正**零生产调用**的是 `feedPet` 这个**函数**(实测 18 处出现里 15 处在 tests/)。
-     ★ 差别要紧:「字段没人读」与「整个入口没人调」是**两种缺陷、两种修法**。
-     ★ 错话从哪来:`tests/WS-04.test.ts:1251` 的断言只测**一个文件**——
-         `ok(!/tameItem/.test(behavSrc))`,结论句却写「⇒ 7 种可驯服生物的
-         tameItem 字段无人消费」,把**单文件范围偷换成全仓范围**。
-         该断言**是绿的**,于是错结论被当已核实事实抄进本表(陷阱 95)。 */
-  ['server/src/mobs/taming.ts',
-    'WS-04 牧场驯服,等宠物容器 + 驯服交互(feedPet 零生产调用;'
-    + 'tameItem 字段**有**消费者,旧措辞「无人消费」已订正)'],
+  /* ═══ ★ 2026-11-19:`server/src/mobs/taming.ts` **已可达 ⇒ 摘除**(本条曾在此挂了 16 天) ═══
+   *
+   * 摘除方式(不是「import 一下」):宠物容器搬进 `taming.ts` 第 6 节(**按玩家存**:
+   * `roomId → ownerId → petId`),`net/actions/breed_tame.ts` 的 `BREED_TAME` 四个子操作
+   * 调它 —— `FEED` → `createPetRecord` + `feedPet`;`TAME` → `commandPet`;
+   * `RANCH` → `sendToRanch`;`forgetRoom` → `forgetRoomPets`。
+   * ⇒ 可达闭包:`server/src/index.ts → net/room.ts → net/actions/action_table.ts →
+   *   net/actions/breed_tame.ts → mobs/taming.ts`。
+   *
+   * ⚠️ 旧措辞里那句「feedPet 零生产调用」随之作废 —— 它现在是**真调用点**。
+   *   故 `tests/WS-04.test.ts` 的判据(剥注释后 `feedPet` 恰好 1 处 = 定义行)
+   *   **必须同步改成 3 处**(1 定义 + 1 import + 1 调用);那条判据自己的注释原本就
+   *   写着「接上那天这条必红,必须一并改写」。
+   * ⚠️ `tests/WS-FND-90` 的「登记 ↔ 实测」互校要求 `scripts/orphan-audit.ts` 的
+   *   `ORPHAN_KNOWN` **同步**摘掉同一条(否则「登记 N / 实测 M」永远对不上)。
+   * ⚠️ taming 的 `tameItem` 读者身份未变(`tameableDefs` / `feedPet` 仍在读),
+   *   旧措辞那次订正(「字段没人读」≠「入口没人调」)依然成立,留作教训。 */
   /* `net/prediction.ts` 已于 2026-11-12 **搬迁**到 `client/src/net/`,
      不是接线 —— 它本就是客户端模块,放在 `server/src/` 下是放错位置。
      服务端侧**根本不该接**它(`reconcile` 要的是服务端权威快照,
@@ -4827,9 +4832,10 @@ export const CROSS_ANNOTATION: ReadonlyMap<string, string> = new Map<string, str
   ['server/src/db/memory_db.ts',
     '可达性侧:传递不可达(只在测试与门禁里被 import);orphan 侧:生产零引用(生产走 driver.sqlite)。'
     + '相容原因:它的消费者刻意只在测试侧,故生产既进不了闭包也没有 importer。'],
-  ['server/src/mobs/taming.ts',
-    '可达性侧:传递不可达(生产根走不到);orphan 侧:生产零引用(直接引用=0)。'
-    + '相容原因:驯服链路等"宠物容器 + 交互"落地,两边同时等同一件事。'],
+  /* ★ 2026-11-19:`server/src/mobs/taming.ts` 的交叉标注**摘除** —— 它已随可达性白名单
+     一起摘(容器接进 `net/actions/breed_tame.ts`)。R2 是**双向**判据:本表每一条必须
+     「确实同时在两张表里」,留着就成墓碑(与 `prank/immunity.ts` 同一次处置)。
+     ⚠️ 摘除动作写在这里而不是静默删:否则下一个人会以为它还在两张表里等接线。 */
   ['server/src/build/wiring_view.ts',
     '可达性侧:传递不可达;orphan 侧:生产零引用。'
     + '相容原因:**服务端侧根本不该接**(纯视图计算),客户端侧宿主不存在 —— '
