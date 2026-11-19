@@ -28,7 +28,7 @@ import {
    纯逻辑在 `net/action_entry.ts`(0 import、可单测),键位薄绑定在 `net/action_binding.ts`;
    本文件只做**装配根**:把真 `SessionHandle` 注进端口,再挂到 `window`。 */
 import { ActionEntry } from './net/action_entry.ts';
-import { createActionBinding, entryKeyHints, sessionPorts } from './net/action_binding.ts';
+import { createActionBinding, entryKeyHints, hotbarKeyHints, sessionPorts } from './net/action_binding.ts';
 /* ★ 第七轮审计 P2:输入避让 —— 搜索框里打字时动作键必须让路。
    判定在 `net/key_guard.ts`(纯、可单测):修前搜索态下打 `e` 会**同时**
    追加查询字符并发出 `BREAK_BLOCK`,两条监听各自都"工作正常"。 */
@@ -117,7 +117,29 @@ function main(): void {
   const url = serverUrlFromLocation();
   /* 动作状态**先于** `createSession` 与键处理声明:两处都要用它们
      (声明在后面会 TDZ —— 回执回调是异步的,但键处理不是)。 */
-  let lastAction = `按 ${keyHints()} —— 动作入口 ${entryKeyHints()}`;
+  /* ★ 第十轮:开局那句话把**两张键位表**都报出来 —— 修前只报字母表那六个,
+     四个新动作(驯养/购买/炼金/放自动化件)的入口对玩家**不可见**。 */
+  let lastAction = `按 ${keyHints()} —— 动作入口 ${entryKeyHints()} · 热键 ${hotbarKeyHints()}`;
+  /**
+   * ★ 第十轮 P3:最近一条**服务端拒绝原因**(`reject` 报文)。
+   *
+   * 修前 `session` 已经把拒因放在三处(`onReject` / `lastReject` / `rejectedFrames`),
+   * 而本文件**一个都没接**:只在 `onState('failed')` 时 warn 一句,而服务端的拒绝
+   * 随即把状态推成 `closed` ⇒ 拒因被"断开"盖掉,现场只剩「连不上」。
+   * 现在它同时进 HUD(状态条)与 `__stageReady`(机读),不再被覆盖。
+   */
+  let lastReject = '';
+  /**
+   * 「最近真的碰过的那件」物品 id。
+   *
+   * ⚠️ ★ 第十轮 P1:**它是 Q/E/G/F 与 N/T 以及四个新动作的前置**,
+   *   而新玩家开局**从未碰过任何物品** ⇒ `lastItemId === 0` ⇒ 全部被拒。
+   *   客户端的快照里**没有按件背包明细**(`PlayerState` 只有 `heldItemId`,
+   *   而它恒 0)⇒ 拿不到"脚下/面前最近一件"这种默认值 —— 凭空编一个 id
+   *   只会换来一条 `INVALID`(而且掩盖真正的原因)。
+   *   ⇒ 如实说清前置:提示点名「先按 E 拆一块或 F 捡一件」,手册同样写明
+   *   (PLAY.md「先拿到一件」一节 + `client/index.html` 的提示条)。
+   */
   let lastItemId = 0;
   /**
    * ★ 第七轮审计 P1:**朝向**。
@@ -180,6 +202,30 @@ function main(): void {
        * 一件都没有时仍然是"有话说"的拒绝(`actionEntry.status` 会写出来),不是静默。
        */
       useItem: () => ({ itemId: lastItemId }),
+      /*
+       * ★ 第十轮(WS-FND-138):四个此前**玩家按不到**的动作,现在有了宿主参数来源。
+       * 参数一律取**权威快照**里的东西(最近的生物 / 最近碰过的物品),不编造:
+       * - 驯养(`1`):投喂离你最近的那只 —— `petId` 用**实例 id**(`wildlife[].id`),
+       *   `mobId` 用**物种 id**;两者是两层,服务端第一次投喂要靠它登记。
+       * - 购买(`2`)/ 炼金台(`3`):都用「最近物品」当 itemId(购买 1 件)。
+       * - 放自动化件(`4`):走**播种形态**(只给 itemId)——
+       *   客户端不持有 `wiring` 的 kind 名单(那是服务端的注册表),编一份就是第二份实现。
+       * ⚠️ 给不出参数时**不发**,由入口回一句可读的话(绝不发一条注定被拒的报文)。
+       */
+      breedTame: () => {
+        const me = predictor.pos;
+        const w = nearestWildlife(me);
+        return { op: 'FEED', petId: w?.id, mobId: w?.mobId, itemId: lastItemId };
+      },
+      buyItem: () => ({ itemId: lastItemId, qty: 1 }),
+      useAlchemyFurnace: () => ({ itemId: lastItemId }),
+      /* ⚠️ 目标格必须是**整数格**:`predictor.pos` 是浮点(如 12.53),直接传会被
+         构建器的整数守卫拒掉(`PLACE_AUTOMATION 需要 x / y(整数)`),而玩家看到的是
+         "按了 4 没反应" —— 这就是"修好了一半"的典型。用 `cellUnder`(与开箱同一口径)。 */
+      placeAutomation: () => {
+        const cell = cellUnder(predictor.pos);
+        return { x: cell.x, y: cell.y, itemId: lastItemId };
+      },
     },
   });
   /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */
@@ -197,8 +243,26 @@ function main(): void {
         /* 帧到达:渲染循环自己在读 `handle.store`,这里**不需要**触发重画。
            只把"坏包/空帧"留痕,便于自检脚本读。 */
         onFrame: () => { /* 渲染循环每帧自读 store */ },
+        /* ★ 第十轮 P3:**拒因不许被 close 盖掉**。修前这里只对 `'failed'` 告警,
+           而服务端的拒绝随即把状态推成 `'closed'`(带同一条拒因)⇒ 「为什么被拒」
+           只留在一次瞬时 `failed` 上,现场只剩「断了」。⇒ `closed` 带 detail 时也打。 */
         onState: (s, detail) => {
-          if (s === 'failed') console.warn('[session] 失败:', detail);
+          if (s === 'failed' || (s === 'closed' && detail !== undefined)) {
+            console.warn(`[session] ${s}:`, detail);
+          }
+        },
+        /* ★ 第十轮 P3:`session` 的 `onReject` / `lastReject` / `rejectedFrames`
+           三个出口此前在客户端**零消费者**。现在接上,并做**分档**:
+           `WORLD_REJECTED`(世界侧回退权威坐标)是**游戏内事件**——「原地不动」,
+           不是连接级失败;其余(反作弊/入场)才按失败告警。 */
+        onReject: (r) => {
+          const code = r.code ?? r.kind ?? 'UNKNOWN';
+          if (code === 'WORLD_REJECTED') {
+            lastReject = '移动被世界侧拒收 ⇒ 回退权威坐标(非反作弊)';
+            return;
+          }
+          lastReject = `服务端拒绝 ${code}:${r.reason ?? '没给理由'}`;
+          console.warn('[session] 拒绝:', lastReject);
         },
         /* ★ WS-FND-113 第 4 处:`epoch >= 2` = 这一次 open 是**重连** ⇒
            先把整条本地预测链复位,再让新一代命令从 seq=1 出发。 */
@@ -251,13 +315,20 @@ function main(): void {
   /**
    * 最近的怪 —— 从**权威快照**取(`store.state.wildlife`)。
    * ⚠️ 客户端不自己维护怪列表:那是服务端的事,两份列表迟早分叉。
+   *
+   * ★ 第十轮:`id`(**实例 id**)也一起返回 —— 驯养动作(`BREED_TAME`)的 `petId`
+   *   要的是**实例 id**,而 `mobId` 是**物种 id**,两者是两层
+   *   (见 `server/src/mobs/spawner.ts` 的 id 规则)。只返回 `mobId` 的话,
+   *   驯养那条路只能拿物种 id 当 petId 用 —— 那是两个不同的键。
    */
   const nearestWildlife = (from: { x: number; y: number }):
-    { mobId: string; hp: number; maxHp: number; d: number } | null => {
-    let best: { mobId: string; hp: number; maxHp: number; d: number } | null = null;
+    { id: string; mobId: string; hp: number; maxHp: number; d: number } | null => {
+    let best: { id: string; mobId: string; hp: number; maxHp: number; d: number } | null = null;
     for (const w of handle.store.state.wildlife) {
       const d = Math.hypot(w.x - from.x, w.y - from.y);
-      if (best === null || d < best.d) best = { mobId: w.mobId, hp: w.hp, maxHp: w.maxHp, d };
+      if (best === null || d < best.d) {
+        best = { id: w.id, mobId: w.mobId, hp: w.hp, maxHp: w.maxHp, d };
+      }
     }
     return best;
   };
@@ -271,6 +342,22 @@ function main(): void {
     lastHit = `已发攻击 → ${w.mobId}(${w.d.toFixed(1)} 格)`;
   };
   window.addEventListener('mousedown', (ev) => { if (ev.button === 0) attackNearest(); });
+  /**
+   * 空格 = **攻击**(这条监听),而同一个键在 `net/input.ts` 的 `InputSource.press`
+   * 里**同时**会锁存一次 `jump`。
+   *
+   * ★ 第十轮 P1:这条"一键两义"此前**任何文档都没写**(PLAY.md 与提示条都只说
+   *   「空格 攻击」),而它有两个后果:
+   * ```
+   * 1 玩家以为空格是跳   ⇒ 其实只挥了一刀(跳跃锁存被上行送出去,服务端
+   *                        `parseMoveIntent` **不认这个字段、直接丢掉**,不报错)
+   * 2 玩家以为空格是攻击 ⇒ 对,但每按一次还夹带一条带 `jump:true` 的移动命令
+   * ```
+   * ⇒ 本轮**如实写清**(PLAY.md 的键位表 + `client/index.html` 的提示条都点名),
+   *   不拆键位:拆会把「空格 = 攻击」这条已被玩家与 `WS-FND-16`/`WS-FND-113`
+   *   钉住的行为无声改掉,而跳跃的末端仍是空的(服务端不接)—— 那是服务端的事,
+   *   客户端不替它假装。见 `net/input.ts` 的 `jumpLatched` 注释。
+   */
   window.addEventListener('keydown', (ev) => {
     /* ★ 第七轮审计 P2:搜索框里打空格应当是"空格",不是"挥一刀"。
        判定走 `net/key_guard.ts`(纯),源是 `boot` 的 `searchMode`(拉,不是回调)。 */
@@ -296,12 +383,20 @@ function main(): void {
       /* 动作那两行:回执文案(分类不同话不同)+ 最近碰过的物品。
          背包**明细**不在快照里(只有服务端有)⇒ 这里不编一个数字出来。 */
       lastAction,
+      /* ★ 第十轮 P3:最近一条**服务端拒绝原因**(HUD 出口)。修前拒因在客户端
+         一个出口都没有 —— 只在 `onState('failed')` 的一瞬 warn,随即被 close 盖掉。 */
+      lastReject === '' ? '拒绝 (无)' : lastReject,
       /* ★ 2026-11-15:五个新动作(合成/睡觉/开箱/派对开局)那一行。
          它由**入口**给出:发出去时是"合成 → 已发 (itemId=151)",
          被拒时是"开公共箱 ✗ 你没有这个权限"(四条失败分类四句话)。
          ⇒ 玩家第一次能分清"我按错了"与"服务端不让我做"。 */
       actionEntry.status,
       lastItemId === 0 ? '最近物品 (还没有)' : `最近物品 ${lastItemId}`,
+      /* ★ 第十轮:四个热键的**前置**也写进状态条 —— 它是那句话的机器可读版,
+         自检/复现脚本据此能判断"这条拒绝是前置没满足,不是参数写错"。 */
+      lastItemId === 0
+        ? '热键 1/2/3/4 需要「最近物品」(按 E 或 F 先拿一件)'
+        : '热键 1/2/3/4 就绪(1 驯养 · 2 购买 · 3 炼金台 · 4 放自动化件)',
     ].join('\n');
     statusEl.classList.toggle('bad', st !== 'live');
   };
@@ -341,7 +436,13 @@ function main(): void {
     const needItem = spec.action === 'PLACE_BLOCK' || spec.action === 'DROP_ITEM'
       || spec.action === 'PICKUP_ITEM';
     if (needItem && lastItemId === 0) {
-      lastAction = `${spec.label} ✗ 先按 E 拆一块或按 F 捡一件`;
+      /* ★ 第十轮 P1:**新玩家的第一步就卡在这里。**
+         开局从未碰过任何物品 ⇒ `lastItemId === 0` ⇒ Q/E/G/F 与 N/T(以及四个热键)
+         全部被拒。修前那句话只说「先按 E 拆一块或按 F 捡一件」—— 没写清
+         **这件事是有前置的、而且 E/F 会把"最近物品"记下来**;玩家读到的是
+         "这个键坏了"。现在把三件事一次说清:缺什么、怎么拿到、拿到后哪个键会通。 */
+      lastAction = `${spec.label} ✗ 还缺「最近物品」:先按 E 拆一块或按 F 捡一件`
+        + `(拆 / 捡的回执会把物品 id 记下来,之后 Q/G/F/N/T/2/3/4 才发得出去)`;
       return;
     }
     ev.preventDefault();
@@ -514,6 +615,9 @@ function main(): void {
     ...handle.summary(),
     /* 联机状态也进自检口径 —— 否则「连没连上」只能靠看控制台 */
     sessionState: session?.state ?? 'offline',
+    /* ★ 第十轮 P3:拒因进**机读口径**(与 HUD 同一份字符串)——「被拒的原因」
+       否则只能靠看控制台,而那正是它静默一整轮的原因。 */
+    lastReject,
     serverContentClaim: session?.serverContentClaim ?? null,
     /* ★ 2026-11-14(task-83 选乙):预测链路也进自检口径 —— */
     /* 否则「输入有没有真的产生命令」只能靠看控制台,而那正是它静默一整轮的原因。 */
@@ -549,6 +653,14 @@ function main(): void {
     actionStatus: actionEntry.status,
     actionSent: actionEntry.sentCount,
     actionKeys: entryKeyHints(),
+    /* ★ 第十轮(WS-FND-138):四个新动作的入口也必须**读得出来** ——
+       否则「按 1/2/3/4 到底发没发」又是只能靠肉眼看的静默形态。
+       三个读数各有分工:`hotbarKeys` 是键位表本身(不是手抄的),
+       `lastItemId` 是四个热键的**前置**(0 = 还没拿到任何物品),
+       `lastSentAction` 是**真的发出过的那一条**的动作名。 */
+    hotbarKeys: hotbarKeyHints(),
+    lastItemId,
+    lastSentAction: actionEntry.lastRequest?.action ?? null,
     /* ── ★ 第七轮审计 P1:朝向进自检口径 ──
      * 修前 `facing` 是写死的常量,而"格坐标"永远看起来正常 ⇒
      * 「Q 永远放脚下南侧」这件事**读不出来**。三个字段一起读:

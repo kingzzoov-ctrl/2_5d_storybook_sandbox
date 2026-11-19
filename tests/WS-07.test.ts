@@ -1,8 +1,15 @@
 /**
  * WS-07 测试(SQLite 存档 · 20Hz 差量协议 · 房间生命周期)。
  *
- * 硬约束:本文件只 import `node:*` 与 `shared/**` 与本 WS 的零依赖实现,
- * 不得 import colyseus / better-sqlite3。
+ * 硬约束:本文件只 import `node:*` 与 `shared/**` 与本 WS 的零依赖实现。
+ *
+ * ⚠️ **唯一例外(FND-142)**:`server/src/net/schema.colyseus.ts` 是**被 import 真跑**的
+ *    —— H11/H12 原本「抽源码体 + `includes`」,于是「只打印不抛错」「对账漏一个类」
+ *    这两类改动**恰好是绿的**(存在性断言冒充行为断言)。现在改为注入坏字段表 +
+ *    断言 `assertSchemaReady()` **真的抛**、`assertFieldTableParity()` **真的报出那一条**。
+ *    代价:该文件传递依赖 `@colyseus/schema`(仓库已声明的 optionalDependency),
+ *    与 `tests/WS-FND-12` import `room.colyseus.ts` 是同一手法。
+ *    仍**不得**直接 import `colyseus` / `better-sqlite3`。
  *
  * 运行:`node tests/WS-07.test.ts` 或 `node scripts/verify.ts --only WS-07`
  */
@@ -22,6 +29,8 @@ import * as SC from '../server/src/net/schema.ts';
 import * as SH from '../shared/types/wire.ts';
 /* task-59:帧数算术的**外部标尺**(独立于接线路径)与双频常量。 */
 import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT } from '../server/src/sim/world_sim.ts';
+/* ★ FND-142:装配层的对账 / 自检**真 import**(见文件头「唯一例外」)。 */
+import * as COL from '../server/src/net/schema.colyseus.ts';
 
 /** 仓库根(本文件在 tests/ 下)。 */
 const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -3334,31 +3343,79 @@ test('H10 生产代码确实调用 assertSchemaReady()(防止有人删掉这行�
   ok(onCreate![0].includes('assertSchemaReady()'), 'assertSchemaReady() 应在 onCreate 内调用(fail-fast)');
 });
 
-test('H11 assertSchemaReady 的实现保留:抛错、聚合 errs、不吞异常', () => {
-  const src = readColyseusSchema();
-  const body = /export function assertSchemaReady\(\)[\s\S]*?\n\}/.exec(src);
-  ok(body !== null, '应保留 assertSchemaReady 实现');
-  const b = body![0];
-  ok(b.includes('assertFieldTableParity()'), '应调用 assertFieldTableParity()');
-  ok(b.includes('errs.length > 0'), '应在有错误时判定失败');
-  ok(b.includes('throw new Error'), '应抛错(fail-fast),而不是仅打印');
-  /* 错误信息应带上有问题字段(便于定位)。 */
-  ok(b.includes('errs.join'), '错误信息应聚合全部 errs');
+test('H11 assertSchemaReady **真的抛错**于坏字段表(注入验证:取代「抽源码体 + includes」)', () => {
+  /* 原判定是 `body.includes('throw new Error')` —— 对「把 throw 改成 console.log」
+     恰好是绿的(本仓反复点名的「存在性断言冒充行为断言」)。
+     现改为:注入一张坏字段表 ⇒ 断言它**真的抛**,且报错正文能指到那个字段。 */
+  eq(COL.assertFieldTableParity(), [], '正对照:未注入时应无对账错误');
+  COL.assertSchemaReady(); /* 正对照:干净表下不抛 */
+
+  const table = FIELD_TABLE as unknown as SH.FieldSpec[];
+  const push = (spec: SH.FieldSpec): void => { table.push(spec); };
+
+  /* ── 注入 1:表里多一条**类体里没有**的字段 ⇒ 「缺少字段」方向 ── */
+  push({ key: 'fnd142Injected', bit: 31, type: FieldType.STR, bytes: 1, note: 'FND-142 注入验证' });
+  try {
+    const errs = COL.assertFieldTableParity();
+    ok(errs.some((e) => e.includes('fnd142Injected') && e.includes('缺少字段')),
+      `注入后应报「缺少字段 fnd142Injected」,实际 ${JSON.stringify(errs)}`);
+    let threw: unknown = null;
+    try { COL.assertSchemaReady(); } catch (err) { threw = err; }
+    ok(threw instanceof Error, '★ 必须**抛**(「只打印不抛」的实现会在这里变绿)');
+    ok(String((threw as Error).message).includes('fnd142Injected'),
+      '错误正文要带上问题字段(便于定位),而不是只丢一句「不一致」');
+  } finally {
+    table.pop();
+  }
+  eq(COL.assertFieldTableParity(), [], '注入必须被撤掉(否则后续用例被污染)');
+
+  /* ── 注入 2:表里**拿掉**一条 ⇒ 「多出字段」方向 ── */
+  const removed = table.pop()!;
+  try {
+    ok(COL.assertFieldTableParity().some((e) => e.includes(`多出字段 ${removed.key}`)),
+      `拿掉 ${removed.key} 后应报「多出字段 ${removed.key}」`);
+  } finally {
+    push(removed);
+  }
+
+  /* ── 注入 3:表格自校验(bit 重复)⇒ `validateFieldTable` 那条路径 ── */
+  push({ ...table[table.length - 1], key: 'fnd142BitClash' });
+  try {
+    ok(COL.assertFieldTableParity().some((e) => e.includes('bit')),
+      '重复 bit 必须被表格自校验抓到(只对字段名的判定在这里是绿的)');
+  } finally {
+    table.pop();
+  }
+  eq(COL.assertFieldTableParity(), [], '三种注入之后必须复原为「完全对齐」');
 });
 
-test('H12 assertFieldTableParity 的判定逻辑完整:缺字段 + 多字段 + 表格自校验', () => {
-  const src = readColyseusSchema();
-  const body = /export function assertFieldTableParity\(\)[\s\S]*?\n\}/.exec(src);
-  ok(body !== null, '应保留 assertFieldTableParity 实现');
-  const b = body![0];
-  ok(b.includes('validateFieldTable'), '应做表格自校验(bit 冲突等)');
-  ok(b.includes('缺少字段'), '应检查「缺字段」方向');
-  ok(b.includes('多出字段'), '应检查「多字段」方向');
-  /* 四个类都要被纳入对账,一个都不能漏。 */
-  for (const cls of ['PlayerSchema', 'WildlifeSchema', 'BossSchema', 'RoomMetaSchema']) {
-    ok(b.includes(cls), `对账应覆盖 ${cls}`);
+test('H12 assertFieldTableParity 的四个类**逐类**可判(注入验证:漏一个类即红)', () => {
+  /* 「四个类都纳入对账」原先靠 `b.includes(cls)` + 数 `label: '...'` 的条数 ——
+     「把 RoomMetaSchema 那一条换成重复项」对它是绿的。
+     改为**逐类注入**:从该类的字段表里拿掉一条 ⇒ 对账必须在**那一个** label 上
+     报出「多出字段 <key>」,且只报这一条(证明四个类各自独立参与对账)。 */
+  const tables: [string, SH.FieldSpec[]][] = [
+    ['PlayerSchema', FIELD_TABLE as unknown as SH.FieldSpec[]],
+    ['WildlifeSchema', WILDLIFE_FIELD_TABLE as unknown as SH.FieldSpec[]],
+    ['BossSchema', BOSS_FIELD_TABLE as unknown as SH.FieldSpec[]],
+    ['RoomMetaSchema', ROOM_FIELD_TABLE as unknown as SH.FieldSpec[]],
+  ];
+  eq(tables.map((t) => t[0]), ['PlayerSchema', 'WildlifeSchema', 'BossSchema', 'RoomMetaSchema'],
+    '对账必须是这四类(与 schema.colyseus.ts 的 checks 同口径,少一个即漏一类)');
+  for (const [label, t] of tables) {
+    const removed = t.pop()!;
+    try {
+      const errs = COL.assertFieldTableParity();
+      ok(errs.some((e) => e.startsWith(`${label} 多出字段 ${removed.key}`)),
+        `${label}:拿掉 ${removed.key} 后应报「${label} 多出字段 ${removed.key}」,实际 ${JSON.stringify(errs)}`);
+      eq(errs.filter((e) => e.startsWith(`${label} 多出字段`)).length, 1,
+        `${label} 只应报一条(多于一条 = 同一字段被两个 label 算重)`);
+    } finally {
+      t.push(removed);
+    }
   }
-  eq([...b.matchAll(/label: '(\w+)'/g)].length, 4, '应有 4 条对账项');
+  eq(COL.assertFieldTableParity(), [], '逐类注入后必须复原(后面的用例依赖干净的表)');
+  COL.assertSchemaReady(); /* 干净表下不抛(上一条已证注入会抛) */
 });
 
 test('H13 装配层的字段清单与核心字段表逐类对账(独立复现 parity 判定)', () => {

@@ -1022,12 +1022,17 @@ export class WorldSim {
   private readonly mobBiome = new Map<string, string>();
 
   /**
-   * ★ WS-FND-135(P1):**待收的尸体** —— 实例 ID → 死亡时的快帧序。
+   * ★ WS-FND-135(P1) / WS-FND-140(P1):**待收的尸体** —— 实例 ID → 死亡时的快帧序。
    *
    * 为什么不「当场移除」:死亡那一帧的收尾还要读这条运行时(结算读 `after.x/y`、
    * 掉落落地、同帧的预警结算)。「变尸体」与「从三张表里消失」是**两件事**,
    * 所以标记 + 延迟 `MOB_CORPSE_FRAMES` 帧收尸。`addMob` 同 id 再登记会撤销标记
    * (姜饼小人复活 / 覆盖式重建)。
+   *
+   * ⚠️ **写入者不止 `damageMob`**:`reapDeadMobs` 每帧开头还会把 `mobHost.deadIds()`
+   * 里尚未登记的(即 AI 自己 `rt.alive = false` 的:汤锅河蟹 / 姜饼逃逸 / 宝箱自爆)
+   * 补进来。所以「这具尸体在不在账里」不可用来判断它是不是被玩家打死的 ——
+   * 那是 `killLedger` / `settleKill` 的职责。这里只回答「死亡帧号是几」。
    */
   private readonly deadMobs = new Map<string, number>();
 
@@ -3624,7 +3629,10 @@ export class WorldSim {
          `spawner.remove` 全仓**零调用** ⇒ 尸体永久留在三张表里:
          `listWildlife` 每帧仍复制排序它、AOI 仍唤醒它、`resolvePairs` 仍与它配对。
          这里只**标记**(带死亡帧号),真移除在 `tick()` 末尾的 `reapDeadMobs()`
-         —— 死亡那一帧的收尾(掉落落地 / 同帧预警结算)还要读这条运行时。 */
+         —— 死亡那一帧的收尾(掉落落地 / 同帧预警结算)还要读这条运行时。
+         ★ WS-FND-140(P1):这是**两条登记路径之一**,不是唯一入口 —— AI 自己
+         `rt.alive = false` 的(汤锅河蟹 / 姜饼逃逸 / 宝箱自爆)不经这里,由
+         `reapDeadMobs` 开头的 `mobHost.deadIds()` 扫描补齐。 */
       this.deadMobs.set(mobId, this.frameCount);
     }
     return r;
@@ -6437,6 +6445,15 @@ export class WorldSim {
    * `aoi.update()` 仍把它当候选、`resolvePairs()`(两两碰撞)仍与尸体配对 ——
    * 而且群系计数只增不减,`hardCap` 迟早被尸体占满(「打死一片之后再也不刷怪」)。
    *
+   * ## ★ WS-FND-140(P1):死亡不止 `damageMob` 一条路
+   *
+   * `deadMobs` 原先只有 `damageMob` 一处写入,而 `behaviors.ts` 有 **3 处**直接
+   * `rt.alive = false`(汤锅河蟹 / 姜饼逃逸 / 宝箱自爆)—— 这些尸体**永不进账**
+   * ⇒ 本函数永远看不见它们,三张表照样泄漏,`corpseCount` 也恒 0(监视器撒谎)。
+   * 修法不是「再去改那 3 处」(新增 AI 会再漏一次),而是让收尸**扫描 `alive === false`**
+   * (`mobHost.deadIds()`),登记只补「死亡帧号」给延迟窗口用。由此得到单一不变量 ——
+   * **宿主表里所有已死实例一定在 `deadMobs` 里**。
+   *
    * ## 为什么三处一起(不许只摘一处)
    *
    * 三张表各自都能独立地「看见」这只怪,只摘一处等于换一张表继续浪费:
@@ -6449,17 +6466,36 @@ export class WorldSim {
    * @returns 本次真的收掉的尸体数(`0` = 还没到点,或没有尸体)
    */
   reapDeadMobs(): number {
+    /* ── 1. ★ WS-FND-140(P1):扫描宿主里所有 alive===false 的实例,补齐登记 ──
+       修前 deadMobs 只有 damageMob 一处写入,而 behaviors.ts 有 3 处直接
+       `rt.alive = false`(汤锅河蟹 / 姜饼逃逸 / 宝箱自爆)⇒ 它们永不进账,
+       下面这段永远看不见,尸体永久留在三张表,corpseCount 恒 0(监视器撒谎)。
+       修法不是「再去改那 3 处」(新增 AI 会再漏),而是让收尸**扫描 alive===false**;
+       登记只补「死亡帧号」给延迟窗口用。不变量:宿主表里已死的都在 deadMobs 里。 */
+    for (const id of this.mobHost.deadIds()) {
+      if (!this.deadMobs.has(id)) this.deadMobs.set(id, this.frameCount);
+    }
     if (this.deadMobs.size === 0) return 0;
-    let reaped = 0;
-    /* 按 ID 升序处理:`deadMobs` 是 Map(遍历顺序 = 击杀顺序),
+
+    /* ── 2. 挑出过窗口的(按 ID 升序:deadMobs 是 Map,遍历顺序 = 击杀顺序;
        排一次序让「同帧收多具」的**副作用顺序**也确定 —— 物理旁表与刷怪计数
-       都有顺序敏感的读者。 */
+       都有顺序敏感的读者)。 ── */
+    const ready: string[] = [];
     for (const id of [...this.deadMobs.keys()].sort()) {
       const diedAt = this.deadMobs.get(id);
       if (diedAt === undefined || this.frameCount - diedAt < MOB_CORPSE_FRAMES) continue;
+      ready.push(id);
+    }
+    if (ready.length === 0) return 0;
+
+    /* ── 3. 宿主侧:交给宿主自己的收尸口(MobHost.reapDead)—— 单一口径,
+       编排层不再直接 delete。它返回的列表只用于「确实摘了」;即便某条此前已被
+       测试注入提前摘走(返回值里没有它),下面三张表仍要清干净。 ── */
+    this.mobHost.reapDead(ready);
+
+    let reaped = 0;
+    for (const id of ready) {
       this.deadMobs.delete(id);
-      /* 宿主:条目连带 AI 实例一起摘掉(重复移除返回 false,不报错)。 */
-      this.mobHost.removeMob(id);
       /* AOI:唤醒集合 + 区块桶一起摘(漏了唤醒集合 ⇒ 每慢帧仍推进一具尸体)。 */
       this.aoi.unregisterMob(id);
       /* 物理:走 `remove()` 而不是 `bodies.delete` —— 五张旁表一起回收
@@ -6477,9 +6513,18 @@ export class WorldSim {
     return reaped;
   }
 
-  /** 待收尸体数(还没有被 `reapDeadMobs` 摘掉的已死实例)。 */
+  /**
+   * 待收尸体数。
+   *
+   * ★ WS-FND-140(P1):**监视器不能说谎**。修前只读 `deadMobs`(只有 `damageMob`
+   * 写入)⇒ AI 置死的尸体不计入 ⇒ 恒 0。现在取「待收账 ∪ 宿主里 `alive === false`
+   * 的实例」的去重并集:前者覆盖「已登记、还没过延迟窗口」,后者覆盖
+   * 「刚死、本帧还没走到帧末收尸点」。
+   */
   get corpseCount(): number {
-    return this.deadMobs.size;
+    const ids = new Set<string>(this.deadMobs.keys());
+    for (const id of this.mobHost.deadIds()) ids.add(id);
+    return ids.size;
   }
 
   /**
@@ -9915,7 +9960,9 @@ export class WorldSim {
 
     /* ── ★ WS-FND-135(P1):收尸(帧末)──
        只在这里收:`deadMobs` 是「死亡帧号」表,过了 `MOB_CORPSE_FRAMES` 帧才真移除。
-       三张表(宿主 / AOI / 物理)+ 刷怪计数一处清 —— 见 `reapDeadMobs` 的 docblock。 */
+       三张表(宿主 / AOI / 物理)+ 刷怪计数一处清 —— 见 `reapDeadMobs` 的 docblock。
+       ★ WS-FND-140(P1):本调用**自己发现**尸体(扫描 `alive === false`),不依赖
+       `damageMob` 登记,所以 AI 置死的那些也在这里被收。 */
     this.reapDeadMobs();
 
     /* ── ★ WS-FND-135(P2):事件投递(帧末,**慢帧块之后**)──

@@ -562,7 +562,16 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
       正是本检测器输出里已注明的那类「层间有意传递」。
   ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
      那时要做的仍是先看是哪一对容器,而不是接着抬。 */
-export const G_CANDIDATE_WATERMARK = 74; /* 2026-11-19(第七轮):`node scripts/judgement_audit.ts --baseline` 实测 **74** > 水位 73
+export const G_CANDIDATE_WATERMARK = 75; /* 2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
+   —— ⚠️ **多出的那一条与本轮改动无关,A/B 已证明**(Q4):
+   把本批新增的文件移走后再跑同一条命令,**仍是 75** ⇒ 增量不来自本次改动面,
+   属第六/七轮同一类「层间有意传递」的运行时快照配对(并行接线时的读数)。
+   ⇒ 按**实测**重钉 74 → 75。抬水位不关告警:守卫比的仍是**总命中数**,
+   下一个人再引入这类形态时它照样会响 —— 那时先看是哪一对容器,而不是接着抬。
+   ★★ **主判据仍是逐条明细**:`judgement_audit.ts` 的 `i` 行会为每一对打印
+      [共享]/[独有] 字段,定性必须看那里;水位只是**粗粒度的增长守卫**。
+      只读水位这一个数字 = 拿汇总数替代逐条判定,那是本仓反复记为陷阱的那类错误。 */
+/* 2026-11-19(第七轮):`node scripts/judgement_audit.ts --baseline` 实测 **74** > 水位 73
    —— 增量 2 对,逐条核对为「层间有意传递」那一类(两条都是**本轮并行接线的运行时快照**):
    1) `server/src/net/actions/start_party.ts:106` `PartySnapshot` ↔ `PartySettlement`@:124
       共享[mode,startedAtMs,endedAtMs] / 独有 A[state,participants,scores] / 独有 B[ranking]

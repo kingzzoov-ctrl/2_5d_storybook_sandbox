@@ -132,6 +132,13 @@ import { createAudio, type AudioHandle } from './audio_out.ts';
    这两个模块都**纯**(零三方、零 DOM)⇒ 可被 WS-12 直接 import 断言。 */
 import { ClientStateStore } from '../net/state_store.ts';
 import { telegraphCenterOf } from '../net/telegraph_center.ts';
+/* ★ 第十轮(WS-FND-138):提示条要把**两张键位表**都报出来(`#hint` 的 `keysHint`)。
+   两张表住在 `net/action_binding.ts`(纯模块、零 DOM),这里只读它,不手抄一份键位
+   —— 手抄的那份必然与真表漂,而"提示写着 N、其实按不到"是最难查的一种。 */
+import { entryKeyHints, hotbarKeyHints } from '../net/action_binding.ts';
+/* ★ 第十轮 P1:背包拖拽是**本地整理视图**(`dragUplink = 'local-only'` 这个读数
+   就是为了让"它没发报文"可被断言,而不是只在注释里)。 */
+import { DRAG_UPLINK } from '../ui/inventory.ts';
 /* ★ WS-FND-23:相机跟随**权威位置**。判定全在 `net/camera_follow.ts`(纯函数、
     零三方、零 DOM ⇒ 可被 `tests/WS-FND-23` 在 node 里直接断言),本文件只剩
     **每帧一个调用点**。
@@ -1308,7 +1315,10 @@ export function boot(container: HTMLElement): BootHandle {
          ★ 缩放档位(`[` / `]`,6 档)与搜索(`/`)也必须写进提示 —— 否则
            "存在但没人知道能按"的键位等于不存在。 */
       keysHint: `${panelKeyHints()} · B Boss · [ ] 缩放 ${isoCam.zoom}×`
-        + ` · / 搜索${searchMode ? `("${invQuery}")` : ''} · 拖拽框选蓝图 · WASD 移动角色(相机跟随)`,
+        + ` · / 搜索${searchMode ? `("${invQuery}")` : ''} · 拖拽框选蓝图 · WASD 移动角色(相机跟随)`
+        + ` · 空格 攻击(同时锁存一次跳跃;服务端不认 jump ⇒ 现在只是挥刀)`
+        + ` · 动作键 ${entryKeyHints()} · 热键 ${hotbarKeyHints()}`
+        + ' · 拖拽背包=本地整理(不发报文,刷新即回原序)',
     };
   };
 
@@ -1472,8 +1482,13 @@ export function boot(container: HTMLElement): BootHandle {
           slotItemIds = applied.itemIds;
           slotMoveCount += 1;
           refreshInventory();
+          /* ★ 第十轮 P1:文案必须**如实标出"这是本地整理"** ——
+             它只改了本机 `slotItemIds`(`DRAG_UPLINK === 'local-only'`),
+             服务端的归属与背包一件没动,刷新/重连即回原序。
+             修前这里只写"第 3 格 → 第 9 格",玩家读到的是"搬好了、存住了"。 */
           lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格`
-            + `(${moved.itemId} ×${moved.count};格位 ${fromGlobal} ⇄ ${toGlobal})`;
+            + `(${moved.itemId} ×${moved.count};格位 ${fromGlobal} ⇄ ${toGlobal})`
+            + ` · 本地整理视图(不发报文:${DRAG_UPLINK};刷新/重连即回原序)`;
         } else {
           /* 越界 / 同一格:如实说"没生效",不假装搬了 */
           lastMove = `第 ${moved.fromSlot} 格 → 第 ${moved.toSlot} 格 未生效(格位 ${fromGlobal}/${toGlobal})`;

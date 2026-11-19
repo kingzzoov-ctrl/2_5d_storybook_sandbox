@@ -283,26 +283,44 @@ export class MobHost implements MobWorld {
   }
 
   /**
-   * ★ WS-FND-135(P1):**仍登记在册但已经死了**的实例 ID(字典序稳定)。
+   * ★ WS-FND-135(P1) / WS-FND-140(P1):**仍登记在册但已经死了**的实例 ID(字典序稳定)。
    *
    * 存在的理由:修前全仓 `removeMob` **零调用** ⇒ 击杀只把 `rt.alive` 置 false,
    * 尸体永久留在宿主表里(`runtimes()` 每帧仍复制排序它、AOI 仍唤醒它、
    * 物理仍拿它配对)。`deadIds()` 让「尸体还没收」从**靠肉眼读代码**变成可断言。
+   *
+   * ★ WS-FND-140:它不只是判据用的读口,还是**生产收尸的发现器** ——
+   * `WorldSim.reapDeadMobs` 每帧先用它把「不经 `damageMob` 的死亡」补登记进
+   * `deadMobs`(`behaviors.ts` 里 3 处直接 `rt.alive = false`:汤锅河蟹 /
+   * 姜饼逃逸 / 宝箱自爆),`WorldSim.corpseCount` 也读它。修前只认 `damageMob`
+   * 一处登记 ⇒ 这些尸体永不进账、`corpseCount` 恒 0(监视器撒谎)。
    */
   deadIds(): string[] {
     return [...this.mobs.keys()].filter((k) => this.mobs.get(k)!.rt.alive === false).sort();
   }
 
   /**
-   * ★ WS-FND-135(P1):收尸 —— 把已死条目从**本表**摘掉,返回被摘掉的 ID(字典序)。
+   * ★ WS-FND-135(P1) / WS-FND-140(P3):收尸 —— 把已死条目从**本表**摘掉,返回
+   * 被摘掉的 ID(字典序)。
+   *
+   * ## 它是**生产路径**,不是「只被测试当注入用」
+   *
+   * `WorldSim.reapDeadMobs` 先按「死亡帧号 + `MOB_CORPSE_FRAMES`」算出**到点的**
+   * ID 集合,再 `reapDead(ready)` 交给宿主自己摘 —— 单一入口,编排层不再直接
+   * `mobs.delete`。`only` 缺省(不传)= 摘掉**全部**已死条目,这是给
+   * `tests/WS-FND-135` 的注入形态用的(证明「只摘宿主一处」不够)。
    *
    * ⚠️ 只动宿主自己的表:AOI(`aoi.unregisterMob`)、物理(`physics.remove`)、
    * 刷怪计数(`spawner.remove`)的对称清理由**编排层**做(`WorldSim.reapDeadMobs`)——
    * 宿主不认识那三张表(见文件头「适配而非重写」),在这里顺手清理就会长出第二份
    * 「谁是权威」的答案。
+   *
+   * @param only 只摘这些 ID(仍要求它们当前 `alive === false`;不存在的 ID 被忽略)
    */
-  reapDead(): string[] {
-    const dead = this.deadIds();
+  reapDead(only?: readonly string[]): string[] {
+    const dead = only === undefined
+      ? this.deadIds()
+      : [...new Set(only)].filter((id) => this.mobs.get(id)?.rt.alive === false).sort();
     for (const id of dead) this.mobs.delete(id);
     return dead;
   }

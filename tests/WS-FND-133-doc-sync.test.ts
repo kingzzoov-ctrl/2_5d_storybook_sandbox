@@ -17,6 +17,8 @@
  * P5 `--check` **绝不写盘**
  * P6 未测量 ⇒ 打印「未校验」,**不是**通过
  * P7 锚点被删 / 表里混进 HANDOVER 自己 ⇒ 结构错误,且**不写盘**
+ * P8 台账**表体 ↔ §2.10 汇总表**不符 ⇒ 红(自检不许被"补齐汇总"糊过去)
+ * P9 `--gate-log` 复用路径活着:UTF-16LE(BOM)日志能解码 + 9 条正则都能取到数
  * ```
  *
  * ## 为什么能在 1 秒内跑完(而不是 4 分钟)
@@ -52,6 +54,40 @@ const DOC_FILES = [
   'docs/COMPLETION-CRITERIA.md',
   'docs/TASK-83-wasd-three-options.md',
 ];
+
+/**
+ * 临时树里的**合成** `docs/WIRING-LEDGER.md`(表体 3 行 ⇒ 1 未接 / 1 部分接 / 1 已接 / 0 已登记)。
+ *
+ * 为什么必须有它:`measureWiring()` 把台账当**静态测量源**读(两条测量路径都要),
+ * 树里缺这份文件时它报的是 error(缺件不许静默跳过)⇒ `--write` 会被拦住。
+ * 这里给的形状与真台账同构(表体 `| R6-... |` + §2.10 汇总表),因此
+ * 「README 那一行取自**表体实算**」这条判据在临时树里同样成立;
+ * 数字由本文件自己定 ⇒ 若 `sync-docs` 改成从别处取数,断言立刻红。
+ */
+const SYNTH_LEDGER = [
+  '# 合成逐符号台账(WS-FND-133 临时树专用)',
+  '',
+  '> 形状与 `docs/WIRING-LEDGER.md` 同构:表体 `| R6-... |` + §2.10 汇总表。',
+  '',
+  '## §2.1 客户端',
+  '',
+  '| ID | 符号 | 位置 | 现状 | 理由(调用点) | 判据 |',
+  '|---|---|---|---|---|---|',
+  '| R6-T-1 | `a` | `x.ts` | **已接** | 合成 | — |',
+  '| R6-T-2 | `b` | `x.ts` | **部分接** | 合成 | — |',
+  '| R6-T-3 | `c` | `y.ts` | **未接** | 合成 | — |',
+  '',
+  '## §2.10 汇总',
+  '',
+  '| 桶 | 条数 |',
+  '|---|---|',
+  '| 已接 | 1 |',
+  '| 已登记 | 0 |',
+  '| 部分接 | 1 |',
+  '| 未接 | 1 |',
+  '| 合计 | 3 |',
+  '',
+].join('\n');
 
 /**
  * 合成测量值。**每个数都是本文件自己定的**(故意与真仓的当前值不同):
@@ -94,6 +130,8 @@ function mkTree(patch?: (m: Record<string, unknown>) => void): Tree {
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(ROOT, rel), join(dir, rel));
   }
+  /* 静态测量源里唯一不来自快照的一份:台账(缺件即 error ⇒ 必须补) */
+  writeFileSync(join(dir, 'docs', 'WIRING-LEDGER.md'), SYNTH_LEDGER, 'utf8');
   const snapshot: Record<string, unknown> = JSON.parse(JSON.stringify(M)) as Record<string, unknown>;
   if (patch !== undefined) patch(snapshot);
   const measure = join(dir, 'measure.json');
@@ -135,6 +173,9 @@ test('FND133-1 --write 幂等:连跑两次,第二次零变化且字节不变', (
     ok(a.readme.includes('共 **18 个**'), 'README 的 .ts 总数应取测量值 18');
     ok(a.handover.includes('| 用例 | **1234 条 / 7 套件** | WS 100 条 / 3 套件 · 基座 FND 1134 条 / 4 套件'),
       'HANDOVER §三 用例行应取测量值');
+    /* 台账那一行取自临时树里**合成台账的表体实算**(3 行:1/1/1/0),不是抄的常数。 */
+    ok(a.readme.includes('(3 行:**1 全未接 / 1 部分接 / 1 已接 / 0 已登记**)'),
+      `README 的台账桶计数应取合成台账表体(实际:${a.readme.split('\n').find((l) => l.includes('WIRING-LEDGER.md'))})`);
     const second = run(t, '--write');
     eq(second.status, 0, second.out);
     ok(second.out.includes('已写回 0 处'), `第二次 --write 应零变化(实际:${second.out.trim().split('\n').pop()})`);
@@ -299,6 +340,114 @@ test('FND133-11 台账与 PROGRESS 行也由测量写回(§九 backlog 行曾写
     ok(ho.includes('# 133 条 / 0 未关闭 / 0 阻塞'), '§九 backlog 行必须取测量值');
     ok(ho.includes('| PROGRESS 陷阱 | **7 节 / 1..7** | 严格递增 ✓ / 无缺号 ✓ / 无 BOM ✓ / 12345 字节 |'),
       `PROGRESS 行必须整体由测量生成(实际:${ho.split('\n').find((l) => l.includes('PROGRESS 陷阱'))})`);
+  } finally { t.drop(); }
+});
+
+test('FND133-12 台账表体 ↔ §2.10 汇总表不符 ⇒ 红,且 --write 拒绝写盘', () => {
+  const t = mkTree();
+  try {
+    settle(t);
+    const ledgerPath = join(t.dir, 'docs', 'WIRING-LEDGER.md');
+    const readmePath = join(t.dir, 'README.md');
+    /* 注入:汇总表自报「已接 = 2」,而表体只有 1 行**已接** ⇒ 台账自己内部矛盾。 */
+    writeFileSync(ledgerPath,
+      readFileSync(ledgerPath, 'utf8').replace('| 已接 | 1 |', '| 已接 | 2 |'), 'utf8');
+    const before = readFileSync(readmePath);
+    const c = run(t, '--check');
+    eq(c.status, 1, `表体与汇总表不符必须红(实际 ${c.status})\n${c.out}`);
+    ok(c.out.includes('台账内部矛盾'), `必须报「台账内部矛盾」(实际:${c.out})`);
+    ok(c.out.includes('汇总表「已接」= 2') && c.out.includes('表体实算 1'),
+      `必须同时给出自报值与实算值(实际:${c.out})`);
+    const w = run(t, '--write');
+    eq(w.status, 1, `台账内部矛盾时 --write 必须拒绝(实际 ${w.status})\n${w.out}`);
+    eq(readFileSync(readmePath).toString('utf8'), before.toString('utf8'),
+      '台账内部矛盾时不得写盘(否则就是把错数字盖上「已同步」的章)');
+  } finally { t.drop(); }
+});
+
+/* ───────── 测量路径二:`--gate-log` 复用(不给 `--measure` 时走的就是这条) ───────── */
+
+/**
+ * 合成门禁输出:**每行形状逐字取自 `verify.ts` 的打印模板**(数字由本文件自己定)。
+ *
+ * 为什么要有它:`parseGate()` 的取数正则只在"真跑一次 `verify --all`"时被执行,
+ * 而生产调用(`verify.ts`)走的是 `--measure` 快照 ⇒ **正则坏死无人发现**:
+ * 某个字段解析不到 ⇒ 那一栏静默变「未校验」⇒ 文档里那个数字再也没人比。
+ * 本用例把"日志复用"这条路径**钉住**:字段全认出来 = 正则活着。
+ */
+function gateLogText(): string {
+  return [
+    '  ✓ 14 份 WS 文档结构完整,且与测试集合一一对应',
+    '  ✓ 内容与基线一致(v5-deadbeef)',
+    '  ✓ 容量账本:物品 12/34,可用号 4321',
+    '  ✓ 全仓可擦除:6 个目录无 enum / 参数属性 / namespace / 装饰器 / 缺扩展名导入'
+      + '(装饰器例外 3 处已登记并核对)',
+    '  ✓ 入口执行层登记自洽(8 个 verdict 守卫 handler 已登记;其中 2 个成功路径为空)',
+    '  ✓ 实测取自客户端 4 处(已登记 1 处)',
+    '  ✓ 用例汇总:2345 条通过(9 个套件;WS-01..11 共 301 条 / 4 套件;基座 2044 条 / 5 套件)。'
+      + '跳过 0 项**未校验**',
+    '  ✓ 冻结层不变量与实测一致(21)',
+    '  ✓ 生产可达性:可达 61 / 不可达 39 (共 100,入口 12 个,白名单 39 条)',
+    '  ✓ 欠账构成(39 条中 6 条**非欠账**,余 33 条按卡点分类):等客户端入口 1 / 等编排层接线 2'
+      + ' / 等服务端机制 3 / 等客户端机制 4 / 等裁决 5',
+    '  ── 本节 7/9 条门禁通过 ──',
+    '  ✓ 差集 2 条是「有生产引用但引用者也不可达」',
+    '  ✓ 同义反复候选:命中 3 条(白名单 4 条)',
+    '  ✓ 类型错误未增加(基线 261 条 / 实测 111 条;唯一指纹 基线 7 / 实测 3)',
+    '  ✓ 门禁自检全部通过(30/31)',
+  ].join('\n');
+}
+
+/** 与 `run()` 相反:**不给 `--measure`** —— 走 `--gate-log` / 默认 spawn `verify --all` 那条路。 */
+function runGate(t: Tree, ...args: string[]): Run {
+  const r = spawnSync(
+    process.execPath,
+    [SYNC, ...args, `--root=${t.dir}`],
+    { cwd: ROOT, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120_000 },
+  );
+  return { status: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+}
+
+test('FND133-13 `--gate-log` 复用路径活着:UTF-16LE(BOM)日志能解码 + 每条正则都取到数', () => {
+  const t = mkTree();
+  try {
+    /* ★ 陷阱复现:PowerShell 的 `node scripts/verify.ts --all > g.log` 写出的是
+       **UTF-16LE + BOM**;按 utf8 读 ⇒ 中文字段全匹配不到 ⇒ 全体「未校验」而输出看着正常。 */
+    const logPath = join(t.dir, 'gate.log');
+    writeFileSync(logPath, Buffer.concat([
+      Buffer.from([0xFF, 0xFE]), Buffer.from(gateLogText(), 'utf16le'),
+    ]));
+    const w = runGate(t, '--write', `--gate-log=${logPath}`);
+    eq(w.status, 0, `--gate-log 下 --write 应成功(实际:${w.status})\n${w.out}`);
+    ok(w.out.includes(`--gate-log ${logPath}`), `测量源必须自报是复用的日志(实际:${w.out.split('\n')[0]})`);
+    /* 每个字段都取自**那份日志**(不是文档旧值、也不是「未校验」) */
+    const md = readmeOf(t);
+    ok(md.includes('可用号 4321'), '可用号应取自日志');
+    ok(/生产可达性\s+61\/100/.test(md), '可达性应取自日志');
+    ok(/跨 WS 集成\s+7\/7/.test(md), '跨 WS 集成应取自日志(本节 7/9)');
+    ok(md.includes('共 2345 个用例'), '用例汇总应取自日志');
+    ok(/测试执行\s+9\/9/.test(md), '套件数应取自日志');
+    const ho = handoverOf(t);
+    ok(ho.includes('| 类型检查基线 | **111 条 / 指纹 3**'), '类型基线两数应取自日志');
+    ok(ho.includes('| 门禁自检 | **30/31**'), '门禁自检应取自日志');
+    ok(/\| 跨 WS 集成 \| 7\/7/.test(ho), 'HANDOVER §三 跨 WS 集成应取自日志');
+    /* 同一条路径上 `--check` 必须干净 */
+    const c = runGate(t, '--check', `--gate-log=${logPath}`);
+    eq(c.status, 0, c.out);
+    ok(c.out.includes('无变化'), `写回后 --check 应报无变化(实际:${c.out.trim().split('\n').pop()})`);
+    /* ★ 正则坏死的**可观测形式**:字段解析不到 ⇒ 那一栏变「未校验」。
+       这份日志覆盖了除台账以外的全部字段,而 `backlog.ts` 不在这棵临时树里
+       ⇒ 只允许**台账那 3 处**(README 未决台账 / §三 未决台账 / §九 backlog 行)未校验。 */
+    const skipped = c.out.split('\n').filter((l) => l.includes('未校验:'));
+    eq(skipped.length, 3, `只允许台账 3 处未校验(实际 ${skipped.length}:${skipped.join(' | ')})\n${c.out}`);
+    ok(skipped.every((l) => l.includes('台账') || l.includes('backlog')),
+      `未校验的必须是台账那几处(实际:${skipped.join(' | ')})`);
+    /* 既无 `--measure` 也无日志 ⇒ 默认 spawn `verify --all`;临时树没有 verify.ts
+       ⇒ 必须报「测量源缺失」,而不是把「没测量」说成「无变化」。 */
+    const noSrc = runGate(t, '--check');
+    eq(noSrc.status, 1, `缺测量源必须非零退出(实际 ${noSrc.status})\n${noSrc.out}`);
+    ok(noSrc.out.includes('找不到 scripts/verify.ts') || noSrc.out.includes('测量源缺失'),
+      `必须报测量源缺失(实际:${noSrc.out.slice(0, 300)})`);
   } finally { t.drop(); }
 });
 

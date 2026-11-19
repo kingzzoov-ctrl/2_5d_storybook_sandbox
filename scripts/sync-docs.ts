@@ -26,7 +26,22 @@
  * 3 (默认)              自己 spawn 一次 `node scripts/verify.ts --all` 并解析输出。
  *                      ⚠️ 全量口径:跑全部套件 + 门禁自检,实测约 4 分钟。
  *                        重复比对请用 `--gate-log` 复用,别跑第二遍。
+ * ★ 2 / 3 不是"备胎":`node scripts/sync-docs.ts --check` / `--write`(**不带 `--measure`**)
+ *   走的就是它们 —— 这是本工具面向人的接口,`verify.ts` 只是调用者之一。
+ *   它们的**存活**由 `tests/WS-FND-133-doc-sync.test.ts` 的 `FND133-13` 钉住:
+ *   UTF-16LE(BOM)日志的解码 + `parseGate()` **每条**正则都必须取到数 ——
+ *   少一条 ⇒ 那个字段静默变「未校验」⇒ 文档里那个数字再也不参与比对(第九轮的老毛病)。
  * ```
+ *
+ * ## 台账数字:一条**自检**(第十轮新增,不是同步)
+ *
+ * `docs/WIRING-LEDGER.md` 的四个桶(`已接` / `已登记` / `部分接` / `未接`)被写了**两遍**:
+ * 表体(§2.x 逐条)与 §2.10 汇总表(人写的合计)。`measureWiring()` 按表体的「现状」列**实算**,并
+ *   (a) 把实算值当成 `README.md` 那一行的应写值(锚点「逐符号台账(WIRING-LEDGER)桶计数」);
+ *   (b) **核对**汇总表与表体 —— 不符即红(exit 1、不写盘)。
+ * 为什么值得单列:那一行第十轮实测**四个数字全反**(README 写「34 行:20/5/2/6」,表体是
+ * 「36 行:9/2/20/5」),而两个来源都绿了很多轮 ⇒ 与本文开头同一条根因:**同一份事实不许有两个来源**。
+ * ⚠️ 「仍含未接的一半」那一列**不进**自检:它是语义判断,不是分类计数(见 `measureWiring` 的口径段)。
  *
  * **未测量 ≠ 通过**:某个字段这次没测到,就打印「未校验」并**不参与比对**,
  * 而不是当成 0 比(那会报假红)或当成对(那是静默绿)。
@@ -46,7 +61,7 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /* ───────────────────────── 测量结果的结构 ───────────────────────── */
@@ -78,6 +93,43 @@ interface SrcCounts {
   prodServer: number; prodClient: number; prodShared: number; prodTotal: number;
 }
 
+/* ───────────────── 台账数字(`docs/WIRING-LEDGER.md`)───────────────── */
+
+/** 「现状」列的四个词(唯一允许的取值;表体与汇总表两边都按它分类)。 */
+const WIRING_STATUS = {
+  /** 有生产调用点 */
+  wired: '已接',
+  /** 有白名单位置 / 门禁按计算式归类 */
+  registered: '已登记',
+  /** 只接了一部分 */
+  partial: '部分接',
+  /** 生产调用点 0 且无白名单位置 */
+  unwired: '未接',
+} as const;
+type WiringBucket = keyof typeof WIRING_STATUS;
+
+/**
+ * 台账的**各桶计数**(表体实算)与 §2.10 汇总表的自报值。
+ *
+ * 为什么这两个都要:`README.md` 那一行引用的是**实算值**,而汇总表是**人写的**。
+ * 两者不符就是台账自己内部矛盾(第九轮的先例:上一版写「合计 34」而表体 37 行)⇒ 当场红。
+ */
+interface Wiring {
+  /** 表体行数(§2.x 里 `| R6-… |` 开头的数据行) */
+  rows: number;
+  /** 表体按「现状」列的实算分桶 */
+  body: Record<WiringBucket, number>;
+  /** §2.10 汇总表的自报值;`null` = 汇总表解析不到(门禁看不见 ⇒ 必须红) */
+  summary: { rows: number; buckets: Record<WiringBucket, number> } | null;
+}
+
+/** 一行「现状」单元格 → 桶。返回 `null` = 四个词都不是(解析口径失效)。 */
+function wiringBucketOf(cell: string): WiringBucket | null {
+  /* 顺序敏感:「部分接」含「接」而不含其它三词;「已登记」与「已接」是两个字面量。 */
+  const order: WiringBucket[] = ['partial', 'unwired', 'registered', 'wired'];
+  for (const b of order) if (cell.includes(WIRING_STATUS[b])) return b;
+  return null;
+}
 /** 一次测量能给出的全部数字;`null` = 本次没有测量源(**未校验**,不是 0)。 */
 interface Numbers {
   docStruct: number | null;
@@ -100,6 +152,8 @@ interface Numbers {
   typecheck: Typecheck | null;
   progress: Progress | null;
   src: SrcCounts | null;
+  /** `docs/WIRING-LEDGER.md` 的台账数字(表体实算 + 汇总表自报,两者必须一致) */
+  wiring: Wiring | null;
 }
 
 const emptyNumbers = (): Numbers => ({
@@ -107,7 +161,7 @@ const emptyNumbers = (): Numbers => ({
   decoratorExempt: null, inert: null, trustFromClient: null, suites: null,
   selfcheck: null, crossWs: null, frozen: null, reach: null, debt: null,
   nonDebt: null, diffSet: null, ledger: null, taut: null, typecheck: null,
-  progress: null, src: null,
+  progress: null, src: null, wiring: null,
 });
 
 /** 数字 → 字符串;`null` 保持 `null`(= 该组不参与本次比对)。 */
@@ -195,6 +249,202 @@ function measureLedger(root: string): Ledger | null {
   const m = /总计 (\d+) 条 \/ 未关闭 (\d+) 条 \/ 阻塞 (\d+) 条 \/ 已关闭 (\d+) 条/.exec(out);
   if (m === null) return null;
   return { total: Number(m[1]), open: Number(m[2]), blocking: Number(m[3]), closed: Number(m[4]) };
+}
+
+/**
+ * `docs/WIRING-LEDGER.md` 的**表体逐行分类** + §2.10 汇总表的自报值。
+ *
+ * ## 为什么这一条要进门禁(第十轮实测的根因)
+ * README 之外,这份台账的四个桶被写了**两遍**:表体(逐条)与 §2.10 汇总表(人写的合计)。
+ * 第十轮实测 README 那一行写「34 行:20 全未接 / 5 部分接 / 2 已接 / 6 已登记」,
+ * 而表体是「36 行:9 / 2 / 20 / 5」—— **四个数字正好反过来**,两处都绿了很多轮。
+ * ⇒ 表体是**唯一真值源**:README 那一行由本文件写回(`ANCHORS` 里的
+ * 「逐符号台账(WIRING-LEDGER)桶计数」),汇总表与表体不符**当场红**。
+ *
+ * ## 口径(写下来,否则下一次改动又变成猜)
+ * · 表体 = `| R6-… |` 开头的数据行;「现状」列由**该表的表头**定位
+ *   (§2.7 的表比别的表多一列「段」,按列号硬编码必然错位);
+ * · 四桶取「现状」单元格里的词(互斥):`部分接` / `未接` / `已登记` / `已接`;
+ * · 「仍含未接的一半」那一列**不参与**自检 —— 它是语义判断(哪几条「已接」里
+ *   还缺一半),不是分类计数;硬算会把 4 条「已接但仍是半截」误判成红。
+ */
+function measureWiring(root: string): { wiring: Wiring | null; errors: string[] } {
+  const p = join(root, 'docs', 'WIRING-LEDGER.md');
+  if (!existsSync(p)) {
+    return {
+      wiring: null,
+      errors: ['docs/WIRING-LEDGER.md 不存在 ⇒ 台账数字无法自检(缺件不许静默跳过)'],
+    };
+  }
+  const errors: string[] = [];
+  const body: Record<WiringBucket, number> = { wired: 0, registered: 0, partial: 0, unwired: 0 };
+  const sum: Record<WiringBucket, number> = { wired: 0, registered: 0, partial: 0, unwired: 0 };
+  let rows = 0;
+  let statusCol = -1;
+  let summaryRows: number | null = null;
+  let sawSummaryBucket = false;
+  const num = (cell: string): number => {
+    const m = /\d+/.exec(cell);
+    return m === null ? Number.NaN : Number(m[0]);
+  };
+
+  for (const line of readFileSync(p, 'utf8').split('\n')) {
+    if (!line.startsWith('|')) { statusCol = -1; continue; }
+    const cells = line.split('|').map((c) => c.trim());
+    const idCell = cells[1] ?? '';
+    /* §2.10 汇总表:第二列是四个桶之一(表体的 ID 列永远是 `R6-…`,不会撞上)。 */
+    const sumBucket = wiringBucketOf(idCell);
+    if (sumBucket !== null) {
+      sawSummaryBucket = true;
+      sum[sumBucket] = num(cells[2] ?? '');
+      continue;
+    }
+    if (/^\*{0,2}合计/.test(idCell)) { summaryRows = num(cells[2] ?? ''); continue; }
+    /* 表头:按列名定位「现状」列(§2.7 的列数不同)。 */
+    if (cells.includes('现状')) { statusCol = cells.indexOf('现状'); continue; }
+    if (!/^R6-/.test(idCell) || statusCol < 0) continue;
+    const bucket = wiringBucketOf(cells[statusCol] ?? '');
+    if (bucket === null) {
+      errors.push(`docs/WIRING-LEDGER.md 表体行 ${idCell} 的「现状」列无法归入四桶`
+        + `(单元格:${cells[statusCol] ?? '(缺列)'})⇒ 台账口径失效`);
+      continue;
+    }
+    rows += 1;
+    body[bucket] += 1;
+  }
+
+  if (rows === 0) {
+    errors.push('docs/WIRING-LEDGER.md 表体一行都没解析到(`| R6-… |` 的行形状被改过)'
+      + ' ⇒ 台账数字无法自检');
+  }
+  if (!sawSummaryBucket || summaryRows === null || Number.isNaN(summaryRows)) {
+    errors.push('docs/WIRING-LEDGER.md §2.10 汇总表解析不到(四个桶 + 合计行)'
+      + ' ⇒ 台账自报值无法与表体核对');
+  } else {
+    for (const b of Object.keys(body) as WiringBucket[]) {
+      if (sum[b] !== body[b]) {
+        errors.push(`docs/WIRING-LEDGER.md:§2.10 汇总表「${WIRING_STATUS[b]}」= ${String(sum[b])},`
+          + `而表体实算 ${String(body[b])} ⇒ 台账内部矛盾(以表体为准)`);
+      }
+    }
+    if (summaryRows !== rows) {
+      errors.push(`docs/WIRING-LEDGER.md:§2.10 汇总表「合计」= ${String(summaryRows)},`
+        + `而表体实算 ${String(rows)} 行 ⇒ 台账内部矛盾`);
+    }
+  }
+
+  const parsed = sawSummaryBucket && summaryRows !== null && !Number.isNaN(summaryRows);
+  return {
+    wiring: {
+      rows,
+      body,
+      summary: parsed ? { rows: summaryRows as number, buckets: sum } : null,
+    },
+    errors,
+  };
+}
+
+/* ───────────── 测量源质量前置(WS-FND-139:两条测量路径共用一份判据)───────────── */
+
+/**
+ * 树里 `tests` 目录下所有 `*.test.ts` 的相对路径(posix,已排序)。
+ *
+ * 用途:**交叉核对"复用来的"套件数**。第十轮实测:同一棵树上 `--write` 量到
+ * 145/2641、`--check` 量到 146/2649 —— 差的那一个套件,是它的汇总行被 stderr 的
+ * 警告顶替了 ⇒ 那个数字**不是测量,是测量失败**。而"树里有几个套件文件"是一个
+ * 与门禁输出**无关**的静态事实 ⇒ 可以拿它对账。
+ */
+function measureTestSuiteFiles(root: string): string[] {
+  return walkTs(join(root, 'tests'))
+    .map((p) => relative(root, p).split(sep).join('/'))
+    .filter((p) => p.endsWith('.test.ts'))
+    .sort();
+}
+
+/**
+ * 门禁输出里**每个套件的逐套件结果行**(`✓ tests/X.test.ts — …` / `✗ tests/X.test.ts …`)。
+ * 它是"这个套件真的被跑过"的**实物证据** —— 汇总行是自称,结果行是证据。
+ */
+const SUITE_EVIDENCE_RE = /^[ \t]*[✓✗][ \t]+(tests\/[^\s]+\.test\.ts)\b/gm;
+
+/** 从门禁输出里抽出「哪些套件文件真的产生了结果行」。 */
+export function suiteEvidenceFiles(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(SUITE_EVIDENCE_RE)) out.add(m[1]!);
+  return [...out].sort();
+}
+
+/** 门禁输出里 `用例汇总:N 条通过(M 个套件;…)` 自称的套件数。 */
+const SUITE_CLAIM_RE = /用例汇总:(\d+) 条通过\((\d+) 个套件/;
+
+/**
+ * 套件数对账(**两条测量路径共用这一份**):`null` = 没问题。
+ *
+ * ⚠️ 树里 0 个套件文件(合成树 / 测试用的临时树)= **无从核对** ⇒ 不报错。
+ * 这与"没测到就当 0 比"不同:那是假红,这里是"这条判据本题不适用"。
+ */
+function suiteCountProblem(claimed: number | null, files: readonly string[]): string | null {
+  if (claimed === null || files.length === 0) return null;
+  if (claimed === files.length) return null;
+  return `自称 ${claimed} 个套件,而树里 tests 目录下有 ${files.length} 个 *.test.ts`
+    + `(差 ${files.length - claimed})⇒ 这份测量源少/多算了套件`
+    + '(若它来自 `--only` 之类的局部口径,它**不能**当全量测量源)';
+}
+
+export interface SuiteSourceReport {
+  /** 门禁输出自称的套件数;`null` = 没有可解析的汇总行。 */
+  claimed: number | null;
+  /** 真的产生了结果行的套件文件。 */
+  evidence: string[];
+  /** 非空 ⇒ 本次测量源**不可信**,调用方必须报错(不许拿它写文档)。 */
+  problems: string[];
+  /** 是否真的做了交叉核对(空树 / 非测试运行日志时为 false,并在输出里说明)。 */
+  checked: boolean;
+}
+
+/**
+ * ★ WS-FND-139:**测量源质量前置** —— 采用一份门禁输出之前先问三个问题:
+ * ```
+ * 1 它自称几个套件?而树里有几个 *.test.ts?     (不相等 ⇒ 少/多算了)
+ * 2 树里每个套件文件都在输出里出现过结果行吗?    (缺的**点名**)
+ * 3 输出里出现的套件文件真的在这棵树里吗?        (不在 ⇒ 这不是这棵树的测量)
+ * ```
+ * 任一条不成立 ⇒ `problems` 非空 ⇒ 调用方**报错并放弃**(绝不写盘)。
+ *
+ * ## 为什么"没有汇总行"也是错误,而不是"这一栏未校验"
+ * 全量日志里那一行是**无条件**打印的(除非本趟一个套件都没量到)。所以
+ * 「有逐套件结果行、却没有可解析的汇总行」= 那一行被顶替/形态被改坏 ⇒
+ * 与「少一个套件」是同一个故障面,必须报错。
+ * 反向(既无结果行也无汇总行)⇒ 这不是一次测试运行的日志(`--docs` 等)⇒ 不报错。
+ */
+export function suiteSourceReport(text: string, files: readonly string[]): SuiteSourceReport {
+  const evidence = suiteEvidenceFiles(text);
+  const m = SUITE_CLAIM_RE.exec(text);
+  const claimed = m === null ? null : Number(m[2]);
+  const problems: string[] = [];
+  if (files.length === 0 || (evidence.length === 0 && claimed === null)) {
+    return { claimed, evidence, problems, checked: false };
+  }
+  if (claimed === null) {
+    problems.push(
+      `输出里有 ${evidence.length} 个套件的逐套件结果行,但**没有可解析的「用例汇总:…」行**`
+      + ' ⇒ 本次的套件数不可测(不许当 0,也不许当成"这一栏没测过")',
+    );
+  } else {
+    const bad = suiteCountProblem(claimed, files);
+    if (bad !== null) problems.push(bad);
+  }
+  const missing = files.filter((f) => !evidence.includes(f));
+  if (missing.length > 0) {
+    problems.push(
+      `这些套件在输出里**没有结果行**(汇总行被警告顶替 / 输出被截断):${missing.join(' / ')}`,
+    );
+  }
+  const unknown = evidence.filter((f) => !files.includes(f));
+  if (unknown.length > 0) {
+    problems.push(`输出里出现树里不存在的套件文件(这份日志不是这棵树的):${unknown.join(' / ')}`);
+  }
+  return { claimed, evidence, problems, checked: true };
 }
 /* ───────────────────────── 门禁输出解析 ───────────────────────── */
 
@@ -338,14 +588,24 @@ function parseGate(text: string): { numbers: Partial<Numbers>; missing: string[]
 
 /* ───────────────────────── 测量总装 ───────────────────────── */
 
-interface Measured { numbers: Numbers; source: string; notes: string[] }
+interface Measured { numbers: Numbers; source: string; notes: string[]; errors: string[] }
 
 function buildNumbers(root: string, gateLog: string | undefined, measurePath: string | undefined): Measured {
   const numbers = emptyNumbers();
   const notes: string[] = [];
+  const errors: string[] = [];
   /* 静态量:无论走哪条测量源都自己算(便宜且不会撒谎)。 */
   numbers.src = measureSrc(root);
   numbers.progress = measureProgress(root);
+  /* 台账自检同样是静态量:它是**写回 README 那个数字的来源**,不能只在某一条测量源下才算
+     (否则 `--measure` 那条路上 README 的桶计数会退回「未校验」)。 */
+  const wiring = measureWiring(root);
+  numbers.wiring = wiring.wiring;
+  errors.push(...wiring.errors);
+  /* ★ WS-FND-139:树里有多少个套件文件 —— 一个**与门禁输出无关**的静态事实,
+     用来对账"复用来的"套件数。两条测量路径(`--measure` 快照 / 门禁输出)
+     **共用这一份**判据(各写一份必然漂移)。 */
+  const suiteFiles = measureTestSuiteFiles(root);
 
   if (measurePath !== undefined) {
     if (!existsSync(measurePath)) throw new Error(`--measure 指向的文件不存在:${measurePath}`);
@@ -357,11 +617,40 @@ function buildNumbers(root: string, gateLog: string | undefined, measurePath: st
     }
     /* JSON 里可能带 `ledger`(verify 用 `backlog.ts` 的解析器算的);没有才现跑。 */
     if (numbers.ledger === null) numbers.ledger = measureLedger(root);
-    return { numbers, source: `--measure ${measurePath}`, notes };
+    /* ★ WS-FND-139:**测量源质量前置** —— 快照里的套件数必须等于树里的套件文件数,
+       否则它就不是「一次完整全量测量」的产物(第十轮实测:`--write` 量到 145/2641,
+       同一棵树上 `--check` 量到 146/2649 —— 差的那个套件的汇总行被警告顶替了)。
+       ⇒ 拿它写盘会把 README 改成**错的** ⇒ 直接报错,不给任何"少一个套件的数字"。 */
+    const snapProblem = suiteCountProblem(
+      numbers.suites === null ? null : numbers.suites.suites, suiteFiles,
+    );
+    if (snapProblem !== null) {
+      throw new Error(
+        `--measure 快照不可信:${snapProblem}\n`
+        + '      ⇒ 处置:`node scripts/verify.ts --all` 重测后再生成快照(本工具不自动重跑门禁)。',
+      );
+    }
+    return { numbers, source: `--measure ${measurePath}`, notes, errors };
   }
 
   const gate = readGate(root, gateLog);
   const parsed = parseGate(gate.text);
+  /* ★ WS-FND-139:复用日志之前,先核对**这份输出是不是一次完整的全量测试运行**。
+     判据在 `suiteSourceReport`(两条测量路径共用);`--check` 与 `--write` 都过这一关。 */
+  const rep = suiteSourceReport(gate.text, suiteFiles);
+  if (rep.problems.length > 0) {
+    throw new Error(
+      `测量源不可信(${gate.source}):\n      · ${rep.problems.join('\n      · ')}\n`
+      + '      ⇒ 这正是「--write 与 --check 量出的套件数差一个」的来源'
+      + '(第十轮实测:145/2641 vs 146/2649)。\n'
+      + '      ⇒ 重测:`node scripts/verify.ts --all > g.log`(再用 `--gate-log=g.log` 复用)。'
+      + '本工具**不自动重跑** —— 那会把一次日志复用变成一次全量门禁。',
+    );
+  }
+  notes.push(rep.checked
+    ? `套件数已交叉核对:输出自称 ${String(rep.claimed)} 个 = 树里 *.test.ts ${suiteFiles.length} 个`
+    : '套件数**未交叉核对**(这份输出里没有逐套件结果行,或树里没有 *.test.ts)'
+      + ' ⇒ 它不是一次全量测试运行的日志');
   const bag = numbers as unknown as Record<string, unknown>;
   for (const [k, v] of Object.entries(parsed.numbers)) bag[k] = v;
   if (parsed.missing.length > 0) {
@@ -372,7 +661,7 @@ function buildNumbers(root: string, gateLog: string | undefined, measurePath: st
   }
   /* 台账:门禁不打印四个数,直接问唯一口径来源(`backlog.ts` 约 0.1s)。 */
   if (numbers.ledger === null) numbers.ledger = measureLedger(root);
-  return { numbers, source: gate.source, notes };
+  return { numbers, source: gate.source, notes, errors };
 }
 
 /* ───────────────────────── 文档锚点表 ───────────────────────── */
@@ -512,6 +801,19 @@ const ANCHORS: Anchor[] = [
         + `另 **${n.nonDebt} 条非欠账**(其中差集 **${n.diffSet}** 条 / `
         + `gate-only **${n.nonDebt - n.diffSet}** 条)。`;
     },
+  },
+
+  /* ── README:逐符号台账(数字来自 docs/WIRING-LEDGER.md 的**表体实算**)── */
+  {
+    file: 'README.md',
+    name: '逐符号台账(WIRING-LEDGER)桶计数',
+    re: /逐符号台账在 `docs\/WIRING-LEDGER\.md`[(（](\d+) 行:\*\*(\d+) 全未接 \/ (\d+) 部分接 \/ (\d+) 已接 \/ (\d+) 已登记\*\*[)）]/g,
+    want: (n) => (n.wiring === null
+      ? [null, null, null, null, null]
+      : [
+        s(n.wiring.rows), s(n.wiring.body.unwired), s(n.wiring.body.partial),
+        s(n.wiring.body.wired), s(n.wiring.body.registered),
+      ]),
   },
 
   /* ── README:其余门禁行 ── */
@@ -906,7 +1208,10 @@ function main(): void {
   const hs = processHashes(h.text, root, r.text);
 
   const findings = [...r.findings, ...h.findings, ...hs.findings];
-  const errors = [...r.errors, ...h.errors, ...hs.errors];
+  /* 台账自检的错误与锚点错误同级:都进同一张表 ⇒ 同一句报错、同一个 exit 1(且**都不写盘**)。
+     为什么必须并列:`README.md` 那一行的数字就取自台账表体,台账自己内部矛盾时写回 = 把一个
+     错数字盖上一个「已同步」的章。 */
+  const errors = [...measured.errors, ...r.errors, ...h.errors, ...hs.errors];
   const skipped = [...new Set([...r.skipped, ...h.skipped])];
 
   console.log(

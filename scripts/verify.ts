@@ -7577,6 +7577,77 @@ export function assertionCountVerdict(
   return { ok: true, message: `${c.passed}/${c.total}` };
 }
 
+/* ══════════════════ ★ WS-FND-139:测量源隔离(套件输出的可计数文本)══════════════════
+ *
+ * ## 修的是什么(第十轮实测,不是设想)
+ * ```
+ *   `sync-docs --write` 在同一棵树上量到 **145/2641**,而 `--check` 量到 **146/2649**。
+ *   差的那一个套件不是"少跑了一次":SQLite 驱动的 `ExperimentalWarning` 写在 **stderr**,
+ *   而旧代码把两个流**拼成一个字符串**再数 ⇒ 警告行可以贴在汇总行上,
+ *   `N/M 通过` 于是数不出来(或被数成多处)⇒ 该套件从总账里消失,
+ *   而汇总行照样打出一个**看起来正常**的数字(少一个套件、少若干条)。
+ * ```
+ * ⇒ 判据:**噪音与信号不许走同一个通道**(与「0 套件即 fail」同族:
+ *   一条环境警告不允许改变任何计数)。
+ */
+
+/** 行首可识别的 Node 警告(`(node:1) ExperimentalWarning: ...` 之类)。 */
+const WARNING_LINE_RE =
+  /^\s*(?:\(node:\d+\)\s*)?(?:ExperimentalWarning|DeprecationWarning|Warning)\s*:/;
+
+/**
+ * 剥掉行首警告行。**只给 stderr 的兜底路径用** —— stdout 一字不动:
+ * 若某天一个套件的汇总行恰好以 `Warning:` 起头,在 stdout 上剥它就是自己把测量删了。
+ */
+export function stripWarningLines(text: string): { text: string; removed: number } {
+  const lines = text.split('\n');
+  const kept = lines.filter((l) => !WARNING_LINE_RE.test(l));
+  return { text: kept.join('\n'), removed: lines.length - kept.length };
+}
+
+/**
+ * 单个套件输出的**可计数文本**:stdout 与 stderr **分开取**。
+ *
+ * 判据(顺序即优先级):
+ * 1 stdout 里有 `N/M 通过` ⇒ 只用 stdout,stderr 一个字符都不混进来;
+ * 2 否则 stderr(剥掉行首警告后)里有 ⇒ 用剥过的 stderr —— 兜底,不是主路径:
+ *   某个套件把汇总行打到 stderr 时仍然量得到,而不是静默变成"没打印";
+ * 3 两边都没有 ⇒ `source: 'none'` ⇒ 调用方必须 fail(见 `assertionCountVerdict`)。
+ *
+ * `bothStreamsHaveCount` 保留旧的「恰好一处」严判:两个流**各**打一行就无法判定
+ * 哪一行是该套件的汇总行 ⇒ 调用方按污染处理(不许挑一个信)。
+ */
+export function suiteCountingText(stdout: string, stderr: string): {
+  text: string;
+  source: 'stdout' | 'stderr-去警告' | 'none';
+  removedWarnings: number;
+  bothStreamsHaveCount: boolean;
+} {
+  const countAll = (t: string): number => [...t.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)].length;
+  const stripped = stripWarningLines(stderr);
+  const inStdout = countAll(stdout);
+  const inStderr = countAll(stripped.text);
+  const bothStreamsHaveCount = inStdout > 0 && inStderr > 0;
+  if (inStdout > 0) {
+    return { text: stdout, source: 'stdout', removedWarnings: stripped.removed, bothStreamsHaveCount };
+  }
+  if (inStderr > 0) {
+    return {
+      text: stripped.text,
+      source: 'stderr-去警告',
+      removedWarnings: stripped.removed,
+      bothStreamsHaveCount,
+    };
+  }
+  return { text: '', source: 'none', removedWarnings: stripped.removed, bothStreamsHaveCount };
+}
+
+/** 最后一个非空行(只用于展示,不做任何解析)。 */
+function lastLineOf(text: string): string {
+  const lines = text.split('\n').filter((l) => l.trim() !== '');
+  return lines.length === 0 ? '(无输出)' : lines[lines.length - 1]!.trim();
+}
+
 function runTests(): void {
   console.log('\n[测试执行]');
   const dir = join(ROOT, 'tests');
@@ -7602,31 +7673,59 @@ function runTests(): void {
      这里累加并在总账行**指名**是哪个套件 —— 跳过只有进了总数才不算静默。 */
   let sumSkipped = 0;
   const skipBySuite: string[] = [];
+  /* ★ WS-FND-139:本趟**没解析出汇总行**的套件(不许按 0 计进总账;见下面「计数质量前置」)。 */
+  const unmeasured: string[] = [];
 
   for (const f of files) {
     const rel = relative(ROOT, f).split(sep).join('/');
     const r = spawnSync(process.execPath, [f], { cwd: ROOT, encoding: 'utf8' });
-    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
+    /* ★ WS-FND-139:**计数只读 stdout**(见 `suiteCountingText` 的注释)。
+       旧写法把 stderr 拼进同一个字符串 ⇒ 一条环境警告(SQLite ExperimentalWarning)
+       就能让本该计数的套件数不出来,而总账照样打出一个"看起来正常"的
+       少一个套件的数字(第十轮实测 145/2641 vs 146/2649)。 */
+    const stdoutText = r.stdout ?? '';
+    const stderrText = r.stderr ?? '';
+    const iso = suiteCountingText(stdoutText, stderrText);
+    /* 两个流只在**展示**处合并(失败明细 / 套件身份),不参与任何计数。 */
+    const streamLines = [...stdoutText.split('\n'), ...stderrText.split('\n')]
+      .filter((l) => l.trim() !== '');
     if (r.status !== 0) {
       /* fail() 内部已 failures += 1,此处不得重复自增 */
       fail(`${rel} 退出码 ${r.status}`);
       /* ★ task B:记下"有套件没跑完" ⇒ 汇总数**不完整** ⇒ README 那一栏**不比**
-         (否则会把 README 的正确值改成错误值,见 suiteHadFailure 的说明)。 */
+         (否则会把 README 的正确值改成错误值,见 suiteHadFailure 的说明)。
+         ★ WS-FND-139:它的断言数**没进**总账 ⇒ 同时记进 `unmeasured`,
+         那一行汇总因此**不给数字**(见下面「计数质量前置」)。 */
       suiteHadFailure = true;
+      unmeasured.push(rel);
       /* 只打印「✗」行,避免与 fail() 的输出重复,也不淹没真正的失败信息 */
-      const bad = out.split('\n').filter((l) => l.includes('✗'));
-      const shown = (bad.length > 0 ? bad : out.split('\n')).slice(0, 20);
+      const bad = streamLines.filter((l) => l.includes('✗'));
+      const shown = (bad.length > 0 ? bad : streamLines).slice(0, 20);
       console.error(shown.map((l) => `      ${l.trim()}`).join('\n'));
     } else {
-      pass(`${rel} — ${out.split('\n').pop() ?? ''}`);
-      const c = parseAssertionCounts(out);
+      /* 展示用的「套件身份」取 **stdout 的最后一行** —— 合并流的最后一行常是 stderr
+         的警告(第十轮实测:那一行 `✓ tests/xxx — …` 被打成了 SQLite 警告),
+         于是它**顶替**掉真正的汇总行,读数的人以为那是套件自己打出来的。 */
+      pass(`${rel} — ${lastLineOf(iso.source === 'stdout' ? stdoutText : iso.text)}`);
+      const c = parseAssertionCounts(iso.text);
       /* ★ 审计 P1(2026-11-18):「没打印 N/M 通过」不再静默跳过 —— 一律 fail。
          旧代码是 `if (c) { ... }`:null 时什么都不做 ⇒ 套件换掉 `report()`
          就能把自己的断言数从总账里抹掉,而门禁仍「全部通过」。 */
       const av = assertionCountVerdict(c);
+      if (iso.bothStreamsHaveCount) {
+        /* ★ WS-FND-139:两个流**各**打一处 ⇒ 无法判定哪一处是该套件的汇总行 ——
+           与旧的「恰好一处」严判同源(只是现在按流分开看,不再靠字符串拼接)。 */
+        fail(
+          `${rel} 的 stdout 与 stderr **各**打印了一处「N/M 通过」`
+          + ' ⇒ 哪一处是该套件的汇总行无法判定(不许挑一个信)',
+        );
+        suiteHadFailure = true;
+        unmeasured.push(rel);
+        continue;
+      }
       if (c === null || !av.ok) {
         if (c !== null) {
-          const n = [...out.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)].length;
+          const n = [...iso.text.matchAll(/(\d+)\s*\/\s*(\d+)\s*通过/g)].length;
           fail(
             `${rel} 输出含 ${n} 处「N/N 通过」—— 每套件应恰好 1 处。`
             + '多处会让门禁的「实测数字」可被伪造(在套件末尾多打一行即可)',
@@ -7636,6 +7735,7 @@ function runTests(): void {
         }
         /* 该套件断言数**不计入** sumTotal ⇒ 汇总数不完整 ⇒ README 那一栏**不比** */
         suiteHadFailure = true;
+        unmeasured.push(rel);
         continue;
       }
       sumPassed += c.passed;
@@ -7645,7 +7745,7 @@ function runTests(): void {
          ⚠️ 只有**自报**的才算:套件不打这一行 ⇒ 这里看不见 ——
          故 `tests/WS-FND-112-gate-no-silent-skip.test.ts` 钉住「WS-FND-06 必须自报」,
          否则"不打这一行"就成了一条新的静默通路。 */
-      const sk = /跳过\s*(\d+)\s*项/.exec(out);
+      const sk = /跳过\s*(\d+)\s*项/.exec(iso.text);
       if (sk !== null && Number(sk[1]) > 0) {
         sumSkipped += Number(sk[1]);
         skipBySuite.push(`${rel} 跳过 ${sk[1]} 项`);
@@ -7713,24 +7813,47 @@ function runTests(): void {
        它自己那行输出与「断言通过」逐字无异 ⇒ 总账看不见 ⇒ 静默绿。
        ⇒ 口径:套件自报 `跳过 N 项`,这里把总数与出事的套件一起打印出来
        (没有自报的套件按 0 计;**不许**把 0 当成"没有问题"的证明)。 */
-    pass(
-      `用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`
-      + `;跳过 ${sumSkipped} 项**未校验**`
-      + (skipBySuite.length > 0 ? `(${skipBySuite.join(' / ')})` : ''),
-    );
-    /* ★ task B:暴露给 README 校验(README 有四行数字都来自这里)。
-       ⚠️ 只赋**全量**值:--only 时 sumTotal 只是那一个套件的数。
-       且必须在这里赋 —— 因为上面的自洽断言已保证
-       `main + fnd == 总数`(否则已 fail),故这里的分部数可信。 */
-    if (fullRun) {
-      suiteSummary = {
-        total: sumTotal,
-        suites: counted,
-        mainTotal: sumOf(main),
-        mainSuites: main.length,
-        fndTotal: sumOf(fnd),
-        fndSuites: fnd.length,
-      };
+    /* ★ WS-FND-139(第十轮实测):**计数质量前置** —— 有套件没解析出汇总行时,
+       这一行**不给数字**。
+       ```
+       旧行为:某个套件的汇总行被 stderr 的警告顶替 ⇒ 它**没进** sumTotal/counted,
+               而这一行照样打印 `… 条通过(N 个套件;…)`(少一个套件、少若干条)
+               ⇒ `sync-docs --write` 把这个数**写进 README**
+               ⇒ 下一次 `--check` 量到的是完整值 ⇒ 文档被改成**错的**(145/2641 vs 146/2649)。
+       ```
+       ⇒ 判据与「0 套件即 fail」同口径:**缺套件的总数不是一次测量,是测量失败**。
+         故这里打印的句子**不含** `用例汇总:` 紧跟数字的形态(下游解析器拿不到数),
+         并 fail + 点名是哪个套件 ⇒ 下游只会得到「未校验」,不会得到错数字。 */
+    if (unmeasured.length > 0) {
+      fail(
+        `用例汇总**不完整**:${counted}/${files.length} 个套件产出汇总行,`
+        + `${unmeasured.length} 个没解析出来(${unmeasured.join(' / ')})`
+        + ' ⇒ 本行不给数字(把"少一个套件的总数"当测量用会写坏文档)',
+      );
+      console.log(
+        `  用例汇总:**不完整**(${counted}/${files.length} 个套件;${parts.join(';')})`
+        + ' —— 未解析出「N/M 通过」的套件见上面的 ✗ 行',
+      );
+    } else {
+      pass(
+        `用例汇总:${sumTotal} 条通过(${counted} 个套件;${parts.join(';')})`
+        + `;跳过 ${sumSkipped} 项**未校验**`
+        + (skipBySuite.length > 0 ? `(${skipBySuite.join(' / ')})` : ''),
+      );
+      /* ★ task B:暴露给 README 校验(README 有四行数字都来自这里)。
+         ⚠️ 只赋**全量**值:--only 时 sumTotal 只是那一个套件的数。
+         ★ WS-FND-139:**只在「每个套件都有汇总行」时赋** —— 否则交出去的快照里
+           会带着一个少一个套件的数,`sync-docs --write` 会把它写进文档。 */
+      if (fullRun) {
+        suiteSummary = {
+          total: sumTotal,
+          suites: counted,
+          mainTotal: sumOf(main),
+          mainSuites: main.length,
+          fndTotal: sumOf(fnd),
+          fndSuites: fnd.length,
+        };
+      }
     }
   }
 

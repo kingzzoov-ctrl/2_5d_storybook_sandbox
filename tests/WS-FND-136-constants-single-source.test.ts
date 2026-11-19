@@ -236,11 +236,22 @@ test('FND136-3 32 色调色盘:三处消费点与冻结层是同一批绑定(引
   eq(PALETTE_COLS * PALETTE_ROWS, 32, 'UI 网格 8×4 = 32');
   eq(PALETTE_ROWS, 4, '行数由色数推出:32 / 8 = 4');
 
-  /* 负对照:「内容相同但另建一份」必须被判为**不同源** —— 否则本判据退化成文本比较。 */
-  const sameSource = (a: readonly string[], b: readonly string[]): boolean => a === b;
-  ok(sameSource(PALETTE_32, DYE_PALETTE), '同源判定对真同源返回真');
-  eq(sameSource([...DYE_PALETTE], DYE_PALETTE), false,
-    '负对照:逐字节相同的**副本**必须是「不同源」(改版前两份副本正是这样"相等"的)');
+  /* ★ 负对照(第十轮 P3 修):修前这里是
+       —— 一个自造的 `a===b` 比较器,套在一份逐字节相同的副本上断言 false
+     —— 纯 JS 引用语义,**与被测实现无数据依赖**:把 `PALETTE_32` 改成独立副本、
+     甚至把整个导出删掉,这一行照样为 false(删除实现也不会红)。
+     现在改成**源码形态 + 注入**:被测模块必须把 `PALETTE_32` 落成**别名**
+     (`= DYE_PALETTE`);把数组字面量(旧形态的第二份副本)写回去 ⇒ 命中。
+     ⇒ 这条对照依赖实现:实现一改成副本就红。 */
+  const easel = readOne('client/src/ui/pixel_easel.ts');
+  const ALIAS = /export\s+const\s+PALETTE_32\s*:[^=]*=\s*DYE_PALETTE\s*;/;
+  const COPY = /export\s+const\s+PALETTE_32\s*:[^=]*=\s*\[/;
+  ok(ALIAS.test(easel.code), 'PALETTE_32 必须是**别名**(`= DYE_PALETTE`),不是第二份数组副本');
+  eq(hitsInCode([easel], COPY), [], '画架不许用数组字面量声明 PALETTE_32(= 第二份副本)');
+  const copyBack = "export const PALETTE_32: readonly string[] = ['#000000', '#ffffff'];\n";
+  eq(hitsInCode([mkFile('client/src/ui/pixel_easel.ts', copyBack)], COPY).length, 1,
+    '负对照/注入:把数组字面量写回画架 ⇒ 副本形态命中(证明本判据有牙)');
+  eq(ALIAS.test(copyBack), false, '负对照/注入:副本形态**不**满足别名判据');
 });
 
 test('FND136-4 调色盘字面量只在一处;把副本写回任一侧 ⇒ 本判据变红', () => {

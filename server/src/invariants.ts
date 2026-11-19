@@ -29,7 +29,7 @@
  * 而不是按 detail 的措辞(措辞一改,判据就静默失效)。
  * ```
  *
- * ## 一条判据「有牙」的两个必要条件(本轮补的两处系统性漏洞)
+ * ## 一条判据「有牙」的两个必要条件(第十轮订正:删掉自证句,补上真反例)
  *
  * ```text
  * 1 参数合法性前置:判据的**边界值**本身非法(容量 NaN、地图 maxZ=Infinity ...)
@@ -37,7 +37,12 @@
  *   ⇒ 凡读过参数的判据都必须先判参数,非法即报(见 POS_FINITE_IN_BOUNDS / CONTAINER_CAPACITY)。
  * 2 分支各自有反例:一条判据内部有 N 个分支(entries/perItem/total/container ...)
  *   时,「多分支压成单点」= 只测第一个分支就把整条标成有牙。
- *   ⇒ 反例表里**每个分支各一个独立反例**(见 `scripts/invariants.ts` 的 VIOLATION_CASES)。
+ *   ⇒ 两层反例表各司其职(都在 `scripts/invariants.ts`,门禁 `runSelfcheck` 一并跑):
+ *     · `VIOLATION_CASES` —— 每 code 一个,钉「这条判据整体有没有牙」;
+ *     · `BRANCH_CASES`    —— 每个**数据分支 / 运行时守卫**各一个独立反例
+ *        (非法地图 / 非法容量 / maxBytes<=0 / 重复 code / overrides 拼错)。
+ *     ⚠️ 只写前一句而不补后一句 = **注释自证**:说过「每个分支各一个反例」,
+ *        而表里只有一个 ⇒ 新增分支全无判据(第十轮实测到的形态)。本轮把两条都补上。
  * ```
  *
  * ## ★ 注入面(`checkAll` 的 `overrides`)
@@ -430,19 +435,35 @@ const CHECKS: Record<InvariantCode, InvariantCheck> = {
   FRAME_BYTES_BOUND: frameBytesBound,
 };
 
-/* 注册表自证:`INVARIANT_CODES` 与 `CHECKS` 的键集必须完全一致。
-   少了它,「加一条不改另一个数组」会让新判据**静默不跑**(或跑到 undefined)。
-   在**模块加载时**判:坏得越早,报错位置离出错点越近。 */
-{
-  const missing = INVARIANT_CODES.filter((c) => CHECKS[c] === undefined);
-  const extra = (Object.keys(CHECKS) as InvariantCode[]).filter((c) => !INVARIANT_CODES.includes(c));
+/**
+ * 注册表自证(**纯函数,可注入**):返回「`codes` 与 `checks` 键集不同 / 有重复 code」的问题清单。
+ * 空数组 = 两个集合完全一致且无重复 code。
+ *
+ * ## 为什么抽成可调用函数,而不是一段 inline 判据
+ * 修前这段只能「在模块加载时跑一次」 ⇒ 它自己的「有牙」没有任何入口:
+ * 传一份**含重复 code** 的数组该报什么,没人能证(第十轮实测到的「实现了没出口」)。
+ * 抽出来之后,`scripts/invariants.ts` 的 `BRANCH_CASES` 可以直接喂一份重复数组验证它。
+ */
+export function registryProblems(
+  codes: readonly InvariantCode[],
+  checks: Readonly<Record<string, unknown>>,
+): string[] {
+  const problems: string[] = [];
+  const missing = codes.filter((c) => checks[c] === undefined);
+  const extra = Object.keys(checks).filter((c) => !(codes as readonly string[]).includes(c));
   /* 重复也算「不同集合」的形态:两条同名 code 会让归因出现两个入口。 */
-  const dup = INVARIANT_CODES.filter((c, i) => INVARIANT_CODES.indexOf(c) !== i);
-  if (missing.length > 0 || extra.length > 0 || dup.length > 0) {
-    throw new Error(
-      `INVARIANT_CODES 与判据注册表不同集合(缺实现:${missing.join(',') || '无'};`
-      + `多实现:${extra.join(',') || '无'};重复 code:${dup.join(',') || '无'})`,
-    );
+  const dup = codes.filter((c, i) => codes.indexOf(c) !== i);
+  if (missing.length > 0) problems.push(`缺实现:${missing.join(',')}`);
+  if (extra.length > 0) problems.push(`多实现:${extra.join(',')}`);
+  if (dup.length > 0) problems.push(`重复 code:${dup.join(',')}`);
+  return problems;
+}
+
+/* 模块加载时就用它判:坏得越早,报错位置离出错点越近。 */
+{
+  const problems = registryProblems(INVARIANT_CODES, CHECKS);
+  if (problems.length > 0) {
+    throw new Error(`INVARIANT_CODES 与判据注册表不同集合(${problems.join(';')})`);
   }
 }
 

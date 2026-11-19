@@ -1506,7 +1506,23 @@ function onMove(c: WsConn, msg: {
   }
   const intent = parsed.intent;
   try {
-    apply.call(opts.room, c.userId, intent);
+    const verdict = apply.call(opts.room, c.userId, intent) as
+      | { worldRejected?: boolean; corrected?: { x: number; y: number; z: number } }
+      | null
+      | undefined;
+    /* ★ 第十轮 P2:`worldRejected` 的**出口**。修前该字段在运输层零消费:
+       客户端只拿到「被纠正」,分不出「世界侧回退到权威坐标(原地不动)」
+       与「反作弊拒绝」——两者同形。这里把它单独下发,code 给出稳定档位,
+       客户端据 `code==='WORLD_REJECTED'` 与反作弊拒绝分开读(至少日志/状态)。 */
+    if (verdict !== null && verdict !== undefined && verdict.worldRejected === true) {
+      sendJson(c, {
+        t: 'reject',
+        kind: 'MOVE',
+        code: 'WORLD_REJECTED',
+        reason: '世界侧拒收本次移动 ⇒ 回退到权威坐标(不是反作弊拒绝)',
+        corrected: verdict.corrected ?? null,
+      });
+    }
     /* ack 只在**应用成功之后**推进 —— 抛错那条路径不该被记成"服务端处理过了",
        否则客户端会把一条从未生效的命令剪掉(那段位移再也补不回来)。
        ★ 推进的是**本连接**的账(`c.ackedSeq`):多连接不许互相冒充。 */

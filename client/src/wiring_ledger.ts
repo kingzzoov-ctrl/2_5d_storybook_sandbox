@@ -88,7 +88,11 @@ export const WIRING_LEDGER: readonly WiringEntry[] = [
     definedIn: 'client/src/ui/state_machine.ts',
     status: WiringStatus.WIRED,
     callSites: 1,
-    reason: 'boot.ts onUiPointerUp:抬手成交(修前全 client 零调用,拖拽永远走不到第三态)',
+    reason: 'boot.ts onUiPointerUp:抬手成交(修前全 client 零调用,拖拽永远走不到第三态)。'
+      + '⚠️ ★ 第十轮 P1:成交只改**本机格位状态**,**一条报文都不发**'
+      + '(`RoomAction` 里没有 MOVE_ITEM;快照里也没有服务端的格子布局)'
+      + ' ⇒ 它被登记为**本地整理视图**(口径常量 `DRAG_UPLINK = "local-only"`,'
+      + '见 `ui/inventory.ts`),文案与手册都如实写明"刷新/重连即回原序"',
   },
   {
     symbol: 'tooltipFor',
@@ -212,6 +216,52 @@ export const WIRING_LEDGER: readonly WiringEntry[] = [
     callSites: 1,
     reason: 'client/src/main.ts:START_PARTY 的模式回声(服务端拿它跟模式名比,回下标会被判不一致)',
   },
+
+  /* ── ★ 第十轮(WS-FND-138):四个补入口的动作 —— 每个构建器都有**真调用点** ── */
+  {
+    symbol: 'breedTameRequest',
+    definedIn: 'client/src/net/action_entry.ts',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: 'net/action_binding.ts 的 trigger 的 breedTame 分支(键位 HOTBAR_KEYS 的 `1`)',
+  },
+  {
+    symbol: 'buyItemRequest',
+    definedIn: 'client/src/net/action_entry.ts',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: 'net/action_binding.ts 的 trigger 的 buyItem 分支(键位 HOTBAR_KEYS 的 `2`)',
+  },
+  {
+    symbol: 'useAlchemyFurnaceRequest',
+    definedIn: 'client/src/net/action_entry.ts',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: 'net/action_binding.ts 的 trigger 的 useAlchemyFurnace 分支(键位 HOTBAR_KEYS 的 `3`)',
+  },
+  {
+    symbol: 'placeAutomationRequest',
+    definedIn: 'client/src/net/action_entry.ts',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: 'net/action_binding.ts 的 trigger 的 placeAutomation 分支(键位 HOTBAR_KEYS 的 `4`)',
+  },
+  {
+    symbol: 'HOTBAR_KEYS',
+    definedIn: 'client/src/net/action_binding.ts',
+    status: WiringStatus.WIRED,
+    callSites: 3,
+    reason: 'action_binding.handleKey 的查表 + ui/panel_keys.keyGroups 的互斥判据'
+      + ' + boot.ts 的 #hint(entryKeyHints/hotbarKeyHints)',
+  },
+  {
+    symbol: 'DRAG_UPLINK',
+    definedIn: 'client/src/ui/inventory.ts',
+    status: WiringStatus.WIRED,
+    callSites: 2,
+    reason: 'boot.ts 的 lastMove 文案与自检口径的 dragUplink:拖拽是**本地整理视图**,'
+      + '不发报文(修前只有一句注释,谁都不知道它不同步)',
+  },
 ];
 
 /** 取某符号的台账条目(`null` = 未登记) */
@@ -265,9 +315,293 @@ export const WIRED_WITNESS: Readonly<Record<string, string>> = {
   layoutBlueprintHud: 'layoutBlueprintHud(this.w, this.h, true)',
   rectVisible: 'rectVisible(box, this.w, this.h)',
   partyModeName: 'partyModeName(handle.store.state.meta.partyMode)',
+  /* ★ 第十轮(WS-FND-138):四个补入口的构建器 + 两张新表 —— 见证片段取**调用点**,
+     而不是定义行(定义行永远存在,等于没有声明"接上了")。 */
+  breedTameRequest: 'return this.submit(breedTameRequest(input));',
+  buyItemRequest: 'return this.submit(buyItemRequest(input));',
+  useAlchemyFurnaceRequest: 'return this.submit(useAlchemyFurnaceRequest(input));',
+  placeAutomationRequest: 'return this.submit(placeAutomationRequest(input));',
+  HOTBAR_KEYS: 'ENTRY_KEYS[k] ?? HOTBAR_KEYS[k]',
+  DRAG_UPLINK: '本地整理视图(不发报文:${DRAG_UPLINK};刷新/重连即回原序)',
 };
 
 /** 某符号的见证片段(`''` = 没有:它应当仍是 `blocked`) */
 export function witnessOf(symbol: string): string {
   return WIRED_WITNESS[symbol] ?? '';
+}
+
+/* ═══════════════════════════ 客户端**入口**台账(★ 第十轮 P1) ═══════════════════════════ */
+
+/**
+ * ## 为什么还要第二张台账
+ *
+ * 上面 `WIRING_LEDGER` 问的是「**客户端模块**里的符号有没有被调用」。
+ * 第十轮实测的 P1 是**另一个方向**的缺口:
+ * ```
+ * 服务端有执行层(dispatchAction 真的会做事情)
+ * 客户端**玩家按不到**(没有键、没有按钮、也没有专用报文)
+ * ⇒ 「服务端能跑、玩家没反应」
+ * ```
+ * 这种缺口**不会让任何既有断言变红**:`WS-FND-18` 查的是服务端逐动作归类,
+ * `WS-FND-121` 查的是客户端模块的调用点 —— 而"这个动作客户端有没有入口"两边都不问。
+ *
+ * ## 口径(逐条可断言)
+ *
+ * ```
+ * status: 'wired'    ⇒ 客户端**代码**(剥掉注释后)里真的出现该动作名
+ * status: 'missing'  ⇒ 客户端代码里**一次都不出现**(注释里提到不算 —— 注释不接线)
+ * ```
+ * ⚠️ 每条都必须覆盖 `RoomAction` 的**全部键**(判据逐键相等,不数总数):
+ *   新增一个服务端动作而不作决定 ⇒ 当场红。这正是 `WS-FND-18` 在服务端那一侧
+ *   做的事,本表把它搬到客户端这一侧。
+ */
+
+/** 客户端入口的有无。 */
+export const ClientEntryStatus = {
+  /** 玩家真的按得到(键 / 按钮 / 专用报文) */
+  WIRED: 'wired',
+  /** 服务端有,客户端**零入口** —— `reason` 必须写清为什么以及出路 */
+  MISSING: 'missing',
+} as const;
+export type ClientEntryStatus = (typeof ClientEntryStatus)[keyof typeof ClientEntryStatus];
+
+export interface ClientEntryRow {
+  /** `server/src/net/room.ts` 的 `RoomAction` 名(逐字)。 */
+  action: string;
+  /** 服务端的执行层落点(人读的路径)。 */
+  serverPath: string;
+  /** 客户端入口:`键位` / `专用报文` / `missing`。 */
+  entry: string;
+  status: ClientEntryStatus;
+  /** `wired` 写接入点;`missing` 写**为什么没有 + 出路**(必填且非空)。 */
+  reason: string;
+}
+
+/**
+ * 逐动作的客户端入口台账(★ 第十轮)。
+ *
+ * 第十轮补上的是最后四条 `wired`:`BREED_TAME` / `BUY_ITEM` /
+ * `USE_ALCHEMY_FURNACE` / `PLACE_AUTOMATION`(键位 `net/action_binding.ts`
+ * 的 `HOTBAR_KEYS`:1 / 2 / 3 / 4)。**修前它们是 `missing`**。
+ */
+export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
+  {
+    action: 'MOVE', serverPath: 'sim/world_sim.ts applyPlayerMove', entry: 'WASD/摇杆 → 专用报文 move',
+    status: ClientEntryStatus.WIRED,
+    reason: '不走 action 通道(坐标契约:绝对位置 + tick),入口在 main.ts 的输入链路',
+  },
+  {
+    action: 'ATTACK', serverPath: 'sim/world_sim.ts attackMobAuthorized', entry: '鼠标左键 / 空格 → 专用报文 attack',
+    status: ClientEntryStatus.WIRED,
+    reason: 'main.ts 的 attackNearest;不走 action 通道(结算值经 attackResult 回执)',
+  },
+  {
+    action: 'PLACE_BLOCK', serverPath: 'net/actions/material.ts', entry: 'Q(net/action_target.ts 的 ACTION_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: 'main.ts 的 ACTION_KEYS 监听 → action 报文(需要「最近物品」)',
+  },
+  {
+    action: 'BREAK_BLOCK', serverPath: 'net/actions/material.ts', entry: 'E(ACTION_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '同上;拆下来的 obj 会经回执记进「最近物品」',
+  },
+  {
+    action: 'DROP_ITEM', serverPath: 'net/actions/material.ts', entry: 'G(ACTION_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '同上(count 恒 1,落点取权威位置)',
+  },
+  {
+    action: 'PICKUP_ITEM', serverPath: 'net/actions/material.ts', entry: 'F(ACTION_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '同上',
+  },
+  {
+    action: 'CRAFT', serverPath: 'net/actions/craft.ts', entry: 'N(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: 'action_binding 的 craft 槽位;`have` 由 have_ledger 供给',
+  },
+  {
+    action: 'SLEEP', serverPath: 'net/actions/sleep.ts', entry: 'K(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '空载荷,入口直接发',
+  },
+  {
+    action: 'OPEN_CHEST', serverPath: 'net/actions/open_chest.ts', entry: 'O(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '目标格用宿主给的「脚下那格」',
+  },
+  {
+    action: 'USE_OWN_CHEST', serverPath: 'net/actions/use_own_chest.ts', entry: 'U(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: '同 OPEN_CHEST,只差动作名',
+  },
+  {
+    action: 'START_PARTY', serverPath: 'net/actions/start_party.ts', entry: 'V(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: 'partyMode 回声取 meta.partyMode 的模式名',
+  },
+  {
+    action: 'USE_ITEM', serverPath: 'net/actions/use_item.ts', entry: 'T(ENTRY_KEYS)',
+    status: ClientEntryStatus.WIRED, reason: 'itemId 取「最近物品」;targetId 省略 = 对自己用',
+  },
+  {
+    action: 'BREED_TAME', serverPath: 'net/actions/breed_tame.ts', entry: '1(HOTBAR_KEYS;op 由参数选)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ 第十轮补:键盘走 FEED(投喂 = 首次登记),petId 用权威快照的**实例 id**'
+      + '、mobId 用物种 id;TAME/BREED/RANCH 由按钮路径带 op 参数走同一条路',
+  },
+  {
+    action: 'BUY_ITEM', serverPath: 'net/actions/buy_item.ts', entry: '2(HOTBAR_KEYS)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ 第十轮补:键盘按 qty=1 买「最近物品」那一件;qty 在构建器里是必填(不猜 1)',
+  },
+  {
+    action: 'USE_ALCHEMY_FURNACE', serverPath: 'net/actions/use_alchemy_furnace.ts', entry: '3(HOTBAR_KEYS)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ 第十轮补:站位由服务端判(客户端不报坐标);itemId 取「最近物品」',
+  },
+  {
+    action: 'PLACE_AUTOMATION', serverPath: 'net/actions/place_automation.ts', entry: '4(HOTBAR_KEYS;播种形态)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ 第十轮补:键盘走**播种形态**(只给 itemId);组件形态(kind)由按钮路径给 ——'
+      + '客户端不持有 wiring 的 kind 名单(见 CLIENT_ENTRY_GAPS 的 lane 行)',
+  },
+  {
+    action: 'SET_ROOM_ACCESS', serverPath: 'net/room.ts RoomRuntime.setAccess', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '房间管理动作(密码/容量):需要一个房主面板(表单 + 回执展示),而客户端现在'
+      + '**没有任何房间管理 UI**。硬接一个键会把「改密码」变成一次误触 ⇒ 登记,'
+      + '出路:与 KICK_MEMBER / SET_MEMBER_ROLE 一起做成「房间面板」一件独立任务。',
+  },
+  {
+    action: 'SET_PARTY_MODE', serverPath: 'net/room.ts RoomRuntime.setPartyModeBy', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '赛前选模式(四选一)。`START_PARTY` 的 partyMode 只是**回声核对**,不设模式'
+      + ' ⇒ 客户端今天只能开「房间已选的模式」。出路:派对面板(模式列表 + 当前模式高亮)。',
+  },
+  {
+    action: 'KICK_MEMBER', serverPath: 'net/room.ts RoomRuntime.kick', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '成员管理:要一份成员列表(玩家名 + 角色)才能安全地踢人,'
+      + '而客户端只有 `state.players`(位置/血量),没有角色列 ⇒ 一起进「房间面板」。',
+  },
+  {
+    action: 'SET_MEMBER_ROLE', serverPath: 'net/room.ts RoomRuntime.setMemberRole', entry: 'missing',
+    status: ClientEntryStatus.MISSING, reason: '同 KICK_MEMBER:成员列表 + 角色下拉,属「房间面板」。',
+  },
+  {
+    action: 'RESET_WORLD', serverPath: 'net/actions/reset_world.ts', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '破坏性动作,服务端要求**显式二次确认**(`confirm: true`)。客户端不给一个'
+      + '「确认对话框」就接键 = 一次误触重置世界 ⇒ 登记;出路:房间面板 + 二次确认。',
+  },
+  {
+    action: 'CLOSE_ROOM', serverPath: 'net/room.ts RoomRuntime.close', entry: 'missing',
+    status: ClientEntryStatus.MISSING, reason: '同 RESET_WORLD(不可逆 + 需要确认对话框)。',
+  },
+  {
+    action: 'MODIFY_TOWN', serverPath: 'net/actions/modify_town.ts', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '要**选格子 + 输入名字/半径**(`radius` / `name` / `totemCell`),客户端没有'
+      + '任何拾取坐标的 UI 也没有文本输入口 ⇒ 登记;出路:城镇面板(点格取坐标)。',
+  },
+  {
+    action: 'WIRE_EDIT', serverPath: 'net/actions/wire_edit.ts', entry: 'missing',
+    status: ClientEntryStatus.MISSING,
+    reason: '服务端**不下发线框数据**(`build/wiring_view.ts` 拿不到),客户端因此画不出'
+      + '任何一条已存在的导线 ⇒ 没有"编辑哪个方向"的可见对象。出路:先加 WireView 下发报文。',
+  },
+];
+
+/**
+ * **不是 `RoomAction` 的入口缺口** —— 同样如实登记,因为它们与上面同形
+ * (服务端/世界侧有实现,客户端没有入口或只有一部分),而 `RoomAction` 那张表
+ * 覆盖不到它们。
+ */
+export interface ClientEntryGap {
+  /** 缺什么(人读的一句话)。 */
+  what: string;
+  /** 现状 + 出路(必填且非空)。 */
+  reason: string;
+}
+
+export const CLIENT_ENTRY_GAPS: readonly ClientEntryGap[] = [
+  {
+    what: '急单(rush)开工:客户端**没有也不该有**专门入口',
+    reason: '急单由**世界侧**自动开工(`world_sim.tickPartyStep` → `startRushRun`,'
+      + '条件:食堂建成 + 三工位在场 + 有人站在工位格上,见 `coop/rush_actions.ts` 的'
+      + 'START 行),客户端能做的是**把工位建出来并站上去**(Q/E 建造 + WASD 走过去)'
+      + '⇒ 没有键位缺口。玩家读到的评级走**成功回执**的 `effect.rushGrade`'
+      + '(客户端 `action_target.ts` 的 `describeActionResult` 展示),这也是入口',
+  },
+  {
+    what: 'PLACE_AUTOMATION 的分拣带配置形态(`kind: LOGISTICS_SORTER` + `lane` + `itemId`)',
+    reason: '键盘路径只给**播种形态**;`lane`(第几道收哪件)需要一个配置 UI'
+      + '(选组件 → 选道号 → 选目标物品),而报文键 `lane` **不在** `ActionPayload` 契约里'
+      + '(见 `actions/place_automation.ts` 文件头的形态清单)⇒ 客户端不替它发明一个字段。'
+      + '出路:接线面板(与 WIRE_EDIT 的线框下发一起做,否则用户看不到自己配的是什么)',
+  },
+];
+
+/** 取某动作的客户端入口行(`null` = 未登记 —— 判据要求逐键覆盖) */
+export function clientEntryRow(action: string): ClientEntryRow | null {
+  return CLIENT_ENTRY_LEDGER.find((r) => r.action === action) ?? null;
+}
+
+/**
+ * 客户端入口台账的**见证片段** —— `wired` 行必须逐字出现在客户端代码里
+ * (**剥掉注释、并排除本文件**),`missing` 行必须是空串。
+ *
+ * 口径与 `WIRED_WITNESS` 同族,理由也一样:
+ * ```
+ * 数「动作名出现几次」会把**本台账自己**数进去 ⇒ 恒 ≥ 1 ⇒ 判据没有牙齿;
+ * 而一个片段能同时说明"接在哪、以什么形态接"(`spec.action === 'DROP_ITEM'`
+ * 比 `DROP_ITEM` 多说明了"它来自 ACTION_KEYS 那条监听")。
+ * ```
+ * `MOVE` / `ATTACK` 的见证是**专用报文的发送函数**(它们不走 `action` 通道)。
+ */
+export const CLIENT_ENTRY_WITNESS: Readonly<Record<string, string>> = {
+  MOVE: 'session.sendMove({',
+  ATTACK: 'session.sendAttack({',
+  PLACE_BLOCK: "spec.action === 'PLACE_BLOCK'",
+  BREAK_BLOCK: "action: 'BREAK_BLOCK'",
+  DROP_ITEM: "spec.action === 'DROP_ITEM'",
+  PICKUP_ITEM: "spec.action === 'PICKUP_ITEM'",
+  CRAFT: "action: 'CRAFT'",
+  SLEEP: "action: 'SLEEP'",
+  OPEN_CHEST: "chestBuild('OPEN_CHEST'",
+  USE_OWN_CHEST: "chestBuild('USE_OWN_CHEST'",
+  START_PARTY: "action: 'START_PARTY'",
+  USE_ITEM: "action: 'USE_ITEM'",
+  BREED_TAME: "action: 'BREED_TAME'",
+  BUY_ITEM: "action: 'BUY_ITEM'",
+  USE_ALCHEMY_FURNACE: "action: 'USE_ALCHEMY_FURNACE'",
+  PLACE_AUTOMATION: "action: 'PLACE_AUTOMATION'",
+};
+
+/** 某动作的见证片段(`''` = 它应当仍是 `missing`:客户端代码里一次都不该出现) */
+export function clientEntryWitnessOf(action: string): string {
+  return CLIENT_ENTRY_WITNESS[action] ?? '';
+}
+
+/** 客户端入口台账自检:`missing` 必须给出非空理由;动作名不许重复。 */
+export function validateClientEntryLedger(
+  rows: readonly ClientEntryRow[] = CLIENT_ENTRY_LEDGER,
+): { ok: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    if (seen.has(r.action)) errors.push(`${r.action} 在客户端入口台账里出现了两次`);
+    seen.add(r.action);
+    if (r.action.trim() === '') errors.push('动作名不能为空');
+    if (r.reason.trim() === '') errors.push(`${r.action} 缺少 reason`);
+    if (r.status === ClientEntryStatus.MISSING && r.entry !== 'missing') {
+      errors.push(`${r.action} 标为 missing 却写着入口 ${r.entry}`);
+    }
+    if (r.status === ClientEntryStatus.WIRED && r.entry === 'missing') {
+      errors.push(`${r.action} 标为 wired 却写着入口 missing`);
+    }
+    if (r.serverPath.trim() === '') errors.push(`${r.action} 没写服务端落点`);
+    /* 见证片段与状态必须**同向**:wired 要有片段、missing 不许有 ——
+       否则台账会同时说"接上了"和"没接",两个判据各读一半就永远互相掩盖。 */
+    const w = clientEntryWitnessOf(r.action);
+    if (r.status === ClientEntryStatus.WIRED && w === '') {
+      errors.push(`${r.action} 标为 wired 却没有见证片段(加进 CLIENT_ENTRY_WITNESS)`);
+    }
+    if (r.status === ClientEntryStatus.MISSING && w !== '') {
+      errors.push(`${r.action} 标为 missing 却有见证片段:${w}`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }

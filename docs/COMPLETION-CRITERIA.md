@@ -19,12 +19,18 @@ $ node scripts/gate-selfcheck.ts
   ✓ 门禁自检全部通过(29 通过 / 29 合计)
 
 $ node scripts/backlog.ts
-  总计 133 条 / 未关闭 108 条 / 阻塞 0 条 / 已关闭 25 条
+  总计 133 条 / 未关闭 108 条 / 阻塞 0 条 / 已关闭 25 条   # ← 2026-11-13 快照(现值:未关闭 **0** 条)
 ```
 
-> ★ 2026-11-16:上面这段是 **2026-11-13 的门禁实录**(保留原样,不做后验改写)。今天的同一组命令实测为
-> `2259 条 / 114 套件`(测试执行的用例数与套件数;其余三项 —— 自检 / 类型 / 可达 —— 见 `README.md` 的门禁展示区,本文不再手抄)
-> (那四个数字由门禁自己校验,不再手抄)。
+> ★ 2026-11-16:上面这段是 **2026-11-13 的门禁实录**(保留原样,不做后验改写)。
+> ★ **2026-11-19(第十轮)**:把它**逐项标成快照** —— 里面每个数都只是 2026-11-13 的读数,
+> 已全部过期(`未关闭 108 条` / `1381 条 / 21 套件` / `29/29` **都不是现值**;旧文只在前一句里说
+> 「保留原样」,读者仍会把它们当现值读 —— 第十轮实测:同族四处矛盾数字就是这样活了六天)。
+> 现值**只有一个来源**:`node scripts/sync-docs.ts --check`(比对 `README.md` 的门禁展示区,
+> 由门禁实测写回;调用点 `verify.ts::verifyDocsNumbers()`)。截至 2026-11-19 实测:
+> `未决台账 133 条 / **0 未关闭** / 0 阻塞 / 133 已关闭`(唯一口径来源 `node scripts/backlog.ts`)、
+> 内容基线指纹 `v2-0afe5562`、`测试执行 146/146 · 2649 个用例`、`文档结构 14 份 WS + 75 份非 WS(= 89)`。
+> ⚠️ 手抄这类数字正是本仓反复踩的坑(同一份事实两个来源)⇒ 引用时**引来源命令**,不要引散文里的数。
 
 ### 而同一时刻,以下全部为真
 
@@ -43,27 +49,30 @@ $ node scripts/backlog.ts
 
 ## 二、完成的判据:三档
 
-### 档 A —— 已达成(2026-11-13)
+### 档 A —— 已达成(**历史快照:2026-11-13**;带「现值」的行是读出来的,不是重测的)
 
 ```
+★ 以下 7 项是 **2026-11-13 的读数快照** —— 保留原样、不做后验改写,但**每一项都已过期**;
+  现值只在 `README.md` 的门禁展示区(由 `scripts/sync-docs.ts` 从门禁实测写回),本文件不手抄。
 [x] 冻结层不变量          17 项全绿
-[x] 66 个测试套件         1822 条断言全绿
+[x] 66 个测试套件         1822 条断言全绿          ← 现值:146 套件 / 2649 用例
 [x] 门禁自检              30/30    ★ 2026-11-14:28→29(修 T37)→ 31(加 T38×2)→ **30**(移除 1 条过期用例)
 [x] 可擦除语法            5 个目录无 enum/参数属性/namespace/装饰器
-[x] 内容基线锁            v1-eaefa38b 一致
-[x] 文档结构              12 份 WS + 39 份非 WS 全绿
-[x] 判据形态审计          59 处已定性,本期新增 0
-[x] 临时残留              0
+[x] 内容基线锁            v1-eaefa38b 一致         ← 现值:指纹 `v2-0afe5562`
+[x] 文档结构              12 份 WS + 39 份非 WS 全绿 ← 现值:14 份 WS + 75 份非 WS(= 89;`verify.ts --docs` 实测)
+[x] 判据形态审计          59 处已定性,本期新增 0     ← 现值:登记 107 处 / 本期新增 0
+[x] 临时残留              0                        ← 现值:`--docs` 实测 330 个(审计扫描根**之外**,只告警)
 ⇒ 判据:**所有质量闸门可复跑且全绿**。已达成。
 
 > ★ **2026-11-14 同日补注(接手者)**:上面这个「档 A」块是 **2026-11-13 的时点快照**。
 > 其中**只有「门禁自检」这一项因本轮改动而更新**(29/29 → **31/31**,加了 T38-a / T38-b
-> 两条区分力自检);其余数字(套件数 / 断言数 / WS 文档份数 / 判据形态审计处数 / 临时残留)
-> **当时是实测的,现在已过期** —— 本次**未**逐项重测、也**未**改动它们,
-> 以免制造"已经核对过"的假象。
-> 当前值以
-> `node scripts/verify.ts --all --strict-reach --strict-taut --strict-inert --strict-selfcheck`
-> 的实际输出为准(见 `docs/HANDOVER.md` §三 与 `docs/LEAD-PLAN.md` §7.2.1)。
+> 两条区分力自检);其余数字当时是实测的、现在已过期。
+> ★ **2026-11-19(第十轮)补注**:块内已逐行标「现值」,并给整块加了快照抬头 ——
+> 不带标注的过期数字与现值在读者眼里**同形**,而这一族数字正是「没人管的数」的产地。
+> 「现值」那四处是**读**出来的(不是重测的);现值仍然**只有一个来源**:
+> `node scripts/sync-docs.ts --check`(比对 `README.md` 的门禁展示区,由门禁实测写回;
+> 调用点见 `verify.ts::verifyDocsNumbers()`,人工口径见 `docs/HANDOVER.md` §三 与
+> `docs/LEAD-PLAN.md` §7.2.1)。其余各项本文件**不手抄**。
 ```
 
 ### 档 B —— 「服务端能完整跑一遍」的判据
@@ -76,18 +85,23 @@ $ node scripts/backlog.ts
             `ws_server.ts` 按 `t:'move'` 收下并转 `room.applyMove`)。
     ⇒ **已勾(2026-11-17)**:跨进程端到端断言已补 —— 判据 `tests/WS-FND-65-us2-crossproc.test.ts`(真 socket + 真 `RoomRuntime` + 真 `createSession`)。历史缺口:缺一条**跨进程**的端到端断言(真 socket + 真 `RoomRuntime`
       + 客户端帧形态),本轮只做到「两侧各有断言 + 帧形态被钉住」。
-[x] 23 个 RoomAction 中,该有执行层的那些**真的执行**
-    ★ 现状(2026-11-15 第七轮):已接线 **21 个** ——
-      管理四件(`SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE`)
-      + `CLOSE_ROOM` + **物质层四件套**(`PLACE_BLOCK` / `BREAK_BLOCK` / `DROP_ITEM` /
-      `PICKUP_ITEM`)+ **容器/合成/睡觉四件**(`CRAFT` / `SLEEP` / `OPEN_CHEST` /
-      `USE_OWN_CHEST`)+ **派对/驯养/城镇/炼金四件**(`START_PARTY` / `BREED_TAME` /
-      `MODIFY_TOWN` / `USE_ALCHEMY_FURNACE`)+ **自动化放置 / 布线编辑两件**
-      (`PLACE_AUTOMATION` / `WIRE_EDIT`);
-      另有 2 个走**专用报文通道**(`MOVE` / `ATTACK`);
-      其余 2 个**显式** `NOT_IMPLEMENTED` 并逐条写明缺什么
-      (`docs/TASK-96-action-landing-gaps.md`)。归类判据:`tests/WS-FND-18` 四组。
-      ⚠️ 每一波的**如实边界**都写在 `TASK-96` 的「二之二 ~ 二之四」,**不计入达成**。
+[x] 24 个 RoomAction 中,该有执行层的那些**真的执行**
+    ★ 现状(**2026-11-19 第十轮订正**,取代此前的「23 个 / 已接线 21 个」):
+      `RoomAction` 现为 **24 个**(`server/src/net/room.ts#RoomAction`)⇒ **22 个真执行**;
+      其余 2 个(`MOVE` / `ATTACK`)走**专用报文通道**,`dispatchAction` 对它们**刻意**回
+      `NOT_IMPLEMENTED`(那个码的意思是「别从这里发」,不是「还没做」)。
+      22 = 旧文那 19 件(管理四件 `SET_MEMBER_ROLE` / `KICK_MEMBER` / `SET_ROOM_ACCESS` /
+      `SET_PARTY_MODE` + `CLOSE_ROOM` + 物质层四件套 `PLACE_BLOCK` / `BREAK_BLOCK` /
+      `DROP_ITEM` / `PICKUP_ITEM` + 容器·合成·睡觉四件 `CRAFT` / `SLEEP` / `OPEN_CHEST` /
+      `USE_OWN_CHEST` + 派对·驯养·城镇·炼金四件 `START_PARTY` / `BREED_TAME` / `MODIFY_TOWN` /
+      `USE_ALCHEMY_FURNACE` + 自动化放置·布线编辑两件 `PLACE_AUTOMATION` / `WIRE_EDIT`)
+      + `RESET_WORLD` + `USE_ITEM` + `BUY_ITEM`;后两件是旧文之后新增的(`WS-FND-39/47` 与
+      `WS-FND-77`),**加进来时没人数过这一行** ⇒ 旧文「21/23」与 `README.md` 旧文
+      「5 个动作真执行」**同时**成假。真值源 = `server/src/net/actions/action_table.ts#ACTION_HANDLERS`
+      (`Readonly<Record<RoomAction, ActionHandler>>`,**编译期完整性**:漏一个成员 tsc 报缺键)。
+      ⚠️ `RESET_WORLD` 只是**动作层**那半边接了(见下方 2026-11-17 那段),宿主那半边仍不存在。
+      归类判据:`tests/WS-FND-18` 四组;各波的**如实边界**见 `docs/TASK-96-action-landing-gaps.md`
+      「二之二 ~ 二之四」,**不计入达成**。
     ★ **网络可达性已补齐**(2026-11-14 第二轮):客户端 `sendAction` →
       `ws_server` 的 `t:'action'` → `RoomRuntime.dispatchAction` → `t:'actionResult'`
       回执(**四种分类都回**:OK / INVALID / PERMISSION / NOT_IMPLEMENTED)。
@@ -114,8 +128,8 @@ $ node scripts/backlog.ts
 [x] 未决台账 108 条未关闭 → **逐条定性完成**:24 已实现未标 / 31 真欠账 / 49 待裁 /
     **4 我不知道**(独立计数)。合计 108 ✓。逐条表见 `docs/BACKLOG-108-TRIAGE.md`。
 ⇒ 判据:**从浏览器走一遍多人流程不撞空操作**。**仍未达成** ——
-  剩下的阻塞是「已接的动作只有 21/23」(其余 2 个 `MOVE` / `ATTACK` 走专用报文通道、刻意不进 `action`,
-  见 `docs/TASK-96` 的「未接线」一节;此前这里写的 9/22 是 2026-11-13 的状态),以及档 C 的玩法项。
+  剩下的阻塞是「真执行的动作 **22/24**」(其余 2 个 `MOVE` / `ATTACK` 走专用报文通道、刻意不进 `action`,
+  见 `docs/TASK-96` 的「未接线」一节;此前这里写过的 **9/22**(2026-11-13)与 **21/23** 都是当时的动作表),以及档 C 的玩法项。
 
 **★ 2026-11-14 同日续:US2 与客户端的真实状态(实测,取代 §一 的旧结论)**
 

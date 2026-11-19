@@ -334,11 +334,32 @@ export class MobSpawner {
     return true;
   }
 
+  /**
+   * 退回计数(与 `add` 对称)。
+   *
+   * ## ★ WS-FND-140(P2):只退「本群系真的记过的账」
+   *
+   * 修前是 `globalCount = max(0, globalCount - n)` 的**无条件**扣减,而 `add`
+   * 在触 `hardCap` / `GLOBAL_MOB_CAP` 时**直接返回 false 且一个数都不记**
+   * (`addMob` 却照样登记)⇒ 那些「没被计过数的尸体」被收掉时,扣的是**别的
+   * 群系 / 别的存活怪的额度**。实测形态:MEADOW 记满 14、RUINS 记了 10,
+   * 再超额登记 100 只 MEADOW;清尸时前 14 次把 global 从 24 扣到 10,后 86 次
+   * 继续扣到 0 —— 此刻 RUINS 那 10 只**还活着**,计数却归零 ⇒ 可越过 hardCap
+   * 再刷(`decideSpawn` 只看计数)。
+   *
+   * 现在扣减量 = `min(当前本群系计数, n)`,并且**群系与全局同步扣同一个数**
+   * (全局那一步不再单独夹 0)。由此得到不变量
+   * `globalCount === Σ biomeCounts`,「群系没记过账 ⇒ no-op」。
+   * `FND135-2` 的「100 只 / 计数 ≤14」恰好只覆盖**单群系**,差额被夹取掩盖;
+   * 暴露它需要跨群系夹具 —— 见 `tests/WS-FND-140`。
+   */
   remove(biome: string, n = 1): void {
     const cur = this.state.biomeCounts.get(biome) ?? 0;
-    const next = Math.max(0, cur - n);
-    this.state.biomeCounts.set(biome, next);
-    this.state.globalCount = Math.max(0, this.state.globalCount - n);
+    if (cur <= 0) return;
+    const dec = Math.min(cur, Math.max(0, n));
+    if (dec === 0) return;
+    this.state.biomeCounts.set(biome, cur - dec);
+    this.state.globalCount = Math.max(0, this.state.globalCount - dec);
   }
 
   canSpawn(ctx: SpawnContext, world: SpawnWorld, roll: number): boolean {

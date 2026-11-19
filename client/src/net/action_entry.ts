@@ -11,6 +11,22 @@
  * 第一次有了**客户端入口** —— 此前它们的全部接线在服务端,客户端**零调用点**,
  * 表现就是「服务端能跑、玩家按了没反应」。
  *
+ * ★ 第十轮审计 P1(WS-FND-138):**同一形态又出现一次**,而且这次是四个:
+ * ```
+ * BREED_TAME            服务端 actions/breed_tame.ts 已接线   ← 客户端零入口
+ * BUY_ITEM              服务端 actions/buy_item.ts 已接线     ← 客户端零入口
+ * USE_ALCHEMY_FURNACE   服务端 actions/use_alchemy_furnace.ts ← 客户端零入口
+ * PLACE_AUTOMATION      服务端 actions/place_automation.ts    ← 客户端零入口(连组件形态都没有)
+ * ```
+ * 「零入口」不会让任何断言变红:门禁查的是**服务端**的行为,而「玩家按得到吗」
+ * 不在任何判据里。⇒ 本文件补齐这四个构建器,键位在 `net/action_binding.ts`
+ * 的 `HOTBAR_KEYS`(数字热键),`main.ts` 把宿主参数注进去。
+ * ⚠️ 仍然**没接**的形态如实登记在 `wiring_ledger.ts` 的 `CLIENT_ENTRY_LEDGER`:
+ * `PLACE_AUTOMATION` 的「分拣带 lane 配置」形态(报文键 `lane` 不属 `ActionPayload`)、
+ * 以及管理类动作(`KICK_MEMBER` / `SET_ROOM_ACCESS` / `SET_PARTY_MODE` /
+ * `SET_MEMBER_ROLE` / `RESET_WORLD` / `CLOSE_ROOM` / `MODIFY_TOWN` / `WIRE_EDIT`)
+ * —— 它们**至今没有客户端入口**,按同一套口径登记,而不是假装做了。
+ *
  * ## ★ 边界:本层**不做**下面这些(别越界,越界就是第二份实现)
  * ```
  * 不预测            —— 本地先动、事后校正 = `net/prediction.ts` / `net/predictor.ts`
@@ -140,6 +156,91 @@ export interface UseItemInput {
    * ⇒ 本层省略时**整个键不出现**,不写 `undefined`(否则线上会多一个 `"targetId":null`)。
    */
   targetId?: unknown;
+}
+
+/* ── ★ 第十轮(WS-FND-138):四个此前「服务端有、客户端零入口」的动作 ──────────
+ *
+ * 键名逐条取自 `server/src/net/room.ts` 的 `ActionPayload`:
+ * ```
+ * BREED_TAME          op / petId / mobId / mateId(+ itemId,投喂用)
+ * BUY_ITEM            itemId / qty / orderId
+ * USE_ALCHEMY_FURNACE itemId / orderId
+ * PLACE_AUTOMATION    x / y / kind(组件形态)或 itemId(播种形态)
+ * ```
+ * ⚠️ `qty` 是**必填**不是"默认 1":服务端 `actions/buy_item.ts` 的判序第 4 步
+ *   对缺失的 `qty` 直接 `INVALID`("缺省不等于 1")。在入口就拦掉,省一条注定被拒的往返。
+ */
+
+/**
+ * `BREED_TAME` 的 `op` 取值 —— **字面写死在本层**,因为客户端不能 import 服务端
+ * (`client/` 不许把 `server/**` 拖进浏览器包)。防漂移靠判据而不靠注释:
+ * `tests/WS-FND-138-client-entry-parity.test.ts` 拿服务端导出的 `TameOp`
+ * 逐个对账(漂了当场红)。
+ */
+export const CLIENT_TAME_OPS: readonly string[] = ['FEED', 'TAME', 'BREED', 'RANCH'];
+
+/**
+ * `BREED_TAME` 的入参 —— **一个动作、四个子操作**(`op` 选分支)。
+ *
+ * ```ts
+ * { op: 'FEED',  petId, itemId, mobId? }   // 投喂:首次投喂即「登记」⇒ mobId 必填
+ * { op: 'TAME',  petId }                   // 驯服:好感达标 + 无主
+ * { op: 'BREED', petId, mateId }           // 繁殖:两只都归自己且都达标
+ * { op: 'RANCH', petId }                   // ★ 送进牧场(WS-FND-119 的真实入口)
+ * ```
+ * `petId` 是**非空字符串**(世界侧的生物实例 id),不是内容表编号 ——
+ * 与 `mobId`(物种 id)是两层,别混(见 `mobs/spawner.ts` 的 id 规则)。
+ */
+export interface BreedTameInput {
+  /** 子操作:`FEED` / `TAME` / `BREED` / `RANCH`。 */
+  op?: unknown;
+  /** 宠物 id(非空字符串;缺 ⇒ 拒)。 */
+  petId?: unknown;
+  /** 物种 id(非空字符串;**首次投喂**必填)。 */
+  mobId?: unknown;
+  /** 繁殖配对的那一只(`BREED` 必填)。 */
+  mateId?: unknown;
+  /** 投喂用的那件食物(`FEED` 必填;内容表编号,正整数)。 */
+  itemId?: unknown;
+}
+
+/** `BUY_ITEM` 的入参(百货店 515 的一件货)。 */
+export interface BuyItemInput {
+  /** 要买的物品 id(内容表编号,正整数)。 */
+  itemId?: unknown;
+  /** 件数(正整数;**必填**)。 */
+  qty?: unknown;
+  /** 客户端请求号(可选幂等键;给了就原样透传)。 */
+  orderId?: unknown;
+}
+
+/** `USE_ALCHEMY_FURNACE` 的入参(站在炼金台上用一份材料)。 */
+export interface AlchemyFurnaceInput {
+  /** 投进去的材料 id(内容表编号,正整数)。 */
+  itemId?: unknown;
+  /** 客户端请求号(可选幂等键;世界侧拿它防"同一单炼出第二炉")。 */
+  orderId?: unknown;
+}
+
+/**
+ * `PLACE_AUTOMATION` 的入参 —— **两种形态**:
+ * ```
+ * { kind, x, y }      组件形态:kind 必须是 wiring 注册表里的名字
+ * { itemId, x, y }    播种形态(WS-FND-119):种子 = itemId
+ * ```
+ * ⚠️ 客户端**不持有 kind 名单**(那是服务端 `wiring/components.ts` 的注册表):
+ * 组件形态的 `kind` 由**调用方**(UI 按钮 / 后续面板)给,键盘路径走**播种形态**
+ * (只给 `itemId`)—— 硬编码一份 kind 名单就是"第二份实现",而它迟早漂。
+ * 两种都不给 ⇒ 入口**明确拒绝**(服务端判序第 4 步也是 `INVALID`)。
+ */
+export interface PlaceAutomationInput {
+  /** 目标格 x / y(整数)。 */
+  x?: unknown;
+  y?: unknown;
+  /** 组件种类名(非空字符串;组件形态必填)。 */
+  kind?: unknown;
+  /** 播种形态的种子 id(正整数)。 */
+  itemId?: unknown;
 }
 
 /**
@@ -305,6 +406,158 @@ export function useItemRequest(input: UseItemInput = {}): BuildOutcome {
   return { ok: true, request: { action: 'USE_ITEM', payload } };
 }
 
+/* ── ★ 第十轮(WS-FND-138):四个补入口的构建器 ──
+ *
+ * 与上面六个**同一条纪律**:
+ *   1 载荷键逐条取自 `ActionPayload`(不发明协议);
+ *   2 省掉某个键时**整个键不出现**(不写 `undefined`:线上会多一个 `null`);
+ *   3 参数不对 ⇒ 在入口就拒并给**可读**理由,绝不发一条注定被拒的报文。
+ */
+
+/**
+ * `BREED_TAME` —— 投喂 / 驯服 / 繁殖 / 送进牧场(由 `op` 选分支)。
+ *
+ * 为什么在这里就把 `op` 的分支校验做完:`op` 打错时服务端回的是
+ * 「需要 op(FEED / TAME / BREED / RANCH;实测 …)」—— 那句话在**按键当场**说出来
+ * 比等一趟往返有用得多,而且省掉一条注定 `INVALID` 的报文。
+ */
+export function breedTameRequest(input: BreedTameInput = {}): BuildOutcome {
+  const op = input.op;
+  if (typeof op !== 'string' || !CLIENT_TAME_OPS.includes(op)) {
+    return {
+      ok: false,
+      reason: `BREED_TAME 需要 op(${CLIENT_TAME_OPS.join(' / ')})=喂/驯/繁/牧;实测 ${JSON.stringify(op)}`,
+    };
+  }
+  if (typeof input.petId !== 'string' || input.petId.length === 0) {
+    return {
+      ok: false,
+      reason: 'BREED_TAME 需要 petId(非空字符串:**离你最近的生物实例 id**,不是物种 id)'
+        + ' —— 附近没有生物时按 1 无从驯养,先走过去',
+    };
+  }
+  const payload: Record<string, unknown> = { op, petId: input.petId };
+  if (input.mobId !== undefined) {
+    if (typeof input.mobId !== 'string' || input.mobId.length === 0) {
+      return { ok: false, reason: 'BREED_TAME 的 mobId 若给出必须是非空字符串(物种 id)' };
+    }
+    payload.mobId = input.mobId;
+  }
+  if (input.mateId !== undefined) {
+    if (typeof input.mateId !== 'string' || input.mateId.length === 0) {
+      return { ok: false, reason: 'BREED_TAME 的 mateId 若给出必须是非空字符串(配偶的生物实例 id)' };
+    }
+    payload.mateId = input.mateId;
+  }
+  /* `FEED` 的 `itemId` 是**必填**:服务端 `breed_tame.ts` 的 FEED 分支第一句就是
+     「FEED 需要 itemId(整数,内容表里的食物)」⇒ 缺了不发,理由在入口给。 */
+  if (op === 'FEED' && !isInt(input.itemId)) {
+    return {
+      ok: false,
+      reason: 'BREED_TAME 的 FEED 需要 itemId(整数:投喂的食物)'
+        + ' —— 客户端用「最近物品」,还没有就先按 E 拆一块或 F 捡一件',
+    };
+  }
+  if (input.itemId !== undefined) {
+    if (!isInt(input.itemId) || input.itemId <= 0) {
+      return { ok: false, reason: 'BREED_TAME 的 itemId 必须是正整数(内容表里的物品 id)' };
+    }
+    payload.itemId = input.itemId;
+  }
+  /* `BREED` 的 `mateId` 同样必填:服务端那一支要两只宠物,缺一只就没得判。 */
+  if (op === 'BREED' && payload.mateId === undefined) {
+    return { ok: false, reason: 'BREED_TAME 的 BREED 需要 mateId(配偶的生物实例 id)' };
+  }
+  return { ok: true, request: { action: 'BREED_TAME', payload } };
+}
+
+/**
+ * `BUY_ITEM` —— 在无人自助售货摊(515)上买货。
+ *
+ * `qty` **必填**:服务端 `buy_item.ts` 的判序第 4 步对缺失/非正整数的 `qty`
+ * 直接 `INVALID`(注释原文「缺省不等于 1,缺了就是 INVALID」)⇒ 本层不替它猜 1。
+ */
+export function buyItemRequest(input: BuyItemInput = {}): BuildOutcome {
+  if (!isInt(input.itemId) || input.itemId <= 0) {
+    return {
+      ok: false,
+      reason: 'BUY_ITEM 需要 itemId(正整数:内容表里的物品 id)'
+        + ' —— 客户端用「最近物品」,还没有就先按 E 拆一块或 F 捡一件',
+    };
+  }
+  if (!isInt(input.qty) || input.qty <= 0) {
+    return { ok: false, reason: 'BUY_ITEM 需要 qty(正整数:买几件;服务端对缺省的单位置直接拒)' };
+  }
+  const payload: Record<string, unknown> = { itemId: input.itemId, qty: input.qty };
+  if (input.orderId !== undefined) {
+    if (typeof input.orderId !== 'string' || input.orderId.length === 0) {
+      return { ok: false, reason: 'BUY_ITEM 的 orderId 若给出必须是非空字符串(幂等请求号)' };
+    }
+    payload.orderId = input.orderId;
+  }
+  return { ok: true, request: { action: 'BUY_ITEM', payload } };
+}
+
+/**
+ * `USE_ALCHEMY_FURNACE` —— 站在炼金台上投一份材料。
+ *
+ * 站位由**服务端**判(它读 `lastRoomEffects[].roomKey` 的 `ALCHEMY_LAB`),
+ * 客户端**不报坐标**:报了也没人读,而"报一个没人读的字段"会让后来者以为它是契约。
+ */
+export function useAlchemyFurnaceRequest(input: AlchemyFurnaceInput = {}): BuildOutcome {
+  if (!isInt(input.itemId) || input.itemId <= 0) {
+    return {
+      ok: false,
+      reason: 'USE_ALCHEMY_FURNACE 需要 itemId(正整数:投进炼金台的材料 id)'
+        + ' —— 客户端用「最近物品」,还没有就先按 E 拆一块或 F 捡一件',
+    };
+  }
+  const payload: Record<string, unknown> = { itemId: input.itemId };
+  if (input.orderId !== undefined) {
+    if (typeof input.orderId !== 'string' || input.orderId.length === 0) {
+      return { ok: false, reason: 'USE_ALCHEMY_FURNACE 的 orderId 若给出必须是非空字符串(幂等请求号)' };
+    }
+    payload.orderId = input.orderId;
+  }
+  return { ok: true, request: { action: 'USE_ALCHEMY_FURNACE', payload } };
+}
+
+/**
+ * `PLACE_AUTOMATION` —— 在某一格落一件自动化件(组件形态)或播一颗种子(播种形态)。
+ *
+ * ⚠️ 组件形态的 `kind` **不由本层核对合法性**(注册表在服务端
+ * `wiring/components.ts` 的 `hasComponentKind`)—— 客户端只能把调用方给的名字
+ * 原样送上,由服务端回一句话。硬编码名单 = 第二份实现,且必然与服务端漂。
+ */
+export function placeAutomationRequest(input: PlaceAutomationInput = {}): BuildOutcome {
+  if (!isInt(input.x) || !isInt(input.y)) {
+    return { ok: false, reason: 'PLACE_AUTOMATION 需要 x / y(整数:目标格坐标)' };
+  }
+  const hasKind = typeof input.kind === 'string' && input.kind.length > 0;
+  const hasItem = isInt(input.itemId) && input.itemId > 0;
+  if (input.kind !== undefined && !hasKind) {
+    return { ok: false, reason: 'PLACE_AUTOMATION 的 kind 若给出必须是非空字符串(注册表里的种类名)' };
+  }
+  if (input.itemId !== undefined && !hasItem) {
+    return {
+      ok: false,
+      reason: 'PLACE_AUTOMATION 的 itemId 若给出必须是正整数(播种形态的种子 id)'
+        + ' —— 客户端用「最近物品」,还没有就先按 E 拆一块或 F 捡一件',
+    };
+  }
+  if (!hasKind && !hasItem) {
+    return {
+      ok: false,
+      reason: 'PLACE_AUTOMATION 需要 kind(组件形态)或 itemId(播种形态)**至少一种**'
+        + ' —— 两种都没有时服务端回 INVALID(判序第 4 步),别发',
+    };
+  }
+  const payload: Record<string, unknown> = { x: input.x, y: input.y };
+  if (hasKind) payload.kind = input.kind;
+  if (hasItem) payload.itemId = input.itemId;
+  return { ok: true, request: { action: 'PLACE_AUTOMATION', payload } };
+}
+
 /* ═══════════════════════════ 4. 回执 → 玩家能读的一句话(纯) ═══════════════════════════ */
 
 /** 动作的**显示名**(只影响文案,不影响协议)。 */
@@ -315,6 +568,12 @@ const LABELS: Readonly<Record<string, string>> = {
   USE_OWN_CHEST: '开自己的箱',
   START_PARTY: '派对开局',
   USE_ITEM: '使用道具',
+  /* ★ 第十轮(WS-FND-138):四个补入口的动作也要有**玩家读到的名字** ——
+     否则被拒时状态行会显示原始动作名(`BUY_ITEM ✗ ...`),对玩家等于没提示。 */
+  BREED_TAME: '驯养',
+  BUY_ITEM: '购买',
+  USE_ALCHEMY_FURNACE: '炼金台',
+  PLACE_AUTOMATION: '放自动化件',
 };
 
 /** 把载荷压成一小段可读文本(对象/数组跳过 —— 一行 HUD 塞不下嵌套明细)。 */
@@ -424,6 +683,30 @@ export class ActionEntry {
   /** 对某个目标用掉一件(省略 `targetId` = 对自己用)。 */
   useItem(input: UseItemInput = {}): EntryOutcome {
     return this.submit(useItemRequest(input));
+  }
+
+  /* ── ★ 第十轮(WS-FND-138):四个此前**玩家按不到**的动作 ──
+     它们和服务端执行层早就存在,缺的只是这一行:入口方法。
+     键位/按钮 → 本方法 → `submit`(三支分流)→ 恰好一条报文。 */
+
+  /** 驯养:投喂 / 驯服 / 繁殖 / 送进牧场(由 `op` 选分支)。 */
+  breedTame(input: BreedTameInput = {}): EntryOutcome {
+    return this.submit(breedTameRequest(input));
+  }
+
+  /** 购买(无人货摊 515 的一件货)。 */
+  buyItem(input: BuyItemInput = {}): EntryOutcome {
+    return this.submit(buyItemRequest(input));
+  }
+
+  /** 炼金台:投一份材料进炉。 */
+  useAlchemyFurnace(input: AlchemyFurnaceInput = {}): EntryOutcome {
+    return this.submit(useAlchemyFurnaceRequest(input));
+  }
+
+  /** 落一件自动化件(`kind`)/ 播一颗种子(`itemId`)到某一格。 */
+  placeAutomation(input: PlaceAutomationInput = {}): EntryOutcome {
+    return this.submit(placeAutomationRequest(input));
   }
 
   /**

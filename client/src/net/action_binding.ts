@@ -28,9 +28,9 @@
  * ui/panel_keys.ts 的其他键             b / z / y / x / c / [ / ] / / / escape
  * main.ts                               ' '(空格) = 攻击
  * net/input.ts 的 MOVE_KEYS             w / a / s / d(+ 四个方向键)
- * ⇒ 本层用 n / k / o / u / v / t(六个都不在以上任何一个集合里)
+ * ⇒ 第一波(ENTRY_KEYS)用 n / k / o / u / v / t(六个都不在以上任何一个集合里)
  * ```
- * ★ 第七轮审计 P1(『e』双绑):上面第二行**修前是 `i / r / e / p / b / …`** ——
+ * ★ 第七轮审计 P1(『e』双绑):上面第二行**修前是 `i / r / e / p / b / ...`** ——
  *   `e` 同时出现在 `ACTION_KEYS`(拆除)与面板键(开画架)里,于是**一次按键两件事**:
  *   画架打开了(看不见的副作用)+ `BREAK_BLOCK` 发到服务端。这段注释当时还写着
  *   「互不重叠」,所以照着注释读代码也查不出来。修法:面板键搬进 `ui/panel_keys.ts`
@@ -38,22 +38,51 @@
  * ```
  * tests/WS-FND-35-client-entry.test.ts  FND35-8   与既有键位不重叠(手写清单)
  * tests/WS-FND-126-client-chain.test.ts FND126-2  panel_keys.keyCollisions() 为空(读四张真表)
+ * tests/WS-FND-138-client-entry-parity.test.ts    数字热键也在同一条互斥判据里
  * ```
+ *
+ * ## ★ 第十轮:第二张键位表(`HOTBAR_KEYS`)—— 为什么不是往 `ENTRY_KEYS` 里加
+ *
+ * 第十轮的 P1 是「四个动作服务端已实现、客户端**零入口**」:
+ * `BREED_TAME` / `BUY_ITEM` / `USE_ALCHEMY_FURNACE` / `PLACE_AUTOMATION`。
+ * 空闲**字母**只剩 `j / l / m` 三个(见上面那张占用表)—— 四个槽位放不下,
+ * 而硬把两个动作挤到一个字母上就是"一次按键两件事"(本文件头正在骂的那个形态)。
+ * ⇒ 第二张表用**数字键**,语义是「动作热键条」(不在 WASD 手位上、不参与任何既有前缀):
+ * ```
+ * 1 驯养(BREED_TAME) · 2 购买(BUY_ITEM) · 3 炼金台(USE_ALCHEMY_FURNACE)
+ * 4 放自动化件(PLACE_AUTOMATION,键盘路径走**播种形态**)
+ * ```
+ * ⚠️ 两张表**分开**还有一个硬理由:`ENTRY_KEYS` 的条数被既有判据钉着
+ *   (`WS-FND-35` FND35-8 与 `WS-FND-126` FND126-2 都断言"六个槽位")。
+ *   往那张表里加键会让**别的**套件变红,而那种红盯的是"改了就红",不是"加错了";
+ *   ⇒ 分表,并把两张表都喂进 `panel_keys.keyGroups()` 的同一条互斥判据。
  */
 
 import {
   ActionEntry,
   type ActionPorts,
+  type AlchemyFurnaceInput,
+  type BreedTameInput,
+  type BuyItemInput,
   type ChestInput,
   type CraftInput,
   type EntryOutcome,
+  type PlaceAutomationInput,
   type UseItemInput,
 } from './action_entry.ts';
 
-/* ═══════════════════════════ 1. 槽位与键位表(唯一一处) ═══════════════════════════ */
+/* ═══════════ 1. 槽位与键位表(两张:`ENTRY_KEYS` 字母表 + `HOTBAR_KEYS` 数字热键) ═══════════ */
 
-/** 入口的六个槽位。UI 按钮与键位都映射到它。 */
-export type EntrySlot = 'craft' | 'sleep' | 'openChest' | 'useOwnChest' | 'startParty' | 'useItem';
+/**
+ * 入口槽位。UI 按钮与键位都映射到它。
+ *
+ * ★ 第十轮:`breedTame` / `buyItem` / `useAlchemyFurnace` / `placeAutomation`
+ * 四个是**后加的**(第十轮 P1:服务端已实现、客户端零入口)。
+ * ⚠️ 但它们的键**不在 `ENTRY_KEYS`** 里 —— 见文件头那节(数字热键表 `HOTBAR_KEYS`)。
+ */
+export type EntrySlot =
+  | 'craft' | 'sleep' | 'openChest' | 'useOwnChest' | 'startParty' | 'useItem'
+  | 'breedTame' | 'buyItem' | 'useAlchemyFurnace' | 'placeAutomation';
 
 /**
  * 槽位 → **玩家读到的名字**。UI 按钮的标题取这里(提示行也取这里)——
@@ -66,6 +95,10 @@ export const ENTRY_SLOTS: Readonly<Record<EntrySlot, string>> = {
   useOwnChest: '开自己的储物箱',
   startParty: '派对开局',
   useItem: '使用道具',
+  breedTame: '驯养(投喂/驯服/繁殖/牧场)',
+  buyItem: '购买',
+  useAlchemyFurnace: '炼金台',
+  placeAutomation: '放自动化件/播种',
 };
 
 /** 一条键位定义:这个键属于哪个槽位。 */
@@ -104,6 +137,42 @@ export function entryKeyHints(): string {
     .join(' · ');
 }
 
+/**
+ * **第二张键位表 —— 动作热键条**(★ 第十轮)。
+ *
+ * 与 `ENTRY_KEYS` 同一条纪律(**只管"哪个键是哪个槽位"**,文案在 `ENTRY_SLOTS`),
+ * 只是键集是数字:空闲字母只剩 `j / l / m`,四个槽位放不下,而挤在一起就是
+ * "一次按键两件事"(见文件头)。
+ *
+ * ⚠️ 与 `ENTRY_KEYS` 合起来才是**完整的键位集**:`ui/panel_keys.keyGroups()` 把
+ *   两张表都算进去 ⇒ 数字键与既有键组撞车会**当场红**(不是靠人肉核对)。
+ */
+export const HOTBAR_KEYS: Readonly<Record<string, EntryKeySpec>> = {
+  /* `1` 驯养:`BREED_TAME` 的四个子操作由**参数**选(`op`),不是一个子操作一个键
+     —— 服务端本来就是"一个动作、四个 op",客户端跟着它,不另立一套分支表。 */
+  1: { slot: 'breedTame' },
+  /* `2` 购买:无人货摊(515)的一件货。 */
+  2: { slot: 'buyItem' },
+  /* `3` 炼金台:站位由服务端判(它读 `lastRoomEffects[].roomKey`)。 */
+  3: { slot: 'useAlchemyFurnace' },
+  /* `4` 放自动化件 / 播种:键盘路径走**播种形态**(只给 `itemId`),
+     组件形态(`kind`)由按钮 / 后续面板给 —— 客户端不持有 kind 名单。 */
+  4: { slot: 'placeAutomation' },
+};
+
+/**
+ * 数字热键的一行提示(`1 驯养… · 2 购买…`)。
+ *
+ * ⚠️ 与 `entryKeyHints()` **分开导出**,而不是合并成一句:合并会让
+ *   `entryKeyHints()` 的既有断言(`WS-FND-35` FND35-8 逐字比对那六个)当场红,
+ *   而那条断言盯的是"六个槽位没被偷偷改",不是"不许有第二张表"。
+ */
+export function hotbarKeyHints(): string {
+  return Object.entries(HOTBAR_KEYS)
+    .map(([k, v]) => `${k} ${ENTRY_SLOTS[v.slot]}`)
+    .join(' · ');
+}
+
 /* ═══════════════════════════ 2. 宿主必须提供的参数来源 ═══════════════════════════ */
 
 /**
@@ -131,6 +200,21 @@ export interface EntryInputs {
    * 这正是本层要保证的那条:按了没反应必须变成**按了有话说**。
    */
   useItem?(): UseItemInput;
+  /*
+   * ★ 第十轮:四个新槽位的参数来源,**全部可选**。
+   *
+   * 省略时键盘路径按 `{}` 调构建器 ⇒ 入口回一句"需要 op / itemId / qty / x,y"
+   * 而**不是**静默 —— 这正是本层要保证的那条(按了必须有话说)。
+   * 宿主(`main.ts`)给得出参数时,同一段判定照样跑(它只查表 + 递参数)。
+   */
+  /** `BREED_TAME` 的参数(`op` + `petId`,以及各分支需要的字段)。 */
+  breedTame?(): BreedTameInput;
+  /** `BUY_ITEM` 的参数(`itemId` + `qty`)。 */
+  buyItem?(): BuyItemInput;
+  /** `USE_ALCHEMY_FURNACE` 的参数(`itemId`)。 */
+  useAlchemyFurnace?(): AlchemyFurnaceInput;
+  /** `PLACE_AUTOMATION` 的参数(`x` / `y` + `kind` 或 `itemId`)。 */
+  placeAutomation?(): PlaceAutomationInput;
 }
 
 /** 一次触发可显式给的参数(按钮路径用;省略的项回落到 `EntryInputs`)。 */
@@ -143,6 +227,15 @@ export interface TriggerArgs {
   partyMode?: unknown;
   /** `USE_ITEM` 的参数(哪件道具、对谁用;省略 `targetId` = 对自己用)。 */
   useItem?: UseItemInput;
+  /* ★ 第十轮:四个新槽位的显式参数(按钮路径用;省略则回落到 `EntryInputs`)。 */
+  /** `BREED_TAME` 的参数。 */
+  breedTame?: BreedTameInput;
+  /** `BUY_ITEM` 的参数。 */
+  buyItem?: BuyItemInput;
+  /** `USE_ALCHEMY_FURNACE` 的参数。 */
+  useAlchemyFurnace?: AlchemyFurnaceInput;
+  /** `PLACE_AUTOMATION` 的参数。 */
+  placeAutomation?: PlaceAutomationInput;
 }
 
 /* ═══════════════════════════ 3. 键盘目标(结构化,不引 DOM 类型) ═══════════════════════════ */
@@ -204,11 +297,33 @@ export function createActionBinding(opts: {
        */
       case 'useItem':
         return entry.useItem(args.useItem ?? inputs.useItem?.() ?? {});
+      /*
+       * ★ 第十轮四个槽位:与 `useItem` 同一套写法 ——
+       * 参数**先看显式给的**(按钮路径),再回落到宿主(键盘路径),
+       * 都没有就按 `{}` 递构建器(由它说"缺什么",本层不替它判、不猜默认值)。
+       */
+      case 'breedTame':
+        return entry.breedTame(args.breedTame ?? inputs.breedTame?.() ?? {});
+      case 'buyItem':
+        return entry.buyItem(args.buyItem ?? inputs.buyItem?.() ?? {});
+      case 'useAlchemyFurnace':
+        return entry.useAlchemyFurnace(args.useAlchemyFurnace ?? inputs.useAlchemyFurnace?.() ?? {});
+      case 'placeAutomation':
+        return entry.placeAutomation(args.placeAutomation ?? inputs.placeAutomation?.() ?? {});
     }
   };
 
+  /**
+   * 键盘 → 结局。**两张表都查**:先字母表(`ENTRY_KEYS`,六个),
+   * 再数字热键表(`HOTBAR_KEYS`,四个)。
+   *
+   * ⚠️ 两张表都不命中 ⇒ `null`(交回别的监听器,本层不吞任何键)。
+   *   命中即触发 —— 即使参数不全也返回一个结局(`sent: false` + 一句可读理由),
+   *   那条"按了必须有话说"的纪律对四个新槽位同样成立。
+   */
   const handleKey = (key: string, args?: TriggerArgs): EntryOutcome | null => {
-    const spec = ENTRY_KEYS[key.toLowerCase()];
+    const k = key.toLowerCase();
+    const spec = ENTRY_KEYS[k] ?? HOTBAR_KEYS[k];
     if (spec === undefined) return null;
     return trigger(spec.slot, args);
   };

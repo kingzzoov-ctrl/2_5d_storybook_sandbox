@@ -2,6 +2,9 @@
 
 - **日期**:2026-11-18
 - **结论**:八路审计走完全部生产 `.ts`(180/180),发现按 P0..P3 分级 —— **P0 2 条、P1 11 条全部已修且各有判据**;**P2 13 条 / P3 9 条登记未修**(逐条理由见 §4)。本轮唯一的代码改动是让 `RoomRuntime.expireItemSources()` 真的被调用(内存卫生,给 P0-2 收尾)。**2026-11-18 第二批处置**:P2/P3 中 **15 条已修**(判据 `tests/WS-FND-91..94`),**7 条仍登记** —— 逐条见 §3.2 的状态列与新增的 §7。**2026-11-18 第三批处置**:再关 **3 条**(P2-13 上界 / P3-6 钳制选址 / P3-8 双端同源拦截)+ 订正本文件与代码现状矛盾的措辞(P3-9),判据 `tests/WS-FND-95-gate-and-bounds.test.ts`;详见 §7.5 与 §8。**现存仍登记 4 条**:P2-3 / P3-1 / P3-5 / P3-9。
+> ★ **本抬头已被 §7–§14 取代**(2026-11-18 第二批起共 8 批):上面「**现存仍登记 4 条**:P2-3 / P3-1 / P3-5 / P3-9」
+> 只在**第三批收尾那一刻**成立 —— §9 起逐批处置,`docs/AUDIT-R-ITEMS.md` 已记 **22/22 全部已处置、「仍登记」= 0 条**。
+> ⇒ 引用状态一律看 **§3.2 的状态列 / §9–§14 的逐批台账**(每条都点到判据编号),不要引本行的「4 条」与 §4 的旧账本。
 - **2026-11-18 第四批处置(第二轮)**:新审计的 **8 条 P1 + 12 条 P2/P3** 全部已修且各有判据(`tests/WS-FND-102..105`,共 42 条判据);逐条见 §9。
 - **2026-11-18 第五批处置(第三轮)**:本轮新审计的 **6 条 P1 + 12 条 P2/P3** 全部已修且各有判据,判据落在
   `tests/WS-FND-106-connection-lifecycle.test.ts`(13 条)、`tests/WS-FND-107-idempotency-hardening.test.ts`(9 条)、
@@ -78,6 +81,8 @@ foreach ($d in 'server/src','shared','client','scripts') {
 > **第四批追加**:P1-7(文档数字 / 哈希陈旧)追加判据 `WS-FND-103:13` —— §九 README sha256 过期属同一族(见 §9.3)。
 
 ### 3.2 P2 / P3(2026-11-18 第二批 + 第三批:18 条已修 / 4 条仍登记)
+> ★ **本抬头已被 §9–§14 取代**:下面四条「仍登记」(`P2-3` / `P3-1` / `P3-5` / `P3-9`)在第四批起逐条处置完毕 ——
+> 逐条见 §9.2 / §11.2 与 `docs/AUDIT-R-ITEMS.md`(`R1..R22` **22/22 已处置**)。本表**只为回溯**保留当时状态。
 
 | 编号 | 严重度 | 位置 | 状态 |
 |---|---|---|---|
@@ -212,6 +217,9 @@ this.expireItemSources();
   全仓 **103 个套件 / 2152 个用例全绿**(基座 FND 1138 条 / 89 套件,WS 编号 1014 条 / 14 套件)。
 - `node scripts/verify.ts --docs`:见本批交接报告;`node scripts/content-lock.ts` 指纹仍为
   `v2-76694a25`(本批未碰内容表)。`node scripts/backlog.ts`:133 条 / 37 未关闭 / 0 阻塞 / 96 已关闭(未变)。
+> ★ **本行已被 §7–§14 取代**:`37 未关闭` 是 2026-11-18 第二批那一刻的读数。现值(2026-11-19 实测,
+> 口径来源 `node scripts/backlog.ts`)= **133 条 / 0 未关闭 / 0 阻塞 / 133 已关闭**,与 `docs/AUDIT-R-ITEMS.md`
+> 的「仍登记 0 条」一致。
 - `npm run typecheck`:261 条(与基线一致,**未新增**)。
 
 ### 7.5 ★ 钳制选址的**单点约定**(审计 P3-6 / 交接单 P3-8)
@@ -752,11 +760,11 @@ this.expireItemSources();
 | SH-5 `types/cooking.ts` | **已登记** | `verify.ts:2159`(差集型;`isDiffSet()` 自检在 `:3269`) |
 | SH-6 `constants/cooking.ts` | **已登记** | `verify.ts:2160` + `:5148`(gate-only) |
 | SH-7 `diffChunkVersions` | **未接** | 生产 0 调用者 ⇒ 每个 chunk 都当新档收 |
-| CL-1 `renderPos` 系列 | **已接** | `main.ts` / `boot.ts` 消费;`poseView` 另两个字段仍 0 读者 |
+| CL-1 `renderPos` 系列 | **已接** | 具名读者 = `main.ts#__stageReady`(`predictor.renderPos`);渲染读者 = `main.ts` 把 `poseView` 交给 `boot.ts#setPoseSource`、`boot.ts#tick` 用 `predicted.render` 定立牌(★ 第十轮补查:`boot.ts` **不按名字**读 `renderPos`,旧文「`main.ts` / `boot.ts` 消费」只对一半)。`poseView` 4 字段里只剩 `.ackedSeq` 是 0 读者(`.logical` 已进 `boot.ts#summary` 自检口径) |
 | CL-2 `stage_assembly` | **部分接** | 14 export 里接了 4;`createStage`/`buildBillboard`/`applyDyeUniforms` 等 9 个零消费者 |
-| CL-3 `DragController.drop()` | **已接** | `boot.ts:1306` `dragCtl.drop(hover)`(客户端台账 `drop` = wired,含见证片段) |
+| CL-3 `DragController.drop()` | **已接** | `boot.ts#onUiPointerUp` `dragCtl.drop(hover)`(客户端台账 `drop` = wired,含见证片段;★ 第十轮改**符号锚** —— 旧文 `boot.ts:1306` 已漂,实测 `:1451`) |
 | CL-4 `slotTooltip`/`tooltipFor` | **已接** | `ui_binding.ts:629` `this.tooltipFor(...)`(台账 `tooltipFor` = wired) |
-| CL-5 `isoCam.zoom`/`stepZoom` | **已接** | `boot.ts:1351` 键盘 `[` / `]` 调 `stepZoom`(台账 `stepZoom` = wired) |
+| CL-5 `isoCam.zoom`/`stepZoom` | **已接** | `boot.ts#onKeyDown` 键盘 `[` / `]` 调 `stepZoom`(台账 `stepZoom` = wired;★ 第十轮改**符号锚** —— 旧文 `boot.ts:1351` 已漂,实测 `:1526`) |
 | ~~CL-6 `#hint`~~ | **整条撤回** | 实测**有**读点/写点(`boot.ts:574` `getElementById('hint')`、`:593` `textContent = ...`)⇒「代码从不读它」是错的,不再是符号级未接 |
 
 ### 13.3 ★ 本轮的定性结论(**这一句是本轮唯一的结论**)

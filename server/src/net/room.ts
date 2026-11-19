@@ -2416,6 +2416,10 @@ export class RoomRuntime {
    */
   private clearSeatTraces(userId: string): void {
     this.members.delete(userId);
+    /* ★ 第十轮 P3:`lastTargetlessAttackTick` 每玩家一条,修前 leave/purgeSeat 只调
+       `ac.leave()` ⇒ 这张旁表跨世代残留(同 id 重进时留着上一代的帧号)。
+       它与 `ac.leave` 同属「这个 id 的必清痕迹」,故**并排清**,不散到别处。 */
+    this.lastTargetlessAttackTick.delete(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
     try {
       this.ac.leave(userId);
@@ -3172,6 +3176,10 @@ export class RoomRuntime {
       if (this.lastTargetlessAttackTick.get(userId) === atkTick) {
         this.ac.commitAttackOf(userId, atkTick);
         const again = this.ac.attackPreview(userId, atkTick, claimedBonus);
+        /* ★ 第十轮 P2:同帧第二次畸形攻击的违规**也要**进流水 —— 修前这里与
+           `:3142` 不同:复判确实产出了 ATTACK_RATE,却没人把它推给 `room_events`
+           (drainViolations 只认 pendingViolations)⇒ 攻击刷屏在存档里**零痕迹**。 */
+        if (again.violation) this.pendingViolations.push(again.violation);
         this.lastAttackReport = null;
         this.lastAttackSettled = false;
         this.lastAttackRejection = 'RATE';

@@ -48,6 +48,7 @@
 import {
   INVARIANT_CODES,
   checkAll,
+  registryProblems,
   summarize,
 } from '../server/src/invariants.ts';
 import type {
@@ -212,6 +213,91 @@ export const VIOLATION_CASES: readonly ViolationCase[] = [
   },
 ];
 
+/* ═══════════════════════ 2b 分支级反例(第十轮补)═══════════════════════ */
+
+/**
+ * 一个**分支级**反例:它不新增 `InvariantCode`,只把某个 code 内部的一个**数据分支**
+ * 或某个**运行时守卫**(注册表自证 / `overrides` 拼错)单独钉住。
+ *
+ * ⚠️ 「每 code 一个 `VIOLATION_CASES`」只保证「这条判据**整体**有没有牙」——
+ *   它盖不住「一条判据内部有 N 个分支,只测第一条就把整条标成有牙」。
+ *   本表就是第十轮点到的那批分支的判据:非法地图 / 非法容量 / `maxBytes<=0` /
+ *   重复 code / `overrides` 拼错。
+ */
+export interface BranchCase {
+  /** 归属:哪一条不变量,或哪个运行时守卫。 */
+  owner: string;
+  name: string;
+  why: string;
+  /** 数据分支:期望被 `code` 抓到。 */
+  make?: () => InvSnapshot;
+  code?: InvariantCode;
+  /** 运行时守卫:期望**抛**。 */
+  trigger?: () => void;
+  /** 与 `trigger` 成对的**负对照**:合法形态,期望**不**抛。 */
+  control?: () => void;
+}
+
+/** 一份「键集与 `INVARIANT_CODES` 完全一致」的占位注册表(只作 `registryProblems` 的对照侧)。 */
+function fullChecks(): Record<string, InvariantCheck> {
+  const out: Record<string, InvariantCheck> = {};
+  for (const c of INVARIANT_CODES) out[c] = () => ({ ok: true, code: c, detail: '占位' });
+  return out;
+}
+
+export const BRANCH_CASES: readonly BranchCase[] = [
+  {
+    owner: 'POS_FINITE_IN_BOUNDS',
+    name: '非法地图(h 非有限)⇒ 必须先报「判不了」',
+    why: '地图边界本身非法时「越界」比较恒假 ⇒ 这一条会对所有坐标放行(那不是「没有越界」)',
+    code: 'POS_FINITE_IN_BOUNDS',
+    make: () => { const s = goodSnapshot(); s.map.h = Number.NaN; return s; },
+  },
+  {
+    owner: 'CONTAINER_CAPACITY',
+    name: '非法容量(NaN)⇒ 必须先报容量非法',
+    why: '容量非有限时「是否溢出」无从成立 ⇒ 该条静默放行',
+    code: 'CONTAINER_CAPACITY',
+    make: () => { const s = goodSnapshot(); s.containers[0]!.capacity = Number.NaN; return s; },
+  },
+  {
+    owner: 'FRAME_BYTES_BOUND',
+    name: '单帧上界 maxBytes <= 0 ⇒ 必须先报上界非法',
+    why: '上界非正数时这一条没有判据(0 会让任何字节都「超」,负数更荒谬)',
+    code: 'FRAME_BYTES_BOUND',
+    make: () => { const s = goodSnapshot(); s.frame.maxBytes = 0; return s; },
+  },
+  {
+    owner: 'registryProblems(注册表自证)',
+    name: '重复 code ⇒ 报问题(不是静默放行)',
+    why: '两条同名 code 会让归因出现两个入口 ⇒ 自证必须抓它',
+    trigger: () => {
+      const dup = [...INVARIANT_CODES, 'BODY_ID_UNIQUE'] as InvariantCode[];
+      /* 守卫「有牙」的形态是**报出问题**(返回值非空,不是抛)。这里把「报出来了」
+         翻成一个哨兵抛,与 `BranchReport.caught` 的口径(期望抛)对齐。 */
+      if (registryProblems(dup, fullChecks()).length > 0) throw new Error('重复 code 已被报出(守卫有牙)');
+    },
+    control: () => {
+      /* 负对照:合法注册表**不许**报问题 ⇒ 不许抛。 */
+      if (registryProblems(INVARIANT_CODES, fullChecks()).length !== 0) throw new Error('合法注册表被误报');
+    },
+  },
+  {
+    owner: 'checkAll(overrides 守卫)',
+    name: 'overrides 拼错 key ⇒ 抛(不是静默失效)',
+    why: '拼错的注入静默不生效 ⇒ 「注入后不再被抓到」会假绿',
+    trigger: () => {
+      const bad = {
+        POS_FINITE_IN_BOUYNDS: forceAlwaysOk('BODY_ID_UNIQUE'),
+      } as unknown as Partial<Record<InvariantCode, InvariantCheck>>;
+      checkAll(goodSnapshot(), { overrides: bad });
+    },
+    control: () => {
+      checkAll(goodSnapshot(), { overrides: { BODY_ID_UNIQUE: forceAlwaysOk('BODY_ID_UNIQUE') } });
+    },
+  },
+];
+
 /* ═══════════════════════ 3 注入面 ═══════════════════════ */
 
 /**
@@ -251,23 +337,42 @@ export interface CaseReport {
   ok: boolean;
 }
 
+/** 单个**分支级**反例的自检结论(见 `BranchCase`)。 */
+export interface BranchReport {
+  owner: string;
+  name: string;
+  why: string;
+  /** 数据分支被抓到 / 守卫真的报问题。 */
+  caught: boolean;
+  /** 归因唯一(数据分支)或负对照通过(守卫)。 */
+  confirmed: boolean;
+  /** 注入恒真后**不再**被抓到(数据分支);守卫恒为 true(= 不适用)。 */
+  silenced: boolean;
+  /** 注入物被调用次数(数据分支期望 1;守卫 = -1 表示不适用)。 */
+  injectionUsed: number;
+  detail: string;
+  ok: boolean;
+}
+
 /** 整份自检结论。`--json` 输出的就是它。 */
 export interface SelfcheckReport {
   ok: boolean;
-  /** `N/M 通过(…)` 形态:门禁把它原样打进输出行。 */
+  /** `N/M 通过(...)` 形态:门禁把它原样打进输出行。 */
   summaryLine: string;
   passed: number;
   total: number;
   invariantCount: number;
   positive: { ok: boolean; failing: InvariantCode[]; detail: string };
   cases: CaseReport[];
+  /** ★ 第十轮:分支级反例(每 code 一个的 `cases` 盖不住的那些分支)。 */
+  branches: BranchReport[];
 }
 
 /**
  * 跑完整套自检(**纯函数**:不打印、不设退出码、不读盘 ⇒ 测试与门禁共用同一份)。
  *
- * 判定的条数(见 `total`):1(正例整体)+ 8(正例逐条通过)+ 每个反例 4 条
- * = 1 + 8 + 8×4 = 41。
+ * 判定的条数(见 `total`):1(正例整体)+ 8(正例逐条通过)+ 每个 code 反例 4 条
+ * + 每个**分支级**反例 3 条。示例:1 + 8 + 8×4 + m×3。
  * ⚠️ 这个数是**算出来**的,不是手写的 —— 加一条不变量/反例时它自己会变。
  */
 export function runSelfcheck(): SelfcheckReport {
@@ -306,26 +411,67 @@ export function runSelfcheck(): SelfcheckReport {
     });
   }
 
-  const total = 1 + INVARIANT_CODES.length + cases.length * 4;
+  const branches: BranchReport[] = BRANCH_CASES.map((c) => {
+    if (c.make !== undefined && c.code !== undefined) {
+      const snap = c.make();
+      const results = checkAll(snap);
+      const failing = results.filter((r) => !r.ok).map((r) => r.code);
+      const caught = failing.includes(c.code);
+      const confirmed = caught && failing.length === 1;
+      /* 注入:只替换**这一条** ⇒ 若这个分支正是它抓的,注入恒真后就不再被抓到。 */
+      let used = 0;
+      const overrides: Partial<Record<InvariantCode, InvariantCheck>> = {};
+      overrides[c.code] = forceAlwaysOk(c.code, () => { used += 1; });
+      const injected = checkAll(snap, { overrides });
+      const silenced = !injected.some((r) => r.code === c.code && !r.ok);
+      const detail = results.find((r) => r.code === c.code)?.detail ?? '';
+      return {
+        owner: c.owner, name: c.name, why: c.why,
+        caught, confirmed, silenced, injectionUsed: used, detail,
+        ok: caught && confirmed && silenced && used === 1,
+      };
+    }
+    /* 运行时守卫:期望报问题(抛);配一条**负对照**(合法形态不许抛)。 */
+    let detail = '';
+    let caught = false;
+    try { c.trigger!(); } catch (e) { caught = true; detail = (e as Error).message; }
+    let confirmed = false;
+    if (c.control !== undefined) {
+      try { c.control(); confirmed = true; } catch { confirmed = false; }
+    }
+    return {
+      owner: c.owner, name: c.name, why: c.why,
+      caught, confirmed, silenced: true, injectionUsed: -1, detail,
+      ok: caught && confirmed,
+    };
+  });
+
+  const total = 1 + INVARIANT_CODES.length + cases.length * 4 + branches.length * 3;
   const casesPassed = cases.reduce((n, c) => n
     + (c.caught ? 1 : 0)
     + (c.onlyExpected ? 1 : 0)
     + (c.injectedCaught || c.injectionUsed !== 1 ? 0 : 1)
     + (c.injectionUsed === 1 ? 1 : 0), 0);
-  const passed = (positiveSummary.ok ? 1 : 0) + positivePassed + casesPassed;
+  const branchesPassed = branches.reduce((n, b) => n
+    + (b.caught ? 1 : 0) + (b.confirmed ? 1 : 0) + (b.silenced ? 1 : 0), 0);
+  const passed = (positiveSummary.ok ? 1 : 0) + positivePassed + casesPassed + branchesPassed;
 
-  const bad = cases.filter((c) => !c.ok).map((c) => c.code);
-  const summaryLine = `${passed}/${total} 通过(正例快照 1 个 · 反例 ${cases.length} 个 · 不变量 ${INVARIANT_CODES.length} 条)`
-    + (bad.length === 0 ? '' : `;没牙的条目:${bad.join(',')}`);
+  const badCases = cases.filter((c) => !c.ok).map((c) => c.code);
+  const badBranches = branches.filter((b) => !b.ok).map((b) => b.name);
+  const summaryLine = `${passed}/${total} 通过(正例快照 1 个 · 反例 ${cases.length} 个 · 分支 ${branches.length} 个 · 不变量 ${INVARIANT_CODES.length} 条)`
+    + (badCases.length === 0 ? '' : `;没牙的条目:${badCases.join(',')}`)
+    + (badBranches.length === 0 ? '' : `;没牙的分支:${badBranches.join(',')}`);
 
   return {
-    ok: positiveSummary.ok && positivePassed === INVARIANT_CODES.length && bad.length === 0,
+    ok: positiveSummary.ok && positivePassed === INVARIANT_CODES.length
+      && badCases.length === 0 && badBranches.length === 0,
     summaryLine,
     passed,
     total,
     invariantCount: INVARIANT_CODES.length,
     positive: { ok: positiveSummary.ok, failing: positiveSummary.failed, detail: positiveSummary.detail },
     cases,
+    branches,
   };
 }
 
@@ -342,6 +488,13 @@ function printReport(r: SelfcheckReport): void {
     console.log(`      ${c.injectedCaught ? '✗' : '✓'} 注入恒真 ⇒ 不再被抓到(注入被调用 ${c.injectionUsed} 次)`);
     console.log(`      · 为什么这条要守:${c.why}`);
     if (!c.ok) console.log(`      · detail:${c.detail}`);
+  }
+  for (const b of r.branches) {
+    console.log(`  ${b.ok ? '✓' : '✗'} 分支「${b.name}」(${b.owner})`);
+    console.log(`      ${b.caught ? '✓' : '✗'} ${b.injectionUsed === -1 ? '守卫报问题' : '被抓到'}`
+      + ` · ${b.confirmed ? '✓' : '✗'} ${b.injectionUsed === -1 ? '负对照通过' : '归因唯一'}`
+      + ` · ${b.silenced ? '✓' : '✗'} 注入恒真后静默(调用 ${b.injectionUsed} 次)`);
+    if (!b.ok) console.log(`      · detail:${b.detail}`);
   }
   console.log(`\n[不变量自检] ${r.summaryLine}`);
 }

@@ -23,13 +23,19 @@
  * 判据(`tests/WS-FND-126-client-chain.test.ts`)于是可以**真的**比对四张表的键集。
  *
  * ## 键是怎么选的
- * 空闲字母集是 `{ h, j, l, m }`(q/e/g/f 属 ACTION_KEYS,w/a/s/d 属 MOVE_KEYS,
+ * ## 键是怎么选的
+ * 空闲字母集是 `{ j, l, m }`(q/e/g/f 属 ACTION_KEYS,w/a/s/d 属 MOVE_KEYS,
  * n/k/o/u/v/t 属 ENTRY_KEYS,i/r/p 已被面板占用,z/y/x/c 是画架工具键)。
  * 画架从 `e` 挪到 `h`:与 `e`(拆除)不同指,也不在 WASD 手位上。
+ *
+ * ★ 第十轮:还要给四个「服务端已实现、客户端零入口」的动作补键,
+ *   而空闲字母**不够**(只剩 j/l/m,要放四个)⇒ 第二张表是**数字热键条**
+ *   (`net/action_binding.ts` 的 `HOTBAR_KEYS`:1/2/3/4)。数字键同样进
+ *   `keyGroups()` ⇒ 与上面任何一组撞车都会当场红,不靠人肉核对。
  */
 
 import { ACTION_KEYS } from '../net/action_target.ts';
-import { ENTRY_KEYS } from '../net/action_binding.ts';
+import { ENTRY_KEYS, HOTBAR_KEYS } from '../net/action_binding.ts';
 import { MOVE_KEYS } from '../net/input.ts';
 import { UiPanel } from './state_machine.ts';
 
@@ -75,7 +81,7 @@ export interface KeyGroup {
  * (重叠 = 一次按键两件事,而两边都不报错)。
  *
  * 组是从**各表本身**算出来的,不是手抄的第二份清单:
- * 谁改了 `ACTION_KEYS` / `ENTRY_KEYS` / `PANEL_KEYS`,这里会自动跟着变。
+ * 谁改了 `ACTION_KEYS` / `ENTRY_KEYS` / `HOTBAR_KEYS` / `PANEL_KEYS`,这里会自动跟着变。
  */
 export function keyGroups(): KeyGroup[] {
   const move: string[] = [
@@ -84,6 +90,7 @@ export function keyGroups(): KeyGroup[] {
   return [
     { name: 'ACTION_KEYS(建造/拆/丢/捡)', keys: Object.keys(ACTION_KEYS) },
     { name: 'ENTRY_KEYS(合成/睡觉/开箱/派对/用道具)', keys: Object.keys(ENTRY_KEYS) },
+    { name: 'HOTBAR_KEYS(驯养/购买/炼金/自动化)', keys: Object.keys(HOTBAR_KEYS) },
     { name: 'MOVE_KEYS(WASD + 方向键)', keys: move },
     { name: 'PANEL_KEYS(面板)', keys: Object.keys(PANEL_KEYS) },
     { name: 'EASEL_TOOL_KEYS(画架工具)', keys: EASEL_TOOL_KEYS },
