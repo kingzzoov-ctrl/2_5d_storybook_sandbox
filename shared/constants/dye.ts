@@ -48,3 +48,45 @@ export function dyeAttenuation(dist: number, range: number): number {
   if (dist >= range) return 0;
   return 1 - dist / range;
 }
+/* ═══════════════════ 32 色调色盘(全仓唯一的一份声明)═══════════════════ */
+
+/**
+ * 32 色染色枪 / 像素画架共用的调色盘(8 个色相 × 4 档明度,绘本风低饱和高亮)。
+ *
+ * ## 为什么搬到这里(第九轮实测:两份逐字节相同的副本)
+ *
+ * 改版前 `client/src/ui/pixel_easel.ts` 的 `PALETTE_32` 与
+ * `client/src/stage/dye_overlay.ts` 的 `DYE_PALETTE` 是**两份 32 行字面量**,
+ * 逐字节相同 —— 于是「画架画的第 7 号色」与「染色枪喷的第 7 号色」可以各自漂移,
+ * 而两边都"看起来合理"(调色盘不是一个数,漂一格不会报错)。
+ * 现在**只有这一份**:两侧都必须是同一批绑定(判据按 `===` 钉引用,不是按文本相等)。
+ *
+ * 索引语义(与改版前一致):
+ *   - 索引 0 固定近白(`#FFFDF7`),玩家可从空白直接上色;
+ *   - 索引 31 近黑(`#8A5433` 为末档棕),用于描边;
+ *   - 「透明 / 未染色」**不占调色盘索引**:画架用 `-1`,
+ *     染色通道用 `NO_DYE = -1`(见 `client/src/stage/dye_overlay.ts`)。
+ */
+export const DYE_PALETTE: readonly string[] = [
+  '#FFFDF7', '#F5E7D0', '#E9D3B0', '#D8B98C',
+  '#F7B7C6', '#EE8CA6', '#D76388', '#B03F6C',
+  '#FBD9A0', '#F5B96B', '#E0913C', '#B96A22',
+  '#D8EFA8', '#A9D97C', '#7CB855', '#4E8C39',
+  '#A8E6E0', '#6EC9C4', '#43A0A4', '#2A7178',
+  '#A9C8F5', '#7BA3E8', '#4F76CC', '#2E4C96',
+  '#D3B8F0', '#B08BE0', '#875FC2', '#5B3C90',
+  '#F0C9A8', '#D9A17C', '#B87A55', '#8A5433',
+];
+
+/**
+ * 调色盘色数 = 32。**「32」这个数在全仓只有这一处声明。**
+ *
+ * 改版前它有三个副本:`client/src/ui/pixel_easel.ts` 的 `PALETTE_SIZE = 32`、
+ * `client/src/stage/dye_overlay.ts` 的 `DYE_PALETTE_SIZE = DYE_PALETTE.length`、
+ * `server/src/party/scoring.ts` 的 `DYE_PALETTE_SIZE = 32`(染色计分槽数)。
+ * 三处口径相同、来源不同 ⇒ 加一种颜色的那天必然只改到其中一两处。
+ * 现在三处**都只是本常量的转发**(`client/src/ui/pixel_easel.ts#PALETTE_SIZE` /
+ * `client/src/stage/dye_overlay.ts#DYE_PALETTE_SIZE` /
+ * `server/src/party/scoring.ts#DYE_PALETTE_SIZE`),由 `tests/WS-FND-136` 逐处钉住。
+ */
+export const DYE_PALETTE_SIZE = DYE_PALETTE.length;

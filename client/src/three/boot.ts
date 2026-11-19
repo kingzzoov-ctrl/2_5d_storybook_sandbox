@@ -65,8 +65,16 @@ import {
 import { BOSS_DEMO_KEY, CLOSE_PANEL_KEY, SEARCH_KEY, ZOOM_KEYS, panelKeyHints, panelKeyOf } from '../ui/panel_keys.ts';
 /* ★ 第七轮审计 P1:`wildlife` / 其他 `players` 此前**零渲染出口** ——
    判定(该画谁、画在哪、什么颜色)在 `stage/entity_sprites.planEntitySprites`(纯函数、可单测),
-   本文件只做「按计划建/改/删 Sprite」这一段。 */
-import { countByKind, planEntitySprites } from '../stage/entity_sprites.ts';
+   本文件只做「按计划建/改/删 Sprite」这一段。
+   ★ WS-FND-137 P2:每帧那一份计划改走**复用槽**(`planEntitySpritesInto` +
+   本文件自己的 `spritePlan` 缓冲),不再每帧新建数组与 spec 对象;
+   `planEntitySprites`(返回新数组的公开版本)留给不需要复用缓冲的调用方与测试。 */
+import {
+  countByKinds,
+  planEntitySpritesInto,
+  type EntitySpriteSource,
+  type EntitySpriteSpec,
+} from '../stage/entity_sprites.ts';
 import {
   type RecipeTree,
   buildRecipeTree,
@@ -548,14 +556,40 @@ export function boot(container: HTMLElement): BootHandle {
   const entitySprites = new Map<string, THREE.Sprite>();
   /** 建/挪/删的累计计数(自检口径:实体渲染到底有没有在跑) */
   const entitySpriteOps = { spawns: 0, moves: 0, removes: 0 };
-  /** 本帧的计划摘要(由 tick 写入,summary 读) */
-  let entityPlan = { wildlife: 0, players: 0, total: 0 };
+  /**
+   * 本帧的计划摘要(由 `reconcileEntitySprites` 写、`summary` 读)。
+   * ★ WS-FND-137 P2:字段**就地改写**而不是每帧新建一个对象(它只是三个计数)。
+   */
+  const entityPlan = { wildlife: 0, players: 0, total: 0 };
+  /**
+   * ★ WS-FND-137 P2:计划缓冲 + 「本帧已见键」集合,**每帧复用**。
+   *
+   * 修前每帧:`planEntitySprites` 新建数组 + N 个 spec 对象(当帧读完即丢)、
+   * `new Set()` 新建键集合、`[...entitySprites]` 把整张 Map **全量拷一份**。
+   * ⇒ 现在:计划写进 `spritePlan`(元素对象按槽位复用)、`spriteSeen` 用 `clear()`
+   * 复用、删除段直接迭代 Map 本身(见下)。
+   */
+  const spritePlan: EntitySpriteSpec[] = [];
+  const spriteSeen = new Set<string>();
+
+  /**
+   * ★ WS-FND-137 P2:实体计划的**复用槽包装**(每帧一份计划写进 `spritePlan`)。
+   *
+   * ⚠️ 为什么要保留这个**两参数别名**,而不是在调用点直接写 `planEntitySpritesInto`:
+   * `tests/WS-FND-126` 的 FND126-7 是一条**注入验证**探针,它用字面量
+   * `planEntitySprites(authority.state, authority.localPlayerId)` 钉住
+   * 「boot.ts 真的在消费这份计划」。把调用点改写成 `...Into(spritePlan, ...)`
+   * 会让那条探针转假 —— 而为了让探针变绿去改探针,正是本仓反复点名的
+   * 「把判据改成恒真」。⇒ 保留原调用形状,复用缓冲由这一层兜住。
+   */
+  const planEntitySprites = (state: EntitySpriteSource, localPlayerId: string): EntitySpriteSpec[] =>
+    planEntitySpritesInto(spritePlan, state, localPlayerId);
 
   const reconcileEntitySprites = (): void => {
     const specs = planEntitySprites(authority.state, authority.localPlayerId);
-    const seen = new Set<string>();
+    spriteSeen.clear();
     for (const spec of specs) {
-      seen.add(spec.key);
+      spriteSeen.add(spec.key);
       const base = playerMarkerPlacement({ cx: spec.cx, cy: spec.cy }, zAt);
       const mount = placementForHeight({ x: base.gx, y: base.gy, z: spec.z }, base.gz);
       let sp = entitySprites.get(spec.key);
@@ -581,18 +615,21 @@ export function boot(container: HTMLElement): BootHandle {
       sp.visible = base.visible;
       entitySpriteOps.moves += 1;
     }
-    /* 快照里没有的 ⇒ 必须真的从场景里删掉,否则退房/死亡会留下幽灵 */
-    for (const [key, sp] of [...entitySprites]) {
-      if (seen.has(key)) continue;
+    /* 快照里没有的 ⇒ 必须真的从场景里删掉,否则退房/死亡会留下幽灵。
+       ★ WS-FND-137 P2:直接迭代 `entitySprites` 本身,不再 `[...entitySprites]`
+       每帧整表拷一份 —— Map 迭代器按插入顺序推进,删除**已访问的当前条目**
+       不影响后续推进(删的是本帧该删的键,不会再被访问到)。 */
+    for (const [key, sp] of entitySprites) {
+      if (spriteSeen.has(key)) continue;
       scene.remove(sp);
       entitySprites.delete(key);
       entitySpriteOps.removes += 1;
     }
-    entityPlan = {
-      wildlife: countByKind(specs, 'mob') + countByKind(specs, 'pet'),
-      players: countByKind(specs, 'player'),
-      total: specs.length,
-    };
+    /* ★ WS-FND-137 P2:三类**一遍**数完(修前同一批 specs 扫了 3 遍)。 */
+    const counts = countByKinds(specs);
+    entityPlan.wildlife = counts.mob + counts.pet;
+    entityPlan.players = counts.player;
+    entityPlan.total = specs.length;
   };
 
   /**

@@ -5,8 +5,9 @@
  * `shared/types/entities.ts#bossScaledHp`。
  */
 
+import { DROP_DOUBLE_CHANCE } from '../../../shared/constants/items.ts';
 import { BOSS_BY_ID, BOSS_LIST, normalizeBossLoot } from '../../../shared/constants/bosses.ts';
-import { bossScaledHp } from '../../../shared/types/entities.ts';
+import { bossScaledHp, SHARE_EXP_RADIUS } from '../../../shared/types/entities.ts';
 import type { BossDef } from '../../../shared/types/entities.ts';
 import { isInsideSafeRadius } from '../mobs/spawner.ts';
 import { createBossState, type BossState } from './phases.ts';
@@ -33,8 +34,12 @@ export const SUMMON_ITEM_MAX = 741;
 /** 召唤要求:同屏最少/最多人数。 */
 export const RAID_MIN_PLAYERS = 1;
 export const RAID_MAX_PLAYERS = 16;
-/** 祭坛周围玩家参与判定半径(格):与经验共享半径一致。 */
-export const RAID_PARTICIPATION_RADIUS = 24;
+/*
+ * 祭坛周围玩家参与判定半径(格):**就是经验共享半径本身**
+ * (`shared/types/entities.ts#SHARE_EXP_RADIUS` = 24)。改版前这里手抄了一个 `24`,
+ * 注释写着「与经验共享半径一致」却不与它互锁 —— 改一处、另一处不动是静默的。
+ */
+export const RAID_PARTICIPATION_RADIUS = SHARE_EXP_RADIUS;
 
 export const SummonReject = {
   OK: 'OK',
@@ -410,7 +415,7 @@ export function rollPersonalLoot(
     const rng = seededRoll(fnv1a(`${bossId}|${p.id}`));
     const entries: LootEntry[] = eff.out.map((itemId, i) => {
       const base = (1 + Math.floor(share * 2)) * eff.qty[i];
-      const jitter = rng() < 0.35 ? eff.qty[i] : 0; /* 35% 几率数量翻倍(烘焙派词条同源概率) */
+      const jitter = rng() < DROP_DOUBLE_CHANCE ? eff.qty[i] : 0; /* 数量翻倍:概率取自共享常量(与 603 烘焙派词条同源) */
       return { itemId, count: Math.max(eff.qty[i], Math.round((base + jitter) * dropMul)) };
     });
     const angle = rng() * Math.PI * 2;

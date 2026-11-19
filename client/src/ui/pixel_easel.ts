@@ -15,13 +15,15 @@
  *
  * 全部操作都是「改 1 个字节」级别,复杂度 O(1)(`fillRect` 为 O(w·h))。
  */
+import { DYE_PALETTE, DYE_PALETTE_SIZE } from '../../../shared/constants/dye.ts';
 
 /** 画布边长 */
 export const EASEL_SIZE = 16;
 /** 像素数 */
 export const EASEL_PIXELS = EASEL_SIZE * EASEL_SIZE;
 /** 调色盘色数 */
-export const PALETTE_SIZE = 32;
+/** 调色盘色数(32):取自单一事实源 `shared/constants/dye.ts#DYE_PALETTE_SIZE` */
+export const PALETTE_SIZE = DYE_PALETTE_SIZE;
 /** 透明像素的调色盘索引 */
 export const TRANSPARENT_INDEX = -1;
 /** 撤销栈默认容量 */
@@ -34,19 +36,18 @@ export interface Rgb {
 }
 
 /**
- * 32 色调色盘:8 个色相 × 4 档明度,绘本风低饱和高亮。
- * 索引 0 固定为「近白」,便于玩家从空白直接上色;索引 31 为「近黑」描边。
+ * 32 色调色盘 —— **同一批绑定,不是第二份副本**。
+ *
+ * 定义唯一地住在 `shared/constants/dye.ts`(314 地毯 / 524 画框 / 630 披风 /
+ * 209 染色枪共用同一个调色盘)。改版前这里是 32 行字面量,`dye_overlay.ts` 里
+ * 还有一份逐字节相同的副本 ⇒「画架画的第 N 号色」与「喷枪喷的第 N 号色」可以
+ * 各自漂移,而两边都"看起来合理"。
+ *
+ * 判据钉的是**引用相等**:`PALETTE_32 === DYE_PALETTE`(不是文本相等 ——
+ * 文本相等正是改版前那份副本成立的理由,它挡不住下一次只改一边)。
+ * 索引语义与 `DYE_PALETTE` 一致:0 近白、31 近黑;透明用 `TRANSPARENT_INDEX`。
  */
-export const PALETTE_32: readonly string[] = [
-  '#FFFDF7', '#F5E7D0', '#E9D3B0', '#D8B98C',
-  '#F7B7C6', '#EE8CA6', '#D76388', '#B03F6C',
-  '#FBD9A0', '#F5B96B', '#E0913C', '#B96A22',
-  '#D8EFA8', '#A9D97C', '#7CB855', '#4E8C39',
-  '#A8E6E0', '#6EC9C4', '#43A0A4', '#2A7178',
-  '#A9C8F5', '#7BA3E8', '#4F76CC', '#2E4C96',
-  '#D3B8F0', '#B08BE0', '#875FC2', '#5B3C90',
-  '#F0C9A8', '#D9A17C', '#B87A55', '#8A5433',
-];
+export const PALETTE_32: readonly string[] = DYE_PALETTE;
 
 /** 调色盘索引 → RGB(越界回退为白色) */
 export function paletteColor(index: number): Rgb {

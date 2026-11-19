@@ -1,5 +1,5 @@
 /**
- * **动作 → 处理器**的唯一一张表(`RoomAction` 22 个动作的**执行层归属**)。
+ * **动作 → 处理器**的唯一一张表(`RoomAction` **24** 个动作的**执行层归属**)。
  *
  * ## 为什么是 `Readonly<Record<RoomAction, ActionHandler>>` 而不是手搓 `switch`
  *
@@ -8,12 +8,12 @@
  * 漏一个 `case` 只会在运行期安静地掉进 `default`(正是 `tests/WS-FND-18` FND18-1
  * 要逐个归类的那种缺口,它只能**事后**发现)。⇒ 把「必须作决定」提前到编译期。
  *
- * ## 文件互斥(为什么 13 个未接动作各占一个模块)
+ * ## 文件互斥(为什么每个动作各占一个模块)
  *
- * 9 个已接动作按**族**分在 `admin.ts`(5)/ `material.ts`(4);
- * 尚未接线的 13 个各占一个模块(`move.ts` / `craft.ts` / …),在这里只登记**引用**。
- * ⇒ 后续接线某个动作时,**只改它自己那个文件**(把 `notImplemented` 换成真实现),
- *   本文件与 `room.ts` 一个字都不用动 ⇒ 13 个动作可以真正并行接线,互不冲突。
+ * 24 个动作**全部已登记**;其中 22 个各有真实现(`admin.ts` 5 个 / `material.ts` 4 个
+ * 按**族**分文件,其余 15 个各占一个模块:`craft.ts` / `sleep.ts` / ...)。
+ * 余下 2 个 —— `MOVE` / `ATTACK` —— 仍回 `NOT_IMPLEMENTED`(见下方 ★)。
+ * ⇒ 改某个动作时**只改它自己那个文件**,本文件与 `room.ts` 一个字都不用动。
  *
  * ## 没有循环 import
  *
@@ -46,10 +46,11 @@ import { useItem } from './use_item.ts';
 import { buyItem } from './buy_item.ts';
 
 /**
- * 22 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
+ * 24 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
  *
- * ★ 「已接线 / 未接线」的归属说明见 `docs/TASK-96-action-landing-gaps.md`;
- *   其中 `MOVE` / `ATTACK` 回 `NOT_IMPLEMENTED` 是**刻意**的(它们走专用报文通道)。
+ * ★ 「接线缺口」的历史清单见 `docs/TASK-96-action-landing-gaps.md`(当时记的 13 处未接线,
+ *   现已全部接线);今天仍回 `NOT_IMPLEMENTED` 的只剩 `MOVE` / `ATTACK`,这是**刻意**的
+ *   (它们走专用报文通道,`move.ts` / `attack.ts` 上方各有说明),不是「还没做」。
  */
 export const ACTION_HANDLERS: Readonly<Record<RoomAction, ActionHandler>> = {
   MOVE: move,

@@ -802,3 +802,91 @@ this.expireItemSources();
   跑出来的红会指向他们的半成品,不是本轮的产物。
 - 未改任何 `.ts` / `tests/`;未 commit;未碰 `.pi/`。
 - 写域:`README.md` · `docs/HANDOVER.md` · `docs/AUDIT-W34.md` · **新增** `docs/WIRING-LEDGER.md`。
+
+---
+
+## 14 2026-11-19 第九轮处置(错误可观测性 / 热路径与尸体回收 / 常量同源 / 每帧成本 / 检查器自身的牙口)
+
+> 起点是一条**实测命令**,终点是一条**仍未修复的红**:`node scripts/verify.ts --all`
+> ⇒ **exit 1 / 6 项失败**(235740ms);此后门禁**崩**在 `server/src/invariants.ts:533`(见 §14.2)。
+> 本节只登记**归属**与**元结论**;每条后面给了复算方式。
+
+### 14.1 开工读数:`verify.ts --all` ⇒ **exit 1 / 6 项失败**(行首 ✗ 6)
+
+| # | 红项(位置 · 报错原文) | 本轮谁该修 |
+|---|---|---|
+| 1 | `tests/WS-07.test.ts` 退出码 1:`[WS-07] G04 端到端:四类作弊在完整房间流程中都被拒绝 — 同一 tick 二次攻击应被拒 期望 false / 实际 true`;`[WS-07] WR-14 U2-b 经真实入口 applyMove / applyAttack 同样挡住 — 同一 tick 二次攻击必须被拒(非数字声明不豁免攻速) 期望 false / 实际 true` | net-persist(WS-07 写域) |
+| 2 | `tests/WS-09.test.ts` 退出码 1:`[WS-09] 染色批量喷色:整片墙 1 次调用,材质实例按表面数增长而非调用数 — 15 格内满强度 期望 1 / 实际 0.5` | client-stage(WS-09 写域) |
+| 3 | `tests/WS-FND-99-both-sides-structured.test.ts` 退出码 1:`FND99-6 真实仓库:命中清单逐条锚定(文件:行 + 两侧值),合法镜像 0 误报 — …[3]:期望 "DYE_PALETTE_SIZE" / 实际 "EncodeStats"` | FND-99 套件作者(常量同源的连带,见 R9-3) |
+| 4 | `[同义反复候选]`:`新增未登记的同义反复候选 1 个(--strict-taut):WS-FND-137-frame-cost::VIOLATION_KEEP_PER_PLAYER`(`tests/WS-FND-137-frame-cost.test.ts:350`) | 137 套件作者(T1 复测已归 0 ⇒ 已修) |
+| 5 | `[同义反复候选]`:`双端同源(结构化)登记表失真(登记的名字已不再命中,应移出):DYE_PALETTE_SIZE` | 常量同源执行者(见 R9-3) |
+| 6 | `[门禁自检]`:`README.md / docs/HANDOVER.md 的数字与实测不一致` **17 处** | **本轮(已由 `sync-docs --write` 消掉,见 R9-6)** |
+
+### 14.2 收工读数:门禁**自己崩了**(比上面 6 条更硬)
+
+```text
+node scripts/verify.ts --all  ⇒  exit 1,且**跑不完第一个检查节**
+file:///…/server/src/invariants.ts:533
+TypeError: Cannot destructure property 'live' of 's.triSide' as it is undefined.
+    at triSideMatch (server/src/invariants.ts:533:11)
+    at server/src/invariants.ts:699:15
+    at checkAll (server/src/invariants.ts:696:26)
+    at runSelfcheck (scripts/invariants.ts:274:42)
+    at scripts/verify.ts:7809:15
+```
+
+- 复算(1 秒,免跑全量门禁):`node -e "import('./scripts/invariants.ts').then(m=>console.log(m.runSelfcheck().summaryLine))"`;
+  连跑 7 次(约 12 分钟)**每次都崩** ⇒ 不是瞬态、不是并发写盘撞出来的。
+- 归属:`server/src/invariants.ts` + `scripts/invariants.ts`(不变量自检那条线)。**本轮不改**(不是本轮写域)。
+- ★ 为什么这条要单列:崩点在 `checkBomGuard()` 之后、`checkFrozen()` 之前 ⇒
+  **其后的每一节(含「文档数字比对」)一条都不执行**。「后面都绿」这句话此刻没有任何依据 ——
+  这与 §13.4 记的是同一条纪律:崩溃点之后不存在判据,只有不存在。
+
+### 14.3 R9 台账(靶子 ↔ 本轮事实 ↔ 归属)
+
+| 编号 | 靶子 | 本轮事实(实测) | 归属 |
+|---|---|---|---|
+| R9-1 | **错误可观测性** | 新套件 `tests/WS-FND-134-failure-observability.test.ts` **已落盘**(单跑 18/18 绿);但实测到一条「红的看不见」的通道:**`用例汇总` 把退出非 0 的套件整条排除在总数之外**(`verify.ts:7641 suiteHadFailure = true; continue;`)⇒ 红套件**不在总账里**,总账只**变小**:T0 读数 142 套件 / 2303 条(当时磁盘上 145 个套件文件,WS-07 / WS-09 / WS-FND-99 因红被剔除),T1 读数 145 / 2424。⇒ **「总数变小」不能读成「用例变少」** | 门禁汇总口径(Lead / `verify.ts`) |
+| R9-2 | 热路径与尸体回收 | `tests/WS-FND-135-hotpath-and-reap.test.ts` 已落盘(单跑 13/13 绿),本轮无它的红 | — |
+| R9-3 | **常量同源** | `DYE_PALETTE_SIZE` 已收敛到 `shared/constants/dye.ts` 单源(`tests/WS-FND-136-constants-single-source.test.ts` 用三处 `eq(..., DYE_PALETTE_SIZE)` 钉同源,12/12 绿)⇒ **同源化让「两端各声明一份」这件事消失**,于是两条**旧检查同时失真**:(a)`[双端同源(结构化)]` 报「登记表失真(登记的名字已不再命中,应移出):DYE_PALETTE_SIZE」;(b)`tests/WS-FND-99` 的 FND99-6「真实命中清单」仍写着旧名(红)。⇒ 这两条红**不是同源化做错了**,是检查器侧的登记/清单没跟着收窄 | 常量同源执行者 + FND-99 作者 |
+| R9-4 | **每帧成本** | `tests/WS-FND-137-frame-cost.test.ts` 已落盘(单跑 16/16 绿);但 T0 漏出 1 条同义反复候选(见 §14.1 第 4 条),T1 复测已归 0 ⇒ **常量在 actual 侧才有牙齿**这条老纪律的又一次复发 | 137 套件作者(已修) |
+| R9-5 | **不变量检查器自身的牙口** | 见 §14.2:不变量自检**自己崩** —— `triSideMatch()` 解构 `s.triSide` 时它已是 `undefined`(快照工厂与不变量对不上)。「检查器有牙」这件事本身没有牙去保证 | 不变量线作者 |
+| R9-6 | 文档数字 / §九 哈希 | 17 处(T0)⇒ 由 `node scripts/sync-docs.ts --write` 写回(含 §九 README 哈希);幂等由**工具收尾复扫零差异**与随后 `--check` 双重证明(§14.5) | **本轮(已完成)** |
+
+### 14.4 两个元结论
+
+**R9-M1 `sync-docs` 消掉了「人抄」这个易腐点。**
+本轮唯一属于文档侧的红(§14.1 第 6 条)不再用手改:`--write` 一次写回 17 处(+4 处静态量漂移),
+写回后**同一测量源**下 `--check` 报「✓ 无变化」、工具收尾复扫零差异 ⇒ 「同一份数字有两个来源」
+这件事被消掉了:文档侧的数字现在只有一个来源(门禁实测),人不再有地方抄错。
+⚠️ **但它消掉的是「抄错」,不是「判据错」**,且覆盖面**只到锚点**:
+· 值是什么仍取决于门禁怎么量 —— 例如 R9-1 的「红套件不进总账」,工具照抄该口径;
+· 锚点**之外**的散文仍是手抄、仍会腐化:实测 `README.md:75` 与 `docs/HANDOVER.md:96` 里的
+  「基座(FND-01..132)」号段**不会被工具更新**(锚点只捕获数字,不捕获括注里的号段)
+  ⇒ 新套件 134..137 已落盘,而那两处仍写「..132」。
+
+**R9-M2 检查器也会腐化 —— 「不变量检查器自身改窄不报」是本轮的一个实例。**
+把 `DYE_PALETTE_SIZE` 收敛到单源之后,检查器原本要看的**那条缝变窄到 0**:
+`[双端同源(结构化)]` 的登记名不再命中、FND-99 的期望清单仍写旧名(R9-3)。
+⇒ 关键不在「同源化做错了」,而在于:**登记/清单是手写的期望,被检查对象改窄后它们不会自己改窄**,
+它们只是「不再命中」——而「不再命中」在旧读数里与「已修好」同形。
+配套证据:本轮**有**反向自检的地方当场被抓(登记名不再命中 ⇒ 红);
+而 `[判据形态审计]` 自报「该检测器覆盖判定已知偏窄」却没报具体是哪一条 ⇒ 同一类问题在**没有反向自检**的检查器上是静默的。
+⇒ 结论:**「检查器有牙」不是一次性属性**;「让缺陷不可能发生」的修法必须**同时收窄检查器自己的登记**,
+否则检查器会从「守一条缝」退化成「守一条已经不存在的缝」,它仍然绿、仍然看起来有牙。
+
+### 14.5 本批验证口径(以及**没跑什么**)
+
+- T0(开工)`node scripts/verify.ts --all` ⇒ **exit 1 / 6 项失败**(见 §14.1)。
+- T1(收工前复测,`sync-docs --check` 现跑的那次)⇒ 应写值已变:`145 套件 / 2424 条`、
+  `WS 799 条 / 13 套件`、`基座 1625 条 / 132 套件`、同义反复 **0 条**、`§九 README 哈希 6abccada8ecf`。
+- ❌ **T2 起门禁跑不完**(§14.2 的 TypeError)⇒ **无法**再用「现跑门禁」当测量源。
+- `node scripts/sync-docs.ts --write --gate-log=<T0 门禁输出>` ⇒ 写回 17 处,复扫零差异(幂等);
+  随后 `node scripts/sync-docs.ts --check --gate-log=<同一份>` ⇒ **✓ 无变化**(exit 0)。
+  故:**写回的数是 T0 门禁读数 × 写回那一刻的静态量**;README 的「146 份测试套件 / 342 个 .ts」
+  是静态现算(与 T0 门禁里的 145/341 差 1 —— 两次写之间磁盘又变了)⇒ 这类数**只能读成时刻快照**。
+- ⚠️ **待办(必须重跑)**:`server/src/invariants.ts:533` 修好后,再跑一次
+  `node scripts/sync-docs.ts --write` —— 现在的文档数字是 T0 快照,而 T1 已经漂了;
+  且 `README.md:198` 的「同义反复候选」在 T0 是 1 条、T1 已归 0,散文里的 ✅/「当前相等」由下一次写回的上下文决定。
+- 未 commit;未碰 `.pi/`;未改任何 `.ts` / `tests/`。
+- 本轮写域:`README.md` · `docs/HANDOVER.md` · `docs/AUDIT-W34.md`(数字全部由 `sync-docs` 写回,**零手抄**)。

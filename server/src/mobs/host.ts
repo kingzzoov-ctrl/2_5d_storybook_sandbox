@@ -118,6 +118,23 @@ function makeDefaultRng(seed = 0x2f6e2b1): () => number {
   };
 }
 
+/* ── ★ WS-FND-135:尸体保留窗口 ── */
+
+/**
+ * 尸体在「已死」状态下保留的**快帧数**,之后由编排层收尸(`WorldSim.reapDeadMobs`)。
+ *
+ * ## 为什么不是 0(立即移除)
+ * 死亡那一帧的收尾工作还要读这条运行时:击杀结算(`settleKill` 读 `after.x/y`)、
+ * 掉落落地(`dropItem` 落在击杀点)、同一击的预警结算。而且「变尸体」与
+ * 「从三张表里消失」在语义上是**两件事**(前者是战斗事实,后者是生命周期事实)。
+ *
+ * ## 为什么必须很小
+ * 尸体只要还在,`runtimes()` 每帧就仍复制排序它、AOI 仍可能唤醒它、
+ * 物理仍拿它两两配对 —— 那是纯浪费。取 2 帧 = 最多一帧余量,
+ * 收尸在**下一帧末尾**发生(判据见 `tests/WS-FND-135`)。
+ */
+export const MOB_CORPSE_FRAMES = 2;
+
 /** 一帧的宿主统计。 */
 export interface MobHostFrameStats {
   /** 本帧推进的生物数。 */
@@ -263,6 +280,31 @@ export class MobHost implements MobWorld {
   /** 移除一只生物。 */
   removeMob(id: string): boolean {
     return this.mobs.delete(id);
+  }
+
+  /**
+   * ★ WS-FND-135(P1):**仍登记在册但已经死了**的实例 ID(字典序稳定)。
+   *
+   * 存在的理由:修前全仓 `removeMob` **零调用** ⇒ 击杀只把 `rt.alive` 置 false,
+   * 尸体永久留在宿主表里(`runtimes()` 每帧仍复制排序它、AOI 仍唤醒它、
+   * 物理仍拿它配对)。`deadIds()` 让「尸体还没收」从**靠肉眼读代码**变成可断言。
+   */
+  deadIds(): string[] {
+    return [...this.mobs.keys()].filter((k) => this.mobs.get(k)!.rt.alive === false).sort();
+  }
+
+  /**
+   * ★ WS-FND-135(P1):收尸 —— 把已死条目从**本表**摘掉,返回被摘掉的 ID(字典序)。
+   *
+   * ⚠️ 只动宿主自己的表:AOI(`aoi.unregisterMob`)、物理(`physics.remove`)、
+   * 刷怪计数(`spawner.remove`)的对称清理由**编排层**做(`WorldSim.reapDeadMobs`)——
+   * 宿主不认识那三张表(见文件头「适配而非重写」),在这里顺手清理就会长出第二份
+   * 「谁是权威」的答案。
+   */
+  reapDead(): string[] {
+    const dead = this.deadIds();
+    for (const id of dead) this.mobs.delete(id);
+    return dead;
   }
 
   /** 取运行时(只读用途;改动请通过 AI 或 onDamage)。 */

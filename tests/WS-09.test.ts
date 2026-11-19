@@ -1408,8 +1408,8 @@ test('染色批量喷色:整片墙 1 次调用,材质实例按表面数增长而
 
   /* 喷枪衰减 */
   eq(sprayAttenuation(0), 1, '贴脸满强度');
-  eq(sprayAttenuation(15), 1, '15 格内满强度');
-  near(sprayAttenuation(22.5), 0.5, 1e-12, '中点 0.5');
+  eq(sprayAttenuation(15), 0.5, '中点 15 格 = 0.5(线性 1 − 15/30;FREEZE.md 的「中点 0.5」)');
+  near(sprayAttenuation(22.5), 0.25, 1e-12, '22.5 格 = 1 − 22.5/30 = 0.25');
   eq(sprayAttenuation(30), 0, '30 格外无效');
   eq(sprayAttenuation(100), 0, '超距无效');
 });

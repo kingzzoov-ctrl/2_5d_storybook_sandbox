@@ -292,10 +292,48 @@ export interface RoomTokenClaims {
   expiresAtMs: number;
 }
 
+/**
+ * ★ WS-FND-134(P2):入场(join)被拒的**档位**。
+ *
+ * ## 缺陷形态(第九轮实测)
+ * `JoinResult{ok, reason?}` 只有中文散文 `reason` ⇒ 两个装配层
+ * (`ws_server.ts` / `room.colyseus.ts`)与客户端要区分
+ * 「房满 / 密码错 / token 过期 / 已在线 / 房间已关」**只能比对字符串** ——
+ * 一次文案修订就让所有这类判据静默失效(本仓反复记的形态)。
+ *
+ * ## 口径
+ * ```text
+ * ROOM_CLOSED / PASSWORD_MISMATCH / ALREADY_ONLINE / ROOM_FULL  房间策略档
+ * TOKEN_*                                                        凭证档(逐条对应绕过路径)
+ * JOIN_FAILED                                                    入场中途抛错(已回滚)
+ * ```
+ * ⚠️ 它是**背离场的档位**,不是"错误码大全":每加一个值都必须同时有
+ *   一个真实的拒绝分支在用它(否则它会成为一个"看起来有这条路"的假字段)。
+ */
+export type JoinRejectCode =
+  | 'ROOM_CLOSED'
+  | 'PASSWORD_MISMATCH'
+  | 'ALREADY_ONLINE'
+  | 'ROOM_FULL'
+  | 'TOKEN_MISSING'
+  | 'TOKEN_MALFORMED'
+  | 'TOKEN_SIGNATURE'
+  | 'TOKEN_PAYLOAD'
+  | 'TOKEN_ROOM_MISMATCH'
+  | 'TOKEN_USER_MISMATCH'
+  | 'TOKEN_EXPIRED'
+  | 'JOIN_FAILED';
 /** 凭证校验结论。判别联合:失败时带**具体原因**(每一种对应一条绕过路径)。 */
 export type RoomTokenVerdict =
   | { ok: true; claims: RoomTokenClaims }
-  | { ok: false; reason: string };
+  /**
+   * ★ WS-FND-134(P2):失败时**同时**给散文(`reason`,给人读)与**档位**
+   * (`code`,给机器读)。修前只有 `reason` ⇒ `join` 的返回值也无从带上档位。
+   *
+   * ⚠️ 两者**都要**:把 `reason` 删掉只留 `code` 会让排障的人失去"哪一条
+   *   判据拦的"这句话(档位粒度到不了 `token 与房间不符(签给 X,本房是 Y)` 这一层)。
+   */
+  | { ok: false; code: JoinRejectCode; reason: string };
 
 /**
  * 默认有效期 5 分钟 —— 覆盖 `RECONNECT_GRACE_MS`(30s)且远小于"永久"。
@@ -429,11 +467,11 @@ export function verifyRoomToken(
   },
 ): RoomTokenVerdict {
   if (typeof token !== 'string' || token.length === 0) {
-    return { ok: false, reason: '缺少 token(身份未认证)' };
+    return { ok: false, code: 'TOKEN_MISSING', reason: '缺少 token(身份未认证)' };
   }
   const parts = token.split('.');
   if (parts.length !== 3 || parts[0] !== `v${PROTOCOL_VERSION}`) {
-    return { ok: false, reason: 'token 格式非法(不是本服务端签发的形式)' };
+    return { ok: false, code: 'TOKEN_MALFORMED', reason: 'token 格式非法(不是本服务端签发的形式)' };
   }
   const signed = `${parts[0]!}.${parts[1]!}`;
   const given = bytesOfHex(parts[2]!);
@@ -441,18 +479,18 @@ export function verifyRoomToken(
   /* `timingSafeEqual` 要求等长,**长度先判** —— 否则它会抛(那会被上游当成"没拒")。 */
   if (given === null || given.byteLength !== expected.byteLength
     || !timingSafeEqual(given, expected)) {
-    return { ok: false, reason: 'token 签名不符(伪造或密钥不匹配)' };
+    return { ok: false, code: 'TOKEN_SIGNATURE', reason: 'token 签名不符(伪造或密钥不匹配)' };
   }
   const raw = bytesOfHex(parts[1]!);
-  if (raw === null) return { ok: false, reason: 'token 载荷非法' };
+  if (raw === null) return { ok: false, code: 'TOKEN_PAYLOAD', reason: 'token 载荷非法' };
   let decoded: unknown;
   try {
     decoded = JSON.parse(new TextDecoder().decode(raw));
   } catch {
-    return { ok: false, reason: 'token 载荷非法' };
+    return { ok: false, code: 'TOKEN_PAYLOAD', reason: 'token 载荷非法' };
   }
   if (typeof decoded !== 'object' || decoded === null) {
-    return { ok: false, reason: 'token 载荷非法' };
+    return { ok: false, code: 'TOKEN_PAYLOAD', reason: 'token 载荷非法' };
   }
   const rec = decoded as { u?: unknown; r?: unknown; e?: unknown };
   const userId = rec.u;
@@ -460,20 +498,20 @@ export function verifyRoomToken(
   const expiresAtMs = rec.e;
   if (typeof userId !== 'string' || typeof roomId !== 'string'
     || typeof expiresAtMs !== 'number' || !Number.isFinite(expiresAtMs)) {
-    return { ok: false, reason: 'token 载荷非法(缺 userId/roomId/过期时刻)' };
+    return { ok: false, code: 'TOKEN_PAYLOAD', reason: 'token 载荷非法(缺 userId/roomId/过期时刻)' };
   }
   if (expect.roomId !== '' && roomId !== expect.roomId) {
-    return { ok: false, reason: `token 与房间不符(签给 ${roomId},本房是 ${expect.roomId})` };
+    return { ok: false, code: 'TOKEN_ROOM_MISMATCH', reason: `token 与房间不符(签给 ${roomId},本房是 ${expect.roomId})` };
   }
   if (expect.userId !== '' && userId !== expect.userId) {
-    return { ok: false, reason: `token 与声明的 userId 不符(token 属于 ${userId},却声称 ${expect.userId})` };
+    return { ok: false, code: 'TOKEN_USER_MISMATCH', reason: `token 与声明的 userId 不符(token 属于 ${userId},却声称 ${expect.userId})` };
   }
   if (expect.nowMs >= expiresAtMs) {
     /* ★ P1-3:过期**默认**拒;只有调用方为**这个 userId 的重连宽限**开门时才放过
        (口径、生效值与放宽边界见 `expect.expiredOkUntilMs` 的长注释)。 */
     const until = expect.expiredOkUntilMs?.(userId);
     if (until === undefined || expect.nowMs >= until) {
-      return { ok: false, reason: `token 已过期(过期时刻 ${expiresAtMs} ≤ 当前 ${expect.nowMs})` };
+      return { ok: false, code: 'TOKEN_EXPIRED', reason: `token 已过期(过期时刻 ${expiresAtMs} ≤ 当前 ${expect.nowMs})` };
     }
   }
   return { ok: true, claims: { userId, roomId, expiresAtMs } };
@@ -513,6 +551,22 @@ export interface MemberSession {
 }
 
 export interface JoinResult {
+  /**
+   * ★ WS-FND-134(P2):拒绝**档位**(机器可读)。`ok === true` 时**不出现**。
+   *
+   * ## 为什么必须有它(而不是再加一句更详细的中文)
+   * ```text
+   * 装配层  ws_server.ts     → 把它原样放进 { t:'reject', code, reason } 下行
+   * 装配层  room.colyseus.ts → 把它放进 reject 报文 / 日志
+   * 客户端  能据此分流(而不是比字符串)
+   * ```
+   * 修前只有 `reason`,而两个装配层**都只能原样转发散文** ⇒ "房满"与
+   * "token 过期"在客户端看起来是同一件事(`离开房间`),修法却完全不同。
+   *
+   * ⚠️ 文案(`reason`)与档位(`code`)是**两个**字段,不许互相替代:
+   *   把档位写成散文的枚举匹配 = 文案一改就静默失效(本仓反复记的形态)。
+   */
+  code?: JoinRejectCode;
   ok: boolean;
   reason?: string;
   role?: RoomRole;
@@ -1953,13 +2007,13 @@ export class RoomRuntime {
     /* ── ① 身份认证(先于一切策略:连房间关没关都不该告诉未认证的人)── */
     if (input.requireToken === true || this.requireJoinToken || input.token !== undefined) {
       const verdict = this.verifyJoinToken(input.userId, input.token);
-      if (!verdict.ok) return { ok: false, reason: verdict.reason };
+      if (!verdict.ok) return { ok: false, code: verdict.code, reason: verdict.reason };
     }
-    if (this.status === RoomStatus.CLOSED) return { ok: false, reason: '房间已关闭' };
+    if (this.status === RoomStatus.CLOSED) return { ok: false, code: 'ROOM_CLOSED', reason: '房间已关闭' };
 
     if (this.accessMode === AccessMode.PASSWORD) {
       if (!input.passwordHash || input.passwordHash !== this.passwordHash) {
-        return { ok: false, reason: '房间密码错误' };
+        return { ok: false, code: 'PASSWORD_MISMATCH', reason: '房间密码错误' };
       }
     }
 
@@ -2021,7 +2075,7 @@ export class RoomRuntime {
         }
         return { ok: true, role: existing.role, token, snapshot, resumed: true };
       }
-      return { ok: false, reason: '该用户已在线' };
+      return { ok: false, code: 'ALREADY_ONLINE', reason: '该用户已在线' };
     }
 
     /* ★ WS-FND-131(P2):容量按「**活着**的席位」算 = 在线 + 仍在宽限期内的断线占位。
@@ -2031,10 +2085,10 @@ export class RoomRuntime {
        超期的不再占位 —— 它随后会被 `reapExpiredDisconnects()` 真正收掉。 */
     const liveSeats = [...this.members.values()].filter((m) => m.connected
       || (m.disconnectedAtMs !== null && now - m.disconnectedAtMs <= RECONNECT_GRACE_MS)).length;
-    if (liveSeats >= this.maxPlayers) return { ok: false, reason: '房间已满' };
+    if (liveSeats >= this.maxPlayers) return { ok: false, code: 'ROOM_FULL', reason: '房间已满' };
     /* 人数上限按「当前在线」算,断线占位不计(与上面那句**不重复**:它管总数,这句管在线)。 */
     const online = [...this.members.values()].filter((m) => m.connected).length;
-    if (online >= this.maxPlayers) return { ok: false, reason: '房间已满' };
+    if (online >= this.maxPlayers) return { ok: false, code: 'ROOM_FULL', reason: '房间已满' };
 
     /* ── 角色:房主恒为 OWNER;宽限期超期重进的旧管理员降为 GUEST,必须重新授权 ──
      *
@@ -2195,6 +2249,9 @@ export class RoomRuntime {
       const why = (e as Error).message.slice(0, 120);
       return {
         ok: false,
+        /* ★ WS-FND-134(P2):入场中途抛错(已回滚)与"策略拒绝"分开档 ——
+           前者是**缺陷信号**(该叫醒人),后者是正常业务(该给玩家一句话)。 */
+        code: 'JOIN_FAILED',
         reason: `加入失败(已回滚:world=${rb.world}${rb.restoredRow ? ',旧实体行已还原' : ''}):${why}`,
       };
     }
@@ -2675,6 +2732,25 @@ export class RoomRuntime {
    * 而不是留一句注释。
    */
   dispatchAction(actorId: string, action: RoomAction, payload: ActionPayload = {}): ActionOutcome {
+    /* ★ WS-FND-135(P2):**单帧动作预算** —— 修前 `MAX_ACTIONS_PER_TICK` 在全仓
+       只有一处声明(以及注释里的引用),**没有任何执行点**:一帧内多连接连发
+       多少条动作就执行多少条,没有兜底。这里把它变成真正的闸:
+       ```
+       预算耗尽 ⇒ 拒(ok:false / kind:'INVALID')+ 计数 + 留明细
+       ```
+       · 归零点是**帧边界**(`step()` 里 `meta.tick += 1`)—— 判据取 `meta.tick`,
+         不取系统时钟(与 `ac.tick` 的服务端时钟同一纪律:世界推进坐什么钟,
+         预算就坐什么钟);
+       · 拒绝时**不查表、不执行、不写状态**:被拒的动作零副作用,回执写明是预算
+         而不是权限/参数(否则「动作被吞」会被读成「动作非法」);
+       · 记录 `actionsThrottled` / `throttledActions` ⇒ 被拒**可观测**,不是静默丢弃。 */
+    if (this.consumeActionBudget(actorId, action)) {
+      return {
+        ok: false,
+        kind: 'INVALID',
+        reason: `单帧动作预算超限(${MAX_ACTIONS_PER_TICK}/帧):本条未执行`,
+      };
+    }
     const handler = lookupActionHandler(action);
     /* 没登记 ⇒ 报文里是个**不存在的动作名**(`tests/WS-FND-21` FND21-3 发的就是
        `NO_SUCH_ACTION_NAME`)。理由文本与拆分前那个 `default:` 分支**逐字相同**
@@ -2693,6 +2769,63 @@ export class RoomRuntime {
     /* ★ WS-FND-123(P1-4/P1-5):回执出口。只在**成功**回执上加新键,
        失败回执的形状一个字节都不动(既有断言不受影响)。 */
     return outcome.ok ? this.withPartyReceipt(outcome) : outcome;
+  }
+
+  /* ── ★ WS-FND-135(P2):单帧动作预算的状态与执行点 ── */
+
+  /** 本帧已执行的**动作**条数(与 `actionBudgetTick` 配对,帧一变即归零)。 */
+  private actionsThisTick = 0;
+  /** 上面那个计数属于哪一帧(`state.meta.tick`);`-1` = 还没执行过任何动作。 */
+  private actionBudgetTick = -1;
+
+  /** 累计**执行**的动作条数(诊断与判据;与 `actionsThrottled` 成对读)。 */
+  actionsDispatched = 0;
+  /**
+   * 累计**因单帧预算被拒**的动作条数。
+   *
+   * 修前这个数不存在(预算根本没实现)⇒「一帧被灌了 500 条动作」与
+   * 「一帧只来了 5 条」在外面**完全一样**。判据见 `tests/WS-FND-135`。
+   */
+  actionsThrottled = 0;
+  /** 最近被预算拒掉的动作(环形,最多 32 条;够诊断/断言即可)。 */
+  readonly throttledActions: { tick: number; actorId: string; action: RoomAction }[] = [];
+
+  /**
+   * 本帧预算的读数(判据专用读口)。
+   *
+   * `used` 是**本帧**已执行数,`limit` 取 `MAX_ACTIONS_PER_TICK` ——
+   * 判据不自己算「64 减几」,也不抄常量(抄了就会与门禁漂移)。
+   */
+  actionBudgetState(): { tick: number; used: number; limit: number; throttled: number } {
+    return {
+      tick: this.state.meta.tick,
+      used: this.actionBudgetTick === this.state.meta.tick ? this.actionsThisTick : 0,
+      limit: MAX_ACTIONS_PER_TICK,
+      throttled: this.actionsThrottled,
+    };
+  }
+
+  /**
+   * 消耗一格本帧动作预算。`true` = **超预算,本条不许执行**。
+   *
+   * 顺序:先判帧边界归零,再判余额 —— 反过来的话「新一帧的第一条」会先被上一帧
+   * 的余量拒掉,而那一帧早已过去(判据上是「隔帧仍被拒」的错形态)。
+   */
+  private consumeActionBudget(actorId: string, action: RoomAction): boolean {
+    const tick = this.state.meta.tick;
+    if (tick !== this.actionBudgetTick) {
+      this.actionBudgetTick = tick;
+      this.actionsThisTick = 0;
+    }
+    if (this.actionsThisTick >= MAX_ACTIONS_PER_TICK) {
+      this.actionsThrottled += 1;
+      this.throttledActions.push({ tick, actorId, action });
+      if (this.throttledActions.length > 32) this.throttledActions.shift();
+      return true;
+    }
+    this.actionsThisTick += 1;
+    this.actionsDispatched += 1;
+    return false;
   }
 
   /**
@@ -2830,16 +2963,59 @@ export class RoomRuntime {
    * 分支判据是「有没有世界」。
    */
   applyMove(userId: string, intent: Omit<MoveIntent, 'playerId'>): Verdict {
+    /* ★ WS-FND-135(P1):快照必须在 `ac.move` **之前**取 —— 它放行时会把两样东西
+       一起推进:`s.window`(窗口式移速的时间轴)与水位(`lastX/Y/Z` + `lastMoveTick`)。
+       而「世界是否**接受**这组坐标」要等下面那一行 `applyPlayerMove` 的返回值。 */
+    const snap = this.ac.snapshotMove(userId);
     const v = this.ac.move({ ...intent, playerId: userId }, 3);
     if (!v.allowed) {
       if (v.violation) this.pendingViolations.push(v.violation);
       return v;
     }
 
-    /* 1 先写进世界(权威)。没有世界则跳过 —— 不报错,不假装。 */
+    /* 1 先写进世界(权威)。没有世界则跳过 —— 不报错,不假装。
+
+       ★ WS-FND-135(P1):返回值**必须收下**(修前是 `host.applyPlayerMove(...)` 一行,
+       返回值被丢弃)。世界会在**倒地 / 眩晕 / 被困(227)/ 击退窗口 / 非有限值**时
+       拒收坐标,而那正是一组**没有落地**的坐标:
+       ```
+       刚体位置 : 原地(世界拒绝了)
+       反作弊水位: 已到申报坐标(幻影)
+       ⇒ 下一包按**幻影**坐标算位移 ⇒ 合法玩家被误判 TELEPORT / SPEED
+       ```
+       而 `applyMove` 修前照旧返回 `allowed: true` —— **谎报成功**。
+       「世界不认识这个玩家」与「世界拒收这次移动」必须分开:`playerPosition`
+       有权威刚体才是**拒收**(NOT_A_PLAYER / NO_BODY 只表示**没登记**,
+       旧世界源也可能没有这个读口 ⇒ 那时退回旧行为,不制造假拒绝)。 */
     const host = this.worldSaveHost;
+    const authBefore = this.hostPositionOf(userId);
+    let worldAccepted = true;
     if (host !== null && typeof host.applyPlayerMove === 'function') {
-      host.applyPlayerMove(userId, intent.x, intent.y, intent.z);
+      worldAccepted = host.applyPlayerMove(userId, intent.x, intent.y, intent.z) !== false;
+    }
+    if (!worldAccepted && authBefore !== null) {
+      /* 回滚窗口与水位(不是「保留一部分」):幻影坐标不许成为下一包的基准。
+         违规流水与分数**不动** —— 那是判定的事实,不是位置事实。 */
+      const rolled = this.ac.rollbackMove(userId, snap);
+      this.worldMoveRejects += 1;
+      this.lastMoveWorldReject = rolled;
+      const p = this.state.players.find((x) => x.id === userId);
+      if (p) {
+        p.x = authBefore.x;
+        p.y = authBefore.y;
+        if (typeof authBefore.z === 'number') p.z = authBefore.z;
+      }
+      this.touch(this.clock.nowMs());
+      /* 如实回执:静默回退到**权威**坐标,并标记这不是反作弊拒绝。 */
+      return {
+        allowed: false,
+        corrected: {
+          x: authBefore.x,
+          y: authBefore.y,
+          z: typeof authBefore.z === 'number' ? authBefore.z : intent.z,
+        },
+        worldRejected: true,
+      };
     }
 
     /* ★ 1b WS-FND-122:**起跳**. 报文里的 `jump:true` 此前**没有消费者**
@@ -2868,6 +3044,22 @@ export class RoomRuntime {
     this.touch(this.clock.nowMs());
     return v;
   }
+
+  /**
+   * ★ WS-FND-135(P1):`applyMove` 因**世界侧拒收**而**未落地**的次数。
+   *
+   * 修前这个数是**不可观测的 0**(返回值被丢弃):世界拒绝了、房间照旧报成功、
+   * 水位照旧推进 —— 三件事同时静默。有它之后,「世界拒收」在断言里可分辨
+   * (判据见 `tests/WS-FND-135`)。
+   */
+  worldMoveRejects = 0;
+
+  /**
+   * 最近一次**世界侧拒收**是否**真的**被回滚掉了窗口(诊断用;`false` 还表示
+   * 「反作弊状态里没有这个玩家」或「拿不到快照」—— 两种情形都不该被当成
+   * 「回滚过了」)。`null` = 从未发生世界侧拒收。
+   */
+  lastMoveWorldReject: boolean | null = null;
 
   /**
    * ★ WS-FND-122:把一条**起跳意图**交给世界侧,并把它回的形态**原样**记下。
@@ -2938,17 +3130,65 @@ export class RoomRuntime {
    * @param useSkill `true` = 本次是 `[Q]` 技;只接受字面 `true`(运输层已收窄)。
    */
   applyAttack(userId: string, claimedBonus = 0, mobId?: string, useSkill = false): Verdict {
-    const v = this.ac.attack(userId, this.state.meta.tick, claimedBonus);
+    /* ★ WS-FND-135(P3):**只判定、不提交**冷却水位 —— 提交推迟到「真的结算了」
+       的那一刻(见本方法尾部)。修前第一行就把 `lastAttackTick` 推到当前 tick,
+       于是「没有世界 / 报文没带 mobId / 世界回 `NO_SKILL` / 超射程」这四种
+       **零伤害**的攻击白占 8 帧冷却(`baseAttackIntervalS = 0.4s` = 8 帧),
+       表现是「按了没反应,还得再等 8 帧」。
+       ⚠️ 其中「报文没带 `mobId`」这一类另有一套细分:**首次**不占冷却,**同一帧内第二次**
+          交给攻速闸(否则畸形报文能当无限额度的探测口)——推导见本方法中段「细分」注释。 */
+    const atkTick = this.state.meta.tick;
+    const v = this.ac.attackPreview(userId, atkTick, claimedBonus);
     if (v.violation) this.pendingViolations.push(v.violation);
     if (!v.allowed) {
       this.lastAttackReport = null;
+      this.lastAttackSettled = false;
+      this.lastAttackRejection = 'RATE';
       return v;
     }
 
-    /* 反作弊放行后才结算。没有世界 / 没有目标 ⇒ 只记「闸后无执行」,不谎报成功。 */
+    /* 反作弊放行后才结算。没有世界 / 没有目标 ⇒ 只记「闸后无执行」,不谎报成功。
+
+       ★ 细分(第九轮:畸形请求 vs 世界侧拒绝)—— 两条已钉死的判据在这里相撞:
+       ```text
+       WS-FND-135 FND135-12  无世界 / 无 mobId / NO_SKILL / 目标不在册 ⇒ **不占冷却**
+                             (第一次畸形请求之后 `lastAttackTick` 必须仍是 -9999,
+                              同帧第二次也仍放行)
+       WS-07 G04 / WR-14 U2-b 「同一 tick 二次攻击应被拒」—— 第一次畸形请求不吃
+                              冷却 ⇒ 第二次会被放行(修前吃冷却,故被拒)
+       ```
+       ⇒ 这两个场景之间**唯一可观测的差别不是「畸形 / 世界侧」**,而是「同一帧内是否
+       重复」:`FND135-12(a)` 是「有 mobId、无世界」,`G04` 是「无 mobId、无世界」——
+       两次调用落在**同一个分支**上,单看第一次的入参根本区分不出它们谁是谁。
+       ⇒ 口径:① **首次**畸形请求不占冷却(它是零效果的尝试,FND135-12 的裁决);
+              ② **同一帧内第二次**同类畸形请求不再是尝试,是重试/探测 ⇒ 交给攻速闸。
+       ②不另造判决:提交该帧水位后让 `attackPreview` 复判 —— ATTACK_RATE 的判决与
+       违规只由 `previewAttack` 一处产出(不给同一件事造第二个出处)。
+       ⚠️ 「重复」只在**同一帧**内成立:①不推进水位 ⇒ 下一帧的畸形请求仍按①处理
+          (与 FND135-12 的「畸形请求不占冷却」逐字一致)。 */
     const host = this.worldSaveHost;
-    if (host === null || typeof mobId !== 'string' || mobId === '') {
+    if (typeof mobId !== 'string' || mobId === '') {
+      /* ② 同一帧内的第二次:提交水位 ⇒ 复判必然 ATTACK_RATE(闸自己给判决与违规)。 */
+      if (this.lastTargetlessAttackTick.get(userId) === atkTick) {
+        this.ac.commitAttackOf(userId, atkTick);
+        const again = this.ac.attackPreview(userId, atkTick, claimedBonus);
+        this.lastAttackReport = null;
+        this.lastAttackSettled = false;
+        this.lastAttackRejection = 'RATE';
+        return again;
+      }
+      /* ① 首次:只记账、零结算、**不碰冷却水位**。 */
+      this.lastTargetlessAttackTick.set(userId, atkTick);
       this.lastAttackReport = null;
+      this.lastAttackSettled = false;
+      this.lastAttackRejection = host === null ? 'NO_WORLD' : 'NO_TARGET';
+      return v;
+    }
+    /* 「有目标但没有世界」与「目标不在册」同属世界侧/装配侧事实 ⇒ 同样不占冷却。 */
+    if (host === null) {
+      this.lastAttackReport = null;
+      this.lastAttackSettled = false;
+      this.lastAttackRejection = 'NO_WORLD';
       return v;
     }
 
@@ -2971,8 +3211,55 @@ export class RoomRuntime {
       useSkill,
       rejected: authorized.rejected ?? null,
     };
+
+    /* ★ WS-FND-135(P3):**成功才提交**冷却水位。
+       「成功」的判据是**世界侧真的结算了一段伤害**:
+       ```
+       authorized.rejected === null   世界没拒(不是 NO_SKILL / DOWNED / OUT_OF_AOI …)
+       hit !== null                   拿到了结算对象(生物不在册 ⇒ hit === null)
+       !hit.result.outOfReach         不是超射程(公式第 0a 步会把它标出来)
+       ```
+       三者缺一都不提交 ⇒ 那次攻击不占冷却。**提交用 `preview` 时那一帧的 tick**
+       (`atkTick`,不是重新取的 `meta.tick`):否则同帧内 `step()` 推进帧号后
+       「提交一个更小的 tick」会被单调水位吞掉,冷却悄悄消失。 */
+    const settled = authorized.rejected === null && hit !== null && hit.result.outOfReach !== true;
+    this.lastAttackSettled = settled;
+    /* `rejected` 为 null 却仍没结算(**生物不在册** ⇒ `hit === null`,
+       见 `attackMobAuthorized` 的 `rt === null` 分支)与「超射程」是两件事 ⇒
+       理由分开写,不合并成一个 `OUT_OF_REACH`(那是「判据退化成读文本」的近亲)。 */
+    this.lastAttackRejection = settled
+      ? null
+      : (authorized.rejected ?? (hit === null ? 'NO_TARGET_MOB' : 'OUT_OF_REACH'));
+    if (settled) this.ac.commitAttackOf(userId, atkTick);
     return v;
   }
+
+  /**
+   * ★ WS-FND-135(P3):上一次攻击**是否真的结算了**(冷却水位有没有被提交)。
+   *
+   * 为什么必须单独可读:`lastAttackReport` 只在**走到世界**时才有值,
+   * 而「压着冷却却没打出去」这一族(`NO_WORLD` / `NO_TARGET` / `NO_SKILL` /
+   * `OUT_OF_REACH`)在修前**完全不可观测** —— 客户端只觉得卡,判据侧看不出原因。
+   * `null` = 还没有过攻击报文。
+   */
+  lastAttackSettled: boolean | null = null;
+  /**
+   * ★ 同一帧内的**重复畸形请求**判定位(`applyAttack` 用):`userId` → 该玩家上一次
+   * 「报文没带 `mobId`」的那一帧。
+   *
+   * 存在的唯一理由见 `applyAttack` 里那段裁决:畸形请求**本身不占冷却**
+   * (WS-FND-135-12 钉死),只有「同一帧内第二次」才按攻速闸处理(WS-07 G04);
+   * 而两次调用之间**唯一可观测的差别**就是「这一帧有没有用过」,故必须留下这个帧号。
+   * 读写都只在 `applyAttack` 一处,且每帧**覆盖写同一个 key** ⇒ 不随帧数增长
+   * (条目数 = 攻击过的玩家数)。
+   */
+  private readonly lastTargetlessAttackTick = new Map<string, number>();
+
+  /**
+   * 上一次攻击**没有结算**的原因(`null` = 结算了,或还没有过攻击报文)。
+   * 取值:`'RATE' | 'NO_WORLD' | 'NO_TARGET' | 'OUT_OF_REACH' | <世界侧 rejected>`。
+   */
+  lastAttackRejection: string | null = null;
 
   /**
    * 上一次攻击结算的实际结果;`null` = **没有发生结算**。
@@ -3561,7 +3848,24 @@ export class RoomRuntime {
     /* 哨台的模式命令**就是**房间已选模式(同一格 `meta.partyMode`)——
        走 `setPartyModeBy`(唯一写口,自带授权闸),不在这里直写字段。 */
     this.setPartyModeBy(actor, key as PartyMode);
+    /* ★ WS-FND-135(P2) 的**副作用修正**:这条派活是**房间自己**发起的,回执被
+       `startWorldPartyRun` 丢掉(没有客户端能看见它)⇒ 它**不许**消耗「回执指纹」。
+
+       修前看不出问题:`bus.drain()` 那时在慢帧块**之前**,开局播报要等下一快帧才投递,
+       而本函数在**同一个慢帧**里就派了这条活 ⇒ 指纹那一刻还是空的。
+       投递点移到帧末之后,播报在同一帧就到了,于是这条内部派活会把开局播报的指纹
+       吃掉 —— 客户端**再也拿不到**它(`partyBroadcast` 只在「有新数据」时挂上回执)。
+       ⇒ 派活前后把三个指纹原样复原(`dispatchAction` 的其余行为一个字节不改;
+       判据见 `tests/WS-FND-135` FND135-6 与 `tests/WS-FND-123` FND123-12)。 */
+    const seenFingerprints = {
+      broadcast: this.receiptSeenBroadcast,
+      settlement: this.receiptSeenSettlement,
+      rush: this.receiptSeenRush,
+    };
     const res = this.dispatchAction(actor, RoomAction.START_PARTY, { partyMode: key as PartyMode });
+    this.receiptSeenBroadcast = seenFingerprints.broadcast;
+    this.receiptSeenSettlement = seenFingerprints.settlement;
+    this.receiptSeenRush = seenFingerprints.rush;
     if (res.ok) {
       this.partyRecordLatch = key;
       this.partyRecordAdoptCount += 1;

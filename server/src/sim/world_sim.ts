@@ -279,7 +279,7 @@ import '../wiring/components.ts';
 /* ★ D-07:昼夜边界**只有一处**(`isNight(hour)`,405 感光器也用它)—— 这里只借用,不重写。 */
 import { isNight as isNightAtHour } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
-import { MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
+import { MOB_CORPSE_FRAMES, MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, warnHitsPlayer, BLIND_VIEW_MUL, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
 /* ★ D2(视线遮挡):纯函数模块(`server/src/world/vision.ts`)。
    生物 → 玩家的打击在**结算前**过一次射线遮挡 —— 修前隔着 1 格墙也能打中
@@ -1010,6 +1010,31 @@ export class WorldSim {
    * 所以序号**不能**取"当前存活数 + 1"。
    */
   private readonly mobOrdinals = new Map<string, number>();
+
+  /**
+   * ★ WS-FND-135(P1):实例 ID → **它是以哪个群系入册的**。
+   *
+   * `addMob(id, biome, …)` 会 `spawner.add(biome, 1)`,而收尸必须**对称地**
+   * `spawner.remove(biome, 1)` —— 否则群系计数只增不减,`hardCap` 迟早被尸体占满,
+   * 表现是「打死一片之后再也不刷怪」(不报错)。biome 只在这一处入参里,
+   * 不记账就没法对称扣减(全仓 `spawner.remove` 此前**零调用**就是这个后果)。
+   */
+  private readonly mobBiome = new Map<string, string>();
+
+  /**
+   * ★ WS-FND-135(P1):**待收的尸体** —— 实例 ID → 死亡时的快帧序。
+   *
+   * 为什么不「当场移除」:死亡那一帧的收尾还要读这条运行时(结算读 `after.x/y`、
+   * 掉落落地、同帧的预警结算)。「变尸体」与「从三张表里消失」是**两件事**,
+   * 所以标记 + 延迟 `MOB_CORPSE_FRAMES` 帧收尸。`addMob` 同 id 再登记会撤销标记
+   * (姜饼小人复活 / 覆盖式重建)。
+   */
+  private readonly deadMobs = new Map<string, number>();
+
+  /**
+   * 累计**真的被收掉**的尸体数(诊断与判据;`spawner.remove` 与它同一次调用)。
+   */
+  mobsReaped = 0;
   carry: CarrySystem;
   /**
    * 事件总线 —— 事件驱动子系统的共同出口。
@@ -1102,6 +1127,38 @@ export class WorldSim {
    * `tests/WS-FND-122` 的 FND122-4 钉住「落地后立刻再跳 ⇒ COOLDOWN」。 */
   private static readonly JUMP_COOLDOWN_FRAMES = 24;
   private players: AoiPlayer[] = [];
+
+  /**
+   * ★ WS-FND-137 P2:`syncPlayers()` 的**元素对象池**(按 id 复用)。
+   *
+   * 为什么要池化而不是「每帧新建」:`syncPlayers()` 跑在**快帧 20Hz**
+   * (`tick()` 里紧随 `physics.step`),而 `physics.bodies` 含**生物**,数量随世界涨 ——
+   * 每帧给每个刚体 + 每个玩家各造一个对象,是稳定的垃圾流(实测每帧 2×N 个对象),
+   * 而这些对象的字段每帧都会被**重新覆写**。池化后稳态(名册不变)分配数 0。
+   *
+   * ⚠️ 语义约束(本文件最容易被这个改动破坏的一条):**字段仍必须每帧覆写**。
+   * 复用对象一旦漏写某个字段,它就会「继承上一帧的值」,而表现是安静的
+   * (例如 `afk` 不写 ⇒ 打盹玩家的唤醒能量永不消失)。
+   */
+  private readonly playerElemPool = new Map<string, AoiPlayer>();
+  /** `mobPlayers` 的元素池(与上面那张分开:id 集合不同 —— 这里只有玩家)。 */
+  private readonly mobPlayerElemPool = new Map<string, WorldPlayer>();
+  /**
+   * `mobPlayers` 的**池缓冲**数组。
+   *
+   * ⚠️ 为什么不让 `shareMobPlayers` 就地清空 `this.mobPlayers`:
+   * `setMobPlayers(players)` 会把**调用方传进来的数组**直接赋给 `this.mobPlayers`,
+   * 就地清空就会把别人手里的数组清掉(修前每次换新数组,外部数组从不会被改)。
+   * ⇒ 同步时写进本缓冲,再把 `this.mobPlayers` 指回来。
+   */
+  private readonly mobPlayerBuf: WorldPlayer[] = [];
+  /**
+   * `syncPlayers()` 至今**新建**过多少个投影元素对象(AoiPlayer + WorldPlayer 合计)。
+   *
+   * 存在的理由:「每帧分配次数下降」必须**可测**,否则只能靠读代码相信。
+   * 判据:名册不变的 N 帧里它**一次都不涨**;新增一个刚体恰好涨 1(负对照见 WS-FND-137)。
+   */
+  syncPlayerObjectAllocs = 0;
   /**
    * 每慢帧重新施加的驱动态。
    *
@@ -3562,6 +3619,13 @@ export class WorldSim {
      * 各自独立:前者防「尸体反复结算」,后者防「同一怪被多路径结算」。 */
     if (wasAlive && after !== null && !after.alive) {
       this.settleKill(mobId, after.x, after.y);
+      /* ★ WS-FND-135(P1):**标记待收** —— 修前击杀只把 `alive` 置 false,
+         而 `mobHost.removeMob` / `aoi.unregisterMob` / `physics.remove` /
+         `spawner.remove` 全仓**零调用** ⇒ 尸体永久留在三张表里:
+         `listWildlife` 每帧仍复制排序它、AOI 仍唤醒它、`resolvePairs` 仍与它配对。
+         这里只**标记**(带死亡帧号),真移除在 `tick()` 末尾的 `reapDeadMobs()`
+         —— 死亡那一帧的收尾(掉落落地 / 同帧预警结算)还要读这条运行时。 */
+      this.deadMobs.set(mobId, this.frameCount);
     }
     return r;
   }
@@ -6034,6 +6098,11 @@ export class WorldSim {
     this.players = [];
     this.unknownMobs.length = 0;
     this.mobOrdinals.clear();            /* 实例序号从 #1 重来(见 mobOrdinals 注释) */
+    /* ★ WS-FND-135(P1):收尸账与群系账同属**世界世代** —— 新世界里那批 id 不存在,
+       留着「待收」标记只会去收一只不存在的怪(而 `mobBiome` 留着就与
+       `spawner` 的新计数**对不上**,收尸时扣减会扣到别的群系头上)。 */
+    this.mobBiome.clear();
+    this.deadMobs.clear();
     this.spawnBudget = 0;
     this.lastMobTicks = [];
     this.mobErrors = 0;
@@ -6180,9 +6249,26 @@ export class WorldSim {
     });
   }
 
-  /** 从 AOI 的当前状态重建玩家列表(位置每帧会变,必须同步)。 */
+  /**
+   * 从 AOI 的当前状态重建玩家列表(位置每帧会变,必须同步)。
+   *
+   * ★ WS-FND-137 P2(第九轮实测):本节修的是「**每快帧重造同一批对象**」,
+   * 不是算法复杂度。修前每次调用(20Hz)都:
+   * ```text
+   * 1 新建 list 数组 + 每个刚体一个 AoiPlayer 对象   ← physics.bodies 含生物,数量随世界涨
+   * 2 再 filter + map 出 mobPlayers(每人一个新 WorldPlayer 对象)
+   * 3 aoi.setPlayers 内部**又** filter 一遍(mobs/aoi.ts,本文件改不到)
+   * ```
+   * ⇒ 现在:数组**复用**(`length = 0` 后重填)+ 元素对象**按 id 池化**,
+   * 名册不变时稳态分配数 **0**(计数:`syncPlayerObjectAllocs`)。
+   *
+   * ⚠️ 语义一字未改:字段仍是每帧从 `physics.bodies` / `profiles` 逐字段覆写的
+   * **投影** —— 「权威一变,投影立刻一致」靠的是**覆写**而不是「新对象」。
+   */
   private syncPlayers(): void {
-    const list: AoiPlayer[] = [];
+    const list = this.players;
+    list.length = 0;
+    const pool = this.playerElemPool;
     /*
      * `PhysicsWorld.bodies` 是 **Map<string, DynamicBody>**,不是数组。
      * 写成 `bodies.length` 会得到 `undefined`,而 `undefined ?? 0` 静默变成 0 —— 
@@ -6193,40 +6279,78 @@ export class WorldSim {
       /* `afk` 是真值投影,不是字面量 —— 这一行曾是本仓第 101 条陷阱:
          写死 `false` ⇒ `aoi.setPlayers` 里 `filter((p) => !p.afk)` 永不生效
          ⇒ **打盹玩家仍提供 AOI 唤醒能量**(手册 §2.4 明确说打盹不维持生态模拟)。
-         注意 `bodies` 里混有生物,`afkPlayers` 只含玩家 ID,故生物恒 false —— 正确。 */
-      list.push({ id: b.id, x: b.x, y: b.y, afk: this.afkPlayers.has(b.id) });
+         注意 `bodies` 里混有生物,`afkPlayers` 只含玩家 ID,故生物恒 false —— 正确。
+         (池化后 `afk` 更要在**每帧覆写**,否则复用对象会带着上一帧的 afk 值跑。) */
+      /* ⚠️ 池化后 afk 必须在**两条支路都**从真值取:漏掉 else 支路 ⇒ 复用对象会带着
+         上一帧的 afk 跑(「刚打盹」永不生效,或「已取消打盹」被永久钉住)。
+         ⚠️ 写法保持 `afk: this.afkPlayers.has(...)` 的**字面形状**:
+         `tests/WS-FND-11` 的 FND11-2 用正则据此数「三处 afk 生产者」,
+         抽成局部变量会让那条静态判据少算一处 —— 而那条判据是必要的:
+         漏掉一处只在真跑到该支路时才暴露。 */
+      let p = pool.get(b.id);
+      if (p === undefined) {
+        p = { id: b.id, x: b.x, y: b.y, afk: this.afkPlayers.has(b.id) };
+        pool.set(b.id, p);
+        this.syncPlayerObjectAllocs += 1;
+      } else {
+        p.x = b.x;
+        p.y = b.y;
+        p.afk = this.afkPlayers.has(b.id);
+      }
+      list.push(p);
     }
-    this.players = list;
-    this.aoi.setPlayers(this.players);
+    /* 池随名册收缩:离场的 id 不留残项(尺寸不等才扫一遍,稳态零成本)。 */
+    if (pool.size !== list.length) {
+      for (const id of pool.keys()) if (!this.physics.bodies.has(id)) pool.delete(id);
+    }
+    this.aoi.setPlayers(list);
+    this.shareMobPlayers(list);
+  }
 
-    /*
-     * 同步给生物 AI 的玩家视图。
-     *
-     * **必须按 `playerIds` 过滤**。`physics.bodies` 里玩家与生物**混在一起**
-     * (`addPlayer` 和 `addMob` 都调 `physics.spawn`),直接把它当玩家列表
-     * 会让生物**互相视为玩家**:野猪会把绵羊当猎物冲锋、`nearest()` 返回
-     * 另一只生物。这个错误不报错 —— 表现是「生物莫名的攻击性」。
-     *
-     * 漏掉整个 `mobPlayers` 同步则更隐蔽:25 个 AI 的
-     * `BaseMobAi.nearest()` 只读 `world.players()`,为空时恒返回 `null`,
-     * 于是所有「发现玩家」的行为(冲锋/伏击/逃跑/驯化)**永不触发**,
-     * 而 `tick` 确实在跑、不抛异常 —— 生物只是安静地站着。
-     * 实测证据:未同步时 `mob_boar` 的 `mem` 是 `{}`。
-     *
-     * ## ⚠ `wearing` / `heldItem` 必须从 `profiles` 投影,不能写字面量 `[]`
-     *
-     * 这里原先是 `wearing: []`。那是**把派生视图当权威用**:本方法每帧执行,
-     * 于是装配层经 `setMobPlayers` 灌入的装备**下一次 tick 就被抹成裸装**
-     * (实测:灌 `[712]` 后立刻攻击 76 伤害,`tick()` 一次后掉回 10)。
-     * 位置同样由本方法每帧重建,但位置的权威**本来就在** `physics.bodies`,
-     * 所以那是正确的投影;装备的权威不在物理层,照抄这个形状就丢了状态。
-     * ⇒ 装备改为从 `profiles` 取(权威),`afk` 仍取 AOI 视图。
-     */
-    this.mobPlayers = this.players
-      .filter((p) => this.playerIds.has(p.id))
-      .map((p) => {
-        const prof = this.profiles.get(p.id) ?? EMPTY_PROFILE;
-        return {
+  /**
+   * 同步给生物 AI 的玩家视图(`mobPlayers`,见字段注释)。
+   *
+   * ★ WS-FND-137 P2 拆分:修前它是 `syncPlayers` 里的一条 `filter(...).map(...)`
+   * 链 —— 两遍遍历 + 每人一个新对象;现在**单遍**从上面那份 `list` 投影,
+   * 元素对象同样按 id 池化。
+   *
+   * **必须按 `playerIds` 过滤**。`physics.bodies` 里玩家与生物**混在一起**
+   * (`addPlayer` 和 `addMob` 都调 `physics.spawn`),直接把它当玩家列表
+   * 会让生物**互相视为玩家**:野猪会把绵羊当猎物冲锋、`nearest()` 返回
+   * 另一只生物。这个错误不报错 —— 表现是「生物莫名的攻击性」。
+   *
+   * 漏掉整个 `mobPlayers` 同步则更隐蔽:25 个 AI 的
+   * `BaseMobAi.nearest()` 只读 `world.players()`,为空时恒返回 `null`,
+   * 于是所有「发现玩家」的行为(冲锋/伏击/逃跑/驯化)**永不触发**,
+   * 而 `tick` 确实在跑、不抛异常 —— 生物只是安静地站着。
+   * 实测证据:未同步时 `mob_boar` 的 `mem` 是 `{}`。
+   *
+   * ## ⚠ `wearing` / `heldItem` 必须从 `profiles` 投影,不能写字面量 `[]`
+   *
+   * 这里原先是 `wearing: []`。那是**把派生视图当权威用**:本方法每帧执行,
+   * 于是装配层经 `setMobPlayers` 灌入的装备**下一次 tick 就被抹成裸装**
+   * (实测:灌 `[712]` 后立刻攻击 76 伤害,`tick()` 一次后掉回 10)。
+   * 位置同样由本方法每帧重建,但位置的权威**本来就在** `physics.bodies`,
+   * 所以那是正确的投影;装备的权威不在物理层,照抄这个形状就丢了状态。
+   * ⇒ 装备改为从 `profiles` 取(权威),`afk` 仍取 AOI 视图。
+   *
+   * ## ⚠ 为什么是「写进池缓冲再赋回」,而不是就地清空 `this.mobPlayers`
+   *
+   * `setMobPlayers()` 会把**调用方传进来的数组**直接赋给 `this.mobPlayers`
+   * (装配层与测试都这么用)。就地 `length = 0` 会把**别人手里的数组**清空 ——
+   * 那是行为变更:修前每次同步都换新数组,外部数组从不会被改。⇒ 池缓冲独立存放,
+   * 每次同步把 `this.mobPlayers` **指回**池缓冲。
+   */
+  private shareMobPlayers(list: readonly AoiPlayer[]): void {
+    const mobs = this.mobPlayerBuf;
+    mobs.length = 0;
+    const pool = this.mobPlayerElemPool;
+    for (const p of list) {
+      if (!this.playerIds.has(p.id)) continue;
+      const prof = this.profiles.get(p.id) ?? EMPTY_PROFILE;
+      let m = pool.get(p.id);
+      if (m === undefined) {
+        m = {
           id: p.id,
           x: p.x,
           y: p.y,
@@ -6237,7 +6361,21 @@ export class WorldSim {
           wearing: prof.wearing,
           playingInstrument: false,
         };
-      });
+        pool.set(p.id, m);
+        this.syncPlayerObjectAllocs += 1;
+      } else {
+        m.x = p.x;
+        m.y = p.y;
+        m.afk = p.afk;
+        m.heldItem = prof.heldItem;
+        m.wearing = prof.wearing;
+      }
+      mobs.push(m);
+    }
+    this.mobPlayers = mobs;
+    if (pool.size !== mobs.length) {
+      for (const id of pool.keys()) if (!this.playerIds.has(id)) pool.delete(id);
+    }
   }
 
   /**
@@ -6265,6 +6403,11 @@ export class WorldSim {
     if (this.physics.occupantsAt(Math.floor(x), Math.floor(y)).some((o) => o !== id)) this.spawnCellClash += 1;
     this.aoi.registerMob(id, x, y);
     this.spawner.add(biome, 1);
+    /* ★ WS-FND-135(P1):记下群系(收尸时**对称扣减**)并**撤销待收标记** ——
+       同一个实例被重新登记(姜饼小人复活 / `addMob` 覆盖重建)之后就不该再被收尸,
+       否则新那只会在下一帧末尾凭空消失。 */
+    this.mobBiome.set(id, biome);
+    this.deadMobs.delete(id);
     /* 登记到宿主 —— 漏了这一步的表现是「AOI 唤醒了它,但宿主不认识,
        于是安静地跳过」:生物不动、不报错,像世界空了。 */
     const def = mobDefOf(id);
@@ -6275,6 +6418,68 @@ export class WorldSim {
       return 'REPLACED';
     }
     return 'CREATED';
+  }
+
+  /**
+   * ★ WS-FND-135(P1):**收尸** —— 把已死且过了 `MOB_CORPSE_FRAMES` 的实例从
+   * **三张表**里真移除,并对称扣回刷怪计数。
+   *
+   * ## 修前是什么样(第九轮实测)
+   *
+   * 击杀只做一件事:`after.alive = false`。而
+   * ```
+   * mobHost.removeMob   全仓 0 调用
+   * aoi.unregisterMob   只被 removePlayer 调
+   * physics.remove      只被 removePlayer / applyRestore 调
+   * spawner.remove      全仓 0 调用
+   * ```
+   * ⇒ 尸体**永久**留下。后果是三类浪费叠在一起:`listWildlife()` 每帧仍复制排序尸体、
+   * `aoi.update()` 仍把它当候选、`resolvePairs()`(两两碰撞)仍与尸体配对 ——
+   * 而且群系计数只增不减,`hardCap` 迟早被尸体占满(「打死一片之后再也不刷怪」)。
+   *
+   * ## 为什么三处一起(不许只摘一处)
+   *
+   * 三张表各自都能独立地「看见」这只怪,只摘一处等于换一张表继续浪费:
+   * ```
+   * 只摘 host ⇒ AOI 仍唤醒它、物理仍与它配对
+   * 只摘 aoi  ⇒ 宿主仍 tick、`listWildlife` 仍复制它
+   * ```
+   * 所以判据是**三张表都不增长**(见 `tests/WS-FND-135`)。
+   *
+   * @returns 本次真的收掉的尸体数(`0` = 还没到点,或没有尸体)
+   */
+  reapDeadMobs(): number {
+    if (this.deadMobs.size === 0) return 0;
+    let reaped = 0;
+    /* 按 ID 升序处理:`deadMobs` 是 Map(遍历顺序 = 击杀顺序),
+       排一次序让「同帧收多具」的**副作用顺序**也确定 —— 物理旁表与刷怪计数
+       都有顺序敏感的读者。 */
+    for (const id of [...this.deadMobs.keys()].sort()) {
+      const diedAt = this.deadMobs.get(id);
+      if (diedAt === undefined || this.frameCount - diedAt < MOB_CORPSE_FRAMES) continue;
+      this.deadMobs.delete(id);
+      /* 宿主:条目连带 AI 实例一起摘掉(重复移除返回 false,不报错)。 */
+      this.mobHost.removeMob(id);
+      /* AOI:唤醒集合 + 区块桶一起摘(漏了唤醒集合 ⇒ 每慢帧仍推进一具尸体)。 */
+      this.aoi.unregisterMob(id);
+      /* 物理:走 `remove()` 而不是 `bodies.delete` —— 五张旁表一起回收
+         (与 `removePlayer` 同一条纪律;旁表按 id 索引,漏了会跨世代残留)。 */
+      this.physics.remove(id);
+      /* 刷怪计数:与 `addMob` 的 `spawner.add(biome, 1)` **对称**。 */
+      const biome = this.mobBiome.get(id);
+      if (biome !== undefined) {
+        this.spawner.remove(biome, 1);
+        this.mobBiome.delete(id);
+      }
+      reaped += 1;
+    }
+    this.mobsReaped += reaped;
+    return reaped;
+  }
+
+  /** 待收尸体数(还没有被 `reapDeadMobs` 摘掉的已死实例)。 */
+  get corpseCount(): number {
+    return this.deadMobs.size;
   }
 
   /**
@@ -9543,11 +9748,13 @@ export class WorldSim {
       }
     }
 
-    /* ── 快帧 20Hz:事件投递 ──
-       每帧末尾清空当帧队列。放在物理与 AI 之后,使同一帧内 AI 产生的事件
-       在下一帧被订阅方看到 —— 刻意**不**在同帧内递归投递到底:
-       那会让「谁先响应」取决于 emit 顺序,难以推理,也放大了死循环风险。 */
-    this.bus.drain();
+    /* ── 事件投递:**已移到本方法末尾(慢帧块之后)** —— ★ WS-FND-135(P2) ──
+       修前 `this.bus.drain()` 就写在这里,而 `if (isSlow) { … }` 那一大块在**它之后**:
+       慢帧系统 emit 的事件(`party_broadcast` / `cook_done` / `party_desk_start|stop`)
+       要等**下一快帧**才投递。而房间一旦离开 `OPEN`,`RoomRuntime.step()` 在
+       `host.advance(1)` **之前**就早退 ⇒ `advance` 再也不跑 ⇒
+       **终场播报(慢帧最后一刻发的那条)永不投递**。
+       ⇒ 投递点必须位于「本帧所有 emit 之后」。见下方帧末那一处。 */
 
     if (isSlow) {
       /* ── 慢帧 2Hz:举投冷却 ──
@@ -9705,6 +9912,18 @@ export class WorldSim {
         spawned = this.tickSpawn();
       }
     }
+
+    /* ── ★ WS-FND-135(P1):收尸(帧末)──
+       只在这里收:`deadMobs` 是「死亡帧号」表,过了 `MOB_CORPSE_FRAMES` 帧才真移除。
+       三张表(宿主 / AOI / 物理)+ 刷怪计数一处清 —— 见 `reapDeadMobs` 的 docblock。 */
+    this.reapDeadMobs();
+
+    /* ── ★ WS-FND-135(P2):事件投递(帧末,**慢帧块之后**)──
+       每帧末尾清空当帧队列:物理 / AI(快帧)与全部慢帧系统都在它之前跑完,
+       所以**本帧 emit 的事件在本帧内投递完**(没有「慢帧事件要等下一快帧」这个延迟)。
+       刻意**不**在同帧内递归投递到底:那会让「谁先响应」取决于 emit 顺序,
+       难以推理,也放大了死循环风险(`EventBus` 自身的重入深度上限是第二道防线)。 */
+    this.bus.drain();
 
     return {
       frame,

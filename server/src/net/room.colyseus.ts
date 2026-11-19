@@ -73,6 +73,14 @@ export interface NetPersistRoomOptions {
   clock: { nowMs: () => number };
   db: DbLike | null;
   /**
+   * ★ WS-FND-134(P1-2):日志出口(**注入式**)。
+   *
+   * 省略时默认写 `console.error`(见 `logLine`)—— 不是 no-op。
+   * 为什么放在 options 而不是直接读 `process.env`:注入让测试能**断言**
+   * 「被拒时真的有一行日志」(否则"有没有出口"只能靠读代码)。
+   */
+  onLog?: (msg: string) => void;
+  /**
    * 房主(玩家)id —— 喂给 `RoomRuntimeOptions.ownerId`,用于权限判定。
    *
    * ★ task-76 订正:本字段**此前叫 `registryOwnerId`**,已改名为 `ownerId`。
@@ -243,6 +251,67 @@ export class NetPersistRoom extends Room<RoomSchema> {
    * 三个方法里(缺陷形态与修法见 `bindSeat` 的长注释)。
    */
   private seatKeys = new Map<string, string>();
+
+  /* ── ★ WS-FND-134(P2):留证字段 → 日志出口(见 noteRuntimeEvidence) ──
+     三个字段记的是「**最近一次**」错因 ⇒ 必须记住「上一次已经报过的那一条」,
+     否则 20Hz 的 stepTick 会把同一行刷 20 次(噪声会让人关掉日志 —— 那等于又回到静默)。 */
+  private loggedRestoreError: string | null = null;
+  private loggedRemoveError: string | null = null;
+  private loggedJoinAudit: RoomRuntime['lastJoinAudit'] = null;
+
+  /**
+   * ★ WS-FND-134(P1-2):装配层(B 路)的**日志出口**。
+   *
+   * 修前:本文件一个日志出口都没有(A/B 两条装配路径里,B 路发生的事 ——
+   * 凭证被拒 / 入场失败 / 读档坏了 —— 在生产**没有任何痕迹**)。
+   *
+   * 现在:
+   *   注入 deps.onLog(部署层可接管)⇒ 默认写 console.error,**不静默**
+   *   行首带类别标签 `[room:<cat>]`(结构化,便于筛选与断言)
+   *
+   * ⚠️ 出口自己抛不许把房间带崩(宽容 catch,与断开路径同一纪律)。
+   */
+  private logLine(cat: string, msg: string): void {
+    const line = `[room:${cat}] ${msg}`;
+    const sink = this.deps?.onLog;
+    if (typeof sink === 'function') {
+      try { sink(line); return; } catch { /* 出口抛不许把房间带崩 */ }
+    }
+    try { console.error(line); } catch { /* 控制台不可用时不抛 */ }
+  }
+
+  /**
+   * ★ WS-FND-134(P2):把 RoomRuntime 的三个**留证字段**接上日志出口。
+   *
+   * 缺陷形态(第九轮实测):lastRestoreError / lastRemoveError / lastJoinAudit
+   * 在 room.ts 里被认真写入(每处都配有「不许静默」的长注释),但**生产侧 0 个读点**
+   * —— 只有测试读它们。⇒ 运行期真的发生「读档坏了 / 世界侧移除失败」时,
+   * 注释承诺的可观测**只对测试成立**,而生产里没有任何出口。
+   *
+   * 为什么放在 stepTick 而不是各自的发生点:
+   *   发生点都在 room.ts(不是本层),而「写日志」是装配层的事;
+   *   stepTick 是唯一每帧都会跑的本层方法 ⇒ 它保证「只要发生了,下一帧就被搬出来」,
+   *   且不必在 room.ts 里塞回调(那会让房间反向依赖装配层)。
+   */
+  private noteRuntimeEvidence(): void {
+    const rt = this.runtime;
+    if (rt.lastRestoreError !== null && rt.lastRestoreError !== this.loggedRestoreError) {
+      this.loggedRestoreError = rt.lastRestoreError;
+      this.logLine('restore', rt.lastRestoreError);
+    }
+    if (rt.lastRemoveError !== null && rt.lastRemoveError !== this.loggedRemoveError) {
+      this.loggedRemoveError = rt.lastRemoveError;
+      this.logLine('remove', rt.lastRemoveError);
+    }
+    /* ⚠️ 入场审计用**引用**比较(每一次入场都是新对象):内容比较会每帧做一次
+       序列化,而它对本判据没有增量(同一个对象不会变)。 */
+    if (rt.lastJoinAudit !== null && rt.lastJoinAudit !== this.loggedJoinAudit) {
+      this.loggedJoinAudit = rt.lastJoinAudit;
+      const a = rt.lastJoinAudit;
+      this.logLine('join-audit',
+        `user=${a.userId} members=${a.members} state=${a.state} world=${a.world}`);
+    }
+  }
 
   override onCreate(options: RoomCreateOptions): void {
     assertSchemaReady();
@@ -447,11 +516,18 @@ export class NetPersistRoom extends Room<RoomSchema> {
     if (token !== undefined) {
       const verdict = this.runtime.decodeJoinToken(token);
       if (!verdict.ok) {
+        /* ★ WS-FND-134(P2/P5):凭证被拒要带**档位**(TOKEN_EXPIRED / TOKEN_SIGNATURE / ...)
+           且**必须出声**。修前只有一句 `client.leave(4001, verdict.reason)` ⇒
+           客户端只知道"被踢了",服务端一个字都不留。 */
+        this.logLine('join-reject', `code=${verdict.code} user=${userId} reason=${verdict.reason}`);
+        client.send('reject', { kind: 'JOIN', code: verdict.code, reason: verdict.reason });
         client.leave(4001, verdict.reason);
         return;
       }
       userId = verdict.claims.userId;
     } else if (this.deps?.requireJoinToken === true) {
+      this.logLine('join-reject', `code=TOKEN_MISSING user=${userId} 本房要求加入凭证`);
+      client.send('reject', { kind: 'JOIN', code: 'TOKEN_MISSING', reason: '缺少 token(本房要求加入凭证)' });
       client.leave(4001, '缺少 token(本房要求加入凭证)');
       return;
     }
@@ -469,7 +545,12 @@ export class NetPersistRoom extends Room<RoomSchema> {
       requireToken: token !== undefined,
     });
     if (!res.ok) {
-      client.leave(4000, res.reason ?? 'join rejected');
+      /* ★ WS-FND-134(P2/P5):把房间给出的**档位**原样带回客户端(修前只有散文)。 */
+      const code = res.code ?? 'JOIN_REJECTED';
+      const reason = res.reason ?? 'join rejected';
+      this.logLine('join-reject', `code=${code} user=${userId} reason=${reason}`);
+      client.send('reject', { kind: 'JOIN', code, reason });
+      client.leave(4000, reason);
       return;
     }
     /* ★ WS-FND-131(P1):**装配层的交叉核对** —— `runtime.join()` 说 ok,
@@ -479,12 +560,19 @@ export class NetPersistRoom extends Room<RoomSchema> {
        按键没反应」—— 那正是本仓反复记的「静默成功」形态。
        ⇒ 出声拒绝(4002),并且**不建绑定**(否则旁表会留下一条房间从没收过的键)。 */
     if (!this.runtime.isSeated(userId)) {
+      this.logLine('join-reject', `code=RUNTIME_NOT_SEATED user=${userId}`);
+      client.send('reject', { kind: 'JOIN', code: 'RUNTIME_NOT_SEATED', reason: '入场未生效' });
       client.leave(4002, '入场未生效(runtime 侧没有这个席位,已按失败处理)');
       return;
     }
     /* ★ P1-1:入场**成功之后**才建绑定 —— 被拒的连接不许在表里留键,
        否则 `unbindSeat` 会把一个房间从没收过的 userId 交给 leave/disconnect。 */
     this.bindSeat(client.sessionId, userId);
+    /* ★ WS-FND-134(P1-2):入场**成功**也要留一行 —— 修前装配层只在失败时
+       `client.leave()`,成功路径上一个字都没有 ⇒ "他到底进没进来"只能靠客户端说。
+       这里带上三方交叉校验结果(`lastJoinAudit`),而 errors 由 stepTick 搬出去。 */
+    this.logLine('join', `入场 ok user=${userId} resumed=${res.resumed === true}`
+      + ` audit=${JSON.stringify(this.runtime.lastJoinAudit)}`);
     /* 入场报文:全量快照(重连时是逐字节一致的恢复快照)。 */
     if (res.snapshot) client.send('snapshot', res.snapshot);
     this.schema().syncFrom(this.runtime.cloneState());
@@ -525,6 +613,10 @@ export class NetPersistRoom extends Room<RoomSchema> {
      *   真正决定「有没有定时器」的是 `_patchInterval`。
      *   ⇒ 措辞按**机制**写,不按字段名写。 */
     this.schema().syncFrom(this.lastBroadcastState);
+
+    /* ★ WS-FND-134(P2):把三个**留证字段**(lastRestoreError / lastRemoveError /
+       lastJoinAudit)搬到唯一的日志出口上 —— 修前它们在**生产侧 0 个读点**。 */
+    this.noteRuntimeEvidence();
 
     const violations = this.runtime.drainViolations();
     if (violations.length > 0) {
@@ -630,7 +722,19 @@ export class NetPersistRoom extends Room<RoomSchema> {
       action: Parameters<RoomRuntime['authorize']>[1];
       payload?: Parameters<RoomRuntime['dispatchAction']>[2];
     }) => {
-      const out = this.runtime.dispatchAction(this.seatKeyOf(client), msg.action, msg.payload ?? {});
+      /* ★ WS-FND-134(P2):dispatchAction **抛**时必须回一条 INTERNAL 档(且先留日志)——
+         修前它原样冒泡进 Colyseus:那条连接只看到连接级错误,分不清"我发错了"
+         与"服务端执行崩了";而裸 WS 路径当时回的是 INVALID,两边各自都不对。
+         ⇒ 两条装配路径现在对齐到同一档 INTERNAL(判据在测试里各自钉住)。 */
+      let out: ReturnType<RoomRuntime['dispatchAction']>;
+      try {
+        out = this.runtime.dispatchAction(this.seatKeyOf(client), msg.action, msg.payload ?? {});
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        this.logLine('action-error', `dispatchAction 抛错(action=${String(msg.action)}):${reason}`);
+        client.send('reject', { kind: 'INTERNAL', action: msg.action, reason });
+        return;
+      }
       if (out.ok) {
         client.send('actionResult', { ok: true, action: msg.action, effect: out.effect ?? null });
         return;

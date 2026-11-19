@@ -29,6 +29,17 @@
  * 而不是按 detail 的措辞(措辞一改,判据就静默失效)。
  * ```
  *
+ * ## 一条判据「有牙」的两个必要条件(本轮补的两处系统性漏洞)
+ *
+ * ```text
+ * 1 参数合法性前置:判据的**边界值**本身非法(容量 NaN、地图 maxZ=Infinity ...)
+ *   会让比较恒假 ⇒ 这一条对所有输入放行 —— 那不是「没有违反」,是「判不了」。
+ *   ⇒ 凡读过参数的判据都必须先判参数,非法即报(见 POS_FINITE_IN_BOUNDS / CONTAINER_CAPACITY)。
+ * 2 分支各自有反例:一条判据内部有 N 个分支(entries/perItem/total/container ...)
+ *   时,「多分支压成单点」= 只测第一个分支就把整条标成有牙。
+ *   ⇒ 反例表里**每个分支各一个独立反例**(见 `scripts/invariants.ts` 的 VIOLATION_CASES)。
+ * ```
+ *
  * ## ★ 注入面(`checkAll` 的 `overrides`)
  *
  * 「有这条检查」与「这条检查有牙」是两件事。`overrides` 让调用方把**某一条**
@@ -38,6 +49,10 @@
  * 注入恒真 ⇒ 对应的反例**不再被抓到** ⇒ 说明抓到它的**正是这一条**(归因),
  * 而不是「恰好被别的条目顺手抓到」或「它本来就是恒真的」。
  * ```
+ * 运行时防线(本轮补):`overrides` 的 key 必须是 `INVARIANT_CODES` 的成员 ——
+ * 拼错 key 直接抛(否则注入静默不生效,「注入后不再被抓到」会**假绿**)。
+ * 被注入的条目在其结果上留痕 `overridden:true`,`summarize` 汇总为 `overridden` 清单。
+ *
  * 消费者见 `scripts/invariants.ts`(自带反例 + 注入自证)与
  * `tests/WS-FND-128-invariants.test.ts`(每条正例/反例 + 注入验证)。
  *
@@ -45,14 +60,14 @@
  *
  * | code | 判什么 | 破了会怎样 |
  * | :--- | :--- | :--- |
- * | `POS_FINITE_IN_BOUNDS` | 位置有限且在地图内 | NaN/Infinity 会静默污染物理与存档;越界刚体永远走不回可行域 |
+ * | `POS_FINITE_IN_BOUNDS` | 位置有限且在地图内(地图边界本身须合法) | NaN/Infinity 会静默污染物理与存档;越界刚体永远走不回可行域 |
  * | `BODY_ID_UNIQUE` | 同 id 唯一刚体 | 两个刚体共用一个 id ⇒ 旁表/存档/网络指着谁变成非确定 |
- * | `CONTAINER_CAPACITY` | 背包/容器总量 ≤ 容量 | 溢出件在下一次落盘时凭空消失(或无限增长) |
+ * | `CONTAINER_CAPACITY` | 背包/容器总量 ≤ 容量(容量本身须合法) | 溢出件在下一次落盘时凭空消失(或无限增长) |
  * | `LEDGER_NON_NEGATIVE` | 账不得为负 | 负结余 = 凭空多出来的东西,且会一路传下去 |
  * | `PER_ITEM_MATCHES_TOTAL` | 按件账与总量账一致 | 两个数各说各话 ⇒ 总量越大越容易瞒过容量判据 |
- * | `STATE_EXCLUSION` | 状态互斥(BUBBLED/STUNNED/alive) | 同时眩晕+泡泡/dead 还活着 ⇒ 逻辑分支互相抵消 |
+ * | `STATE_EXCLUSION` | 状态互斥(BUBBLED/STUNNED/alive/DEAD) | 同时眩晕+泡泡/dead 还活着 ⇒ 逻辑分支互相抵消 |
  * | `SIDE_TABLE_KEYS` | 旁表 key ⊆ 存在 id | 旁表指向不存在的 id ⇒ 空指针或永远清不掉的残留 |
- * | `FRAME_BYTES_BOUND` | 单帧字节 ≤ 上界 | 带宽预算被击穿(客户端卡顿,而服务端看起来一切正常) |
+ * | `FRAME_BYTES_BOUND` | 单帧字节 ≤ 上界(上界本身须合法) | 带宽预算被击穿(客户端卡顿,而服务端看起来一切正常) |
  */
 
 /** 三维坐标(单位:格;与世界坐标同量纲)。 */
@@ -77,6 +92,7 @@ export interface InvBody {
  *
  * `byItem` 是**按件账**(itemId → 件数),`total` 是**总量账**。
  * 两者必须相等(`PER_ITEM_MATCHES_TOTAL`),且都不超过 `capacity`。
+ * ⚠️ `capacity` 必须是**非负有限数**;否则 `CONTAINER_CAPACITY` 的比较恒假(见文件头「有牙」第 1 条)。
  */
 export interface InvContainer {
   id: string;
@@ -101,7 +117,7 @@ export interface InvLedger {
   total: number;
 }
 
-/** 旁表(非刚体索引:携带 / 队伍 / 冷却 / 掉落归属 …)。`keys` 必须是**已存在的 id**。 */
+/** 旁表(非刚体索引:携带 / 队伍 / 冷却 / 掉落归属 ...)。`keys` 必须是**已存在的 id**。 */
 export interface InvSideTable {
   name: string;
   keys: string[];
@@ -116,7 +132,7 @@ export interface InvSideTable {
 export interface InvSnapshot {
   /** 世界帧号(只为 detail 里指认「哪一跳」)。 */
   tick: number;
-  /** 地图尺寸(格)与最高可站高度。 */
+  /** 地图尺寸(格)与最高可站高度。⚠️ 三者必须非负有限(见 `POS_FINITE_IN_BOUNDS`)。 */
   map: { w: number; h: number; maxZ: number };
   /** 单帧下发预算与实际字节数。 */
   frame: { bytes: number; maxBytes: number };
@@ -144,6 +160,12 @@ export interface InvariantResult {
   ok: boolean;
   code: InvariantCode;
   detail: string;
+  /**
+   * 本次是否被 `opts.overrides` 替换过(注入面留痕)。
+   * ⚠️ 它不足以单独作为「有牙」的证据 —— 只用它会让「注入物接错、一次都没跑」也看起来正常;
+   *    调用方仍须按「注入物被调用次数 === 1」自证(见 `scripts/invariants.ts`)。
+   */
+  overridden?: boolean;
 }
 
 /** 一条判据的实现形态(纯函数:同一输入 ⇒ 同一输出)。 */
@@ -153,8 +175,9 @@ export type InvariantCheck = (snapshot: InvSnapshot) => InvariantResult;
 export interface InvariantOptions {
   /**
    * 按 code 替换某条判据。典型用法:换成恒真以证明「反例是被这一条抓到的」。
-   * ⚠️ 注入物写错 `code` 也没关系:`checkAll` 以**注册表**为准回填 code
-   * (否则一次笔误就会让归因静默错位)。
+   * ⚠️ key **必须**是 `INVARIANT_CODES` 的成员:`checkAll` 会在运行时校验,
+   * 拼错即**抛**(否则注入静默不生效,而「注入后不再被抓到」会假成立)。
+   * 注入物的 `code` 字段被忽略:`checkAll` 以**注册表**为准回填 code。
    */
   overrides?: Partial<Record<InvariantCode, InvariantCheck>>;
 }
@@ -164,6 +187,11 @@ export interface InvariantSummary {
   ok: boolean;
   total: number;
   failed: InvariantCode[];
+  /**
+   * 本次汇总里被 `overrides` 覆盖(注入)的条目。
+   * 非空即「这份结论里有被替换过的判据」—— 读的人必须据此决定是否采信。
+   */
+  overridden: InvariantCode[];
   detail: string;
 }
 
@@ -190,7 +218,7 @@ const MUTEX_PAIRS: readonly (readonly [string, string])[] = [
 /** 明细只列前 `max` 条:门禁输出要能读,不能被 1000 条越界刷屏。 */
 function brief(items: readonly string[], max = 3): string {
   if (items.length <= max) return items.join('; ');
-  return `${items.slice(0, max).join('; ')} …另有 ${items.length - max} 处`;
+  return `${items.slice(0, max).join('; ')} ...另有 ${items.length - max} 处`;
 }
 
 /** 按件账合计。`NaN` 会传染出去(那是刻意的:它由 `LEDGER_NON_NEGATIVE` 报)。 */
@@ -200,8 +228,17 @@ function itemSum(byItem: Record<string, number>): number {
   return n;
 }
 
-/** 1 位置有限且在地图内。 */
+/** 1 位置有限且在地图内。★ 先判地图边界**本身**是否合法(否则比较恒假 ⇒ 判据静默放行)。 */
 function posFiniteInBounds(s: InvSnapshot): InvariantResult {
+  const { w, h, maxZ } = s.map;
+  if (!Number.isFinite(w) || !Number.isFinite(h) || !Number.isFinite(maxZ) || w < 0 || h < 0 || maxZ < 0) {
+    return {
+      ok: false,
+      code: 'POS_FINITE_IN_BOUNDS',
+      detail: `地图尺寸非法(w=${w}, h=${h}, maxZ=${maxZ})—— 边界非有限/为负时`
+        + '「越界」判定无从成立(那不是「没有越界」,是「判不了」)',
+    };
+  }
   const bad: string[] = [];
   for (const b of s.bodies) {
     const { x, y, z } = b.pos;
@@ -209,15 +246,15 @@ function posFiniteInBounds(s: InvSnapshot): InvariantResult {
       bad.push(`${b.id} 坐标非有限(x=${x}, y=${y}, z=${z})`);
       continue;
     }
-    if (x < 0 || x > s.map.w || y < 0 || y > s.map.h || z < 0 || z > s.map.maxZ) {
-      bad.push(`${b.id} 越界(${x}, ${y}, ${z};地图 ${s.map.w}×${s.map.h}×${s.map.maxZ})`);
+    if (x < 0 || x > w || y < 0 || y > h || z < 0 || z > maxZ) {
+      bad.push(`${b.id} 越界(${x}, ${y}, ${z};地图 ${w}×${h}×${maxZ})`);
     }
   }
   return bad.length === 0
     ? {
       ok: true,
       code: 'POS_FINITE_IN_BOUNDS',
-      detail: `${s.bodies.length} 个刚体坐标有限且落在 [0,${s.map.w}]×[0,${s.map.h}]×[0,${s.map.maxZ}] 内`,
+      detail: `${s.bodies.length} 个刚体坐标有限且落在 [0,${w}]×[0,${h}]×[0,${maxZ}] 内`,
     }
     : { ok: false, code: 'POS_FINITE_IN_BOUNDS', detail: `位置非法 ${bad.length} 个:${brief(bad)}` };
 }
@@ -237,10 +274,14 @@ function bodyIdUnique(s: InvSnapshot): InvariantResult {
     };
 }
 
-/** 3 背包/容器总量 ≤ 容量。 */
+/** 3 背包/容器总量 ≤ 容量。★ 先判 `capacity` 本身是否合法(非有限 ⇒ 比较恒假 ⇒ 静默放行)。 */
 function containerCapacity(s: InvSnapshot): InvariantResult {
   const bad: string[] = [];
   for (const c of s.containers) {
+    if (!Number.isFinite(c.capacity) || c.capacity < 0) {
+      bad.push(`${c.id} 容量非法(${c.capacity})—— 非有限/为负的容量让「是否溢出」无从判定`);
+      continue;
+    }
     const sum = itemSum(c.byItem);
     if (sum > c.capacity) bad.push(`${c.id} 按件合计 ${sum} > 容量 ${c.capacity}`);
     if (c.total > c.capacity) bad.push(`${c.id} 总量账 ${c.total} > 容量 ${c.capacity}`);
@@ -395,10 +436,12 @@ const CHECKS: Record<InvariantCode, InvariantCheck> = {
 {
   const missing = INVARIANT_CODES.filter((c) => CHECKS[c] === undefined);
   const extra = (Object.keys(CHECKS) as InvariantCode[]).filter((c) => !INVARIANT_CODES.includes(c));
-  if (missing.length > 0 || extra.length > 0) {
+  /* 重复也算「不同集合」的形态:两条同名 code 会让归因出现两个入口。 */
+  const dup = INVARIANT_CODES.filter((c, i) => INVARIANT_CODES.indexOf(c) !== i);
+  if (missing.length > 0 || extra.length > 0 || dup.length > 0) {
     throw new Error(
       `INVARIANT_CODES 与判据注册表不同集合(缺实现:${missing.join(',') || '无'};`
-      + `多实现:${extra.join(',') || '无'})`,
+      + `多实现:${extra.join(',') || '无'};重复 code:${dup.join(',') || '无'})`,
     );
   }
 }
@@ -407,15 +450,31 @@ const CHECKS: Record<InvariantCode, InvariantCheck> = {
  * 跑**全部**不变量(每条一条结果,顺序与 `INVARIANT_CODES` 一致)。
  *
  * `opts.overrides` 见文件头「注入面」—— 它是「这条判据有牙」的可证明入口。
+ * ⚠️ `overrides` 的 key 若不在 `INVARIANT_CODES` 里**直接抛**(拼错即抛):
+ *   否则该注入静默不生效,而「注入后不再被抓到」会**恰好成立**(最危险的假绿)。
+ * 被注入的条目在结果上留痕 `overridden:true`。
  */
 export function checkAll(snapshot: InvSnapshot, opts: InvariantOptions = {}): InvariantResult[] {
   const overrides = opts.overrides;
+  if (overrides !== undefined) {
+    for (const key of Object.keys(overrides)) {
+      if (!(INVARIANT_CODES as readonly string[]).includes(key)) {
+        throw new Error(
+          `overrides 含未知 code「${key}」—— 合法值只有 ${INVARIANT_CODES.join(', ')}`
+          + '(拼错即抛:否则该注入静默失效,「注入后不再被抓到」会假绿)',
+        );
+      }
+    }
+  }
   return INVARIANT_CODES.map((code) => {
-    const fn = (overrides === undefined ? undefined : overrides[code]) ?? CHECKS[code];
+    const injected = overrides !== undefined && overrides[code] !== undefined;
+    const fn = injected ? overrides![code]! : CHECKS[code];
     const r = fn(snapshot);
     /* ⚠️ code 以**注册表**为准回填:注入物/手写实现写错 code 时,
        归因不会静默错位(`r.code` 与 `code` 不一致本身就是笔误的证据)。 */
-    return { ok: r.ok, code, detail: r.detail };
+    return injected
+      ? { ok: r.ok, code, detail: r.detail, overridden: true }
+      : { ok: r.ok, code, detail: r.detail };
   });
 }
 
@@ -424,15 +483,26 @@ export function violations(snapshot: InvSnapshot, opts: InvariantOptions = {}): 
   return checkAll(snapshot, opts).filter((r) => !r.ok);
 }
 
-/** 把一组结果汇总成一句话 + 失败 code 清单。 */
+/**
+ * 把一组结果汇总成一句话 + 失败 code 清单 + **被注入的条目**。
+ *
+ * `overridden` 非空 ⇒ 这份结论里掺了注入物(例如反例的「有牙」自证),
+ * 读的人必须知道:它不是纯粹的实际状态。
+ */
 export function summarize(results: readonly InvariantResult[]): InvariantSummary {
   const failed = results.filter((r) => !r.ok).map((r) => r.code);
+  const overridden = results.filter((r) => r.overridden === true).map((r) => r.code);
+  const head = failed.length === 0
+    ? `${results.length} 条不变量全部通过`
+    : `违反 ${failed.length}/${results.length} 条:${failed.join(', ')}`;
+  const covered = overridden.length === 0
+    ? ''
+    : `;本次覆盖 ${overridden.length} 条(注入):${overridden.join(', ')}`;
   return {
     ok: failed.length === 0,
     total: results.length,
     failed,
-    detail: failed.length === 0
-      ? `${results.length} 条不变量全部通过`
-      : `违反 ${failed.length}/${results.length} 条:${failed.join(', ')}`,
+    overridden,
+    detail: head + covered,
   };
 }

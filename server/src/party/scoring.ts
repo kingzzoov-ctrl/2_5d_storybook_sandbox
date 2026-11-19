@@ -19,6 +19,15 @@
 
 import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
 import type { Rng } from '../coop/rush_order.ts';
+/*
+ * 32 颜料色号数的**唯一声明**在冻结层 `shared/constants/dye.ts#DYE_PALETTE_SIZE`
+ * (32 色染色枪 / 505 染缸 / 像素画架共用);本文件 import 后只**转发**同名绑定。
+ * ⚠️ 下面「事件 → 分」一节里的 `文件.ts:NNN` 判据锚于第九轮按**当时**的文件现状重钉过
+ *    (`modes.ts` / `world_sim.ts` 都会继续长行;`world_sim.ts` 尤其快,漂了就按**符号名**搜,
+ *    别只改数字 —— 判据 `tests/WS-FND-136` FND136-11 会逐条核对「那一行真的是那个符号」)。
+ */
+import { DYE_PALETTE_SIZE } from '../../../shared/constants/dye.ts';
+export { DYE_PALETTE_SIZE };
 
 /**
  * Mulberry32。与 `shared/testing/harness.ts` 的 `mulberry32` 逐位一致,
@@ -331,8 +340,11 @@ export function rankPaint(g: PaintGrid): PaintStanding[] {
 
 /* ═══════════════════════ 彩色喷枪的确定性取色 ═══════════════════════ */
 
-/** 32 色染料色号(505 炼金调色染缸)。 */
-export const DYE_PALETTE_SIZE = 32;
+/*
+ * 32 色染料色号(505 炼金调色染缸):**转发**冻结层 `shared/constants/dye.ts` 的那一份。
+ * 本文件不再写第二份 `= 32`(改版前这里就是第二个 32 —— 加一种颜色时,
+ * 服务端记分槽数会与调色盘静默分叉)。
+ */
 /** 与 TEAM_ORDER 一一对应的队伍色号。 */
 export const TEAM_DYE_INDEX: Readonly<Record<TeamKey, number>> = {
   RED: 0, BLUE: 1, YELLOW: 2, GREEN: 3,
@@ -413,7 +425,9 @@ export function paintStandingLine(s: readonly PaintStanding[]): string {
  *
  * **今天的调用者(世界侧;那行接线由主线落)**:`server/src/sim/world_sim.ts` 的赛局推进
  * —— 它每慢帧已经把 WS-11 的事件送上总线
- * (`world_sim.ts:4102` `this.bus.emit('party_event', { kind: ev })`)。
+ * —— 那行的形状是 `this.bus.emit('party_event', { kind: ev })`(在 `world_sim.ts` 的
+ * 慢帧循环里)。⚠️ 这里**只钉符号名、不钉行号**:`world_sim.ts` 已上万行且每轮都在长,
+ * 行号会在几分钟内过期,而符号名不会(判据 `tests/WS-FND-136` FND136-11 两样都核对)。
  * 赛局里**动作类**的事件(击杀生物 / 采集拾取 / 触碰目标件)由世界侧按下面的
  * `PARTY_SCORE_EVENT` 词表发出,走本节换算成「该给谁加多少分」,再把 `award.points`
  * 交给 `server/src/net/actions/start_party.ts:199` 的 `addScore(roomId, playerId, points)`
@@ -440,15 +454,15 @@ export function paintStandingLine(s: readonly PaintStanding[]): string {
  *
  * | 模式 | 最小一档分 | 出处(逐条可查) |
  * | :--- | :--- | :--- |
- * | BRIDGE_CTF | 2 | `modes.ts:213` `BRIDGE_SCORE_PER_TILE = 2`「每一步建造/冲刺折算的团队分」;`settleBridgeRun` 用它算安慰分(`modes.ts:266`),`docs/WS-11-coop-prank-party.md:453`「未夺旗队 + 2 × built(安慰分)」 |
- * | JELLY_BALL | 1 | `modes.ts:405` `ts.score += 1`(进球),`docs/WS-11-coop-prank-party.md:463`「进球 → 对手队 goals++、score++」 |
- * | CROWN_BR | 1 | `modes.ts:519` `ts.crownSec += dt`,且 `settleCrown` 直接以 `crownSec` 为团队 `value`(`modes.ts:537`)⇒ 1 秒持冠 = 1 分 |
- * | PAINT_WAR | 1 | `modes.ts:614` `getTeam(...).tiles = tiles`,且 `settlePaintWar` 以 `tiles` 为 `value`(`modes.ts:629`)⇒ 1 格色块 = 1 分 |
+ * | BRIDGE_CTF | 2 | `modes.ts:258` `BRIDGE_SCORE_PER_TILE = 2`「每一步建造/冲刺折算的团队分」;`settleBridgeRun` 用它算安慰分(`modes.ts:329`),`docs/WS-11-coop-prank-party.md:453`「未夺旗队 + 2 × built(安慰分)」 |
+ * | JELLY_BALL | 1 | `modes.ts:479` `ts.score += 1`(进球),`docs/WS-11-coop-prank-party.md:463`「进球 → 对手队 goals++、score++」 |
+ * | CROWN_BR | 1 | `modes.ts:597` `ts.crownSec += dt`,且 `settleCrown` 直接以 `crownSec` 为团队 `value`(`modes.ts:614`)⇒ 1 秒持冠 = 1 分 |
+ * | PAINT_WAR | 1 | `modes.ts:695` `getTeam(...).tiles = tiles`,且 `settlePaintWar` 以 `tiles` 为 `value`(`modes.ts:706`)⇒ 1 格色块 = 1 分 |
  *
  * 「到达/触碰目标点」按**各模式主目标件**计价(`PARTY_REACH_TARGET_POINTS`):
- * 造桥夺旗 = 100(`modes.ts:212` `BRIDGE_SCORE_PER_FLAG = 100`,手册 §6.3 夺旗分;
+ * 造桥夺旗 = 100(`modes.ts:257` `BRIDGE_SCORE_PER_FLAG = 100`,手册 §6.3 夺旗分;
  * `docs/WS-11-coop-prank-party.md:453`「夺旗队 +100」)、果冻球 = 1(进球)、涂色 = 1 分/格、
- * 抢皇冠 = **0**(那一模式的分在 `tickCrown` 的持冠秒上累积,拾冠本身不加分,`modes.ts:518-520`)。
+ * 抢皇冠 = **0**(那一模式的分在 `tickCrown` 的持冠秒上累积,拾冠本身不加分,`modes.ts:595-598`)。
  *
  * ## 只有一条"折算"规则,且它写在明面上
  *
@@ -476,7 +490,7 @@ export interface PartyScoreEvent {
  * 见 `mobs/behaviors.ts` 的 `world.emit('boar_wall_stun')` 一族)。
  */
 export const PARTY_SCORE_EVENT = {
-  /** 击杀生物:玩家把生物打到 `alive = false`(`world_sim.ts:2116`)。 */
+  /** 击杀生物:玩家把生物打到 `alive = false`(`world_sim.ts` 的 `after.alive = false` 分支;同上,不钉行号)。 */
   CREATURE_KILL: 'party_creature_kill',
   /** 采集 / 拾取:玩家把地上的物品收进背包。 */
   GATHER: 'party_gather',
@@ -543,22 +557,22 @@ export const PARTY_REACH_TARGET_METRIC: Readonly<Record<string, PartyScoreMetric
 
 /** 最小一档分的锚(写进 `reason`;调这个数时,这条注释必须一起改)。 */
 const MODE_UNIT_ANCHOR: Readonly<Record<string, string>> = {
-  BRIDGE_CTF: 'modes.ts:213 BRIDGE_SCORE_PER_TILE=2(一块桥板的基础分)',
-  JELLY_BALL: 'modes.ts:405 进球 `ts.score += 1`(手册 §6.3「4v4 果冻球」)',
-  CROWN_BR: 'modes.ts:519 `crownSec += dt` + modes.ts:537 以 crownSec 为 value ⇒ 1 秒 = 1 分',
-  PAINT_WAR: 'modes.ts:614 `tiles = tiles` + modes.ts:629 以 tiles 为 value ⇒ 1 格 = 1 分',
+  BRIDGE_CTF: 'modes.ts:258 BRIDGE_SCORE_PER_TILE=2(一块桥板的基础分)',
+  JELLY_BALL: 'modes.ts:479 进球 `ts.score += 1`(手册 §6.3「4v4 果冻球」)',
+  CROWN_BR: 'modes.ts:597 `crownSec += dt` + modes.ts:614 以 crownSec 为 value ⇒ 1 秒 = 1 分',
+  PAINT_WAR: 'modes.ts:695 `tiles = tiles` + modes.ts:706 以 tiles 为 value ⇒ 1 格 = 1 分',
 };
 
 /** 主目标件的锚(同上)。 */
 const REACH_ANCHOR: Readonly<Record<string, string>> = {
-  BRIDGE_CTF: 'modes.ts:212 BRIDGE_SCORE_PER_FLAG=100(手册 §6.3 夺旗分)',
-  JELLY_BALL: 'modes.ts:405 进球 `ts.score += 1`(手册 §6.3 进球计分)',
-  CROWN_BR: 'modes.ts:518-520 分在 `tickCrown` 的持冠秒上累积 ⇒ 拾冠(434)本身 0 分',
-  PAINT_WAR: 'modes.ts:614 与 629 色块数即分数 ⇒ 1 格 1 分',
+  BRIDGE_CTF: 'modes.ts:257 BRIDGE_SCORE_PER_FLAG=100(手册 §6.3 夺旗分)',
+  JELLY_BALL: 'modes.ts:479 进球 `ts.score += 1`(手册 §6.3 进球计分)',
+  CROWN_BR: 'modes.ts:595-598 分在 `tickCrown` 的持冠秒上累积 ⇒ 拾冠(434)本身 0 分',
+  PAINT_WAR: 'modes.ts:695 与 706 色块数即分数 ⇒ 1 格 1 分',
 };
 
 /**
- * 模式词表就是冻结层 `PARTY_MODES`(`shared/constants/bosses.ts:180`)。
+ * 模式词表就是冻结层 `PARTY_MODES`(`shared/constants/bosses.ts:247`)。
  * **不另写第二张**:`start_party.ts:87` 与 `party/modes.ts` 都从同一处取词表。
  */
 function isLegalPartyMode(mode: unknown): mode is string {

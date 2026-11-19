@@ -537,6 +537,10 @@ function entityOf(state: RoomState, kind: EntityKind, id: string): AnyEntity | u
   switch (kind) {
     case EntityKind.ROOM:
       return roomToFlat(state);
+    /* ⚠️ 这三行是**全表线性查找**。它们**不在** `linearIdLookups` 的计数点里:
+       本函数**没有任何调用点**(旧口径的按 id 取实体残留,`applyPacket` 自己
+       用 `find` / `findIndex` 就地取),在死代码里自增只会让计数器看起来恒 0。
+       ★ WS-FND-137 的计数点因此放在 `applyPacket` 的 `find` / `findIndex` 上。 */
     case EntityKind.PLAYER:
       return state.players.find((p) => p.id === id) as unknown as AnyEntity | undefined;
     case EntityKind.WILDLIFE:
@@ -553,13 +557,26 @@ function entityOf(state: RoomState, kind: EntityKind, id: string): AnyEntity | u
  * **不含 tick** —— 帧号走报文头,见 `ROOM_FIELD_TABLE` 的注释。
  */
 export function roomToFlat(s: RoomState): AnyEntity {
-  return {
-    chunkVersions: serializeChunkVersions(s.meta.chunkVersions),
-    partyMode: s.meta.partyMode,
-    partyTimer: s.meta.partyTimer,
-    scoreA: s.meta.scoreA,
-    scoreB: s.meta.scoreB,
-  };
+  /* 计数:这是**新建**一个扁平对象(解码/落地路径与公开 API 用它)。 */
+  encodePerf.flatAllocs += 1;
+  return roomToFlatInto({}, s);
+}
+
+/**
+ * 把房间级字段写进**已有**对象 —— `roomToFlat` 的复用槽版本(§4.1)。
+ *
+ * 用义:房间级 diff 每次编码要两份扁平对象(prev / next),而它们的字段集合恒为
+ * `ROOM_FIELD_TABLE` 那 5 个 ⇒ 逐字段覆写即可,不必每次新造。
+ * 判据:`encodeDelta` 稳态下 `encodePerf.flatAllocs` 不再增长(WS-FND-137)。
+ */
+export function roomToFlatInto(out: AnyEntity, s: RoomState): AnyEntity {
+  out.chunkVersions = serializeChunkVersions(s.meta.chunkVersions);
+  out.partyMode = s.meta.partyMode;
+  out.partyTimer = s.meta.partyTimer;
+  out.scoreA = s.meta.scoreA;
+  out.scoreB = s.meta.scoreB;
+  encodePerf.flatReuses += 1;
+  return out;
 }
 
 function applyFlatToRoom(s: RoomState, flat: AnyEntity): void {
@@ -660,17 +677,36 @@ export function encodeDelta(
   const roomPlan = planFor(
     EntityKind.ROOM,
     next.roomId,
-    prev ? roomToFlat(prev) : undefined,
-    roomToFlat(next),
+    /* ★ WS-FND-137 P2:两个槽对象**每帧复用**(修前是两次 `roomToFlat` 新建)。
+       安全前提见 §4.1:编码同步、`planFor` 只读不存引用。 */
+    prev ? roomToFlatInto(prevFlatScratch, prev) : undefined,
+    roomToFlatInto(nextFlatScratch, next),
   );
   if (roomPlan) plans.push(roomPlan);
 
-  /* ── 实体级 ── */
+  /* ── 实体级 ──
+     ★ WS-FND-137 P1(第九轮实测):修前每个实体都 `listOf(prev, kind).find((x) => x.id === e.id)`
+     —— 那是**全表线性查找**,n 个实体 ⇒ O(n²)/帧;而调用点 `room.ts:3356` **每 tick** 一次。
+     改成**每次编码建一次** `kind+id → 实体` 索引(O(n)),实体循环里只做 O(1) 查表。
+     ⚠️ 索引是**复用**的同一张 Map(`prevEntityIndex`),所以 `clear()` 必须在填之前 ——
+     漏了它上一帧的实体会被当成本帧的 prev,表现是「差量里凭空多出/少掉字段」。 */
+  let prevIndex: Map<string, AnyEntity> | null = null;
+  if (prev) {
+    prevIndex = prevEntityIndex;
+    prevIndex.clear();
+    for (const kind of [EntityKind.PLAYER, EntityKind.WILDLIFE, EntityKind.BOSS] as const) {
+      for (const e of listOf(prev, kind)) prevIndex.set(entityIndexKey(kind, e.id), e as unknown as AnyEntity);
+    }
+    encodePerf.idMapBuilds += 1;
+  }
   for (const kind of [EntityKind.PLAYER, EntityKind.WILDLIFE, EntityKind.BOSS] as const) {
     const nextList = listOf(next, kind);
     for (const e of nextList) {
-      const before = prev ? listOf(prev, kind).find((x) => x.id === e.id) : undefined;
-      const p = planFor(kind, e.id, before as unknown as AnyEntity | undefined, e as unknown as AnyEntity);
+      /* 「尸体」(在 prev 里、但本帧已不在 next 里)由上面的删除段处理,
+         **不参与**这里的 upsert 配对 —— 查表次数因此恰等于 next 侧实体数。 */
+      const before = prevIndex === null ? undefined : prevIndex.get(entityIndexKey(kind, e.id));
+      if (prevIndex !== null) encodePerf.idMapLookups += 1;
+      const p = planFor(kind, e.id, before, e as unknown as AnyEntity);
       if (p) plans.push(p);
     }
   }
@@ -695,18 +731,28 @@ export function encodeDelta(
   }
 
   const bytes = w.finish();
-  return {
-    bytes,
-    stats: {
-      changedFields: plans.map((p) => ({
-        kind: p.kind,
-        id: p.id,
-        fields: p.fields.map((f) => f.key),
-      })),
-      removed,
-      bytes: bytes.length,
+  /* ★ WS-FND-137 P2 惰性化:`changedFields` 修前是**每帧无条件** `plans.map(...)`,
+     而生产路径(`room.ts:3356` 只取 `.bytes`)从不读它 ⇒ 每个变更实体白造
+     一个对象 + 一个字符串数组,20Hz 下与实体数同阶。
+     现在**首次读取时物化并缓存**:不读不花成本,读了与修前逐字段相同
+     (且两次读到**同一份**,不是每次新造 —— `stats` 的用途是断言,不是流式输出)。 */
+  let changedCache: EncodeStats['changedFields'] | null = null;
+  const stats: EncodeStats = {
+    get changedFields(): EncodeStats['changedFields'] {
+      if (changedCache === null) {
+        changedCache = plans.map((p) => ({
+          kind: p.kind,
+          id: p.id,
+          fields: p.fields.map((f) => f.key),
+        }));
+        encodePerf.changedFieldsMaterialized += 1;
+      }
+      return changedCache;
     },
+    removed,
+    bytes: bytes.length,
   };
+  return { bytes, stats };
 }
 
 /**
@@ -719,6 +765,88 @@ export function encodeDelta(
  */
 export function encodeFull(state: RoomState, tick: number = state.meta.tick): EncodedPacket {
   return encodeDelta(null, state, tick);
+}
+
+/* ═══════════ 4.1 编码侧复用槽与成本计数器(WS-FND-137) ═══════════
+ *
+ * 第九轮实测的五条里有三条落在本文件,共性是「**同一个对象每帧重造**」而不是
+ * 「算法复杂度错了」:
+ *
+ * ```text
+ * 1 P1 每实体 `listOf(prev, kind).find(...)`  —— 全表线性查找 ⇒ O(n²)/帧
+ * 2 P2 `roomToFlat` 每帧新造 1~2 个扁平对象 + `stats.changedFields` 每帧 map 新数组
+ * ```
+ *
+ * 修法与判据(判据见 `tests/WS-FND-137-frame-cost.test.ts`):
+ *   · 索引**每次编码建一次**(O(n)),实体循环里只做 O(1) 查表 ⇒
+ *     `encodePerf.idMapLookups` 恒等于「next 侧实体数」,不再是 Σn;
+ *   · 房间级扁平对象走**复用槽**(prev/next 各一),内容逐字段覆写 ⇒
+ *     `encodePerf.flatAllocs` 稳态恒 0;
+ *   · `stats.changedFields` **惰性物化并缓存** ⇒ 生产路径(`room.ts:3356` 只读 `.bytes`)
+ *     一次都不物化(`encodePerf.changedFieldsMaterialized` 恒 0),
+ *     而真要读时逐字段与修前**完全相同**。
+ *
+ * ⚠️ 复用槽的安全前提:**编码是同步的**(`encodeDelta` 内不回调外部代码)。
+ * 若哪天有人在编码途中调用了外部钩子(再进编码),这些槽必须改成栈式。
+ */
+
+/** `kind + id` 索引键:不同 kind 的 id 可能重名(玩家/生物各编各的号),不能只用 id。 */
+function entityIndexKey(kind: EntityKind, id: string): string {
+  return `${kind}\u0000${id}`;
+}
+
+/** prev 侧的 `kind+id → 实体` 索引(复用同一张 Map,每次编码先 `clear()`)。 */
+const prevEntityIndex = new Map<string, AnyEntity>();
+
+/** 房间级扁平对象的复用槽(见上面 §4.1 的安全前提)。 */
+let prevFlatScratch: AnyEntity = {};
+let nextFlatScratch: AnyEntity = {};
+
+/**
+ * 编码侧成本计数器 —— 修「够不够快」这件事**必须可测**,否则只能靠肉眼读代码。
+ *
+ * ⚠️ 这些字段**只增不减**,由 `resetEncodePerf()` 清零(测试在每次测量前调用)。
+ * 生产路径不读它们(零成本:纯整数自增)。
+ */
+export interface EncodePerfCounters {
+  /** `kind+id` 索引构建次数(每次带 `prev` 的编码 1 次)。 */
+  idMapBuilds: number;
+  /** 索引查表次数(每次带 `prev` 的编码应 = next 侧实体数)。 */
+  idMapLookups: number;
+  /**
+   * **全表线性查找**次数。
+   *
+   * 计数点在**落地侧**(`applyPacket` 里每条文按 id 找当前值 / 找下标的
+   * `find` + `findIndex`,每条计 2)—— 编码侧修完后一次都不再贡献。
+   * 保留这个字段的用义:它证明「计数器是活的」—— 收一包并落地就会把它顶上去
+   * (负对照),所以「编码侧 0 次」不是一条恒真的断言。
+   */
+  linearIdLookups: number;
+  /** 新造的房间级扁平对象数(复用后稳态 0)。 */
+  flatAllocs: number;
+  /** 复用房间级扁平槽的次数。 */
+  flatReuses: number;
+  /** `stats.changedFields` 物化次数(生产路径不读它 ⇒ 0)。 */
+  changedFieldsMaterialized: number;
+}
+
+export const encodePerf: EncodePerfCounters = {
+  idMapBuilds: 0,
+  idMapLookups: 0,
+  linearIdLookups: 0,
+  flatAllocs: 0,
+  flatReuses: 0,
+  changedFieldsMaterialized: 0,
+};
+
+/** 清零全部编码侧计数器(测试测量前调用)。 */
+export function resetEncodePerf(): void {
+  encodePerf.idMapBuilds = 0;
+  encodePerf.idMapLookups = 0;
+  encodePerf.linearIdLookups = 0;
+  encodePerf.flatAllocs = 0;
+  encodePerf.flatReuses = 0;
+  encodePerf.changedFieldsMaterialized = 0;
 }
 
 function listOf(
@@ -948,17 +1076,29 @@ export function applyPacket(base: RoomState, pkt: DecodedPacket): RoomState {
       continue;
     }
     const table = tableFor(u.kind as EntityKind);
+    /* ★ WS-FND-137:`linearIdLookups` 的**活的**计数点。
+       这里按**报文条数**做全表查找(每条 2 次:取当前值 + 取下标)——
+       与编码侧修掉的「每实体一次、每帧一遍」不是同一量级:
+       ```text
+       编码侧(修前)  Σ kind n²  ×20Hz   ← 每帧的常态成本,已改成 O(n) 的 id 索引
+       解码侧(现在)  k × n               ← 只有收到报文时才有,k = 本包条数
+       ```
+       计数放在这里而不是 `entityOf`:后者**没有任何调用点**(死函数),
+       在死代码里自增会让这个计数器看起来恒 0,那不是判据、是装饰。 */
     if (u.kind === EntityKind.PLAYER) {
+      encodePerf.linearIdLookups += 2;
       const cur = out.players.find((p) => p.id === u.id);
       const merged = mergeEntity(cur, table, u.id, u.fields) as unknown as PlayerState;
       const i = out.players.findIndex((p) => p.id === u.id);
       if (i === -1) out.players.push(merged); else out.players[i] = merged;
     } else if (u.kind === EntityKind.WILDLIFE) {
+      encodePerf.linearIdLookups += 2;
       const cur = out.wildlife.find((w) => w.id === u.id);
       const merged = mergeEntity(cur, table, u.id, u.fields) as unknown as WildlifeState;
       const i = out.wildlife.findIndex((w) => w.id === u.id);
       if (i === -1) out.wildlife.push(merged); else out.wildlife[i] = merged;
     } else if (u.kind === EntityKind.BOSS) {
+      encodePerf.linearIdLookups += 2;
       const cur = out.bosses.find((b) => b.id === u.id);
       const merged = mergeEntity(cur, table, u.id, u.fields) as unknown as BossState;
       const i = out.bosses.findIndex((b) => b.id === u.id);

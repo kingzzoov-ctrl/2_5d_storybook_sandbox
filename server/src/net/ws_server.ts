@@ -626,6 +626,19 @@ export type WsRoomLike = {
     ok: boolean;
     reason?: string;
     resumed?: boolean;
+    /**
+     * ★ WS-FND-134(P2):拒绝**档位**(机器可读)。
+     *
+     * 修前 `JoinResult` 只有 `reason`(中文散文)⇒ 两个装配层
+     * (`ws_server` / `room.colyseus`)与客户端**都只能比对字符串**才能区分
+     * 「房满」「密码错」「token 过期」「已在线」—— 而文案一改,判据静默失效
+     * (本仓反复记的形态:判据盯在会变的字串上)。
+     *
+     * ⚠️ 类型写成 `string`(而不是 import `room.ts` 的联合):本文件刻意
+     *   **不 import 房间实现**(结构化最小接口,见文件头),多出来的那条 import
+     *   会让运输层依赖房间的内容类型。取值口径由 `room.ts` 的 `JoinRejectCode` 定义。
+     */
+    code?: string;
   };
   /**
    * 签发一张加入凭证。**可选**(结构化最小接口):没有它的房间无法鉴权,
@@ -719,6 +732,24 @@ export type WsServerHandle = {
   frameRejected(): number;
   /** 最近一次帧层被拒的原因原文(null = 没拒过)。 */
   lastFrameError(): string | null;
+
+  /**
+   * ★ WS-FND-134(P1-2):**hello 被拒**的累计次数(缺身份 / join 拒)。
+   *
+   * 与 `uplinkRejected` 分开计:那是"载荷解不开",这是"人不许进"。
+   * 它同时是 P1-1 的服务端半边:客户端能看到 `t:'reject'` 之前,
+   * 服务端必须**先**有一条可读的痕迹(否则"玩家说连不上"时无从对账)。
+   */
+  helloRejected(): number;
+  /** ★ WS-FND-134(P2):**下行写失败**的累计次数(修前 `catch` 不留痕)。 */
+  writeErrors(): number;
+  /**
+   * ★ WS-FND-134(P1-2):已经**写出去**的日志行数。
+   *
+   * 为什么需要它:`log` 被调用 ≠ 出口真的被调过 —— 若哪天有人把默认出口改回
+   * `() => {}`,计数仍在(断言"发生过"还是绿),只有这个数会停在 0。
+   */
+  logLines(): number;
   /**
    * ★ 某条连接**已应用成功的最高客户端命令序号**(`-1` = 该连接还没带过 `seq`)。
    *
@@ -816,10 +847,99 @@ export interface HelloFrame {
   asGuest?: boolean;
 }
 
+/* ═══════════ ★ WS-FND-134(P1-2):失败日志的**出口** ═══════════
+ * ## 缺陷形态(第九轮实测)
+ * ```ts
+ * const log = opts.onLog ?? (() => {});
+ * ```
+ * 默认**静默**,而全仓没有一处装配点传 `onLog` ⇒ 「hello 被拒 / 帧解析失败 /
+ * applyMove 抛错」在生产**没有任何出口**:连接被关掉,服务端一条痕迹都不留。
+ * ## 修法(三件一起才成立)
+ * ```text
+ * 1 默认出口 = `defaultWsLog`(真写 console,不再静默)
+ * 2 每行带**类别**标签 `[ws:<cat>]`(结构化分派,不靠子串猜)与**计数快照**
+ *   `{framesRejected=.. uplinkRejected=.. helloRejected=.. writeErrors=..}`
+ * 3 计数本身可从 handle 读到(`frameRejected` / `uplinkRejected` /
+ *   `helloRejected` / `writeErrors`),日志行数读 `logLines()`
+ * ```
+ * ⇒ 「日志出现过」与「这件事发生过几次」变成**两个都能断言的量**。
+ *   只断言前者时,「把 log 调用注释掉但计数还在」与「都还在」不可区分 ——
+ *   这正是本仓反复点名的「能变绿的假判据」形态。
+ */
+/** 日志**类别**(唯一的分类来源;`log(cat, msg)` 的第一个参数)。 */
+export type WsLogCategory =
+  | 'boot' | 'conn' | 'close' | 'frame' | 'uplink'
+  | 'hello' | 'move' | 'attack' | 'action' | 'step' | 'write' | 'misc';
+
+/** 每行日志末尾附的**计数快照**(叶子是单调累加量,不是"最近一次")。 */
+export interface WsLogCounts {
+  framesRejected: number;
+  uplinkRejected: number;
+  helloRejected: number;
+  writeErrors: number;
+}
+
+/**
+ * 把 (类别, 消息, 计数) 拼成**一行**。
+ *
+ * 为什么单独抽成导出的纯函数:这样「行里有类别标签、有计数」这件事
+ * **可被直接断言**,而不必起一个服务器去读它的输出(判据要能单独变红)。
+ */
+export function formatWsLogLine(cat: WsLogCategory, msg: string, c: WsLogCounts): string {
+  return `[ws:${cat}] ${msg} {framesRejected=${c.framesRejected}`
+    + ` uplinkRejected=${c.uplinkRejected} helloRejected=${c.helloRejected}`
+    + ` writeErrors=${c.writeErrors}}`;
+}
+
+/**
+ * **默认**日志出口 —— 真写出去(stderr,因为它是**失败**通道)。
+ *
+ * ⚠️ 不是 `() => {}`:默认静默等于「生产环境里这条路上什么都没有」,
+ *   而那正是本任务 P1-2 的缺陷本体。
+ */
+export function defaultWsLog(line: string): void {
+  try { console.error(line); } catch { /* 控制台不可用时不抛 */ }
+}
 export async function startWsServer(opts: WsServerOptions): Promise<WsServerHandle> {
   const port = opts.port ?? 0;
   const frameMs = opts.frameMs ?? 50;
-  const log = opts.onLog ?? ((): void => { /* 静默 */ });
+  /* ═══════════ ★ WS-FND-134(P1-2):日志**出口**与计数 ═══════════
+   * ## 修前(第九轮实测)
+   * ```ts
+   * const log = opts.onLog ?? (() => { /* 静默 *\/ });
+   * ```
+   * 而本仓**没有任何**装配点传 `onLog`(唯一的调用点 `server/src/sim/ws_demo.ts` 与
+   * 演示脚本显式静音)⇒ 「hello 被拒 / 帧解析失败 / applyMove 抛错」在生产
+   * **一条出口都没有**:连接被关、客户端只看到 disconnected,而服务端**不留痕**。
+   * ## 现在
+   * ```
+   * 默认 = `defaultWsLog`(= console,不静默)
+   * 每一行都带 **类别标签** `[ws:<cat>]` 与 **计数快照** {framesRejected=... ...}
+   * `logLines()` 可断言「日志出口真的被调过」(只断言"代码里有 log 调用"是
+   *   本仓反复点名的**不能变红的假判据**:符号被引用 ≠ 被执行)
+   * ```
+   * ⚠️ 出口本身**抛**不许把运输层带崩(宽容 catch,与断开路径同一纪律):
+   *   一个坏 logger 不该让玩家掉线。 */
+  const sink = opts.onLog ?? defaultWsLog;
+  /** hello 被拒(缺身份 / join 拒)的累计次数 —— 与 `uplinkRejected` 分开计。 */
+  let helloRejected = 0;
+  /** 下行写失败的累计次数(P2:修前 `catch { closed = true }` 不留痕)。 */
+  let writeErrors = 0;
+  /** 写出去的日志行数(证明出口真的被调过)。 */
+  let logLines = 0;
+  /**
+   * **唯一**写日志的地方。
+   *
+   * 为什么类别是参数而不是拼进消息里:拼进消息就等于**没有结构** ——
+   * 读者(与断言)只能靠子串匹配,而那正是本仓记过的「判据盯在会变的字串上」。
+   */
+  const log = (cat: WsLogCategory, msg: string): void => {
+    logLines += 1;
+    const line = formatWsLogLine(cat, msg, {
+      framesRejected, uplinkRejected, helloRejected, writeErrors,
+    });
+    try { sink(line); } catch { /* 出口自己抛不许把运输层带崩 */ }
+  };
   const conns = new Set<WsConn>();
   /** 上一次广播的状态快照 —— 增量编码的基准。 */
   let prevState: unknown = null;
@@ -849,7 +969,14 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
 
   const write = (c: WsConn, bytes: Uint8Array): void => {
     if (c.closed || c.socket.destroyed) return;
-    try { c.socket.write(bytes); } catch { c.closed = true; }
+    try { c.socket.write(bytes); } catch (e) {
+      /* ★ WS-FND-134(P2):修前这里是 `catch { c.closed = true }` ——
+         下行写失败**一点痕迹都没有**:报文丢了、连接被标记关闭,
+         而调用方看到的是"这个玩家一直没收到帧"。 */
+      writeErrors += 1;
+      c.closed = true;
+      log('write', `下行写失败(bytes=${bytes.byteLength}):${e instanceof Error ? e.message : String(e)}`);
+    }
   };
 
   /* ── 包头里 ackedSeq 的位置与编码 ──
@@ -931,7 +1058,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       ackedSeq: -1,
     };
     conns.add(conn);
-    log(`upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
+    log('conn', `upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
 
     socket.on('data', (chunk: Buffer) => {
       /* ★ 追加到残帧缓冲区 —— **不假设一 data 一帧**(见 parseFrame) */
@@ -950,7 +1077,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           const tooBig = e instanceof FrameTooBigError;
           framesRejected += 1;
           lastFrameError = e instanceof Error ? e.message : String(e);
-          log(`帧解析失败(${tooBig ? '超界' : '协议错'}):${lastFrameError}`);
+          log('frame', `帧解析失败(${tooBig ? '超界' : '协议错'}):${lastFrameError}`);
           write(conn, encodeClose(tooBig ? 1009 : 1002,
             tooBig ? 'message too big' : 'protocol error'));
           try { socket.destroy(); } catch { /* 已断 */ }
@@ -963,7 +1090,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           if (isBufOverflow(conn.buf.byteLength)) {
             framesRejected += 1;
             lastFrameError = `残帧缓冲超界:${conn.buf.byteLength} > ${MAX_CONN_BUF_BYTES} 字节`;
-            log(`残帧缓冲超界 ⇒ 关连接:${lastFrameError}`);
+            log('frame', `残帧缓冲超界 ⇒ 关连接:${lastFrameError}`);
             write(conn, encodeClose(1009, 'message too big'));
             try { socket.destroy(); } catch { /* 已断 */ }
           }
@@ -975,7 +1102,13 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       }
     });
 
-    socket.on('error', () => { conn.closed = true; conns.delete(conn); });
+    socket.on('error', (e: Error) => {
+      conn.closed = true;
+      conns.delete(conn);
+      /* ★ WS-FND-134(P2):连接层错误此前**一声不响**(无日志、无计数)——
+         它恰恰是"连不上"这类工单的第一现场。 */
+      log('conn', `socket error:${e instanceof Error ? e.message : String(e)}`);
+    });
     socket.on('close', () => {
       conn.closed = true;
       conns.delete(conn);
@@ -1004,7 +1137,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           else opts.room.disconnect(conn.userId);
         } catch { /* 宽容:断开路径不该因房间抛错而中断 */ }
       }
-      log(`close userId=${conn.userId ?? '(未握手)'}`
+      log('close', `userId=${conn.userId ?? '(未握手)'}`
         + ` ${conn.closeFrameSeen ? '主动' : '异常'} conns=${conns.size}`);
     });
   });
@@ -1028,13 +1161,26 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     if (f.op === OP_TEXT || f.op === OP_BINARY) {
       const u = classifyUplink(f.payload);
       if (u.kind === 'empty') {
-        log('忽略空载荷上行(无 tag、无内容)');
+        log('uplink', '忽略空载荷上行(无 tag、无内容)');
         return;
       }
       if (u.kind === 'text') {
+        const text = new TextDecoder().decode(u.payload);
         let parsed: HelloFrame & { t?: string };
-        try { parsed = JSON.parse(new TextDecoder().decode(u.payload)) as HelloFrame & { t?: string }; }
+        try { parsed = JSON.parse(text) as HelloFrame & { t?: string }; }
         catch {
+          /* ★ WS-FND-134(P2):修前这里 `catch { close(1003); return }` ——
+             既不计数也不出声(对比:帧层拒收 L1042/载荷层拒收 L1213 都记了)。
+             ⇒ 一个解析不了的文本帧把连接关掉,而服务端**没有任何痕迹**
+             (调用方只看到"连接断了")。
+             ⚠️ 归 `uplinkRejected`(载荷层)而不是 `framesRejected`:后者是
+             "连一帧都没读出来",这一帧**读出来了**、是内容解不开 ——
+             两件事分属不同处置,合并计数会让排障指错方向。
+             ⚠️ 为了**能指认对象**,日志里带前 32 字符(不含全文:上行是外部输入)。 */
+          uplinkRejected += 1;
+          lastParseError = '文本上行不是合法 JSON';
+          log('uplink', `文本上行不是合法 JSON ⇒ 关连接(1003),前 32 字符:`
+            + `${JSON.stringify(text.slice(0, 32))}`);
           write(c, encodeClose(1003, '文本上行不是合法 JSON'));
           c.closed = true;
           return;
@@ -1111,7 +1257,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
         uplinkParsed += 1;
         lastParsedPacket = pkt;
         lastParseError = null;
-        log(`上行协议包已解析 op=${pkt.op} tick=${pkt.tick}`
+        log('uplink', `上行协议包已解析 op=${pkt.op} tick=${pkt.tick}`
           + ` removed=${pkt.removed.length} upserts=${pkt.upserts.length}`
           + ` ${pkt.bytesConsumed}B`);
       } catch (e) {
@@ -1121,13 +1267,13 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
          *   ⚠️ 但"宽容"不等于"假装没发生" ⇒ 计数 + 原因 + 日志三样都要留。 */
         uplinkRejected += 1;
         lastParseError = e instanceof Error ? e.message : String(e);
-        log(`上行协议包解析失败:${lastParseError}`);
+        log('uplink', `上行协议包解析失败:${lastParseError}`);
       }
       return;
     }
     /* 未识别的 opcode(如 continuation 0x0):不静默丢 —— 记为一条日志。
        (本服务端不解分片;契约 §13 已记为未覆盖项。) */
-    log(`忽略未识别的 opcode=0x${f.op.toString(16)}`);
+    log('frame', `忽略未识别的 opcode=0x${f.op.toString(16)}`);
   }
 
   function onHello(c: WsConn, hello: HelloFrame): void {
@@ -1167,8 +1313,9 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       /* 没有声明就无从比对 ⇒ 拒(旧代码在这里**替客户端编**一个 `c1` 身份,
          那正是"身份由服务端凭空产生"的另一面:编出来的身份也能占席位)。 */
       const reason = '缺少 userId(身份无从校验)';
-      log(`hello 被拒:${reason}`);
-      sendJson(c, { t: 'reject', reason });
+      helloRejected += 1;
+      log('hello', `hello 被拒 code=NO_IDENTITY:${reason}`);
+      sendJson(c, { t: 'reject', code: 'NO_IDENTITY', reason });
       write(c, encodeClose(1008, reason));
       c.closed = true;
       return;
@@ -1183,8 +1330,15 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       requireToken,
     });
     if (!res.ok) {
-      sendJson(c, { t: 'reject', reason: res.reason ?? 'join 失败' });
-      write(c, encodeClose(1008, res.reason ?? 'join 失败'));
+      /* ★ WS-FND-134(P2):入场被拒必须带**机器可读的 code**(修前只有中文散文
+         `reason`,客户端只能靠比对字符串区分"房满 / 密码错 / token 过期 / 已在线")。
+         房间侧给出 `res.code`(见 `JoinResult`);同时**出声**(计数 + 日志)。 */
+      const code = res.code ?? 'JOIN_REJECTED';
+      const reason = res.reason ?? 'join 失败';
+      helloRejected += 1;
+      log('hello', `join 被拒 code=${code}:${reason}`);
+      sendJson(c, { t: 'reject', code, reason });
+      write(c, encodeClose(1008, reason));
       c.closed = true;
       return;
     }
@@ -1246,17 +1400,17 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
  */
 function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown; useSkill?: unknown }): void {
   if (!c.helloDone || c.userId === null) {
-    log('攻击意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    log('attack', '攻击意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
     return;
   }
   const apply = opts.room.applyAttack;
   if (typeof apply !== 'function') {
-    log('本房间没有 applyAttack ⇒ 攻击无处应用(丢弃,不是丢包)');
+    log('attack', '本房间没有 applyAttack ⇒ 攻击无处应用(丢弃,不是丢包)');
     return;
   }
   const mobId = typeof msg.mobId === 'string' ? msg.mobId : '';
   if (mobId === '') {
-    log('攻击意图缺 mobId ⇒ 丢弃(没有目标就没有结算)');
+    log('attack', '攻击意图缺 mobId ⇒ 丢弃(没有目标就没有结算)');
     return;
   }
   const bonus = typeof msg.bonus === 'number' && Number.isFinite(msg.bonus) ? msg.bonus : 0;
@@ -1270,7 +1424,7 @@ function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown; useSkill?:
   try {
     apply.call(opts.room, c.userId, bonus, mobId, useSkill);
   } catch (e) {
-    log(`applyAttack 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+    log('attack', `applyAttack 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
     return;
   }
   sendJson(c, {
@@ -1299,17 +1453,17 @@ function onAttack(c: WsConn, msg: { mobId?: unknown; bonus?: unknown; useSkill?:
  */
 function onAction(c: WsConn, msg: { action?: unknown }): void {
   if (!c.helloDone || c.userId === null) {
-    log('动作意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    log('action', '动作意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
     return;
   }
   const dispatch = opts.room.dispatchAction;
   if (typeof dispatch !== 'function') {
-    log('本房间没有 dispatchAction ⇒ 动作无处应用(丢弃,不是丢包)');
+    log('action', '本房间没有 dispatchAction ⇒ 动作无处应用(丢弃,不是丢包)');
     return;
   }
   const action = typeof msg.action === 'string' ? msg.action : '';
   if (action === '') {
-    log('动作意图缺 action ⇒ 丢弃(没有动作名就没有执行)');
+    log('action', '动作意图缺 action ⇒ 丢弃(没有动作名就没有执行)');
     sendJson(c, { t: 'actionResult', ok: false, kind: 'INVALID', reason: '缺 action' });
     return;
   }
@@ -1317,8 +1471,11 @@ function onAction(c: WsConn, msg: { action?: unknown }): void {
   try {
     out = dispatch.call(opts.room, c.userId, action, msg);
   } catch (e) {
-    log(`dispatchAction 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
-    sendJson(c, { t: 'actionResult', action, ok: false, kind: 'INVALID', reason: '服务端执行抛错' });
+    log('action', `dispatchAction 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+    /* ★ WS-FND-134(P2):**内部错**必须与"参数/状态不对"分开档 ——
+       修前这里回 `kind:'INVALID'`,与真·参数错同码 ⇒ 客户端(与排障的人)
+       把"服务端执行抛错"读成"我发错了",而两者的修法完全不同。 */
+    sendJson(c, { t: 'actionResult', action, ok: false, kind: 'INTERNAL', reason: '服务端执行抛错' });
     return;
   }
   /* 回执里带 `action`:一个连接可能连着发多个动作,回执必须能对上号
@@ -1334,17 +1491,17 @@ function onMove(c: WsConn, msg: {
      (本轮实测:基线锁当场抓到 +1)—— 这不是洁癖:若哪天真有连接在
      `helloDone` 之后被清掉 userId,`applyMove(null, …)` 会去查一个不存在的玩家。 */
   if (!c.helloDone || c.userId === null) {
-    log('移动意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
+    log('move', '移动意图早于 hello ⇒ 丢弃(还没有 userId,无法应用)');
     return;
   }
   const apply = opts.room.applyMove;
   if (typeof apply !== 'function') {
-    log('本房间没有 applyMove ⇒ 移动意图无处应用(丢弃,不是丢包)');
+    log('move', '本房间没有 applyMove ⇒ 移动意图无处应用(丢弃,不是丢包)');
     return;
   }
   const parsed = parseMoveIntent(msg);
   if (!parsed.ok) {
-    log(`移动意图被拒(${parsed.reason})⇒ 丢弃`);
+    log('move', `移动意图被拒(${parsed.reason})⇒ 丢弃`);
     return;
   }
   const intent = parsed.intent;
@@ -1358,13 +1515,13 @@ function onMove(c: WsConn, msg: {
        非法 ⇒ 不推进(账本保持不变),并在日志里点名;绝不把回绕值记成 ack。 */
     if (intent.seq !== undefined) {
       if (!(intent.seq >= 0 && isValidAckedSeq(intent.seq))) {
-        log(`ack 拒收:seq=${String(intent.seq)} 不在 0..${MAX_ACKED_SEQ}(不推进 ack,移动已应用)`);
+        log('move', `ack 拒收:seq=${String(intent.seq)} 不在 0..${MAX_ACKED_SEQ}(不推进 ack,移动已应用)`);
       } else if (intent.seq > c.ackedSeq) {
         c.ackedSeq = intent.seq;
       }
     }
   } catch (e) {
-    log(`applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
+    log('move', `applyMove 抛错(已丢弃该动作,连接保持):${(e as Error).message}`);
   }
 }
 
@@ -1374,7 +1531,7 @@ function onMove(c: WsConn, msg: {
     try {
       payload = opts.room.step(prevState);
     } catch (e) {
-      log(`step 抛错:${(e as Error).message}`);
+      log('step', `step 抛错:${(e as Error).message}`);
       return;
     }
     if (payload.byteLength > 0) {
@@ -1437,6 +1594,13 @@ function onMove(c: WsConn, msg: {
     /* ★ WS-FND-132(P1):帧层拒收的累计计数 + 最近原因(见 handle 类型上的说明)。 */
     frameRejected: (): number => framesRejected,
     lastFrameError: (): string | null => lastFrameError,
+
+    /* ★ WS-FND-134(P1/P2):三处**失败出口**的计数。
+       ⚠️ 它们与日志行数是**两个判据**:日志证明"说出来了",计数证明"发生过几次"
+       —— 只断言其中一个时,"把 log 注释掉"与"把计数删掉"两种走样各自不可见。 */
+    helloRejected: (): number => helloRejected,
+    writeErrors: (): number => writeErrors,
+    logLines: (): number => logLines,
     /* ★ D-14(2026-11-17):**每连接**的"已应用成功的最高客户端命令序号"。
        与 `uplinkParsed`(报文解析成功)分开计 —— 这是"这条命令生效了"。
        它同时是下行包头 `ackedSeq` 的真值来源(见广播循环)。

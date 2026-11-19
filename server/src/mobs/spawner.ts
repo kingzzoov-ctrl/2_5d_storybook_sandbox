@@ -44,7 +44,14 @@ export const STREET_LAMP_RADIUS = 5;
 /** 夜路砖的微光抑制半径(格),取 1 格防贴脸刷怪。 */
 export const NIGHT_BRICK_RADIUS = 1;
 
-/** 城镇安全区半径(格)。 */
+/*
+ * 城镇安全区半径(格)= 24。
+ *
+ * ⚠️ **与 `shared/types/entities.ts#SHARE_EXP_RADIUS`(经验共享半径 24)/
+ * `bosses/raid.ts#RAID_PARTICIPATION_RADIUS`(祭坛参与判定 24)**数值相同、语义不同**:
+ * 这一条管「刷怪抑制 + 安全区护盾」,那两条管「经验分给谁 / 谁算参与者」。
+ * ⇒ 不合并来源、不互相替代(`tests/WS-FND-30` FND30-5 钉的就是本值 24)。
+ */
 export const TOWN_SAFE_RADIUS = 24;
 /** 安全区护盾吸收比例(100% 免疫野生怪伤害)。 */
 export const SAFE_SHIELD_MULT = 1.0;

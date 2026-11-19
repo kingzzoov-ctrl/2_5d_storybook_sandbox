@@ -605,3 +605,25 @@ export function matchRecipeByTags(
 export function hasAnyTagSlot(itemId: number): boolean {
   return (ITEM_BY_ID.get(itemId)?.recipeAnyTag ?? []).length > 0;
 }
+
+/* ═══════════════════ 掉落件数规则(与内容表共享的常量)═══════════════════ */
+
+/**
+ * 「掉落件数按概率翻倍」的名义概率(0.35 = 35%)。**唯一的一份。**
+ *
+ * ## 出处与两个消费点(改版前是两处各写一遍)
+ *
+ * | 消费点 | 改版前的写法 | 现在 |
+ * | :--- | :--- | :--- |
+ * | `server/src/bosses/raid.ts#rollPersonalLoot` | 裸字面量 `rng() < 0.35` | `rng() < DROP_DOUBLE_CHANCE` |
+ * | `server/src/combat/cooking.ts` 的 603 烘焙派词条 | `flags: { dropDoubleChance: 0.35 }` | **待改**(该文件不在本轮写域:数值相同,故行为不变) |
+ *
+ * 为什么落在本文件(物品表)而不是别处:件数放大是**掉落/物品域**的规则,
+ * 与 `ITEM_LIST` 的「一件一份」口径同源;`systems/wiring.ts` 与 `sim/world_sim.ts`
+ * 的注释也一直把这一族词条记作「`items.ts` 的 `flags.dropDoubleChance` 那一族」。
+ *
+ * ⚠️ 它**不是平衡裁决**:0.35 是既有内容(603 烘焙派词条)里已经写着的数,
+ * 这里只是把「同一个数写两遍」收敛成一处 —— 改它要连带复核两处玩法口径
+ * (Boss 个人掉落 / 料理增益),不要只改这里。
+ */
+export const DROP_DOUBLE_CHANCE = 0.35;

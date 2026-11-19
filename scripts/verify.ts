@@ -14,7 +14,8 @@
  *   ⚠️ `gate-selfcheck` **默认真跑**(约 163s;见 `checkGateSelfcheck` 的长注释):`--lenient` 只降级严重性,**不跳过**它。
  */
 
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative, sep, basename, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -277,464 +278,165 @@ let typecheckMeasured: { errors: number; fingerprints: number } | null = null;
 /** 未决台账:总 / 未关闭 / 阻塞 / 已关闭(`backlog.ts` 口径)。`null` = 未跑。 */
 let backlogMeasured: { total: number; open: number; blocking: number; closed: number } | null = null;
 
-/**
- * 校验 README 的数字 —— **统一一次**,在最末尾调用。
- * (HANDOVER §三 基线表用**同一台**校验器,见 `verifyHandoverNumbers`。)
- *
- * 为什么不在各节就地校验:见上面「值的生命周期问题」。
- */
-/** `makeNumberCheck` 的选项。 */
-interface NumberCheckOpts {
-  label: string;
-  re: RegExp;
-  actual: number | string | null;
-  /** 把文档捕获组转成与 `actual` 同类型的期望值(两侧一起验时用)。 */
-  wanted?: (m: RegExpExecArray) => string;
-}
+/* ═══════════ 文档数字:比对只有一份实现(`scripts/sync-docs.ts`) ═══════════ */
 
 /**
- * 造一台「恰好 1 处」的数字校验器 —— **README 与 HANDOVER 共用这一份实现**。
+ * 本节此前是四个函数:`makeNumberCheck` / `verifyReadmeNumbers` /
+ * `verifyHandoverNumbers` / `verifyHandoverHashes` —— 逐项比对
+ * 「README / HANDOVER 里**手写的**数字」vs「本文件实测」。
  *
- * ⚠️ 为什么必须是工厂,而不是两份:本仓对「同一判据两份实现」有明确判据
- *   (两份迟早分叉,且分叉之后**没有任何断言**会发现)。README 与 HANDOVER 的
- *   两张表是同一种东西 —— **文档里手写的自称** —— 校验逻辑没有一处需要不同,
- *   差异只有「哪个文件」与「失败措辞」两件,那正是参数。
+ * 它确实抓得到漂移,但**结构上仍在鼓励手抄**:每加一个套件,人还是得去改文档,
+ * 只是改错了会被红一次。八轮里这批数字被重钉过 **5 次**,全部由手抄引起。
+ * ⇒ 判据:**「抄错会被发现」不等于「不用抄」**;要消灭的是手抄这个动作本身。
  *
- * `actual === null` ⇒ 本次运行没算出 ⇒ **跳过并打印原因**(不是静默,也不是 NaN)。
- *   ★ 本仓既定做法:静默跳过会变成"静默绿",NaN 会变成"永远红" —— 只有"跳过且说出来"对。
- * `actual === undefined` ⇒ 我**接错了变量** ⇒ 必须红(这是我们自己的 bug)。
+ * 现在:
+ *   · 比对与写回**只有一份实现**:`scripts/sync-docs.ts`
+ *     (`--check` 只回答「会不会变」,`--write` 现算现写,幂等);
+ *   · 本文件只做两件事 —— 把已经算好的那批数交出去(JSON 快照),
+ *     再把它的结论搬进 pass/fail。不一致时它的报错**直接给出应写的值**,
+ *     并提示跑 `node scripts/sync-docs.ts --write`。
+ *
+ * ⚠️ 为什么给快照,而不是让它自己再跑一次门禁:那会**递归**
+ *    (本文件 → 它 → `verify --all` → 本文件 …),并把全量口径的 3~4 分钟翻倍。
+ * ⚠️ 快照里的 `null` 语义与原来逐字一致:**本次没测到 ⇒ 那边记「未校验」**——
+ *    不是 0(当 0 比会假红),也不是通过(那是静默绿)。
  */
-function makeNumberCheck(file: string, docLabel: string, text: string): (opts: NumberCheckOpts) => void {
-  return (opts: NumberCheckOpts): void => {
-    if (opts.actual === null) {
-      console.log(`      · 本次未算出「${opts.label}」⇒ ${docLabel} 该项**未校验**(不是通过)`);
-      return;
-    }
-    const all = [...text.matchAll(new RegExp(opts.re.source, opts.re.flags.includes('g') ? opts.re.flags : `${opts.re.flags}g`))];
-    if (all.length > 1) {
-      /* 影子行:只校验首处会让其余永远读不到(本仓实测过三种藏法) */
-      fail(`${file} 里出现 ${all.length} 处「${opts.label}」—— 只校验首处会让其余成为影子行`);
-      return;
-    }
-    if (all.length === 0) {
-      fail(`${file} 里找不到「${opts.label}」—— 无法校验(改了措辞就要同步改本门禁)`);
-      return;
-    }
-    const m = all[0]!;
-    const got = opts.wanted !== undefined ? opts.wanted(m) : m[1]!;
-    const want = String(opts.actual);
-    if (got !== want) {
-      fail(`${docLabel} 声称「${opts.label}」为 ${got},实测 ${want} —— 应更新 ${docLabel}`);
-    } else {
-      pass(`${docLabel} ${opts.label}与实测一致(${want})`);
-    }
+
+/** PROGRESS 陷阱台账的统计(HANDOVER §三 那一行要它;纯静态,不依赖任何 producer)。 */
+function progressNumbers(): Record<string, unknown> | null {
+  const p = join(ROOT, 'docs', 'PROGRESS.md');
+  if (!existsSync(p)) return null;
+  const buf = readFileSync(p);
+  const text = buf.toString('utf8');
+  const traps = [...text.matchAll(/^##\s+[^、\n]*、陷阱\s+(\d+)/gm)].map((m) => Number(m[1]));
+  const first = traps[0];
+  const last = traps[traps.length - 1];
+  if (first === undefined || last === undefined) return null;
+  return {
+    sections: traps.length,
+    first,
+    last,
+    increasing: traps.every((v, i) => i === 0 || v > traps[i - 1]!),
+    noGap: traps.every((v, i) => i === 0 || v === traps[i - 1]! + 1),
+    hasBom: buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF,
+    bytes: buf.length,
   };
 }
 
-function verifyReadmeNumbers(): void {
-  const readmeText = readFileSync(join(ROOT, 'README.md'), 'utf8');
-  const check = makeNumberCheck('README.md', 'README', readmeText);
-
-  /* ── 1 WS 文档结构 N/N ──
-     README:`WS 文档结构     12/12 ✅(每份 10 节、≥2000 字符)`
-     两侧都是「文档份数」(与测试集合一一对应),故 N/N 两个数相等。
-     ⚠️ 只取前一个 N 比较;若 README 写成 12/13,那是它自己不自洽 —— 也报。 */
-  check({
-    label: 'WS 文档结构',
-    re: /WS 文档结构\s+(\d+)\s*\/\s*(\d+)/,
-    actual: docStructCount,
-    wanted: (m) => {
-      /* 两个数必须相等(它们本就指同一件事);不等则原样返回以触发失败 */
-      return m[1] === m[2] ? m[1]! : `${m[1]}/${m[2]}`;
+/**
+ * 交给 `sync-docs.ts` 的测量快照。字段名与那边的 `Numbers` 一一对应。
+ * ⚠️ 这里**只搬运**本文件各 producer 已经算出的值,**不重算** ——
+ *    重算就是第二份测量实现,而两份实现迟早分叉(本仓反复踩过)。
+ */
+function docNumbersSnapshot(): Record<string, unknown> {
+  const wl = whitelistBreakdown();
+  return {
+    docStruct: docStructCount,
+    fingerprint: contentFingerprint,
+    freeIds: contentFreeCount,
+    strippableDirs: strippableDirCount,
+    decoratorExempt: decoratorExemptCount,
+    inert: inertRegisteredCount === null || inertEmptySuccessCount === null
+      ? null
+      : { registered: inertRegisteredCount, emptySuccess: inertEmptySuccessCount },
+    trustFromClient: trustFromClientCount,
+    /* ⚠️ 字段名必须**显式映射**:`suiteSummary` 里是 `mainTotal/mainSuites`,
+       `sync-docs.ts` 的 `Numbers.suites` 里是 `wsTotal/wsSuites`。
+       直接传对象 ⇒ 那两个键是 `undefined` ⇒ 那边记「未校验」而**不报错**
+       (实测踩过:README「WS 编号套件」+ HANDOVER「§三 用例」两栏静默变成未校验)。
+       ⇒ 跨模块搬运的一份数据,必须逐字段写出来,不许整对象透传。 */
+    suites: suiteSummary === null
+      ? null
+      : {
+        total: suiteSummary.total,
+        suites: suiteSummary.suites,
+        wsTotal: suiteSummary.mainTotal,
+        wsSuites: suiteSummary.mainSuites,
+        fndTotal: suiteSummary.fndTotal,
+        fndSuites: suiteSummary.fndSuites,
+      },
+    selfcheck: selfcheckCounts,
+    crossWs: crossWsPassedCount,
+    frozen: frozenInvariantMeasured,
+    /* `-1` 是「没测过」的哨兵(初值),不是可达数 —— 必须转成 null。 */
+    reach: reachProdReachable < 0 || reachProdTotal < 0
+      ? null
+      : {
+        reachable: reachProdReachable,
+        total: reachProdTotal,
+        unreachable: reachProdTotal - reachProdReachable,
+        whitelist: UNREACHABLE_EXEMPT.size,
+      },
+    debt: {
+      clientShell: wl.clientShell,
+      wiring: wl.wiring,
+      mechanism: wl.mechanism,
+      clientMech: wl.clientMech,
+      dependency: wl.dependency,
+      decision: wl.decision,
+      other: wl.other,
     },
-  });
-
-  /* ── 2 内容基线锁指纹 ──
-     README:`内容基线锁     一致  ✅(指纹 v1-eaefa38b · 引用闭合 · 可用号 3775)`
-     ⚠️ 实测输出是 `内容与基线一致(v1-eaefa38b)` —— **没有"指纹"二字**。
-        故这里锚 README 里的 `指纹 vN-xxxxxxxx` 形态,而不是锚 verify 的输出。 */
-  check({
-    label: '内容基线锁指纹',
-    re: /内容基线锁[\s\S]{0,40}?指纹\s*(v\d+-[0-9a-f]{8})/,
-    actual: contentFingerprint,
-  });
-
-  /* ── 3 可用号 N ── */
-  check({
-    label: '可用号',
-    re: /内容基线锁[\s\S]{0,120}?可用号\s*(\d+)/,
-    actual: contentFreeCount,
-  });
-
-  /* ── 4 可擦除语法:N 个目录 ──
-     README:`可擦除语法      全仓 ✅(5 个目录:enum / ...)` */
-  check({
-    label: '可擦除语法目录数',
-    re: /可擦除语法[^\n]*?(\d+)\s*个目录/,
-    actual: strippableDirCount,
-  });
-
-  /* ── 5 装饰器例外 N 处 ── */
-  check({
-    label: '装饰器例外条数',
-    re: /装饰器例外\s*(\d+)\s*处/,
-    actual: decoratorExemptCount,
-  });
-
-  /* ── 10 首段「N 份文档结构」 ──
-     ★ 与 HANDOVER §一 同一教训:README **首段**也在自称,而它此前没人比过 ——
-       实测它漂成过 `12`(真值 `14`)。 */
-  check({
-    label: '首段文档结构份数',
-    re: /冻结不变量 \+ (\d+) 份文档结构/,
-    actual: docStructCount,
-  });
-
-/* ── 6 入口执行层:N 个已登记 / M 个成功路径为空 ──
-   README:`入口执行层      1 个 ✅(**成功路径为空 0 个**)`
-   ⚠️ 两个数**互相约束**(登记数 ≥ 空路径数),故一次全验 —— 与上面非欠账条数同一手法。
-   ★ 2026-11-14 接入:这两个数此前是手写、无人比对的,已陈旧过。 */
-check({
-  label: '入口执行层登记数',
-  re: /入口执行层\s+(\d+)\s*个[\s\S]{0,24}?成功路径为空\s*(\d+)\s*个/,
-  actual: inertRegisteredCount === null || inertEmptySuccessCount === null
-    ? null
-    : `${inertRegisteredCount}/${inertEmptySuccessCount}`,
-  wanted: (m) => `${m[1]}/${m[2]}`,
-});
-
-/* ── 7 信任边界:实测「取自客户端」的处数 ──
-   README:`信任边界        **取自客户端 0 处** ✅(受管字段 3 个 / 汇点 1 个 ...)`
-   ⚠️ 锚的是「取自客户端 N 处」而**不是**「受管字段 N 个」——
-      这两个量曾被混用,而那正是 README 长期陈旧的原因。 */
-check({
-  label: '信任边界取自客户端处数',
-  re: /信任边界[^\n]*?取自客户端\s*(\d+)\s*处/,
-  actual: trustFromClientCount,
-});
-
-  /* ── 8 非欠账条数 ──
-     README:`**15 条中 12 条是欠账**(...),另 **3 条非欠账**。`
-     ⚠️ 三个数**互相约束**:15 - 12 = 3。故一次全验,而不是只验"3"。 */
-  if (nonDebtCount === null) {
-    console.log('      · 本次未算出「非欠账条数」⇒ README 该项**未校验**(不是通过)');
-  } else {
-    const m = /(\d+)\s*条中\s*(\d+)\s*条是欠账[\s\S]{0,40}?另\s*(?:\*\*)?\s*(\d+)\s*(?:\*\*)?\s*条非欠账/.exec(readmeText);
-    if (m === null) {
-      fail('README.md 里找不到「N 条中 M 条是欠账,另 K 条非欠账」—— 无法校验非欠账口径');
-    } else {
-      const total = Number(m[1]);
-      const debt = Number(m[2]);
-      const nd = Number(m[3]);
-      if (nd !== nonDebtCount) {
-        fail(`README 声称「另 ${nd} 条非欠账」,实测 ${nonDebtCount} 条 —— 应更新 README`);
-      } else if (total - debt !== nd) {
-        /* 内部不自洽:总量对不推出分部对(陷阱 67),这里反过来查它自己 */
-        fail(`README 的「${total} 条中 ${debt} 条是欠账 / 另 ${nd} 条非欠账」自身不自洽(差 ${total - debt - nd})`);
-      } else {
-        pass(`README 非欠账条数与实测一致(${nd} 条;${total} 条中 ${debt} 条欠账)`);
-      }
-    }
-  }
-
-  /* ── 9 用例汇总(四项:总条数 / 总套件 / WS 小计 / 基座小计) ──
-     README:
-       测试执行        21/21 ✅  共 1382 个用例
-         ├─ WS 编号套件          922 条 / 12 套件
-         └─ 基座(FND-01..09)     460 条 / 9 套件
-     ⚠️ **四项必须一起验**:只验总数会漏"分部错但合计对"(陷阱 67)。
-     ⚠️ 且**自洽**要单独查:922+460=1382、12+9=21 —— 这是 README 内部的恒等式,
-        与实测值无关。两者都查,才能分清"README 抄错了"与"实测变了"。 */
-  if (suiteSummary === null) {
-    console.log('      · 本次未跑全量测试 ⇒ README「测试执行 / 编号套件 / 基座」**未校验**(不是通过)');
-    return;
-  }
-  const s = suiteSummary;
-  /* 只在**全量**模式下校验:--only 时 sumTotal 只是那一个套件的数,
-     拿它比 README 的全量数字必然假红。 */
-  if (suiteHadFailure) {
-    console.log(
-      '      · 本次有测试套件失败(断言数不计入汇总)⇒ README「测试执行 / 编号套件 / 基座」'
-      + '**未校验**(不是通过;README 可能仍是对的 —— 先让套件全绿再看这一栏)',
-    );
-    return;
-  }
-  if (!fullRun) {
-    console.log(`      · --only ${String(only)} ⇒ README 用例汇总**未校验**(只跑了部分套件)`);
-    return;
-  }
-  const mExec = /测试执行\s+(\d+)\s*\/\s*(\d+)[^\n]*?共\s*(\d+)\s*个用例/.exec(readmeText);
-  const mMain = /WS 编号套件\s*(\d+)\s*条\s*\/\s*(\d+)\s*套件/.exec(readmeText);
-  const mFnd = /基座[^\n]*?(\d+)\s*条\s*\/\s*(\d+)\s*套件/.exec(readmeText);
-  const bad: string[] = [];
-  if (mExec === null) bad.push('找不到「测试执行 N/N ... 共 M 个用例」');
-  else if (Number(mExec[3]) !== s.total) bad.push(`共 ${mExec[3]} 个用例,实测 ${s.total}`);
-  else if (Number(mExec[1]) !== s.suites || Number(mExec[2]) !== s.suites) {
-    bad.push(`测试执行 ${mExec[1]}/${mExec[2]} 套件,实测 ${s.suites}/${s.suites}`);
-  }
-  if (mMain === null) bad.push('找不到「WS 编号套件 N 条 / M 套件」');
-  else if (Number(mMain[1]) !== s.mainTotal || Number(mMain[2]) !== s.mainSuites) {
-    bad.push(`WS 编号套件 ${mMain[1]} 条 / ${mMain[2]} 套件,实测 ${s.mainTotal} / ${s.mainSuites}`);
-  }
-  if (mFnd === null) bad.push('找不到「基座 ... N 条 / M 套件」');
-  else if (Number(mFnd[1]) !== s.fndTotal || Number(mFnd[2]) !== s.fndSuites) {
-    bad.push(`基座 ${mFnd[1]} 条 / ${mFnd[2]} 套件,实测 ${s.fndTotal} / ${s.fndSuites}`);
-  }
-  if (bad.length > 0) {
-    fail(`README 用例汇总过期:${bad.join(';')} —— 应更新 README`);
-  } else {
-    pass(`README 用例汇总与实测一致(${s.total} 个用例 / ${s.suites} 套件;WS ${s.mainTotal} 条 / 基座 ${s.fndTotal} 条)`);
-  }
+    nonDebt: wl.nonDebt,
+    diffSet: wl.diffSet.length,
+    ledger: backlogMeasured,
+    taut: tautMeasured,
+    typecheck: typecheckMeasured,
+    progress: progressNumbers(),
+  };
 }
 
 /**
- * 校验 `docs/HANDOVER.md` §三「当前基线(逐项实测)」那张表的 9 行数字。
+ * 文档数字的**唯一**比对入口(README 与 HANDOVER 一起,含 §九 哈希表)。
  *
- * ## 为什么需要
- *
- * 那张表此前**一个数都没有门禁**(全仓对 `HANDOVER.md` 的唯一引用是本文件的
- * `verifyHandoverHashes`,只管 §九 的哈希表)。2026-11-14 外部审计第二次抓到
- * 同一类陈旧:`1526 条 / 28 套件`(实测 1533/29)、`265 条 / 指纹 131`(实测 261/129)、
- * `47 节 / 94..140 / 453550 字节`(实测 51 节 / 94..144 / 463346 字节)—— 三行全过期。
- * ⇒ 手抄的数字**不会因为被抄进表里就变成事实**;它只会变成"看起来像事实"。
- *
- * ## 与 README 那台的关系
- *
- * 校验器是**同一个**`makeNumberCheck`(见其注释:两份实现迟早分叉)。
- * 这一组测量值(`selfcheckCounts` / `crossWsPassedCount` / `frozenInvariantMeasured` /
- * `tautMeasured` / `typecheckMeasured` / `backlogMeasured`)是**为这张表新发布**的 ——
- * 它们此前有的只在局部变量里活过一次 `console.log`。
- *   ★ 教训同「打印 ≠ 校验」:一个数被打印出来只证明它被算过,不证明有人看着它。
- *
- * ## 跳过语义
- *
- * 调用点排在**所有 producer 之后**(`--docs` 等局部口径里多数测量值为 `null`)
- * ⇒ 那些行打印「**未校验**(不是通过)」,与 README 那台逐字一致。
+ * 失败信息必须**直接可执行**:它包含 sync-docs 给出的「应写值」与修复命令,
+ * 而不是只报「文档陈旧」(那样读者还得自己去算)。
  */
-function verifyHandoverNumbers(): void {
-  const docText = readFileSync(join(ROOT, 'docs', 'HANDOVER.md'), 'utf8');
-  const check = makeNumberCheck('docs/HANDOVER.md', 'HANDOVER', docText);
-
-  /* ── 1 用例(四个数:总条数 / 总套件;行内还写着 WS 与基座的小计,但那是同一份
-     `suiteSummary` 的另外两个字段,故一并验 —— 只验总数会漏「分部错但合计对」)。 ── */
-  const s = suiteSummary;
-  check({
-    label: '用例',
-    re: /^\| 用例 \| \*\*(\d+) 条 \/ (\d+) 套件\*\* \| WS (\d+) 条 \/ (\d+) 套件 · 基座 FND (\d+) 条 \/ (\d+) 套件/m,
-    actual: s === null
-      ? null
-      : `${s.total}/${s.suites}/${s.mainTotal}/${s.mainSuites}/${s.fndTotal}/${s.fndSuites}`,
-    wanted: (m) => `${m[1]}/${m[2]}/${m[3]}/${m[4]}/${m[5]}/${m[6]}`,
-  });
-
-  /* ── 2 门禁自检 N/M ── */
-  check({
-    label: '门禁自检',
-    re: /^\| 门禁自检 \| \*\*(\d+)\/(\d+)\*\*/m,
-    actual: selfcheckCounts === null ? null : `${selfcheckCounts.passed}/${selfcheckCounts.total}`,
-    wanted: (m) => `${m[1]}/${m[2]}`,
-  });
-
-  /* ── 3 跨 WS 集成 N/N ──
-     两侧都是「本节点数」,故必须相等;写成 N/M 且不等 ⇒ 它自己不自洽 ⇒ 也报。 */
-  check({
-    label: '跨 WS 集成',
-    re: /^\| 跨 WS 集成 \| (\d+)\/(\d+)/m,
-    actual: crossWsPassedCount,
-    wanted: (m) => (m[1] === m[2] ? m[1]! : `${m[1]}/${m[2]}`),
-  });
-
-  /* ── 4 冻结层不变量 N ── */
-  check({
-    label: '冻结层不变量',
-    re: /^\| 冻结层不变量 \| (\d+) \|/m,
-    actual: frozenInvariantMeasured,
-  });
-
-  /* ── 5 生产可达性 A / B ── */
-  check({
-    label: '生产可达性',
-    re: /^\| 生产可达性 \| \*\*(\d+) \/ (\d+)\*\*/m,
-    /* ⚠️ `-1` 是「没测过」的哨兵(初值 `-1`,不是 0)⇒ 必须当成未校验,
-       否则在不跑可达性的口径里会报假红「声称 88/98,实测 -1/-1」。 */
-    actual: reachProdReachable < 0 || reachProdTotal < 0
-      ? null
-      : `${reachProdReachable}/${reachProdTotal}`,
-    wanted: (m) => `${m[1]}/${m[2]}`,
-  });
-
-  /* ── 6 同义反复候选:N 条(白名单 M) ── */
-  check({
-    label: '同义反复候选',
-    re: /^\| 同义反复候选 \| \*\*(\d+) 条\*\*\(白名单 (\d+)\)/m,
-    actual: tautMeasured === null ? null : `${tautMeasured.hit}/${tautMeasured.whitelist}`,
-    wanted: (m) => `${m[1]}/${m[2]}`,
-  });
-
-  /* ── 7 类型检查基线:N 条 / 指纹 M ── */
-  check({
-    label: '类型检查基线',
-    re: /^\| 类型检查基线 \| \*\*(\d+) 条 \/ 指纹 (\d+)\*\*/m,
-    actual: typecheckMeasured === null
-      ? null
-      : `${typecheckMeasured.errors}/${typecheckMeasured.fingerprints}`,
-    wanted: (m) => `${m[1]}/${m[2]}`,
-  });
-
-  /* ── 8 未决台账:总 / 未关闭 / 阻塞 / 已关闭(四个数互相约束,一次全验) ── */
-  check({
-    label: '未决台账',
-    re: /^\| 未决台账 \| \*\*(\d+) 条\*\*\((\d+) 未关闭 \/ \*\*(\d+) 阻塞\*\* \/ (\d+) 已关闭\)/m,
-    actual: backlogMeasured === null
-      ? null
-      : `${backlogMeasured.total}/${backlogMeasured.open}`
-        + `/${backlogMeasured.blocking}/${backlogMeasured.closed}`,
-    wanted: (m) => `${m[1]}/${m[2]}/${m[3]}/${m[4]}`,
-  });
-
-  /* ── 9 PROGRESS 陷阱:4 个数 + 3 个 ✓ 一次全验 ──
-     ⚠️ 那三个 ✓ 此前是**手打的字符**,不是算出来的。这里改成**算出来再比** ——
-        否则「无缺号 ✓」只是一句自我评价。 */
-  const progressPath = join(ROOT, 'docs', 'PROGRESS.md');
-  let progressActual: string | null = null;
-  if (existsSync(progressPath)) {
-    const buf = readFileSync(progressPath);
-    const traps = [...buf.toString('utf8').matchAll(/^##\s+[^、\n]*、陷阱\s+(\d+)/gm)]
-      .map((mm) => Number(mm[1]));
-    const first = traps[0];
-    const last = traps[traps.length - 1];
-    if (first !== undefined && last !== undefined) {
-      const increasing = traps.every((v, i) => i === 0 || v > traps[i - 1]!);
-      const noGap = traps.every((v, i) => i === 0 || v === traps[i - 1]! + 1);
-      const hasBom = buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF;
-      progressActual = `${traps.length} 节 / ${first}..${last}`
-        + ` | 严格递增 ${increasing ? '✓' : '✗'}`
-        + ` / 无缺号 ${noGap ? '✓' : '✗'}`
-        + ` / 无 BOM ${hasBom ? '✗' : '✓'}`
-        + ` / ${buf.length} 字节`;
-    }
+function verifyDocsNumbers(): void {
+  const script = join(ROOT, 'scripts', 'sync-docs.ts');
+  if (!existsSync(script)) {
+    fail('scripts/sync-docs.ts 不存在 —— 文档数字的唯一实现缺失(不许静默跳过)');
+    return;
   }
-  check({
-    label: 'PROGRESS 陷阱',
-    re: /^\| PROGRESS 陷阱 \| \*\*([^*]+)\*\* \| ([^|]+) \|/m,
-    actual: progressActual,
-    wanted: (m) => `${(m[1] ?? '').trim()} | ${(m[2] ?? '').trim()}`,
-  });
-
-  /* ── 10 §一「这个项目是什么」表:生产 .ts 合计 / 套件数 / 装饰器例外 ──
-     ★ 2026-11-14(外部审计第二轮):§三 接进门禁之后,§一 那几行**仍然是手写的**,
-       于是同一轮里一起漂了:生产 .ts `98 → 100`、套件 `28 → 32`、
-       装饰器例外「1 处」→ `0`。
-     ⇒ 教训与 §三 那次**完全相同**:只给一张表接门禁,等于把"没人管"的标签留给了别的表。 */
-  check({
-    label: '生产 .ts 合计',
-    re: /⇒ \*\*生产 \.ts 合计 (\d+)\*\*/m,
-    actual: reachProdTotal < 0 ? null : reachProdTotal,
-  });
-  check({
-    label: '测试套件数',
-    re: /^\| 测试 \| `tests\/\*\.test\.ts` \*\*(\d+)\*\* 个套件/m,
-    actual: suiteSummary === null ? null : suiteSummary.suites,
-  });
-  check({
-    label: '装饰器例外条数',
-    re: /装饰器例外 \*\*(\d+)\*\* 处/m,
-    actual: decoratorExemptCount,
-  });
+  const tmp = join(tmpdir(), `sync-docs-measure-${process.pid}-${Date.now()}.json`);
+  writeFileSync(tmp, JSON.stringify(docNumbersSnapshot()), 'utf8');
+  try {
+    const r = spawnSync(process.execPath, [script, '--check', `--measure=${tmp}`], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 300_000,
+    });
+    reportSyncDocsOutcome(r);
+  } finally {
+    /* 快照是中间物:无论成功失败都删掉(同一进程里跑多次也不会堆积)。 */
+    rmSync(tmp, { force: true });
+  }
 }
 
-/**
- * 校验 `docs/HANDOVER.md` §九「查验本文是否被篡改」那张 sha256 表的**自洽性**。
- *
- * 为什么需要:那张表的用途是让接手者判断「文档是否被人改过」——
- * 而它自己有 **7 个手写哈希,一个都没被任何脚本比过**(实测:全仓 `sha256 前 12`
- * 只出现在 HANDOVER 自己,没有第二个消费者)。
- * ⇒ 一张不校验的校验表**比没有这张表更坏**:它把「没查」伪装成「查过了」,
- *   而且**必然**会随着每一次文档改动而腐烂 —— 腐烂后照它查验,
- *   得到的结论恰恰是它要防的那个(「文档已被篡改」)。
- *
- * 口径(实测确认,不是猜的):**LF 归一后的字节 sha256 前 12 位**
- *  = 索引 blob 的字节(本仓无 `.gitattributes`,且 `core.autocrlf=true` ⇒ 索引恒为 LF)。
- *  ⚠️ **不要**改回「工作区原始字节」:实测本机工作区是「3 个 CRLF + 4 个 LF」的**混合**状态,
- *     而 `core.autocrlf=true` 会让**新克隆把全部文件检出成 CRLF** ⇒ 照原始字节记录的值
- *     在新克隆上对 4 个文件**全部误报**(这张表原本就是这么烂的:7 个值里有 3 个
- *     只在本机工作区成立)。归一化之后,记录值与检出设置无关。
- *     ★ 实测依据:6 个未改动文件的「LF 归一」哈希与 `git cat-file blob HEAD:<path>`
- *       **逐位相同**(7 个里第 7 个是 README,只因它本轮被改过而不同)。
- *  ⚠️ `HANDOVER.md` **不进表**(它自己在表下注释里写明了原因:自己是校验对象)。
- *     本检查据此断言它**不在**表里,防止有人"顺手补全"造出一个自指的表。
- */
-function verifyHandoverHashes(): void {
-  const text = readFileSync(join(ROOT, 'docs', 'HANDOVER.md'), 'utf8');
+/** 把 `sync-docs --check` 的结局分派成 pass / fail(含「未跑成」这一态)。 */
+function reportSyncDocsOutcome(r: ReturnType<typeof spawnSync>): void {
+  const status = r.status;
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
+  const shown = out.split('\n').map((l) => `      ${l.trim()}`).join('\n');
 
-  /* 表行形态(实测:该文件里只有这 7 行符合,零误匹配 —— 故可直接全文件扫):
-       `cd57ee031c19  README.md`
-       `8009b71b0684  docs/PROGRESS.md`  */
-  /* ★ 哈希算在「LF 归一」后的字节上 —— 口径及其实测理由见上面函数注释。 */
-  const normHash = (p: string): string =>
-    createHash('sha256')
-      .update(Buffer.from(readFileSync(p, 'utf8').replace(/\r\n/g, '\n'), 'utf8'))
-      .digest('hex')
-      .slice(0, 12);
-
-  const rows = [...text.matchAll(/^([0-9a-f]{12})[ \t]+(\S+\.md)[ \t]*$/gm)]
-    .map((m) => ({ hash: m[1]!, file: m[2]! }));
-
-  if (rows.length === 0) {
-    fail('docs/HANDOVER.md 里找不到 sha256 表 —— 表被删了?(本检查锚「12 位十六进制 + .md」的行)');
-    return;
-  }
-
-  /* ★ 期望集合**写死在这里**,而不是「表里有什么就查什么」。
-     否则删掉一行 = 少查一个文件 = **静默通过**(本仓「删断言式作弊」的老坑)。 */
-  const EXPECTED = [
-    'README.md',
-    'docs/PROGRESS.md',
-    'docs/LEAD-PLAN.md',
-    'docs/ARCH-GAPS.md',
-    'docs/CHANGE_REQUESTS.md',
-    'docs/COMPLETION-CRITERIA.md',
-    'docs/TASK-83-wasd-three-options.md',
-  ];
-
-  const structural: string[] = [];
-  const seen = new Set<string>();
-  for (const r of rows) {
-    if (seen.has(r.file)) structural.push(`表里出现重复行:${r.file}`);
-    seen.add(r.file);
-  }
-  for (const f of EXPECTED) {
-    if (!seen.has(f)) structural.push(`表里缺行:${f}(删行就能让本检查变绿 ⇒ 必须显式补齐)`);
-  }
-  for (const f of seen) {
-    if (!EXPECTED.includes(f)) structural.push(`表里有未预期行:${f}(加文件要同步改本检查的 EXPECTED)`);
-  }
-  if (seen.has('docs/HANDOVER.md')) {
-    structural.push('HANDOVER.md 自己进了哈希表 —— 自校验不可能(表下注释已写明)');
-  }
-
-  const mismatched: string[] = [];
-  for (const r of rows) {
-    const p = join(ROOT, r.file);
-    if (!existsSync(p)) {
-      mismatched.push(`${r.file} 不存在`);
-      continue;
-    }
-    const actual = normHash(p);
-    if (actual !== r.hash) mismatched.push(`${r.file}:表 ${r.hash} / 实测 ${actual}`);
-  }
-
-  if (structural.length === 0 && mismatched.length === 0) {
-    pass(`docs/HANDOVER.md sha256 表自洽(${rows.length} 个文件,LF 归一 = 索引 blob 口径)`);
-    return;
-  }
-  if (structural.length > 0) fail(`docs/HANDOVER.md sha256 表结构异常:${structural.join(';')}`);
-  if (mismatched.length > 0) {
+  if (status === null) {
     fail(
-      `docs/HANDOVER.md sha256 表与实测不符:${mismatched.join(';')}`
-      + ' —— 照这张表查验会误判「文档已被篡改」;应重算并更新(LF 归一 sha256 前 12 位)'
+      'scripts/sync-docs.ts 未能跑完 ⇒ 文档数字**未校验**'
+      + `(${r.error?.message ?? '未知原因'})`,
     );
+    return;
   }
+  if (status !== 0) {
+    fail(`README.md / docs/HANDOVER.md 的数字与实测不一致(sync-docs 给出应写值):\n${shown}`);
+    return;
+  }
+  /* 「未校验」的行必须进输出:它在语义上不是「比对通过」,而是「没比对」。
+     静默丢掉它 = 把「没查」伪装成「查过了」。 */
+  for (const l of out.split('\n')) {
+    if (l.includes('未校验')) console.log(`      ${l.trim()}`);
+  }
+  const last = out.split('\n').filter((l) => l.trim() !== '').pop() ?? '';
+  pass(`文档数字与实测一致(sync-docs --check:${last.replace(/^\s*[✓·]\s*/, '').trim()})`);
 }
 
 /**
@@ -4595,7 +4297,7 @@ export function bothSidesStructuredVerdict(count: number, lenient: boolean): Bot
  *
  * 每一条都写明两侧文件与两侧为什么口径不同;名字相同只是入口。
  * 每一条都写明两侧文件与两侧为什么口径不同;名字相同只是入口。
- * 这 8 条都是**跨层镜像**(服务端/客户端/shared 各一份),本仓禁改生产三层的
+ * 这 7 条都是**跨层镜像**(服务端/客户端/shared 各一份),本仓禁改生产三层的
  * 前提下不能合并来源 ⇒ 按 owner 口径「能合并就合并,不能合并的逐条登记理由」处理。
  */
 export const BOTH_SIDES_STRUCTURED_REGISTERED: ReadonlyMap<string, string> = new Map<string, string>([
@@ -4611,9 +4313,6 @@ export const BOTH_SIDES_STRUCTURED_REGISTERED: ReadonlyMap<string, string> = new
     + '(`def/castCd/stunnedSec/shieldHp/clones/...`),`shared/types/wire.ts` 的是'
     + '**下行电报的线格式**(只带 `telegraph*`/`phase/hp/maxHp` 这类订阅者需要的字段)。'
     + '线格式刻意是运行时的**子集投影**;搬进 shared 会让服务端内部状态成为冻结层契约 ⇒ 有意镜像。'],
-  ['DYE_PALETTE_SIZE', '服务端 `party/scoring.ts` 用字面量 `32`(染色计分槽数),'
-    + '客户端 `stage/dye_overlay.ts` 由 `DYE_PALETTE.length` 派生(调色板数组是客户端的视觉来源)。'
-    + '服务端没有那张数组、也不该有(视觉资产不进服务端)⇒ 两处必然各有一份 ⇒ 有意镜像。'],
   ['EncodeStats', '**同名异义**:`server/src/build/blueprint.ts` 的 `{code,bytes,runs,ratio}` 是'
     + '蓝图文本压缩的构建期度量;`shared/net/delta.ts` 的 `{changedFields,removed,bytes}` 是'
     + '网络增量编码的度量。两者只是名字撞了,语义与字段都不同 ⇒ 有意同名,不是同一份。'],
@@ -8195,20 +7894,11 @@ if (!frozenOnly && !only && !contentOnly) checkDocs();
 if (!frozenOnly && !docsOnly && !integrationOnly) await checkContent();
 if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
 
-/* ★ task B:统一校验 README 里那些「已经算好、已经打印、却从没人比过」的数。
-   ⚠️ 必须在**所有**producer 之后调用 —— 它读的是那 5 个模块级变量,
-      那些变量由 runTests / checkDocs / checkContent / checkStrippable /
-      checkReachability 填充。放前面会读到 null ⇒ 全部跳过(静默变摆设)。
-   ⚠️ `--only` 时跳过:`--only WS-XX` 的语义是"只查那个套件",
-      而 README 的数字都是**全量**口径 ⇒ 比了必然假红。 */
-if (!frozenOnly && !only) verifyReadmeNumbers();
-
-/* ★ 2026-11-14(接手者):HANDOVER §九 的 sha256 表接链。与上面两道同性质 ——
-   「文档里手写的、看起来像校验的」数字 vs 「脚本能算出的正解」。
-   同样只在 `!frozenOnly && !only` 时跑(它比的是**全量**口径的文档,局部口径里报它会误导)。
-   ⚠️ 这里**不排除 `--docs`**:`--docs` 的语义是「只检查文档」,
-      而这张表正是文档的一部分 —— 排除它等于让 `--docs` 漏掉一个必红的项。 */
-if (!frozenOnly && !only) verifyHandoverHashes();
+/* ★ 2026-11-19(第八轮):README / HANDOVER 的数字**不再在这里逐项比对** ——
+   比对与写回已整体搬到 `scripts/sync-docs.ts`(唯一实现)。
+   调用点在**所有 producer 之后**(见下方 `verifyDocsNumbers()`),理由与原来相同:
+   那些数字来自 runTests / checkDocs / checkContent / checkStrippable /
+   checkReachability / checkGateSelfcheck,放前面会读到 null(静默变摆设)。 */
 
 /* ★ 2026-11-14(接手者):计数对账接链。位置与守卫**都与 `verifyReadmeNumbers()` 对齐** ——
    两者是同一性质(「文档/注释里的自称」vs「代码算出的正解」),故:
@@ -8226,11 +7916,13 @@ if (!frozenOnly && !only) checkCountAudit();
       ⇒ 在局部口径里报它会误导(看起来像那道局部门禁出了问题)。 */
 if (!frozenOnly && !only && !docsOnly && !contentOnly && !integrationOnly) await checkGateSelfcheck();
 
-/* ★ 2026-11-14(接手者):HANDOVER §三 基线表接链。位置**必须在 `checkGateSelfcheck()` 之后** ——
-   那张表的「门禁自检 30/30」一行要用自检的结果,排在它前面会读到 `null`(静默变摆设)。
-   守卫与 `verifyReadmeNumbers()` 对齐(`--only` / `--frozen` 时跳过:局部口径里报它会误导),
-   但**不排除 `--docs`** —— 与 §九 哈希表同理,`--docs` 正是该管这两张表的模式。 */
-if (!frozenOnly && !only) verifyHandoverNumbers();
+/* ★ README / HANDOVER 的数字(**含 §九 sha256 表**)——唯一比对入口。
+   位置**必须在 `checkGateSelfcheck()` 之后**:HANDOVER「门禁自检 30/30」那一行
+   要用自检结果,排在它前面会读到 `null`(静默变摆设)。
+   守卫 `!frozenOnly && !only`:局部口径(`--only WS-XX` / `--frozen`)里这些数字
+   都是**全量**口径 ⇒ 比了必然假红。
+   ⚠️ **不排除 `--docs`**:`--docs` 的语义正是「只检查文档」,而这两张表就是文档。 */
+if (!frozenOnly && !only) verifyDocsNumbers();
 
 /* ⚠️ 汇总行必须**自报它不覆盖什么**。见 `advise()` 的定义处长注释 ——
    实测过:造一个「新增未登记的不可达模块」后,默认口径仍打「全部通过」退出码 0,

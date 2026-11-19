@@ -27,7 +27,11 @@
 
 import { dyeAttenuation } from '../../../shared/constants/dye.ts';
 
-/** 喷枪射程上界(格):作为曲线的 `range` 传入,达到即完全无效 */
+/*
+ * 喷枪射程上界(格):作为曲线的 `range` 传入,达到即完全无效。
+ * `stage/dye_overlay.ts` 的 `SPRAY_RANGE_FAR` 取的就是本值 —— 两条染色路径
+ * (「能不能染上」/「有多浓」)只有这一份射程口径。
+ */
 export const DYE_DECAY_FAR_CELLS = 30;
 
 /** 曲线源(单一事实源)。判据用它证明本文件不是另一份曲线副本 */

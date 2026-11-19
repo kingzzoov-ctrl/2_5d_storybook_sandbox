@@ -211,7 +211,6 @@ const REAL_HITS: readonly string[] = [
   'Blueprint',
   'BlueprintCell',
   'BossState',
-  'DYE_PALETTE_SIZE',
   'EncodeStats',
   'HelloFrame',
   'MoveIntent',
@@ -243,10 +242,6 @@ test('FND99-6 真实仓库:命中清单逐条锚定(文件:行 + 两侧值),合�
   }
 
   /* 逐条(取代表):两侧值必须是**原文**,不是抹掉字符串/注释后的空白。 */
-  const dye = hits.find((h) => h.name === 'DYE_PALETTE_SIZE');
-  ok(dye !== undefined, 'DYE_PALETTE_SIZE 应在清单里(server 硬编码 32 / client 由调色板长度推出)');
-  eq(fmtHit(dye as BothSidesStructuredHit),
-    'DYE_PALETTE_SIZE@server/src/party/scoring.ts:335=32 ↔ client/src/stage/dye_overlay.ts:43=DYE_PALETTE.length');
 
   const bp = hits.find((h) => h.name === 'Blueprint');
   ok(bp !== undefined, 'Blueprint 应在清单里(server 与 client 各写一份)');

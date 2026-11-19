@@ -29,9 +29,10 @@
  *
  * 没有本层时,被拒的形态是「我发了、什么都没发生」—— 而 `ws_server.onAction`
  * 其实**每一条都回执**(`OK` / `INVALID` / `PERMISSION` / `NOT_IMPLEMENTED` /
- * `ROOM_CLOSED`)。回执到了却没人读,等于没回。⇒ `describeEntryReceipt` 是那条出路:
- * **四种失败给四句不同的话**(越权 / 参数状态不对 / 这一版没做 / 房间关了),
- * 混成一句"操作失败"就等于把服务端辛苦分开的分类又丢了。
+ * `ROOM_CLOSED`,以及 WS-FND-134 新增的 `INTERNAL` = 服务端执行抛错)。
+ * 回执到了却没人读,等于没回。⇒ `describeEntryReceipt` 是那条出路:
+ * **五种失败给五句不同的话**(越权 / 参数状态不对 / 这一版没做 / 房间关了 /
+ * 服务端内部错),混成一句"操作失败"就等于把服务端辛苦分开的分类又丢了。
  *
  * ## 幂等口径(第 5 条判据:重复触发不串包)
  * ```
@@ -344,6 +345,13 @@ export function describeEntryReceipt(r: EntryReceipt): string {
       return `${what} ✗ 服务端还没有这个动作的执行层`;
     case 'ROOM_CLOSED':
       return `${what} ✗ 房间已关闭`;
+    case 'INTERNAL':
+      /* ★ WS-FND-134(P2):**内部错**必须是独立的一档 —— 修前服务端把
+         "执行抛错"回报成 `INVALID`,玩家读到的是"服务端拒绝了,但没给理由"
+         或一句参数错的话,于是"我发错了"与"服务端崩了"在现场同形。
+         ⚠️ 文案里点名"已记日志":服务端那侧确实会留痕(见 `ws_server.onAction`
+         与 `room.colyseus` 的 action-error),玩家据此可以放心报障。 */
+      return `${what} ✗ 服务端内部错误(已记日志)${r.reason === undefined ? '' : `:${r.reason}`}`;
     case 'INVALID':
       return `${what} ✗ ${r.reason ?? '服务端拒绝了,但没给理由'}`;
     default:

@@ -184,6 +184,23 @@ export const MAX_ITEM_DELTA_PER_TICK = 64;
 export const VIOLATION_SCORE_KICK = 12;
 export const VIOLATION_SCORE_DECAY_PER_TICK = 0.02;
 
+/**
+ * 房间级违规流水保留条数(**环形缓冲**,见 `AntiCheatRoom.pushViolation`)。
+ *
+ * 512 与修前的 `slice(-512)` 同值 —— 这是**保持行为不变**的一处:流水仍然只留
+ * 最近 512 条,变的只是「怎么留」(每帧重建数组 → 写一个槽)。
+ */
+export const VIOLATION_LOG_CAPACITY = 512;
+
+/**
+ * 单个玩家最多留多少条自己的违规(有界)。
+ *
+ * ⚠️ 修前 `PlayerAntiCheatState.violations` **只进不出**:一个 20Hz 长期在线的玩家
+ * 只要持续触发(哪怕只是速度抖动)就让这条数组无界增长,而它挂在房间状态里
+ * ⇒ 内存随在线时长线性涨。256 条足够回溯最近几十秒的抖动,超出即丢最旧。
+ */
+export const VIOLATION_KEEP_PER_PLAYER = 256;
+
 export const ViolationKind = {
   TELEPORT: 'TELEPORT',
   SPEED: 'SPEED',
@@ -250,6 +267,16 @@ export interface Verdict {
   /** 拒绝时给客户端的权威值(用于静默回退)。 */
   corrected?: { x: number; y: number; z: number };
   violation?: Violation;
+  /**
+   * ★ WS-FND-135(P1):这次拒绝来自**世界侧**(倒地 / 眩晕 / 被困 / 击退窗口 /
+   * 非有限值 …),不是反作弊判定。
+   *
+   * 两者都会让 `allowed === false`,但客户端的正确反应不同(前者原地不动,
+   * 后者回退到权威坐标)⇒ 必须能区分。修前世界拒收时 `applyMove` 照旧返回
+   * `allowed: true`(**谎报成功**),而反作弊窗口已被推进到那组**没落地的
+   * 幻影坐标**上 —— 下一包按幻影坐标判跳变,合法玩家被误判 TELEPORT / SPEED。
+   */
+  worldRejected?: boolean;
 }
 
 export interface AntiCheatLimits {
@@ -376,7 +403,22 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
   };
 }
 
+/**
+ * 记一条违规:入**有界**流水 + 加分(达阈值即标记踢出)。
+ *
+ * ★ WS-FND-137 P2:`s.violations` 修前**只进不出** —— 它的消费者只有诊断/断言
+ * (WS-07 读 `.length` / `.some(...)`),但数组本身挂在房间状态里,
+ * 一个反复触发抖动的在线玩家会让它随在线时长线性涨。
+ * ⇒ 现在是**有界窗口**:超过 `VIOLATION_KEEP_PER_PLAYER` 先丢最旧一条。
+ *
+ * ⚠️ 为什么用 `shift()` 而不是环形:`violations` 是**外部可读的公开字段**
+ * (`PlayerAntiCheatState` 的一部分,测试直接 `.length` / `.some(...)`),
+ * 改成环形结构会改掉它的形状。这里的量级是「违规次数」(抖动级,通常个位数),
+ * 而 `shift()` 只在**到顶之后**才发生 ⇒ 摊还成本可忽略。
+ * 房间级那条 20Hz 热路径用的是真环形(`AntiCheatRoom.pushViolation`)。
+ */
 function record(s: PlayerAntiCheatState, v: Violation): void {
+  if (s.violations.length >= VIOLATION_KEEP_PER_PLAYER) s.violations.shift();
   s.violations.push(v);
   s.score += v.weight;
   if (s.score >= VIOLATION_SCORE_KICK) s.kicked = true;
@@ -398,6 +440,63 @@ export function decayScore(s: PlayerAntiCheatState): number {
  */
 export function advanceServerClock(s: PlayerAntiCheatState, tick: number): void {
   s.lastTick = Math.max(s.lastTick, tick);
+}
+
+/* ── ★ WS-FND-135(P1):移动窗口的**快照 / 回滚** ──
+ *
+ * ## 为什么需要它(第九轮实测)
+ *
+ * `checkMove` 在**放行**时会把三件事一起推进:
+ * ```
+ * s.window.push(申报坐标)        窗口式移速的时间轴
+ * s.lastX / lastY / lastZ        下一包「跳变」比较的基准
+ * s.lastMoveTick                 下一包「额度」的基准(单调)
+ * ```
+ * 而 `room.ts#applyMove` 修前是**先推进、后写世界**,且 `host.applyPlayerMove` 的
+ * 返回值**被丢弃**。世界在倒地 / 眩晕 / 被困 / 击退窗口拒收坐标时:
+ * ```
+ * 刚体位置 : 原地(世界没接受)
+ * 反作弊水位: 已到申报坐标(幻影)
+ * ⇒ 下一包按幻影坐标算位移 —— 合法玩家被误判 TELEPORT / SPEED,而攻击者只要
+ *   「先撞一次世界闸」就能把水位推到任意远处
+ * ```
+ * ⇒ 世界拒收时必须把这组字段**一起**回滚。回滚的是**窗口与水位**,
+ * **不含** `violations` / `score`(那是判定的事实,不是位置事实)。
+ *
+ * 快照是**浅结构 + 窗口元素的逐点拷贝**:`checkMove` 会 `push` / `shift`
+ * 那张数组,共享引用会被后续 `shift` 悄悄改掉。
+ */
+export interface MoveWindowSnapshot {
+  lastX: number;
+  lastY: number;
+  lastZ: number;
+  lastMoveTick: number;
+  window: { tick: number; x: number; y: number }[];
+}
+
+/** 取一份 `checkMove` 会改动的字段快照(见上文)。 */
+export function snapshotMoveWindow(s: PlayerAntiCheatState): MoveWindowSnapshot {
+  return {
+    lastX: s.lastX,
+    lastY: s.lastY,
+    lastZ: s.lastZ,
+    lastMoveTick: s.lastMoveTick,
+    window: s.window.map((p) => ({ tick: p.tick, x: p.x, y: p.y })),
+  };
+}
+
+/**
+ * 把快照写回(**只回滚窗口与水位**)。
+ *
+ * 单调性照旧:`lastMoveTick` 回滚后**不会**低于进入本次移动之前的值 ——
+ * 快照就是那个值,故不存在「回滚把水位拉回去 ⇒ 重复兑现额度」这一路。
+ */
+export function restoreMoveWindow(s: PlayerAntiCheatState, snap: MoveWindowSnapshot): void {
+  s.lastX = snap.lastX;
+  s.lastY = snap.lastY;
+  s.lastZ = snap.lastZ;
+  s.lastMoveTick = snap.lastMoveTick;
+  s.window = snap.window.map((p) => ({ tick: p.tick, x: p.x, y: p.y }));
 }
 
 /**
@@ -706,14 +805,48 @@ function pathLength(win: readonly { x: number; y: number }[]): number {
 }
 
 /**
- * 校验一次攻击。
- * 最小间隔 = `baseAttackIntervalS / (1 + 攻速加成)`;加成被服务端上限钳制。
+ * 校验一次攻击。最小间隔 = `baseAttackIntervalS / (1 + 攻速加成)`;加成被服务端上限钳制。
  *
  * ⚠️ 「钳制」≠「核算」:声明 `1.0` 即拿满 2× 攻速且**不需要任何装备前置**
  * (CR-14 U2 的已知取舍)。服务端**不**核对声明是否与持有物相符 ——
  * 它没有装备数据可核。见 `MoveIntent.speedMul` 注释与 §7。
+ *
+ * ★ WS-FND-135(P3):本函数是**判定 + 提交**的合体形态(给「判定即生效」的调用方用)。
+ * 需要「先判定、结算成功后才提交」的调用方(`RoomRuntime.applyAttack`)必须用
+ * `previewAttack` + `commitAttack` 两步 —— 见那对函数的 docblock。
  */
 export function checkAttack(
+  s: PlayerAntiCheatState,
+  tick: number,
+  claimedAttackSpeedBonus = 0,
+  limits: AntiCheatLimits = DEFAULT_LIMITS,
+): Verdict {
+  const v = previewAttack(s, tick, claimedAttackSpeedBonus, limits);
+  if (v.allowed) commitAttack(s, tick);
+  return v;
+}
+
+/**
+ * ★ WS-FND-135(P3):攻速闸的**判定**(**不**推进 `lastAttackTick`)。
+ *
+ * ## 为什么必须与提交分开(第九轮实测)
+ *
+ * 修前房间入口是**先提交、后结算**:`applyAttack` 第一行就把 `lastAttackTick`
+ * 推到当前 tick,之后才 world 侧结算。于是三种**什么都没打出去**的情形
+ * 白占 8 帧冷却(基线 `baseAttackIntervalS = 0.4s` = **8 帧**):
+ * ```
+ * · 没有世界(host === null)或报文没带 mobId ⇒ 只记账、零结算
+ * · 世界侧 `rejected === 'NO_SKILL'`(按了 Q 但武器没技能)⇒ 零伤害
+ * · 世界侧 `outOfReach`(超射程)⇒ 零伤害
+ * ```
+ * 表现是「按了没反应,还得再等 8 帧」—— 玩家看到的是一次**凭空丢掉的攻击**。
+ *
+ * ## 违规记账不受影响
+ *
+ * 间隔不够 ⇒ 照旧 `record(s, v)`(ATTACK_RATE 是**事实**,与结算成不成功无关),
+ * 只是不再顺手把水位往前推 —— 否则「连点两次都被拒」会让水位越推越远。
+ */
+export function previewAttack(
   s: PlayerAntiCheatState,
   tick: number,
   claimedAttackSpeedBonus = 0,
@@ -733,8 +866,18 @@ export function checkAttack(
     record(s, v);
     return { allowed: false, violation: v };
   }
-  s.lastAttackTick = tick;
   return { allowed: true };
+}
+
+/**
+ * ★ WS-FND-135(P3):提交攻速冷却水位 —— **只在这次攻击真的结算了之后**调用。
+ *
+ * 单调(`Math.max`)而不是直接赋值:修前是 `s.lastAttackTick = tick`,而 `tick`
+ * 是**客户端申报**值 —— 申报一个更小的 tick 就能把水位**往回**拉,下一次攻击
+ * 立刻又满足间隔。这与 `lastMoveTick` 的纪律(只进不退)是同一族。
+ */
+export function commitAttack(s: PlayerAntiCheatState, tick: number): void {
+  s.lastAttackTick = Math.max(s.lastAttackTick, tick);
 }
 
 /* ═══════════════════════════ 5. 物品栏一致性 ═══════════════════════════ */
@@ -1129,7 +1272,20 @@ export class AntiCheatRoom {
    */
   readonly limitsIssues: readonly string[];
   private states = new Map<string, PlayerAntiCheatState>();
+  /**
+   * 违规流水(**环形缓冲**,容量 `VIOLATION_LOG_CAPACITY`)。
+   *
+   * 修前它是无界的普通数组 + 每次 `move()` 一次 `slice(-512)` 重建
+   * (见 `move` / `pushViolation`)。环形同时治了两件事:
+   *   · 热路径成本:写槽 O(1),不再每次重建整个数组;
+   *   · 内存上界:长度恒 ≤ 512(修前靠每帧 slice 才勉强有界,
+   *     而 `attack` / `inventory` 两条路径连 slice 都没有 —— 只 push 不裁)。
+   */
   private log: Violation[] = [];
+  /** 环形写游标(仅在 `log` 已满后推进)。 */
+  private logNext = 0;
+  /** 累计写入条数(判断「有没有绕过一圈」的唯一依据)。 */
+  private logCount = 0;
 
   constructor(limits: AntiCheatLimits | unknown = DEFAULT_LIMITS) {
     /* ★ CR-27 修复点:此前是 `this.limits = limits`(不做任何检查)
@@ -1171,38 +1327,146 @@ export class AntiCheatRoom {
     }
   }
 
+  /**
+   * 移动检查 + 违规入流水。
+   *
+   * ★ WS-FND-137 P2:修前本方法尾部有一行 `this.log = this.log.slice(-512)` ——
+   * 每次移动(20Hz × 玩家数)都**整数组重建一遍**,只为丢掉最多 1 条过期记录。
+   * 现在走 `pushViolation`(环形缓冲,满了才绕回)⇒ 本方法**恒定成本**,
+   * 与流水长度无关。
+   */
   move(intent: MoveIntent & { playerId: string }, maxZ = 3): Verdict {
     const s = this.states.get(intent.playerId);
     if (!s) return { allowed: false };
     const v = checkMove(s, intent, this.limits, maxZ);
-    if (v.violation) this.log.push(v.violation);
-    this.log = this.log.slice(-512);
+    if (v.violation) this.pushViolation(v.violation);
     return v;
+  }
+
+  /**
+   * ★ WS-FND-135(P1):取一份**本次移动会改动的窗口/水位**快照。
+   *
+   * 与 `rollbackMove` 配对:`checkMove` 放行时窗口与水位已被推进,而
+   * 「世界是否**接受**了这次坐标」要等 `applyPlayerMove` 的返回值 ——
+   * 世界拒收时那组坐标是**幻影**。调用方(房间)拿快照 → 调 `move` →
+   * 世界拒收 ⇒ `rollbackMove`。
+   *
+   * `playerId` 未登记(或已被 `leave` 清掉)⇒ 返回 `null`(没有状态可回滚)。
+   */
+  snapshotMove(playerId: string): MoveWindowSnapshot | null {
+    const s = this.states.get(playerId);
+    return s === undefined ? null : snapshotMoveWindow(s);
+  }
+
+  /**
+   * ★ WS-FND-135(P1):把窗口/水位回滚到 `snap`(世界拒收那次移动之前)。
+   *
+   * 只回滚**位置事实**(窗口 + `lastX/Y/Z` + `lastMoveTick`);违规流水与分数
+   * **不动** —— 它们是「判定」的事实。`snap === null`(玩家未登记)⇒ 空操作。
+   */
+  rollbackMove(playerId: string, snap: MoveWindowSnapshot | null): boolean {
+    const s = this.states.get(playerId);
+    if (s === undefined || snap === null) return false;
+    restoreMoveWindow(s, snap);
+    return true;
+  }
+
+  /**
+   * 违规入流水(环形缓冲,容量 `VIOLATION_LOG_CAPACITY`)。
+   *
+   * 为什么必须是**环形**而不是「push 完 `slice(-512)`」:后者把 O(cap) 的重建
+   * 压在**每次移动**上,而它要表达的只是「留最近 512 条」。
+   * 环形:未满 ⇒ append;已满 ⇒ 覆写最旧槽并把游标前移。单次 O(1) 且**零分配**。
+   *
+   * ⚠️ `logNext` 只在**已满**时有意义 —— `violations()` 靠 `logCount` 判断
+   * 「有没有绕过一圈」,不能只看 `log.length === capacity`(恰好装满但没绕回时,
+   * 从 `logNext === 0` 开始读也刚好是对的,但那时语义是巧合而非保证)。
+   */
+  private pushViolation(v: Violation): void {
+    if (this.log.length < VIOLATION_LOG_CAPACITY) {
+      this.log.push(v);
+    } else {
+      this.log[this.logNext] = v;
+      this.logNext = (this.logNext + 1) % VIOLATION_LOG_CAPACITY;
+    }
+    this.logCount += 1;
+  }
+
+  /**
+   * 因容量上限被**覆写丢弃**的违规条数(= 总写入 − 当前留存)。
+   *
+   * 用途:证明「有界」不是靠读代码相信 —— 灌 700 条之后这个数必须是 188,
+   * 而 `violations()` 里必须只剩**最后** 512 条(判据见 WS-FND-137)。
+   */
+  get droppedViolations(): number {
+    return Math.max(0, this.logCount - this.log.length);
   }
 
   attack(playerId: string, tick: number, claimedBonus = 0): Verdict {
     const s = this.states.get(playerId);
     if (!s) return { allowed: false };
     const v = checkAttack(s, tick, claimedBonus, this.limits);
-    if (v.violation) this.log.push(v.violation);
+    if (v.violation) this.pushViolation(v.violation);
     return v;
+  }
+
+  /**
+   * ★ WS-FND-135(P3):**只判定、不提交**攻速冷却水位(见 `previewAttack`)。
+   *
+   * 房间入口用它:世界侧真的结算了才 `commitAttackOf`。这样「按了 Q 但武器没技能」
+   * 「超射程」这两类**零伤害**的攻击不再白占 8 帧冷却。
+   */
+  attackPreview(playerId: string, tick: number, claimedBonus = 0): Verdict {
+    const s = this.states.get(playerId);
+    if (!s) return { allowed: false };
+    const v = previewAttack(s, tick, claimedBonus, this.limits);
+    if (v.violation) this.pushViolation(v.violation);
+    return v;
+  }
+
+  /** ★ WS-FND-135(P3):提交攻速冷却水位(**只在结算成功后**)。未登记 ⇒ `false`。 */
+  commitAttackOf(playerId: string, tick: number): boolean {
+    const s = this.states.get(playerId);
+    if (s === undefined) return false;
+    commitAttack(s, tick);
+    return true;
   }
 
   inventory(playerId: string, input: InventoryCheckInput): InventoryCheckResult {
     const s = this.states.get(playerId);
     if (!s) return { allowed: false, afterTotal: input.beforeTotal };
     const r = checkInventory(s, input, this.limits);
-    if (r.violation) this.log.push(r.violation);
+    if (r.violation) this.pushViolation(r.violation);
     return r;
   }
 
-  /** 全部违规流水(供写入 room_events)。 */
+  /**
+   * 全部违规流水(供写入 `room_events`)。
+   *
+   * ★ WS-FND-137 P2:底层改成**环形缓冲**(容量 `VIOLATION_LOG_CAPACITY`)。
+   * 修前是 `this.log = this.log.slice(-512)`,而那一行在 `move()` 里 ——
+   * `move` 是 20Hz × 玩家数的热路径 ⇒ 每次移动都**整数组重建一遍**,
+   * 只为丢掉最多 1 条过期记录。环形只写一个槽(且满了才绕回)。
+   *
+   * ⚠️ 返回值定义**未变**:仍然是「最近 512 条、按时间顺序(最早在前)」的一串。
+   * 变的是它现在是**快照**而不是内部数组本身 —— 环形缓冲的物理顺序没有意义,
+   * 直接暴露会让「第 0 条 = 最早」这个既有读法静默失效。返回副本的代价只落在
+   * **诊断 / 落库**路径(`violations()` 不在每帧热路径上)。
+   */
   violations(): readonly Violation[] {
-    return this.log;
+    const n = this.log.length;
+    /* 还没绕回:物理顺序就是时间顺序。 */
+    if (this.logCount <= n) return this.log.slice(0, n);
+    const out: Violation[] = [];
+    for (let i = 0; i < n; i += 1) out.push(this.log[(this.logNext + i) % n]);
+    return out;
   }
 
+  /** 按 kind 计数(**只读诊断路径**,不在每帧热路径上)。 */
   countByKind(kind: ViolationKind): number {
-    return this.log.filter((v) => v.kind === kind).length;
+    let n = 0;
+    for (const v of this.log) if (v.kind === kind) n += 1;
+    return n;
   }
 
   kickedPlayers(): string[] {

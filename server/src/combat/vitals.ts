@@ -38,6 +38,7 @@ import type { WarnGeom } from '../mobs/geometry.ts';
    import 的是**内容表**本身,不是"抄一个数过来" —— 见 `CONTENT_MAX_MOB_LEVEL`。 */
 import { MOB_LIST } from '../../../shared/constants/mobs.ts';
 import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
+import { BASE_HP } from '../../../shared/types/entities.ts';
 
 /* ═══════════════════════ 1. 常量 ═══════════════════════ */
 
@@ -56,13 +57,16 @@ import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
  *   (上限的**唯一**算子)先算 `statsAtLevel(level).maxHp + hpFlat`,再套
  *   `maxHpMulOf`,结果经 `syncMaxHp` 落到 `v.maxHp` —— 不乘在本常量上。
  *
- * ## 为什么仍保留 100
+ * ## 为什么是 100(而且不再是第二处声明)
  *
- * 取 100:手册未硬性规定玩家血量(它规定的是伤害公式),而 100 使
- * 「一刀掉多少」与百分比直觉一致。生物伤害量级见 `MOB_HIT_*`。
+ * 手册未硬性规定玩家血量(它规定的是伤害公式),而 100 使「一刀掉多少」与
+ * 百分比直觉一致。生物伤害量级见 `MOB_HIT_*`。
+ * **这个数不再是本文件的第二份声明**:改版前这里写的是 `= 100`,与冻结层
+ * `shared/types/entities.ts#BASE_HP`(= 100)构成「同一个数、两处声明」⇒ 现在只
+ * **引用**它(判据:`PLAYER_BASE_HP === BASE_HP`)。
  * 它同时是 `new VitalsSystem()` 无参时的值 —— 测试夹具与 `demo` 都靠它。
  */
-export const PLAYER_BASE_HP = 100;
+export const PLAYER_BASE_HP = BASE_HP;
 
 /**
  * 冻结层内容里**生物等级的上界**(派生值,不是手写常量)。

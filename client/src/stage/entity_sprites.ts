@@ -529,54 +529,117 @@ function finite(v: unknown): v is number {
  * `bosses` 不在内:boss 的身位要等服务端投影出坐标(线上 `BossState` 只有预警圆心),
  * 现在画只能把 boss 钉在预警圈圆心 —— 那是一个看起来合法的错误位置。
  */
-export function planEntitySprites(
-  state: {
-    players?: readonly { id: string; name?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number }[];
-    wildlife?: readonly {
-      id: string; mobId?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number;
-      tameOwnerId?: string;
-    }[];
-  },
+/** 立牌计划的**输入快照**形状(玩家/生物两个可选列表)。 */
+export type EntitySpriteSource = {
+  players?: readonly { id: string; name?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number }[];
+  wildlife?: readonly {
+    id: string; mobId?: string; x: number; y: number; z?: number; hp?: number; maxHp?: number;
+    tameOwnerId?: string;
+  }[];
+};
+
+/**
+ * ★ WS-FND-137 P2:计划里的元素对象**复用计数**(新建过多少个 spec)。
+ *
+ * 存在的理由:本函数跑在**每帧**(`boot.ts` 的 `reconcileEntitySprites`),
+ * 修前每帧新建 N 个 spec 对象 + 一个数组 ⇒ 20Hz × 实体数的垃圾流。
+ * 判据:同一份快照连调两次,`spritePlanSpecAllocs` **不再增长**(负对照:
+ * 加一个实体,恰好 +1)。
+ */
+export let spritePlanSpecAllocs = 0;
+
+/** 复位计数器(测试测量前调用)。 */
+export function resetSpritePlanCounters(): void {
+  spritePlanSpecAllocs = 0;
+}
+
+/** 空槽(字段随后逐个覆写,见 `planEntitySpritesInto`)。 */
+function blankSpec(): EntitySpriteSpec {
+  spritePlanSpecAllocs += 1;
+  return {
+    key: '', kind: 'player', entityId: '', label: '',
+    cx: 0, cy: 0, z: 0, heightPx: 0, colorHex: '', hp: 0, maxHp: 0, isLocal: false,
+  };
+}
+
+function specAt(out: EntitySpriteSpec[], i: number): EntitySpriteSpec {
+  const s = out[i];
+  return s ?? blankSpec();
+}
+
+/**
+ * 由**权威快照**算出这一帧该画哪些实体立牌(每次返回**新数组**,语义与修前一致)。
+ *
+ * 覆盖:`wildlife`(含已驯服的宠物)与**其他** `players`。
+ * `bosses` 不在内:boss 的身位要等服务端投影出坐标(线上 `BossState` 只有预警圆心),
+ * 现在画只能把 boss 钉在预警圈圆心 —— 那是一个看起来合法的错误位置。
+ */
+export function planEntitySprites(state: EntitySpriteSource, localPlayerId: string): EntitySpriteSpec[] {
+  return planEntitySpritesInto([], state, localPlayerId);
+}
+
+/**
+ * `planEntitySprites` 的**复用槽**版本(WS-FND-137 P2,`boot.ts` 每帧用)。
+ *
+ * ## 修的是什么
+ * 每帧都新建一个数组 + 每个实体一个 spec 对象,而这些对象**当帧就被读掉丢弃**。
+ * ⇒ 现在写进调用方给的 `out`:数组复用(`out.length = n`)、元素对象按槽位复用,
+ * 每个字段**逐个覆写**(所以复用槽不会串上一帧的值)。
+ *
+ * ## 为什么需要「按槽位复用」而不是「永远不新建」
+ * 名册会变(玩家进出、生物生灭)⇒ 槽位不够时才 `blankSpec()` 新建,
+ * 名册稳定的帧里分配数为 **0**。
+ *
+ * ## 为什么公开的 `planEntitySprites` 仍然返回新数组
+ * 调用方可能持有返回的数组(测试会连调两次做比对);把复用缓冲直接返回出去
+ * 会让「第二次调用」把「第一次的结果」改掉 —— 那是行为变更,不是优化。
+ */
+export function planEntitySpritesInto(
+  out: EntitySpriteSpec[],
+  state: EntitySpriteSource,
   localPlayerId: string,
 ): EntitySpriteSpec[] {
-  const out: EntitySpriteSpec[] = [];
+  let n = 0;
   for (const p of state.players ?? []) {
     if (p.id === localPlayerId) continue;         /* 本地玩家有 player_marker */
     if (!finite(p.x) || !finite(p.y)) continue;   /* 坐标坏了 ⇒ 不画(不是画到 0,0) */
-    out.push({
-      key: `player:${p.id}`,
-      kind: 'player',
-      entityId: p.id,
-      label: typeof p.name === 'string' && p.name !== '' ? p.name : p.id,
-      cx: p.x,
-      cy: p.y,
-      z: finite(p.z) ? p.z : 0,
-      heightPx: spriteHeightPx('player'),
-      colorHex: ENTITY_SPRITE_COLOR.player,
-      hp: finite(p.hp) ? p.hp : 0,
-      maxHp: finite(p.maxHp) ? p.maxHp : 0,
-      isLocal: false,
-    });
+    const s = specAt(out, n);
+    n += 1;
+    s.key = `player:${p.id}`;
+    s.kind = 'player';
+    s.entityId = p.id;
+    s.label = typeof p.name === 'string' && p.name !== '' ? p.name : p.id;
+    s.cx = p.x;
+    s.cy = p.y;
+    s.z = finite(p.z) ? p.z : 0;
+    s.heightPx = spriteHeightPx('player');
+    s.colorHex = ENTITY_SPRITE_COLOR.player;
+    s.hp = finite(p.hp) ? p.hp : 0;
+    s.maxHp = finite(p.maxHp) ? p.maxHp : 0;
+    s.isLocal = false;
+    out[n - 1] = s;
   }
   for (const w of state.wildlife ?? []) {
     if (!finite(w.x) || !finite(w.y)) continue;
     const tame = typeof w.tameOwnerId === 'string' && w.tameOwnerId !== '';
     const kind: 'mob' | 'pet' = tame ? 'pet' : 'mob';
-    out.push({
-      key: `${kind}:${w.id}`,
-      kind,
-      entityId: w.id,
-      label: typeof w.mobId === 'string' && w.mobId !== '' ? w.mobId : w.id,
-      cx: w.x,
-      cy: w.y,
-      z: finite(w.z) ? w.z : 0,
-      heightPx: spriteHeightPx(kind),
-      colorHex: tame ? ENTITY_SPRITE_COLOR.pet : ENTITY_SPRITE_COLOR.mob,
-      hp: finite(w.hp) ? w.hp : 0,
-      maxHp: finite(w.maxHp) ? w.maxHp : 0,
-      isLocal: false,
-    });
+    const s = specAt(out, n);
+    n += 1;
+    s.key = `${kind}:${w.id}`;
+    s.kind = kind;
+    s.entityId = w.id;
+    s.label = typeof w.mobId === 'string' && w.mobId !== '' ? w.mobId : w.id;
+    s.cx = w.x;
+    s.cy = w.y;
+    s.z = finite(w.z) ? w.z : 0;
+    s.heightPx = spriteHeightPx(kind);
+    s.colorHex = tame ? ENTITY_SPRITE_COLOR.pet : ENTITY_SPRITE_COLOR.mob;
+    s.hp = finite(w.hp) ? w.hp : 0;
+    s.maxHp = finite(w.maxHp) ? w.maxHp : 0;
+    s.isLocal = false;
+    out[n - 1] = s;
   }
+  out.length = n;
   /* 稳定顺序:同一份快照两次调用逐字段相同(自检口径可比对) */
   out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   return out;
@@ -587,4 +650,23 @@ export function countByKind(specs: readonly EntitySpriteSpec[], kind: EntitySpri
   let n = 0;
   for (const s of specs) if (s.kind === kind) n += 1;
   return n;
+}
+
+/**
+ * 三类一次数完(WS-FND-137 P2:`boot.ts` 修前为同一批 specs 扫了 **3 遍**
+ * —— `countByKind('mob') + countByKind('pet') + countByKind('player')`)。
+ *
+ * ⚠️ 与 `countByKind` 的关系:**口径必须一致**(同一条逐条比较的判据)。
+ * 判据里直接拿两者逐类对比(WS-FND-137 的 FND137-9),避免「两份统计各自漂移」。
+ */
+export function countByKinds(specs: readonly EntitySpriteSpec[]): { player: number; mob: number; pet: number } {
+  let player = 0;
+  let mob = 0;
+  let pet = 0;
+  for (const s of specs) {
+    if (s.kind === 'player') player += 1;
+    else if (s.kind === 'mob') mob += 1;
+    else pet += 1;
+  }
+  return { player, mob, pet };
 }

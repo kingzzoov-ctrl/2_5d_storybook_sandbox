@@ -62,6 +62,43 @@ export interface WelcomeFrame {
   contentClaim: string;
 }
 
+/**
+ * 服务端**拒绝报文**(`ws_server.ts` 的 `onHello` / `onAction` 发出)。
+ *
+ * ## 为什么单独立一个类型(而不是塞进 `WelcomeFrame`)
+ * `t` 是**判别式**:`welcome` / `actionResult` / `reject` 是三种报文,
+ * 而修前客户端把它们**全当成 `WelcomeFrame`** 解析 ⇒ `t` 一不匹配就静默丢弃。
+ *
+ * ## 字段
+ * ```text
+ * code  机器可读档位(NO_IDENTITY / TOKEN_* / ROOM_FULL / JOIN_REJECTED / ...)
+ * kind  分类(两处来源:ws_server 的 actionResult 用 kind;装配层的 join 拒用 kind:'JOIN')
+ * reason 散文描述(给人读;`code` 缺席时的兜底说明)
+ * note  ⚠️ code/kind 都可能缺席(老服务端只发 reason)⇒ 展示层必须容忍
+ * ```
+ */
+export interface RejectFrame {
+  t: 'reject';
+  code?: string;
+  kind?: string;
+  reason?: string;
+  action?: string;
+}
+
+/**
+ * 把一条 `reject` 变成**一行可读原因**(UI / 自检脚本共用一处,不造第二份文案)。
+ *
+ * ⚠️ `code ?? kind ?? 'UNKNOWN'` 的兜底是刻意的:老服务端只发 `reason`,
+ *   那时**不许**把行写成"服务端拒绝(UNKNOWN):"(那等于把原因丢了一半)。
+ */
+export function describeReject(r: RejectFrame): string {
+  const tag = r.code ?? r.kind ?? 'UNKNOWN';
+  return `服务端拒绝(${tag}):${r.reason ?? '没给理由'}`;
+}
+
+/** 下行**文本**报文的三种形态 —— `t` 是判别式(修前只认前两种)。 */
+type DownlinkText = WelcomeFrame | ActionResultFrame | RejectFrame;
+
 export type SessionState = 'idle' | 'connecting' | 'live' | 'closed' | 'failed';
 
 export interface SessionEvents {
@@ -84,6 +121,19 @@ export interface SessionEvents {
    *   而那正是本仓反复记的静默形态。
    */
   onActionResult?: (r: ActionResultFrame) => void;
+  /**
+   * ★ WS-FND-134(P1):服务端**拒绝报文**到了(`{t:'reject', code?, reason?}`)。
+   *
+   * ## 这个回调为什么必须存在(修前的形态,实测)
+   * 服务端在 `ws_server.onHello` 里先发 `{t:'reject', reason}` 再关连接,
+   * 而客户端当时**只判 `welcome` 与 `actionResult`,其余直接 `return`**
+   * ⇒ 玩家只看到 `closed`(随后自动重连),**永远不知道为什么被拒** ——
+   * "缺凭证 / token 过期 / 房满 / 密码错"四种原因在现场完全同形。
+   *
+   * ⇒ 现在:状态(`onState` 的 detail)、字段(`lastReject`)、**这个回调**三处
+   *   都拿到同一条可读原因(不是"再加一条日志"就算修了)。
+   */
+  onReject?: (r: RejectFrame) => void;
   /**
    * ★ WS-FND-113:每次 socket **建立**都调一次(首连与每次重连同一条路)。
    *
@@ -134,6 +184,20 @@ export interface SessionHandle {
   readonly droppedFrames: number;
   /** 最近一次丢弃的原因(便于自检脚本一眼看出是"形态"问题,不是"网络"问题)。 */
   readonly lastDropReason: string | null;
+  /**
+   * ★ WS-FND-134(P1):最近一次**服务端拒绝报文**(`null` = 本次连接没被拒过)。
+   *
+   * ## 为什么必须有它(而不是只靠 `onReject` 回调)
+   * 回调是**推送**:没注册回调的调用方(或注册晚了的)就什么都看不到。
+   * 而拒因是"这次连接为什么失败"的**唯一**答案 ⇒ 它必须同时是**可拉的**
+   * (自检脚本 / UI 面板 / 事后对账都能读)。
+   *
+   * ⚠️ 语义是**按连接**:`open` 时清空(见 `dial` 的 open 回调)——
+   *   否则一次成功后,下一次断开会把上一轮的拒因重新报一遍。
+   */
+  readonly lastReject: RejectFrame | null;
+  /** ★ WS-FND-134(P1):收到过几条 `reject` 报文(单调累加,与 `lastReject` 分开)。 */
+  readonly rejectedFrames: number;
   /** 发一帧上行(原始字节,由调用方用 `delta.ts` 编码)。未连接时返回 false。 */
   send(bytes: Uint8Array): boolean;
   /**
@@ -338,7 +402,13 @@ export interface ActionResultFrame {
   t: 'actionResult';
   action: string;
   ok: boolean;
-  kind: 'OK' | 'INVALID' | 'PERMISSION' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
+  /**
+   * ★ WS-FND-134(P2):`INTERNAL` = **服务端执行抛错**(不是参数/状态不对)。
+   *
+   * 修前服务端把"执行抛错"与真·参数错一律回报成 `INVALID` ⇒ 客户端(与排障
+   * 的人)把"服务端崩了"读成"我发错了",而两者的修法完全不同。
+   */
+  kind: 'OK' | 'INVALID' | 'PERMISSION' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED' | 'INTERNAL';
   reason?: string;
   effect?: Record<string, unknown>;
 }
@@ -418,6 +488,9 @@ export function createSession(opts: SessionOptions): SessionHandle {
   let serverClaim: string | null = null;
   let socket: WebSocketLike | null = null;
   let droppedFrames = 0;
+  /* ★ WS-FND-134(P1):服务端拒绝报文的留证(见 `SessionHandle.lastReject`)。 */
+  let lastReject: RejectFrame | null = null;
+  let rejectedFrames = 0;
   let lastDropReason: string | null = null;
   /* ★ WS-FND-113 第 4 处:重连三件套。三个字段各有单一职责,别合并 —— */
   /** 已建立的连接数;`onOpen` 的实参就是它(一处来源,不造第二份计数)。 */
@@ -475,6 +548,9 @@ export function createSession(opts: SessionOptions): SessionHandle {
            顺序不能反:调用方(重连)据 `epoch` 复位本地预测链,而复位必须在
            **第一条上行之前**完成,否则新一代命令会带着上一代的 `seq` 发出去。 */
         epoch += 1;
+        /* ★ WS-FND-134(P1):新连接开始 ⇒ 清掉**上一条连接**的拒因
+           (否则本次断开会把上一轮的 reject 当成这次的原因报出来)。 */
+        lastReject = null;
         opts.events.onOpen?.(epoch);
         /* 连接建立后**先**发握手。上行也走 1 字节类型头,服务端据此分流。 */
         const hello: HelloFrame = {
@@ -547,7 +623,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
       const cls = classifyDownlink(bytes);
       if (cls.kind === 'text') {
         try {
-          const w = JSON.parse(new TextDecoder().decode(cls.payload)) as WelcomeFrame;
+          /* ★ WS-FND-134(P1):下行文本是**一族**报文(`t` 是判别式),不是一个
+             `WelcomeFrame`。修前这里 `as WelcomeFrame` 之后只判 welcome 与
+             actionResult,其余**静默 return** —— 服务端发的 `{t:'reject',reason}`
+             就是那条被吞掉的路(玩家只看到 "closed → 重连",不知道为什么被拒)。 */
+          const w = JSON.parse(new TextDecoder().decode(cls.payload)) as DownlinkText;
           if (w.t === 'welcome') {
             if (w.protocolVersion !== PROTOCOL_VERSION) {
               setState('failed',
@@ -559,13 +639,29 @@ export function createSession(opts: SessionOptions): SessionHandle {
             opts.events.onWelcome?.(w);
             setState('live');
           } else if (w.t === 'actionResult') {
-            /* ★ 2026-11-14:动作回执。**四种结果都送达**(OK / INVALID /
-               PERMISSION / NOT_IMPLEMENTED)—— 客户端据此区分"被拒"与
+            /* ★ 2026-11-14:动作回执。**五种结果都送达**(OK / INVALID /
+               PERMISSION / NOT_IMPLEMENTED / ROOM_CLOSED,以及 WS-FND-134 新增的
+               INTERNAL = 服务端执行抛错)—— 客户端据此区分"被拒"与
                "服务器没听见"(见 `ws_server` 的 `onAction`)。
                ⚠️ 这里**只**加动作回执,不加 `attackResult`:攻击的反馈走
-                  快照里那只怪的血量下降(见 `main.ts` 的 HUD 注释)——
-                  一条真值来源,不是两条。 */
-            opts.events.onActionResult?.(w as unknown as ActionResultFrame);
+                  快照里那只怪的血量下降(见 `main.ts` 的 HUD 注释)—— 一条真值来源。 */
+            opts.events.onActionResult?.(w);
+          } else if (w.t === 'reject') {
+            /* ★ WS-FND-134(P1):**服务端拒绝报文**。三处同时暴露(状态 / 字段 /
+               回调)—— 任一处单独存在时,"为什么被拒"都可能在现场丢失
+               (状态会被 close 覆盖、回调可能没人注册、字段要有人去读)。 */
+            lastReject = w;
+            rejectedFrames += 1;
+            setState('failed', describeReject(w));
+            opts.events.onReject?.(w);
+          } else {
+            /* ★ WS-FND-134(P1):未知文本报文**也要留痕** —— 修前它落在那个
+               "其余直接 return"的静默口上:服务端将来加一种报文时,客户端会
+               安静地什么都不做(本仓反复记的形态)。
+               ⚠️ 归 `onDrop`(帧被丢弃)但**不**动 `droppedFrames`:那个计数器的
+               语义是「**载荷形态**不对」(Blob / 非字节),把它混进来会让
+               "binaryType 没设对"这一类判据失去分辨力(实测那正是它的用法)。 */
+            opts.events.onDrop?.(`收到未知文本报文 t=${String((w as { t?: unknown }).t)}`);
           }
         } catch (e) {
           /* 握手 JSON 坏 ⇒ 明确失败(握手无法猜) */
@@ -583,7 +679,13 @@ export function createSession(opts: SessionOptions): SessionHandle {
            不拦它,一次重连就会被记成"又断了一次"(状态改成 closed,
            还多排一个重连定时器,两条连接轮流顶掉对方)。 */
         if (socket !== sock) return;
-        setState('closed');
+        /* ★ WS-FND-134(P1):被拒之后的那次 close **必须带上拒因** ——
+           修前这里写死 `setState('closed')`,于是上一行的
+           `setState('failed','服务端拒绝(...)')` 立刻被覆盖成一句 "closed"
+           ⇒ 玩家/自检脚本只能看到"断了、重连",**拒因在状态流里消失**。
+           ⚠️ 只在**本次连接**收过 reject 时带(`open` 时清空),否则会把上一轮
+           无关的拒因挂到这一次的断开上(那会指错对象)。 */
+        setState('closed', lastReject === null ? undefined : describeReject(lastReject));
         scheduleRetry();
       }) as never);
       sock.addEventListener('error', (() => {
@@ -607,6 +709,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
     get serverContentClaim() { return serverClaim; },
     get droppedFrames() { return droppedFrames; },
     get lastDropReason() { return lastDropReason; },
+    /* ★ WS-FND-134(P1):被拒的**证据**。两个读数分开:
+       `lastReject` 是"最近一次拒了我什么"(诊断),`rejectedFrames` 是"拒了几次"
+       (单调累加 ⇒ "发生过的次数"不会被一次调用伪造)。 */
+    get lastReject() { return lastReject; },
+    get rejectedFrames() { return rejectedFrames; },
     send(bytes: Uint8Array): boolean {
       if (socket === null || socket.readyState !== 1 /* OPEN */) return false;
       socket.send(encodeClientFrame(bytes, false));

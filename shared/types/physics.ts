@@ -28,7 +28,12 @@ export const MASS_HEAVY = 3.0;
 export const MASS_BOSS = 20.0;
 
 export const BASE_MOVE_SPEED = 4.5; // 格/秒
-export const BASE_HP = 100;
+/*
+ * ★ `BASE_HP` 的**唯一声明**在 `shared/types/entities.ts`(成长公式 `statsAtLevel` 的底座);
+ *   本文件只**转发**它。原先这里有一份同值副本(`= 100`)——零生产消费者,
+ *   但它是「同一个数两处声明」,加一级血上限时必然只改一处 ⇒ 副本已删。
+ */
+export { BASE_HP } from './entities.ts';
 export const BASE_ATK = 10;
 
 export const BodyState = {

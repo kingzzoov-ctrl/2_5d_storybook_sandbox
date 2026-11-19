@@ -22,25 +22,26 @@
 
 import { unpackTile } from '../../../shared/types/tile.ts';
 import {
+  DYE_DECAY_FAR_CELLS,
   dyeDecayAt,
   dyeDecayColor,
   formatCssRgb,
   parseHexColor,
 } from './dye_decay.ts';
 
-/** 32 色调色盘(与 UI 的 `PALETTE_32` 同源;这里保留十六进制字符串,装配层转 RGB) */
-export const DYE_PALETTE: readonly string[] = [
-  '#FFFDF7', '#F5E7D0', '#E9D3B0', '#D8B98C',
-  '#F7B7C6', '#EE8CA6', '#D76388', '#B03F6C',
-  '#FBD9A0', '#F5B96B', '#E0913C', '#B96A22',
-  '#D8EFA8', '#A9D97C', '#7CB855', '#4E8C39',
-  '#A8E6E0', '#6EC9C4', '#43A0A4', '#2A7178',
-  '#A9C8F5', '#7BA3E8', '#4F76CC', '#2E4C96',
-  '#D3B8F0', '#B08BE0', '#875FC2', '#5B3C90',
-  '#F0C9A8', '#D9A17C', '#B87A55', '#8A5433',
-];
+import { DYE_PALETTE, DYE_PALETTE_SIZE } from '../../../shared/constants/dye.ts';
 
-export const DYE_PALETTE_SIZE = DYE_PALETTE.length;
+/* ═══════════ 32 色调色盘:转出冻结层那一份(不是第二份副本)═══════════ */
+
+/**
+ * 32 色调色盘 / 色数 —— **转出** `shared/constants/dye.ts` 的那一份,本文件不再有
+ * 第二份字面量(改版前这里是与 `pixel_easel.ts#PALETTE_32` 逐字节相同的 32 行)。
+ * 判据:`DYE_PALETTE === PALETTE_32`(引用相等,不是文本相等)。
+ *
+ * ⚠️ 转发与自用是同一批绑定:`DyeChannel.colorOf` / `paletteCell` / `sprayColorAtDistance`
+ *   用的都是它,所以「转发」与「自用」不可能变成两份。
+ */
+export { DYE_PALETTE, DYE_PALETTE_SIZE };
 
 /** 未染色哨兵值 */
 export const NO_DYE = -1;
@@ -332,16 +333,24 @@ export function isDyeableTile(tile: number): boolean {
   return u.obj !== 0;
 }
 
-/** 喷枪射程(格)与衰减:15 格内满强度,30 格外无效 */
-export const SPRAY_RANGE_NEAR = 15;
-export const SPRAY_RANGE_FAR = 30;
+/*
+ * 喷枪射程(格):`SPRAY_RANGE_FAR` 与 `dye_decay.ts#DYE_DECAY_FAR_CELLS` 是同一个值(30 格);
+ * `SPRAY_RANGE_NEAR` = 射程的一半 —— 它**不再是"满强度平台"的端点**,而是冻结判据
+ * 「中点 0.5」的那个距离(15 格 ⇒ 0.5)。旧的「15 格内恒 1 / 22.5 格才 0.5」平台折线已删。
+ */
+export const SPRAY_RANGE_FAR = DYE_DECAY_FAR_CELLS;
+export const SPRAY_RANGE_NEAR = DYE_DECAY_FAR_CELLS / 2;
 
-/** 距离 → 强度衰减(线性) */
+/**
+ * 距离(格)→ 强度衰减(0..1)。**取自冻结层那一条曲线**,不是本文件的第二份折线。
+ *
+ * `dyeDecayAt` 的曲线 = 冻结层线性 `1 − dist/range`、射程 = 30 格 ⇒ 15 格 = 0.5
+ * (冻结判据「中点 0.5」)、22.5 格 = 0.25、30 格 = 0;负数 / 0 格按贴身处理(⇒ 1),
+ * 端点语义与 `dyeDecayAt` **逐点相同**。改版前这里是「15 格内恒 1、22.5 格才 0.5」的
+ * 平台折线 —— 同一枪在 UI 侧读 1.0、在冻结层读 0.5,这就是「两边颜色不同」的来源。
+ */
 export function sprayAttenuation(distance: number): number {
-  const d = Math.abs(distance);
-  if (d <= SPRAY_RANGE_NEAR) return 1;
-  if (d >= SPRAY_RANGE_FAR) return 0;
-  return 1 - (d - SPRAY_RANGE_NEAR) / (SPRAY_RANGE_FAR - SPRAY_RANGE_NEAR);
+  return dyeDecayAt(distance);
 }
 
 /* ───────────────── 距离衰减曲线(WS-09 U5 的消费点)───────────────── */
@@ -351,8 +360,8 @@ export function sprayAttenuation(distance: number): number {
  *
  * ## 这是曲线的**唯一**消费点
  *
- * 曲线本体住在 `stage/dye_decay.ts`(裁决 U5 的原定落点是 `shared/constants/**`,
- * 该常量当前尚不存在,详见该文件头「落点说明」)。本函数只做两件事:
+ * 曲线本体住在**冻结层** `shared/constants/dye.ts#dyeAttenuation`(`dye_decay.ts` 只
+ * 负责把射程 30 格钉进去,冻结层不发明射程)。本函数只做两件事:
  *   1. 用 `DyeChannel.colorOf` 把 6 bit 色号还原成调色盘基色;
  *   2. 用 `dyeDecayColor` 把「基色 × 距离衰减」算成最终颜色。
  *
@@ -369,9 +378,9 @@ export function sprayColorAtDistance(tintIndex: number, distance: number): strin
 /**
  * 某距离下写进 `uDyeStrength` 的强度值(0..1)。
  *
- * 与 `sprayAttenuation`(线性,已冻结的旧口径)并存:`sprayAttenuation` 管
- * 「这一枪能不能染上」,本函数管「染上去有多浓」。两者不可互相替代 ——
- * 前者的 22.5 格必须是 0.5(既有判据),而后者的曲线在那里是 0.61(21→24 格之间)。
+ * 与 `sprayAttenuation` 是**同一个函数**(同一份冻结层曲线):「这一枪能不能染上」
+ * 与「染上去有多浓」在本仓是同一个数 —— 15 格 = 0.5、22.5 格 = 0.25、30 格 = 0。
+ * (改版前这一行写的两个数与那两条实现**都不符** —— 已按现状订正,不再复述旧值。)
  */
 export function sprayStrengthAtDistance(distance: number): number {
   return dyeDecayAt(distance);
@@ -382,9 +391,9 @@ export function dyeCost(surfaceCells: number): number {
   return Math.max(1, Math.ceil(Math.max(0, surfaceCells) / 16));
 }
 
-/** 调色盘 UI 网格布局:8×4 */
+/** 调色盘 UI 网格布局:8×4(行数由单一事实源的色数推出,不另写 4) */
 export const PALETTE_COLS = 8;
-export const PALETTE_ROWS = 4;
+export const PALETTE_ROWS = DYE_PALETTE_SIZE / PALETTE_COLS;
 
 export function paletteCell(index: number): { row: number; col: number } {
   const i = Math.max(0, Math.min(DYE_PALETTE_SIZE - 1, Math.trunc(index)));
