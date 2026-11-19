@@ -1236,5 +1236,145 @@ export function settleSession(s: RushOrderSession): RushSessionSettlement {
   };
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * 7. 急单 `stock` 的**供给台账**(WS-FND-148)
+ *
+ * ## 审计说的那句话,逐字核实的结果
+ * ```
+ * 「急单传入的 stock 恒空、房间等级未接入」
+ *   前半 成立:生产唯一入口 world_sim#stepRushEntry 传的是字面量 `{}`
+ *             (`startRushRun(RUSH_ENTRY_ROOM_LEVEL, makeRng(...), {})`)。
+ *   后半 成立,且**早已登记**:房间等级由房间持有,世界侧只能取最低档 1,
+ *             那一支是 `rush_actions.ts#RUSH_ACTION_LEDGER` 的 `EXTRA:ROOM_LEVEL` 行。
+ * ```
+ *
+ * ## 为什么本文件不自己「补」一份 stock
+ * `stock` 是**房间/世界的库存事实**(151 木板在谁的账上),不是急单能凭空造的。
+ * 本模块对它的两个读点都在下面写清了;接线只差**生产者传一个真对象**进来 ——
+ * 而生产者在 `sim/world_sim.ts`(本轮写域外)。
+ * 在这里偷偷维护一份自造库存 = 厂里出现第二本账,正是本仓点名的那类缺陷。
+ *
+ * ⇒ 处置:登记 + **可机器对账**。`auditRushStockWiring` 盯两件事:
+ *   1 读点仍在本模块里(`reads` 必须匹配本文件);
+ *   2 生产端**仍然**传空对象(`evidence` 必须匹配 `world_sim.ts` 的调用点)——
+ *     哪天真接了,这一行就红,逼着改状态而不是让台账继续撒谎。
+ *
+ * ## 空 `stock` 的可观测后果(判据 WS-FND-148 用它们给证)
+ * ```
+ * 订单权重  scarcity = 1 + (10 − min(stock,10))/10  ⇒ 空表时恒 = 2,「越缺越点」失效
+ * 偷料河狸  take = min(BEAVER_RECLAIM_QTY, stock[151]) ⇒ 空表时恒 = 0,
+ *           于是 `hitBeaver` 的 reclaimable 恒 false —— 敲晕了也夺不回木板
+ * ```
+ */
+
+export const RUSH_STOCK_SUPPLY = {
+  /** 生产端传了真实库存(读点拿到的是「厂里的账」)。 */
+  SUPPLIED: 'SUPPLIED',
+  /** 读点在,但生产端传的是空对象 ⇒ 读到的恒为空,相关玩法退化成常量。 */
+  UNSUPPLIED: 'UNSUPPLIED',
+} as const;
+export type RushStockSupply = (typeof RUSH_STOCK_SUPPLY)[keyof typeof RUSH_STOCK_SUPPLY];
+
+export interface RushStockRow {
+  /** 读点名(本模块内的位置)。 */
+  site: string;
+  /** 读点证据正则(对本模块的**剥注释代码**跑)。 */
+  reads: string;
+  /** 生产端:`路径#位置`。 */
+  producer: string;
+  /**
+   * 生产端证据正则。**必须**只在「传空对象」时匹配 ——
+   * 于是「接线了」与「没接线」是同一个正则的两种结果,台账不可能自己说过头。
+   */
+  evidence: string;
+  status: RushStockSupply;
+  reason: string;
+}
+
+/** `stock` 的两个读点 + 生产端的真相。 */
+export const RUSH_STOCK_WIRING: readonly RushStockRow[] = Object.freeze([
+  {
+    site: 'ORDER_WEIGHT(generateOrderBoard 的稀缺系数)',
+    reads: 'stock\\[id\\]',
+    producer: 'server/src/sim/world_sim.ts#stepRushEntry → startRushRun(..., {})',
+    evidence: 'startRushRun\\(\\s*RUSH_ENTRY_ROOM_LEVEL[^;]*\\{\\s*\\}\\)',
+    status: RUSH_STOCK_SUPPLY.UNSUPPLIED,
+    reason:
+      '订单权重里的 scarcity 项读 `stock[id]`(`1 + (10 − min(stock,10))/10`)。生产端传空对象 ⇒'
+      + '该项恒为 2,「手上越少越容易被点名」退化成「所有候选同权」。',
+  },
+  {
+    site: 'BEAVER_STEAL(tickBeaver 的偷料扣减)',
+    reads: 'stock\\[b\\.wantItem\\]',
+    producer: 'server/src/sim/world_sim.ts#stepRushEntry → startRushRun(..., {})',
+    evidence: 'startRushRun\\(\\s*RUSH_ENTRY_ROOM_LEVEL[^;]*\\{\\s*\\}\\)',
+    status: RUSH_STOCK_SUPPLY.UNSUPPLIED,
+    reason:
+      '偷料河狸按 `min(BEAVER_RECLAIM_QTY, stock[151])` 扣库存。生产端传空对象 ⇒ 恒偷 0 块,'
+      + '`stolenQty = 0` ⇒ `hitBeaver` 的 reclaimable 恒 false,「敲晕夺回木板」这条玩法整条失效。',
+  },
+]);
+
+/**
+ * `stock` 供给台账对账(纯函数,**不读盘**、不 import 世界侧)。
+ *
+ * 规则:
+ * ```
+ * 1 reads 必须匹配**本模块**的剥注释代码(读点被删/改名 ⇒ 红)
+ * 2 producer 指向的文件必须在扫描集里(路径写错 = 判据失效)
+ * 3 evidence 必须匹配生产端代码 —— 它的语义是「**仍然**传空对象」
+ *   ⇒ UNSUPPLIED 行匹配 = 台账与仓库一致;不匹配 = 生产已开始供 stock,台账过时
+ * 4 SUPPLIED 行反过来:evidence **不得**匹配(否则就是还没接就写已接)
+ * 5 reason ≥ 24 字符
+ * ```
+ *
+ * @param sources 仓库相对路径(`/` 分隔)→ **已剥注释**的源码。
+ */
+export function auditRushStockWiring(
+  rows: readonly RushStockRow[],
+  sources: ReadonlyMap<string, string>,
+  selfModule = 'server/src/coop/rush_order.ts',
+): string[] {
+  const problems: string[] = [];
+  const self = sources.get(selfModule);
+  for (const row of rows) {
+    if (self === undefined) {
+      problems.push(`${row.site}: 本模块 ${selfModule} 不在扫描集里`);
+    } else {
+      let reads: RegExp | null = null;
+      try {
+        reads = new RegExp(row.reads);
+      } catch {
+        problems.push(`${row.site}: reads 不是合法正则`);
+      }
+      if (reads !== null && !reads.test(self)) {
+        problems.push(`${row.site}: 读点 ${row.reads} 在 ${selfModule} 里找不到(改过名?)`);
+      }
+    }
+    if (row.reason.trim().length < 24) problems.push(`${row.site}: reason 太短`);
+    const path = row.producer.split('#')[0];
+    const code = sources.get(path);
+    if (code === undefined) {
+      problems.push(`${row.site}: producer 指向的 ${path} 不在扫描集里`);
+      continue;
+    }
+    let evidence: RegExp;
+    try {
+      evidence = new RegExp(row.evidence);
+    } catch {
+      problems.push(`${row.site}: evidence 不是合法正则`);
+      continue;
+    }
+    const stillEmpty = evidence.test(code);
+    if (row.status === RUSH_STOCK_SUPPLY.UNSUPPLIED && !stillEmpty) {
+      problems.push(`${row.site}: 标记 UNSUPPLIED,但 ${path} 已不再传空对象 —— 台账过时(该改为 SUPPLIED)`);
+    }
+    if (row.status === RUSH_STOCK_SUPPLY.SUPPLIED && stillEmpty) {
+      problems.push(`${row.site}: 标记 SUPPLIED,但 ${path} 仍传空对象 —— 台账过时(还没接)`);
+    }
+  }
+  return problems;
+}
+
 /** 预热订单池自检(任何写手首次 import 后调用即可发现悬空引用)。 */
 assertOrderPoolClosed();

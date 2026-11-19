@@ -24,12 +24,18 @@
  * ## 具名台账(唯一入口:`PRANK_ACTION_LEDGER`)
  *
  * 修前的说法是「整蛊玩具已实现」,而实际是「表已实现、判定无消费者」。
- * 台账把**每一件玩具的动作路径**逐条写清:`WIRED:<verb>` = 生产里真会走到,
- * `NONE` = 还等动作层(每条带原因)。判据见 `tests/WS-FND-120`。
+ * 台账把**每一件玩具的三条路**逐列写清(WS-FND-148 起):
+ * ```
+ * path    掉冠(contestCrownDrop → gateCrownKnock)—— WS-FND-120 冻结口径
+ * player  玩家→玩家(use_item 的 221..255 分支 → gatePrank → applyPrankToTarget)
+ * enemy   玩家→怪物(enemyEffect 的落点;今天 35 件全 NONE,理由逐行写清)
+ * ```
+ * 判据见 `tests/WS-FND-120`(掉冠列)与 `tests/WS-FND-148`(三列对账)。
  */
 
 import {
   PRANK_TOYS,
+  PRANK_TOY_BY_ID,
   PRANK_TOY_ID_MAX,
   PRANK_TOY_ID_MIN,
   SAFE_SHIELD_ITEM_ID,
@@ -192,37 +198,71 @@ export function resolveCrownKnock(opts: { shieldOn: boolean }): CrownKnockOutcom
   return { drop: false, reason: world.reason, blockedBy: candidates[0], candidates };
 }
 
-/** 台账里一行。`path` = `WIRED:<verb>` 或 `NONE`。 */
+/**
+ * 台账里一行。**两条路分两列**,不再合并。
+ *
+ * 修前的形态只有一个 `path`,而它只回答「掉冠」这一条
+ * (`contestCrownDrop → gateCrownKnock`),`note` 却拿它当「整蛊能不能用」的总开关,
+ * 于是写着「32 件没有动作路径,出路是 `use_item` 的 221..255 分支(不在本任务写域)」。
+ * 那段分支**后来接上了**(WS-FND-122:`use_item.ts` 的玩具分支 →
+ * `gatePrank` → `WorldSim.applyPrankToTarget`),而这行说明没跟着改 ——
+ * 台账因此成了「说明与仓库相反」的那类缺陷(审计 WS-FND-148 第 1 项)。
+ *
+ * ⇒ `path` 保留 WS-FND-120 的冻结口径(`WIRED:<verb>` / `NONE`,判据钉住
+ *    「只有掉冠那三件是 WIRED、其余 32 行 NONE」),另开 `player` / `enemy`
+ *    两列说清**真实**的动作入口。三列一起才对得上仓库。
+ */
 export interface PrankActionRow {
   toyId: number;
   name: string;
+  /** 掉冠这条路(`WIRED:<verb>` / `NONE`)。字段名与取值形态是 WS-FND-120 的冻结口径。 */
   path: string;
-  /** `NONE` 行必须写清欠的是哪一步 */
   note: string;
+  /** 玩家→玩家整蛊:`WIRED:...` / `NONE:<欠哪一步>`。 */
+  player: string;
+  /** 玩家→怪物(`enemyEffect` 的落点):`WIRED:...` / `NONE:<欠哪一步>`。 */
+  enemy: string;
 }
 
-/**
- * 生产里**真会走到**的玩具(动作路径 → verb)。
- *
- * 只列世界侧已经有击杀/掉冠入口的那几件;其余 32 件仍是 `NONE`,
- * 出路是 `net/actions/use_item` → `sim.useItem` 的 221..255 分支
- * (那一处不在本任务写域内,故**不登记为已接**)。
- */
-const WIRED_PRANK_PATHS: Readonly<Record<number, string>> = {
-  222: 'WIRED:crown_knock',
-  224: 'WIRED:crown_knock',
-  225: 'WIRED:crown_knock',
+/** 玩家→玩家整蛊的唯一生产动词(`use_item` 的 221..255 分支)。 */
+export const PRANK_PLAYER_VERB = 'WIRED:use_item#gatePrank → WorldSim.applyPrankToTarget';
+/** 掉冠动词。 */
+export const PRANK_CROWN_VERB = 'WIRED:crown_knock';
+
+/** 掉冠这条路在哪些玩具上是活的(手册 §6.1 点名的三件)。 */
+const WIRED_CROWN_PATHS: Readonly<Record<number, string>> = {
+  222: PRANK_CROWN_VERB,
+  224: PRANK_CROWN_VERB,
+  225: PRANK_CROWN_VERB,
 };
 
-const NONE_PRANK_NOTE = '动作路径待接:`use_item` 的 221..255 分支(动作层,不在本任务写域)';
+const NOTE_CROWN = '掉冠:持冠者被这三件之一击退 ⇒ `gateCrownKnock` 判 218 盾后掉冠(手册 §6.1/§3.4)';
+const NOTE_NO_CROWN = '掉冠这条路没有它:手册点名的掉冠来源是 222 大锤 / 225 香蕉皮 / 224 钩爪,这一件只走整蛊效果';
+/**
+ * 227 是 35 件里**唯一**被世界侧语义表接走的(`itemUseKind(227) = 'BUBBLE'`)。
+ * 玩具分支因此让路(WS-FND-122 实测的回归点):一发就 STUNNED 会打红
+ * 「连中 3 发才困住」(`WS-FND-53`)。⇒ 它在**这条**路上没有入口,不是忘了接。
+ */
+const PLAYER_NONE_227 = 'NONE:世界侧 `itemUseKind(227)=BUBBLE` 优先(WS-FND-122 ⇒ 一发 STUNNED 会打红「连中 3 发才困住」)';
+/**
+ * 玩家→怪物:35 件**全部**未接。
+ * 世界侧的落点 `applyPrankToTarget` 只对玩家生效(`NOT_A_PLAYER`),
+ * 怪物侧的伤害/控制在战斗层(`combat/damage.ts`),不属本轮写域。
+ */
+const ENEMY_NONE = 'NONE:`WorldSim.applyPrankToTarget` 只对玩家生效(NOT_A_PLAYER)⇒ 怪物侧落点在战斗层,不在本轮写域';
 
 /** 台账与玩具表逐条对应(35 行)—— 由 `assertPrankActionLedgerComplete()` 自检。 */
-export const PRANK_ACTION_LEDGER: readonly PrankActionRow[] = PRANK_TOYS.map((t) => ({
-  toyId: t.id,
-  name: t.name,
-  path: WIRED_PRANK_PATHS[t.id] ?? 'NONE',
-  note: WIRED_PRANK_PATHS[t.id] ?? NONE_PRANK_NOTE,
-}));
+export const PRANK_ACTION_LEDGER: readonly PrankActionRow[] = PRANK_TOYS.map((t) => {
+  const crown = WIRED_CROWN_PATHS[t.id] !== undefined;
+  return {
+    toyId: t.id,
+    name: t.name,
+    path: crown ? PRANK_CROWN_VERB : 'NONE',
+    note: crown ? NOTE_CROWN : NOTE_NO_CROWN,
+    player: t.id === 227 ? PLAYER_NONE_227 : PRANK_PLAYER_VERB,
+    enemy: ENEMY_NONE,
+  };
+});
 
 /** 台账里标成 `WIRED:` 的行(断言「不许把没接的写成已接」用)。 */
 export function wiredPrankToys(): number[] {
@@ -233,7 +273,8 @@ export function wiredPrankToys(): number[] {
  * 自检:
  *  1 台账与玩具表**逐 ID 一致**(少一行就是「这件玩具没人认领」);
  *  2 `WIRED:` 行的 ID 必须在 `PRANK_TOYS` 里(不许写悬空 ID);
- *  3 掉冠候选玩具必须都在表内。
+ *  3 掉冠候选玩具必须都在表内;
+ *  4 `NONE:` 列必须写清欠的是哪一步(空话挡在门外)。
  */
 export function assertPrankActionLedgerComplete(): void {
   if (PRANK_ACTION_LEDGER.length !== PRANK_TOYS.length) {
@@ -245,8 +286,69 @@ export function assertPrankActionLedgerComplete(): void {
     }
     if (row.path === 'NONE' && row.note === '') throw new Error(`#${row.toyId} 登记为 NONE 却没写原因`);
     if (row.path.startsWith('WIRED:')) toyOf(row.toyId);
+    if (row.player.startsWith('NONE:') && row.player.length < 'NONE:'.length + 12) {
+      throw new Error(`#${row.toyId} 的玩家侧 NONE 没写清欠哪一步`);
+    }
+    if (row.enemy.startsWith('NONE:') && row.enemy.length < 'NONE:'.length + 12) {
+      throw new Error(`#${row.toyId} 的怪物侧 NONE 没写清欠哪一步`);
+    }
   }
   for (const id of CROWN_KNOCK_TOY_IDS) toyOf(id);
+}
+
+/**
+ * 台账对账(纯函数,**不 import 世界侧**)。
+ *
+ * 判据只有一条核心:**玩家侧入口的归属必须由「世界侧语义表认不认它」决定**。
+ * ``` 
+ * itemUseKind(id) === null  ⇒  玩具分支必然接管 ⇒ 台账必须写 WIRED
+ * itemUseKind(id) !== null  ⇒  世界侧语义优先   ⇒ 台账必须写 NONE:<为什么>
+ * ``` 
+ * 调用方把 `worldSemanticOf` 注入进来(判据里传 `WorldSim.itemUseKind`),
+ * 于是「227 例外」不是注释里的一句口号:世界侧那张表一改,这一行当场红。
+ *
+ * @param worldSemanticOf 世界侧语义表的读口;`null` = 那张表不认它。
+ * @returns 问题清单(空数组 = 全绿)。
+ */
+export function auditPrankLedger(
+  rows: readonly PrankActionRow[],
+  worldSemanticOf: (itemId: number) => string | null,
+): string[] {
+  const problems: string[] = [];
+  if (rows.length !== PRANK_TOYS.length) {
+    problems.push(`台账 ${rows.length} 行,玩具表 ${PRANK_TOYS.length} 件`);
+  }
+  const seen = new Set<number>();
+  for (const row of rows) {
+    if (seen.has(row.toyId)) problems.push(`#${row.toyId}: 台账里重复登记`);
+    seen.add(row.toyId);
+    const def = PRANK_TOY_BY_ID.get(row.toyId);
+    if (def === undefined) {
+      problems.push(`#${row.toyId}: 不在玩具表里(悬空行)`);
+      continue;
+    }
+    if (def.name !== row.name) problems.push(`#${row.toyId}: 名称与玩具表不符(${row.name} ≠ ${def.name})`);
+    const semantic = worldSemanticOf(row.toyId);
+    const claimsUseItem = row.player.startsWith('WIRED:');
+    if (semantic === null && !claimsUseItem) {
+      problems.push(`#${row.toyId}: 世界侧语义表不认它 ⇒ 玩具分支必然接管,台账却写 ${row.player}`);
+    }
+    if (semantic !== null && claimsUseItem) {
+      problems.push(`#${row.toyId}: 世界侧语义表认它(${semantic})⇒ 玩具分支让路,台账却写 WIRED`);
+    }
+    if (!row.player.startsWith('WIRED:') && !row.player.startsWith('NONE:')) {
+      problems.push(`#${row.toyId}: player 只允许 WIRED:... / NONE:...`);
+    }
+    if (!row.enemy.startsWith('WIRED:') && !row.enemy.startsWith('NONE:')) {
+      problems.push(`#${row.toyId}: enemy 只允许 WIRED:... / NONE:...`);
+    }
+    if (row.note.trim().length < 12) problems.push(`#${row.toyId}: note 太短(台账不许写空话)`);
+    if (row.path.startsWith('WIRED:') && !CROWN_KNOCK_TOY_IDS.includes(row.toyId)) {
+      problems.push(`#${row.toyId}: 掉冠登记的玩具不在候选三件(${CROWN_KNOCK_TOY_IDS.join('/')})里`);
+    }
+  }
+  for (const t of PRANK_TOYS) if (!seen.has(t.id)) problems.push(`#${t.id}: 台账缺行`);
+  return problems;
 }
 
 assertPrankActionLedgerComplete();

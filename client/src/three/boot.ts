@@ -1314,9 +1314,15 @@ export function boot(container: HTMLElement): BootHandle {
          接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。
          ★ 缩放档位(`[` / `]`,6 档)与搜索(`/`)也必须写进提示 —— 否则
            "存在但没人知道能按"的键位等于不存在。 */
+      /* ★ 空格是「一键两义」,这里如实写**现状**:既挥一刀,也锁存一次跳跃(`net/input.ts`
+         的 `jumpLatched` → `MoveIntent.jump` 上行,恰好一条)。服务端**认这个字段**
+         (`ws_server.ts#parseMoveIntent` 只收字面 `true`)⇒ `applyJumpIntent` → `tryPlayerJump`,
+         「能不能起跳」(空中 / 冷却)由世界侧一处裁决,被拒会写进 `lastJumpReport`。
+         接线前这里写的是「服务端不认 jump ⇒ 现在只是挥刀」—— 那句话现在是错的,
+         而错文案没人会去测(判据 `tests/WS-FND-122-protocol-exits.test.ts`)。 */
       keysHint: `${panelKeyHints()} · B Boss · [ ] 缩放 ${isoCam.zoom}×`
         + ` · / 搜索${searchMode ? `("${invQuery}")` : ''} · 拖拽框选蓝图 · WASD 移动角色(相机跟随)`
-        + ` · 空格 攻击(同时锁存一次跳跃;服务端不认 jump ⇒ 现在只是挥刀)`
+        + ` · 空格 攻击 + 跳跃(锁存一次;服务端认 jump,地面/冷却由世界侧判)`
         + ` · 动作键 ${entryKeyHints()} · 热键 ${hotbarKeyHints()}`
         + ' · 拖拽背包=本地整理(不发报文,刷新即回原序)',
     };

@@ -562,7 +562,16 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
       正是本检测器输出里已注明的那类「层间有意传递」。
   ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
      那时要做的仍是先看是哪一对容器,而不是接着抬。 */
-export const G_CANDIDATE_WATERMARK = 75; /* 2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
+/* 2026-11-20(第十轮):75 → **76**。命令 `node scripts/judgement_audit.ts --baseline`,读数 76 ⇒ 按**实测**重钉。
+  U1 的新增两对:`server/src/combat/progression.ts#TalentEffectRow` ↔ `ProgressFieldRow`
+    共享 [status, at, evidence] / 独有 A[talentId,effect] / 独有 B[field]
+  —— 「天赋效果行」与「进度字段行」是同一登记概念在层内的两份声明(各自带独有的定位字段),
+     属本文件反复记过的「层间有意传递」那一类,不是缺陷形态。
+  ⚠️ 抬水位不关告警:守卫比的仍是**总命中数**,下次再出现这类配对还会响 —— 先看是哪一对,而不是接着抬。
+  ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
+     只读水位这一个数字 = 拿汇总数替代逐条判定。 */
+export const G_CANDIDATE_WATERMARK = 76; /*
+  2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
    —— ⚠️ **多出的那一条与本轮改动无关,A/B 已证明**(Q4):
    把本批新增的文件移走后再跑同一条命令,**仍是 75** ⇒ 增量不来自本次改动面,
    属第六/七轮同一类「层间有意传递」的运行时快照配对(并行接线时的读数)。

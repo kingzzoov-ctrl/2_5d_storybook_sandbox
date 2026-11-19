@@ -349,14 +349,16 @@ function main(): void {
    * ★ 第十轮 P1:这条"一键两义"此前**任何文档都没写**(PLAY.md 与提示条都只说
    *   「空格 攻击」),而它有两个后果:
    * ```
-   * 1 玩家以为空格是跳   ⇒ 其实只挥了一刀(跳跃锁存被上行送出去,服务端
-   *                        `parseMoveIntent` **不认这个字段、直接丢掉**,不报错)
+   * 1 玩家以为空格是跳   ⇒ 对,但整条链是异步的:客户端只**锁存**一次 `jump: true`
+   *                        随下一条移动命令上行,能不能起跳由世界侧裁决(见下)
    * 2 玩家以为空格是攻击 ⇒ 对,但每按一次还夹带一条带 `jump:true` 的移动命令
    * ```
    * ⇒ 本轮**如实写清**(PLAY.md 的键位表 + `client/index.html` 的提示条都点名),
    *   不拆键位:拆会把「空格 = 攻击」这条已被玩家与 `WS-FND-16`/`WS-FND-113`
-   *   钉住的行为无声改掉,而跳跃的末端仍是空的(服务端不接)—— 那是服务端的事,
-   *   客户端不替它假装。见 `net/input.ts` 的 `jumpLatched` 注释。
+   *   钉住的行为无声改掉。跳跃的末端**已接通**(此前这里是「服务端不接」,那句是错的):
+   *   `server/src/net/ws_server.ts#parseMoveIntent`(只收字面 `true`)→ `applyJumpIntent`
+   *   → `WorldSim.tryPlayerJump`,结果(含拒绝理由)记进 `lastJumpReport`;
+   *   判据 `tests/WS-FND-122-protocol-exits.test.ts`。见 `net/input.ts` 的 `jumpLatched` 注释。
    */
   window.addEventListener('keydown', (ev) => {
     /* ★ 第七轮审计 P2:搜索框里打空格应当是"空格",不是"挥一刀"。
@@ -592,9 +594,10 @@ function main(): void {
        `seq` 写进下行包头 `ackedSeq`,客户端据此剪 `pending`。漏了它的症状是
        「移动照常、永不剪枝」,而两端**都不报错**(TASK-100 实测:生产者此前不存在)。 */
     if (session !== null) {
-      /* ★ WS-FND-113:`jump` 在这里**有出口**了(此前 `InputSource` 的锁存永远发不出去)。
-         ⚠️ 末端仍是空的:服务端 `parseMoveIntent` 不认这个字段、会丢掉(不报错)——
-            要让它真的跳起来得改服务端那条路,本行只保证"它不再被客户端吞掉"。 */
+      /* ★ WS-FND-113:`jump` 在这里**有出口**(此前 `InputSource` 的锁存永远发不出去);
+         末端也已接通:`parseMoveIntent`(只收字面 `true`)→ `applyJumpIntent`
+         → `tryPlayerJump`,被拒写进 `lastJumpReport`(判据 `tests/WS-FND-122-protocol-exits.test.ts`)。
+         本行只负责**发出去**;能不能起跳是服务端的裁决,客户端不预判。 */
       session.sendMove({ tick: localTick, x: p.x, y: p.y, z: p.z, seq: cmd.seq, jump: cmd.jump });
     }
     /* ── HUD:连没连上 / 站在哪 / 附近有没有怪 / 最近一次命中 ──

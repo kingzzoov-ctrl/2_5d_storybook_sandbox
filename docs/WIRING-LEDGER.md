@@ -159,12 +159,22 @@ Get-ChildItem tests -Filter *.test.ts |
 
 ### 2.7 social 四段(`server/src/social/afk.ts`;手册 §6.4)
 
+> ★ **WS-FND-149 登记口径**:这一节四条的「现状」列**刻意保留 `未接`** —— 它们是
+> 「**预留·不做**」(登记写在**理由列** + `afk.ts` 每段标题的 `〔RESERVED〕` 标记里,
+> 不写成 `已登记`)。
+> 为什么不进 `已登记` 桶:`已登记` 指「已有白名单位置 / 由门禁按计算式归类」,
+> 而这四段**没有任何门禁位置**,桶计数 (`§2.10` / `README`) 按现状列实算 ——
+> 改成 `已登记` 会同时改三处数字,却不会让任何人多接一条。**欠账就是欠账。**
+> 判据:`tests/WS-FND-149-arch-hazards.test.ts`(FND149-1..4)双向钉住 ——
+> `RESERVED` 段必须**生产侧 0 引用**,`WIRED` 段(第 1 段"打盹攒露水",被
+> `world_sim.ts#setPlayerDozing` 消费)必须**真有消费者**。谁接线谁翻标记,当场提示。
+
 | ID | 段 | 符号 | 位置(符号锚) | 现状 | 理由 | 判据 |
 |---|---|---|---|---|---|---|
-| R6-SOC-1 | 水族箱 | `VIVARIUM` / `createVivarium` / `tickVivarium` / `WHITE_NOISE_MIX` | `social/afk.ts#createVivarium`(表 `#VIVARIUM`) | **未接** | 转播镜头序列与白噪音混音表齐备,但镜头要**客户端 renderer**、混音要音频宿主;`boot.ts` 不读 `VIVARIUM` | WS-11 |
-| R6-SOC-2 | 信箱 | `createMailbox` / `leaveMail` / `pruneMailbox` / `badgeFor` | `social/afk.ts#createMailbox` | **未接** | 需要「离线玩家存档容器 + 信箱 UI」;`net/room` 的存档只有 world / player 两块,没有第三个容器 | WS-11 |
-| R6-SOC-3 | 摊位 | `createStall` / `listItem` / `buyFromStall` / `suggestedPrice` | `social/afk.ts#createStall` | **未接** | ⚠️ 与 `world_sim.ts` 的 `stallStock` **同名异义**(那是百货摊位库存);交易没有动作入口(BUY / LIST 都不在 22 个动作里) | WS-11 |
-| R6-SOC-4 | 赛道 | `createTrack` / `trackStart` / `trackFinish` / `trackStandings` | `social/afk.ts#createTrack` | **未接** | ⚠️ 与 `party/modes.ts` 的 `RaceRuntime` 是**两套**赛道运行时(一套社交计时、一套竞技结算);竞技那套已接(§2.4 S5),**社交这套仍 0 调用者** | WS-11 |
+| R6-SOC-1 | 水族箱 | `VIVARIUM` / `createVivarium` / `tickVivarium` / `WHITE_NOISE_MIX` | `social/afk.ts#createVivarium`(表 `#VIVARIUM`) | **未接** | **预留·不做**(`afk.ts` 第 2 段 `〔RESERVED〕`):镜头序列表与白噪音混音表只是**参数**,真正"隐藏 UI 的微缩景观"要**客户端 renderer** 与音频宿主;`three/boot.ts` 不读 `VIVARIUM` ⇒ 缺的是一整个表现层,不是一条接线 | WS-11 · FND-149 |
+| R6-SOC-2 | 信箱 | `createMailbox` / `leaveMail` / `pruneMailbox` / `badgeFor` | `social/afk.ts#createMailbox` | **未接** | **预留·不做**(第 3 段 `〔RESERVED〕`):缺「离线玩家存档容器 + 信箱 UI」——`net/room` 的存档只有 world / player 两块,动作面也没有 MAIL 类动词 | WS-11 · FND-149 |
+| R6-SOC-3 | 摊位(上架行) | `createStall` / `listItem` / `buyFromStall` / `suggestedPrice` | `social/afk.ts#createStall` | **未接** | **预留·不做**(第 4 段 `〔RESERVED〕`)。★ **同名异义已改名消歧**:这四段是「上架行」模型(卖家 / 单价 / 跨房 5% 抽成),原来撞名的 `world_sim.ts#stallStock` 现名 **`depotStock`**(515 百货机的**库存**,`物品 id → 件数`);515 的成交权威只有 `systems/depot.ts`(幂等键 `CLOUD_DEPOT@ORDER:*`),且动作面没有 LIST / BUY ⇒ 本段不接 | WS-11 · FND-149 |
+| R6-SOC-4 | 赛道(社交展示) | `createTrack` / `trackStart` / `trackFinish` / `trackStandings` | `social/afk.ts#createTrack` | **未接** | **预留·不做**(第 5 段 `〔RESERVED〕`)。★ **两套赛道边界已裁决**(写在 `party/modes.ts` §5 与 `afk.ts` 第 5 段):`party/modes.ts#RaceRuntime` = **玩法与结算**的唯一权威(发奖 / 播报 / `PartySettlement`);本段 = **罚时视图**(风筝 Boss 追上 +3s 后的耗时),**没有 `tick`** ⇒ 两者不可能同时推进同一 tick;毫秒表共用 `party/scoring.ts#RaceTimer` | WS-11 · FND-149 |
 
 ### 2.8 shared(`shared/**`)
 

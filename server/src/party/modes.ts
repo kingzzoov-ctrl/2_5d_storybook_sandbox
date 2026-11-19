@@ -727,6 +727,29 @@ export function settlePaintWar(r: PaintWarRuntime): PartySettlement {
 
 /* ═══════════════════════ 5. 跑酷 / 马拉松毫秒计时 ═══════════════════════ */
 
+/*
+ * ★ **赛道运行时的唯一权威(WS-FND-149 边界裁决)**
+ *
+ * 仓库里有两个"赛道运行时":本段的 `RaceRuntime`(`party/modes.ts`)与
+ * `social/afk.ts#TrackRuntime`(马拉松 / 风筝 Boss 跑道的罚时计时)。两者**并存是刻意的**,
+ * 但它们不是平级的两套 —— 边界三条,各自有能抓回归的判据
+ * (`tests/WS-FND-149-arch-hazards.test.ts`):
+ *
+ * 1 **结算权在本段**:发奖 / 播报 / `PartySettlement` 只有这里产出
+ *   (`podiumBroadcast` / `rewardsForPlayers` / `pushBroadcast` 都只在本文件出现);
+ *   `social/afk.ts` 的 import 表里没有这三样,它的赛道段也不定义 `RewardLine` /
+ *   `PartySettlement` ⇒ **不存在第二条结算链**。
+ * 2 **推进权只有一处**:本段的相位由 `tickPartyContest`(`sim/world_sim.ts` 慢帧)推进;
+ *   `social/afk.ts` 的赛道**没有 `tick`**(只有 `trackStart` / `trackFinish` 两个被动计时口)
+ *   ⇒「两套同时推进同一 tick」在结构上不可能。
+ * 3 **同一只毫秒表**:两套都用 `party/scoring.ts#RaceTimer`
+ *   (`createRaceTimer` / `gateStart` / `podiumFinish` / `rankRace`),谁也不许自带第二套时钟
+ *   (毫秒口径分叉 = 同一场比赛两个成绩)。
+ *
+ * ⇒ 一句话:`RaceRuntime` 是**玩法与结算**的赛道,`afk.ts#TrackRuntime` 是**罚时视图**
+ *   (风筝 Boss 追上 +3s 后的耗时展示)。要合并就先删掉一方,不要给两边各加一个 tick。
+ */
+
 export interface RaceRuntime {
   mode: PartyModeRuntime;
   timers: Map<string, RaceTimer>;
@@ -738,6 +761,9 @@ export interface RaceRuntime {
 /**
  * 独立跑酷计时赛(借用 BRIDGE_CTF 的配置骨架但覆盖时长)。
  * 411 起点门 + 412 领奖台为本模式的核心联动件。
+ *
+ * ★ 这是**玩法与结算**的赛道:发奖 / 播报 / `PartySettlement` 只从本运行时出;
+ *   `social/afk.ts#TrackRuntime` 是它的**罚时视图**,不结算(边界见本节开头的裁决)。
  */
 export function createRaceRun(clock: Clock, refereeId: string, raceSec = 90, seed = 55): RaceRuntime {
   const mode = createPartyMode({ key: PARTY_MODE_KEY.BRIDGE_CTF, clock, refereeId, seed });

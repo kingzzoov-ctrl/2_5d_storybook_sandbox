@@ -1,7 +1,7 @@
-# TASK-96 动作执行层:**未接线的 17 个 `RoomAction` 各自缺什么**
+# TASK-96 动作执行层:**未接线的 `RoomAction` 各自缺什么**
 
 > 判据来源:`docs/COMPLETION-CRITERIA.md` 档 B 的
-> 「22 个 `RoomAction` 中,**该有执行层的那些**真的执行」。
+> 「`RoomAction` 全表里,**该有执行层的那些**真的执行」。
 >
 > 本文回答的是那句里的**「那些」**:逐个动作说明它**有没有执行层**、
 > 以及**没有的话缺什么**。`tests/WS-FND-18` 会读本文件核对:
@@ -12,8 +12,12 @@
 > ① 已接的直接调宿主方法并把返回值翻译成回执;
 > ② 未接的**显式** `kind:'NOT_IMPLEMENTED'` + 理由(消灭静默成功);
 > ③ `OK` 必须带 `effect`。
+> ⚠️ **计数口径**:动作总数与「已接线」条数**不在本文手抄** —— 真值源是
+> `server/src/net/actions/action_table.ts#ACTION_HANDLERS`(`Readonly<Record<RoomAction, …>>`,
+> 编译期完整性:漏一个成员 tsc 报缺键)与 `tests/WS-FND-18`(逐动作归类,总数从代码取)。
+> 本文只负责**名字与缺口**;加动作时那两个地方先绿,本文再补一行。
 
-## 已接线(21 / 23)
+## 已接线(逐波列在下面;总数从 `ACTION_HANDLERS` 取,不手抄)
 
 | 动作 | 落点 | 说明 |
 |---|---|---|
@@ -123,6 +127,11 @@
 3 料理 11 个字段里**只有 `hpFlat` 与即时回复**真的到达玩家(`hpFlat` 经 `maxHpForLevel` 并进上限);
    `gravityMul`(冻结层 `integrateVertical` 无参数位)/ `gatherMul`(本仓无采集系统)/ `jumpMul`(无跳跃入口)
    / `defFlat`·`moveMul`·`gravityMul`·`jumpMul`·`gatherMul`·`expMul` **仍是未接**。
+
+   ★ **2026-11-19 更正**:上面这份「未接」清单里的 **`jumpMul` 已不成立** ——
+   `parseMoveIntent.jump` → `applyJumpIntent` → `WorldSim.tryPlayerJump` →
+   `physics/world.ts#jump` 这条链把 `jumpMul` 结算掉了(判据 `WS-FND-122`);
+   `gatherMul` 的缺口**仍然成立**(本仓没有采集子系统,冻结层也没有采集参数位)。
    ★ 2026-11-15 更新:`atkMul` / `critRate` / `critDmg` **已经进战斗管线**
    (`world_sim.ts` 的 `combatantStats` 第三参由 `combat/cooking.ts` 的 `foodCombatInput` 换算;
    ⚠️ 两侧约定不同,`critDmg` 必须 `-1` 换算 —— 直接传会把伤害从 14 抬到 24,这条由 `WS-FND-39` FND39-11/12 钉住)。
@@ -207,8 +216,8 @@
   (`shared/constants/items.ts:120` 只写"连射队友 3 发")⇒ **等平衡裁决**;
 3 **`forgeUnlocked`** —— `shared/constants/items.ts` 检索 `forge` / `tier` 命中 **0**,
   没有"中高级锻造"的分档可解锁 ⇒ **等内容分档裁决**;
-4 **`defFlat` / `moveMul` / `gravityMul` / `jumpMul` / `gatherMul` / `expMul`** —— 冻结层无参数位
-  或全仓无该子系统(采集 / 跳跃),逐条见上一节;
+4 **`defFlat` / `gatherMul` / `expMul`**(`moveMul` / `gravityMul` / `jumpMul` 已在 `WS-FND-77` /
+  `WS-FND-122` 接线,见上一节更正) —— 冻结层无参数位 或 全仓无该子系统(采集);
 5 **227 浇灭 coop 工位**(`rush_order.ts` 的 `STATION_STATE.BURNING` / `opts.spraying`)——
   工位槽位**没有世界坐标**,`opts.spraying` 只能按"种类"喂 ⇒ 玩家动作无法映射到它(设计缺口)。
 
@@ -227,7 +236,7 @@ M11(把按物种去重加回 `trySpawnOne`)⇒ 只有 FND19-10 红 —— 那正
 **仍未做**:刷满 `BIOME_SPAWN.hardCap` **没有被判据覆盖**(那要靠世界时间,断言它等于让套件等十分钟)
 ⇒ 本批只钉"契约允许同物种多只 + 刷怪路径真的会刷出第二只",不声称"能刷满"。
 
-## 未接线(2 / 23)
+## 未接线(按设计只剩两条:走专用报文通道的那两个)
 
 ### 一、**有专用报文通道**、但**不走 `action` 通道**(2 个)
 
@@ -245,7 +254,7 @@ M11(把按物种去重加回 `trySpawnOne`)⇒ 只有 FND19-10 红 —— 那正
 
 ```
 tests/WS-FND-18
-  FND18-1  22 个动作必须由 dispatchAction 逐个归类(不交、不重、全覆盖)
+  FND18-1  每个动作必须由 dispatchAction 逐个归类(不交、不重、全覆盖;总数从代码取,不写死)
   FND18-2  未接线的必须显式 NOT_IMPLEMENTED + reason 非空 + **出现在本文件里**
   FND18-3  已接线的回 OK 时必须带 effect(不留"回 OK 却无副作用")
   FND18-4  越权必须先被权限闸拦下(类别为 PERMISSION,不是 INVALID/NOT_IMPLEMENTED)

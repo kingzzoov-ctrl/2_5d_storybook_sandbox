@@ -66,9 +66,14 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 | 左上角状态条 | 连接态 / 坐标 / 附近的生物 / 最近一次命中 / **最近一次动作** / **最近物品** |
 
 ⚠️ **空格是"一键两义",这里如实写明**:它既**攻击**(上面那条),又会在
-`net/input.ts` 里**锁存一次跳跃**(`jump: true` 随下一条移动命令上行)。
-而服务端的 `parseMoveIntent` **不认这个字段、直接丢掉**(不报错)⇒
-**今天按空格只是挥了一刀,不会真的跳**。跳跃的末端是空的(要落地得改服务端那条路)。
+`net/input.ts` 里**锁存一次跳跃**(`jump: true` 随下一条移动命令上行,**恰好一条**)。
+服务端**认这个字段**(`ws_server.ts#parseMoveIntent`:只接受字面 `true`)⇒
+`RoomRuntime.applyMove` 里转成 `applyJumpIntent` → `WorldSim.tryPlayerJump`,
+「能不能起跳」(不在空中 / 冷却未到)只在**世界侧一处**判,`jumpMul` 在
+`physics/world.ts#jump` 结算,结果记进 `lastJumpReport`(被拒带理由,不静默)。
+⇒ **今天按空格 = 真的挥一刀 + 真的起跳**(判据 `tests/WS-FND-122-protocol-exits.test.ts`)。
+⚠️ 代码注释 / 提示文案**滞后于本节**是可能的(它们改得比手册慢)⇒ **以本节为准**;
+发现哪里还写着「服务端不认 jump」,按本节的链路核对一遍再改那一处。
 
 ⚠️ **`Q` / `G` / `F` / `N` / `T` / `2` / `3` / `4` 都有一个前置:必须"碰过一件东西"**。
 它们要一个物品 id,而客户端**没有按件背包明细**(快照里只有总量;`heldItemId` 恒 0)

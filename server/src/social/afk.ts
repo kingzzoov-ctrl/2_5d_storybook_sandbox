@@ -1,12 +1,32 @@
 /**
  * WS-11 · 社交、打盹与度假子系统(设计手册 §6.4)
  *
- * 覆盖:
- *  1. 切后台 5 秒自动打盹 + 按注入时钟攒「梦境露水」(物品 130);
- *  2. 生态缸挂机模式:隐藏 UI 的微缩景观运镜 + 白噪音混音参数表;
- *  3. 534 迎宾点赞留言信箱:离线留言、贴纸贺卡与礼物;
- *  4. 515 无人自助售货摊:定价、上架、跨房交易结算与抽成;
- *  5. 风筝 Boss 跑道与马拉松跑道毫秒计时。
+ * ## 接线状态(★ 唯一处:每段标题里的 `〔WIRED〕` / `〔RESERVED〕` 标记)
+ *
+ * | 段 | 标记 | 生产入口 / 缺什么 |
+ * |---|---|---|
+ * | 1 打盹攒露水(物品 130) | `〔WIRED〕` | `sim/world_sim.ts#setPlayerDozing`(装配层 `sleepSource` 注入)+ `#tickPartyStep` 慢帧 `tickAfk` |
+ * | 2 生态缸挂机(运镜 + 白噪音) | `〔RESERVED〕` | 缺**客户端**:镜头要 renderer、混音要音频宿主;`three/boot.ts` 不读 `VIVARIUM` |
+ * | 3 534 迎宾点赞留言信箱 | `〔RESERVED〕` | 缺**离线存档容器 + 信箱 UI**;`net/room` 的存档只有 world / player 两块,动作面也没有 MAIL 类动词 |
+ * | 4 515 无人自助售货摊(**上架行**) | `〔RESERVED〕` | 缺 LIST / BUY 动作;且 515 的**成交权威不在本文件**(`systems/depot.ts` + `world_sim.ts#depotStock`) |
+ * | 5 马拉松 / 风筝 Boss 跑道计时 | `〔RESERVED〕` | 玩法赛道的权威在 `party/modes.ts#RaceRuntime`(见下「两套赛道」);本段只做罚时后的耗时展示 |
+ *
+ * ⇒ **第 2~5 段是「预留·不做」**:有实现、有单元判据,但**生产消费者 0 处**。
+ *   不要把第 2~5 段当成「已可用的接口」来引用 —— 要接,先补上面那一列写明的宿主
+ *   (客户端 renderer / 音频宿主 / 离线存档 / 动作面),并**同时**做两件事:
+ *   ① 把该段标题的标记改成 `〔WIRED:<文件#符号>〕`;② 在 `docs/WIRING-LEDGER.md §2.7`
+ *   的理由列写调用点。判据 `tests/WS-FND-149-arch-hazards.test.ts` 是**双向**的:
+ *   `RESERVED` 段必须 0 生产消费者,`WIRED` 段必须真有消费者 —— 只改一边当场红。
+ *
+ * ## 两条**同名边界**(别合并)
+ *
+ * · **摊位(515)**:本文件的 `Stall` 是「**上架行**」模型(卖家 / 单价 / 跨房 5% 抽成);
+ *   `world_sim.ts#depotStock`(`物品 id → 件数`)是 515 那台百货机的**库存**。
+ *   两者共用 515 这件家具,**不是同一个模型**;515 的成交权威只有 `systems/depot.ts`
+ *   (幂等键 `CLOUD_DEPOT@ORDER:*`),本文件不参与成交。
+ * · **赛道**:本文件的 `TrackRuntime` 只做「罚时后耗时排名」的**展示**(不发奖、不播报、
+ *   没有自己的 `tick`);带结算 / 发奖 / 全房播报的权威是 `party/modes.ts#RaceRuntime`。
+ *   ⇒ 同一 tick 只准推进**一套**;两侧都不许给对方加推进口(判据见 WS-FND-149)。
  *
  * 时间一律来自注入的 `Clock`;不使用任何系统时钟或真 sleep。
  */
@@ -24,7 +44,14 @@ import {
 import { ITEM_BY_ID } from '../../../shared/constants/items.ts';
 import { AFK_EXP_RATIO } from '../../../shared/types/entities.ts';
 
-/* ═══════════════════════ 1. 打盹与梦境露水 ═══════════════════════ */
+/* ═══════════ 1. 打盹与梦境露水 〔WIRED:world_sim.ts#setPlayerDozing〕 ═══════════ */
+/*
+ * 生产链:装配层 `sleepSource` → `world_sim.ts#stepDozingEntry` → `#setPlayerDozing`
+ * → 本文件的 `goBackground` / `tickAfk`(慢帧 2Hz,`dt = SIM_SLOW_DT = 0.5s`,
+ * 与 `tickAfk` 自己写的「推荐 0.5s」逐值吻合)。
+ * ⚠️ 与 `room.ts` 的「在场 AFK」**不是同一件事**:那是**连接态**(30 分钟占席位、仍算 online),
+ * 本条是**玩法态**(切后台攒露水)。两套时间线各自独立,名字撞了而已(不要互相顶替)。
+ */
 
 /** 切后台 5 秒即自动进入打盹。 */
 export const DOZE_AFTER_SEC = 5;
@@ -155,7 +182,12 @@ export function afkExpRatio(): number {
   return AFK_EXP_RATIO;
 }
 
-/* ═══════════════════════ 2. 生态缸挂机模式 ═══════════════════════ */
+/* ═══════════ 2. 生态缸挂机模式 〔RESERVED:缺客户端 renderer + 音频宿主,生产 0 消费者〕 ═══════════ */
+/*
+ * 预留·不做:镜头序列表(`VIVARIUM_CAMERA_SHOTS`)与混音表(`WHITE_NOISE_MIX`)只是**参数**,
+ * 「隐藏 UI 的微缩景观」要 `three/boot.ts` 的相机与音频总线 —— 两者都在客户端。
+ * ⇒ 别把 `tickVivarium` 读成「运镜已生效」:它只算 `masterGain` / `shotIndex` 两个数,没有画面。
+ */
 
 /** 隐藏 UI 后的微缩景观运镜轨道。 */
 export const VIVARIUM_CAMERA_SHOTS = ['ORBIT_SLOW', 'DOLLY_IN', 'TILT_DOWN', 'MACRO_LEAF', 'SUNSET_RIM'] as const;
@@ -240,7 +272,12 @@ export function exitVivarium(v: VivariumState): void {
   v.masterGain = 0;
 }
 
-/* ═══════════════════════ 3. 534 迎宾点赞留言信箱 ═══════════════════════ */
+/* ═══════════ 3. 534 迎宾点赞留言信箱 〔RESERVED:缺离线存档容器 + 信箱 UI,生产 0 消费者〕 ═══════════ */
+/*
+ * 预留·不做:留言要有**跨会话**的落点(`net/room` 的存档只有 world / player 两块,
+ * 没有第三个容器),还要玩家能点的 MAIL 类动作(22 个动作里没有)。
+ * ⇒ `leaveMail` / `likeMail` 今天只有套件在调,「信箱」在生产里不存在。
+ */
 
 export const MAILBOX_ITEM_ID = 534;
 export const MAILBOX_CAPACITY = 50;
@@ -314,7 +351,19 @@ export function pruneMailbox(mb: Mailbox, nowSec: number): number {
   return before - mb.items.length;
 }
 
-/* ═══════════════════════ 4. 515 无人自助售货摊 ═══════════════════════ */
+/* ═══════════ 4. 515 无人自助售货摊(上架行)〔RESERVED:缺 LIST/BUY 动作,生产 0 消费者〕 ═══════════ */
+/*
+ * ★ **同名不同物**(本文件唯一一处与 `world_sim.ts` 撞过名的地方,已改名消歧):
+ *   · 本段 = 「**上架行**」模型:`StallListing` 带 `sellerId` / `price` / `listedAtSec`,
+ *     `Stall` 记 `revenue` / `feePaid`(跨房 5% 抽成)—— 语义是**玩家自发摆摊**;
+ *   · `world_sim.ts#depotStock`(`物品 id → 件数`)= 515 那台**百货机**的库存,
+ *     成交走 `systems/depot.ts#buyOnce`,幂等键 `CLOUD_DEPOT@ORDER:<订单号>`。
+ *   ⇒ 两段共用 515 这件家具、**不是同一个模型**,也不许互喂:本段的 `StallListing[]`
+ *     不进 `depotStock`,`depotStock` 也不进 `Stall`。判据 `tests/WS-FND-149`:
+ *     两侧符号集交集必须为空,且 `suggestedPrice` / `buyFromStall` / `listItem` /
+ *     `createStall` 的生产引用必须是 0(515 的定价与成交只有 depot 一份权威)。
+ *   ⇒ 预留·不做:摆摊要有 LIST / BUY 动作面,今天的动作面没有这两个动词。
+ */
 
 export const STALL_ITEM_ID = 515;
 export const STALL_SLOT_COUNT = 8;
@@ -405,7 +454,20 @@ export function buyFromStall(s: Stall, itemId: number, qty: number, crossRoom: b
   return { ok: true, itemId, qty: sold, gross, fee, net, reason: 'OK' };
 }
 
-/* ═══════════════════════ 5. 跑道计时 ═══════════════════════ */
+/* ═══════════ 5. 跑道计时(社交展示)〔RESERVED:玩法赛道权威在 party/modes.ts#RaceRuntime〕 ═══════════ */
+/*
+ * ★ **两套赛道运行时,边界三条**(判据 `tests/WS-FND-149-arch-hazards.test.ts`):
+ *   1 **结算权**:只有 `party/modes.ts#RaceRuntime` 能发奖 / 播报
+ *     (`podiumBroadcast` / `rewardsForPlayers` / `pushBroadcast`)。本文件的 import 表里
+ *     **没有**这三样,本段也不定义 `RewardLine` / `PartySettlement` —— 加一样就红;
+ *   2 **推进权**:本段**没有 `tick`**(它是被动的计时器口:`trackStart` / `trackFinish`),
+ *     所以「两套同时推进同一 tick」在结构上不可能;世界慢帧只推 `tickPartyContest`;
+ *   3 **同一只表**:两套的毫秒计时器都是 `party/scoring.ts#RaceTimer`
+ *     (`createRaceTimer` / `gateStart` / `podiumFinish` / `rankRace`),本文件不自带第二套时钟。
+ * ⇒ 本段是**玩法赛道结果的罚时视图**(风筝 Boss 追上 +3s 后的耗时),不是第二条结算链。
+ * ⇒ **预留·不做**:要真跑这条跑道,先接上面的玩法赛道(`RaceRuntime` 起跑 / 结算 / 发奖),
+ *   再把本段当**展示**读;今天它没有任何生产入口,`trackStart` / `trackFinish` 只有套件在调。
+ */
 
 export const TRACK_KIND = {
   MARATHON: 'MARATHON',

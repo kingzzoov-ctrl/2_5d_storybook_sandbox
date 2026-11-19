@@ -95,8 +95,10 @@ export class InputSource {
    * 修法是**给出口**(`MoveIntent.jump` → 上行报文),不是删掉锁存:
    * 删掉会让「空格 = 跳跃」这条已存在的行为无声消失,而它在
    * `tests/WS-FND-16` 的 FND16-2 里被钉着(零输入也发、jump 恰好锁存一次)。
-   * ⚠️ 出口的**末端**目前仍是空的:服务端 `parseMoveIntent` 不认识这个字段,
-   * 会把它**丢掉**(不报错)。要让它真的落地得改服务端那条路 —— 本文件不谎称已落地。
+   * ★ 末端**已接通**(此前这里写「服务端 `parseMoveIntent` 不认识、会丢掉」,那句已过时):
+   * `server/src/net/ws_server.ts#parseMoveIntent` 只接受**字面 `true`** → `applyJumpIntent`
+   * → `WorldSim.tryPlayerJump`(空中 / 冷却只在那里判),结果写进 `lastJumpReport`;
+   * 判据 `tests/WS-FND-122-protocol-exits.test.ts`。本文件只负责锁存,不替服务端裁决。
    */
   private jumpLatched = false;
 

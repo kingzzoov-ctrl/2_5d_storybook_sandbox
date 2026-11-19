@@ -1697,7 +1697,15 @@ export class WorldSim {
     ranchDropped: number;
   } | null = null;
   /**
-   * 无人自助售货摊(515)的库存:`物品 id → 件数`(世界世代的一部分)。
+   * 无人自助售货摊(515)的**百货机库存**:`物品 id → 件数`(世界世代的一部分)。
+   *
+   * ★ **改名消歧(WS-FND-149)**:本字段旧名 `stallStock` 与 `social/afk.ts` 的
+   * `Stall`(那是「**上架行**」模型:卖家 / 单价 / 跨房 5% 抽成)**同名不同物**。
+   * 现在两侧的名字**结构上不重叠**:本侧 = `depotStock` + `setStallStock` / `stallStockOf`
+   * (515 那台**百货机**的库存与成交,权威是 `systems/depot.ts#buy` / `#buyOnce`);
+   * afk 侧 = `createStall` / `listItem` / `buyFromStall` / `suggestedPrice`(预留,0 消费者)。
+   * 判据 `tests/WS-FND-149-arch-hazards.test.ts`:两侧符号集交集必须为空,
+   * 且 `private stallStock` / `this.stallStock` 在全仓必须 0 处(防改名回退)。
    *
    * ⚠️ 与它**成对**的购买幂等键**不在本文件**:修前那张私有表
    * (`committedPurchaseKeys`,`${actorId}#${itemId}#${frameCount}` 形状)已并入
@@ -1705,7 +1713,7 @@ export class WorldSim {
    * `systems/idempotency.ts`)—— 与牧场 / 炼金**同一把键、同一张表**,
    * 重置时一处清空就够(两张表各清一处、漏一处就是静默拒单)。
    */
-  private stallStock: Record<number, number> = {};
+  private depotStock: Record<number, number> = {};
   /** 最近一次牧场日结的**落货**账(哪些产出真的落到地上 / 哪些没物品 id)。 */
   private lastRanchDrop: { dropped: { itemId: number; count: number; x: number; y: number }[]; skipped: string[] } =
     { dropped: [], skipped: [] };
@@ -6271,10 +6279,10 @@ export class WorldSim {
     this.relayPlacedCount = 0;
     /* ★ WS-FND-77 / D-19:四系统与百货摊位的状态是**世界世代**的一部分 ——
        一起换代。漏掉 `roomSystemsState` 的后果是「重置后牧场还在按旧动物结算、
-       537 陈列还挂着上一局的冠名」;漏掉 `stallStock` 是「重置后摊位库存不刷新」。
+     537 陈列还挂着上一局的冠名」;漏掉 `depotStock` 是「重置后摊位库存不刷新」。
        两者都不报错,只是跨世代残留(与 `killLedger` / `mobOrdinals` 同一纪律)。 */
     this.roomSystemsState = createRoomSystemsState();
-    this.stallStock = {};
+    this.depotStock = {};
     /* ★ 幂等键表**不再单独清**:三把键(牧场日 / 炼金订单 / 百货订单)都住在
        `roomSystemsState.settled` 里,而它在上面刚被换成一张空台账 ⇒ 换代即清空。
        `roomDayIndex` 是键的一维,同样归零(否则新世界第一天被当成旧世界的重放)。 */
@@ -9224,7 +9232,13 @@ export class WorldSim {
 
   /* ── A-4 百货店(515 无人自助售货摊)── */
 
-  /** 摊位库存(装配层/管理动作注入;`物品 id → 件数`)。 */
+  /**
+   * 百货机库存(装配层/管理动作注入;`物品 id → 件数`)。
+   *
+   * ★ 名字保留 `setStallStock`(515「无人自助售货摊」这件家具的业务名,`net` 侧已有调用点),
+   * 但**字段**是 `depotStock` —— 与 `social/afk.ts#createStall` 的「上架行」模型**不是一个东西**。
+   * 见字段 `depotStock` 的 docblock 与 `tests/WS-FND-149-arch-hazards.test.ts`。
+   */
   setStallStock(stock: Readonly<Record<number, number>>): void {
     const next: Record<number, number> = {};
     for (const [k, v] of Object.entries(stock)) {
@@ -9233,12 +9247,12 @@ export class WorldSim {
       if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) continue;
       next[id] = Math.trunc(v);
     }
-    this.stallStock = next;
+    this.depotStock = next;
   }
 
-  /** 摊位库存快照(拷贝)。 */
+  /** 百货机库存快照(拷贝)。★ 不是 `social/afk.ts#Stall.listings`(上架行)。 */
   stallStockOf(): Record<number, number> {
-    return { ...this.stallStock };
+    return { ...this.depotStock };
   }
 
   /**
@@ -9255,7 +9269,7 @@ export class WorldSim {
    *   而「成交之后」才有意义的幂等/实测库存那几条判据需要一条走得通的价。
    */
   purchaseQuote(itemId: number, qty: number, table: PriceTable = CONTENT_PRICE_TABLE): BuyResult {
-    return buy({ itemId, qty, stock: this.stallStock, table });
+    return buy({ itemId, qty, stock: this.depotStock, table });
   }
 
   /**
@@ -9290,7 +9304,7 @@ export class WorldSim {
    * ## ★ 返回的 `stock` / `stockOfItem` 是**提交时**的实测值
    *
    * 不是 `purchaseQuote` 那张**旧快照**(它按报价那一刻的库存算)。两者在
-   * 「报价之后、提交之前库存又被动过」时会分叉;权威只有一个:`stallStock`。
+   * 「报价之后、提交之前库存又被动过」时会分叉;权威只有一个:`depotStock`。
    *
    * @param opts.actorId 发起者(退化形态的键的一维;缺省 ⇒ 见上)
    * @param opts.orderId 订单号(给了就以它为准,不再看 actorId / tick)
@@ -9317,25 +9331,25 @@ export class WorldSim {
     const once = buyOnce(this.roomSystemsState.settled, {
       itemId,
       qty,
-      stock: this.stallStock,
+      stock: this.depotStock,
       table: opts.table ?? CONTENT_PRICE_TABLE,
       orderId,
     });
     if (!once.accepted) {
-      /* 重放 或 `buy` 被拒:两条路都**不做任何写入**(`stallStock` 一位不动)。 */
+      /* 重放 或 `buy` 被拒:两条路都**不做任何写入**(`depotStock` 一位不动)。 */
       return {
         ok: false, cost: 0, replayed: once.replayed, reason: once.reason,
-        stock: { ...this.stallStock },
-        stockOfItem: this.stallStock[itemId] ?? 0,
+        stock: { ...this.depotStock },
+        stockOfItem: this.depotStock[itemId] ?? 0,
       };
     }
     const r = once.result;
-    this.stallStock = r.stock;
+    this.depotStock = r.stock;
     return {
       ok: true, cost: r.cost, replayed: false, reason: r.reason,
-      /* 实测:提交后的 `stallStock`(权威),不是 `purchaseQuote` 的旧快照。 */
-      stock: { ...this.stallStock },
-      stockOfItem: this.stallStock[itemId] ?? 0,
+      /* 实测:提交后的 `depotStock`(权威),不是 `purchaseQuote` 的旧快照。 */
+      stock: { ...this.depotStock },
+      stockOfItem: this.depotStock[itemId] ?? 0,
     };
   }
 

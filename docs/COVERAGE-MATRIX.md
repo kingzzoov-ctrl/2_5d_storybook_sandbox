@@ -38,12 +38,12 @@ node scripts/coverage-matrix.ts --write    # 重写 §1/§2/§3 三块(保留人
 三档判据的**定义**在 `scripts/coverage-matrix.ts` 文件头(含优先级与边界),这里只抄结果:
 
 <!-- GEN:STATS:BEGIN -->
-total = 2307
-behavior = 1204
-symbol-only = 13
-none = 1090
-none-prodref-positive = 276
-none-prodref-zero = 814
+total = 2322
+behavior = 1215
+symbol-only = 12
+none = 1095
+none-prodref-positive = 275
+none-prodref-zero = 820
 src-files = 100
 <!-- GEN:STATS:END -->
 
@@ -102,283 +102,281 @@ none-prodref-zero      连生产引用也没有 ⇒ 多是"本文件内部用"�
 | 10 | `server/src/net/ws_server.ts:HelloFrame` | type | 2 | 待补 |
 | 11 | `server/src/net/ws_server.ts:WsServerHandle` | type | 0 | 待补 |
 | 12 | `server/src/party/actions.ts:gateCrownKnock` | value | 2 | 无需(WS-FND-120 断言生产源码里出现 gateCrownKnock( —— 判接线) |
-| 13 | `server/src/party/actions.ts:gatePrank` | value | 3 | 无需(WS-FND-120 断言生产源码里没有 gatePrank( —— 判它的缺席) |
-| 14 | `server/src/alchemy/attributes.ts:NormalSpec` | value | 1 | 待补 |
-| 15 | `server/src/alchemy/attributes.ts:PowerMeanBreakdown` | value | 1 | 待补 |
-| 16 | `server/src/alchemy/attributes.ts:QualityBreakdown` | value | 1 | 待补 |
-| 17 | `server/src/alchemy/attributes.ts:ReactionHit` | value | 1 | 待补 |
-| 18 | `server/src/alchemy/attributes.ts:ReactionRule` | value | 1 | 待补 |
-| 19 | `server/src/alchemy/attributes.ts:RollBreakdown` | value | 1 | 待补 |
-| 20 | `server/src/alchemy/attributes.ts:RollOutcome` | value | 4 | 待补 |
-| 21 | `server/src/alchemy/attributes.ts:RollRequest` | value | 1 | 待补 |
-| 22 | `server/src/alchemy/attributes.ts:S_LOGIC_CEIL` | value | 11 | 待补 |
-| 23 | `server/src/alchemy/attributes.ts:S_LOGIC_FLOOR` | value | 15 | 待补 |
-| 24 | `server/src/alchemy/attributes.ts:SliceBreakdown` | value | 1 | 待补 |
-| 25 | `server/src/alchemy/attributes.ts:WEIGHT_SUM_TOLERANCE` | value | 3 | 待补 |
-| 26 | `server/src/alchemy/cache.ts:BuildRowInput` | value | 1 | 待补 |
-| 27 | `server/src/alchemy/cache.ts:CacheEntry` | value | 1 | 待补 |
-| 28 | `server/src/alchemy/cache.ts:CacheStats` | value | 3 | 待补 |
-| 29 | `server/src/alchemy/cache.ts:DEFAULT_DISCOVERER` | value | 3 | 待补 |
-| 30 | `server/src/alchemy/cache.ts:LlmClient` | value | 4 | 待补 |
-| 31 | `server/src/alchemy/cache.ts:RecipeCache` | value | 3 | 待补 |
-| 32 | `server/src/alchemy/cache.ts:RecipeCacheOptions` | value | 1 | 待补 |
-| 33 | `server/src/alchemy/cache.ts:RecipeStore` | value | 3 | 待补 |
-| 34 | `server/src/alchemy/cache.ts:SQL_BUMP_COUNT` | value | 1 | 待补 |
-| 35 | `server/src/alchemy/cache.ts:SQL_GET_RECIPE` | value | 1 | 待补 |
-| 36 | `server/src/alchemy/cache.ts:SQL_TOP_GALLERY` | value | 1 | 待补 |
-| 37 | `server/src/alchemy/cache.ts:StubLlmOptions` | value | 1 | 待补 |
-| 38 | `server/src/alchemy/cache.ts:emptyStats` | value | 1 | 待补 |
-| 39 | `server/src/alchemy/degrade.ts:CARRIER_WORD` | value | 1 | 待补 |
-| 40 | `server/src/alchemy/degrade.ts:ColorTriple` | value | 1 | 待补 |
-| 41 | `server/src/alchemy/degrade.ts:DegradeRequest` | value | 1 | 待补 |
-| 42 | `server/src/alchemy/degrade.ts:DegradeResult` | value | 1 | 待补 |
-| 43 | `server/src/alchemy/degrade.ts:FALLBACK_RULE` | value | 1 | 待补 |
-| 44 | `server/src/alchemy/degrade.ts:MECHANIC_WORD` | value | 1 | 待补 |
-| 45 | `server/src/alchemy/degrade.ts:NEUTRAL_AFFINITY` | value | 2 | 待补 |
-| 46 | `server/src/alchemy/degrade.ts:NameParts` | value | 1 | 待补 |
-| 47 | `server/src/alchemy/degrade.ts:PromptMaterialLike` | type | 3 | 待补 |
-| 48 | `server/src/alchemy/degrade.ts:SILHOUETTE_NOUN` | value | 1 | 待补 |
-| 49 | `server/src/alchemy/degrade.ts:SILHOUETTE_RULES` | value | 1 | 待补 |
-| 50 | `server/src/alchemy/degrade.ts:SILHOUETTE_WEIGHTS` | value | 1 | 待补 |
-| 51 | `server/src/alchemy/degrade.ts:SilhouetteRule` | value | 1 | 待补 |
-| 52 | `server/src/alchemy/degrade.ts:TAG_COLOR` | value | 1 | 待补 |
-| 53 | `server/src/alchemy/degrade.ts:composeLore` | value | 1 | 待补 |
-| 54 | `server/src/alchemy/degrade.ts:composeName` | value | 1 | 待补 |
-| 55 | `server/src/alchemy/degrade.ts:pickAura` | value | 1 | 待补 |
-| 56 | `server/src/alchemy/degrade.ts:pickColor` | value | 1 | 待补 |
-| 57 | `server/src/alchemy/degrade.ts:pickElement` | value | 1 | 待补 |
-| 58 | `server/src/alchemy/degrade.ts:selectSilhouetteRule` | value | 1 | 待补 |
-| 59 | `server/src/alchemy/degrade.ts:tagsOf` | value | 1 | 待补 |
-| 60 | `server/src/alchemy/gate.ts:AffinityBreakdown` | value | 1 | 待补 |
-| 61 | `server/src/alchemy/gate.ts:DEW_RELEASE_QUALITY_PENALTY` | value | 1 | 待补 |
-| 62 | `server/src/alchemy/gate.ts:DewRelease` | value | 1 | 待补 |
-| 63 | `server/src/alchemy/gate.ts:GateCode` | value | 1 | 待补 |
-| 64 | `server/src/alchemy/gate.ts:GateRequest` | value | 1 | 待补 |
-| 65 | `server/src/alchemy/gate.ts:GateResult` | value | 7 | 待补 |
-| 66 | `server/src/alchemy/gate.ts:REJECT_SUBJECT` | value | 1 | 待补 |
-| 67 | `server/src/alchemy/gate.ts:S_LOGIC_BASE` | value | 2 | 待补 |
-| 68 | `server/src/alchemy/gate.ts:S_LOGIC_CEIL` | value | 9 | 待补 |
-| 69 | `server/src/alchemy/gate.ts:S_LOGIC_FLOOR` | value | 11 | 待补 |
-| 70 | `server/src/alchemy/gate.ts:S_LOGIC_SPAN` | value | 2 | 待补 |
-| 71 | `server/src/alchemy/gate.ts:clampNum` | value | 7 | 待补 |
-| 72 | `server/src/alchemy/gate.ts:collectTags` | value | 3 | 待补 |
-| 73 | `server/src/alchemy/gate.ts:isCarrierTag` | value | 2 | 待补 |
-| 74 | `server/src/alchemy/gate.ts:isMechanicTag` | value | 2 | 待补 |
-| 75 | `server/src/alchemy/index.ts:AlchemyService` | type | 3 | 待补 |
-| 76 | `server/src/alchemy/index.ts:ForgeResult` | type | 2 | 待补 |
-| 77 | `server/src/alchemy/index.ts:createAlchemyService` | value | 2 | 待补 |
-| 78 | `server/src/alchemy/pixel_icon.ts:CanvasTexturePayload` | value | 1 | 待补 |
-| 79 | `server/src/alchemy/pixel_icon.ts:IconBuildResult` | value | 3 | 待补 |
-| 80 | `server/src/alchemy/pixel_icon.ts:PALETTE_CHAR` | value | 1 | 待补 |
-| 81 | `server/src/alchemy/pixel_icon.ts:PALETTE_KEYS` | value | 3 | 待补 |
-| 82 | `server/src/alchemy/pixel_icon.ts:PALETTE_MEANING` | value | 1 | 待补 |
-| 83 | `server/src/alchemy/pixel_icon.ts:PixelMatrixCheck` | value | 3 | 待补 |
-| 84 | `server/src/alchemy/pixel_icon.ts:PixelMatrixProblem` | value | 1 | 待补 |
-| 85 | `server/src/alchemy/pixel_icon.ts:RasterResult` | value | 1 | 待补 |
-| 86 | `server/src/alchemy/pixel_icon.ts:Rgba` | value | 4 | 待补 |
-| 87 | `server/src/alchemy/pixel_icon.ts:TEXTURE_PIXEL_RATIO` | value | 1 | 待补 |
-| 88 | `server/src/alchemy/pixel_icon.ts:describePixelProblems` | value | 3 | 待补 |
-| 89 | `server/src/alchemy/pixel_icon.ts:normalizeHexColor` | value | 2 | 待补 |
-| 90 | `server/src/alchemy/pixel_icon.ts:parseHexColor` | value | 4 | 待补 |
-| 91 | `server/src/alchemy/prompt.ts:BuildUserPromptOptions` | value | 1 | 待补 |
-| 92 | `server/src/alchemy/prompt.ts:FewShot` | value | 1 | 待补 |
-| 93 | `server/src/alchemy/prompt.ts:MAX_LORE_LEN` | value | 1 | 待补 |
-| 94 | `server/src/alchemy/prompt.ts:MIN_ITEM_NAME_LEN` | value | 1 | 待补 |
-| 95 | `server/src/alchemy/prompt.ts:MIN_LORE_LEN` | value | 1 | 待补 |
-| 96 | `server/src/alchemy/prompt.ts:MechanicCorrection` | value | 1 | 待补 |
-| 97 | `server/src/alchemy/prompt.ts:PromptMaterial` | value | 6 | 待补 |
-| 98 | `server/src/alchemy/prompt.ts:SCHEMA_INVARIANTS` | value | 1 | 待补 |
-| 99 | `server/src/alchemy/prompt.ts:ValidationIssue` | value | 1 | 待补 |
-| 100 | `server/src/alchemy/prompt.ts:ValidationResult` | value | 1 | 待补 |
-| 101 | `server/src/alchemy/prompt.ts:buildFewShotMessages` | value | 1 | 待补 |
-| 102 | `server/src/alchemy/prompt.ts:describeMaterials` | value | 1 | 待补 |
-| 103 | `server/src/alchemy/prompt.ts:issueMessages` | value | 3 | 待补 |
-| 104 | `server/src/bosses/breaks.ts:BreakResult` | type | 4 | 待补 |
-| 105 | `server/src/bosses/phases.ts:BREAK_CRIT_BONUS` | value | 2 | 待补 |
-| 106 | `server/src/bosses/phases.ts:BossClone` | type | 5 | 待补 |
-| 107 | `server/src/bosses/raid.ts:LootOrb` | type | 2 | 待补 |
-| 108 | `server/src/bosses/raid.ts:OfferingPort` | type | 5 | 待补 |
-| 109 | `server/src/bosses/raid.ts:SummonWithOfferingRequest` | type | 4 | 待补 |
-| 110 | `server/src/bosses/raid.ts:SummonWithOfferingResult` | type | 4 | 待补 |
-| 111 | `server/src/bosses/runtime.ts:BossSnapshot` | type | 2 | 待补 |
-| 112 | `server/src/bosses/runtime.ts:BossTickReport` | type | 2 | 待补 |
-| 113 | `server/src/build/autotile.ts:isDoor` | value | 3 | 待补 |
-| 114 | `server/src/build/autotile.ts:isRoof` | value | 2 | 待补 |
-| 115 | `server/src/build/autotile.ts:isWall` | value | 1 | 待补 |
-| 116 | `server/src/build/autotile.ts:isWindow` | value | 3 | 待补 |
-| 117 | `server/src/build/blueprint.ts:BlueprintCell` | type | 3 | 待补 |
-| 118 | `server/src/build/blueprint.ts:EncodeStats` | type | 5 | 待补 |
-| 119 | `server/src/build/grid.ts:DIR_DX` | value | 10 | 待补 |
-| 120 | `server/src/build/grid.ts:DIR_DY` | value | 10 | 待补 |
-| 121 | `server/src/build/grid.ts:TileGridLike` | type | 21 | 待补 |
-| 122 | `server/src/build/rooms.ts:RoomIdentity` | type | 4 | 待补 |
-| 123 | `server/src/combat/cooking.ts:BIG_SHOVEL_ID` | value | 2 | 待补 |
-| 124 | `server/src/combat/cooking.ts:EXTINGUISH_RADIUS` | value | 4 | 待补 |
-| 125 | `server/src/combat/cooking.ts:KitchenState` | type | 3 | 待补 |
-| 126 | `server/src/combat/cooking.ts:PIZZA_OVEN_ID` | value | 5 | 待补 |
-| 127 | `server/src/combat/cooking.ts:createKitchenState` | value | 2 | 待补 |
-| 128 | `server/src/combat/cooking.ts:feedStation` | value | 3 | 待补 |
-| 129 | `server/src/combat/cooking.ts:tryCook` | value | 2 | 待补 |
-| 130 | `server/src/combat/damage.ts:AttackInput` | type | 1 | 待补 |
-| 131 | `server/src/combat/damage.ts:DEFAULT_UNARMED_KNOCKBACK` | value | 2 | 待补 |
-| 132 | `server/src/combat/damage.ts:DotTask` | type | 3 | 待补 |
-| 133 | `server/src/combat/damage.ts:skillZeroResult` | value | 3 | 待补 |
-| 134 | `server/src/combat/live_bubble.ts:LiveBubbleState` | type | 3 | 待补 |
-| 135 | `server/src/combat/live_bubble.ts:isTrapped` | value | 6 | 待补 |
-| 136 | `server/src/combat/progression.ts:PlayerProgress` | type | 9 | 待补 |
-| 137 | `server/src/combat/progression.ts:ShareResult` | type | 3 | 待补 |
-| 138 | `server/src/combat/revive.ts:ReviveResult` | type | 2 | 待补 |
-| 139 | `server/src/combat/vitals.ts:BLIND_VIEW_MUL` | value | 2 | 待补 |
-| 140 | `server/src/combat/vitals.ts:ELEMENT_RESIST_NEUTRAL` | value | 2 | 待补 |
-| 141 | `server/src/combat/vitals.ts:MobHitResult` | type | 3 | 待补 |
-| 142 | `server/src/combat/vitals.ts:PendingStrike` | type | 4 | 待补 |
-| 143 | `server/src/combat/vitals.ts:collectEventBlinds` | value | 2 | 待补 |
-| 144 | `server/src/combat/vitals.ts:collectEventStrikes` | value | 2 | 待补 |
-| 145 | `server/src/combat/vitals.ts:warnHitsPlayer` | value | 2 | 待补 |
-| 146 | `server/src/combat/weapons.ts:CombatantStats` | type | 3 | 待补 |
-| 147 | `server/src/combat/weapons.ts:SkillDef` | type | 11 | 待补 |
-| 148 | `server/src/combat/weapons.ts:WeaponDef` | type | 4 | 待补 |
-| 149 | `server/src/combat/weapons.ts:sanitizeComboMul` | value | 2 | 待补 |
-| 150 | `server/src/combat/weapons.ts:sanitizeMul` | value | 4 | 待补 |
-| 151 | `server/src/combat/wiring_ledger.ts:CombatWiringRow` | type | 2 | 待补 |
-| 152 | `server/src/content/registry.ts:ContentFingerprints` | type | 2 | 待补 |
-| 153 | `server/src/coop/rush_actions.ts:rushAcceptsDelivery` | value | 2 | 待补 |
-| 154 | `server/src/coop/rush_actions.ts:rushRewardCellOf` | value | 2 | 待补 |
-| 155 | `server/src/coop/rush_order.ts:Clock` | type | 24 | 待补 |
-| 156 | `server/src/coop/rush_order.ts:Rng` | type | 9 | 待补 |
-| 157 | `server/src/coop/rush_order.ts:RushOrderSession` | type | 6 | 待补 |
-| 158 | `server/src/coop/rush_order.ts:RushOrderState` | type | 3 | 待补 |
-| 159 | `server/src/coop/rush_order.ts:RushSessionSettlement` | type | 4 | 待补 |
-| 160 | `server/src/db/repo.ts:KeyParts` | type | 11 | 待补 |
-| 161 | `server/src/db/repo.ts:Row` | type | 25 | 待补 |
-| 162 | `server/src/db/repo.ts:TABLE_PRIMARY_KEYS` | value | 4 | 待补 |
-| 163 | `server/src/db/repo.ts:WorldArchiveBootCheck` | type | 2 | 待补 |
-| 164 | `server/src/db/repo.ts:clampInt` | value | 2 | 待补 |
-| 165 | `server/src/db/repo.ts:listRooms` | value | 2 | 待补 |
-| 166 | `server/src/db/repo.ts:loadVitalsFromUsers` | value | 2 | 待补 |
-| 167 | `server/src/db/repo.ts:setRoomStatus` | value | 4 | 待补 |
-| 168 | `server/src/events/bus.ts:EventPayload` | type | 2 | 待补 |
-| 169 | `server/src/mobs/behaviors.ts:BaseMobAi` | value | 2 | 待补 |
-| 170 | `server/src/mobs/behaviors.ts:MobRuntime` | type | 13 | 待补 |
-| 171 | `server/src/mobs/behaviors.ts:MobWorld` | type | 2 | 待补 |
-| 172 | `server/src/mobs/drops.ts:MobDropResult` | type | 2 | 待补 |
-| 173 | `server/src/mobs/fsm.ts:FsmConfig` | type | 1 | 待补 |
-| 174 | `server/src/mobs/fsm.ts:PROBE_LEN` | value | 1 | 待补 |
-| 175 | `server/src/mobs/geometry.ts:DEG` | value | 15 | 待补 |
-| 176 | `server/src/mobs/geometry.ts:WarnGeom` | type | 59 | 无需(类型导出:无可断言的运行时行为;生产引用按名字计数,只作类型位) |
-| 177 | `server/src/mobs/geometry.ts:WarnShape` | value | 7 | 待补 |
-| 178 | `server/src/mobs/geometry.ts:angleDiffDeg` | value | 3 | 待补 |
-| 179 | `server/src/mobs/geometry.ts:angleToDeg` | value | 6 | 待补 |
-| 180 | `server/src/mobs/geometry.ts:unit` | value | 15 | 待补 |
-| 181 | `server/src/mobs/host.ts:MobHostWorld` | type | 2 | 待补 |
-| 182 | `server/src/mobs/host.ts:MobTickResult` | type | 2 | 待补 |
-| 183 | `server/src/mobs/spawner.ts:MOB_INSTANCE_SEP` | value | 2 | 待补 |
-| 184 | `server/src/mobs/spawner.ts:SpawnContext` | type | 2 | 待补 |
-| 185 | `server/src/mobs/spawner.ts:mobDefOf` | value | 9 | 待补 |
-| 186 | `server/src/mobs/spawner.ts:mobSpeciesId` | value | 8 | 待补 |
-| 187 | `server/src/mobs/spawner.ts:spawnsPerCheck` | value | 2 | 待补 |
-| 188 | `server/src/mobs/taming.ts:petSlotsOfRoom` | value | 3 | 待补 |
-| 189 | `server/src/net/actions/action_table.ts:lookupActionHandler` | value | 2 | 待补 |
-| 190 | `server/src/net/actions/admin.ts:closeRoom` | value | 2 | 待补 |
-| 191 | `server/src/net/actions/admin.ts:setRoomAccess` | value | 2 | 待补 |
-| 192 | `server/src/net/actions/material.ts:pickupItem` | value | 2 | 待补 |
-| 193 | `server/src/net/actions/modify_town.ts:modifyTown` | value | 2 | 待补 |
-| 194 | `server/src/net/actions/open_chest.ts:ItemStack` | type | 1 | 待补 |
-| 195 | `server/src/net/actions/open_chest.ts:forgetChests` | value | 2 | 待补 |
-| 196 | `server/src/net/actions/open_chest.ts:ownChestContainers` | value | 2 | 待补 |
-| 197 | `server/src/net/actions/open_chest.ts:runChestAction` | value | 2 | 待补 |
-| 198 | `server/src/net/actions/place_automation.ts:forgetPlacements` | value | 2 | 待补 |
-| 199 | `server/src/net/actions/plant_crop.ts:plantSeedAt` | value | 2 | 待补 |
-| 200 | `server/src/net/actions/types.ts:ActionHandler` | type | 45 | 待补 |
-| 201 | `server/src/net/actions/use_alchemy_furnace.ts:forgetFurnaceClaims` | value | 2 | 待补 |
-| 202 | `server/src/net/actions/wire_edit.ts:wireEdit` | value | 2 | 待补 |
-| 203 | `server/src/net/anticheat.ts:Clock` | type | 24 | 待补 |
-| 204 | `server/src/net/anticheat.ts:InventoryCheckResult` | type | 2 | 待补 |
-| 205 | `server/src/net/anticheat.ts:InventoryOp` | type | 6 | 待补 |
-| 206 | `server/src/net/anticheat.ts:Verdict` | type | 3 | 待补 |
-| 207 | `server/src/net/anticheat.ts:Violation` | type | 3 | 待补 |
-| 208 | `server/src/net/anticheat.ts:mintItemSourceToken` | value | 2 | 待补 |
-| 209 | `server/src/net/room.ts:EffectValue` | type | 2 | 待补 |
-| 210 | `server/src/net/room.ts:ItemReadPort` | type | 5 | 待补 |
-| 211 | `server/src/net/schema.ts:removeBoss` | value | 2 | 待补 |
-| 212 | `server/src/net/schema.ts:removeWildlife` | value | 2 | 待补 |
-| 213 | `server/src/net/schema.ts:upsertBoss` | value | 2 | 待补 |
-| 214 | `server/src/net/ws_server.ts:startWsServer` | value | 3 | 待补 |
-| 215 | `server/src/party/actions.ts:REFEREE_DESK_STOP_MODE` | value | 3 | 待补 |
-| 216 | `server/src/party/actions.ts:gatePartyStart` | value | 2 | 待补 |
-| 217 | `server/src/party/modes.ts:BRIDGE_BOARD_ITEM_ID` | value | 3 | 待补 |
-| 218 | `server/src/party/modes.ts:PartyContest` | type | 3 | 待补 |
-| 219 | `server/src/party/modes.ts:PartyModeRuntime` | type | 2 | 待补 |
-| 220 | `server/src/party/modes.ts:settlePartyRun` | value | 2 | 待补 |
-| 221 | `server/src/party/scoring.ts:Broadcast` | type | 2 | 待补 |
-| 222 | `server/src/party/scoring.ts:Broadcaster` | type | 3 | 待补 |
-| 223 | `server/src/party/scoring.ts:PaintGrid` | type | 3 | 待补 |
-| 224 | `server/src/party/scoring.ts:PaintStanding` | type | 2 | 待补 |
-| 225 | `server/src/party/scoring.ts:RaceResult` | type | 7 | 待补 |
-| 226 | `server/src/party/scoring.ts:RaceTimer` | type | 6 | 待补 |
-| 227 | `server/src/party/scoring.ts:RewardLine` | type | 3 | 待补 |
-| 228 | `server/src/party/scoring.ts:TeamKey` | type | 33 | 待补 |
-| 229 | `server/src/party/scoring.ts:TeamScore` | type | 2 | 待补 |
-| 230 | `server/src/party/scoring.ts:modeEndLine` | value | 6 | 待补 |
-| 231 | `server/src/party/scoring.ts:modeStartLine` | value | 2 | 待补 |
-| 232 | `server/src/party/scoring.ts:podiumBroadcast` | value | 2 | 待补 |
-| 233 | `server/src/party/scoring.ts:rankByDescending` | value | 2 | 待补 |
-| 234 | `server/src/party/scoring.ts:rewardsForPlayers` | value | 3 | 待补 |
-| 235 | `server/src/party/scoring.ts:rewardsForTeams` | value | 5 | 待补 |
-| 236 | `server/src/physics/carry.ts:ChainNode` | type | 2 | 待补 |
-| 237 | `server/src/physics/carry.ts:JUMP_VZ` | value | 2 | 待补 |
-| 238 | `server/src/physics/carry.ts:ThrowResult` | type | 2 | 待补 |
-| 239 | `server/src/physics/world.ts:KNOCKBACK_STUN_SEC` | value | 2 | 待补 |
-| 240 | `server/src/physics/world.ts:StepReport` | type | 3 | 待补 |
-| 241 | `server/src/physics/world.ts:applyTimedBodyState` | value | 3 | 待补 |
-| 242 | `server/src/prank/actions.ts:CrownKnockOutcome` | type | 2 | 待补 |
-| 243 | `server/src/prank/actions.ts:PrankActionOutcome` | type | 2 | 待补 |
-| 244 | `server/src/prank/immunity.ts:EffectOrigin` | type | 2 | 待补 |
-| 245 | `server/src/prank/immunity.ts:ShieldResolution` | type | 2 | 待补 |
-| 246 | `server/src/prank/toys.ts:PrankToyDef` | type | 3 | 待补 |
-| 247 | `server/src/prank/toys.ts:ToyStateFlag` | type | 5 | 待补 |
-| 248 | `server/src/rooms/effects.ts:RoomEffectState` | type | 3 | 待补 |
-| 249 | `server/src/sim/world_debts.ts:WorldDebtRow` | type | 2 | 待补 |
-| 250 | `server/src/sim/world_sim.ts:WorldArchiveReceipt` | type | 3 | 待补 |
-| 251 | `server/src/sim/world_sim.ts:WorldArchiveRequest` | type | 2 | 待补 |
-| 252 | `server/src/sim/world_sim.ts:WorldArchiveSink` | type | 4 | 待补 |
-| 253 | `server/src/social/afk.ts:AfkPlayer` | type | 2 | 待补 |
-| 254 | `server/src/systems/alchemy_lab.ts:ALCHEMY_LAB_SYSTEM` | value | 2 | 待补 |
-| 255 | `server/src/systems/alchemy_lab.ts:BrewInput` | type | 3 | 待补 |
-| 256 | `server/src/systems/alchemy_lab.ts:BrewOutcome` | type | 3 | 待补 |
-| 257 | `server/src/systems/alchemy_lab.ts:Gallery` | type | 2 | 待补 |
-| 258 | `server/src/systems/alchemy_lab.ts:GalleryEntry` | type | 2 | 待补 |
-| 259 | `server/src/systems/depot.ts:BuyResult` | type | 2 | 待补 |
-| 260 | `server/src/systems/depot.ts:CONTENT_PRICE_TABLE` | value | 3 | 待补 |
-| 261 | `server/src/systems/depot.ts:DEPOT_SYSTEM` | value | 2 | 待补 |
-| 262 | `server/src/systems/depot.ts:PriceTable` | type | 3 | 待补 |
-| 263 | `server/src/systems/greenhouse.ts:GREENHOUSE_SYSTEM` | value | 2 | 待补 |
-| 264 | `server/src/systems/greenhouse.ts:Weather` | value | 6 | 待补 |
-| 265 | `server/src/systems/intake.ts:roomSystemsPortOf` | value | 6 | 待补 |
-| 266 | `server/src/systems/ranch.ts:RANCH_SYSTEM` | value | 2 | 待补 |
-| 267 | `server/src/systems/ranch.ts:RanchAnimal` | type | 15 | 待补 |
-| 268 | `server/src/systems/ranch.ts:RanchDayResult` | type | 6 | 待补 |
-| 269 | `server/src/systems/ranch.ts:RanchOnceOutcome` | type | 2 | 待补 |
-| 270 | `server/src/systems/wiring.ts:CropCellState` | type | 3 | 待补 |
-| 271 | `server/src/systems/wiring.ts:GalleryDisplayRow` | type | 4 | 待补 |
-| 272 | `server/src/systems/wiring.ts:GrowInput` | type | 2 | 待补 |
-| 273 | `server/src/systems/wiring.ts:HarvestRow` | type | 6 | 待补 |
-| 274 | `server/src/systems/wiring.ts:gatherMulOf` | value | 1 | 待补 |
-| 275 | `server/src/systems/wiring.ts:producedItemIdOf` | value | 2 | 待补 |
-| 276 | `server/src/wiring/components.ts:SPEC_BY_KIND` | value | 2 | 待补 |
-| 277 | `server/src/wiring/graph.ts:ComponentContext` | type | 2 | 待补 |
-| 278 | `server/src/wiring/graph.ts:ComponentNode` | type | 6 | 待补 |
-| 279 | `server/src/wiring/graph.ts:registerComponentKind` | value | 41 | 待补 |
-| 280 | `server/src/wiring/logistics.ts:ARM_BATCH` | value | 2 | 待补 |
-| 281 | `server/src/wiring/logistics.ts:ArmState` | type | 2 | 待补 |
-| 282 | `server/src/wiring/logistics.ts:ConveyorState` | type | 2 | 待补 |
-| 283 | `server/src/wiring/logistics.ts:DIR_DX` | value | 6 | 待补 |
-| 284 | `server/src/wiring/logistics.ts:DIR_DY` | value | 6 | 待补 |
-| 285 | `server/src/wiring/logistics.ts:DrillState` | type | 2 | 待补 |
-| 286 | `server/src/wiring/logistics.ts:ItemStack` | value | 15 | 待补 |
-| 287 | `server/src/wiring/logistics.ts:LogisticsLine` | type | 6 | 待补 |
-| 288 | `server/src/wiring/logistics.ts:LogisticsTickReport` | type | 2 | 待补 |
-| 289 | `server/src/world/chunk.ts:toBytes` | value | 3 | 待补 |
+| 13 | `server/src/alchemy/attributes.ts:NormalSpec` | value | 1 | 待补 |
+| 14 | `server/src/alchemy/attributes.ts:PowerMeanBreakdown` | value | 1 | 待补 |
+| 15 | `server/src/alchemy/attributes.ts:QualityBreakdown` | value | 1 | 待补 |
+| 16 | `server/src/alchemy/attributes.ts:ReactionHit` | value | 1 | 待补 |
+| 17 | `server/src/alchemy/attributes.ts:ReactionRule` | value | 1 | 待补 |
+| 18 | `server/src/alchemy/attributes.ts:RollBreakdown` | value | 1 | 待补 |
+| 19 | `server/src/alchemy/attributes.ts:RollOutcome` | value | 4 | 待补 |
+| 20 | `server/src/alchemy/attributes.ts:RollRequest` | value | 1 | 待补 |
+| 21 | `server/src/alchemy/attributes.ts:S_LOGIC_CEIL` | value | 11 | 待补 |
+| 22 | `server/src/alchemy/attributes.ts:S_LOGIC_FLOOR` | value | 15 | 待补 |
+| 23 | `server/src/alchemy/attributes.ts:SliceBreakdown` | value | 1 | 待补 |
+| 24 | `server/src/alchemy/attributes.ts:WEIGHT_SUM_TOLERANCE` | value | 3 | 待补 |
+| 25 | `server/src/alchemy/cache.ts:BuildRowInput` | value | 1 | 待补 |
+| 26 | `server/src/alchemy/cache.ts:CacheEntry` | value | 1 | 待补 |
+| 27 | `server/src/alchemy/cache.ts:CacheStats` | value | 3 | 待补 |
+| 28 | `server/src/alchemy/cache.ts:DEFAULT_DISCOVERER` | value | 3 | 待补 |
+| 29 | `server/src/alchemy/cache.ts:LlmClient` | value | 4 | 待补 |
+| 30 | `server/src/alchemy/cache.ts:RecipeCache` | value | 3 | 待补 |
+| 31 | `server/src/alchemy/cache.ts:RecipeCacheOptions` | value | 1 | 待补 |
+| 32 | `server/src/alchemy/cache.ts:RecipeStore` | value | 3 | 待补 |
+| 33 | `server/src/alchemy/cache.ts:SQL_BUMP_COUNT` | value | 1 | 待补 |
+| 34 | `server/src/alchemy/cache.ts:SQL_GET_RECIPE` | value | 1 | 待补 |
+| 35 | `server/src/alchemy/cache.ts:SQL_TOP_GALLERY` | value | 1 | 待补 |
+| 36 | `server/src/alchemy/cache.ts:StubLlmOptions` | value | 1 | 待补 |
+| 37 | `server/src/alchemy/cache.ts:emptyStats` | value | 1 | 待补 |
+| 38 | `server/src/alchemy/degrade.ts:CARRIER_WORD` | value | 1 | 待补 |
+| 39 | `server/src/alchemy/degrade.ts:ColorTriple` | value | 1 | 待补 |
+| 40 | `server/src/alchemy/degrade.ts:DegradeRequest` | value | 1 | 待补 |
+| 41 | `server/src/alchemy/degrade.ts:DegradeResult` | value | 1 | 待补 |
+| 42 | `server/src/alchemy/degrade.ts:FALLBACK_RULE` | value | 1 | 待补 |
+| 43 | `server/src/alchemy/degrade.ts:MECHANIC_WORD` | value | 1 | 待补 |
+| 44 | `server/src/alchemy/degrade.ts:NEUTRAL_AFFINITY` | value | 2 | 待补 |
+| 45 | `server/src/alchemy/degrade.ts:NameParts` | value | 1 | 待补 |
+| 46 | `server/src/alchemy/degrade.ts:PromptMaterialLike` | type | 3 | 待补 |
+| 47 | `server/src/alchemy/degrade.ts:SILHOUETTE_NOUN` | value | 1 | 待补 |
+| 48 | `server/src/alchemy/degrade.ts:SILHOUETTE_RULES` | value | 1 | 待补 |
+| 49 | `server/src/alchemy/degrade.ts:SILHOUETTE_WEIGHTS` | value | 1 | 待补 |
+| 50 | `server/src/alchemy/degrade.ts:SilhouetteRule` | value | 1 | 待补 |
+| 51 | `server/src/alchemy/degrade.ts:TAG_COLOR` | value | 1 | 待补 |
+| 52 | `server/src/alchemy/degrade.ts:composeLore` | value | 1 | 待补 |
+| 53 | `server/src/alchemy/degrade.ts:composeName` | value | 1 | 待补 |
+| 54 | `server/src/alchemy/degrade.ts:pickAura` | value | 1 | 待补 |
+| 55 | `server/src/alchemy/degrade.ts:pickColor` | value | 1 | 待补 |
+| 56 | `server/src/alchemy/degrade.ts:pickElement` | value | 1 | 待补 |
+| 57 | `server/src/alchemy/degrade.ts:selectSilhouetteRule` | value | 1 | 待补 |
+| 58 | `server/src/alchemy/degrade.ts:tagsOf` | value | 1 | 待补 |
+| 59 | `server/src/alchemy/gate.ts:AffinityBreakdown` | value | 1 | 待补 |
+| 60 | `server/src/alchemy/gate.ts:DEW_RELEASE_QUALITY_PENALTY` | value | 1 | 待补 |
+| 61 | `server/src/alchemy/gate.ts:DewRelease` | value | 1 | 待补 |
+| 62 | `server/src/alchemy/gate.ts:GateCode` | value | 1 | 待补 |
+| 63 | `server/src/alchemy/gate.ts:GateRequest` | value | 1 | 待补 |
+| 64 | `server/src/alchemy/gate.ts:GateResult` | value | 7 | 待补 |
+| 65 | `server/src/alchemy/gate.ts:REJECT_SUBJECT` | value | 1 | 待补 |
+| 66 | `server/src/alchemy/gate.ts:S_LOGIC_BASE` | value | 2 | 待补 |
+| 67 | `server/src/alchemy/gate.ts:S_LOGIC_CEIL` | value | 9 | 待补 |
+| 68 | `server/src/alchemy/gate.ts:S_LOGIC_FLOOR` | value | 11 | 待补 |
+| 69 | `server/src/alchemy/gate.ts:S_LOGIC_SPAN` | value | 2 | 待补 |
+| 70 | `server/src/alchemy/gate.ts:clampNum` | value | 7 | 待补 |
+| 71 | `server/src/alchemy/gate.ts:collectTags` | value | 3 | 待补 |
+| 72 | `server/src/alchemy/gate.ts:isCarrierTag` | value | 2 | 待补 |
+| 73 | `server/src/alchemy/gate.ts:isMechanicTag` | value | 2 | 待补 |
+| 74 | `server/src/alchemy/index.ts:AlchemyService` | type | 3 | 待补 |
+| 75 | `server/src/alchemy/index.ts:ForgeResult` | type | 2 | 待补 |
+| 76 | `server/src/alchemy/index.ts:createAlchemyService` | value | 2 | 待补 |
+| 77 | `server/src/alchemy/pixel_icon.ts:CanvasTexturePayload` | value | 1 | 待补 |
+| 78 | `server/src/alchemy/pixel_icon.ts:IconBuildResult` | value | 3 | 待补 |
+| 79 | `server/src/alchemy/pixel_icon.ts:PALETTE_CHAR` | value | 1 | 待补 |
+| 80 | `server/src/alchemy/pixel_icon.ts:PALETTE_KEYS` | value | 3 | 待补 |
+| 81 | `server/src/alchemy/pixel_icon.ts:PALETTE_MEANING` | value | 1 | 待补 |
+| 82 | `server/src/alchemy/pixel_icon.ts:PixelMatrixCheck` | value | 3 | 待补 |
+| 83 | `server/src/alchemy/pixel_icon.ts:PixelMatrixProblem` | value | 1 | 待补 |
+| 84 | `server/src/alchemy/pixel_icon.ts:RasterResult` | value | 1 | 待补 |
+| 85 | `server/src/alchemy/pixel_icon.ts:Rgba` | value | 4 | 待补 |
+| 86 | `server/src/alchemy/pixel_icon.ts:TEXTURE_PIXEL_RATIO` | value | 1 | 待补 |
+| 87 | `server/src/alchemy/pixel_icon.ts:describePixelProblems` | value | 3 | 待补 |
+| 88 | `server/src/alchemy/pixel_icon.ts:normalizeHexColor` | value | 2 | 待补 |
+| 89 | `server/src/alchemy/pixel_icon.ts:parseHexColor` | value | 4 | 待补 |
+| 90 | `server/src/alchemy/prompt.ts:BuildUserPromptOptions` | value | 1 | 待补 |
+| 91 | `server/src/alchemy/prompt.ts:FewShot` | value | 1 | 待补 |
+| 92 | `server/src/alchemy/prompt.ts:MAX_LORE_LEN` | value | 1 | 待补 |
+| 93 | `server/src/alchemy/prompt.ts:MIN_ITEM_NAME_LEN` | value | 1 | 待补 |
+| 94 | `server/src/alchemy/prompt.ts:MIN_LORE_LEN` | value | 1 | 待补 |
+| 95 | `server/src/alchemy/prompt.ts:MechanicCorrection` | value | 1 | 待补 |
+| 96 | `server/src/alchemy/prompt.ts:PromptMaterial` | value | 6 | 待补 |
+| 97 | `server/src/alchemy/prompt.ts:SCHEMA_INVARIANTS` | value | 1 | 待补 |
+| 98 | `server/src/alchemy/prompt.ts:ValidationIssue` | value | 1 | 待补 |
+| 99 | `server/src/alchemy/prompt.ts:ValidationResult` | value | 1 | 待补 |
+| 100 | `server/src/alchemy/prompt.ts:buildFewShotMessages` | value | 1 | 待补 |
+| 101 | `server/src/alchemy/prompt.ts:describeMaterials` | value | 1 | 待补 |
+| 102 | `server/src/alchemy/prompt.ts:issueMessages` | value | 3 | 待补 |
+| 103 | `server/src/bosses/breaks.ts:BreakResult` | type | 4 | 待补 |
+| 104 | `server/src/bosses/phases.ts:BREAK_CRIT_BONUS` | value | 2 | 待补 |
+| 105 | `server/src/bosses/phases.ts:BossClone` | type | 5 | 待补 |
+| 106 | `server/src/bosses/raid.ts:LootOrb` | type | 2 | 待补 |
+| 107 | `server/src/bosses/raid.ts:OfferingPort` | type | 5 | 待补 |
+| 108 | `server/src/bosses/raid.ts:SummonWithOfferingRequest` | type | 4 | 待补 |
+| 109 | `server/src/bosses/raid.ts:SummonWithOfferingResult` | type | 4 | 待补 |
+| 110 | `server/src/bosses/runtime.ts:BossSnapshot` | type | 2 | 待补 |
+| 111 | `server/src/bosses/runtime.ts:BossTickReport` | type | 2 | 待补 |
+| 112 | `server/src/build/autotile.ts:isDoor` | value | 3 | 待补 |
+| 113 | `server/src/build/autotile.ts:isRoof` | value | 2 | 待补 |
+| 114 | `server/src/build/autotile.ts:isWall` | value | 1 | 待补 |
+| 115 | `server/src/build/autotile.ts:isWindow` | value | 3 | 待补 |
+| 116 | `server/src/build/blueprint.ts:BlueprintCell` | type | 3 | 待补 |
+| 117 | `server/src/build/blueprint.ts:EncodeStats` | type | 5 | 待补 |
+| 118 | `server/src/build/grid.ts:DIR_DX` | value | 10 | 待补 |
+| 119 | `server/src/build/grid.ts:DIR_DY` | value | 10 | 待补 |
+| 120 | `server/src/build/grid.ts:TileGridLike` | type | 21 | 待补 |
+| 121 | `server/src/build/rooms.ts:RoomIdentity` | type | 4 | 待补 |
+| 122 | `server/src/combat/cooking.ts:BIG_SHOVEL_ID` | value | 2 | 待补 |
+| 123 | `server/src/combat/cooking.ts:EXTINGUISH_RADIUS` | value | 4 | 待补 |
+| 124 | `server/src/combat/cooking.ts:KitchenState` | type | 3 | 待补 |
+| 125 | `server/src/combat/cooking.ts:PIZZA_OVEN_ID` | value | 5 | 待补 |
+| 126 | `server/src/combat/cooking.ts:createKitchenState` | value | 2 | 待补 |
+| 127 | `server/src/combat/cooking.ts:feedStation` | value | 3 | 待补 |
+| 128 | `server/src/combat/cooking.ts:tryCook` | value | 2 | 待补 |
+| 129 | `server/src/combat/damage.ts:AttackInput` | type | 1 | 待补 |
+| 130 | `server/src/combat/damage.ts:DEFAULT_UNARMED_KNOCKBACK` | value | 2 | 待补 |
+| 131 | `server/src/combat/damage.ts:DotTask` | type | 3 | 待补 |
+| 132 | `server/src/combat/damage.ts:skillZeroResult` | value | 3 | 待补 |
+| 133 | `server/src/combat/live_bubble.ts:LiveBubbleState` | type | 3 | 待补 |
+| 134 | `server/src/combat/live_bubble.ts:isTrapped` | value | 6 | 待补 |
+| 135 | `server/src/combat/progression.ts:PlayerProgress` | type | 9 | 待补 |
+| 136 | `server/src/combat/progression.ts:ShareResult` | type | 3 | 待补 |
+| 137 | `server/src/combat/revive.ts:ReviveResult` | type | 2 | 待补 |
+| 138 | `server/src/combat/vitals.ts:BLIND_VIEW_MUL` | value | 2 | 待补 |
+| 139 | `server/src/combat/vitals.ts:ELEMENT_RESIST_NEUTRAL` | value | 2 | 待补 |
+| 140 | `server/src/combat/vitals.ts:MobHitResult` | type | 3 | 待补 |
+| 141 | `server/src/combat/vitals.ts:PendingStrike` | type | 4 | 待补 |
+| 142 | `server/src/combat/vitals.ts:collectEventBlinds` | value | 2 | 待补 |
+| 143 | `server/src/combat/vitals.ts:collectEventStrikes` | value | 2 | 待补 |
+| 144 | `server/src/combat/vitals.ts:warnHitsPlayer` | value | 2 | 待补 |
+| 145 | `server/src/combat/weapons.ts:CombatantStats` | type | 3 | 待补 |
+| 146 | `server/src/combat/weapons.ts:SkillDef` | type | 11 | 待补 |
+| 147 | `server/src/combat/weapons.ts:WeaponDef` | type | 4 | 待补 |
+| 148 | `server/src/combat/weapons.ts:sanitizeComboMul` | value | 2 | 待补 |
+| 149 | `server/src/combat/weapons.ts:sanitizeMul` | value | 4 | 待补 |
+| 150 | `server/src/combat/wiring_ledger.ts:CombatWiringRow` | type | 2 | 待补 |
+| 151 | `server/src/content/registry.ts:ContentFingerprints` | type | 2 | 待补 |
+| 152 | `server/src/coop/rush_actions.ts:rushAcceptsDelivery` | value | 2 | 待补 |
+| 153 | `server/src/coop/rush_actions.ts:rushRewardCellOf` | value | 2 | 待补 |
+| 154 | `server/src/coop/rush_order.ts:Clock` | type | 24 | 待补 |
+| 155 | `server/src/coop/rush_order.ts:Rng` | type | 9 | 待补 |
+| 156 | `server/src/coop/rush_order.ts:RushOrderSession` | type | 6 | 待补 |
+| 157 | `server/src/coop/rush_order.ts:RushOrderState` | type | 3 | 待补 |
+| 158 | `server/src/coop/rush_order.ts:RushSessionSettlement` | type | 4 | 待补 |
+| 159 | `server/src/db/repo.ts:KeyParts` | type | 11 | 待补 |
+| 160 | `server/src/db/repo.ts:Row` | type | 25 | 待补 |
+| 161 | `server/src/db/repo.ts:TABLE_PRIMARY_KEYS` | value | 4 | 待补 |
+| 162 | `server/src/db/repo.ts:WorldArchiveBootCheck` | type | 2 | 待补 |
+| 163 | `server/src/db/repo.ts:clampInt` | value | 2 | 待补 |
+| 164 | `server/src/db/repo.ts:listRooms` | value | 2 | 待补 |
+| 165 | `server/src/db/repo.ts:loadVitalsFromUsers` | value | 2 | 待补 |
+| 166 | `server/src/db/repo.ts:setRoomStatus` | value | 4 | 待补 |
+| 167 | `server/src/events/bus.ts:EventPayload` | type | 2 | 待补 |
+| 168 | `server/src/mobs/behaviors.ts:BaseMobAi` | value | 2 | 待补 |
+| 169 | `server/src/mobs/behaviors.ts:MobRuntime` | type | 13 | 待补 |
+| 170 | `server/src/mobs/behaviors.ts:MobWorld` | type | 2 | 待补 |
+| 171 | `server/src/mobs/drops.ts:MobDropResult` | type | 2 | 待补 |
+| 172 | `server/src/mobs/fsm.ts:FsmConfig` | type | 1 | 待补 |
+| 173 | `server/src/mobs/fsm.ts:PROBE_LEN` | value | 1 | 待补 |
+| 174 | `server/src/mobs/geometry.ts:DEG` | value | 15 | 待补 |
+| 175 | `server/src/mobs/geometry.ts:WarnGeom` | type | 59 | 无需(类型导出:无可断言的运行时行为;生产引用按名字计数,只作类型位) |
+| 176 | `server/src/mobs/geometry.ts:WarnShape` | value | 7 | 待补 |
+| 177 | `server/src/mobs/geometry.ts:angleDiffDeg` | value | 3 | 待补 |
+| 178 | `server/src/mobs/geometry.ts:angleToDeg` | value | 6 | 待补 |
+| 179 | `server/src/mobs/geometry.ts:unit` | value | 15 | 待补 |
+| 180 | `server/src/mobs/host.ts:MobHostWorld` | type | 2 | 待补 |
+| 181 | `server/src/mobs/host.ts:MobTickResult` | type | 2 | 待补 |
+| 182 | `server/src/mobs/spawner.ts:MOB_INSTANCE_SEP` | value | 2 | 待补 |
+| 183 | `server/src/mobs/spawner.ts:SpawnContext` | type | 2 | 待补 |
+| 184 | `server/src/mobs/spawner.ts:mobDefOf` | value | 9 | 待补 |
+| 185 | `server/src/mobs/spawner.ts:mobSpeciesId` | value | 8 | 待补 |
+| 186 | `server/src/mobs/spawner.ts:spawnsPerCheck` | value | 2 | 待补 |
+| 187 | `server/src/net/actions/action_table.ts:lookupActionHandler` | value | 2 | 待补 |
+| 188 | `server/src/net/actions/admin.ts:closeRoom` | value | 2 | 待补 |
+| 189 | `server/src/net/actions/admin.ts:setRoomAccess` | value | 2 | 待补 |
+| 190 | `server/src/net/actions/material.ts:pickupItem` | value | 2 | 待补 |
+| 191 | `server/src/net/actions/modify_town.ts:modifyTown` | value | 2 | 待补 |
+| 192 | `server/src/net/actions/open_chest.ts:ItemStack` | type | 1 | 待补 |
+| 193 | `server/src/net/actions/open_chest.ts:forgetChests` | value | 2 | 待补 |
+| 194 | `server/src/net/actions/open_chest.ts:ownChestContainers` | value | 2 | 待补 |
+| 195 | `server/src/net/actions/open_chest.ts:runChestAction` | value | 2 | 待补 |
+| 196 | `server/src/net/actions/place_automation.ts:forgetPlacements` | value | 2 | 待补 |
+| 197 | `server/src/net/actions/plant_crop.ts:plantSeedAt` | value | 2 | 待补 |
+| 198 | `server/src/net/actions/types.ts:ActionHandler` | type | 45 | 待补 |
+| 199 | `server/src/net/actions/use_alchemy_furnace.ts:forgetFurnaceClaims` | value | 2 | 待补 |
+| 200 | `server/src/net/actions/wire_edit.ts:wireEdit` | value | 2 | 待补 |
+| 201 | `server/src/net/anticheat.ts:Clock` | type | 24 | 待补 |
+| 202 | `server/src/net/anticheat.ts:InventoryCheckResult` | type | 2 | 待补 |
+| 203 | `server/src/net/anticheat.ts:InventoryOp` | type | 6 | 待补 |
+| 204 | `server/src/net/anticheat.ts:Verdict` | type | 3 | 待补 |
+| 205 | `server/src/net/anticheat.ts:Violation` | type | 3 | 待补 |
+| 206 | `server/src/net/anticheat.ts:mintItemSourceToken` | value | 2 | 待补 |
+| 207 | `server/src/net/room.ts:EffectValue` | type | 2 | 待补 |
+| 208 | `server/src/net/room.ts:ItemReadPort` | type | 5 | 待补 |
+| 209 | `server/src/net/schema.ts:removeBoss` | value | 2 | 待补 |
+| 210 | `server/src/net/schema.ts:removeWildlife` | value | 2 | 待补 |
+| 211 | `server/src/net/schema.ts:upsertBoss` | value | 2 | 待补 |
+| 212 | `server/src/net/ws_server.ts:startWsServer` | value | 3 | 待补 |
+| 213 | `server/src/party/actions.ts:REFEREE_DESK_STOP_MODE` | value | 3 | 待补 |
+| 214 | `server/src/party/actions.ts:gatePartyStart` | value | 2 | 待补 |
+| 215 | `server/src/party/modes.ts:BRIDGE_BOARD_ITEM_ID` | value | 3 | 待补 |
+| 216 | `server/src/party/modes.ts:PartyContest` | type | 3 | 待补 |
+| 217 | `server/src/party/modes.ts:PartyModeRuntime` | type | 2 | 待补 |
+| 218 | `server/src/party/modes.ts:settlePartyRun` | value | 2 | 待补 |
+| 219 | `server/src/party/scoring.ts:Broadcast` | type | 2 | 待补 |
+| 220 | `server/src/party/scoring.ts:Broadcaster` | type | 3 | 待补 |
+| 221 | `server/src/party/scoring.ts:PaintGrid` | type | 3 | 待补 |
+| 222 | `server/src/party/scoring.ts:PaintStanding` | type | 2 | 待补 |
+| 223 | `server/src/party/scoring.ts:RaceResult` | type | 7 | 待补 |
+| 224 | `server/src/party/scoring.ts:RaceTimer` | type | 6 | 待补 |
+| 225 | `server/src/party/scoring.ts:RewardLine` | type | 3 | 待补 |
+| 226 | `server/src/party/scoring.ts:TeamKey` | type | 33 | 待补 |
+| 227 | `server/src/party/scoring.ts:TeamScore` | type | 2 | 待补 |
+| 228 | `server/src/party/scoring.ts:modeEndLine` | value | 6 | 待补 |
+| 229 | `server/src/party/scoring.ts:modeStartLine` | value | 2 | 待补 |
+| 230 | `server/src/party/scoring.ts:podiumBroadcast` | value | 2 | 待补 |
+| 231 | `server/src/party/scoring.ts:rankByDescending` | value | 2 | 待补 |
+| 232 | `server/src/party/scoring.ts:rewardsForPlayers` | value | 3 | 待补 |
+| 233 | `server/src/party/scoring.ts:rewardsForTeams` | value | 5 | 待补 |
+| 234 | `server/src/physics/carry.ts:ChainNode` | type | 2 | 待补 |
+| 235 | `server/src/physics/carry.ts:JUMP_VZ` | value | 2 | 待补 |
+| 236 | `server/src/physics/carry.ts:ThrowResult` | type | 2 | 待补 |
+| 237 | `server/src/physics/world.ts:KNOCKBACK_STUN_SEC` | value | 2 | 待补 |
+| 238 | `server/src/physics/world.ts:StepReport` | type | 3 | 待补 |
+| 239 | `server/src/physics/world.ts:applyTimedBodyState` | value | 3 | 待补 |
+| 240 | `server/src/prank/actions.ts:CrownKnockOutcome` | type | 2 | 待补 |
+| 241 | `server/src/prank/actions.ts:PrankActionOutcome` | type | 2 | 待补 |
+| 242 | `server/src/prank/immunity.ts:EffectOrigin` | type | 2 | 待补 |
+| 243 | `server/src/prank/immunity.ts:ShieldResolution` | type | 2 | 待补 |
+| 244 | `server/src/prank/toys.ts:PrankToyDef` | type | 3 | 待补 |
+| 245 | `server/src/prank/toys.ts:ToyStateFlag` | type | 5 | 待补 |
+| 246 | `server/src/rooms/effects.ts:RoomEffectState` | type | 3 | 待补 |
+| 247 | `server/src/sim/world_debts.ts:WorldDebtRow` | type | 2 | 待补 |
+| 248 | `server/src/sim/world_sim.ts:WorldArchiveReceipt` | type | 3 | 待补 |
+| 249 | `server/src/sim/world_sim.ts:WorldArchiveRequest` | type | 2 | 待补 |
+| 250 | `server/src/sim/world_sim.ts:WorldArchiveSink` | type | 4 | 待补 |
+| 251 | `server/src/social/afk.ts:AfkPlayer` | type | 2 | 待补 |
+| 252 | `server/src/systems/alchemy_lab.ts:ALCHEMY_LAB_SYSTEM` | value | 2 | 待补 |
+| 253 | `server/src/systems/alchemy_lab.ts:BrewInput` | type | 3 | 待补 |
+| 254 | `server/src/systems/alchemy_lab.ts:BrewOutcome` | type | 3 | 待补 |
+| 255 | `server/src/systems/alchemy_lab.ts:Gallery` | type | 2 | 待补 |
+| 256 | `server/src/systems/alchemy_lab.ts:GalleryEntry` | type | 2 | 待补 |
+| 257 | `server/src/systems/depot.ts:BuyResult` | type | 2 | 待补 |
+| 258 | `server/src/systems/depot.ts:CONTENT_PRICE_TABLE` | value | 3 | 待补 |
+| 259 | `server/src/systems/depot.ts:DEPOT_SYSTEM` | value | 2 | 待补 |
+| 260 | `server/src/systems/depot.ts:PriceTable` | type | 3 | 待补 |
+| 261 | `server/src/systems/greenhouse.ts:GREENHOUSE_SYSTEM` | value | 2 | 待补 |
+| 262 | `server/src/systems/greenhouse.ts:Weather` | value | 6 | 待补 |
+| 263 | `server/src/systems/intake.ts:roomSystemsPortOf` | value | 6 | 待补 |
+| 264 | `server/src/systems/ranch.ts:RANCH_SYSTEM` | value | 2 | 待补 |
+| 265 | `server/src/systems/ranch.ts:RanchAnimal` | type | 15 | 待补 |
+| 266 | `server/src/systems/ranch.ts:RanchDayResult` | type | 6 | 待补 |
+| 267 | `server/src/systems/ranch.ts:RanchOnceOutcome` | type | 2 | 待补 |
+| 268 | `server/src/systems/wiring.ts:CropCellState` | type | 3 | 待补 |
+| 269 | `server/src/systems/wiring.ts:GalleryDisplayRow` | type | 4 | 待补 |
+| 270 | `server/src/systems/wiring.ts:GrowInput` | type | 2 | 待补 |
+| 271 | `server/src/systems/wiring.ts:HarvestRow` | type | 6 | 待补 |
+| 272 | `server/src/systems/wiring.ts:gatherMulOf` | value | 1 | 待补 |
+| 273 | `server/src/systems/wiring.ts:producedItemIdOf` | value | 2 | 待补 |
+| 274 | `server/src/wiring/components.ts:SPEC_BY_KIND` | value | 2 | 待补 |
+| 275 | `server/src/wiring/graph.ts:ComponentContext` | type | 2 | 待补 |
+| 276 | `server/src/wiring/graph.ts:ComponentNode` | type | 6 | 待补 |
+| 277 | `server/src/wiring/graph.ts:registerComponentKind` | value | 41 | 待补 |
+| 278 | `server/src/wiring/logistics.ts:ARM_BATCH` | value | 2 | 待补 |
+| 279 | `server/src/wiring/logistics.ts:ArmState` | type | 2 | 待补 |
+| 280 | `server/src/wiring/logistics.ts:ConveyorState` | type | 2 | 待补 |
+| 281 | `server/src/wiring/logistics.ts:DIR_DX` | value | 6 | 待补 |
+| 282 | `server/src/wiring/logistics.ts:DIR_DY` | value | 6 | 待补 |
+| 283 | `server/src/wiring/logistics.ts:DrillState` | type | 2 | 待补 |
+| 284 | `server/src/wiring/logistics.ts:ItemStack` | value | 15 | 待补 |
+| 285 | `server/src/wiring/logistics.ts:LogisticsLine` | type | 6 | 待补 |
+| 286 | `server/src/wiring/logistics.ts:LogisticsTickReport` | type | 2 | 待补 |
+| 287 | `server/src/world/chunk.ts:toBytes` | value | 3 | 待补 |
 <!-- GEN:ROWS:END -->
 
 ## 3 导出普查(逐符号)
@@ -453,9 +451,9 @@ server/src/combat/damage.ts | t | none | AppliedDamage AttackInput DamageStep Do
 server/src/combat/live_bubble.ts | v | behavior | LIVE_BUBBLE_INITIAL liveBubbleHit tickLiveBubble
 server/src/combat/live_bubble.ts | v | none | LIVE_BUBBLE_SHOTS_TO_TRAP LIVE_BUBBLE_STACK_WINDOW_SEC isTrapped
 server/src/combat/live_bubble.ts | t | none | LiveBubbleState
-server/src/combat/progression.ts | v | behavior | KILL_LEDGER_CAPACITY KillLedger PER_MOB_EXP_CAP_MULT REBIRTH_AFFIX_POOL REBIRTH_DEW_COST SHARE_RADIUS TALENTS TALENT_BY_ID TALENT_UNLOCK_LEVELS activeTalents applyShareResult createProgress cumulativeExp expToReachMax gainExp isTalentUnlocked levelGapMul reforge setLevel settleMobExp talentsUnlockedAt
-server/src/combat/progression.ts | v | none | LEVEL_GAP_MIN LEVEL_GAP_STEP
-server/src/combat/progression.ts | t | none | ExpGainResult LevelUpEvent PlayerProgress RebirthResult ShareContext ShareEntry ShareParticipant ShareResult TalentDef
+server/src/combat/progression.ts | v | behavior | KILL_LEDGER_CAPACITY KillLedger PER_MOB_EXP_CAP_MULT PROGRESS_FIELD_WIRING REBIRTH_AFFIX_POOL REBIRTH_DEW_COST SHARE_RADIUS TALENTS TALENT_BY_ID TALENT_EFFECT_WIRING TALENT_UNLOCK_LEVELS activeTalents applyShareResult auditTalentWiring createProgress cumulativeExp expToReachMax gainExp isTalentUnlocked levelGapMul reforge setLevel settleMobExp talentsUnlockedAt
+server/src/combat/progression.ts | v | none | LEVEL_GAP_MIN LEVEL_GAP_STEP TALENT_WIRING_STATUS
+server/src/combat/progression.ts | t | none | ExpGainResult LevelUpEvent PlayerProgress ProgressFieldRow RebirthResult ShareContext ShareEntry ShareParticipant ShareResult TalentDef TalentEffectRow TalentWiringStatus
 server/src/combat/revive.ts | v | behavior | BUBBLE_GUN_SHOTS BUBBLE_STACK_WINDOW_SEC BUBBLE_TRAP_SEC FLAG_REVIVE_RADIUS FLAG_REVIVE_TIME ReviveMethod TOUCH_RADIUS bubbleGunHit createDowned featherRevive flagRevive ghostControl ghostDamageMul isInvulnerable snapshotDiff tickGhostBubble tickInvuln touchRevive
 server/src/combat/revive.ts | v | none | GHOST_BUBBLE_MIN_SEC GHOST_DRIFT_SPEED GHOST_MOVE_MUL MANUAL_REVIVE_INVULN
 server/src/combat/revive.ts | t | behavior | DownedState EquipmentSnapshot
@@ -481,10 +479,10 @@ server/src/content/registry.ts | t | none | CapacityEntry ContentAudit ContentFi
 server/src/coop/rush_actions.ts | v | behavior | RUSH_ACTION_LEDGER RUSH_DELIVERY_RADIUS RUSH_ENTRY_ROOM_LEVEL openOrderLines
 server/src/coop/rush_actions.ts | v | none | rushAcceptsDelivery rushRewardCellOf
 server/src/coop/rush_actions.ts | t | none | OpenOrderLine RushActionRow
-server/src/coop/rush_order.ts | v | behavior | BEAVER_STATE BEAVER_TARGET_ITEM_ID BOSS_BACK_HEIGHT CHAIN_STATE DEFAULT_STATION_CELLS EVT_BEAVER_STOLE EVT_DOUSED EVT_FIRE EVT_SMOKE EXTINGUISH_SEC HAMMER_222_IMPULSE ORDER_POOL ORDER_SLOT_MAX ORDER_SLOT_MIN OVERHEAT_SEC RELAY_RIVER_WIDTH RELAY_STAGES RELAY_STAGE_TIMEOUT_SEC RELAY_THROW_RANGE ROOM_LEVEL_PER_SLOT RUSH_ORDER_DURATION_SEC RUSH_ORDER_STATE STACK_REACH_Z STATION_KIND STATION_SPRAY_RADIUS STATION_STATE Z2_FRUIT_HEIGHT Z2_REACH_TARGET addRelayChain advanceRelayChain assertOrderPoolClosed boardProgress canMountBossBack canPickZ2Fruit cellCenterOf createManualClock createRelayChain createRushOrderSession createStation deliverItem elapsedSec fireRelayStage generateOrderBoard gradeOf hitBeaver isSmoking reclaimWood settleSession spawnBeaver sprayableKinds stackCarrierSpeed stackTopZ startRushOrder startStation stationStateOf stationsBeingSprayedBy stationsBeingTendedBy submitDelivery tendStation tickBeaver tickRushOrder tickStation
-server/src/coop/rush_order.ts | v | none | BEAVER_ESCAPE_SEC BEAVER_MAX_ACTIVE BEAVER_MOB_ID BEAVER_RECLAIM_QTY BEAVER_SPAWN_INTERVAL_SEC BEAVER_STEAL_SEC BEAVER_STUN_IMPULSE BEAVER_STUN_SEC BURN_DAMAGE_PER_SEC CHAIN_BREAK_PENALTY CHAIN_BREAK_REASON CHAIN_SUCCESS_SCORE EPS EVT_BEAVER_ESCAPED EVT_BEAVER_KNOCKED EVT_WOOD_RECLAIMED ORDER_LEVEL_VALUE_STEP ORDER_NEED_MAX ORDER_NEED_MIN RUSH_GRADE RUSH_GRADE_THRESHOLDS SMOKE_LEAD_SEC STACK_FORMATIONS STOCK_PRESSURE_UNIT canReachHeight pollChainTimeout settleRushOrder stationCellOf
+server/src/coop/rush_order.ts | v | behavior | BEAVER_STATE BEAVER_STEAL_SEC BEAVER_TARGET_ITEM_ID BOSS_BACK_HEIGHT CHAIN_STATE DEFAULT_STATION_CELLS EVT_BEAVER_STOLE EVT_DOUSED EVT_FIRE EVT_SMOKE EXTINGUISH_SEC HAMMER_222_IMPULSE ORDER_POOL ORDER_SLOT_MAX ORDER_SLOT_MIN OVERHEAT_SEC RELAY_RIVER_WIDTH RELAY_STAGES RELAY_STAGE_TIMEOUT_SEC RELAY_THROW_RANGE ROOM_LEVEL_PER_SLOT RUSH_ORDER_DURATION_SEC RUSH_ORDER_STATE RUSH_STOCK_WIRING STACK_REACH_Z STATION_KIND STATION_SPRAY_RADIUS STATION_STATE Z2_FRUIT_HEIGHT Z2_REACH_TARGET addRelayChain advanceRelayChain assertOrderPoolClosed auditRushStockWiring boardProgress canMountBossBack canPickZ2Fruit cellCenterOf createManualClock createRelayChain createRushOrderSession createStation deliverItem elapsedSec fireRelayStage generateOrderBoard gradeOf hitBeaver isSmoking reclaimWood settleSession spawnBeaver sprayableKinds stackCarrierSpeed stackTopZ startRushOrder startStation stationStateOf stationsBeingSprayedBy stationsBeingTendedBy submitDelivery tendStation tickBeaver tickRushOrder tickStation
+server/src/coop/rush_order.ts | v | none | BEAVER_ESCAPE_SEC BEAVER_MAX_ACTIVE BEAVER_MOB_ID BEAVER_RECLAIM_QTY BEAVER_SPAWN_INTERVAL_SEC BEAVER_STUN_IMPULSE BEAVER_STUN_SEC BURN_DAMAGE_PER_SEC CHAIN_BREAK_PENALTY CHAIN_BREAK_REASON CHAIN_SUCCESS_SCORE EPS EVT_BEAVER_ESCAPED EVT_BEAVER_KNOCKED EVT_WOOD_RECLAIMED ORDER_LEVEL_VALUE_STEP ORDER_NEED_MAX ORDER_NEED_MIN RUSH_GRADE RUSH_GRADE_THRESHOLDS RUSH_STOCK_SUPPLY SMOKE_LEAD_SEC STACK_FORMATIONS STOCK_PRESSURE_UNIT canReachHeight pollChainTimeout settleRushOrder stationCellOf
 server/src/coop/rush_order.ts | t | behavior | StationKind
-server/src/coop/rush_order.ts | t | none | BeaverRuntime BeaverState ChainBreakReason ChainState Clock DeliverResult HammerHitResult ManualClock RelayChain RelayStage RelayStageInput RelayStageResult Rng RushGrade RushOrderBoard RushOrderSession RushOrderSessionOptions RushOrderSlot RushOrderState RushSessionSettlement RushSettlement RushTickOptions StationCellBook StationRuntime StationState WorldCell
+server/src/coop/rush_order.ts | t | none | BeaverRuntime BeaverState ChainBreakReason ChainState Clock DeliverResult HammerHitResult ManualClock RelayChain RelayStage RelayStageInput RelayStageResult Rng RushGrade RushOrderBoard RushOrderSession RushOrderSessionOptions RushOrderSlot RushOrderState RushSessionSettlement RushSettlement RushStockRow RushStockSupply RushTickOptions StationCellBook StationRuntime StationState WorldCell
 server/src/db/driver.sqlite.ts | v | behavior | nodeSqliteConnection openNodeSqlite
 server/src/db/driver.sqlite.ts | v | none | RECOMMENDED_PRAGMAS SqliteDb betterSqlite3Connection
 server/src/db/driver.sqlite.ts | t | none | SqlConnection
@@ -528,8 +526,8 @@ server/src/mobs/spawner.ts | v | behavior | BIOME_SPAWN GLOBAL_MOB_CAP MobSpawne
 server/src/mobs/spawner.ts | v | none | MOB_INSTANCE_SEP NIGHT_BRICK_RADIUS NOCTURNAL SAFE_SHIELD_MULT SPAWNER_MOB_TOTAL mobDefOf mobSpeciesId spawnsPerCheck
 server/src/mobs/spawner.ts | t | behavior | SpawnWorld
 server/src/mobs/spawner.ts | t | none | BiomeSpawnConfig SpawnContext SpawnerState TownRadiusProvider
-server/src/mobs/taming.ts | v | behavior | DEPLOY_BADGE_ID RANCH_CAPACITY TameCommand TameStage canTame carrySlots carrySpeedMul commandPet createPetRecord deployLimit deployPet feedPet forgetRoomPets petSlotOf petsOfPlayer putPetSlot sendToRanch tameableDefs tamingCoverage tickRanch undeployPet
-server/src/mobs/taming.ts | v | none | CARRY_BASE_SLOTS CARRY_MAX_SLOTS CARRY_SPEED_PENALTY DEFAULT_TAME_FEED_COUNT DEPLOY_LIMIT_BASE DEPLOY_LIMIT_WITH_BADGE RANCH_PRODUCE_SEC TAME_COMMANDS TAME_FEED_COUNT commandIntent petSlotsOfRoom
+server/src/mobs/taming.ts | v | behavior | DEPLOY_BADGE_ID RANCH_CAPACITY TameCommand TameStage canTame carrySlots carrySpeedMul commandPet createPetRecord deployLimit deployPet feedPet forgetRoomPets petSlotOf petSlotsOfRoom petsOfPlayer putPetSlot sendToRanch tameableDefs tamingCoverage tickRanch undeployPet
+server/src/mobs/taming.ts | v | none | CARRY_BASE_SLOTS CARRY_MAX_SLOTS CARRY_SPEED_PENALTY DEFAULT_TAME_FEED_COUNT DEPLOY_LIMIT_BASE DEPLOY_LIMIT_WITH_BADGE RANCH_PRODUCE_SEC TAME_COMMANDS TAME_FEED_COUNT commandIntent
 server/src/mobs/taming.ts | t | behavior | PetRecord PetSlot
 server/src/mobs/taming.ts | t | none | DeployResult RanchYield TameResult
 server/src/net/actions/action_table.ts | v | behavior | ACTION_HANDLERS
@@ -597,8 +595,8 @@ server/src/net/ws_server.ts | v | behavior | FrameTooBigError MAX_CONN_BUF_BYTES
 server/src/net/ws_server.ts | v | none | OP_CONT OP_PONG OP_TEXT defaultWsLog encodeClose readQueryParam readTokenFromUrl startWsServer
 server/src/net/ws_server.ts | t | symbol-only | HelloFrame WsServerHandle
 server/src/net/ws_server.ts | t | none | MoveIntentParse ParsedFrame UplinkKind WsConn WsLogCategory WsLogCounts WsRoomLike WsServerOptions
-server/src/party/actions.ts | v | behavior | PARTY_ACTION deskModeKey gateBridgeCapture gateBridgePlace gateCrownPickup gatePartyStop gateRushDelivery gateRushStart unwiredActions wiredActions
-server/src/party/actions.ts | v | symbol-only | gateCrownKnock gatePrank
+server/src/party/actions.ts | v | behavior | PARTY_ACTION deskModeKey gateBridgeCapture gateBridgePlace gateCrownPickup gatePartyStop gatePrank gateRushDelivery gateRushStart unwiredActions wiredActions
+server/src/party/actions.ts | v | symbol-only | gateCrownKnock
 server/src/party/actions.ts | v | none | CROWN_COOLDOWN_SEC GATE_REJECT PARTY_ACTION_LEDGER REFEREE_DESK_STOP_MODE gatePartyStart
 server/src/party/actions.ts | t | none | ActionGate ActionLedgerRow GateReject PartyAction
 server/src/party/modes.ts | v | behavior | BRIDGE_TILES_TO_WIN CROWN_MODE_SEC CROWN_PICKUP_COOLDOWN_SEC CROWN_WIN_SEC JELLY_BALL_RESET_SEC PAINT_BALL_RADIUS PAINT_MODE_SEC PARTY_MODE_KEY PARTY_PHASE assertAllModesPresent bridgeCapture bridgePlace contestAssignTeam contestBridgeFlagged contestBroadcaster contestBuiltOf contestCapture contestCrownCooldown contestCrownDrop contestCrownHolder contestCrownPickup contestCrownSecOf contestCrownWinner contestMode contestPlaceBoard contestSettlement createBridgeRun createCrownRun createJellyBall createPaintWar createPartyContest createRaceRun crownAssignTeam crownDrop crownPickup finishRunner judgeGoal kickBall modeElapsedSec openGate partyModeConfig settleBridgeRun settleCrown settleJellyBall settlePaintWar settleRace startPartyMode throwPaintBall tickCrown tickJellyBall tickPartyContest tickPartyMode
@@ -616,8 +614,8 @@ server/src/physics/world.ts | v | behavior | BELT_FORCE BLEED_DPS BOUNCE_VZ BOUN
 server/src/physics/world.ts | v | none | BELT_POWERED_BONUS BELT_REQUIRES_POWER BODY_STATE_PRIORITY DEFAULT_PLAYER_MASS FINITE_LIMIT FxKind KNOCKBACK_STUN_SEC MU_MUL_NEUTRAL PhysStats SERVER_TICK_HZ SUBSTEP_SPEED_THRESHOLD SWEEP_REFINE_STEPS TIMED_BODY_STATES TRAP_EPS TRAP_FALL_MUL VORTEX_ACCEL VORTEX_RADIUS applyTimedBodyState isTimedBodyState
 server/src/physics/world.ts | t | behavior | PhysTerrain
 server/src/physics/world.ts | t | none | PhysFx PhysicsWorldOptions StepReport
-server/src/prank/actions.ts | v | behavior | CROWN_KNOCK_TOY_IDS PRANK_ACTION_LEDGER PRANK_REJECT resolveCrownKnock resolvePrankAction wiredPrankToys
-server/src/prank/actions.ts | v | none | PRANK_SHIELD_ITEM_ID assertPrankActionLedgerComplete
+server/src/prank/actions.ts | v | behavior | CROWN_KNOCK_TOY_IDS PRANK_ACTION_LEDGER PRANK_PLAYER_VERB PRANK_REJECT auditPrankLedger resolveCrownKnock resolvePrankAction wiredPrankToys
+server/src/prank/actions.ts | v | none | PRANK_CROWN_VERB PRANK_SHIELD_ITEM_ID assertPrankActionLedgerComplete
 server/src/prank/actions.ts | t | none | CrownKnockOutcome PrankActionOutcome PrankActionRequest PrankActionRow PrankReject
 server/src/prank/immunity.ts | v | behavior | EFFECT_ORIGIN HOSTILE_ENTRIES HOSTILE_SOURCES IMMUNITY_BY_KEY IMMUNITY_MANIFEST NAMED_IMMUNE_TOY_IDS SHIELD_VERDICT applyShield assertImmunityManifestComplete createShield isImmuneToAllyPrank isImmuneToHostile resolveShield toggleShield
 server/src/prank/immunity.ts | v | none | EFFECT_ORIGINS HOSTILE_SOURCE HOSTILE_SOURCE_LABEL NAMED_IMMUNE_LABEL
@@ -633,8 +631,8 @@ server/src/sim/world_debts.ts | t | none | WorldDebtEvidence WorldDebtRow WorldD
 server/src/sim/world_sim.ts | v | behavior | FAST_PER_SLOW RESTORE_FAIL SIM_FAST_DT SIM_SLOW_DT WorldSim mulberry32
 server/src/sim/world_sim.ts | v | none | warnRadiusOf wireTelegraphShapeOf
 server/src/sim/world_sim.ts | t | none | MaterialApi PlayerProfile RestoreFailCode SimFrameReport WorldArchiveReceipt WorldArchiveRequest WorldArchiveSink WorldArchiveTrimReceipt WorldResetResult WorldSimOptions
-server/src/social/afk.ts | v | behavior | CROSS_ROOM_FEE_RATIO DEEP_SLEEP_AFTER_SEC DEW_FIRE_BONUS DEW_SEC_PER_UNIT DEW_TATAMI_BONUS DOZE_AFTER_SEC DOZE_STATE KITE_CATCH_PENALTY_MS MAILBOX_CAPACITY MAIL_TTL_SEC MARATHON_LENGTH TRACK_KIND VIVARIUM VIVARIUM_CAMERA_SHOTS WHITE_NOISE_MIX afkExpRatio badgeFor buyFromStall createAfkPlayer createMailbox createStall createTrack createVivarium dewRatePerSec enterVivarium exitVivarium goBackground goForeground leaveMail likeMail listItem patDozing pruneMailbox suggestedPrice tickAfk tickVivarium trackCaught trackFinish trackPodiumText trackStandings trackStart whiteNoiseMasterGain
-server/src/social/afk.ts | v | none | BED_HP_PER_SEC CROSS_ROOM_MAX_QTY DEEP_SLEEP_MUL DEW_PAT_BONUS KITE_LENGTH MAILBOX_ITEM_ID MAIL_LIKE_BADGES STALL_ITEM_ID STALL_SLOT_COUNT STICKER_COUNT SUGGESTED_PRICE_MUL assertSocialRefsClosed
+server/src/social/afk.ts | v | behavior | CROSS_ROOM_FEE_RATIO DEEP_SLEEP_AFTER_SEC DEW_FIRE_BONUS DEW_SEC_PER_UNIT DEW_TATAMI_BONUS DOZE_AFTER_SEC DOZE_STATE KITE_CATCH_PENALTY_MS MAILBOX_CAPACITY MAIL_TTL_SEC MARATHON_LENGTH STALL_ITEM_ID TRACK_KIND VIVARIUM VIVARIUM_CAMERA_SHOTS WHITE_NOISE_MIX afkExpRatio badgeFor buyFromStall createAfkPlayer createMailbox createStall createTrack createVivarium dewRatePerSec enterVivarium exitVivarium goBackground goForeground leaveMail likeMail listItem patDozing pruneMailbox suggestedPrice tickAfk tickVivarium trackCaught trackFinish trackPodiumText trackStandings trackStart whiteNoiseMasterGain
+server/src/social/afk.ts | v | none | BED_HP_PER_SEC CROSS_ROOM_MAX_QTY DEEP_SLEEP_MUL DEW_PAT_BONUS KITE_LENGTH MAILBOX_ITEM_ID MAIL_LIKE_BADGES STALL_SLOT_COUNT STICKER_COUNT SUGGESTED_PRICE_MUL assertSocialRefsClosed
 server/src/social/afk.ts | t | none | AfkPlayer DozeState Mail Mailbox PurchaseResult Stall StallListing TrackKind TrackRuntime VivariumShot VivariumState
 server/src/systems/alchemy_lab.ts | v | behavior | brewAndRecord createGallery firstDiscovererOf galleryEntryOf galleryOrder materialsOf
 server/src/systems/alchemy_lab.ts | v | none | ALCHEMY_LAB_SYSTEM GALLERY_FALLBACK_NAME MAX_BREW_MATERIALS MIN_BREW_MATERIALS displayNameOf materialsResolvable
