@@ -24,7 +24,7 @@
  * 正确归类是**测试替身**(需新类别标签,见 task-37 报告)。
  */
 
-import { TABLE_PRIMARY_KEYS, type DbLike, type KeyParts, type Row } from './repo.ts';
+import { TABLE_PRIMARY_KEYS, type DbLike, type KeyParts, type OrderBy, type Row } from './repo.ts';
 
 /** 外键 -> 删除策略。`CASCADE` 删子行;`SET NULL` 置空可空列。 */
 export const FOREIGN_KEYS: readonly {
@@ -477,10 +477,23 @@ export class MemoryDb implements DbLike {
     return this.ensure(table).find((r) => matches(r, key));
   }
 
-  select(table: string, where?: KeyParts): Row[] {
-    const rows = this.ensure(table);
-    if (!where) return rows;
-    return rows.filter((r) => matches(r, where));
+  /**
+   * 按等值条件取行 + 可选的上界(与 `driver.sqlite.ts` 同一口径):
+   * 先 `where` 过滤,再 `orderBy` 排,最后 `limit` 截前 N 行。
+   *
+   * 一个上界参数都没带时**原样返回内部数组**(改前就是这个行为)——
+   * 只在真的用了上界时才构造新数组,免得顺手收紧一个既有依赖。
+   */
+  select(table: string, where?: KeyParts, limit?: number, orderBy?: OrderBy): Row[] {
+    const all = this.ensure(table);
+    if (!where && limit === undefined && !orderBy) return all;
+    let rows = where ? all.filter((r) => matches(r, where)) : all.slice();
+    if (orderBy) {
+      const sign = orderBy.dir === 'desc' ? -1 : 1;
+      rows = rows.sort((a, b) => sign * compareColumn(a[orderBy.column], b[orderBy.column]));
+    }
+    if (limit !== undefined) rows = rows.slice(0, Math.max(0, Math.trunc(limit)));
+    return rows;
   }
 
   count(table?: string): number {
@@ -535,6 +548,24 @@ export class MemoryDb implements DbLike {
 function matches(row: Row, key: KeyParts): boolean {
   for (const [k, v] of Object.entries(key)) if (row[k] !== v) return false;
   return true;
+}
+
+/**
+ * `select` 的排序比较器(SQL `ORDER BY` 的「够用」对齐):
+ * 两侧都能当有限数字看的(INTEGER 列)按数值比,否则按字符串比。
+ * 与 `driver.sqlite.ts` 的 `ORDER BY <col> ASC|DESC` 对应 —— 内存实现不能装死,
+ * 否则同一段仓储逻辑在两个后端上给出不同窗口(`room_events` 的有界保留/读取就靠它)。
+ */
+function compareColumn(a: unknown, b: unknown): number {
+  const na = Number(a);
+  const nb = Number(b);
+  if (a !== null && a !== undefined && b !== null && b !== undefined
+    && Number.isFinite(na) && Number.isFinite(nb)) {
+    return na === nb ? 0 : (na < nb ? -1 : 1);
+  }
+  const sa = String(a ?? '');
+  const sb = String(b ?? '');
+  return sa === sb ? 0 : (sa < sb ? -1 : 1);
 }
 
 /** 按顶层 `;` 切分,忽略括号内的分号(例如 CHECK (...))与 BEGIN…END 块内的分号(触发器体)。 */

@@ -46,12 +46,15 @@ import type { Database } from 'better-sqlite3';
 import {
   TABLE_PRIMARY_KEYS,
   migrate,
+  migrateStartingInventoryIfInstalled,
   migrateWorldArchives,
   migrateWorldArchivesIfInstalled,
   schemaSqlPath,
   type DbLike,
   type KeyParts,
+  type OrderBy,
   type Row,
+  type StartingInventoryBootCheck,
   type WorldArchiveBootCheck,
 } from './repo.ts';
 
@@ -128,6 +131,9 @@ function tableNamesOf(db: SqliteDb): string[] {
 export class SqliteDb implements DbLike {
   private conn: SqlConnection;
 
+  /** ★ 审计 P2:最近一次启动期维护(VACUUM)的结果;`null` = 还没跑过。 */
+  lastVacuum: VacuumReport | null = null;
+
   /**
    * @param conn 连接。传 `better-sqlite3` 的 `Database` 会自动适配
    *   (保留旧调用方式),也可直接传 `SqlConnection`。
@@ -156,6 +162,11 @@ export class SqliteDb implements DbLike {
    *   * 全新的库 ⇒ **不建**那第 10 张表(建表数被既有判据锁在 9 张,见
    *     `schema_world_archive.sql` 文件头);需要「启动即有归档表」的宿主显式调
    *     `bootstrapWorldArchives()`。
+   *
+   * ## ★ WS-FND-156 起始背包台账也在同一处置里
+   * 装过台账的库 ⇒ `checkStartingInventory()`(幂等 DDL + 漂移判定,漂移 ⇒ 拒绝启动);
+   * 全新的库 ⇒ 不建那张表(它由**第一次发放**时就地补上,见
+   * `schema_starting_inventory.sql` 文件头)。
    */
   bootstrap(nowMs: number, failClosed = true): void {
     const r = migrate(this, nowMs, schemaSqlPath());
@@ -171,11 +182,31 @@ export class SqliteDb implements DbLike {
         + '见 docs/WS-07-net-persist.md 的迁移段',
       );
     }
+    /* ★ WS-FND-156:起始背包台账的启动检查(装过才查)。
+       同一处置:台账是「谁已经领过起始背包」的唯一真值,它的 DDL 漂移会让
+       「已领」判断建在一个没人核对过的结构上 ⇒ 拒绝启动而不是等到某次入场。 */
+    const s = this.checkStartingInventory(nowMs);
+    if (s.drift && failClosed) {
+      throw new Error(
+        'user_starting_inventory 的迁移 checksum 漂移(schema_starting_inventory.sql 被改过,'
+        + '而库里的表没跟着改)⇒ 拒绝启动(fail-closed):'
+        + '台账判「已领」靠的是这张表,带着不确定的结构跑起来会重复发或永不发',
+      );
+    }
+    /* ★ 审计 P2 维护位:启动期检查一次「库是否已经膨胀到该重写」。
+       结果落在 `this.lastVacuum` 上 —— 「有没有做、为什么没做」必须可观测。
+       注意 VACUUM 是整库重写,**只**在启动期做,不挂写入路径。 */
+    this.lastVacuum = maybeVacuum(this);
   }
 
   /** 归档迁移的启动检查(装过才查;返回值可观测,便于装配层记录/判定)。 */
   checkWorldArchives(nowMs: number): WorldArchiveBootCheck {
     return migrateWorldArchivesIfInstalled(this, nowMs);
+  }
+
+  /** ★ WS-FND-156:起始背包台账迁移的启动检查(装过才查;返回值可观测)。 */
+  checkStartingInventory(nowMs: number): StartingInventoryBootCheck {
+    return migrateStartingInventoryIfInstalled(this, nowMs);
   }
 
   /**
@@ -228,17 +259,31 @@ export class SqliteDb implements DbLike {
   get(table: string, key: KeyParts): Row | undefined {
     return this.select(table, key).slice(0, 1)[0];
   }
-
-  select(table: string, where?: KeyParts, limit?: number): Row[] {
+  /**
+   * 按等值条件取行 + 可选的上界(`limit` / `orderBy`)。
+   *
+   * 上界必须**下推到 SQL**:改前这里虽有 `limit`,但 `repo.ts` 的 `select` 声明
+   * 里根本没有它 ⇒ 「只读最近 N 行」只能把整表取回 JS 再裁(`room_events` 就是
+   * 这样长跑的)。现在 `ORDER BY` 的列名与方向都过白名单,`LIMIT` 取整内联。
+   */
+  select(table: string, where?: KeyParts, limit?: number, orderBy?: OrderBy): Row[] {
     assertTable(table);
     const cols = where ? Object.keys(where) : [];
     for (const c of cols) assertColumn(c);
+    if (orderBy) assertColumn(orderBy.column);
     const clause = cols.length > 0 ? ` WHERE ${cols.map((c) => `${c} = ?`).join(' AND ')}` : '';
+    const order = orderBy
+      ? ` ORDER BY ${orderBy.column} ${orderBy.dir === 'desc' ? 'DESC' : 'ASC'}`
+      : '';
     /* LIMIT 取整后内联:它是数字,不构成注入面;而绑参给 LIMIT 在部分引擎上不被接受。 */
     const lim = limit === undefined ? '' : ` LIMIT ${Math.max(0, Math.trunc(limit))}`;
-    const rows = this.conn.all(`SELECT * FROM ${table}${clause}${lim}`, cols.map((c) => toSqlValue(where?.[c])));
+    const rows = this.conn.all(
+      `SELECT * FROM ${table}${clause}${order}${lim}`,
+      cols.map((c) => toSqlValue(where?.[c])),
+    );
     return rows.map(normalizeRow);
   }
+
 
   /** 表名列表(自省用,验证 DDL 是否落地)。 */
   tableNames(): string[] {
@@ -397,6 +442,37 @@ export function openNodeSqlite(file = ':memory:'): SqliteDb {
   return new SqliteDb(nodeSqliteConnection(new nodeSqlite.DatabaseSync(file)));
 }
 
+/**
+ * WAL 自动检查点阈值(页)。
+ *
+ * 为什么必须**显式**设(审计 P2):`journal_mode = WAL` + `synchronous = NORMAL`
+ * 之后,-wal 文件只在 checkpoint 时收缩,而「何时检查点」由 `wal_autocheckpoint`
+ * (引擎默认 1000 页)决定。本仓原先只设了前三条 PRAGMA,**没设这一条** ⇒
+ * 这个决定交给了引擎默认值:换引擎/换版本就悄悄变了,而它正是长跑里
+ * 「-wal 文件涨到几百 MB」的那个开关。
+ *
+ * 512 页(默认页 4 KiB ⇒ 约 2 MiB 上限)是本仓「20 Hz 写入 + 小库」的折中:
+ * 比默认更早回收,又不至于每个事务都检查点一次。
+ * ⚠️ 单位是**页**不是字节;`better-sqlite3` 与 `node:sqlite` 接受同一语法。
+ */
+export const WAL_AUTOCHECKPOINT_PAGES = 512;
+
+/**
+ * VACUUM 的触发阈值:空闲页占比 ≥ 该百分比才整库重写。
+ *
+ * 要不要 VACUUM、什么时候做(结论 + 依据):
+ *   结论:只在**启动期**做,且只有超过阈值才做;不挂高频写入路径。
+ *   依据:VACUUM 把整库重写一遍(临时文件 + 全表拷贝),代价 O(库大小);
+ *   而删行(`room_events` 的有界保留、归档裁剪)**只把页放回 freelist**,
+ *   文件字节数不会缩 —— 长跑之后会出现「逻辑规模已封顶、文件仍然很大」。
+ *   既不能省(否则文件只涨不缩),也不能随便做(每删一次就真空一次,等于把
+ *   删行的收益立刻花掉)⇒ 启动期一次 + 阈值挡住空转 = 折中。
+ *
+ * 未做(留 owner 裁决):`PRAGMA incremental_vacuum` 需要建库时就定下的
+ *   `auto_vacuum = INCREMENTAL`(持久属性),事后改等于改库的物理布局。
+ */
+export const VACUUM_FREELIST_PCT_THRESHOLD = 25;
+
 /** WAL 下推荐的额外 PRAGMA(连接建立后调用一次即可)。 */
 export const RECOMMENDED_PRAGMAS: readonly string[] = [
   'PRAGMA journal_mode = WAL',
@@ -405,4 +481,54 @@ export const RECOMMENDED_PRAGMAS: readonly string[] = [
   'PRAGMA busy_timeout = 5000',
   'PRAGMA temp_store = MEMORY',
   'PRAGMA cache_size = -16000',
+  /* ★ 审计 P2:检查点阈值从「引擎默认」变成**本仓的具名常量**。 */
+  `PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`,
 ];
+
+/** 一次启动期维护(VACUUM)的结果。**必须可观测** —— 「默默没做」本身就是缺陷。 */
+export interface VacuumReport {
+  /** 真的执行了 VACUUM 吗。 */
+  ran: boolean;
+  /** `ran === false` 的原因:`empty` 空库 / `under-threshold` 没到阈值 /
+   *  `in-transaction` 在事务里(SQLite 不允许)/ `failed` 执行抛错。 */
+  reason: 'ok' | 'empty' | 'under-threshold' | 'in-transaction' | 'failed';
+  /** 空闲页数(`PRAGMA freelist_count`)。 */
+  freePages: number;
+  /** 库页数(`PRAGMA page_count`)。 */
+  pageCount: number;
+  /** 空闲页占比(0..100);`pageCount === 0` 时记 0。 */
+  freePct: number;
+  /** `reason === 'failed'` 时的错误消息。 */
+  error?: string;
+}
+
+/**
+ * 超阈值才 VACUUM。SQLite 不允许在事务里跑 ⇒ 那种情况报 `in-transaction` 而不是
+ * 抛错(启动期调用方不该因为「恰好有人开着事务」而崩)。
+ */
+export function maybeVacuum(
+  db: SqliteDb,
+  thresholdPct = VACUUM_FREELIST_PCT_THRESHOLD,
+): VacuumReport {
+  const pragma = (name: string): number => {
+    const row = db.raw<Record<string, unknown>>(`PRAGMA ${name}`, [])[0];
+    return Number(row?.[name] ?? 0) || 0;
+  };
+  const freePages = pragma('freelist_count');
+  const pageCount = pragma('page_count');
+  const freePct = pageCount > 0 ? (freePages / pageCount) * 100 : 0;
+  const base = { freePages, pageCount, freePct };
+  if (pageCount === 0) return { ran: false, reason: 'empty', ...base };
+  if (freePages === 0 || freePct < thresholdPct) {
+    return { ran: false, reason: 'under-threshold', ...base };
+  }
+  try {
+    db.exec('VACUUM');
+    return { ran: true, reason: 'ok', ...base };
+  } catch (e) {
+    const msg = (e as Error)?.message ?? String(e);
+    if (/within a transaction/i.test(msg)) return { ran: false, reason: 'in-transaction', ...base };
+    /* 不静默吞:原因与错误文本一起回给调用方,由它决定记日志还是告警。 */
+    return { ran: false, reason: 'failed', error: msg, ...base };
+  }
+}

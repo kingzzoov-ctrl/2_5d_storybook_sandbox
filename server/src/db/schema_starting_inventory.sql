@@ -1,0 +1,66 @@
+-- ============================================================================
+-- 2.5D 绘本沙盒 · **起始背包发放台账** DDL(WS-FND-156)
+-- 归属:WS-FND-155 的后续 —— 「起始背包已发」必须**跨进程幂等**
+--       (修前它只是 `RoomRuntime.startingInventoryGranted:Set<string>`,
+--        即**房间实例**的内存账:服务重启后同一个 id 会**再发一次**)。
+-- 目标引擎:SQLite 3(与 schema.sql 同一个库、同一套 PRAGMA)
+--
+-- ## 为什么是**独立的旁表**,而不是 `users` 上加一列
+--
+-- 1 ★ **并发占位需要「库层唯一约束」**。本表的主键就是 `user_id` ⇒
+--    「同一个 id 只能有一行」由库**结构性**保证:
+--   ```
+--   进程 A 先写 ⇒ 成功;进程 B 的 INSERT ⇒ 唯一约束当场拒(调用方回滚自己的发放)
+--   ```
+--   `users` 上加一列**做不到**这件事:`DbLike.update` 的 where 只有等值键
+--   (`repo.ts:45`),没有「只有在 version = 0 时才写得进去」的条件写入 ⇒
+--   两个进程各自「读 0 → 都判定未领 → 都发一份」,而这不是理论问题:
+--   同一台机器上重启 + 旧进程未退干净、或两个 Room 实例共享一个库都会撞上。
+--2  **不动 `schema.sql`**:那份 DDL 的 checksum 已经登记在既有库的
+--   `schema_migrations` 里(`version = 1`)。往 `users` 里加一列会改掉整份
+--   schema.sql 的 checksum ⇒ **每一个旧库**都会在启动时判成 drift 并
+--   fail-closed 拒绝启动(`repo.ts:216` 的 `migrate()`)。那不是「兼容既有库」,
+--   那是把既有库全部拒之门外。
+--3  本表**不引外键**:
+--   * 入场者未必有 `users` 行(访客 id 只活在房间/世界侧,`ensureOwnerUser`
+--     只给房主建号)⇒ 一条 `FOREIGN KEY (user_id) REFERENCES users(id)` 会
+--     在**真实 SQLite** 上当场拒掉合法的发放;
+--   * 外键条数被 `tests/WS-07.test.ts` 的 A07b 锁在 11 条(与归档表同一处置,
+--     见 `schema_world_archive.sql` 文件头)。
+--
+-- ## 「旧库」怎么进来(兼容既有库:就地补表,**不重建**)
+--
+-- 老库(v1 基线 / v1+v2)里**没有这张表**,也没有版本 3 的登记行 ⇒
+-- `repo.ts:migrateStartingInventory()` 在**第一次发放尝试时**跑一次本文件
+-- (`CREATE TABLE IF NOT EXISTS` 是幂等的)并登记一行 ⇒ 库原地升到 v3,
+-- 既有表与既有行一个都不动。迁移的判序与归档同一条纪律:
+-- 「先读版本 → 护栏 → 漂移 → 才 exec DDL」。
+--
+-- ## 为什么建表数是 1,而「9 张表」的既有判据不会红
+--
+-- 本表**不在 `migrate()` 里建**(那条路只建 schema.sql 的 9 张),而是**第一次
+-- 发放**时由 `migrateStartingInventory()` 建 —— 与 `room_world_archives`
+-- 由 `archiveWorldSnapshot()` 建是同一处置。只在「装过 / 用过本特性」的库上
+-- 多一张表:
+--   * `migrate()` 后仍是 9 张(tests/WS-07.test.ts:213/501、verify.ts:6776 不动);
+--   * 尚未发放过的库走进场段 ⇒ 表被建出来(此后一直是 10 张,这是**预期**结构)。
+--
+-- 单位约定(与 schema.sql 一致):时间戳 = Unix 毫秒。
+-- ============================================================================
+
+-- ── 一行 = 一个玩家**已领过**起始背包(这是「已发」的全部真值)──────────────
+-- 语义:
+--   * `user_id`    = 玩家 id(主键 ⇒ 库层唯一约束 = 并发占位的抓手);
+--   * `version`    = 发放**当时**的起始包版本号(`repo.ts:STARTING_INVENTORY_VERSION`)。
+--                    只作审计与将来裁决的输入:**判据只看「有没有这一行」**,
+--                    版本升高**不补发**(理由写在 `repo.ts` §14 与
+--                    `tests/WS-FND-156` 的 FND156-10 里);
+--   * `granted_at` = 发放时刻(Unix 毫秒)。
+-- `CHECK (version >= 1)` 的形态是 `MemoryDb` 认得的那一种(`cmp`);
+-- 「version = 0」不在值域内 —— 0 的语义是「从未发放」,它由**行的不存在**表达,
+-- 不允许两个状态说同一件事(否则「有行但 version=0」会变成第三个态)。
+CREATE TABLE IF NOT EXISTS user_starting_inventory (
+  user_id    TEXT    PRIMARY KEY,
+  version    INTEGER NOT NULL CHECK (version >= 1),
+  granted_at INTEGER NOT NULL
+);

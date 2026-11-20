@@ -166,6 +166,56 @@ export const MAX_FRAME_HEADER_BYTES = 14;
  */
 export const MAX_CONN_BUF_BYTES = MAX_FRAME_HEADER_BYTES + MAX_FRAME_BYTES;
 
+/* ═══════ ★ WS-FND-161:连接侧四项(待握手 / 写背压 / 席位)的上界与阈值 ═══════
+ *
+ * ## 修前的实测形态(每个常量对应其中一条)
+ * ```text
+ * 1 `conns.add(conn)` 只认「升级成功」,**没有任何上界**:一条 TCP 连上来、
+ *   做完 Upgrade 就沉默 ⇒ 它占一个 Set 槽 + 一个 socket,**永不超时**。
+ *   攻击成本 = 一个 TCP 连接(不需要任何协议知识)⇒ 内存/句柄无上界。
+ * 2 `c.socket.write(bytes)` 的**返回值被丢弃** ⇒ 慢客户端没有背压信号:
+ *   帧照旧进 Node 的发送队列,而「发不出去」这件事在服务端**不可观测**,
+ *   直到内存或延迟把它暴露出来(那时已经晚了)。
+ * 3 广播只看 `c.helloDone && !c.closed`:席位被房间收走(`kick` ⇒ `leave`)
+ *   的连接**仍在广播集里** ⇒ 被踢者继续收全房 delta。
+ * 4 于是「广播集」既无成员判据(3)也无上界(1/2)⇒ 有界性只能靠人手推。
+ * ```
+ */
+/**
+ * **已升级但还没 hello** 的连接数上界。
+ *
+ * 为什么在**升级之前**判:101 一发出,对方就已经占到 socket 与 Set 槽;
+ * 事后再关,也要先把它收下(见 `HELLO_TIMEOUT_MS` 那条路径的补刀)。
+ * ⇒ 两道,**互不替代**:入口闸(这个常量)+ 时间闸(`HELLO_TIMEOUT_MS`)。
+ * 64 的依据:真实客户端从 Upgrade 到 hello 是**同一批事件**里的一帧
+ * (客户端 `session.ts` 连上即发),64 个并发握手留了足够余量,
+ * 而"永远不会 hello"的连接最多只占 64 个槽。
+ */
+export const MAX_PENDING_HELLO_CONNS = 64;
+/**
+ * 升级之后必须在这个毫秒数内完成 hello,否则**断开**(并计数 + 日志)。
+ *
+ * 10s 的依据:真实握手是"立刻"(远慢于此的任何值都是在放行占位),
+ * 而它比「永不回收」好无穷倍 —— 后者正是修前的形态。
+ */
+export const HELLO_TIMEOUT_MS = 10_000;
+/**
+ * 单连接**连续**「`socket.write` 返回 false」多少次之后断开。
+ *
+ * ## 为什么策略是「断开」而不是「丢弃最旧」
+ * ```text
+ * 下行是**差量**编码(delta 相对 `prevState`,见广播循环)⇒ 丢一帧不是
+ *   "客户端少看一眼",而是让它**此后每一帧都对不上**(差量链断了)
+ *   ⇒ 静默丢帧比断连更坏(它把"卡住"变成"错位",且都不出声)。
+ * ⇒ 明确策略:背压持续到阈值 ⇒ 断开该连接(1011)+ 计数 + 日志。
+ *   断开之前**不阻塞**(绝不 await 写)、也**不偷偷丢**(`writeBackpressure`
+ *   就是"发不出去"这件事的读数)。
+ * ```
+ * 10 帧 ≈ 20Hz 下 500ms 的持续积压:足够排除一次 TCP 抖动,
+ * 又远小于玩家能察觉的"卡住"。
+ */
+export const BACKPRESSURE_DISCONNECT_STRIKES = 10;
+
 /**
  * 帧超界**专用**错误类 —— 运输层据此回 **1009**(message too big),
  * 而不是把超界与协议错一律回 1002。
@@ -458,6 +508,26 @@ export type WsConn = {
    * (见广播循环里的 `withAckedSeq`)。读取口:`lastAckedSeqFor(userId)`。
    */
   ackedSeq: number;
+  /**
+   * ★ WS-FND-161(P1-3):**这条连接是否在广播集里**(= 席位仍在房间)。
+   *
+   * 为什么需要它(修前实测):`kick()` 走 `leave()` **只摘席位、不断连接**
+   * (`room.colyseus.ts`),而广播只看 `helloDone && !closed` ⇒ 被踢者
+   * 继续收全房 delta(`snapshotFor(_userId)` 又**忽略参数**,"按人裁剪"从未生效)。
+   * ⇒ 运输层自己维护"广播集成员"这一位:握手成功置 `true`,
+   *   房间报告席位没了(见 `WsRoomLike.isSeated`)⇒ 置 `false` 并**移出**广播集。
+   * ⚠️ 移出广播集**不等于**断开连接:socket 留着(下行停、上行按原纪律处理),
+   *   让"被踢"这件事有明确的传输层表现,而不是让被踢者继续看全房。
+   */
+  inRoom: boolean;
+  /**
+   * ★ WS-FND-161(P1-2):**连续**「`socket.write` 返回 false」的次数(一次 true 归零)。
+   *
+   * `write` 的返回值是 Node 唯一的「对端读得慢」信号;修前它被丢弃 ⇒
+   * 慢客户端在服务端**不可观测**。到达 `BACKPRESSURE_DISCONNECT_STRIKES`
+   * ⇒ 断开(理由见那个常量:「丢帧比断连更坏」)。
+   */
+  writeStalls: number;
 };
 
 /**
@@ -518,6 +588,18 @@ export type WsServerOptions = {
    *   `token !== null` 分支)——"不强制"不等于"伪造也放行"。
    */
   requireToken?: boolean;
+
+  /**
+   * ★ WS-FND-161(P1-1):**待握手**(已升级、还没 hello)连接数上限。
+   * 默认 `MAX_PENDING_HELLO_CONNS`。可覆盖是为了让判据不必真连 64 条 TCP
+   * (理由与 `frameMs` 相同:参数化的是**量**,不是语义 —— 超限一律拒升级)。
+   */
+  maxPendingHello?: number;
+  /**
+   * ★ WS-FND-161(P1-1):握手超时 ms。默认 `HELLO_TIMEOUT_MS`。
+   * ⚠️ 覆盖它**不改变**语义:超时一律「断开 + 计数 + 一行日志」。
+   */
+  helloTimeoutMs?: number;
 };
 
 /**
@@ -655,6 +737,20 @@ export type WsRoomLike = {
   leave(userId: string): boolean;
   disconnect(userId: string): boolean;
   /**
+   * ★ WS-FND-161(P1-3):这个 userId 现在是否**还在房间里**(可选)。
+   *
+   * 名字与 `RoomRuntime.isSeated` **逐字一致**是有意的:`RoomRuntime`
+   * 结构性满足本接口(见文件头的结构化最小接口纪律),于是两处是**同一份口径**
+   * (`members.get(id)?.connected === true`),没有第二个"在不在房里"的判定被写出来。
+   *
+   * 用途(修前实测的缺陷):`kick()` ⇒ `leave()` 摘掉席位后,广播集
+   * **不知道**这件事 ⇒ 被踢者继续收全房 delta。现在每一帧广播前用它核对席位,
+   * 没了 ⇒ 移出广播集(`inRoom=false` + 计数 + 一行日志)。
+   * ⚠️ 可选:单机演示房 / 测试桩没有席位表 ⇒ 那是"无法得知",
+   *   此时**保持旧行为**(不假装知道也没人占位)—— 这类房间本来也没有 kick。
+   */
+  isSeated?(userId: string): boolean;
+  /**
    * 应用一条移动意图。**可选** —— 它只对「真驱动一个模拟层」的房间有意义。
    *
    * ⚠️ 刻意**可选**:`WsRoomLike` 是本文件的**结构化最小接口**,
@@ -757,6 +853,34 @@ export type WsServerHandle = {
    * `() => {}`,计数仍在(断言"发生过"还是绿),只有这个数会停在 0。
    */
   logLines(): number;
+  /**
+   * ★ WS-FND-161(P1-1):**当前**已升级但还没 hello 的连接数(≤ 上限,超了不升级)。
+   * 它与 `connCount()` 分开:后者是"握过手的人",这是"还没说自己是谁的连接"。
+   */
+  helloPending(): number;
+  /** ★ WS-FND-161(P1-1):因**握手超时**被断开的累计连接数(与下面那条入口闸分开计)。 */
+  handshakeTimeouts(): number;
+  /** ★ WS-FND-161(P1-1):因**待握手连接满**被拒(不升级,HTTP 503)的累计连接数。 */
+  pendingHelloRejected(): number;
+  /**
+   * ★ WS-FND-161(P1-2):`socket.write` **返回 false**(对端读得慢)的累计次数。
+   *
+   * ⚠️ 与 `writeErrors` **分开**:那是"写抛了"(帧真的没进 socket),
+   * 这是"写排队了"(帧进了 socket,但内核缓冲已满)。两件事两种处置。
+   */
+  writeBackpressure(): number;
+  /** ★ WS-FND-161(P1-2):背压**持续到阈值**因而被断开的累计连接数。 */
+  backpressureDrops(): number;
+  /**
+   * ★ WS-FND-161(P1-3):**当前广播集**大小(握过手 + 席位在 + 未关)。
+   *
+   * 为什么必须是一个可读的数:`connCount() - broadcastTargets()` 就是
+   * 「连着但不在房里的人」(被踢者)⇒ 这条判据能直接问"被踢者还在收帧吗",
+   * 而不是读代码猜广播条件。
+   */
+  broadcastTargets(): number;
+  /** ★ WS-FND-161(P1-3):因**席位被房间收走**而移出广播集的累计连接数。 */
+  seatsRevoked(): number;
   /**
    * ★ 某条连接**已应用成功的最高客户端命令序号**(`-1` = 该连接还没带过 `seq`)。
    *
@@ -934,6 +1058,25 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let writeErrors = 0;
   /** 写出去的日志行数(证明出口真的被调过)。 */
   let logLines = 0;
+  /* ═══════ ★ WS-FND-161:连接侧四项的计数与阈值(与上面的失败计数**分开计**) ═══════
+   * ```
+   * handshakeTimeouts    超时没 hello 被断开     ← P1-1 时间闸
+   * pendingHelloRejected 待握手满了拒升级(503)  ← P1-1 入口闸
+   * writeBackpressure    write 返回 false 的次数 ← P1-2 背压可见性
+   * backpressureDrops    背压到阈值被断开         ← P1-2 明确策略
+   * seatsRevoked         席位没了 ⇒ 移出广播集    ← P1-3 被踢者不再收帧
+   * ```
+   * ⚠️ 五个数**不合并**:合并之后「超时断开」与「入口拒升级」再也分不出来,
+   *   而它们的修法完全不同(一个是超时太短,一个是容量太小)。 */
+  let handshakeTimeouts = 0;
+  let pendingHelloRejected = 0;
+  let writeBackpressure = 0;
+  let backpressureDrops = 0;
+  let seatsRevoked = 0;
+  /** 待握手连接数上限(默认 `MAX_PENDING_HELLO_CONNS`)。 */
+  const maxPendingHello = opts.maxPendingHello ?? MAX_PENDING_HELLO_CONNS;
+  /** 握手超时 ms(默认 `HELLO_TIMEOUT_MS`)。 */
+  const helloTimeoutMs = opts.helloTimeoutMs ?? HELLO_TIMEOUT_MS;
   /**
    * **唯一**写日志的地方。
    *
@@ -974,16 +1117,126 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   /* ★ 旧的闭包级 `lastAckedSeq` 已删除(D-14):ack 是**每连接**的量,
      全局那一份正是"多连接互相冒充"的成因。见 `WsConn.ackedSeq`。 */
 
-  const write = (c: WsConn, bytes: Uint8Array): void => {
-    if (c.closed || c.socket.destroyed) return;
-    try { c.socket.write(bytes); } catch (e) {
+  /**
+   * 下发字节。**返回 `socket.write` 的可写性**(true = 直接进了内核缓冲,
+   * false = 排进了 Node 的发送队列 = 对端读得慢)。
+   *
+   * ## ★ WS-FND-161(P1-2):修前这里返回 `void`,**把返回值丢掉了**
+   * ```text
+   * const write = (c, bytes): void => { try { c.socket.write(bytes); } catch ... }
+   * ⇒ 慢客户端**没有任何信号**:帧照旧排队,服务端既不知道"发不出去",
+   *  也没有任何上界 ⇒ 内存与延迟都变成攻击面(与帧层那个 O(n^2) 同形)。
+   * ⇒ 现在:返回值被**消费**(调用方/计数都看得见),并按下面那条策略处置。
+   * ```
+   * ⚠️ 「返回 false」**不是丢帧**:Node 的 `write` 返回 false 只是"队列满了",
+   *   字节**已经交给** socket ⇒ 计数文案必须说清(否则下一个人会以为帧丢了,
+   *   去补一条重发逻辑 —— 那才是把差量协议改坏)。 */
+  const write = (c: WsConn, bytes: Uint8Array): boolean => {
+    if (c.closed || c.socket.destroyed) return false;
+    let writable: boolean;
+    try {
+      writable = c.socket.write(bytes);
+    } catch (e) {
       /* ★ WS-FND-134(P2):修前这里是 `catch { c.closed = true }` ——
          下行写失败**一点痕迹都没有**:报文丢了、连接被标记关闭,
-         而调用方看到的是"这个玩家一直没收到帧"。 */
+         而调用方看到的是「这个玩家一直没收到帧」。 */
       writeErrors += 1;
       c.closed = true;
       log('write', `下行写失败(bytes=${bytes.byteLength}):${e instanceof Error ? e.message : String(e)}`);
+      return false;
     }
+    if (writable) {
+      /* 一次可写 ⇒ 背压解除("**连续** N 次"的口径靠这一行成立)。 */
+      c.writeStalls = 0;
+      return true;
+    }
+    /* ── ★ WS-FND-161(P1-2):背压态 ──
+       1 记账:帧**已在** socket 里排队 ⇒ 不许说成"丢帧"(`writeBackpressure`);
+       2 连续到阈值 ⇒ **断开**(1011)+ `backpressureDrops`,理由与取舍写在
+         `BACKPRESSURE_DISCONNECT_STRIKES` 上(丢帧会打断差量链,比断连更坏)。
+       ⚠️ 这里**不阻塞**:`socket.write` 本来就是非阻塞的,而"等它排空再写"
+         会让 20Hz 循环的帧率由**最慢的那个客户端**决定 —— 那是把一个人的
+         卡顿摊给全房。 */
+    writeBackpressure += 1;
+    c.writeStalls += 1;
+    if (c.writeStalls >= BACKPRESSURE_DISCONNECT_STRIKES) {
+      backpressureDrops += 1;
+      log('write', `背压持续 ${c.writeStalls} 帧(socket.write 恒 false)⇒ 断开`
+        + `${c.userId === null ? '(未握手)' : `,userId=${c.userId}`}`);
+      c.closed = true;
+      try { c.socket.end(encodeClose(1011, 'backpressure')); } catch { /* 已断 */ }
+      try { c.socket.destroy(); } catch { /* 已断 */ }
+    }
+    return false;
+  };
+
+  /**
+   * **当前**已升级但还没 hello 的连接数(P1-1 的两个闸都读它)。
+   *
+   * 为什么必须是"数一遍"而不是维护一个计数变量:连接的进出路径有 3 条
+   * (upgrade / error / close)⇒ 手工加减迟早漏一条,而"漏一条"的表现是
+   * **上界失效**(正是本轮要修的东西)。数一遍是 O(n),n ≤ 上界。
+   */
+  const countPending = (): number => {
+    let n = 0;
+    for (const c of conns) if (!c.helloDone && !c.closed) n += 1;
+    return n;
+  };
+
+  /**
+   * ★ WS-FND-161(P1-3):房间**现在**是否还认这个席位。
+   *
+   * 三种情况都返回 `true`(不许把"不知道"当成"不在"):
+   * ```text
+   * 1 还没握手(userId === null):没有席位可言,不参与判定;
+   * 2 房间没有 isSeated(单机演示房 / 测试桩):**无法得知** ⇒ 保持旧行为;
+   * 3 isSeated 自己抛:断言的现场是"房间实现坏了",而"因为房间抛错就把玩家
+   *   静音"会让故障表现成"这个人收不到帧"(静默)—— 故宽容 + 保持旧行为。
+   * ```
+   */
+  const seatAlive = (c: WsConn): boolean => {
+    if (c.userId === null) return true;
+    const has = opts.room.isSeated;
+    if (typeof has !== 'function') return true;
+    try { return has.call(opts.room, c.userId) === true; } catch { return true; }
+  };
+
+  /**
+   * ★ WS-FND-161(P1-3):每一帧广播前把**广播集**与房间的席位表核对一次。
+   *
+   * ## 修前(实测缺陷)
+   * ```text
+   * kick() ⇒ leave() 只摘席位、不断连接(room.colyseus.ts),
+   * 而广播条件只有 `helloDone && !closed` ⇒ **被踢者继续收全房 delta**;
+   * snapshotFor(_userId) 又忽略参数("按人裁剪"从未生效)⇒ 两条路都不裁。
+   * ```
+   * ## 现在
+   * `inRoom=false` + `seatsRevoked += 1` + 一行 `[ws:conn]` 日志。
+   * ⚠️ 幂等:只有**真变化**那一次计数(否则这个数会变成"每帧涨 1"的噪声,
+   *   而本仓纪律是"计数是单调累加的事实",不是节拍器);
+   * 席位回来了(同一条连接上 join 了第二次)⇒ 重新进广播集(自愈)。
+   */
+  const syncSubscriptions = (): void => {
+    for (const c of conns) {
+      if (!c.helloDone || c.closed) continue;
+      if (seatAlive(c)) { c.inRoom = true; continue; }
+      if (c.inRoom) {
+        seatsRevoked += 1;
+        log('conn', '席位已被房间收走(leave / kick)⇒ 移出广播集'
+          + `${c.userId === null ? '' : `,userId=${c.userId}`}`);
+      }
+      c.inRoom = false;
+    }
+  };
+
+  /** ★ WS-FND-161(P1-3):广播的**唯一**成员判据(修前只有 `helloDone && !closed`)。 */
+  const isBroadcastTarget = (c: WsConn): boolean => c.helloDone && c.inRoom && !c.closed;
+
+  /** 当前广播集大小 —— 供 `broadcastTargets()` 读(与 `connCount()` 的差 = 被踢者)。 */
+  const countBroadcastTargets = (): number => {
+    let n = 0;
+    for (const c of conns) if (isBroadcastTarget(c)) n += 1;
+    return n;
   };
 
   /* ── 包头里 ackedSeq 的位置与编码 ──
@@ -1021,17 +1274,21 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     return out;
   };
 
-  /** 下发:★ **不加 tag**(契约 §12.1)。 */
-  const sendBinary = (c: WsConn, payload: Uint8Array): void => {
-    if (payload.byteLength === 0) return;
-    write(c, encodeFrame(OP_BINARY, payload));
+  /**
+   * 下发:★ **不加 tag**(契约 §12.1)。
+   * ★ WS-FND-161(P1-2):返回值**透出去**(= `socket.write` 的可写性),
+   * 广播循环据它记账 —— 修前这里也是 `void`,慢客户端的信号传到一半就断了。
+   */
+  const sendBinary = (c: WsConn, payload: Uint8Array): boolean => {
+    if (payload.byteLength === 0) return false;
+    return write(c, encodeFrame(OP_BINARY, payload));
   };
-  const sendJson = (c: WsConn, obj: unknown): void => {
+  const sendJson = (c: WsConn, obj: unknown): boolean => {
     /* ★ 下行文本发**裸 JSON**(首字节就是 `{`)。
        客户端 `classifyDownlink` 两条都支持(裸 JSON / `0x01`+JSON),
        但"下行无 tag"是本契约的原则 ⇒ 少一层转换、少一处出错点。 */
     const b = new TextEncoder().encode(JSON.stringify(obj));
-    write(c, encodeFrame(OP_TEXT, b));
+    return write(c, encodeFrame(OP_TEXT, b));
   };
 
   /* ── HTTP upgrade 握手 ── */
@@ -1045,6 +1302,23 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     if (typeof key !== 'string' || key.length === 0) {
       socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
       socket.destroy();
+      return;
+    }
+    /* ── ★ WS-FND-161(P1-1):**入口闸** —— 待握手连接满了就**不升级** ──
+       ## 修前
+       `conns.add(conn)` 没有任何上界:一条"做完 Upgrade 就沉默"的 TCP
+       即可永久占一个 socket + 一个 Set 槽(攻击成本 = 一个连接,不需要
+       任何协议知识)⇒ 句柄/内存无上界,而**没有任何东西会红**。
+       ## 判据为什么必须在写 101 **之前**
+       101 一发出就升级完成了 —— 那时再拒只是"关掉一条已经占过资源的连接",
+       闸门拦不住任何东西。故这里先数一遍(`countPending`),再决定给不给 101。
+       ⚠️ 与时间闸(`HELLO_TIMEOUT_MS`)**互不替代**:这条管并发量,
+         那条管"已经进来的那条能占多久"。 */
+    if (countPending() >= maxPendingHello) {
+      pendingHelloRejected += 1;
+      log('conn', `待握手连接已满(${countPending()}/${maxPendingHello})⇒ 拒绝升级`);
+      try { socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n'); } catch { /* 已断 */ }
+      try { socket.destroy(); } catch { /* 已断 */ }
       return;
     }
     socket.write(
@@ -1063,9 +1337,31 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       /* ★ 凭证在**建连接时**取一次(见 `WsConn.urlToken`:重复 hello 不得换证据)。 */
       urlToken: readTokenFromUrl(req.url),
       ackedSeq: -1,
+      /* ★ WS-FND-161:握手成功才进广播集(`onHello` 置 true);背压计数从 0 起。 */
+      inRoom: false, writeStalls: 0,
     };
     conns.add(conn);
     log('conn', `upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
+    /* ── ★ WS-FND-161(P1-1):**时间闸** —— 升级了就必须在 helloTimeoutMs 内 hello ──
+       ## 修前
+       一条只做 Upgrade、不发 hello 的连接**没有超时**:Upgrade 一成功它就
+       永久留在 `conns` 里(没有定时器、没有判据、没有日志)。
+       ## 为什么"不清理定时器"是有意的
+       回调**自带** no-op 判断(`helloDone || closed` ⇒ 直接返回),而定时器
+       `unref()` 掉 ⇒ 它既不占事件循环、也不需要谁记得清它。
+       ⇒ 少一个"必须顺手清掉"的 Map,就少一处漏清(本仓反复记的那个形态)。
+       ⚠️ 超时**必须出声**:计数 + 一行 `[ws:conn]` 日志 + 回 1008 再 destroy
+         (直接 destroy 会让对端把"服务端关我"读成网络抖动)。 */
+    const helloTimer = setTimeout(() => {
+      if (conn.helloDone || conn.closed) return;
+      handshakeTimeouts += 1;
+      log('conn', `握手超时(${helloTimeoutMs}ms 内没有 hello)⇒ 断开`
+        + `,conns=${conns.size}`);
+      write(conn, encodeClose(1008, 'handshake timeout'));
+      conn.closed = true;
+      try { socket.destroy(); } catch { /* 已断 */ }
+    }, helloTimeoutMs);
+    if (typeof helloTimer.unref === 'function') helloTimer.unref();
 
     socket.on('data', (chunk: Buffer) => {
       /* ★ 追加到残帧缓冲区 —— **不假设一 data 一帧**(见 parseFrame) */
@@ -1355,6 +1651,10 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     c.userId = claimed;
     c.declaredUserId = claimed;
     c.helloDone = true;
+    /* ★ WS-FND-161(P1-3):握手成功 ⇒ **进广播集**。
+       之后每一帧广播前都会用 `isSeated(userId)` 与房间核对一次;
+       席位被收走(kick / leave)⇒ 这一位翻 false,该连接**立刻**不再收帧。 */
+    c.inRoom = true;
     /* welcome:字段与客户端 WelcomeFrame 对齐(契约 §12.4) */
     sendJson(c, {
       t: 'welcome',
@@ -1548,8 +1848,22 @@ function onMove(c: WsConn, msg: {
   }
 }
 
-  /* ── 20Hz 广播循环 ── */
+  /* ── 20Hz 广播循环 ──
+   * ★ WS-FND-161(P2)「广播顺序 / 有界」在这一段里的三条依据:
+   * ```text
+   * 1 **成员**:先 `syncSubscriptions()` 与房间席位表核对 ⇒ 广播集里
+   *   不会有"连着但已被踢"的人(修前只有 `helloDone && !closed`)。
+   * 2 **顺序**:`room.step()` 每帧**只算一次**,同一份 payload 按 `conns`
+   *   的插入序逐连接发 ⇒ 同一连接收到的帧序 = `step()` 的调用序,
+   *   不会被"某条连接的背压"打乱(见 `write`:从不阻塞、从不 await)。
+   * 3 **有界**:进来的连接数由 `MAX_PENDING_HELLO_CONNS` + `HELLO_TIMEOUT_MS`
+   *   卡住,单连接积压由 `BACKPRESSURE_DISCONNECT_STRIKES` 卡住 ⇒
+   *   "广播集大小"与"每条连接的排队量"都不再是无界的。
+   * ``` */
   const timer = setInterval(() => {
+    /* ★ WS-FND-161(P1-3):**每一帧**先核对席位 —— 被踢者从下一帧起就不再收帧。
+       ⚠️ 放在 `step()` 之前:否则被踢者还会多收本帧(而"下一帧"是判据的口径)。 */
+    syncSubscriptions();
     let payload: Uint8Array;
     try {
       payload = opts.room.step(prevState);
@@ -1561,7 +1875,11 @@ function onMove(c: WsConn, msg: {
       /* ★★ D-14:包头那 4 字节 ack 是**每连接**的量,而 `step()` 只算一次、
          一份字节要发给所有人 ⇒ 逐连接重写它(拷贝,不动 `payload` 本体)。 */
       for (const c of conns) {
-        if (c.helloDone && !c.closed) sendBinary(c, withAckedSeq(payload, c.ackedSeq));
+        if (!isBroadcastTarget(c)) continue;
+        /* ★ WS-FND-161(P1-2):返回值(= 可写性)被**消费** —— 记账在 `write` 里
+           (`writeBackpressure`)。这里**不**据它做分支:false 不是丢帧,
+           而是"已排队 + 可能触发了断开",处置只有一处(`write`)。 */
+        sendBinary(c, withAckedSeq(payload, c.ackedSeq));
       }
       framesSent += 1;
       lastFrameBytes = payload.byteLength;
@@ -1624,6 +1942,16 @@ function onMove(c: WsConn, msg: {
     helloRejected: (): number => helloRejected,
     writeErrors: (): number => writeErrors,
     logLines: (): number => logLines,
+    /* ★ WS-FND-161:连接侧四项的读数(**五个数各自单调,不合并**)。
+       ⚠️ `broadcastTargets()` 与 `connCount()` 的差就是「连着但不在房里的人」
+         (被踢者)⇒ 判据可以直接问"他还在收帧吗",不必读代码猜广播条件。 */
+    helloPending: (): number => countPending(),
+    handshakeTimeouts: (): number => handshakeTimeouts,
+    pendingHelloRejected: (): number => pendingHelloRejected,
+    writeBackpressure: (): number => writeBackpressure,
+    backpressureDrops: (): number => backpressureDrops,
+    broadcastTargets: (): number => countBroadcastTargets(),
+    seatsRevoked: (): number => seatsRevoked,
     /* ★ D-14(2026-11-17):**每连接**的"已应用成功的最高客户端命令序号"。
        与 `uplinkParsed`(报文解析成功)分开计 —— 这是"这条命令生效了"。
        它同时是下行包头 `ackedSeq` 的真值来源(见广播循环)。

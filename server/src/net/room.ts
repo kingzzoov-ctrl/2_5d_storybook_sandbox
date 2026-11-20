@@ -51,7 +51,15 @@ import {
   setRoomStatus,
   upsertRoomPlayer,
   totalItemsOf,
+  /* ★ WS-FND-156:「起始背包已发」的**库层真值**(发放台账,`repo.ts` §14)。
+     这里只搬函数与版本常量,语义写在 `grantStartingInventory` 的判序里。 */
+  STARTING_INVENTORY_VERSION,
+  claimStartingInventoryGrant,
+  migrateStartingInventory,
+  readStartingInventoryGrant,
+  releaseStartingInventoryGrant,
   type DbLike,
+  type StartingInventoryGrantRecord,
 } from '../db/repo.ts';
 import {
   createPlayerState,
@@ -135,8 +143,41 @@ export const AUTOSAVE_INTERVAL_MS = 30_000;
 /** 帧节流:每 20 帧一次低频落盘(20Hz ⇒ 1 秒;`tests/WS-FND-02` C25 钉着这个数)。 */
 export const AUTOSAVE_FRAME_INTERVAL = 20;
 
-/** 存档失败日志的环形上限(诊断够用即可,不随房间寿命增长)。 */
-export const SAVE_ERROR_LOG_MAX = 8;
+/**
+ * 存档失败日志的环形上限(诊断够用即可,不随房间寿命增长)。
+ *
+ * ★ P2(2026-11-21)并发修点:修前那条上限小到「同一段时间里多名玩家一起失败」
+ * 时更早的错因会被挤掉(单槽字段 `lastSaveError` 更是只剩最后一份)。这里放宽到
+ * 足以留住并发的那几份,且**仍是**有界环形 —— 放宽 ≠ 变成无界。
+ */
+export const SAVE_ERROR_LOG_MAX = 32;
+
+/**
+ * 存档失败后的**退避上界**(帧)。
+ *
+ * 退避按帧指数增长(`autosaveBackoffFrames`),封顶在这里(与墙钟轨同一量级):
+ * 「库里写不进去」不该变成每秒一次的重试,但也不该永久放弃。
+ *
+ * ⚠️ 刻意**不导出**:它是调度内部量,进 `docs/COVERAGE-MATRIX.md` 的普查块只会
+ * 多一条与判据无关的行;判据读 `autosaveState()` 的读数。
+ */
+const AUTOSAVE_BACKOFF_MAX_FRAMES = 600;
+
+/**
+ * 每帧**每名在线玩家**的动作份额下限。
+ *
+ * 份额 = `floor(MAX_ACTIONS_PER_TICK / 在线人数)`,但不低于本常量 ——
+ * 在线人数超过整房预算的格数时,人均份额算出来是 0(等于谁都不能动),
+ * 那不是收紧而是瘫痪。
+ */
+const MIN_ACTIONS_PER_TICK_PER_PLAYER = 1;
+
+/** 入场三方交叉校验的**有界**台账容量(并发入场不再「只剩最后一份」)。 */
+const JOIN_AUDIT_LOG_MAX = 64;
+/** 世界侧移除证据(成功/失败各留一条)的有界台账容量。 */
+const REMOVAL_LOG_MAX = 64;
+/** 「待重试移除」与「重进」撞车的有界台账容量(见 `dropPendingRemovalOnJoin`)。 */
+const REMOVAL_CONFLICT_LOG_MAX = 64;
 
 /**
  * 触发一次存档的**原因**(写进 `lastSaveReason`,失败日志里也带)。
@@ -1762,8 +1803,14 @@ export interface ActionPayload {
  */
 export interface ActionOutcome {
   ok: boolean;
-  /** 结果类别。**必须显式**(含 `NOT_IMPLEMENTED`)= 消灭"静默成功"的载体。 */
-  kind: 'OK' | 'PERMISSION' | 'INVALID' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
+  /**
+   * 结果类别。**必须显式**(含 `NOT_IMPLEMENTED`)= 消灭"静默成功"的载体。
+   *
+   * ★ P1(2026-11-21)预算档修点:`THROTTLED` 是**单帧动作预算**被吃光时的那一档;
+   * 修前它复用了 `INVALID` —— 与「不是参数问题」的注释**自相矛盾**(客户端只能
+   * 读到一个「你参数错了」,而真正的原因是这一帧挤不下)。
+   */
+  kind: 'OK' | 'PERMISSION' | 'INVALID' | 'THROTTLED' | 'NOT_IMPLEMENTED' | 'ROOM_CLOSED';
   /** 失败原因;`ok === true` 时不存在。 */
   reason?: string;
   /** 成功时的后果摘要(回执用)。值域见 `EffectValue`。 */
@@ -1934,6 +1981,25 @@ export class RoomRuntime {
    * 而这条是调度用的内部水位 —— 让它俩共用一个字段等于把调度状态暴露成公开 API。
    */
   private lastAutosaveAtMs: number;
+
+  /**
+   * ★ P1(2026-11-21)自动存档双轨倒置修点:上一次**尝试**存档的房间帧号
+   * (`-1` = 还没试过)。退避窗口就是按它算的帧差。
+   */
+  private lastSaveAttemptTick = -1;
+  /**
+   * ★ P1(2026-11-21)退避窗口(帧):一次失败之后要等这么多帧才允许再试,
+   * 每次继续失败翻倍、封顶 `AUTOSAVE_BACKOFF_MAX_FRAMES`,**成功即归零**。
+   * 修前没有这一项 ⇒ 失败后每帧都重试(每秒一次,永不退避)。
+   */
+  private autosaveBackoffFrames = 0;
+  /**
+   * ★ P1(2026-11-21)**在途**标志:一次存档正在写库时不允许再进一次。
+   *
+   * 闸在 `autosaveDue()` 与 `saveWorldNow()` 上各判一次:前者避免「同一帧被两个
+   * 触发源各推一次」,后者兜住重入(宿主回调里再碰存档)。判据读 `autosaveState()`。
+   */
+  private autosaveInFlight = false;
   /**
    * 上一次读档恢复:`restoreFromProfile` 返回的**生效玩家数**;null = 从未尝试。
    *
@@ -1965,8 +2031,39 @@ export class RoomRuntime {
   lastRemoveApplied: boolean | null = null;
   /** 最近一次世界侧/反作弊清理的错因;null = 无错。 */
   lastRemoveError: string | null = null;
-  /** 世界侧移除失败、等待下一帧重试的 userId(见 `retryPendingWorldRemovals`)。 */
-  private readonly pendingWorldRemovals = new Set<string>();
+  /**
+   * 世界侧移除失败、等待下一帧重试的 userId ⇒ **该席位当时的入场世代**(见
+   * `retryPendingWorldRemovals` / `memberGens`)。
+   *
+   * ★ P1(2026-11-21)世代修点:修前是 `Set<string>`(只有 userId)。同一个 id 在
+   * 下一帧重试**之前**重进时,重试会把**刚重进的那具刚体**删掉;而 join 不删这条、
+   * `auditJoin` 只在入场那一刻跑 ⇒ 「房里有他 / 世界没他」**没有任何告警**。
+   * 现在条目带世代:重进时先清本人待删并留证(`removalConflicts`),重试时再核一次。
+   */
+  private readonly pendingWorldRemovals = new Map<string, { epoch: number; tick: number }>();
+  /** 每个席位的**入场世代**(`join` 发号;`clearSeatTraces` 删除)。 */
+  private readonly memberGens = new Map<string, number>();
+  /** 世代发号器(只增,不复用 —— 复用会让「上一代」与「这一代」重新相等)。 */
+  private memberGenSeq = 0;
+  /**
+   * 世界侧移除的证据台账(**有界**;`lastRemoveApplied` 只是它最后一条的投影)。
+   *
+   * ★ P2(2026-11-21)并发修点:修前只有单槽 `lastRemoveApplied` / `lastRemoveError`,
+   * N 个人并发离开之后只剩最后一份 —— 前面几个人失败得静悄悄。
+   */
+  readonly removeLog: {
+    at: number; tick: number; userId: string; applied: boolean; error: string | null;
+  }[] = [];
+  /**
+   * 「待重试移除」与「重进」撞车的台账(**有界**)。
+   *
+   * `worldMismatch` = 入场那次三方校验里 `world !== 'ok'`,也就是「房里有他、
+   * 世界侧却查不到」—— 修前这种态**连一个字段都没有**(只能靠人读代码推)。
+   */
+  removalConflicts: {
+    at: number; tick: number; userId: string; kind: 'rejoined' | 'epoch-stale';
+    epoch: number; worldMismatch: boolean;
+  }[] = [];
 
   /**
    * ★ WS-FND-131(P1):最近一次入场的**三方交叉校验**结果;null = 还没入场过。
@@ -1980,6 +2077,19 @@ export class RoomRuntime {
     state: boolean;
     world: 'ok' | 'missing' | 'unknown';
   } | null = null;
+  /**
+   * 入场审计的**有界**台账(`lastJoinAudit` 只是它最后一条)。
+   *
+   * ★ P2(2026-11-21)并发修点:修前只有单槽 —— N 个人并发入场时,除了最后进来的
+   * 那一个,其余人的三方校验结果**一条都不留**。判据:`joinAudits.length` 必须等于
+   * 并发入场人数,而不是 1。
+   */
+  readonly joinAudits: {
+    userId: string;
+    members: boolean;
+    state: boolean;
+    world: 'ok' | 'missing' | 'unknown';
+  }[] = [];
   /** 每 tick 累计的违规,由外层写 room_events。 */
   private pendingViolations: Violation[] = [];
 
@@ -2131,13 +2241,19 @@ export class RoomRuntime {
    * 101×2 / 106×2 / 118×2 / 201×1)。**一个 id 都不新造**,本文件不挑物品、
    * 也不复述那张表 —— 表动了这里自动跟着动。
    *
-   * ## 什么时候发:**只在玩家首次出现时**,判据三条(全在一处)
+   * ## 什么时候发:**只在玩家首次出现时**,判据四条(全在一处,顺序固定)
    * ```text
+   * 0 库里的**发放台账**(`user_starting_inventory`)没有这个 id ⇒ 才继续
+   *   ★ WS-FND-156:跨进程的真值。有行 ⇒ SKIPPED(重启 / 换实例 / 换进程都不重发)
    * 1 本房间实例里**没发过**这个 id    ← startingInventoryGranted:Set<string>
+   *   (有库模式下的**快路径**;无库模式下的**唯一**账)
    * 2 权威账里**一件都没有**(总量 0) ← 「他不是一个空手的新玩家」的负向佐证
    * 3 装得下 且 内容合法               ← planStartingInventory(见下)
    * ```
-   * 三条全过才写账;**任何一条不过都只留回执、一个数都不动**(`verdict: SKIPPED/FAILED`)。
+   * 四条全过才写账;**任何一条不过都只留回执、一个数都不动**(`verdict: SKIPPED/FAILED`)。
+   * 发完之后**再**写库占位(`claimStartingInventoryGrant`,主键 = `user_id`):
+   * 并发里后到的那个撞唯一约束 ⇒ **撤回自己刚发的那一份**并如实记 `SKIPPED`
+   * —— 「并发两次 join 只发一份」由**库层唯一约束**保证,不靠时间差侥幸。
    *
    * ## 为什么判据是「房间账」而不是「世界账」
    *   · 世界侧的 `WorldSim.addPlayer` 返回值(`CREATED` / `RELOCATED`)**不够用**:
@@ -2163,13 +2279,48 @@ export class RoomRuntime {
    * 自己发的东西没有「凭证」可言 —— 硬塞一张反而要给用途枚举加一项
    * (`anticheat.ts`,本轮写域外)。
    *
-   * ## 已知边界(如实记)
-   * `startingInventoryGranted` 是**房间实例**的内存账:服务重启后同一 id 会再发一次
-   * —— 与既有的 `itemCounts` / `inventoryTotals` 同一世代(它们也不跨进程)。要跨进程
-   * 幂等,得把「已发」写进库(`rooms` / `repo.ts` 的写域),不在本轮。闸 2 把这条边界
-   * 当场收窄一半:库里 / 账里已经有东西的 id 一律不发。
+   * ## ★ WS-FND-156:跨进程幂等靠**库里的台账**(本轮主修点)
+   *
+   * 修前这一整段只有**房间实例**的内存账(`startingInventoryGranted`)⇒
+   * 服务重启后同一个 id 会**再发一份**。现在多了一条闸 0:
+   * ```
+   * user_starting_inventory(user_id PK, version, granted_at)
+   *   ⇒ 有行 = 已领(真值);主键 = 库层唯一约束 = 并发占位的抓手
+   * ```
+   * 顺序是「**先查库 → 未领才发 → 发成功再写库**」:发账抛错时库里还没有行
+   * (不留半态);写库撞唯一约束时把**刚发的那一份撤回**(账与库同时回到未发)。
+   *
+   * ## 无库模式(`--memory` / `db === null`)的语义:退化为进程内账
+   * 闸 1 就是无库模式下**唯一**的账,行为与改前逐字相同 ⇒ ⚠️ **此模式下服务
+   * 重启后同一个 id 会再发一份**(不是缺陷,是「没有库就没有跨进程真值」的必然
+   * 结果;如实写在这里,也写进 `--memory` 的说明)。
+   *
+   * ## `RESET_WORLD` 的语义:标记**不清**(与 FND155-8 的裁定一致)
+   * 台账 / 内存账都是**玩家世代**数据(`user_id` → 已领),而 `RESET_WORLD` 换的是
+   * **世界世代**(种子 / 地形 / 生物)⇒ 重置通路上不存在「清发放标记」这件事,
+   * 也不该有:清了就是「重置一次,每人再白拿一份」。走廊证据:重置分支只做三件事
+   * (睡眠换代登记 / 立刻落盘 / 世界内存重建),台账既不在这三件里,也不是按
+   * `room_id` 存的 ⇒ 重置后重进仍然 SKIPPED(FND156-8 钉这一条)。
+   *
+   * ## 起始包**版本号**变化的语义:选「不补发」(理由见 `repo.ts` §14)
+   * 台账里的 `version` 记的是**发放当时**的版本;判据只看「有没有这一行」,
+   * 版本升高不给老玩家补发 —— 那属于经济/补偿玩法(与 FND155-8 第 3 条同源),
+   * 而版本号留下的是**将来真要做补发时的原料**。
    */
   private readonly startingInventoryGranted = new Set<string>();
+
+  /**
+   * ★ WS-FND-156:**本进程写成功的**台账行(`user_id` 集合)。
+   *
+   * 撤回(`rollbackStartingInventory`)时用它决定「要不要删库里的那一行」:
+   * ```text
+   * 在集合里   ⇒ 那行是**我们**写成功的 ⇒ 撤回时必须一并删掉(否则这个 id 从此
+   *              被记为「已领」而账里一件都没有 ⇒ 同名重试永远拿不到包,且不报错)
+   * 不在集合里 ⇒ 那行是**别人**写的(并发里对方赢了唯一约束)⇒ **不许删** ——
+   *              两个进程争着删会让「谁都不留」,而且等于把对方真实发出的那份作废
+   * ```
+   */
+  private readonly dbGrantClaimed = new Set<string>();
 
   /**
    * 最近一次起始背包发放的**回执**(可观测;`null` = 还没有过任何一次入场尝试)。
@@ -2353,6 +2504,12 @@ export class RoomRuntime {
     const prevPlayerRow = this.state.players.find((p) => p.id === input.userId) ?? null;
     let worldAdded = false;
     try {
+      /* ★ P1(2026-11-21)世代修点:席位登记**同时**发一个入场世代 ——
+         世界侧移除的待重试条目按它核对「这还是不是同一条命」(见 `purgeSeat` /
+         `retryPendingWorldRemovals`)。放着这条,「刚重进的刚体被上一次的
+         重试删掉」就只能靠人工读代码发现。 */
+      this.memberGenSeq += 1;
+      this.memberGens.set(input.userId, this.memberGenSeq);
       this.members.set(input.userId, session);
 
       /* 玩家实体进场:同位置已有玩家则做最小偏移,避免叠在一起。 */
@@ -2457,12 +2614,46 @@ export class RoomRuntime {
       /* ★ WS-FND-131:三方交叉校验(见上面那段契约说明)。 */
       const audit = this.auditJoin(input.userId);
       this.lastJoinAudit = { userId: input.userId, ...audit };
+      /* ★ P2(2026-11-21):审计结果**入台账**(有界),不再只留最后一份 ——
+         N 个人并发入场时,单槽 `lastJoinAudit` 只会留下最后一个。 */
+      this.joinAudits.push({ userId: input.userId, ...audit });
+      if (this.joinAudits.length > JOIN_AUDIT_LOG_MAX) this.joinAudits.shift();
       if (!audit.members || !audit.state) {
         /* 房间侧两方自己都不一致 ⇒ 这次入场**没成** ⇒ 按失败回滚,
            不留「连带状态的幽灵席位」。 */
         throw new Error(
           `入场后三方不一致(members=${audit.members} state=${audit.state} world=${audit.world})`,
         );
+      }
+      /* ══════════ ★ P1(2026-11-21)「待重试移除」与「本人重进」撞车 ══════════
+       *
+       * ## 修前形态(实测可复现)
+       * ```
+       * 帧 N    leave(u) → host.removePlayer 两次都抛 ⇒ pendingWorldRemovals.add('u')
+       * 帧 N+1  u 重进(members / state / 刚体都回来了)
+       * 帧 N+2  step() 顶部 retryPendingWorldRemovals() ⇒ removePlayer('u')
+       *         ⇒ **把刚重进的那具刚体删掉**
+       * ```
+       * 结果:房间里有他的席位与快照,世界侧查不到他 —— 而这**没有任何告警**
+       * (`auditJoin` 只在入场那一刻跑过一次,那时他还好好的)。
+       *
+       * ## 现在
+       * 入场这条路上先把**本人**的待删条目清掉,并把这次撞车写进
+       * `removalConflicts`(`worldMismatch` 直接来自刚算出的三方校验)⇒
+       * 「房里有他 / 世界没他」从此有一条可断言的记录,而不是靠人读代码推。
+       */
+      const pendingBefore = this.pendingWorldRemovals.get(input.userId);
+      if (pendingBefore !== undefined) {
+        this.pendingWorldRemovals.delete(input.userId);
+        this.removalConflicts.push({
+          at: now,
+          tick: this.state.meta.tick,
+          userId: input.userId,
+          kind: 'rejoined',
+          epoch: pendingBefore.epoch,
+          worldMismatch: audit.world !== 'ok',
+        });
+        if (this.removalConflicts.length > REMOVAL_CONFLICT_LOG_MAX) this.removalConflicts.shift();
       }
       return { ok: true, role, token, snapshot, resumed: false };
     } catch (e) {
@@ -2550,16 +2741,26 @@ export class RoomRuntime {
   }
 
   /**
-   * ★ WS-FND-155:**发放起始背包**(入场段唯一的写法;判据的完整说明见类里那段注释)。
+   * ★ WS-FND-155 / WS-FND-156:**发放起始背包**(入场段唯一的写法;判据的完整说明见类里那段注释)。
    *
-   * ## 三条守卫,顺序固定(先便宜后昂贵,且**都不写账**)
+   * ## 四条守卫,顺序固定(先便宜后昂贵,且**都不写账**)
    * ```text
-   * 1 房间账:这个 id 已经发过      ⇒ SKIPPED —— 这就是「只在首次出现时发」的判据本身
-   * 2 权威账:手里已有东西(总量>0) ⇒ SKIPPED —— 他不是「空手的新玩家」
-   * 3 计划  :容量(问 carryCapacityOf)+ 内容合法 + 截断 ⇒ 拒了就 FAILED,零副作用
+   * 0 库台账 :这个 id 已在 `user_starting_inventory` 里 ⇒ SKIPPED(★ 跨进程真值)
+   * 1 房间账 :这个 id 已经发过                ⇒ SKIPPED(进程内快路径 / 无库模式唯一账)
+   * 2 权威账 :手里已有东西(总量>0)           ⇒ SKIPPED —— 他不是「空手的新玩家」
+   * 3 计划   :容量(问 carryCapacityOf)+ 内容合法 + 截断 ⇒ 拒了就 FAILED,零副作用
    * ```
-   * 三条全过才写:一次 `applyItemCountDelta`(**按件账唯一写入口**)+
-   * 一次 `projectInventoryTotalFor`(总量按明细**重算**)。⇒ 不新增第二个背包真值。
+   * 四条全过才写:一次 `applyItemCountDelta`(**按件账唯一写入口**)+
+   * 一次 `projectInventoryTotalFor`(总量按明细**重算**);然后**再**写库占位
+   * (`claimStartingInventoryGrant`,主键 = `user_id`)。⇒ 不新增第二个背包真值。
+   *
+   * ## ★ 「发成功再写库 + 冲突即撤回」是判据的一部分
+   * ```text
+   * 写库抛别的错   ⇒ 撤回这次发放(账回到 0 件),回执 FAILED ⇒ 不留半态
+   * 写库撞唯一约束 ⇒ 另一个实例 / 进程已经发过 ⇒ 撤回这次发放,回执 SKIPPED
+   * ```
+   * 撤回复用 `rollbackStartingInventory`(与入场失败那条路**同一份**实现),
+   * 且只删**本进程写成功的**那行(`dbGrantClaimed`)—— 见那个字段的注释。
    *
    * ## 为什么这里不经 `applyInventory`
    * 那条路判的是**客户端报文**(凭证链 + `allowedSources` 查「凭空产出」),
@@ -2567,9 +2768,10 @@ export class RoomRuntime {
    *
    * ## 失败为什么不抛
    * 入场不该因为一份起始礼物失败。但**不许静默**:拒因逐字进
-   * `lastStartingInventory.reason`(`FAILED`),而且一个数都没写。
+   * `lastStartingInventory.reason`(`FAILED` / `SKIPPED`),而且一个数都没写。
    */
   grantStartingInventory(userId: string): StartingInventoryReport {
+    const now = this.clock.nowMs();
     const capacity = this.carryCapacityOf(userId);
     const record = (r: StartingInventoryReport): StartingInventoryReport => {
       this.lastStartingInventory = r;
@@ -2578,8 +2780,34 @@ export class RoomRuntime {
     const base: Omit<StartingInventoryReport, 'verdict' | 'reason'> = {
       userId, granted: [], truncated: [], total: 0, capacity, rolledBack: false,
     };
+    /* 闸 0(★ WS-FND-156):**库里的发放台账** —— 跨进程唯一的真值。
+       顺序:先把表确保在(`migrateStartingInventory` 幂等 + 漂移判定),再读这一行。
+       漂移 ⇒ FAILED 且零副作用:台账写不进去时继续发,就等于退化成
+       「每个进程各发一份」(那正是改前的缺陷形态)。 */
+    if (this.db) {
+      const migration = migrateStartingInventory(this.db, now);
+      if (migration.drift) {
+        return record({
+          ...base,
+          verdict: 'FAILED',
+          reason: '起始背包发放台账的结构漂移(登记的 checksum 与 schema_starting_inventory.sql 对不上)'
+            + ' ⇒ 不发(fail-closed):台账写不进去就会变成「每次重启重发一份」,比不发更坏',
+        });
+      }
+      const grantedRow: StartingInventoryGrantRecord | undefined =
+        readStartingInventoryGrant(this.db, userId);
+      if (grantedRow !== undefined) {
+        return record({
+          ...base,
+          verdict: 'SKIPPED',
+          reason: `库里记着这个 id 已领过起始背包(version=${grantedRow.version},`
+            + `at=${grantedRow.granted_at})⇒ 不重发(★ 跨进程幂等:重启 / 换房间实例 / 换进程都不发)`,
+        });
+      }
+    }
 
-    /* 闸 1:本房间实例里**已经发过**这个 id(重连 / 重进 / 世界换代后回来都撞这一条)。 */
+    /* 闸 1:本房间实例里**已经发过**这个 id(重连 / 重进 / 世界换代后回来都撞这一条)。
+       有库模式下它是**快路径**(闸 0 才是真值);无库模式下它是**唯一**的账。 */
     if (this.startingInventoryGranted.has(userId)) {
       return record({
         ...base,
@@ -2614,33 +2842,68 @@ export class RoomRuntime {
       });
     }
 
-    /* 发放:与 `applyInventory` 放行之后**同一对**写口。 */
-    this.applyItemCountDelta(
-      userId,
-      plan.granted.map((g) => ({ itemId: g.itemId, delta: g.count })),
-    );
-    this.projectInventoryTotalFor(userId);
-    this.startingInventoryGranted.add(userId);
-    return record({
+    /* 发放:与 `applyInventory` 放行之后**同一对**写口。
+       ★ 先把回执挂上:撤回(`rollbackStartingInventory`)只认 `GRANTED` + 这个 userId,
+       而下面写库失败时撤回的正是「这一次」的发放。 */
+    const issuing: StartingInventoryReport = {
       ...base,
       verdict: 'GRANTED',
       granted: plan.granted,
       truncated: plan.truncated,
       total: plan.total,
       reason: plan.reason,
-    });
+    };
+    this.lastStartingInventory = issuing;
+    this.applyItemCountDelta(
+      userId,
+      plan.granted.map((g) => ({ itemId: g.itemId, delta: g.count })),
+    );
+    this.projectInventoryTotalFor(userId);
+
+    /* ★ 发成功**之后**才写库:失败 ⇒ **撤回**(账与库都不留半态)。 */
+    if (this.db) {
+      let claimed = false;
+      try {
+        claimed = claimStartingInventoryGrant(this.db, userId, STARTING_INVENTORY_VERSION, now);
+      } catch (e) {
+        this.rollbackStartingInventory(userId);
+        return record({
+          ...base,
+          verdict: 'FAILED',
+          reason: `起始背包台账写库失败(${(e as Error).message.slice(0, 120)})`
+            + ' ⇒ 本次发放已整批撤回(账与库都不留半态)',
+        });
+      }
+      if (!claimed) {
+        /* 另一个实例 / 进程 / 上一次进程已经写过这一行 ⇒ 我方这次是**多余的那一份**。 */
+        this.rollbackStartingInventory(userId);
+        return record({
+          ...base,
+          verdict: 'SKIPPED',
+          reason: '另一个房间实例 / 进程已经占位(库层唯一约束挡住第二次写入)'
+            + ' ⇒ 撤回本次发放,只保留对方那一份',
+        });
+      }
+      this.dbGrantClaimed.add(userId);
+    }
+
+    this.startingInventoryGranted.add(userId);
+    return record(issuing);
   }
 
   /**
-   * ★ WS-FND-155:把**这一次**刚发出去的起始背包撤回来(入场失败时唯一的回滚点)。
+   * ★ WS-FND-155 / ★ WS-FND-156:把**这一次**刚发出去的起始背包撤回来
+   * (两条通路共用:入场失败 / 台账占位失败)。
    *
    * ## 为什么必须显式撤回
    * 入场失败只回滚**席位痕迹**(`members` / `state.players` / 反作弊 / 世界侧刚体),
    * 而背包账是**另一对表**(`itemCounts` / `inventoryTotals`)—— 它不在
-   * `clearSeatTraces()` 的清单里。⇒ 不撤就是两件事同时发生:
+   * `clearSeatTraces()` 的清单里。⇒ 不撤就是三件事同时发生:
    * ```text
    * 1 权威账里留下一份谁都看不见的起始包(这个 id 连席位都没有);
-   * 2 幂等账记着「发过了」⇒ 同名重试**永远**拿不到包(而且不报错)。
+   * 2 幂等账记着「发过了」⇒ 同名重试**永远**拿不到包(而且不报错);
+   * 3 ★ WS-FND-156:库里的台账行也记着「已领」⇒ 连**进程重启**也救不回来
+   *   (重试只会走闸 0 的 SKIPPED)⇒ 所以库那一行必须在同一次撤回里一并删掉。
    * ```
    *
    * 撤回走**减 delta**,与发放**同一条**按件写入口(`applyItemCountDelta`),
@@ -2659,14 +2922,38 @@ export class RoomRuntime {
       if (g.count > 0) this.applyItemCountDelta(userId, [{ itemId: g.itemId, delta: -g.count }]);
     }
     this.projectInventoryTotalFor(userId);
+    /* ★ WS-FND-156:库里的台账行也要一并解掉 —— 否则这个 id 从此被记为「已领」,
+       而账里一件都没有(同名重试、甚至进程重启之后的同名重试都**永远**拿不到包)。
+       ⚠️ **只删本进程写成功的那条**(`dbGrantClaimed`):并发里对方赢的那条是对方
+       真实发出的那份包的凭据,我方撤回时删掉它 = 把别人的发放作废。 */
+    const note = this.releaseDbGrantIfOurs(userId);
     /* ★ 幂等账也要解掉 —— 否则这条 id 从此被记为「发过」,而账里一件都没有。 */
     this.startingInventoryGranted.delete(userId);
     this.lastStartingInventory = {
       ...rep,
       rolledBack: true,
-      reason: `${rep.reason} ⇒ 入场失败,已整批撤回`,
+      reason: `${rep.reason} ⇒ 已整批撤回${note}`,
     };
     return true;
+  }
+
+  /**
+   * ★ WS-FND-156:删掉**本进程写成功的**那条台账行(别的进程写的一律不碰)。
+   *
+   * 返回一段可拼进 `reason` 的**失败说明**(成功时是空串):删不掉必须**看得见**
+   * —— 那会让这个 id 在库里被记为「已领」而账里一件都没有,之后每次重试都 SKIPPED。
+   * 与 `saveWorldNow` 同一纪律:清理失败**不抛**(那会掀掉整个入场),但也**不静默**。
+   */
+  private releaseDbGrantIfOurs(userId: string): string {
+    const db = this.db;
+    if (db === null || !this.dbGrantClaimed.has(userId)) return '';
+    this.dbGrantClaimed.delete(userId);
+    try {
+      releaseStartingInventoryGrant(db, userId);
+      return '';
+    } catch (e) {
+      return `;⚠️ 库台账清理失败(${(e as Error).message.slice(0, 80)})⇒ 该 id 可能被记为已领`;
+    }
   }
 
   /**
@@ -2756,9 +3043,12 @@ export class RoomRuntime {
     /* ★ WS-FND-131(P2):修前世界侧(`host.removePlayer`)排在**最后**且没有
        try — 它一抛就整条 `leave()` 被吞,而 `members` 已删 ⇒ **没有重试点**
        (席位没了、刚体/AOI/vitals 还在,同名重进会在世界里叠出第二份刚体)。
-       现在:房间侧痕迹与**可重试**的世界侧移除各走各的,任一侧失败都留证据。 */
+       现在:房间侧痕迹与**可重试**的世界侧移除各走各的,任一侧失败都留证据。
+       ★ P1(2026-11-21):世代在**清席位之前**取 —— 条目要记住「这是哪一代的待删」,
+       同一个 id 以新一代回来之后,那一条就不许再执行(见 `retryPendingWorldRemovals`)。 */
+    const epoch = this.memberGens.get(userId) ?? -1;
     this.clearSeatTraces(userId);
-    this.removeFromWorld(userId);
+    this.removeFromWorld(userId, epoch);
   }
 
   /**
@@ -2769,16 +3059,51 @@ export class RoomRuntime {
    */
   private clearSeatTraces(userId: string): void {
     this.members.delete(userId);
+    /* ★ P1(2026-11-21):入场世代随席位一起清。留着它,下一次重进就会与「上一代的
+       待删条目」**同代**,那条待删又会被执行 —— 正是这次要消灭的形态。 */
+    this.memberGens.delete(userId);
+    /* ★ P2(2026-11-21):按玩家的动作预算桶同属「这个 id 的必清痕迹」,
+       否则每个进过房的 id 都在 `actionsThisTickByPlayer` 里留一把钥匙。 */
+    this.actionsThisTickByPlayer.delete(userId);
     /* ★ 第十轮 P3:`lastTargetlessAttackTick` 每玩家一条,修前 leave/purgeSeat 只调
        `ac.leave()` ⇒ 这张旁表跨世代残留(同 id 重进时留着上一代的帧号)。
        它与 `ac.leave` 同属「这个 id 的必清痕迹」,故**并排清**,不散到别处。 */
     this.lastTargetlessAttackTick.delete(userId);
+    /* ★ P2(2026-11-21):两张按玩家的背包表也要收 —— 只收**空账**,见下面的理由。 */
+    this.prunePlayerLedger(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
     try {
       this.ac.leave(userId);
     } catch (e) {
       this.lastRemoveError = `反作弊回收失败(${userId}):${(e as Error).message.slice(0, 80)}`;
     }
+  }
+
+  /**
+   * ★ P2(2026-11-21):把**空账**从按玩家的两张背包表(`itemCounts` /
+   * `inventoryTotals`)里摘掉,并计数 `ledgerPrunes`。
+   *
+   * ## 为什么是「只清空账」,而不是「离场一律清」
+   * 这两张表**不是缓存**:`authoritativeItemCount` / `authoritativeItemTotal` 直接
+   * 读它们,而重进时 `startingInventoryGranted`(跨进程幂等账)**会**挡住重发
+   * ⇒ 离场一律清 = 退房即吞掉玩家的持有,重进拿回一个空包,且**没有任何东西报错**。
+   * 既有判据 `tests/WS-FND-155` 的 FND155-4(退房重进仍是 7 件)钉的正是这一条。
+   * ⇒ 只摘「一件都没有」的那一条:它不承载任何玩家状态,只是 Map 里的一把钥匙
+   *   (长期房间反复进出时会一直攒着 —— 那才是要治的形态)。
+   *
+   * ⚠️ 非空账**必须**留着(那是玩家的东西);这条边界写在这里,免得下一个人把它
+   * 改回「一律清」。
+   */
+  private prunePlayerLedger(userId: string): void {
+    const counts = this.itemCounts.get(userId);
+    if (counts !== undefined) {
+      for (const n of counts.values()) if (n > 0) return;
+    }
+    if ((this.inventoryTotals.get(userId) ?? 0) > 0) return;
+    if (counts === undefined && !this.inventoryTotals.has(userId)) return;
+    this.itemCounts.delete(userId);
+    this.inventoryTotals.delete(userId);
+    this.ledgerPrunes += 1;
   }
 
   /**
@@ -2790,21 +3115,30 @@ export class RoomRuntime {
    *   房间侧前 3 步已经做完(席位已删)⇒ 没有任何一处还会再调它
    *   世界侧刚体 / AOI / vitals / 玩法表**留着** ⇒ 同名重进 = 同一 id 两份刚体
    * ```
-   * ⇒ 两件事都要:①**重试**(同一处最多 2 次);②失败**入队**
+   * ⇒ 两件事都要:1**重试**(同一处最多 2 次);2失败**入队**
    *   (`pendingWorldRemovals`),由 `retryPendingWorldRemovals()` 在下一帧再试 ——
    *   这样「世界侧抛错」不再是终态,而是一个**可观测量 + 可重试点**。
    *
    * ## 可观测量
    * `lastRemoveApplied`:`true` = 这次移除世界侧**确实**成功(或本来就没世界源);
    * `false` = 两次都抛 ⇒ 已入队待重试。`lastRemoveError` 记最后一次的错因。
+   * ★ P2(2026-11-21):两次结果各留一条到 `removeLog`(有界)—— 单槽在并发离场时
+   * 只剩最后一份,前面几个人的失败得静悄悄。
+   *
+   * @param epoch 这个席位的**入场世代**(`purgeSeat` 取;回滚路径传 -1)。
+   *              条目记下它 ⇒ 同一个 id 以新一代回来之后这条待删就作废
+   *              (见 P1 世代修点)。
    */
-  private removeFromWorld(userId: string): boolean {
+  private removeFromWorld(userId: string, epoch = -1): boolean {
     const host = this.worldSaveHost;
+    const now = this.clock.nowMs();
+    const tick = this.state.meta.tick;
     if (host === null || typeof host.removePlayer !== 'function') {
       /* 没有世界源 ⇒ 没有「世界侧残留」这件事,如实算成功(与 saveToDb 同一 null 契约)。 */
       this.pendingWorldRemovals.delete(userId);
       this.lastRemoveApplied = true;
       this.lastRemoveError = null;
+      this.pushRemoveEvidence({ at: now, tick, userId, applied: true, error: null });
       return true;
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -2813,15 +3147,25 @@ export class RoomRuntime {
         this.pendingWorldRemovals.delete(userId);
         this.lastRemoveApplied = true;
         this.lastRemoveError = null;
+        this.pushRemoveEvidence({ at: now, tick, userId, applied: true, error: null });
         return true;
       } catch (e) {
         this.lastRemoveError =
           `世界侧移除失败(${userId},第 ${attempt + 1} 次):${(e as Error).message.slice(0, 80)}`;
       }
     }
-    this.pendingWorldRemovals.add(userId);
+    this.pendingWorldRemovals.set(userId, { epoch, tick });
     this.lastRemoveApplied = false;
+    this.pushRemoveEvidence({ at: now, tick, userId, applied: false, error: this.lastRemoveError });
     return false;
+  }
+
+  /** 世界侧移除证据入**有界**台账(见 `removeLog`)。 */
+  private pushRemoveEvidence(row: {
+    at: number; tick: number; userId: string; applied: boolean; error: string | null;
+  }): void {
+    this.removeLog.push(row);
+    if (this.removeLog.length > REMOVAL_LOG_MAX) this.removeLog.shift();
   }
 
   /**
@@ -2829,12 +3173,33 @@ export class RoomRuntime {
    *
    * 调用点:`step()` 的**最顶部**(早于 status 早退)⇒ 休眠房里也会推进;
    * 队列为空时是 O(1) 早退。
+   *
+   * ★ P1(2026-11-21):每条都要先核**世代**。调用点与重进点在同一个 20Hz 循环里
+   * 竞争(消息处理 → 下一帧 step),修前 `Set<string>` 只有 userId ⇒ 无法区分
+   * 「这条待删说的是哪一代」,于是重试会把**刚重进的刚体**删掉。
    */
   retryPendingWorldRemovals(): string[] {
     if (this.pendingWorldRemovals.size === 0) return [];
     const done: string[] = [];
-    for (const userId of [...this.pendingWorldRemovals]) {
-      if (this.removeFromWorld(userId)) done.push(userId);
+    for (const [userId, entry] of [...this.pendingWorldRemovals]) {
+      /* 第二道闸(`join()` 里是第一道):这个 id 现在**在房里**,而且它的世代与条目
+         记的那一代不同 ⇒ 条目说的是上一代的席位,执行它就是把刚重进的那具刚体删掉。
+         ⇒ 丢条目、留证,不调宿主。 */
+      const liveEpoch = this.memberGens.get(userId);
+      if (liveEpoch !== undefined && liveEpoch !== entry.epoch) {
+        this.pendingWorldRemovals.delete(userId);
+        this.removalConflicts.push({
+          at: this.clock.nowMs(),
+          tick: this.state.meta.tick,
+          userId,
+          kind: 'epoch-stale',
+          epoch: entry.epoch,
+          worldMismatch: this.auditJoin(userId).world !== 'ok',
+        });
+        if (this.removalConflicts.length > REMOVAL_CONFLICT_LOG_MAX) this.removalConflicts.shift();
+        continue;
+      }
+      if (this.removeFromWorld(userId, entry.epoch)) done.push(userId);
     }
     return done;
   }
@@ -3098,26 +3463,32 @@ export class RoomRuntime {
        只有一处声明(以及注释里的引用),**没有任何执行点**:一帧内多连接连发
        多少条动作就执行多少条,没有兜底。这里把它变成真正的闸:
        ```
-       预算耗尽 ⇒ 拒(ok:false / kind:'INVALID')+ 计数 + 留明细
+       预算耗尽 ⇒ 拒(ok:false / kind:'THROTTLED')+ 计数 + 留明细
        ```
        · 归零点是**帧边界**(`step()` 里 `meta.tick += 1`)—— 判据取 `meta.tick`,
          不取系统时钟(与 `ac.tick` 的服务端时钟同一纪律:世界推进坐什么钟,
          预算就坐什么钟);
        · 拒绝时**不查表、不执行、不写状态**:被拒的动作零副作用,回执写明是预算
          而不是权限/参数(否则「动作被吞」会被读成「动作非法」);
-       · 记录 `actionsThrottled` / `throttledActions` ⇒ 被拒**可观测**,不是静默丢弃。 */
-    if (this.consumeActionBudget(actorId, action)) {
-      return {
-        ok: false,
-        kind: 'INVALID',
-        reason: `单帧动作预算超限(${MAX_ACTIONS_PER_TICK}/帧):本条未执行`,
-      };
-    }
+       · 记录 `actionsThrottled` / `throttledActions` ⇒ 被拒**可观测**,不是静默丢弃。
+
+       ══════════ ★ P1(2026-11-21)三条修点 ══════════
+       实测(16 人房):一个客户端灌满整房那 64 格之后,同帧其余人的动作**全灭**,
+       而且被拒回执写的是 `INVALID`(读的人只会以为是自己的参数错了)。
+       ```text
+       1 查表**先于**扣格 —— 报文里不存在的动作名只花一次 Map 查找,不再吃预算;
+       2 预算分两层:整房上限 + **每玩家份额**(见 `consumeActionBudget`)⇒
+         一个人只能耗掉自己那一份,别人那一份还在;
+       3 超预算回 `THROTTLED` 这一**独立档位**,不复用 `INVALID`(见 `ActionOutcome.kind`)。
+       ``` */
     const handler = lookupActionHandler(action);
     /* 没登记 ⇒ 报文里是个**不存在的动作名**(`tests/WS-FND-21` FND21-3 发的就是
        `NO_SUCH_ACTION_NAME`)。理由文本与拆分前那个 `default:` 分支**逐字相同**
-       (唯一出处:`actions/not-implemented.ts`)。 */
+       (唯一出处:`actions/not-implemented.ts`)。
+       ★ 这一步在**扣格之前**:垃圾动作(查不到处理器)不该花掉任何人(包括别人)的预算。 */
     if (handler === undefined) return notImplemented(action);
+    const overBudget = this.consumeActionBudget(actorId, action);
+    if (overBudget !== null) return { ok: false, kind: 'THROTTLED', reason: overBudget };
     const outcome = handler(this.actionContextFor(actorId, action, payload));
     /* ★ WS-FND-123(P1-2):记账建好之后,把**赛局**也开起来。
        `START_PARTY` 的处理器只写 `PartyRecord`,世界的 contest 必须由这条钩子开
@@ -3146,6 +3517,16 @@ export class RoomRuntime {
   private actionsThisTick = 0;
   /** 上面那个计数属于哪一帧(`state.meta.tick`);`-1` = 还没执行过任何动作。 */
   private actionBudgetTick = -1;
+  /**
+   * ★ P1(2026-11-21)**按玩家**的本帧已执行数(帧边界清空)。
+   *
+   * 为什么必须有它:修前只有整房一个计数 ⇒ 一个客户端灌满 64 格,同帧其余 7 人的
+   * 动作全部被拒(「邻居把预算吃光」)。按玩家记之后,份额用完只挡他自己。
+   * 离场时随席位清(`clearSeatTraces`),否则每个进过房的 id 都留一条。
+   */
+  private readonly actionsThisTickByPlayer = new Map<string, number>();
+  /** 本帧的**每玩家份额**(帧边界按在线人数重算;读数见 `actionBudgetState`)。 */
+  private perPlayerActionLimit = MAX_ACTIONS_PER_TICK;
 
   /** 累计**执行**的动作条数(诊断与判据;与 `actionsThrottled` 成对读)。 */
   actionsDispatched = 0;
@@ -3156,45 +3537,104 @@ export class RoomRuntime {
    * 「一帧只来了 5 条」在外面**完全一样**。判据见 `tests/WS-FND-135`。
    */
   actionsThrottled = 0;
-  /** 最近被预算拒掉的动作(环形,最多 32 条;够诊断/断言即可)。 */
-  readonly throttledActions: { tick: number; actorId: string; action: RoomAction }[] = [];
+  /**
+   * 其中**由每玩家份额**(而不是整房上限)拒掉的条数。
+   *
+   * 为什么单独计数:「邻居把整房预算吃光」与「这个人自己刷过头」是两件不同的事,
+   * 而修前它们连一个数都没有(两档都只剩一个共享计数)。
+   */
+  actionsThrottledByPlayerShare = 0;
+  /**
+   * 最近被预算拒掉的动作(环形,最多 32 条;够诊断/断言即可)。
+   *
+   * `scope` = 拒它的是哪一层预算(`player` = 每玩家份额;`room` = 整房上限)。
+   */
+  readonly throttledActions: {
+    tick: number; actorId: string; action: RoomAction; scope: 'player' | 'room';
+  }[] = [];
 
   /**
    * 本帧预算的读数(判据专用读口)。
    *
    * `used` 是**本帧**已执行数,`limit` 取 `MAX_ACTIONS_PER_TICK` ——
    * 判据不自己算「64 减几」,也不抄常量(抄了就会与门禁漂移)。
+   *
+   * ★ P1(2026-11-21):加上 `playerLimit`(本帧每人份额)与 `perPlayer`
+   * (本帧各人已执行数)—— 「一个人能不能把别人的份吃掉」才有可断言的事实。
    */
-  actionBudgetState(): { tick: number; used: number; limit: number; throttled: number } {
+  actionBudgetState(): {
+    tick: number; used: number; limit: number; throttled: number;
+    playerLimit: number; perPlayer: Record<string, number>;
+  } {
+    const sameFrame = this.actionBudgetTick === this.state.meta.tick;
+    const perPlayer: Record<string, number> = {};
+    if (sameFrame) {
+      for (const [id, n] of this.actionsThisTickByPlayer) perPlayer[id] = n;
+    }
     return {
       tick: this.state.meta.tick,
-      used: this.actionBudgetTick === this.state.meta.tick ? this.actionsThisTick : 0,
+      used: sameFrame ? this.actionsThisTick : 0,
       limit: MAX_ACTIONS_PER_TICK,
       throttled: this.actionsThrottled,
+      playerLimit: this.perPlayerActionLimit,
+      perPlayer,
     };
   }
 
   /**
-   * 消耗一格本帧动作预算。`true` = **超预算,本条不许执行**。
+   * 本帧的**每玩家份额** = `floor(MAX_ACTIONS_PER_TICK / 在线人数)`,不低于
+   * `MIN_ACTIONS_PER_TICK_PER_PLAYER`。
    *
-   * 顺序:先判帧边界归零,再判余额 —— 反过来的话「新一帧的第一条」会先被上一帧
-   * 的余量拒掉,而那一帧早已过去(判据上是「隔帧仍被拒」的错形态)。
+   * 依据「在线人数」而不是「曾经进过房的人数」:份额约束的是**同一帧里同时在
+   * 抢预算的人**;离线席位的份额本来就没人会用,按它摊只会让在线的人更宽松。
+   * 单人房(以及测试里的裸 `RoomRuntime`)⇒ 份额 = 整房上限,行为与修前一致。
    */
-  private consumeActionBudget(actorId: string, action: RoomAction): boolean {
+  private perPlayerAllowance(): number {
+    let online = 0;
+    for (const m of this.members.values()) if (m.connected) online += 1;
+    const share = Math.floor(MAX_ACTIONS_PER_TICK / Math.max(1, online));
+    return Math.max(MIN_ACTIONS_PER_TICK_PER_PLAYER, share);
+  }
+
+  /**
+   * 消耗一格本帧动作预算。返回 `null` = 放行;否则是**拒绝理由**(本条不许执行)。
+   *
+   * 顺序:先判帧边界归零,再判**每玩家份额**,最后判整房上限 —— 反过来的话
+   * 「新一帧的第一条」会先被上一帧的余量拒掉,而那一帧早已过去(判据上是
+   * 「隔帧仍被拒」的错形态)。
+   *
+   * ★ P1(2026-11-21):两层的**先后**也是判据的一部分 —— 先查份额才能说清
+   * 「拒的是这个人自己刷过头」还是「这一帧整房真的满了」。
+   */
+  private consumeActionBudget(actorId: string, action: RoomAction): string | null {
     const tick = this.state.meta.tick;
     if (tick !== this.actionBudgetTick) {
       this.actionBudgetTick = tick;
       this.actionsThisTick = 0;
+      this.actionsThisTickByPlayer.clear();
+      /* 份额按**本帧**的在线人数重算一次(帧内不变 ⇒ 同一条动作在两帧之间的
+         裁决依据是稳定的,不会因为别人刚走就让这一帧中途放宽)。 */
+      this.perPlayerActionLimit = this.perPlayerAllowance();
+    }
+    const mine = this.actionsThisTickByPlayer.get(actorId) ?? 0;
+    if (mine >= this.perPlayerActionLimit) {
+      this.actionsThrottled += 1;
+      this.actionsThrottledByPlayerShare += 1;
+      this.throttledActions.push({ tick, actorId, action, scope: 'player' });
+      if (this.throttledActions.length > 32) this.throttledActions.shift();
+      return `单帧动作预算超限(每玩家 ${this.perPlayerActionLimit}/帧):本条未执行`
+        + ' —— 被拒的是**你自己**这一帧的动作,别人的份额不受影响';
     }
     if (this.actionsThisTick >= MAX_ACTIONS_PER_TICK) {
       this.actionsThrottled += 1;
-      this.throttledActions.push({ tick, actorId, action });
+      this.throttledActions.push({ tick, actorId, action, scope: 'room' });
       if (this.throttledActions.length > 32) this.throttledActions.shift();
-      return true;
+      return `单帧动作预算超限(${MAX_ACTIONS_PER_TICK}/帧):本条未执行`;
     }
     this.actionsThisTick += 1;
+    this.actionsThisTickByPlayer.set(actorId, mine + 1);
     this.actionsDispatched += 1;
-    return false;
+    return null;
   }
 
   /**
@@ -3827,6 +4267,13 @@ export class RoomRuntime {
 
   /** 本地总量记账(仅 `db === null` 时参与计算;有库时以库为准)。 */
   private readonly inventoryTotals = new Map<string, number>();
+  /**
+   * ★ P2(2026-11-21):`prunePlayerLedger` 真的摘掉了多少条按玩家账(可观测)。
+   *
+   * 为什么要有这个数:修前这两张表**只增不删**(没有清理点)⇒「长跑房间里到底
+   * 攒了多少把没人用的钥匙」连一个数都没有。摘一条 +1,让清理本身可断言。
+   */
+  ledgerPrunes = 0;
   /** 每 tick 的合法产出凭证:userId → source 集合。 */
   private readonly grantedSources = new Map<string, Set<string>>();
 
@@ -3946,6 +4393,12 @@ export class RoomRuntime {
       this.lastSaveSkipReason = db === null ? 'no-db' : 'no-host';
       return false;
     }
+    /* ★ P1(2026-11-21)**在途闸**:已经在写库时不许再进一次(判据读
+       `autosaveState().inFlight`)。写库是同步的,这个标志兜的是**重入**
+       (宿主回调里再碰存档 / 两个触发源在同一帧互相插队)。 */
+    if (this.autosaveInFlight) return false;
+    this.autosaveInFlight = true;
+    this.lastSaveAttemptTick = this.state.meta.tick;
     try {
       const r = host.saveToDb(db, this.id, this.lastActivityMs);
       /* 报告与库是**同一份**写入的结果:报告的 tick 取**存档后**的房间帧号,
@@ -3962,6 +4415,8 @@ export class RoomRuntime {
       this.saveCount += 1;
       this.lastSaveError = null;
       this.lastSaveSkipReason = null;
+      /* ★ P1:成功 ⇒ 退避归零(失败过的那一段窗口已经过去)。 */
+      this.autosaveBackoffFrames = 0;
       return true;
     } catch (e) {
       const message = ((e as Error)?.message ?? String(e)).slice(0, 160);
@@ -3969,20 +4424,85 @@ export class RoomRuntime {
       this.saveFailCount += 1;
       this.saveErrors.push({ at: now, reason, message });
       if (this.saveErrors.length > SAVE_ERROR_LOG_MAX) this.saveErrors.shift();
+      /* ★ P1(2026-11-21)**退避**:修前失败后每一帧都重试(20Hz 下一秒钟一次,
+         永不退避)⇒ 写不进去的库会被重试打死。现在按**帧**指数放大:
+         第一次失败 ⇒ 一个帧节流窗,之后每次翻倍、封顶 `AUTOSAVE_BACKOFF_MAX_FRAMES`;
+         任何一次成功立刻归零(见上一支)。 */
+      this.autosaveBackoffFrames = this.autosaveBackoffFrames === 0
+        ? AUTOSAVE_FRAME_INTERVAL
+        : Math.min(this.autosaveBackoffFrames * 2, AUTOSAVE_BACKOFF_MAX_FRAMES);
       return false;
+    } finally {
+      this.autosaveInFlight = false;
     }
   }
 
   /**
-   * 本帧该不该自动存档 —— 返回**原因**(`null` = 本帧不存),而不是布尔:
-   * 「周期到点」与「帧节流到点」在排查存档频率时是两个答案,不该被压成一个 `true`。
+   * ★ P1(2026-11-21)自动存档的**调度读数**(判据专用:调度状态本身是私有的,
+   * 不该为了可测就长成第二套公开 API)。
    *
-   * 判序(帧节流优先):它同时是 `world_tick` 的写点(C25 钉着第 20 帧),
-   * 两轨都到点时按帧节流记账能保持既有的 tick 语义。
+   * ```text
+   * inFlight        一次写库正在进行中(闸见 `saveWorldNow`)
+   * backoffFrames   当前失败退避窗(帧);0 = 不在退避
+   * lastAttemptTick 上一次**尝试**存档的房间帧号(-1 = 还没试过)
+   * untilBackoffOver 还差几帧才允许再试(0 = 现在允许)
+   * ```
+   */
+  autosaveState(): {
+    inFlight: boolean; backoffFrames: number; lastAttemptTick: number; untilBackoffOver: number;
+  } {
+    const since = this.state.meta.tick - this.lastSaveAttemptTick;
+    return {
+      inFlight: this.autosaveInFlight,
+      backoffFrames: this.autosaveBackoffFrames,
+      lastAttemptTick: this.lastSaveAttemptTick,
+      untilBackoffOver: Math.max(0, this.autosaveBackoffFrames - since),
+    };
+  }
+
+  /**
+   * 本帧该不该自动存档 —— 返回**原因**(`null` = 本帧不存),而不是布尔:
+   * 「周期到点」与「冷启动帧节流」在排查存档频率时是两个答案,不该压成一个 `true`。
+   *
+   * ══════════ ★ P1(2026-11-21)双轨**倒置**修点 ══════════
+   *
+   * ## 修前形态(实测:16 人房 ~35 SQL/s、约 12.6 万条/h)
+   * ```text
+   * autosaveDue():  if (tick % 20 === 0) return 'frame';     ← **先判**
+   *                 if (now - lastAutosaveAtMs >= 30_000) …   ← 正常推进下永远轮不到
+   * ```
+   * 帧轨先判 ⇒ 每 20 帧(1 秒)**必存一次**,而墙钟轨那 30 秒的承诺一次都不触发
+   * (它只在房间被低频驱动、且帧号恰好不是 20 的倍数时才有机会)。owner 裁定要的是
+   * 「像 Minecraft 一样自动保存」= **每 30 秒一次**,不是「每秒一次」—— 两个
+   * 「至少 / 至多」被写成了两个**触发器**,于是一个顶掉另一个。
+   *
+   * ## 现在:墙钟是**触发源**,帧节流只能让它**更慢**
+   * ```text
+   * 在途 / 失败退避窗未过            ⇒ 不存           ← 新增
+   * now - lastAutosaveAtMs ≥ 30s    ⇒ 'interval'     ← 稳态**唯一**触发器
+   * 还没成功存过 且 tick % 20 === 0  ⇒ 'frame'        ← 冷启动垫底(见下)
+   * 其余                            ⇒ 不存
+   * ```
+   * 「帧轨更慢、不更快」的两条保证:
+   *   1 帧轨只在 `saveCount === 0`(还没有一次**成功**存档)时成立 —— 冷启动那一次,
+   *      以及持续失败时(那时真正的限速器是退避窗);一旦存成功过,它就不再参与;
+   *   2 任何一次触发都要先过「距上次墙钟 ≥ `AUTOSAVE_INTERVAL_MS`」⇒ **没有任何
+   *      路径**能让两次成功存档的间隔短于 30 秒。
+   *
+   * ⚠️ 为什么保留冷启动那一次:第 20 帧触发是**既有口径**
+   * (`AUTOSAVE_FRAME_INTERVAL`;`tests/WS-FND-150` 的 FND150-5 / FND150-9 用**冻结的
+   * 虚拟时钟**钉着它:空库第一次帧节流点要落一次盘、写失败在帧节流点也要记账)。
+   * 删掉它 = 「建房后一直没人推进到 30 秒」的房间一个字节都不写库 —— 那是另一条缺陷。
+   * 冷启动只发生一次,不构成每秒写库。
    */
   private autosaveDue(): AutosaveReason | null {
-    if (this.state.meta.tick % AUTOSAVE_FRAME_INTERVAL === 0) return 'frame';
+    if (this.autosaveInFlight) return null;
+    const tick = this.state.meta.tick;
+    /* 退避窗没过 ⇒ 这一帧不试(它同时是「失败后每秒重试」的止血点)。 */
+    if (tick - this.lastSaveAttemptTick < this.autosaveBackoffFrames) return null;
     if (this.clock.nowMs() - this.lastAutosaveAtMs >= AUTOSAVE_INTERVAL_MS) return 'interval';
+    /* 冷启动垫底:还没有一次成功存档时,帧节流点试一次(只到第一次成功为止)。 */
+    if (this.saveCount === 0 && tick % AUTOSAVE_FRAME_INTERVAL === 0) return 'frame';
     return null;
   }
 
@@ -4063,9 +4583,10 @@ export class RoomRuntime {
 
     this.checkIdleSleep();
     /* ══════════ ★ 自动存档(owner 裁定 2026-11-20:不提供手动 SAVE/LOAD)══════════
-     * 两条轨取**先到者**,见 `AUTOSAVE_INTERVAL_MS` / `autosaveDue()`:
-     *   · 帧节流(每 `AUTOSAVE_FRAME_INTERVAL` 帧 = 1 秒)—— 既有口径,C25 钉着;
-     *   · 墙钟(每 `AUTOSAVE_INTERVAL_MS` = 30 秒)—— 低频驱动下的保底。
+     * 两条轨的关系见 `autosaveDue()`(**墙钟是触发源,帧节流只能更慢**):
+     *   · 墙钟(每 `AUTOSAVE_INTERVAL_MS` = 30 秒)—— 稳态**唯一**触发器;
+     *   · 帧节流(每 `AUTOSAVE_FRAME_INTERVAL` 帧)—— 只在「还没成功存过」时垫一次;
+     *   · 失败后按帧**指数退避**(`saveWorldNow`),不再每帧重试。
      * 落盘动作本身**只有一个实现**(`saveWorldNow()`):这里只决定「何时」。
      */
     if (this.db) {
@@ -4838,11 +5359,38 @@ export class RoomRuntime {
    * 某玩家在**本轮会话**的稳定快照。
    * 编码是确定性的(`encodeFull` 遍历顺序固定、定点量化),因此只要世界状态未变,
    * 同一 tick 下重复调用逐字节一致 —— 重连一致性的基础。
+   *
+   * ★ WS-FND-162(P1):**按 userId 裁剪** —— 只有在**成员表**里的人拿得到快照,
+   *   别人拿到的是一份**空包**(= 什么都不发)。判据与理由见方法体里的长注释。
    */
-  snapshotFor(_userId: string): Uint8Array {
+  snapshotFor(userId: string): Uint8Array {
     /* ★ WS-FND-131:此处原本写 `s.seq = this.state.meta.tick` —— 那条 `MemberSession.seq`
        全仓**0 读取**,而且它把**房间帧号**混写进**成员会话**字段(两个时钟混写)。
        字段已删;快照本身按整房编码,逐字节一致性不受影响(见 docblock)。 */
+    /* ══════════ ★ WS-FND-162(P1):**按 userId 裁剪**(修前这个参数被忽略)══════════
+       ## 修前(实测缺陷)
+       签名写的是 `snapshotFor(_userId)` —— 下划线已经声明了「没人用它」,实现是
+       无条件的 `encodeFull(整房)` ⇒ **被踢者 / 已离场者**与在场者拿到的东西**逐字节相同**。
+       「按人裁剪」这件事在代码里从未存在过(两个装配层都只**读** `res.snapshot`)。
+
+       ## 现在:不在成员表里 ⇒ 返回**空包**
+       `Uint8Array(0)` 是本仓既有的「什么都不发」哨兵:`ws_server.ts` 的 `sendBinary`
+       遇 0 字节**直接 return** ⇒ 那条连接一个字节都收不到。
+       ⚠️ **不许**改成「发一份零实体的合法帧」:客户端会把它读成**一次世界换代**
+         (空实体集 = 全删),那比不发更坏。
+
+       ## 判据为什么是「在成员表里」,而**不是** `connected`
+       `disconnect()` 是在把席位标成 `connected=false` **之后**才调本方法落盘;
+       若判据写成 `connected`,断线那一瞬间这份快照就成了空包 ⇒ **重连快照永远存不进去**,
+       而库里只是少一行、没有任何东西会红(本仓反复点名的静默形态)。
+       `kick()` / `leave()` 走的是 `purgeSeat()` → `clearSeatTraces()`,它把席位
+       **从表里删掉** ⇒ 「被踢 / 离场」与「断线待重连」在**同一张表**上可分。
+
+       ## 边界(如实标注,不是遗漏)
+       这是**席位级**裁剪:仍在席位上的人拿到的仍是**整房**快照。
+       按人做 AOI 级实体裁剪要动编码层(`shared/net/delta.ts` 的 `encodeFull`),
+       不在本条的写域内 —— 但**口径不会有第二处**:谁在成员表里,谁才拿得到东西。 */
+    if (!this.members.has(userId)) return new Uint8Array(0);
     return encodeFull(this.state, this.state.meta.tick).bytes;
   }
 

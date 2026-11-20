@@ -419,8 +419,11 @@ test('FND114-12 ★ 40 件在生产侧**没有**生产者:台账 40 行全 NONE,
 
   /* 口径一致的另一半:`PLACE_AUTOMATION` 只写它自己的登记表,世界侧不读它。 */
   eq(productionCallSites(/place_automation\.ts'/),
-    ['server/src/net/actions/action_table.ts', 'server/src/net/actions/reset_world.ts'],
-    '★ 放置登记表的消费者只有「动作分派 + 世界重置后清桶」,`sim/**` / `wiring/**` 里没有读者');
+    ['server/src/net/actions/action_table.ts', 'server/src/net/actions/reset_world.ts',
+      'server/src/net/room.colyseus.ts'],
+    '★ 放置登记表的读者 3 处:动作分派 + 世界重置后清桶 + 房间销毁清桶'
+    + '(`room.colyseus.ts#onDispose` 的 `forgetPlacements`,**仅清理、非求值** ——'
+    + ' 它不建 `ComponentNode`、不进求值);`sim/**` / `wiring/**` 里没有读者');
   /* 登记表自己的模块里有这两个**定义**(所以扫描到它是正常的);要看的是**别的**模块有没有读。 */
   eq(productionCallSites(/placementAt\(|placementsOfRoom\(/)
     .filter((f) => f !== 'server/src/net/actions/place_automation.ts'), [],

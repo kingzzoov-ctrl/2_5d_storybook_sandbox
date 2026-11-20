@@ -20,20 +20,76 @@ npm run play
 
 ```
   [play] 装配世界(96×96,带怪)...
+  [play] 存档:.data/world.db(文件库)⇒ 30 秒周期 + 离场 + 销毁 + 重置 自动保存
   [play] 预热 1200 帧(60 秒世界时间,耗时 23ms) ⇒ 世界里有 3 只生物
   [play]   mob_boar(180/180) · mob_sheep(60/60) · mob_slime_green(90/90)
   [play] 房间 play 就绪;host=已装配
   [play] WS 服务端:ws://127.0.0.1:8791/ws
 ```
 
-换端口 / 换世界大小 / 换预热:
+第二行是**存档**(见下面「存档」一节):文件库模式下打印库路径,`--memory` 模式下打印
+`存档:内存模式(--memory)⇒ 不落盘,退出即丢`(`scripts/play.ts:98-101`)。
+
+换端口 / 换世界大小 / 换预热 / 换存档目标:
 
 ```bash
 node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
+node scripts/play.ts --db D:\games\my_world.db    # 换库路径(父目录要先存在)
+node scripts/play.ts --memory                     # 显式内存模式:退出即丢,不留库
 ```
 
-`npm run play` 一次做了四件事:装配**真实世界**(`assemble()` → `WorldSim`)、
+开关清单(`scripts/play.ts` 逐个读;默认值写在后面):
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `--port <n>` | `8791` | WS 服务端端口 |
+| `--web-port <n>` | `5173` | 客户端 dev server 端口 |
+| `--size <格>` | `96` | 世界边长(格)。**再大会拖慢首帧建面** |
+| `--warmup <帧>` | `1200` | 连上之前先跑多少帧(20 帧 = 1 秒世界时间) |
+| `--db <path>` | `.data/world.db` | 存档文件库路径(`DEFAULT_DB_PATH`) |
+| `--memory` | 关 | **显式**内存模式:不落盘,退出即丢;给了它 `--db` 就不生效 |
+
+---
+
+`npm run play` 一次做了五件事:**装配**真实世界(`assemble()` → `WorldSim`)、开**存档**、
 **预热**它、起 **20Hz WS 服务端**(房间的 `step()` 推进世界)、起**客户端 dev server**。
+
+### 存档:默认自动落盘(**不需要任何手动保存**)
+
+`npm run play` 默认把世界存进**文件库** `.data/world.db`(`server/src/index.ts` 的
+`DEFAULT_DB_PATH`),**自动保存**的四个触发点全在 `server/src/net/room.ts`:
+**30 秒周期**(`AUTOSAVE_INTERVAL_MS = 30_000`)+ **玩家离场** + **房间销毁** + **世界重置**。
+`Ctrl+C` 关进程时另存一次(`SIGINT` ⇒ `room.close()`),并打印
+`存档统计:成功 N 次 · 失败 M 次 · 最近 <时刻>` —— 失败**不静默**(库打不开就报错因)。
+
+三条如实说明:
+
+- **没有**手动 `SAVE` / `LOAD` 键位,也**没有**这两个动作。存的就是**同一个世界**:
+  库还在,重启 `npm run play` 接着玩;库里留的是**最后一次自动存档**。
+- 想「只看一眼、不留痕」:加 `--memory`(显式内存模式)。它比「路径为空就不存」好,
+  因为后者让「忘了配」与「我不要存」行为完全一样 —— 那正是要消灭的静默。
+- 换库路径 = `--db <path>`,**父目录要先存在**(脚本不建目录);开不出库会在
+  启动日志里出现一行 `⚠️ 期望文件库(...)但 db 仍是 null —— 落盘不会发生`。
+
+### 昼夜时钟(世界真的在走时间,**客户端没有任何显示**)
+
+世界有一口**钟**:一天 `WORLD_DAY_SEC = 1200` 秒 = **20 分钟一天**,0 帧对应
+**06:00**(`WorldSim.WORLD_DAY_SEC` / `WORLD_START_HOUR`,`server/src/sim/world_sim.ts:4603-4625`)。
+钟点 = `06:00 + 帧数 × 0.05 / 1200 × 24`(取 24 模),**夜**的定义全仓只有一处:
+`wiring/components.ts` 的 `NIGHT_WINDOW = { startHour: 19, endHour: 6 }` ⇒ **19:00 入夜、06:00 天亮**。
+
+它今天就**有后果**:
+
+- **刷怪**:`spawnWorld()` 把 `isNight: () => this.isNightNow()` 交给刷怪层
+  (`world_sim.ts:8806`),`decideSpawn` 的 `DAYLIGHT` 因此**真的在判**:`NOCTURNAL` 夜行怪
+  **只在 19:00–06:00 刷**,白天被拒(判据 `tests/WS-FND-153-daynight-wired.test.ts`);
+- **电路**:环境键 `hour` / `night` 吃的是同一次读数,405 昼夜感光器据此翻转;
+- **`isNightNow()`** 还喂给房间系统 / 存档快照 / 温室。
+
+⚠️ **客户端没有昼夜显示**:HUD / 状态条 / 提示条里**没有**钟点或"现在是不是夜"这一行,
+`client/src` 全树不引用 `hourOfDay` / `isNight`。所以想知道现在是几点,只能看
+`WORLD_DAY_SEC` 自己折算(20 分钟一天),或者从「夜行怪刷没刷出来」反过来推。
+要看具体钟点,服务端侧读 `world_sim.hourOfDay()` / `lastHourOfDay`。
 
 ---
 
@@ -61,6 +117,7 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 | **`I`** / **`R`** / **`H`** / **`P`** / **`M`** | 背包 / 配方 / 画架 / 音高 / **派对模式**面板(开/关;`M` 再按一次或 `Esc` 关闭) |
 | **`[`** / **`]`** | 缩放(6 档:0.5× ~ 2×) |
 | **`/`** | 背包/配方**搜索**(进搜索态后动作键让路;`Enter` 收下 / `Esc` 清空) |
+| **`Esc`** | **关面板** / **清空搜索**:面板开着时回到 `CLOSED`(合法迁移,`ui/panel_keys.ts` 的 `CLOSE_PANEL_KEY = 'escape'`);搜索态里清空输入并退出(`three/boot.ts` 的 `onKeyDown`) |
 | **`B`** | demo Boss 血条开关(快照里没有权威 boss 时才看得到) |
 | **`Z`** / **`Y`** / **`X`** / **`C`** | 画架工具(撤销 / 重做 / 清空 / 填充;**只在画架打开时有效**) |
 | 单指拖动(触屏)| 移动(虚拟摇杆) |
@@ -123,12 +180,17 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
   `action` 通道(走专用报文,保住「绝对位置 + tick」的坐标契约)。逐条状态与仍未做的三处
   写在 [`docs/TASK-96-action-landing-gaps.md`](docs/TASK-96-action-landing-gaps.md)。
   **客户端这一侧**的入口逐动作登记在 `client/src/wiring_ledger.ts` 的
-  `CLIENT_ENTRY_LEDGER`(25 条,含"服务端有、客户端按不到"的那 8 条)。
+  `CLIENT_ENTRY_LEDGER`(25 条,含"服务端有、客户端按不到"的那 **7** 条)。
 - **生物 FSM 状态不下发**:`WildlifeState.fsm` 是 wire 上的 `uint8`,而模拟层的
   `MobFsmState` 是字符串枚举,两者之间**没有定义过映射表** ⇒ 快照里恒为 0(wire 默认值),
   而不是硬塞一个没有含义的编号。客户端目前不需要它。
-- **夜行怪白天不刷**:`spawnWorld().isNight()` 恒 `false`(世界还没有昼夜),
-  于是 `NOCTURNAL` 那些物种永远不会被刷出来 —— 这是规则在起作用,不是漏刷。
+- **夜行怪白天不刷 —— 这现在是规则在起作用,不是漏刷**(这条一度是缺陷,已修):
+  `spawnWorld()` 把 `isNight: () => this.isNightNow()` 交给刷怪层(`world_sim.ts:8806`),
+  于是 `decideSpawn` 的 `DAYLIGHT` **真的判夜**(★ WS-FND-153):
+  `NOCTURNAL` 夜行怪**只在 19:00–06:00 刷**,白天被如实拒;
+  昼行怪昼夜都放行。⇒ **白天看不见夜行怪是准的**,想见它们就得等到世界钟过了 19:00
+  (一天 20 分钟,见上面「昼夜时钟」)。判据 `tests/WS-FND-153-daynight-wired.test.ts`
+  7 条钉住夜刷 / 昼拒两端。
 - **相机跟随**:相机跟着**权威位置**走(`three/boot.ts` 每帧一次 `net/camera_follow.ts` 的
   `stepCamera`),所以角色不会走出画面 —— 这**不是**巧合。上一版手册把「WASD 顺手平移相机」
   当成了跟随的原因,**那句话已经过期**(代码里 `pan.x += ...` 那半**删掉**了):
@@ -138,13 +200,14 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 ### 服务端**已实现**、客户端**刻意不提供**的动作(逐条,不许当成已支持)
 
 出处只有一处:`client/src/wiring_ledger.ts` —— **台账** `CLIENT_ENTRY_LEDGER`
-(逐动作覆盖 `RoomAction` 的 25 条)+ **登记** `CLIENT_ENTRY_HOLDS`(八条管理类)
+(逐动作覆盖 `RoomAction` 的 25 条)+ **登记** `CLIENT_ENTRY_HOLDS`(**7** 条管理类;
+`SET_PARTY_MODE` 于 WS-FND-151 翻成 `wired` ⇒ 已从登记里删掉)
 + 非 `RoomAction` 的 `CLIENT_ENTRY_GAPS`(急单 / 分拣带道号)。
 第十轮补上的四条入口:`1` 驯养 / `2` 购买 / `3` 炼金台 / `4` 放自动化件;★ **WS-FND-154**
 补上第五条:**`5` 采集**(`GATHER`,采**面前**那格的**可采集物**;能不能采 / 工具够不够 /
 站得够不够近三件事**全在服务端判**,判序见 `server/src/net/actions/gather.ts` 的文件头)。
 
-**剩下八条全部裁决为「服务端已实现、客户端刻意不提供」**(不是"还没做")。它们都是
+**剩下七条全部裁决为「服务端已实现、客户端刻意不提供」**(不是"还没做")。它们都是
 **房间管理类**动作:缺的不是一行转发,而是那块 UI(表单 / 成员表 / 确认框 / 线框数据);
 UI 缺席时接一个裸键 = 一次误触改掉**整个房间**的状态,其中一半**不可逆**。
 ⇒ **0 条 `missing` 没有说明**:每一条都必须在这张登记表里写清 `why` / `unblock` / `today`,
@@ -185,9 +248,12 @@ Enter    选中光标那一档 ⇒ 发 SET_PARTY_MODE(载荷 partyMode = 冻结�
 ```
 
 ⚠️ 三条**如实**说明:
-- 模式键**不是** `1..4` —— 那四个键是 `HOTBAR_KEYS`(驯养/购买/炼金/放件),
-  面板开着时也照样生效 ⇒ 用 `1..4` 就会"一次按键两件事"。互斥性由
-  `ui/panel_keys.ts` 的 `keyGroups()` / `keyCollisions()` 钉住(读的是四张真表)。
+- 模式键**不是** `1..5` —— 那**五个**键是 `HOTBAR_KEYS`(`1` 驯养 / `2` 购买 / `3` 炼金台 /
+  `4` 放件·播种 / `5` 采集),面板开着时也照样生效 ⇒ 用 `1..5` 就会"一次按键两件事"
+  (按 `2` 既买一件货、又选第二档,两边都不报错)。互斥性由 `ui/panel_keys.ts` 的
+  `keyGroups()` / `keyCollisions()` 钉住(那张表由**真表**算出:`ACTION_KEYS` /
+  `ENTRY_KEYS` / `HOTBAR_KEYS` / `PANEL_KEYS` / `EASEL_TOOL_KEYS` / `PARTY_SELECT_KEYS` /
+  `MOVE_KEYS` + 五个单键,不手抄第二份清单)。
 - 选了模式 = **改赛制**(影响全房,含正在跑的那一局);`V`(`START_PARTY`)只把
   **房间已选**的模式开成一局,它**不设模式**。
 - 权限(OWNER/ADMIN)在**服务端**判(`net/room.ts` 的 `authorize`),客户端不预判:

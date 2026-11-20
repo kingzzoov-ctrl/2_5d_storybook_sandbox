@@ -32,6 +32,24 @@ import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 import { runSelfcheck } from './invariants.ts';
 import { runCheck as runCoverageMatrixCheck } from './coverage-matrix.ts';
+/* ★ WS-FND-158:性能预算判据要**真的跑一遍合成夹具** ⇒ 进程内 import 被计数的四个模块。
+   口径与 `runSelfcheck()` 一致:进程内调用才能算进 `pass`/`fail` 与退出码。
+   ⚠️ 这里只 import **纯逻辑**(无 IO、无网络、无子进程、无装饰器),与 `checkFrozen()` 的用法相同。 */
+import {
+  applyPacket, decodePacket, encodeDelta, encodePerf, resetEncodePerf,
+} from '../shared/net/delta.ts';
+import {
+  cloneRoomState, createPlayerState, createRoomState, createWildlifeState, type RoomState,
+} from '../server/src/net/schema.ts';
+import {
+  AntiCheatRoom, DEFAULT_LIMITS, VIOLATION_KEEP_PER_PLAYER, VIOLATION_LOG_CAPACITY,
+  checkMove, createAcState,
+} from '../server/src/net/anticheat.ts';
+import { WorldSim } from '../server/src/sim/world_sim.ts';
+import {
+  planEntitySpritesInto, resetSpritePlanCounters, spritePlanSpecAllocs,
+  type EntitySpriteSpec, type EntitySpriteSource,
+} from '../client/src/stage/entity_sprites.ts';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -1478,6 +1496,50 @@ const PROD_ENTRIES = [
  * ```
  * ⇒ 它**不**回答「模块逻辑跑得起来吗」(那是集成测试的事)。
  */
+/**
+ * `package.json` 声明的**可选依赖 / 依赖**名集合 —— 环境缺了它们**不算模块图缺陷**。
+ *
+ * ## 为什么需要(2026-11-21 实测)
+ *
+ * `gate-selfcheck` 的临时副本**刻意不复制 `node_modules`**(速度,见 `makeLab()`),
+ * 而入口 `server/src/net/room.colyseus.ts` 的 `import ... from 'colyseus'` 在那里
+ * 解析不到 ⇒ 副本里每个跑 `verify` 的用例都会多一条**永真的**基线红:
+ * ```
+ * ✗ 入口不可加载(1 处):server/src/net/room.colyseus.ts
+ *     (ERR_MODULE_NOT_FOUND | Cannot find package 'colyseus')
+ * ```
+ * 但**真实仓库**里 `colyseus` 已装(`optionalDependencies`)⇒ 该入口**实测可加载**。
+ * ⇒ 记在自检基线里的那条红是**环境差异**,不是「模块图坏了」。
+ *
+ * ## 口径(与 `ReferenceError` 同类)
+ *
+ * `ERR_MODULE_NOT_FOUND` 有两种根因,判据必须分开:
+ * ```
+ * 1 相对说明符丢了(`./x.ts` 不存在)      ⇒ 模块图缺陷 ⇒ **不可加载**(照旧报红)
+ * 2 裸包名 `Cannot find package 'p'` 且 p 在 package.json 里 ⇒ **环境**缺那个依赖
+ * ```
+ * 后者与既有的「`ReferenceError`(浏览器环境)算可加载」是同一条原则 ——
+ * 环境缺失是**运行环境**问题,不是模块图问题。名单**从 `package.json` 现算**
+ * (单一事实来源),不手抄一份,否则与「两份实现并存」同罪。
+ *
+ * ⚠️ 不放松真判据:`p` 不在 `package.json` 里(凭空 import 一个没人装的包)
+ *   仍然照旧报红。
+ */
+const OPTIONAL_DEPS: ReadonlySet<string> = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
+      optionalDependencies?: Record<string, string>;
+      dependencies?: Record<string, string>;
+    };
+    return new Set([
+      ...Object.keys(pkg.optionalDependencies ?? {}),
+      ...Object.keys(pkg.dependencies ?? {}),
+    ]);
+  } catch {
+    return new Set<string>();
+  }
+})();
+
 function entryLoadable(rel: string): { ok: boolean; reason: string } {
   const probe
     = `import(${JSON.stringify('./' + rel)}).then(() => { process.exit(0); }, (e) => {`
@@ -1498,7 +1560,15 @@ function entryLoadable(rel: string): { ok: boolean; reason: string } {
   });
   const err = `${r.stderr ?? ''}`;
   const hit = /LOAD_FAIL::([^\n]*)/.exec(err);
-  if (hit) return { ok: false, reason: hit[1]!.trim().slice(0, 180) };
+  if (hit) {
+    const detail = hit[1]!.trim();
+    /* 裸包说明符 + 已声明依赖 ⇒ 环境缺失(见上面 `OPTIONAL_DEPS` 的长注释),不是模块图缺陷 */
+    const pkgMiss = /Cannot find package '([^']+)'/.exec(detail);
+    if (detail.startsWith('ERR_MODULE_NOT_FOUND') && pkgMiss !== null && OPTIONAL_DEPS.has(pkgMiss[1]!)) {
+      return { ok: true, reason: `环境缺可选依赖 '${pkgMiss[1]}'(已声明在 package.json ⇒ 非模块图缺陷)` };
+    }
+    return { ok: false, reason: detail.slice(0, 180) };
+  }
   /* 退出码 3 = 判据命中(上面已 return);非 0 非 3 = 子进程自身崩了 ⇒ 也要报 */
   if (r.status !== 0) {
     return { ok: false, reason: `子进程退出 ${r.status}:${err.replace(/\s+/g, ' ').slice(0, 100)}` };
@@ -1510,6 +1580,7 @@ function entryLoadable(rel: string): { ok: boolean; reason: string } {
 function checkEntryLoadable(): void {
   console.log('\n[入口可加载性]');
   const bad: string[] = [];
+  const envNotes: string[] = [];
   let exempt = 0;
   for (const e of PROD_ENTRIES) {
     const why = ENTRY_LOAD_EXEMPT.get(e);
@@ -1520,11 +1591,18 @@ function checkEntryLoadable(): void {
     }
     const r = entryLoadable(e);
     if (!r.ok) bad.push(`${e}(${r.reason})`);
+    else if (r.reason !== '') envNotes.push(`${e}(${r.reason})`);
   }
   /* 豁免表里出现「已不在 PROD_ENTRIES 的条目」也是失真 ——
      否则豁免会越积越多,最后没人敢删。 */
   for (const k of ENTRY_LOAD_EXEMPT.keys()) {
     if (!PROD_ENTRIES.includes(k)) bad.push(`${k}(豁免条目已不在 PROD_ENTRIES —— 应删除该豁免)`);
+  }
+  /* 环境缺「已声明的可选依赖」⇒ **如实打印**(不算红):它是**环境差异**,不是
+     「模块图坏了」。静默跳过会让「真仓库里那个入口可加载」这件事从输出里消失
+     (读者只看到 4 个入口),下次有人在自检副本里看见这条红又会重新查一遍。 */
+  if (envNotes.length > 0) {
+    console.log(`  i         └─ 环境缺已声明依赖 ${envNotes.length} 处(照旧算可加载):${envNotes.join('; ')}`);
   }
   if (bad.length > 0) {
     fail(`入口不可加载(${bad.length} 处):${bad.join('; ')}`);
@@ -2557,6 +2635,13 @@ function findFileByName(name: string): string | null {
 function checkPathReadTargets(): void {
   /* 根变量白名单 —— **枚举**,不是模式匹配。新增根名会被"未知根"分支接住。 */
   const ROOTS = new Set(['ROOT', 'ROOT_DIR', 'REPO_ROOT', 'HERE', 'root']);
+  /* ★ 根变量分**两类** —— 解析基准不同,混用会把路径算到仓库外面去(实测假阳性):
+     · 仓库根类(`ROOT` / `ROOT_DIR` / `REPO_ROOT` / `root`)⇒ 相对 `ROOT` 解析;
+     · **文件自身目录**类(`HERE = dirname(fileURLToPath(import.meta.url))`)⇒ 必须相对
+       **该文件所在目录**解析,否则 `join(HERE, '..', ...)` 会相对仓库根再退一级。
+     实测:`tests/WS-FND-159:377` 的 `join(HERE, '..', 'server/src/net', 'room.colyseus.ts')`
+     被误报「目标不存在」,而文件就在仓库里 —— 那是**判据自己的解析错**,不是路径错。 */
+  const DIRNAME_ROOTS = new Set(['HERE']);
   const resolved: string[] = [];
   let total = 0;
   let unresolvable = 0;
@@ -2592,12 +2677,14 @@ function checkPathReadTargets(): void {
           const target = [...m[2]!.matchAll(/'([^']+)'/g)].map((x) => x[1]!).join('/');
           if (!target.endsWith('.ts')) { unresolvable += 1; continue; }
           resolved.push(`${rel}:${i + 1}`);
-          const ex = existsSync(target);
+          const targetAbs = DIRNAME_ROOTS.has(rootVar) ? resolve(dirname(p), target) : resolve(ROOT, target);
+          const targetRel = relative(ROOT, targetAbs).split(sep).join('/');
+          const ex = existsSync(targetAbs);
           if (/!\s*existsSync/.test(l)) {
             /* 否定式:目标**应当**不存在。存在了才是失效。 */
-            if (ex) missing.push(`${rel}:${i + 1} → ${target}(否定式断言,但文件存在 ⇒ 该断言已失效)`);
+            if (ex) missing.push(`${rel}:${i + 1} → ${targetRel}(否定式断言,但文件存在 ⇒ 该断言已失效)`);
           } else if (!ex) {
-            missing.push(`${rel}:${i + 1} → ${target}(读取但目标不存在)`);
+            missing.push(`${rel}:${i + 1} → ${targetRel}(读取但目标不存在)`);
           }
         }
       }
@@ -7870,6 +7957,457 @@ function runTests(): void {
   for (const [k, v] of byGroup) suiteCounts.set(k, v.total);
 }
 
+/* ══════════ WS-FND-158:活性能计数器的**每帧预算**(防回归判据)═══════════════════
+ *
+ * ## 缺口(本轮要修的)
+ * 第九轮把五处「每帧重造」改成了复用,并留下**活计数器**
+ * (`encodePerf.linearIdLookups` / `WorldSim.syncPlayerObjectAllocs` /
+ *  `spritePlanSpecAllocs` / 反作弊环形缓冲的留存长度与丢弃数)。
+ * 但那些数字当时**只被 `tests/WS-FND-137` 读过一次**:
+ * ```text
+ * 1 没有任何东西**阻止**将来把 O(n) 改回 O(n2) —— 改回去只让一个套件红,
+ *   而本仓的「唯一完成定义」是 `node scripts/verify.ts` 全绿;
+ * 2 也没有**每帧上限**:137 判的是「某次调用恰好涨了几个」,
+ *   不是「每帧最多涨几个」⇒ 它抓不住「一帧多扫了两遍」这种回归。
+ * ```
+ * ⇒ 本节给每个计数器定**每帧上限**(具名常量,见下),用一个**合成夹具**
+ *   (20 玩家 × 200 实体,**不连真实服务**)量出来,并**接进门禁**:
+ *   进程内调用 → 算进 `pass`/`fail` 与退出码(形态与 WS-FND-128 的 `runSelfcheck()` 相同)。
+ *
+ * ## 为什么预算取这些值(依据,不是猜)
+ * ```text
+ * ① linearIdLookups = 0        **结构式**。编码侧已建 id→实体 索引 ⇒ 全表线性查找出现的
+ *                             唯一原因就是「索引被绕过/被删」。上限必须是 0 而非「小于实体数」:
+ *                             「小于 N」会放 O(n2) 悄悄回来(那正是第九轮修掉的形态)。
+ * ② syncPlayerObjectAllocs      投影元素对象**按 id 池化** ⇒ 一帧的合法分配上限 =
+ *     每帧 ≤ 1 × 玩家数          「这一帧新出现的刚体数」≤ 玩家数。注意每个玩家实际占 **2** 个
+ *                             元素对象(AoiPlayer + WorldPlayer),故「1 个/玩家」是**宽松**上界;
+ *                             而「每帧重建投影」= 2 × 玩家数 ⇒ 必红(反例见 FND158-3)。
+ * ③ spritePlanSpecAllocs        立牌槽**复用**(`planEntitySpritesInto` 写进调用方的缓冲)⇒
+ *     每帧 ≤ 1 × 实体数          一帧的合法分配上限 = 实体数(一个实体一个槽);
+ *                             「每帧重建」= 2 × 实体数 ⇒ 必红(FND158-4)。
+ * ④ 环形长度 ≤ 512              具名容量(`VIOLATION_LOG_CAPACITY` / `VIOLATION_KEEP_PER_PLAYER`)。
+ *    单玩家窗口 ≤ 256          ⚠️ C7/C8 另判「**预算常量 === 实现容量**」:哪天实现改了容量
+ *                             而预算没跟,这两条当场红 —— 预算不是另一份口头承诺。
+ * ⑤ droppedViolations 余量 = 0  「有界策略」**精确规定**丢弃数:`丢弃 = max(0, 写入 − 容量)`。
+ *                             余量 > 0 会允许「无界留存」(留存超容 ⇒ 丢弃数小于策略值);
+ *                             反例是真实读数:`FND158-5/6` 把容量上界**真的拔掉**再灌一次。
+ * ```
+ *
+ * ## 判据的分工(不在两处各写一份)
+ * ```text
+ * 本节            预算常量 + 夹具 + 判据 + 命门自检(进程内,进 pass/fail)
+ * tests/WS-FND-158 逐条**正例 + 反例**(反例全是真实读数/真注入),并证明「改常量立即反映」
+ * ```
+ * ⚠️ 判据只在这里实现一次;测试 import 它(`judgePerfSample` / `measurePerfFixture`),
+ *   不许复制一份到测试里 —— 否则「预算」与「判据」会各自漂移。
+ */
+
+/** ①`encodePerf.linearIdLookups` 的每帧上限:**0**(结构式,理由见节首 ①)。 */
+export const PERF_BUDGET_DELTA_LINEAR_ID_LOOKUPS_PER_FRAME = 0;
+/** ②`WorldSim.syncPlayerObjectAllocs` 的每帧上限:**每个玩家 1 个**投影元素对象。 */
+export const PERF_BUDGET_SYNC_ALLOCS_PER_PLAYER_FRAME = 1;
+/** ③`spritePlanSpecAllocs` 的每帧上限:**每个实体 1 个**立牌槽。 */
+export const PERF_BUDGET_SPRITE_ALLOCS_PER_ENTITY_FRAME = 1;
+/** ④反作弊环形缓冲的长度上限:**具名容量**(必须 === `VIOLATION_LOG_CAPACITY`,由 C7 钉住)。 */
+export const PERF_BUDGET_AC_RING_LENGTH = 512;
+/** ④b单玩家违规窗口的长度上限:具名容量(必须 === `VIOLATION_KEEP_PER_PLAYER`,由 C8 钉住)。 */
+export const PERF_BUDGET_AC_KEEP_PER_PLAYER = 256;
+/** ⑤`droppedViolations` 相对有界策略的**余量**:**0**(丢弃数必须恰好等于 `写入 − 留存`)。 */
+export const PERF_BUDGET_AC_DROPS_EXCESS = 0;
+
+/** 夹具:玩家数(合成,不连服务)。 */
+export const PERF_FIXTURE_PLAYERS = 20;
+/** 夹具:实体数(上面 20 个玩家之外的生物/boss 数,合成)。 */
+export const PERF_FIXTURE_ENTITIES = 200;
+/** 夹具:测量窗口帧数(预热之后才计)。 */
+export const PERF_FIXTURE_FRAMES = 8;
+/** 反作弊夹具的灌水条数(必须 > 环形容量,否则「丢弃」这一维不成立)。 */
+const PERF_FIXTURE_VIOLATION_WRITES = 700;
+/** 单玩家窗口夹具的违规条数(必须 > `VIOLATION_KEEP_PER_PLAYER`)。 */
+const PERF_FIXTURE_PLAYER_VIOLATIONS = 400;
+
+/** 一次**测量**的读数(全部来自真实运行的计数器,没有手填值)。 */
+export interface PerfSample {
+  /** 测量窗口帧数(>0)。 */
+  frames: number;
+  /** 该窗口的玩家数(判据 ② 的分母)。 */
+  players: number;
+  /** 该窗口的实体数(玩家 + 生物/boss;判据 ③ 的分母)。 */
+  entities: number;
+  /** 窗口内累计:`encodePerf.linearIdLookups`(delta 编码侧)。 */
+  deltaLinearIdLookups: number;
+  /** 窗口内累计:`WorldSim.syncPlayerObjectAllocs`。 */
+  syncPlayerObjectAllocs: number;
+  /** 窗口内累计:`spritePlanSpecAllocs`。 */
+  spritePlanSpecAllocs: number;
+  /** 反作弊:窗口内**写入**流水条数(实测,由 `violations.length` 逐次累加)。 */
+  violationWrites: number;
+  /** 反作弊:当前**留存**条数(`violations().length`)。 */
+  violationRetained: number;
+  /** 反作弊:累计丢弃条数(`droppedViolations`)。 */
+  violationDropped: number;
+  /** 反作弊:实现侧的环形容量(读生产常量 —— C7 拿预算与它比)。 */
+  violationCapacity: number;
+  /** 反作弊:实现侧的单玩家窗口容量(读生产常量 —— C8 拿预算与它比)。 */
+  violationKeepPerPlayer: number;
+  /** 反作弊:单玩家窗口的**实测**最大长度。 */
+  violationPerPlayerMax: number;
+}
+
+/** 预算(具名常量的集合;判据只读这里,**不读散落的字面量**)。 */
+export interface PerfBudget {
+  deltaLinearIdLookupsPerFrame: number;
+  syncAllocsPerPlayerFrame: number;
+  spriteAllocsPerEntityFrame: number;
+  acRingLength: number;
+  acKeepPerPlayer: number;
+  acDropsExcess: number;
+}
+
+/** 默认预算 —— 只由上面那组具名常量构成(改常量 ⇒ 门禁口径立即跟着变)。 */
+export const PERF_BUDGET: PerfBudget = {
+  deltaLinearIdLookupsPerFrame: PERF_BUDGET_DELTA_LINEAR_ID_LOOKUPS_PER_FRAME,
+  syncAllocsPerPlayerFrame: PERF_BUDGET_SYNC_ALLOCS_PER_PLAYER_FRAME,
+  spriteAllocsPerEntityFrame: PERF_BUDGET_SPRITE_ALLOCS_PER_ENTITY_FRAME,
+  acRingLength: PERF_BUDGET_AC_RING_LENGTH,
+  acKeepPerPlayer: PERF_BUDGET_AC_KEEP_PER_PLAYER,
+  acDropsExcess: PERF_BUDGET_AC_DROPS_EXCESS,
+};
+
+/** 单条判据的结论(`budget` / `measured` 都要能直接打进输出 —— 失败时不必去翻常量)。 */
+export interface PerfCriterionRow {
+  /** 判据名(与计数器一一对应)。 */
+  id: string;
+  /** 预算的可读写法(含**数值**)。 */
+  budget: string;
+  /** 实测的可读写法(含**数值**)。 */
+  measured: string;
+  /** 是否在预算内。 */
+  ok: boolean;
+}
+
+/**
+ * 把一次读数判成 8 条判据(纯函数:同样的入参永远同样的结论)。
+ *
+ * ⚠️ 预算**是参数**,不是闭包里的常量 —— 这是「改预算常量立即反映」可被断言的前提:
+ * 测试拿**同一次真实读数** + 收紧后的预算再判一遍,必须逐条转假。
+ */
+export function judgePerfSample(s: PerfSample, b: PerfBudget = PERF_BUDGET): PerfCriterionRow[] {
+  const frames = Math.max(1, s.frames);
+  const linearPerFrame = s.deltaLinearIdLookups / frames;
+  const syncPerFrame = s.syncPlayerObjectAllocs / frames;
+  const syncCap = b.syncAllocsPerPlayerFrame * s.players;
+  const spritePerFrame = s.spritePlanSpecAllocs / frames;
+  const spriteCap = b.spriteAllocsPerEntityFrame * s.entities;
+  /* 有界策略**精确规定**的丢弃数:超出容量的那些条。 */
+  const dropPolicy = Math.max(0, s.violationWrites - b.acRingLength);
+  const dropExcess = Math.abs(s.violationDropped - dropPolicy);
+  return [
+    {
+      id: 'C1 delta.linearIdLookups/帧',
+      budget: `≤ ${b.deltaLinearIdLookupsPerFrame}(结构式:必须是 0)`,
+      measured: `${linearPerFrame}`,
+      ok: linearPerFrame <= b.deltaLinearIdLookupsPerFrame,
+    },
+    {
+      id: 'C2 syncPlayerObjectAllocs/帧',
+      budget: `≤ ${b.syncAllocsPerPlayerFrame} × 玩家数 ${s.players} = ${syncCap}`,
+      measured: `${syncPerFrame}`,
+      ok: syncPerFrame <= syncCap,
+    },
+    {
+      id: 'C3 spritePlanSpecAllocs/帧',
+      budget: `≤ ${b.spriteAllocsPerEntityFrame} × 实体数 ${s.entities} = ${spriteCap}`,
+      measured: `${spritePerFrame}`,
+      ok: spritePerFrame <= spriteCap,
+    },
+    {
+      id: 'C4 反作弊环形缓冲留存长度',
+      budget: `≤ ${b.acRingLength}`,
+      measured: `${s.violationRetained}(写入 ${s.violationWrites})`,
+      ok: s.violationRetained <= b.acRingLength,
+    },
+    {
+      id: 'C5 droppedViolations 只反映有界策略',
+      budget: `|丢弃 − max(0, 写入 − ${b.acRingLength})| ≤ ${b.acDropsExcess}`,
+      measured: `丢弃 ${s.violationDropped} / 策略值 ${dropPolicy}`,
+      ok: dropExcess <= b.acDropsExcess,
+    },
+    {
+      id: 'C6 单玩家违规窗口长度',
+      budget: `≤ ${b.acKeepPerPlayer}`,
+      measured: `${s.violationPerPlayerMax}`,
+      ok: s.violationPerPlayerMax <= b.acKeepPerPlayer,
+    },
+    {
+      id: 'C7 环形容量与预算常量同步',
+      budget: `= ${b.acRingLength}(预算常量)`,
+      measured: `${s.violationCapacity}(实现常量)`,
+      ok: s.violationCapacity === b.acRingLength,
+    },
+    {
+      id: 'C8 单玩家窗口容量与预算常量同步',
+      budget: `= ${b.acKeepPerPlayer}(预算常量)`,
+      measured: `${s.violationKeepPerPlayer}(实现常量)`,
+      ok: s.violationKeepPerPlayer === b.acKeepPerPlayer,
+    },
+  ];
+}
+
+/** 判据结论 → 一句话(门禁只印这一行;失败时**点名**哪几条超预算)。 */
+export function perfBudgetVerdict(
+  rows: readonly PerfCriterionRow[],
+): { ok: boolean; summaryLine: string } {
+  const bad = rows.filter((r) => !r.ok);
+  if (bad.length === 0) return { ok: true, summaryLine: `${rows.length}/${rows.length} 条计数器在预算内` };
+  const detail = bad.map((r) => `${r.id} 实测 ${r.measured} 超预算 ${r.budget}`).join(';');
+  return { ok: false, summaryLine: `超预算 ${bad.length}/${rows.length} 条:${detail}` };
+}
+
+/* ── 合成夹具(无网络 / 无子进程 / 不读盘)──────────────────────────────── */
+
+/** 一个**合法**的合成玩家(`createPlayerState` 的必填字段全给)。 */
+function perfPlayer(id: string, x: number, y: number): ReturnType<typeof createPlayerState> {
+  return createPlayerState(id, {
+    name: id, level: 10, hp: 100, maxHp: 100, x, y, z: 0,
+    dir: 0, stateFlag: 0, weaponId: 0, aiWeaponRecipeHash: '',
+    heldItemId: 0, carryingEntityId: '',
+  });
+}
+
+/** 合成房间:`PERF_FIXTURE_PLAYERS` 个玩家 + `PERF_FIXTURE_ENTITIES` 只生物(id 固定)。 */
+export function perfRoomState(): RoomState {
+  const s = createRoomState('room_perf_budget');
+  s.meta.tick = 100;
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) {
+    s.players.push(perfPlayer(`p${i}`, 1 + i, 2 + (i % 40)));
+  }
+  for (let i = 0; i < PERF_FIXTURE_ENTITIES; i += 1) {
+    s.wildlife.push(createWildlifeState(`w${i}`, {
+      mobId: 'mob_meadow_piglet', x: 3 + i, y: 4 + (i % 40), z: 0, fsm: 0, hp: 30, maxHp: 30,
+    }));
+  }
+  return s;
+}
+
+/** 立牌计划的合成快照(与上面同一批 id,画出来 = 19 远端玩家 + 200 生物)。 */
+export function perfSpriteSource(): EntitySpriteSource {
+  const players = [];
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) {
+    players.push({ id: `p${i}`, name: `p${i}`, x: 1 + i, y: 2 });
+  }
+  const wildlife = [];
+  for (let i = 0; i < PERF_FIXTURE_ENTITIES; i += 1) {
+    wildlife.push({ id: `w${i}`, mobId: 'mob_boar', x: 3 + i, y: 4 });
+  }
+  return { players, wildlife };
+}
+
+/** 反作弊夹具:灌 `PERF_FIXTURE_VIOLATION_WRITES` 条真违规,返回写入/留存/丢弃三个实测值。 */
+function perfAntiCheatFlood(): { writes: number; retained: number; dropped: number } {
+  const room = new AntiCheatRoom();
+  let writes = 0;
+  for (let i = 0; i < PERF_FIXTURE_VIOLATION_WRITES; i += 1) {
+    const id = `flood_${i}`;
+    room.join(id, 0, 0, 0, 0);
+    /* 瞬移 5000 格:必被拒 ⇒ 每条入流水。 */
+    room.move({ playerId: id, tick: 1, x: 5000, y: 0, z: 0 }, 3);
+    writes += room.get(id)!.violations.length;
+  }
+  return { writes, retained: room.violations().length, dropped: room.droppedViolations };
+}
+
+/**
+ * 跑一遍合成夹具并读出四个计数器(**唯一测量入口**)。
+ *
+ * 每个计数器都先**预热**再计窗口内的增量:
+ * ```text
+ * · 池/槽是「第一次见到就建」的 ⇒ 不预热会把建池那一帧算进稳态,读数没有意义;
+ * · 预热之后增量必须为 0(或与「新出现的东西」同阶)—— 那正是第九轮修成的不变式。
+ * ```
+ */
+export function measurePerfFixture(): PerfSample {
+  /* ① delta 编码侧(20 玩家 + 200 实体的合成房间,逐帧改一个玩家坐标)。 */
+  const prev = perfRoomState();
+  const next = cloneRoomState(prev);
+  resetEncodePerf();
+  for (let f = 0; f < PERF_FIXTURE_FRAMES; f += 1) {
+    next.meta.tick = 1000 + f;
+    next.players[f % PERF_FIXTURE_PLAYERS].x += 1;
+    encodeDelta(prev, next, 1000 + f);
+  }
+  const deltaLinearIdLookups = encodePerf.linearIdLookups;
+
+  /* ② WorldSim 投影(名册不变 ⇒ 稳态 0 分配)。 */
+  const sim = new WorldSim({ sizeCells: 64, mobs: false });
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) sim.addPlayer(`p${i}`, 1 + i, 2 + (i % 40));
+  for (let i = 0; i < PERF_FIXTURE_ENTITIES; i += 1) sim.addMob(`mob_${i}`, 'meadow', 3 + (i % 40), 4 + (i % 40));
+  sim.tick();                                   /* 预热:把池建起来 */
+  const syncBefore = sim.syncPlayerObjectAllocs;
+  for (let f = 0; f < PERF_FIXTURE_FRAMES; f += 1) sim.tick();
+  const syncPlayerObjectAllocs = sim.syncPlayerObjectAllocs - syncBefore;
+
+  /* ③ 立牌计划(复用槽:同一份快照逐帧重算)。 */
+  const src = perfSpriteSource();
+  const planBuf: EntitySpriteSpec[] = [];
+  planEntitySpritesInto(planBuf, src, 'p0');    /* 预热:槽位一次建齐 */
+  resetSpritePlanCounters();
+  for (let f = 0; f < PERF_FIXTURE_FRAMES; f += 1) planEntitySpritesInto(planBuf, src, 'p0');
+  const spriteAllocs = spritePlanSpecAllocs;
+
+  /* ④ 反作弊(流水灌到超过容量;再单独灌一个玩家到超过窗口)。 */
+  const ac = perfAntiCheatFlood();
+  const one = createAcState('flood_one', 0, 0, 0, 0);
+  for (let i = 0; i < PERF_FIXTURE_PLAYER_VIOLATIONS; i += 1) {
+    checkMove(one, { tick: 1, x: 5000, y: 0, z: 0 }, DEFAULT_LIMITS, 3);
+  }
+
+  return {
+    frames: PERF_FIXTURE_FRAMES,
+    players: PERF_FIXTURE_PLAYERS,
+    entities: PERF_FIXTURE_PLAYERS + PERF_FIXTURE_ENTITIES,
+    deltaLinearIdLookups,
+    syncPlayerObjectAllocs,
+    spritePlanSpecAllocs: spriteAllocs,
+    violationWrites: ac.writes,
+    violationRetained: ac.retained,
+    violationDropped: ac.dropped,
+    violationCapacity: VIOLATION_LOG_CAPACITY,
+    violationKeepPerPlayer: VIOLATION_KEEP_PER_PLAYER,
+    violationPerPlayerMax: one.violations.length,
+  };
+}
+
+/* ── 命门自检:证明上面 8 条判据**咬得住**(不是恒真)─────────────────────── */
+
+/** 一条命门自检的结论。 */
+export interface PerfTeethRow {
+  /** 判据 id(与 `judgePerfSample` 的行对应)。 */
+  id: string;
+  /** 怎么造的(超预算读数从哪来 / 改了哪个常量)。 */
+  detail: string;
+  /** 对应判据是否**真的转假**了。 */
+  flipped: boolean;
+}
+
+/**
+ * 命门自检:**用真实读数**给每条判据造一次「应当失败」的场合。
+ *
+ * ```text
+ * T1 落地侧真实读数      收包并 applyPacket ⇒ linearIdLookups 被顶到 > 0(FND137-4 同源)
+ * T2 整帧重建投影        名册全换血(remove 20 / add 20 新 id)⇒ 一帧 40 > 玩家数 20
+ * T3 每帧两遍非复用计划  两次传入**新数组** ⇒ 每帧 2 × 实体数
+ * T4/T5/T6 常量收紧      同一次**真实**反作弊读数,把容量/余量改小 ⇒ 对应判据转假
+ *                        (这一档证明的是「结论由常量决定」,真实超容读数留在 FND158-5/6:
+ *                         那里把容量上界**真的拔掉**再灌一次,留存 700 > 512)
+ * ```
+ */
+export function perfBudgetTeeth(base: PerfSample): PerfTeethRow[] {
+  const rows = base;
+  const pick = (sample: PerfSample, budget: PerfBudget, id: string): boolean => {
+    const row = judgePerfSample(sample, budget).find((r) => r.id === id);
+    return row !== undefined && !row.ok;
+  };
+  const out: PerfTeethRow[] = [];
+
+  /* T1 落地侧:`applyPacket` 每条文两次线性查找(计数点在落地侧)。 */
+  const prev = perfRoomState();
+  const next = cloneRoomState(prev);
+  next.players[0].x += 1;
+  resetEncodePerf();
+  const pkt = decodePacket(encodeDelta(prev, next, 2000).bytes);
+  applyPacket(prev, pkt);
+  const landing: PerfSample = { ...rows, deltaLinearIdLookups: encodePerf.linearIdLookups };
+  out.push({
+    id: 'C1 delta.linearIdLookups/帧',
+    detail: `落地一包后线性查找 ${encodePerf.linearIdLookups} 次(>0)`,
+    flipped: pick(landing, PERF_BUDGET, 'C1 delta.linearIdLookups/帧'),
+  });
+
+  /* T2 整帧重建:名册全换血 ⇒ 该帧为每个玩家重建两个元素对象。 */
+  const sim = new WorldSim({ sizeCells: 64, mobs: false });
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) sim.addPlayer(`p${i}`, 1 + i, 2);
+  sim.tick();
+  const churnBefore = sim.syncPlayerObjectAllocs;
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) sim.removePlayer(`p${i}`);
+  for (let i = 0; i < PERF_FIXTURE_PLAYERS; i += 1) sim.addPlayer(`n${i}`, 3 + i, 5);
+  sim.tick();
+  const churn = sim.syncPlayerObjectAllocs - churnBefore;
+  const churnSample: PerfSample = { ...rows, frames: 1, syncPlayerObjectAllocs: churn };
+  out.push({
+    id: 'C2 syncPlayerObjectAllocs/帧',
+    detail: `名册全换血的一帧分配 ${churn} 个(玩家数 ${PERF_FIXTURE_PLAYERS})`,
+    flipped: pick(churnSample, PERF_BUDGET, 'C2 syncPlayerObjectAllocs/帧'),
+  });
+
+  /* T3 每帧两遍非复用计划(每遍都传一个新数组)。 */
+  resetSpritePlanCounters();
+  const srcAt = perfSpriteSource();
+  for (let f = 0; f < PERF_FIXTURE_FRAMES; f += 1) {
+    planEntitySpritesInto([], srcAt, 'p0');
+    planEntitySpritesInto([], srcAt, 'p0');
+  }
+  const twoPlans = spritePlanSpecAllocs;
+  const spriteSample: PerfSample = { ...rows, spritePlanSpecAllocs: twoPlans };
+  out.push({
+    id: 'C3 spritePlanSpecAllocs/帧',
+    detail: `每帧两遍非复用计划 ⇒ 窗口 ${twoPlans} 个槽(实体数 ${rows.entities})`,
+    flipped: pick(spriteSample, PERF_BUDGET, 'C3 spritePlanSpecAllocs/帧'),
+  });
+
+  /* T4/T5/T6 常量收紧:同一次真实反作弊读数,只改预算常量。 */
+  out.push({
+    id: 'C4 反作弊环形缓冲留存长度',
+    detail: `预算收紧到 ${PERF_BUDGET_AC_RING_LENGTH - 1} ⇒ 实测留存 ${rows.violationRetained} 超容`,
+    flipped: pick(rows, { ...PERF_BUDGET, acRingLength: PERF_BUDGET_AC_RING_LENGTH - 1 },
+      'C4 反作弊环形缓冲留存长度'),
+  });
+  out.push({
+    id: 'C5 droppedViolations 只反映有界策略',
+    detail: `预算放宽到与写入数相同(${rows.violationWrites})⇒ 策略期望 0 条丢弃,而实测 ${rows.violationDropped}`,
+    flipped: pick(rows, { ...PERF_BUDGET, acRingLength: rows.violationWrites },
+      'C5 droppedViolations 只反映有界策略'),
+  });
+  out.push({
+    id: 'C6 单玩家违规窗口长度',
+    detail: `预算收紧到 ${PERF_BUDGET_AC_KEEP_PER_PLAYER - 1} ⇒ 实测 ${rows.violationPerPlayerMax}`,
+    flipped: pick(rows, { ...PERF_BUDGET, acKeepPerPlayer: PERF_BUDGET_AC_KEEP_PER_PLAYER - 1 },
+      'C6 单玩家违规窗口长度'),
+  });
+  return out;
+}
+
+/** 门禁侧的完整结论(判据行 + 命门自检 + 一行汇总)。 */
+export interface PerfBudgetReport {
+  ok: boolean;
+  sample: PerfSample;
+  rows: readonly PerfCriterionRow[];
+  teeth: readonly PerfTeethRow[];
+  summaryLine: string;
+}
+
+/**
+ * 门禁入口:**量夹具 → 判预算 → 自检命门**。
+ *
+ * ⚠️ 三件事都必须在 `ok` 里:判据没牙(命门自检不翻转)与超预算同罪 ——
+ * 一个「永远通过」的判据也是绿的,而那正是本节要消除的形态。
+ */
+export function runPerfBudgetCheck(): PerfBudgetReport {
+  const sample = measurePerfFixture();
+  const rows = judgePerfSample(sample);
+  const verdict = perfBudgetVerdict(rows);
+  const teeth = perfBudgetTeeth(sample);
+  const blind = teeth.filter((t) => !t.flipped);
+  const ok = verdict.ok && blind.length === 0;
+  const summaryLine = verdict.summaryLine
+    + ` · 命门自检 ${teeth.length - blind.length}/${teeth.length}`
+    + (blind.length === 0
+      ? ''
+      : `(${blind.map((t) => `${t.id}:${t.detail}`).join(' / ')} ⇒ 判据没牙)`);
+  return { ok, sample, rows, teeth, summaryLine };
+}
+
 /* ───────────────────── main ───────────────────── */
 
 /**
@@ -7939,6 +8477,18 @@ if (!frozenOnly && !only) {
   const inv = runSelfcheck();
   if (!inv.ok) fail(`不变量自检 ${inv.summaryLine}`);
   else pass(`不变量自检 ${inv.summaryLine}`);
+}
+/* ★ WS-FND-158(第十二轮):**性能预算** —— 与上面的不变量自检同一形态(进程内调用,
+   算进 `pass`/`fail` 与退出码)。为什么必须进程内:它有**真的夹具**(20 玩家 × 200 实体)
+   与真读数,子进程形态在「脚本被改名/删掉」时会静默变成「没跑」,而「没跑」与「在预算内」
+   在输出上长得一模一样。
+   ⚠️ 判据内部含**命门自检**(见 `perfBudgetTeeth`):只报「全部在预算内」而不自证咬得住,
+   就是本节要消除的「恒真门禁」。`--frozen` / `--only` 下跳过(与 `runSelfcheck()` 同一守卫口径:
+   局部口径里比全量预算会误导)。 */
+if (!frozenOnly && !only) {
+  const pb = runPerfBudgetCheck();
+  if (!pb.ok) fail(`性能预算 ${pb.summaryLine}`);
+  else pass(`性能预算 ${pb.summaryLine}`);
 }
 if (!docsOnly && !only && !integrationOnly && !contentOnly) await checkFrozen();
 /* ⚠️ `runTests()` 必须排在 `checkDocs()` **之前**:

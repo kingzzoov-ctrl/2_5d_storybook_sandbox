@@ -475,7 +475,10 @@ test('FND135-9 ★★ 单帧动作预算:前 64 条真执行,第 65 条起被拒
 
   const over = rt.dispatchAction('owner', RoomAction.SET_ROOM_ACCESS, { mode: AccessMode.PUBLIC });
   eq(over.ok, false, '★★ 第 65 条被拒(修前**没有任何兜底**:照样执行)');
-  eq(over.kind, 'INVALID', '回执类别:不是权限 / 参数问题');
+  /* ★ P1(2026-11-21):超预算的档位从 `INVALID` 改成**独立**的 `THROTTLED` ——
+     修前那条「不是权限 / 参数问题」的注释与回执内容自相矛盾(客户端读到的是
+     「你参数错了」)。这条断言跟着改,其余三处(计数 / 明细 / 帧边界)未变。 */
+  eq(over.kind, 'THROTTLED', '回执类别:预算档(不是权限 / 参数问题,也不是 INVALID)');
   ok((over.reason ?? '').includes('预算'), `理由写明是预算:${over.reason}`);
   eq(rt.actionsThrottled, 1, '★ 被拒计数(可观测 —— 静默丢弃才是缺陷)');
   eq(rt.throttledActions.length, 1, '★ 明细留下(谁 / 哪个动作 / 哪一帧)');

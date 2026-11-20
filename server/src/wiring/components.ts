@@ -1020,6 +1020,15 @@ export interface ComponentProducerRow {
  * `ComponentNode`。⇒ `WorldSim.tick()` 里 `if (this.wiringOn)` 那段求值块在生产中
  * **没有件可求值**(`componentsEvaluated` 恒 0),40 项件的输入判据也就无从谈起。
  *
+ * · `net/actions/place_automation.ts` 的**读者**有 3 处(判据 `WS-FND-114` 静态扫描,
+ *   口径 = 该模块的说明符只出现在这 3 个文件里):动作分派 `net/actions/action_table.ts`、
+ *   世界重置 `net/actions/reset_world.ts`、**房间销毁** `net/room.colyseus.ts#onDispose`。
+ *   第三处是 2026-11-21(P2)加的**清理**消费者(`forgetPlacements`):它只做
+ *   `Map.delete(roomId)` 回收 per-room 侧账,**不**建 `ComponentNode`、**不**进求值
+ *   ⇒ 它**不**改变 `worldProducer` 口径:40 行仍全是 `NONE`。
+ *   (登记口径:「消费者」≠「生产者」—— 只有真的在世界侧 `makeComponent`/`addComponent`
+ *    的代码才允许把某行改成 `PRODUCTION`;清理口按本注释登记,不动表。)
+ *
  * ## 为什么本文件只登记、不接线
  *
  * 接线点在 `net/actions/place_automation.ts`(应调 `WorldSim`)与 `net/room.ts`
@@ -1030,8 +1039,10 @@ export interface ComponentProducerRow {
  * ⚠️ 这张表是「口径一致」的唯一登记处:判据 `WS-FND-114` 同时核
  *   1 表仍是 40 行且全部 `NONE`(有人接线后必须来改这一行);
  *   2 `server/src` 的三类调用点仍是:`.addComponent(` / `.addWireDrive(` 只在
- *      `sim/demo.ts`,`makeComponent(` 为 **0**。
- *   两条一起变红才可能漂 —— 只改一处会被另一条挡住。
+ *      `sim/demo.ts`,`makeComponent(` 为 **0**;
+ *   3 放置登记表的读者**恰好**是上面那 3 处,且第 3 处(`room.colyseus.ts`)是
+ *      **仅清理、非求值**口 —— 新增读者/把它改成造件都会当场红。
+ *   三条一起漂才可能漏 —— 只改一处会被另外两条挡住。
  */
 export const COMPONENT_PRODUCER_LEDGER: readonly Readonly<ComponentProducerRow>[] = Object.freeze(
   COMPONENT_SPECS.map((s) => Object.freeze({ id: s.id, kind: s.kind, worldProducer: 'NONE' as const })),

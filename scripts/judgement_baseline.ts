@@ -131,6 +131,20 @@ export const JUDGEMENT_BASELINE: readonly BaselineEntry[] = [
       + '边界另有负对照钉住(只改注释的注入不该让判据红)。挂 CR-18 同批处理。',
   },
 
+  {
+    detector: 'B',
+    file: 'tests/WS-FND-159-event-log-bounds.test.ts',
+    needle: "return src.replace(/\\/\\*[\\s\\S]*?\\*\\//g, ' ').replace(/\\/\\/",
+    verdict: '挂账待修',
+    reason:
+      '与 WS-07 / WS-FND-09 / WS-FND-132 同族(同一个「先剥块注释再剥行注释」惯用法)。'
+      + '该 strip 只服务于「去注释后对**生产插入点**做包含式形态查找」'
+      + "(`writeEvent(db, this.runtime.id)` / `Date.now() * 1000` / 裸 `insert('room_events')`),"
+      + '而被扫文本是本仓源码,`//` 只出现在真注释里 ⇒ 当前无触发点。'
+      + '★ 方向安全:剥多了只会让**该找到的**形态找不到 ⇒ 该判据变红(可见),不会静默变绿;'
+      + '且本判据自带负对照(`LEGACY_WIRING` 片段必须被判出 ≥2 个问题)。挂 CR-18 同批处理。',
+  },
+
   /* ─────────── C:import 探测只认 from(10 处)─────────── */
   {
     detector: 'C',

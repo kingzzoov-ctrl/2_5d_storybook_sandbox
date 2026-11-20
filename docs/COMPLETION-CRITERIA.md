@@ -43,8 +43,12 @@
 | 17 | 派对急行 UI 已接 | 达成 | `tests/WS-FND-151-party-ui.test.ts`(模式面板 / 比分 HUD / 急行条件清单)+ `client/src/ui/party_panel.ts` · `client/src/ui/rush_readiness.ts` · `client/src/wiring_ledger.ts` 的 `SET_PARTY_MODE`(原 `missing`)+ 世界侧真值 `server/src/coop/rush_actions.ts#RUSH_ACTION_LEDGER` · `tests/WS-FND-120-party-coop-wired.test.ts` | 2026-11-20 |
 | 18 | 天赋 × 料理 → 击退 / 连击已接(数值待平衡) | 达成(边界:只判「接上且有判据」,**手感/数值不在此列** —— `COMBO_WINDOW_SEC` / 锻造档位在套件内标「待平衡」) | `tests/WS-FND-152-combat-effects-wired.test.ts`(料理 5 buff / 击退全参数 / 连击窗口 / carry 容量)+ 真值源 `server/src/combat/progression.ts#TALENT_WIRING_STATUS` · `docs/WIRING-LEDGER.md` R6-CBT-2 · `tests/WS-FND-111-combat-numeric-bounds.test.ts` | 2026-11-20 |
 | 19 | 昼夜(世界时钟)已接 | 达成 | `tests/WS-FND-153-daynight-wired.test.ts`(夜行门吃真世界钟:白天 `DAYLIGHT` 拒、夜里放行)+ 生产面 `server/src/mobs/spawner.ts#isNightNow` / `NIGHT_WINDOW` · `server/src/wiring/components.ts` 的 `dayNight`;既有锚点 `WS-FND-59-world-clock.test.ts` · `WS-FND-64-world-clock-wiring.test.ts` | 2026-11-20 |
+| 20 | 长跑有界(状态不随房间寿命无界增长) | 达成(边界:证据是**合成长跑**(死 100 只 / 灌满环形缓冲),不是小时级真长跑) | `tests/WS-FND-135-hotpath-and-reap.test.ts` FND135-2(死 100 只后宿主 / AOI / 物理**三表不增长**)· `tests/WS-FND-137-frame-cost.test.ts`(房间流水环形缓冲有界 + 每帧分配稳态不涨) | 2026-11-20 |
+| 21 | 并发公平与证据 | 达成(边界:单线程内以**注入交错**制造并发,不是真多进程调度;覆盖面只有「同帧动作预算」与「同库并发发放」两处) | `tests/WS-FND-135-hotpath-and-reap.test.ts` FND135-9/10(单帧预算 = **帧**预算、多连接共享不按连接分桶;被拒**计数 + 明细**就是证据面)· `tests/WS-FND-156-crossproc-idempotency.test.ts` FND156-6(两个实例共享一个库并发 join:一方赢 / 败方撤回首份 / 台账只留一行) | 2026-11-20 |
+| 22 | 性能预算入闸(性能回归有牙) | 达成 | `scripts/verify.ts` 的 `PERF_BUDGET*` 常量 + `judgePerfSample` / `runPerfBudgetCheck`(**进程内**接门禁);每条判据的正例 + 反例 + 「改预算常量立即反映」在 `tests/WS-FND-158-perf-budget.test.ts` | 2026-11-20 |
+| 23 | 起始背包「已发」跨进程幂等 | 达成(边界:无库模式 `db === null` 退化为**进程内账**,它自己就是那条唯一账,如实标出) | `tests/WS-FND-156-crossproc-idempotency.test.ts` FND156-1..9(库层台账 = 唯一的跨进程真值)· 实现面 `server/src/db/repo.ts`(发放台账 `user_starting_inventory`)+ `server/src/net/room.ts`(先查库 → 未领才发 → 发成功再写库,失败撤回) | 2026-11-20 |
 
-⇒ **判据:本表 19 项全部「达成」或「达成(边界)」才算完成。今天:16 项达成(其中 7 项带边界)/ 3 项未达成(#13 #14 #15)。**
+⇒ **判据:本表 23 项全部「达成」或「达成(边界)」才算完成。今天:20 项达成(其中 10 项带边界)/ 3 项未达成(#13 #14 #15)。**
 
 ### 复算(三条命令,别抄数)
 

@@ -26,9 +26,28 @@ import type { Client, Room as ColyseusRoom } from 'colyseus';
 import { RoomSchema, BossSchema, PlayerSchema, WildlifeSchema, assertSchemaReady } from './schema.colyseus.ts';
 import { RoomRuntime, RoomRegistry, type RoomRuntimeOptions, type WorldSaveHost } from './room.ts';
 import { DT } from '../../../shared/types/physics.ts';
-import { AccessMode } from '../db/repo.ts';
+import { AccessMode, writeEvent } from '../db/repo.ts';
 import type { DbLike } from '../db/repo.ts';
 import { createHost, resolveAssembly } from '../index.ts';
+/* ★ P2(2026-11-21):模块级**侧账**的回收口。
+   三本账(`chestsByRoom` / `PLACEMENTS` / `ROOM_PETS`,以及炼金订单的预占)住在
+   动作层的模块级 Map 里,而它们此前**只**由 `RESET_WORLD` 清(`actions/reset_world.ts`
+   的 `forgetRoomSideLedgers`)⇒ 房间销毁(`onDispose`)一遍都不碰:每销毁一间房就漏
+   一份(箱子格 / 放置件 / 宠物归属 / 那间房已认领的订单),而房间对象本身早被 GC 了
+   —— 谁也不会再把它们删掉。这里在 `onDispose` 里按 roomId 一并清掉。
+/* ★ P2(2026-11-21):模块级**侧账**的回收口。
+   三本账(`chestsByRoom` / `PLACEMENTS` / `ROOM_PETS`)住在动作层的模块级 Map 里,
+   而它们此前**只**由 `RESET_WORLD` 清(`actions/reset_world.ts` 的
+   `forgetRoomSideLedgers`)⇒ 房间销毁(`onDispose`)一遍都不碰:每销毁一间房就漏一份
+   (箱子格 / 放置件 / 宠物归属),而房间对象本身早被 GC 了 —— 谁也不会再把它们删掉。
+   这里在 `onDispose` 里按 roomId 一并清掉。
+   ⚠️ 只清**本房间**的键(`forget*` 都是 `delete(roomId)`),别的房间不受影响。
+   ⚠️ 炼金订单的预占**不在这里**:它是 `WeakMap`(键是房间 state 对象身份),state 被
+   丢掉时自己就没了 —— 那不是「漏一份」,加进来只是多做一次无人受益的清理。
+   ⚠️ 别把这几行挪进 `stepTick` 的 `writeEvent` 那一段:那是审计事件口,不是回收点。 */
+import { forgetChests } from './actions/open_chest.ts';
+import { forgetPlacements } from './actions/place_automation.ts';
+import { forgetRoom } from './actions/breed_tame.ts';
 
 /**
  * `Room` 的**运行时值**只能从默认导出上取(`colyseus` 是 CommonJS,根入口没有命名导出):
@@ -67,6 +86,63 @@ export const USE_COLYSEUS_PATCH = false;
  */
 export function patchEnabled(): boolean {
   return USE_COLYSEUS_PATCH;
+}
+
+/**
+ * ★ WS-FND-162(P1):**这一帧该跳过谁** —— Colyseus 装配层唯一的 delta 收件人判据。
+ *
+ * ## 修前(实测缺陷:与 `WS-FND-161` 是**同一形态的两个层**)
+ * ```text
+ * stepTick:  if (packet.length > 0) this.broadcast('delta', packet);  ← 房内**所有** client
+ * ```
+ * `broadcast` 身上没有任何成员判据,而 `kick()`(`room.ts`)只走 `leave()` ——
+ * **摘席位、不断连接**:被踢者那条 Colyseus 连接照旧留在 `this.clients` 里,
+ * 于是「被踢」在下行上**完全不可见**(他继续收整房 delta)。
+ * 运输层(`ws_server.ts`)的同类缺陷已在 WS-FND-161 修掉,而**这一层当时没修** ——
+ * 偏偏 B 路(Colyseus 装配)才是 `scripts/play.ts` 真正跑的那条。
+ *
+ * ## 判据来自**房间**,本层不自己记第二本账
+ * `isSeated(seatKey)` = `RoomRuntime.members` 里还有这个人(`room.ts#isSeated`)。
+ * 席位被收走的那一刻房间那边就已经是权威 ⇒ 本层**下一帧**跟着裁掉:不需要通知,
+ * 也没有第二处状态能漂(反例:在本层另存一个 `kickedClients` 集合,就得在入场 /
+ * 重连 / 断线 / 销毁四条路径上都记得清,漏一条就是「被踢者复活」)。
+ *
+ * ## 三态(与 `ws_server.ts` 的 `seatAlive` **逐条同款**)
+ * ```text
+ * 在席位表里      ⇒ 收
+ * 不在席位表里    ⇒ 裁掉(被踢 / 主动离场 / 入场被拒因而**从未绑座位**)
+ * isSeated 自己抛 ⇒ **收**(fail-open)
+ * ```
+ * 最后一条是刻意的:故障(房间实现坏了)若表现成「这个人收不到帧」,就把
+ * 「服务端坏了」伪装成「网络静了」——本仓反复点名的静默形态。
+ *
+ * ## 为什么取键必须走 `seatKeyOf` 而不是 `client.sessionId`
+ * 带凭证入场的成员键是**凭证里的 userId**,不带凭证的才是 `sessionId`
+ * (口径见 `bindSeat`)。若在这里直接拿 `sessionId` 去查房间,前者恒查不到
+ * ⇒ 带凭证的人会被**整片**裁掉(修好的缺陷换个方向复发)。故调用方传的
+ * 取键函数必须与 onJoin / onLeave / onMessage **同一处**。
+ *
+ * ## 为什么返回**排除集**而不是收件人集
+ * 生产路径用 Colyseus 官方的 `broadcast(type, msg, { except })`:它把报文
+ * **编码一次**再发给其余客户端;自己循环 `client.send` 会让同一份字节被逐客户端重编码。
+ */
+export function deltaExclusions<C extends { sessionId: string }>(
+  clients: readonly C[],
+  seatKeyOf: (client: C) => string,
+  isSeated: (userId: string) => boolean,
+): C[] {
+  const out: C[] = [];
+  for (const client of clients) {
+    let seated: boolean;
+    try {
+      seated = isSeated(seatKeyOf(client)) === true;
+    } catch {
+      /* 见上面「三态」:房间实现坏了**不许**伪装成「这个人静音」。 */
+      seated = true;
+    }
+    if (!seated) out.push(client);
+  }
+  return out;
 }
 
 export interface NetPersistRoomOptions {
@@ -593,6 +669,22 @@ export class NetPersistRoom extends Room<RoomSchema> {
     /* ★ P1-1:房间销毁 ⇒ 连接旁表一并清掉(席位表由 `runtime.close()` 负责)。 */
     this.seatKeys.clear();
     this.runtime.close();
+    /* ══════════ ★ P2(2026-11-21)模块级侧账的**回收点** ══════════
+     * 缺陷形态(修前):这三本账(`chestsByRoom` / `PLACEMENTS` / `ROOM_PETS`)唯一
+     * 的清理调用点是 `RESET_WORLD`(`actions/reset_world.ts` 的 `forgetRoomSideLedgers`)
+     * ⇒ **正常销毁**的房间一遍都不碰:每销毁一间房就漏一份(箱子格 / 放置件 /
+     * 宠物归属),而房间对象自己早被 GC 掉了 —— 再也没有谁会去删那几把键。
+     * 表现完全静默:房间没了、内存里那几个 Map 还在长(长跑进程里随建房数线性涨)。
+     *
+     * 修法 = 复用一个**已经存在**的回收口(不新造第二套):`close()` 之后按 roomId 清。
+     * 顺序无所谓(两边互不依赖),放在 `close()` **之后**只是让「存档 → 关状态 → 清账」
+     * 这条时间线读起来是一条线。
+     *
+     * ⚠️ 幂等:`forget*` 都是 `Map.delete(roomId)`,重复调用无副作用(`onDispose` 本身
+     *   在 Colyseus 里也只调一次)。 */
+    forgetChests(this.runtime.id);
+    forgetPlacements(this.runtime.id);
+    forgetRoom(this.runtime.id);
   }
 
   /** 每帧:推进权威世界 + 发差量 + 落审计。 */
@@ -600,8 +692,19 @@ export class NetPersistRoom extends Room<RoomSchema> {
     const packet = this.runtime.step(this.lastBroadcastState);
     this.lastBroadcastState = this.runtime.cloneState();
 
-    /* 单通道:只发自研 delta。 */
-    if (packet.length > 0) this.broadcast('delta', packet);
+    /* 单通道:只发自研 delta —— ★ WS-FND-162(P1):按**席位**裁剪收件人
+       (判据与理由见 `deltaExclusions`)。 */
+    if (packet.length > 0) {
+      const except = deltaExclusions(
+        this.clients,
+        (c) => this.seatKeyOf(c),
+        (u) => this.runtime.isSeated(u),
+      );
+      /* 没人被裁时走**原来那一行裸广播**(常规路径不替 Colyseus 的 `except: []`
+         语义背书 —— 那条语义要有自己的判据才用)。 */
+      if (except.length === 0) this.broadcast('delta', packet);
+      else this.broadcast('delta', packet, { except });
+    }
 
     /* Schema 始终与权威状态保持同步 —— 这一步**无条件执行**。
      *
@@ -620,16 +723,18 @@ export class NetPersistRoom extends Room<RoomSchema> {
 
     const violations = this.runtime.drainViolations();
     if (violations.length > 0) {
-      for (const v of violations) {
-        this.runtime.db?.insert('room_events', {
-          id: Date.now() * 1000 + Math.floor(Math.random() * 1000),
-          room_id: this.runtime.id,
-          tick: v.tick,
-          kind: `AC_${v.kind}`,
-          actor_id: v.playerId,
-          payload_json: JSON.stringify({ detail: v.detail, weight: v.weight }),
-          created_at: v.tick,
-        });
+      /* ★ WS-FND-159:生产插入点也走仓储层的 `writeEvent`,不再裸 `insert`。
+         裸 insert 的 id 是 `Date.now() * 1000 + rand`:
+           * 同毫秒 >1000 条就**撞主键**(作弊客户端刷得出来);
+           * 而且它绕过 `trimEvents` ⇒ `room_events` 永不清理(审计 P1)。
+         `nowMs` 传 `v.tick`,与改前的 `created_at: v.tick` 逐字一致;
+         `db` 为 null(未装配持久层)时与改前一样:流水只活在内存里。 */
+      const db = this.runtime.db;
+      if (db) {
+        for (const v of violations) {
+          writeEvent(db, this.runtime.id, v.tick, `AC_${v.kind}`, v.playerId,
+            { detail: v.detail, weight: v.weight }, v.tick);
+        }
       }
     }
   }

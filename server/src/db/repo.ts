@@ -38,6 +38,14 @@ export interface KeyParts {
   [column: string]: string | number;
 }
 
+/**
+ * `select` 的排序子句(列名走驱动侧白名单,方向只有两个取值 ⇒ 不构成注入面)。
+ */
+export interface OrderBy {
+  column: string;
+  dir: 'asc' | 'desc';
+}
+
 export interface DbLike {
   /** 执行 DDL / PRAGMA 批。允许语句以 `;` 分隔。 */
   exec(sql: string): void;
@@ -45,7 +53,14 @@ export interface DbLike {
   update(table: string, key: KeyParts, patch: Row): number;
   delete(table: string, key: KeyParts): number;
   get(table: string, key: KeyParts): Row | undefined;
-  select(table: string, where?: KeyParts): Row[];
+  /**
+   * 按等值条件取行。
+   *
+   * `limit` / `orderBy` 是**可选**的读取上界(后加的参数,老实现不必改):
+   * 「只读最近 N 行」必须能下推到引擎,否则每次读取都会把整个表物化成 JS 行。
+   * `room_events` 的流水读取(`listEvents`)与有界保留(`trimEvents`)靠它落地。
+   */
+  select(table: string, where?: KeyParts, limit?: number, orderBy?: OrderBy): Row[];
   /** 行数;省略 table 时返回全库行数,供断言使用。 */
   count(table?: string): number;
   transaction<T>(fn: () => T): T;
@@ -66,6 +81,11 @@ export const TABLE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
      登记在这里的唯一目的是让 `driver.sqlite.ts` 的表名白名单认得它 ——
      白名单是从本常量表派生的,不登记就写不进真库。 */
   room_world_archives: ['id'],
+  /* ★ WS-FND-156 起始背包发放台账(独立 DDL 文件 `schema_starting_inventory.sql`,
+     见 §14)。登记在这里的唯一目的与归档表相同:`driver.sqlite.ts` 的表名白名单
+     由本常量表派生,不登记就写不进真库。主键 = `user_id` ⇒ 「一个玩家一行」
+     由库层唯一约束保证(并发占位的抓手)。 */
+  user_starting_inventory: ['user_id'],
 };
 
 /* ═══════════════════════════ 2. DDL 载入与迁移 ═══════════════════════════ */
@@ -112,7 +132,11 @@ export const MIGRATION_BASELINE_NAME = 'ws07_baseline_net_persist';
  * 顶层常量在这里读它会踩 TDZ(`export const` 的初始化顺序按文件顺序)。
  */
 export function knownMigrationVersions(): number[] {
-  return [MIGRATION_BASELINE_VERSION, WORLD_ARCHIVE_MIGRATION_VERSION];
+  return [
+    MIGRATION_BASELINE_VERSION,
+    WORLD_ARCHIVE_MIGRATION_VERSION,
+    STARTING_INVENTORY_MIGRATION_VERSION,
+  ];
 }
 
 /**
@@ -828,6 +852,35 @@ export function totalItemsOf(db: DbLike, ownerId: string): number {
 
 /* ═══════════════════════════ 10. room_events ═══════════════════════════ */
 
+/* ── 有界保留:按条数封顶(AUDIT P1)────────────────────────────────────────
+
+   事实:改前全仓对 `room_events` **没有任何 DELETE**,而生产插入点是
+   `room.colyseus.ts:624`(每帧把 `drainViolations()` 逐条落库)。正常玩法近似
+   0 条/小时,但作弊客户端能刷出数千条/小时 ⇒ 库文件**单调涨**、永不回收。
+
+   为什么按**条数**而不是按天数封顶:
+     天数封顶在高写入率下照样无界(1000 条/小时 × 7 天 = 17 万条,全都落在
+     窗口内),只有条数封顶与「库不会涨」直接等价。天数是第二条防线,等有真实
+     留存需求时再加。
+
+   两个水位(不是一个)是为了**摊平成本**:超上限才动手,且一次删到 LOW_WATER
+   ⇒ 每 (MAX - LOW_WATER) 次写入才真删一次,而不是每条写入都删一次。 */
+export const ROOM_EVENT_RETAIN_MAX = 4096;
+export const ROOM_EVENT_RETAIN_LOW_WATER = 3072;
+
+/* `listEvents` 的读取上界(AUDIT P1)。
+
+   改前:`db.select('room_events', {room_id})` 把该房间**全部**行取回 JS 再排序
+   裁剪 —— 房间历史多长就读多少行。现在库里按 `tick DESC` 取固定窗口
+   (走 `idx_room_events_room_tick`,该索引正是为「房间审计回放:按 room + tick
+   倒序」建的),再在调用侧精确排序裁剪。
+     * LIST_MAX       = 调用方能要到的上限(挡住无界查询从 API 面溜进来);
+     * LIST_OVERFETCH = 过取倍率:窗口边界上可能有同 tick 的行,多取一点再裁。 */
+export const ROOM_EVENT_LIST_MAX = 500;
+export const ROOM_EVENT_LIST_OVERFETCH = 4;
+/** `listEvents` 单次从库里最多读多少行(过取后的硬上限)。 */
+export const ROOM_EVENT_LIST_FETCH_MAX = 2000;
+
 /* `room_events.id` 的取号重试计数。
  *
  * **为什么要有这个计数器**:取号重试是一种「兜底」,而兜底会**掩盖**缺陷 ——
@@ -847,12 +900,24 @@ export function resetEventIdRetryCount(): void {
   eventIdRetries = 0;
 }
 
-/** 与 `TABLE_PRIMARY_KEYS.room_events` 一致的主键列。 */
+/** 与 `TABLE_PRIMARY_KEYS.room_events` 一致的主键列。
+ *
+ * 取号 = **全表最大 id + 1**,只读一行(AUDIT P2):`room_events.id` 是
+ * `INTEGER PRIMARY KEY AUTOINCREMENT` ⇒ `ORDER BY id DESC LIMIT 1` 落在主键索引
+ * 上、不物化整表。改前是 `db.select('room_events')` 把整表取回 JS 求 max = O(N)
+ * —— 现在生产插入点还没接上所以不热,接上后就是热点。
+ * trim 只删**最小**的 id ⇒ max 单调不减 ⇒ `maxId + 1` 不会重用已删的 id。 */
 function nextEventId(db: DbLike): number {
-  const rows = db.select('room_events');
-  let maxId = 0;
-  for (const r of rows) maxId = Math.max(maxId, Number(r.id) || 0);
-  return maxId + 1;
+  const newest = db.select('room_events', undefined, 1, { column: 'id', dir: 'desc' })[0];
+  return (Number(newest?.id) || 0) + 1;
+}
+
+/** 一次事件写入的可观测结果(`trimmed` 报数让「有没有真的封顶」可断言)。 */
+export interface EventWriteReport {
+  /** 实际写入的行 id。 */
+  id: number;
+  /** 本次写入触发的 trim 删掉的行数(未超上限 ⇒ 0)。 */
+  trimmed: number;
 }
 
 export function writeEvent(
@@ -863,7 +928,7 @@ export function writeEvent(
   actorId: string | null,
   payload: unknown,
   nowMs: number,
-): void {
+): EventWriteReport {
   /* ⚠️ `room_events.id` 是**全表**自增主键,不是「每房间一套」。
      这里曾经只查 `{room_id: roomId}` 的 maxId,于是:
        房间 A 写了一条事件(id=1)→ 给房间 B 写第一条事件时
@@ -880,6 +945,7 @@ export function writeEvent(
     payload_json: JSON.stringify(payload ?? {}),
     created_at: nowMs,
   };
+  let id = row.id;
   try {
     db.insert('room_events', row);
   } catch (e) {
@@ -888,15 +954,55 @@ export function writeEvent(
     const msg = (e as Error).message;
     if (!/主键冲突|UNIQUE constraint failed/.test(msg)) throw e;
     eventIdRetries += 1;
-    db.insert('room_events', { ...row, id: nextEventId(db) });
+    id = nextEventId(db);
+    db.insert('room_events', { ...row, id });
   }
+  /* ★ 有界保留挂在**写入路径**上:当前宿主没有周期任务,这里是唯一的 trim
+     触发点。将来接入周期任务时同时调 `trimEvents`(幂等,重复无害)。 */
+  const trimmed = trimEvents(db);
+  return { id, trimmed };
 }
 
+/**
+ * 有界保留:把 `room_events` 从 `ROOM_EVENT_RETAIN_MAX` 削到
+ * `ROOM_EVENT_RETAIN_LOW_WATER`,返回删除的行数。
+ *
+ * **幂等**:未超上限 ⇒ 立刻返回 0 且一行不动(判据是「表规模」而不是
+ * 「调用次数」,所以重复调用与一次调用等价)。
+ *
+ * 删的是 **id 最小**的一批(入库顺序 ⇒ 最旧):`ORDER BY id ASC LIMIT n` 取出
+ * 这批 id 再逐行删 —— `DbLike` 只有「按主键删除」这一种写面(没有范围删),故
+ * 代价 = 一次有序窗口读 + k 条 `DELETE`。整段包在一个事务里:删到一半崩掉会让
+ * 「表规模 ≤ 上限」这个不变量说不清(半截状态既不是旧规模也不是新规模)。
+ */
+export function trimEvents(db: DbLike): number {
+  const total = db.count('room_events');
+  if (total <= ROOM_EVENT_RETAIN_MAX) return 0;
+  /* `COUNT(*)` 由引擎计数,不物化行;真正贵的是下面那次「取最旧的 k 行」。 */
+  const victims = Math.max(0, total - ROOM_EVENT_RETAIN_LOW_WATER);
+  const oldest = db.select('room_events', undefined, victims, { column: 'id', dir: 'asc' });
+  return db.transaction(() => {
+    let removed = 0;
+    for (const r of oldest) removed += db.delete('room_events', { id: Number(r.id) });
+    return removed;
+  });
+}
+
+/**
+ * 房间审计回放:按 `tick` 倒序取最近 `limit` 条。
+ *
+ * 「返回多少条」与「从库里读多少行」是两件事,后者才与库规模相关:`limit` 先夹
+ * 到 `ROOM_EVENT_LIST_MAX` 以内,再乘过取倍率,并封在 `ROOM_EVENT_LIST_FETCH_MAX`
+ * 之下;精确排序仍在调用侧做(三个后端同一口径)。
+ */
 export function listEvents(db: DbLike, roomId: string, limit = 50): Row[] {
-  return db.select('room_events', { room_id: roomId })
+  const want = Math.max(0, Math.min(Math.trunc(limit) || 0, ROOM_EVENT_LIST_MAX));
+  if (want === 0) return [];
+  const fetch = Math.min(ROOM_EVENT_LIST_FETCH_MAX, want * ROOM_EVENT_LIST_OVERFETCH);
+  return db.select('room_events', { room_id: roomId }, fetch, { column: 'tick', dir: 'desc' })
     .slice()
     .sort((a, b) => Number(b.tick) - Number(a.tick) || Number(b.id) - Number(a.id))
-    .slice(0, limit);
+    .slice(0, want);
 }
 
 /* ═══════════════════════ 11. 存档闭环:HP 与生物 mem 落地 ═══════════════════ */
@@ -1488,6 +1594,289 @@ export function loadWorldArchive(db: DbLike, archiveId: string): WorldArchiveRec
 export function countWorldArchives(db: DbLike, roomId: string): number {
   try {
     return db.select(WORLD_ARCHIVE_TABLE, { room_id: roomId }).length;
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+    throw e;
+  }
+}
+
+/* ═════════ 14. 起始背包发放台账(★ WS-FND-156:跨进程幂等)══════════════
+ *
+ * ## 缺陷形态(修前)
+ *
+ * 「起始背包已发」只有一份**房间实例**的内存账
+ * (`RoomRuntime.startingInventoryGranted:Set<string>`)⇒
+ * ```
+ * 服务重启(或换一个 Room 实例)⇒ 同一个 id 再 join ⇒ 集合是空的 ⇒ **再发一份**
+ * ```
+ * 本节提供**库层真值**:一张 `user_starting_inventory` 台账(主键 = `user_id`)。
+ *
+ * ## 判序(`net/room.ts:grantStartingInventory` 逐条对着写)
+ * ```
+ * 1 读台账(先 `migrateStartingInventory` 确保表在)未领才继续   ← 本节
+ * 2 本房间内存账 / 权威账 / 计划(纯函数)                       ← room.ts
+ * 3 真的发(按件账 + 总量重算)
+ * 4 写台账:`claimStartingInventoryGrant()` = 一次 INSERT,
+ *   主键冲突 ⇒ false ⇒ 调用方**撤回**第 3 步(不留半态)          ← 本节
+ * ```
+ *
+ * ## 为什么是「先发后记 + 冲突即撤回」,而不是「先占位再发」
+ *
+ * 两者都能保证「并发只发一份」;选前者的理由都在本仓的可观测面上:
+ *   * 写台账失败时库与账**同时**回到未发状态(撤回复用既有的
+ *     `RoomRuntime.rollbackStartingInventory`,不新写一份反向逻辑);
+ *   * 后者会在「占位成功但发账抛错」时留下一条**没有对应物品**的台账行 ——
+ *     那个 id 从此**永远**拿不到起始包,而且不报错。
+ *
+ * ## 撤回必须**只删自己占的那条**
+ *
+ * 并发时「我方发起、对方赢了唯一约束」⇒ 我方撤回**不许**删对方的行(否则两人
+ * 争着删,谁都不留)。调用方用 `RoomRuntime.dbGrantClaimed` 记住哪几条台账是
+ * **本进程**写成功的,只删那些。
+ */
+
+/** 台账表名(与 DDL 文件里那张表逐字一致)。 */
+export const STARTING_INVENTORY_TABLE = 'user_starting_inventory';
+
+/** 台账 DDL 的文件产物名。**独立于 `schema.sql`**(理由见该 SQL 的文件头)。 */
+export const STARTING_INVENTORY_SCHEMA_FILE_NAME = 'schema_starting_inventory.sql';
+
+/** 台账迁移在 `schema_migrations` 里的版本号(基线 1 / 归档 2 / 本表 3)。 */
+export const STARTING_INVENTORY_MIGRATION_VERSION = 3;
+export const STARTING_INVENTORY_MIGRATION_NAME = 'ws_fnd156_starting_inventory';
+
+/**
+ * **起始包内容版本号** —— 与冻结表
+ * `shared/constants/starting_inventory.ts#STARTING_INVENTORY` 配套:那张表里
+ * 「发了什么」改了,这个数就该 +1(与成长表同一纪律:改内容要有版本痕迹)。
+ *
+ * ## 版本升高的语义:选**不补发**,并给出理由
+ * ```
+ * 台账里有行(已领过)⇒ 无论当前版本是多少,一律**不再发**
+ * 台账 `version` 只记录「他领的是哪一版」
+ * ```
+ * 三条理由:
+ *   1 起始包是**入场门槛**的一次性礼包(WS-FND-155 的裁定:它不是经济补偿);
+ *      按版本追发会把「一次性」悄悄变成「按版本记一笔」—— 那是新玩法,需要
+ *      owner 裁决,不是一条 DDL 的副作用;
+ *   2 补发**没有可靠的动作面**:入场是唯一调用点(`room.ts` 的 `join` 两处),
+ *      而入场次数与版本数无关 ⇒ 在入场里补发等于「谁重进谁先拿到」;
+ *   3 但**证据必须留下来**:所以 `version` 落库(而不是只存 0/1)。将来真要补发,
+ *      「谁领的是 v1、现在发到 v3」这个查询有原料,不必重建历史。
+ *
+ * ⚠️ 它在本模块而不是 `shared/constants/starting_inventory.ts` 的原因:冻结层是
+ * 另一条写域(本轮写域不含 `shared/**`)⇒ 暂放在本文件,而**口径上它属于那张表**
+ * (将来真要搬,连这段注释一起搬,别只搬常量)。
+ */
+export const STARTING_INVENTORY_VERSION = 1;
+
+/** 台账 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
+export function startingInventorySqlPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), STARTING_INVENTORY_SCHEMA_FILE_NAME);
+}
+
+export function readStartingInventorySql(path: string = startingInventorySqlPath()): string {
+  return readFileSync(path, 'utf8');
+}
+
+export interface StartingInventoryMigrateResult {
+  applied: boolean;
+  version: number;
+  checksum: string;
+  /** 已存在同版本但 checksum 不一致 = 漂移(调用方决定是否 fail-closed)。 */
+  drift: boolean;
+}
+
+/**
+ * 建台账表 + 登记迁移版本。**幂等**(DDL 全是 `CREATE TABLE IF NOT EXISTS`)。
+ *
+ * ## 与 `migrate()` 的关系(★ 与归档同一条纪律)
+ * `migrate()` 仍然只建 `schema.sql` 那 9 张表;本函数是**第三段**迁移。
+ * 之所以不并进 `migrate()`:`migrate()` 后 `tableNames().length === 9` 被四处
+ * 既有判据锁着(`tests/WS-07.test.ts:213/501`、`scripts/verify.ts:6776`),
+ * 在**全新库**上建第 10 张表会当场把它们打红 —— 那不是本次改动的判据。
+ * 于是与 `room_world_archives` 同一处置:**第一次用到的库**才建它。
+ *
+ * ## 判序:`exec` 必须在版本判定**之后**
+ * 「先读版本 → 护栏 → 漂移 → 才 exec DDL」(审计 P1,见 `migrate()` 的长注释)。
+ * 旧库缺这张表时本函数**就地补表**,既有表与既有行一个都不动 —— 这就是
+ * 「兼容既有库」的实现,不是重建。
+ */
+export function migrateStartingInventory(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): StartingInventoryMigrateResult {
+  const ddl = readStartingInventorySql(ddlPath);
+  const checksum = checksumOf(ddl);
+  const rows = readMigrationRows(db);
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find(
+    (r) => Number((r as MigrationRow).version) === STARTING_INVENTORY_MIGRATION_VERSION,
+  ) as MigrationRow | undefined;
+  if (existing && existing.checksum !== checksum) {
+    return { applied: false, version: STARTING_INVENTORY_MIGRATION_VERSION, checksum, drift: true };
+  }
+  db.exec(ddl);
+  if (existing) {
+    return { applied: false, version: STARTING_INVENTORY_MIGRATION_VERSION, checksum, drift: false };
+  }
+  db.insert('schema_migrations', {
+    version: STARTING_INVENTORY_MIGRATION_VERSION,
+    name: STARTING_INVENTORY_MIGRATION_NAME,
+    checksum,
+    applied_at: nowMs,
+  });
+  return { applied: true, version: STARTING_INVENTORY_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/** 这个库里**装过**台账迁移吗(登记行在 ⇒ 装过)。 */
+export function startingInventoryMigrationInstalled(db: DbLike): boolean {
+  const rows = readMigrationRows(db);
+  return rows.some((r) => Number((r as MigrationRow).version) === STARTING_INVENTORY_MIGRATION_VERSION);
+}
+
+/** `migrateStartingInventoryIfInstalled` 的结果(比迁移结果多一个 `installed`)。 */
+export interface StartingInventoryBootCheck extends StartingInventoryMigrateResult {
+  /** `false` = 这个库从没装过台账 ⇒ 本轮**没有**建它(见函数注释)。 */
+  installed: boolean;
+}
+
+/**
+ * **启动检查**:装过台账迁移的库 ⇒ 跑一遍(幂等 DDL + checksum 漂移检测);
+ * 没装过的库 ⇒ 什么都不做(全新库不许在这里多出第 10 张表)。
+ *
+ * 为什么仍要这一道:装过的库里的台账行是「谁已经领过」的**唯一真值**,checksum
+ * 漂移说明「DDL 被改过而库里的表没跟着改」⇒ 必须 fail-closed,不能等到某次入场
+ * 才发现「判据与库结构已经对不上」。
+ */
+export function migrateStartingInventoryIfInstalled(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): StartingInventoryBootCheck {
+  if (!startingInventoryMigrationInstalled(db)) {
+    return {
+      applied: false,
+      version: STARTING_INVENTORY_MIGRATION_VERSION,
+      checksum: '',
+      drift: false,
+      installed: false,
+    };
+  }
+  return { ...migrateStartingInventory(db, nowMs, ddlPath), installed: true };
+}
+
+/** 一行台账 = 一个玩家已领过起始背包。 */
+export interface StartingInventoryGrantRecord {
+  user_id: string;
+  /** 发放**当时**的起始包版本号(`STARTING_INVENTORY_VERSION`)。 */
+  version: number;
+  granted_at: number;
+}
+
+/**
+ * **纯读**:这个 id 领过起始背包吗(领过 ⇒ 那一行;没领过 / 表还没建 ⇒ `undefined`)。
+ *
+ * 与归档的读口同一处置:只有 `no such table` 这一种错误被降级成「没有记录」
+ * (旧库还没跑过本段迁移 —— 那是「未领」,不是故障),其余错误照旧冒泡
+ * (否则一次磁盘/权限故障会被伪装成「没领过」⇒ 重发一份)。
+ */
+export function readStartingInventoryGrant(
+  db: DbLike,
+  userId: string,
+): StartingInventoryGrantRecord | undefined {
+  if (typeof userId !== 'string' || userId.length === 0) return undefined;
+  let row: Row | undefined;
+  try {
+    row = db.get(STARTING_INVENTORY_TABLE, { user_id: userId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return undefined;
+    throw e;
+  }
+  if (!row) return undefined;
+  const version = Number(row.version);
+  return {
+    user_id: String(row.user_id),
+    version: Number.isFinite(version) ? version : 0,
+    granted_at: Number(row.granted_at) || 0,
+  };
+}
+
+/**
+ * **占位**:把「这个 id 已领过起始背包」写进库。
+ *
+ * ## 返回值是判据的一部分
+ * ```
+ * true   这一次**我方**写成功了 ⇒ 调用方保留刚发出去的那一份
+ * false  已经有行(主键冲突)⇒ ★ 另一个房间实例 / 进程 / 上一次进程已经发过
+ *        ⇒ 调用方必须**撤回自己刚发的那一份**(不留半态)
+ * ```
+ * 「有行就返回 false」而不是「有行先查一次再写」:查-写之间就是竞态窗口,而
+ * `INSERT` + 主键唯一约束是**原子**的 —— 「并发两次 join 只发一份」靠的是这一条,
+ * 不是靠调用方的谨慎。
+ *
+ * 漂移 ⇒ **fail-closed 抛错**(调用方撤回已发出的那一份并如实记 `FAILED`):
+ * 台账写不进去时继续发,就等于退化成改前的「每个进程各发一份」。
+ */
+export function claimStartingInventoryGrant(
+  db: DbLike,
+  userId: string,
+  version: number,
+  nowMs: number,
+): boolean {
+  if (typeof userId !== 'string' || userId.length === 0) {
+    throw new Error('起始背包台账需要非空 userId');
+  }
+  if (!Number.isInteger(version) || version < 1) {
+    throw new Error(`起始背包版本号必须是 ≥1 的整数(实得 ${String(version)})`);
+  }
+  if (!Number.isFinite(nowMs)) throw new Error('起始背包台账需要 nowMs(Unix 毫秒)');
+  const migration = migrateStartingInventory(db, nowMs);
+  if (migration.drift) {
+    throw new Error(
+      `起始背包台账迁移 checksum 漂移(schema_migrations.version=${STARTING_INVENTORY_MIGRATION_VERSION}`
+      + ' 的登记与 schema_starting_inventory.sql 对不上)⇒ 拒绝写入(不静默降级):'
+      + '台账是「已发」的唯一真值,结构没判清就写,重启后会变成重发或永不发',
+    );
+  }
+  try {
+    db.insert(STARTING_INVENTORY_TABLE, {
+      user_id: userId,
+      version: Math.trunc(version),
+      granted_at: nowMs,
+    });
+    return true;
+  } catch (e) {
+    /* 两个后端的主键冲突措辞:MemoryDb「xxx 主键冲突:...」/ SQLite
+       「UNIQUE constraint failed: ...」。**只**把这两种当「已领」,其余错误照抛
+       (磁盘故障不能伪装成「别人发过了」)。 */
+    const msg = (e as Error)?.message ?? '';
+    if (/主键冲突|UNIQUE constraint failed/i.test(msg)) return false;
+    throw e;
+  }
+}
+
+/**
+ * **删掉一条台账**(入场失败撤回时用)。
+ *
+ * ⚠️ 调用方**只许删自己写成功的那条**(见 §14 段头)。表还没建 ⇒ 0
+ * (没有行可删,不是故障)。
+ */
+export function releaseStartingInventoryGrant(db: DbLike, userId: string): number {
+  if (typeof userId !== 'string' || userId.length === 0) return 0;
+  try {
+    return db.delete(STARTING_INVENTORY_TABLE, { user_id: userId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+    throw e;
+  }
+}
+
+/** 台账行数(诊断 / 判据的观测口径;表还没建 ⇒ 0)。 */
+export function countStartingInventoryGrants(db: DbLike): number {
+  try {
+    return db.select(STARTING_INVENTORY_TABLE).length;
   } catch (e) {
     if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
     throw e;

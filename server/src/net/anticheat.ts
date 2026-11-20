@@ -1280,12 +1280,18 @@ export class AntiCheatRoom {
    *   · 热路径成本:写槽 O(1),不再每次重建整个数组;
    *   · 内存上界:长度恒 ≤ 512(修前靠每帧 slice 才勉强有界,
    *     而 `attack` / `inventory` 两条路径连 slice 都没有 —— 只 push 不裁)。
+   *
+   * ★ P2(2026-11-21)公平修点:槽里存 `{ seq, v }` 而不是裸 `Violation` ——
+   * 覆写不再**只能**发生在全局最旧槽(见 `pushViolation`),就地覆写会让物理顺序
+   * 不再等于时间顺序,`violations()` 得按 `seq` 重排。
    */
-  private log: Violation[] = [];
-  /** 环形写游标(仅在 `log` 已满后推进)。 */
+  private log: { seq: number; v: Violation }[] = [];
+  /** 环形写游标(仅在 `log` 已满、且走**全局最旧**那条覆写路径时推进)。 */
   private logNext = 0;
   /** 累计写入条数(判断「有没有绕过一圈」的唯一依据)。 */
   private logCount = 0;
+  /** 写入序号(单调;`violations()` 据此恢复时间顺序)。 */
+  private logSeq = 0;
 
   constructor(limits: AntiCheatLimits | unknown = DEFAULT_LIMITS) {
     /* ★ CR-27 修复点:此前是 `this.limits = limits`(不做任何检查)
@@ -1376,20 +1382,84 @@ export class AntiCheatRoom {
    *
    * 为什么必须是**环形**而不是「push 完 `slice(-512)`」:后者把 O(cap) 的重建
    * 压在**每次移动**上,而它要表达的只是「留最近 512 条」。
-   * 环形:未满 ⇒ append;已满 ⇒ 覆写最旧槽并把游标前移。单次 O(1) 且**零分配**。
+   * 环形:未满 ⇒ append;已满 ⇒ 覆写最旧槽。单次 O(1)(份额判断走一条 O(n) 扫描,
+   * 只在**已满**且该玩家**确实刷过头**时才走 —— 见下)。
    *
-   * ⚠️ `logNext` 只在**已满**时有意义 —— `violations()` 靠 `logCount` 判断
-   * 「有没有绕过一圈」,不能只看 `log.length === capacity`(恰好装满但没绕回时,
-   * 从 `logNext === 0` 开始读也刚好是对的,但那时语义是巧合而非保证)。
+   * ⚠️ `logNext` 只在**已满**时、且走「全局最旧」那条覆写路径时才有意义 ——
+   * `violations()` 靠 `logCount` 判断「有没有绕过一圈 / 有没有就地覆写过」,
+   * 不能只看 `log.length === capacity`。
+   *
+   * ══════════ ★ P2(2026-11-21)公平修点 ══════════
+   *
+   * ## 修前形态
+   * 流水是**全房一本**、覆写的**永远**是全局最旧那一条 ⇒ 一个客户端持续触发违规,
+   * 就能把**别人的违规证据**整批挤出窗口:事后看 room_events,只有刷分那个人的,
+   * 被他骚扰/攻击的人一条都没有。而「挤出去」这件事本身**没有任何计数**
+   * (`droppedViolations` 只告诉你丢了多少,不告诉你是谁被挤没了)。
+   *
+   * ## 现在:每人一份**份额**
+   * ```text
+   * share = max(1, floor(容量 / 在场玩家数))
+   * 该玩家已占 ≥ share  ⇒ 覆写**他自己**最旧的那一条(别人的槽一格都不动)
+   * 该玩家已占 <  share  ⇒ 才动全局最旧槽(游标照旧前移)
+   * ```
+   * ⇒ 一个刷分客户端最多挤掉**他自己**早先的证据;**别人的证据只能被他们自己的
+   * 新证据挤掉**。容量上界与「最近 N 条」的口径不变(单人在场时 share = 容量,
+   * 行为与修前逐位相同 —— 既有判据 `WS-FND-137` / `WS-FND-158` 仍是 512/188)。
    */
   private pushViolation(v: Violation): void {
+    this.logSeq += 1;
+    const entry = { seq: this.logSeq, v };
     if (this.log.length < VIOLATION_LOG_CAPACITY) {
-      this.log.push(v);
+      this.log.push(entry);
     } else {
-      this.log[this.logNext] = v;
-      this.logNext = (this.logNext + 1) % VIOLATION_LOG_CAPACITY;
+      const mine = this.countInLog(v.playerId);
+      if (mine >= this.perPlayerShare()) this.overwriteOldestOf(v.playerId, entry);
+      else {
+        this.log[this.logNext] = entry;
+        this.logNext = (this.logNext + 1) % VIOLATION_LOG_CAPACITY;
+      }
     }
     this.logCount += 1;
+  }
+
+  /**
+   * 单名玩家在房间里最多能占几个流水槽 = `floor(容量 / 在场玩家数)`,下限 1。
+   *
+   * 分母取**在场**人数(`states.size`):份额约束的是「同一段时间里同时在触发违规
+   * 的人」;已经离场的人的旧证据本来就该慢慢被挤掉(那不是「挤掉别人的」)。
+   */
+  private perPlayerShare(): number {
+    return Math.max(1, Math.floor(VIOLATION_LOG_CAPACITY / Math.max(1, this.states.size)));
+  }
+
+  /** 某人在当前流水里占了几条(只在**已满**路径上调用)。 */
+  private countInLog(playerId: string): number {
+    let n = 0;
+    for (const e of this.log) if (e.v.playerId === playerId) n += 1;
+    return n;
+  }
+
+  /** 就地覆写**该玩家自己**最旧的那一条(别人的槽不动;`logNext` 也不动)。 */
+  private overwriteOldestOf(playerId: string, entry: { seq: number; v: Violation }): void {
+    let at = -1;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < this.log.length; i += 1) {
+      const e = this.log[i];
+      if (e.v.playerId !== playerId) continue;
+      if (e.seq < oldest) {
+        oldest = e.seq;
+        at = i;
+      }
+    }
+    if (at < 0) {
+      /* 一条都没有:理论上不可达(调用方刚判过「已占 ≥ 份额」且份额 ≥ 1)——
+         退回全局最旧槽,不许把**新**证据丢了。 */
+      this.log[this.logNext] = entry;
+      this.logNext = (this.logNext + 1) % VIOLATION_LOG_CAPACITY;
+      return;
+    }
+    this.log[at] = entry;
   }
 
   /**
@@ -1455,17 +1525,18 @@ export class AntiCheatRoom {
    */
   violations(): readonly Violation[] {
     const n = this.log.length;
-    /* 还没绕回:物理顺序就是时间顺序。 */
-    if (this.logCount <= n) return this.log.slice(0, n);
-    const out: Violation[] = [];
-    for (let i = 0; i < n; i += 1) out.push(this.log[(this.logNext + i) % n]);
-    return out;
+    /* 还没绕过一圈、也没有就地覆写过:物理顺序就是时间顺序。 */
+    if (this.logCount <= n) return this.log.map((e) => e.v);
+    /* ★ P2(2026-11-21):绕回之后物理顺序本来就没有意义;公平修点还会**就地**
+       覆写中间槽(把某个人的旧证据换成他的新证据)⇒ 一律按写入序号重排,
+       读侧「最早在前」的契约不变。 */
+    return [...this.log].sort((a, b) => a.seq - b.seq).map((e) => e.v);
   }
 
   /** 按 kind 计数(**只读诊断路径**,不在每帧热路径上)。 */
   countByKind(kind: ViolationKind): number {
     let n = 0;
-    for (const v of this.log) if (v.kind === kind) n += 1;
+    for (const e of this.log) if (e.v.kind === kind) n += 1;
     return n;
   }
 

@@ -253,7 +253,7 @@ const IDENT_ALL = /[A-Za-z_$][A-Za-z0-9_$]*/g;
 /* ═══════════════════ 2 枚举导出(Barrel 只解析一层)═══════════════════ */
 
 interface Decl { name: string; kind: ExportKind }
-interface ReExport { name: string; spec: string; kind: ExportKind }
+interface ReExport { name: string; spec: string; kind: ExportKind; explicitType: boolean }
 interface FileDecls { rel: string; locals: Decl[]; reexports: ReExport[]; stars: string[] }
 
 /** 声明前的修饰词(`export default function f` 里 `default` 要跳过)。 */
@@ -332,6 +332,8 @@ export function parseExportDecls(rel: string, src: string): FileDecls {
       const spec = specAfter(src, code, view.literals, close + 1);
       const items = body.split(',').map((x) => x.trim()).filter((x) => x !== '');
       for (const item of items) {
+        /* 逐项 `type` 修饰(`export { type A, b }`):该项是**类型位**,不是 value。 */
+        const explicitType = /^type\s+/.test(item);
         const cleaned = item.replace(/^type\s+/, '');
         const parts = cleaned.split(/\s+as\s+/);
         const name = parts[parts.length - 1].trim();
@@ -340,7 +342,8 @@ export function parseExportDecls(rel: string, src: string): FileDecls {
           /* 没有 from ⇒ 把本文件已声明的名字再导出一次(别名):不新增条目,只登记别名 */
           continue;
         }
-        out.reexports.push({ name, spec, kind: namedKind });
+        const kind: ExportKind = explicitType || namedKind === 'type' ? 'type' : 'value';
+        out.reexports.push({ name, spec, kind, explicitType });
       }
       continue;
     }
@@ -356,7 +359,7 @@ export function parseExportDecls(rel: string, src: string): FileDecls {
       }
       const spec = specAfter(src, code, view.literals, q);
       if (spec === null) continue;
-      if (alias !== null) out.reexports.push({ name: alias, spec, kind: 'value' });
+      if (alias !== null) out.reexports.push({ name: alias, spec, kind: 'value', explicitType: false });
       else out.stars.push(spec);
       continue;
     }
@@ -593,10 +596,11 @@ export function buildMatrix(opts: BuildOptions): MatrixReport {
 
   /* 6.1 先登记**本文件声明**的导出(唯一的"真身") */
   const entries = new Map<string, ExportEntry>();
-  const push = (file: string, name: string, kind: ExportKind): void => {
+  const push = (file: string, name: string, kind: ExportKind, explicitType = false): void => {
     const key = `${file}::${name}`;
     const old = entries.get(key);
-    if (old !== undefined) { if (kind === 'value') old.kind = 'value'; return; }
+    /* 「value 覆盖」只在**非显式 type** 时才升级:显式 `type` 项的 kind 就是 type,不能把类型位摊成 value。 */
+    if (old !== undefined) { if (kind === 'value' && !explicitType) old.kind = 'value'; return; }
     entries.set(key, { file, name, kind, tier: 'none', prodRefs: 0, evidence: [] });
   };
   for (const rel of srcFiles) {
@@ -627,7 +631,7 @@ export function buildMatrix(opts: BuildOptions): MatrixReport {
       const target = resolveSpec(rel, rx.spec, exists);
       if (target === null) continue; /* 指向仓外/包:不登记(不是 server/src 的导出) */
       const def = throughStars(target, rx.name, 0) ?? target;
-      push(def, rx.name, rx.kind);
+      push(def, rx.name, rx.kind, rx.explicitType);
     }
   }
 
