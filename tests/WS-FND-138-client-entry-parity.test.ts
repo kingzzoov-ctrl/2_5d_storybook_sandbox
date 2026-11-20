@@ -360,8 +360,13 @@ test('FND138-7 逐动作覆盖 `RoomAction`,并逐条与**真源码**对账(wire
       ok(row.reason.length > 20, `${row.action} 的"为什么没有"必须写清(现在只有一句话的长度)`);
     }
   }
-  eq(wired, 16, '已接线 16 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 4)');
-  eq(missing, 8, '登记"服务端有、客户端零入口"8 条');
+  /* ★ WS-FND-151/153(接线后应改 wired):`SET_PARTY_MODE` 从 `missing` 翻成 `wired`
+     —— 缺的那块 UI(`ui/party_panel.ts` 的选择器 + `net/action_entry.setPartyMode`)
+     已经落地 ⇒ 这里按**实测**记 17/7,而不是继续钉 16/8。
+     (钉旧数的代价不是"数字难看":它会逼着后来者把已接的入口写回 missing,
+      或者把真入口删掉 —— 两种都是把修好的东西退回去。) */
+  eq(wired, 17, '已接线 17 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 4 + 模式面板 1)');
+  eq(missing, 7, '登记"服务端有、客户端零入口"7 条(SET_PARTY_MODE 已于 WS-FND-151 接线)');
   eq(CLIENT_ENTRY_LEDGER.length, actions.length, '台账条数 = RoomAction 键数(两者派生,不写死)');
 
 
@@ -497,7 +502,16 @@ test('FND138-12 不是 RoomAction 的入口缺口也登记了(急单开工 / 分
   eq(clientEntryRow('BUY_ITEM')?.status, ClientEntryStatus.WIRED, '同上(BUY_ITEM)');
   eq(clientEntryRow('USE_ALCHEMY_FURNACE')?.status, ClientEntryStatus.WIRED, '同上(USE_ALCHEMY_FURNACE)');
   eq(clientEntryRow('PLACE_AUTOMATION')?.status, ClientEntryStatus.WIRED, '同上(PLACE_AUTOMATION)');
-  eq(clientEntryRow('SET_PARTY_MODE')?.status, ClientEntryStatus.MISSING, '对照:管理类动作仍是 missing(本轮没偷接)');
+  /* ★ 接线后应改 wired:`SET_PARTY_MODE` 缺的那块 UI(模式选择器)在 WS-FND-151 落地
+     ⇒ 台账里它是 `wired`(`clientEntryWitnessOf` 有见证片段)。旧判据钉的是
+     `MISSING`("本轮没偷接"),它描述的是**修前**的状态:继续钉就会要求把真入口写回
+     missing,等于让判据反过来禁止修复。剩下的管理类动作仍必须 missing(下面两条)。 */
+  eq(clientEntryRow('SET_PARTY_MODE')?.status, ClientEntryStatus.WIRED,
+    '★ 模式面板已接 ⇒ 台账必须是 wired(旧判据钉 missing,是"修前"的期望)');
+  eq(clientEntryRow('SET_ROOM_ACCESS')?.status, ClientEntryStatus.MISSING,
+    '对照:没接的管理类动作仍是 missing(SET_ROOM_ACCESS —— 没偷接,也不许自认已接)');
+  eq(clientEntryRow('WIRE_EDIT')?.status, ClientEntryStatus.MISSING,
+    '对照同上(WIRE_EDIT):缺的是服务端下发的线框数据,不是一行转发');
   eq(clientEntryRow('没有这个动作'), null, '负对照:未登记的动作返回 null(判据据此发现"没裁决")');
 });
 

@@ -32,8 +32,10 @@ import {
   layoutBossHudBand,
   layoutEaselPanel,
   layoutInventoryPanel,
+  layoutPartyPanel,
   layoutPitchPanel,
   paletteRect,
+  partyRowRect,
   rectVisible,
   slotRect,
 } from '../ui/panel_layout.ts';
@@ -53,6 +55,10 @@ import {
   layoutHpBar,
 } from '../ui/boss_hud.ts';
 import type { PartyHudView } from '../ui/party_hud.ts';
+/* ★ WS-FND-151:模式选择面板的**数据**(纯逻辑)与急行条件清单(三态)。
+   本层只按矩形画字 —— 不在绘制层算"当前是哪档 / 哪几条满足"。 */
+import type { PartyPanelView } from '../ui/party_panel.ts';
+import type { RushReadinessView } from '../ui/rush_readiness.ts';
 import { EASEL_SIZE, type PixelEasel, PALETTE_SIZE, paletteColor, paletteLabel } from '../ui/pixel_easel.ts';
 import { type PitchInfo, PITCH_TABLE } from '../audio.ts';
 import { ATLAS_CELL, ATLAS_COLS, cellIndexFromId } from '../stage/assembly_math.ts';
@@ -66,6 +72,13 @@ export type UiHit =
   | { kind: 'easel'; x: number; y: number }
   | { kind: 'palette'; index: number }
   | { kind: 'brick'; pitch: number }
+  /**
+   * ★ WS-FND-151:点了模式面板的某一行。
+   *
+   * `mode` 是**线上下标(1 起)**;谁来发报文由 `boot.ts` 决定(它持有选择器与报文口),
+   * 本层只回答"点中了哪一档"。
+   */
+  | { kind: 'partyMode'; mode: number }
   | { kind: 'toolbar'; action: 'undo' | 'redo' | 'clear' }
   | { kind: 'none' };
 
@@ -116,6 +129,22 @@ export interface UiDrawState {
    *   ⇒ 派对进行中屏幕上没有任何提示。`text` 为空串表示没在派对,不画。
    */
   party: PartyHudView;
+  /**
+   * ★ WS-FND-151:模式选择面板(`ui/party_panel.partyPanelOf` 的产物)。
+   *
+   * `panel === 'PARTY'` 时才画;内容全部来自它 —— 本层不自己数模式有几档
+   * (档数来自冻结层 `PARTY_MODES`,面板与词表因此不可能对不上)。
+   */
+  partyPanel: PartyPanelView;
+  /** 最近一次选中模式的结果(空串 = 还没选过;来自入口的 `status`,不是本地编的话) */
+  partyModeNote: string;
+  /**
+   * ★ WS-FND-151:急行开工条件清单(三态)。
+   *
+   * 数据来自权威状态;拿不到就报 `unknown` —— **不假装 0**(假装会让玩家
+   * 反复去拆/重建一个其实早就满足的条件)。
+   */
+  rush: RushReadinessView;
   /** 预警圈提示文本(空串 = 不画) */
   telegraphNote: string;
   /**
@@ -257,6 +286,7 @@ export class UiOverlay {
     if (s.panel === 'RECIPE_TREE' && s.recipe) this.drawRecipe(s, a);
     if (s.panel === 'PIXEL_EASEL') this.drawEasel(s, a);
     if (s.panel === 'PITCH_EDITOR') this.drawPitch(s, a);
+    if (s.panel === 'PARTY') this.drawParty(s, a);
     this.drawBoss(s, a);
     this.drawNotes(s, a);
   }
@@ -532,6 +562,59 @@ export class UiOverlay {
     ctx.restore();
   }
 
+  /**
+   * ★ WS-FND-151:派对**模式选择面板**。
+   *
+   * 内容全部来自 `partyPanelOf()`(纯逻辑、可单测):档位、名字、规则、当前档、
+   * 光标全在那边算好;本层只做 `fillRect` / `fillText`
+   * —— 在绘制层再数一次"第几档"就是第二份实现,而它会与词表漂。
+   */
+  private drawParty(s: UiDrawState, a: number): void {
+    const ctx = this.ctx;
+    const p = s.partyPanel;
+    const L = layoutPartyPanel(this.w, this.h, p.rows.length);
+    fillPanel(ctx, L.panel, a);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.textBaseline = 'top';
+    ctx.font = `13px ${MONO}`;
+    ctx.fillStyle = C.title;
+    ctx.fillText('派对模式(选定后立刻发 SET_PARTY_MODE,影响全房)', L.title.x, L.title.y + 6);
+    /* 当前档:来自权威 `meta.partyMode`;没选时用警示色说出来(否则玩家以为已选) */
+    ctx.font = `11px ${MONO}`;
+    ctx.fillStyle = p.currentName === null ? C.bad : C.ok;
+    ctx.fillText(p.currentText, L.title.x + L.title.w - ctx.measureText(p.currentText).width, L.title.y + 9);
+
+    for (let i = 0; i < L.visibleRows; i += 1) {
+      const r = partyRowRect(L, i);
+      const row = p.rows[i];
+      if (r === null || row === undefined) continue;
+      ctx.fillStyle = row.cursor ? 'rgba(255,220,140,.16)' : C.cellBg;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = row.cursor ? C.hot : (row.current ? C.ok : C.cellEdge);
+      ctx.lineWidth = row.cursor ? 2 : 1;
+      ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+      ctx.font = `12px ${MONO}`;
+      ctx.fillStyle = row.current ? C.ok : C.title;
+      ctx.fillText(
+        `${row.mode}. ${row.name}  ${row.players}  ${row.current ? '● 当前' : '○ 可选'}`,
+        r.x + 8, r.y + 5,
+      );
+      ctx.font = `10px ${MONO}`;
+      ctx.fillStyle = C.dim;
+      ctx.fillText(row.rule, r.x + 8, r.y + 25);
+    }
+
+    ctx.font = `11px ${MONO}`;
+    ctx.fillStyle = s.partyModeNote === '' ? C.dim : C.ok;
+    const scroll = L.scrollable ? `(还有 ${p.rows.length - L.visibleRows} 档没画下:窗口太矮)` : '';
+    ctx.fillText(
+      `${p.hint}${scroll === '' ? '' : `  ·  ${scroll}`}${s.partyModeNote === '' ? '' : `  ·  ${s.partyModeNote}`}`,
+      L.footer.x, L.footer.y + 5,
+    );
+    ctx.restore();
+  }
+
   private drawBoss(s: UiDrawState, a: number): void {
     if (!s.boss) return;
     const ctx = this.ctx;
@@ -592,6 +675,7 @@ export class UiOverlay {
         ctx.fillStyle = dangerColor(0.85);
         roundRect(ctx, box, 6);
         ctx.fill();
+
         ctx.fillStyle = '#22110f';
         ctx.fillText(s.telegraphNote, box.x + 10, box.y + 6);
       }
@@ -645,6 +729,37 @@ export class UiOverlay {
         }
       }
     }
+    /* ── ★ WS-FND-151:急行开工条件清单(三项,三态)──
+       世界侧自动开工(食堂 + 三工位 + 站格),客户端只**如实报**这三条:
+       `✓` 已知满足 / `✗` 已知不满足 / `?` **拿不到权威值**。
+       未知单独计数,不并进"没满足" —— 假装 0 会让玩家反复拆了重建。 */
+    if (s.rush.total > 0) {
+      const w = 380;
+      const h = 22 + s.rush.total * 15 + (s.rush.note === '' ? 0 : 14);
+      const box: PanelRect = { x: 16, y: this.h - h - 44, w, h };
+      if (rectVisible(box, this.w, this.h)) {
+        ctx.fillStyle = 'rgba(20,26,42,.78)';
+        roundRect(ctx, box, 6);
+        ctx.fill();
+        ctx.strokeStyle = C.cellEdge;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.font = `11px ${MONO}`;
+        ctx.fillStyle = C.title;
+        ctx.fillText(s.rush.text, box.x + 8, box.y + 5);
+        let y = box.y + 22;
+        for (const r of s.rush.rows) {
+          ctx.font = `10px ${MONO}`;
+          ctx.fillStyle = r.state === 'met' ? C.ok : (r.state === 'unmet' ? C.bad : C.dim);
+          ctx.fillText(r.text, box.x + 8, y);
+          y += 15;
+        }
+        if (s.rush.note !== '') {
+          ctx.fillStyle = C.dim;
+          ctx.fillText(s.rush.note, box.x + 8, y);
+        }
+      }
+    }
     /* 组合键提示条 */
     ctx.fillStyle = C.dim;
     ctx.font = `11px ${MONO}`;
@@ -661,7 +776,18 @@ export class UiOverlay {
    * 背包用 `lastInvLayout`(绘制时存的同一份布局)而不是重算 —— 两处各算一次
    * 会在视口变化时产生「看起来在这、点上去在那」的错位。
    */
-  hit(s: { panel: UiPanel; view: InventoryView; activeCategory: string | null; easel: PixelEasel }, px: number, py: number): UiHit {
+  hit(
+    s: {
+      panel: UiPanel;
+      view: InventoryView;
+      activeCategory: string | null;
+      easel: PixelEasel;
+      /* ★ WS-FND-151:模式面板的命中要用它的行数(行矩形来自 `layoutPartyPanel`) */
+      partyPanel: PartyPanelView;
+    },
+    px: number,
+    py: number,
+  ): UiHit {
     const inRect = (r: PanelRect): boolean => px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
 
     if (s.panel === 'INVENTORY' || s.panel === 'RECIPE_TREE') {
@@ -716,6 +842,18 @@ export class UiOverlay {
         if (inRect(b)) {
           const idx = this.pitch.bricks.indexOf(b);
           return { kind: 'brick', pitch: idx };
+        }
+      }
+      return { kind: 'none' };
+    }
+    if (s.panel === 'PARTY') {
+      const L = layoutPartyPanel(this.w, this.h, s.partyPanel.rows.length);
+      if (!inRect(L.panel)) return { kind: 'none' };
+      for (let i = 0; i < L.rows.length; i += 1) {
+        const r = L.rows[i]!;
+        if (inRect(r)) {
+          const row = s.partyPanel.rows[i];
+          return row === undefined ? { kind: 'none' } : { kind: 'partyMode', mode: row.mode };
         }
       }
       return { kind: 'none' };

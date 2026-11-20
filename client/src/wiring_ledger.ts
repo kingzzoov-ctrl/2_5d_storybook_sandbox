@@ -472,10 +472,16 @@ export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
       + '而客户端**没有任何房间管理 UI** ⇒ 裸键 = 一次误触改掉全房访问。',
   },
   {
-    action: 'SET_PARTY_MODE', serverPath: 'net/room.ts RoomRuntime.setPartyModeBy', entry: 'missing',
-    status: ClientEntryStatus.MISSING,
-    reason: '刻意不提供:`V`(派对开局)只把**房间已选**的模式开成一局、它不设模式;'
-      + '四选一要选择器 + 权限位,而它影响全房(含正在跑的那一局)⇒ 不接裸键。',
+    /* ★ WS-FND-151:这一条**从 `missing` 翻成 `wired`** —— 缺的那块 UI 已经补上
+       (`ui/party_panel.ts` 的选择器 + `three/ui_binding.drawParty` 的绘制 +
+       `net/action_entry.setPartyMode` 的报文)。CLIENT_ENTRY_HOLDS 里对应的登记
+       同时删除(`validateClientEntryHolds` 要求"已接线的行不许还留在登记表里")。 */
+    action: 'SET_PARTY_MODE', serverPath: 'net/room.ts RoomRuntime.setPartyModeBy',
+    entry: 'M(模式面板;J/L 选 + Enter 定 / 点面板行)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ WS-FND-151 补:面板列出冻结层 `PARTY_MODES` 全部模式(名字 + 一句话规则),'
+      + '选中即经 `net/action_entry.setPartyMode` 发一条 `{ action, partyMode: <key> }`;'
+      + '权限(OWNER/ADMIN)仍由服务端 `authorize` 判,被拒会回一条带理由的 PERMISSION 回执。',
   },
   {
     action: 'KICK_MEMBER', serverPath: 'net/room.ts RoomRuntime.kick', entry: 'missing',
@@ -574,17 +580,6 @@ export const CLIENT_ENTRY_HOLDS: readonly ClientHoldRow[] = [
     unblock: '房间面板:访问模式单选 + 口令输入 + `effect.mode` 回读 + 权限位显示;'
       + '与 KICK_MEMBER / SET_MEMBER_ROLE 同一件任务(共用成员表)。',
     today: '做不到:口令/容量只能在**建房那一侧**定,客户端内改不了(如实写,不假装)。',
-  },
-  {
-    action: 'SET_PARTY_MODE',
-    kind: ClientHoldKind.DELIBERATE,
-    why: '赛前选模式(四选一)。模式名客户端**有**(`ui/party_hud.ts` 走冻结层 `PARTY_MODES`),'
-      + '所以缺的不是名单而是**选择器 + 权限位**:这个字段影响**全房所有人**(包括正在跑的那一局),'
-      + '而一个裸键只能"轮到下一档"、没有任何确认 ⇒ 一次误触就把赛制改掉。'
-      + '`V`(`START_PARTY`)只把**房间已选**的模式开成一局,它不设模式。',
-    unblock: '派对面板:模式列表(名字来自 `PARTY_MODES`,不手抄)+ 当前档高亮 + 只给 OWNER/ADMIN;'
-      + '与房间面板同一件任务。',
-    today: '只能开**房间已选**的模式(`V`);"选模式"这一格做不到。',
   },
   {
     action: 'KICK_MEMBER',
@@ -730,6 +725,9 @@ export const CLIENT_ENTRY_WITNESS: Readonly<Record<string, string>> = {
   BUY_ITEM: "action: 'BUY_ITEM'",
   USE_ALCHEMY_FURNACE: "action: 'USE_ALCHEMY_FURNACE'",
   PLACE_AUTOMATION: "action: 'PLACE_AUTOMATION'",
+  /* ★ WS-FND-151:设模式(模式面板)。见证片段取**构建器里的动作名** —— 定义行
+     永远存在,等于没有声明"接上了";这里要求的是"真的有一条报文叫这个名字"。 */
+  SET_PARTY_MODE: "action: 'SET_PARTY_MODE'",
 };
 
 /** 某动作的见证片段(`''` = 它应当仍是 `missing`:客户端代码里一次都不该出现) */

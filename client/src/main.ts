@@ -231,6 +231,19 @@ function main(): void {
   /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */
   const detachActionKeys = actionBinding.attachKeyboard(window);
 
+  /* ★ WS-FND-151:模式面板选中某一档 ⇒ 发 `SET_PARTY_MODE`。
+
+     本文件是**装配根**(持有 `session` 与 `actionEntry`),而 `three/boot.ts` 两个
+     都没有 ⇒ 端口在这里注入(与 `setPoseSource` 同一条手法)。选中的档位来自
+     `ui/party_panel.ts`(名字/规则来自冻结层 `PARTY_MODES`),报文由
+     `net/action_entry.setPartyMode` 走**同一条**三支分流(参数不对 / 未连接 / 发)。
+     ⚠️ 不是开局:`V`(`START_PARTY`)仍只开"房间已选"的模式。 */
+  handle.setPartyModeSink((mode: number, key: string): string => {
+    const out = actionEntry.setPartyMode({ partyMode: key });
+    lastAction = out.status;
+    return out.sent ? out.status : `${out.status}(第 ${String(mode)} 档)`;
+  });
+
   if (url !== null) {
     session = createSession({
       url,

@@ -52,6 +52,9 @@ export const UiPanel = {
   BLUEPRINT: 'BLUEPRINT',
   BOSS_HUD: 'BOSS_HUD',
   PITCH_EDITOR: 'PITCH_EDITOR',
+  /* ★ WS-FND-151:派对**模式选择面板**(列表来自冻结层 `PARTY_MODES`)。
+     加它是因为 `SET_PARTY_MODE` 一直是台账里的 `missing`,缺的正是这块 UI。 */
+  PARTY: 'PARTY',
 } as const;
 export type UiPanel = (typeof UiPanel)[keyof typeof UiPanel];
 

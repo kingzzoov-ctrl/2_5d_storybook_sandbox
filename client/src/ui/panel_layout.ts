@@ -437,3 +437,83 @@ export function layoutFitsViewport(l: { panel: PanelRect }, viewportW: number, v
   const p = l.panel;
   return p.x >= 0 && p.y >= 0 && p.x + p.w <= viewportW + 0.5 && p.y + p.h <= viewportH + 0.5;
 }
+
+/* ────────────────────────── 派对模式面板(★ WS-FND-151) ────────────────────────── */
+
+/**
+ * 模式选择面板的几何。
+ *
+ * ## 为什么高度是算出来的而不是写死的
+ * 行数来自冻结层(`PARTY_MODES.length`),宽度要装得下**一句话规则**
+ * (`PARTY_MODES[].note`,最长的一条约 40 个汉字)。而窄屏(360px)装不下 8 行 ——
+ * 于是 `visibleRows` 由**可用高度反算**,面板因此永远落在视口内
+ * (`layoutFitsViewport` 的不变量,判据对 360/1280 两档都断言)。
+ */
+export interface PartyPanelLayout {
+  panel: PanelRect;
+  title: PanelRect;
+  /** 每行高度(行内两行文字:名字 / 规则) */
+  rowH: number;
+  /** 可见行矩形(下标 = 列表行下标,不是滚动偏移) */
+  rows: PanelRect[];
+  /** 底部提示条(键位 + "当前:xxx") */
+  footer: PanelRect;
+  /** 实际可见行数(窄屏会小于总模式数) */
+  visibleRows: number;
+  /** 列表比可见区更长 ⇒ 需要翻页(今天 4 档,桌面恒 `false`) */
+  scrollable: boolean;
+}
+
+/** 面板最大宽度(再宽就与右下角背包面板抢地方了) */
+export const PARTY_PANEL_W = 520;
+/** 一行的高度(名字一行 + 规则一行) */
+export const PARTY_ROW_H = 46;
+/** 底部提示条高度 */
+export const PARTY_FOOTER_H = 22;
+
+export function layoutPartyPanel(
+  viewportW: number,
+  viewportH: number,
+  rowCount: number,
+  maxVisibleRows = 8,
+): PartyPanelLayout {
+  const n = Math.max(0, Math.trunc(Number.isFinite(rowCount) ? rowCount : 0));
+  const availH = viewportH - PANEL_MARGIN * 2 - TITLE_H - PARTY_FOOTER_H;
+  const byH = Math.floor(availH / PARTY_ROW_H);
+  const visibleRows = Math.max(1, Math.min(Math.max(1, maxVisibleRows), Math.max(1, n), Math.max(1, byH)));
+  const w = Math.max(180, Math.min(PARTY_PANEL_W, viewportW - PANEL_MARGIN * 2));
+  const h = TITLE_H + visibleRows * PARTY_ROW_H + PARTY_FOOTER_H + PANEL_MARGIN * 2;
+  /* 居中:它是"做决定"的面板,不该贴在角落(背包在右下、配方在左上)。 */
+  const x = Math.max(0, Math.round((viewportW - w) / 2));
+  const y = Math.max(0, Math.round((viewportH - h) / 2));
+  const rows: PanelRect[] = [];
+  for (let i = 0; i < visibleRows; i += 1) {
+    rows.push({
+      x: x + PANEL_MARGIN,
+      y: y + PANEL_MARGIN + TITLE_H + i * PARTY_ROW_H,
+      w: w - PANEL_MARGIN * 2,
+      h: PARTY_ROW_H,
+    });
+  }
+  return {
+    panel: { x, y, w, h },
+    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: w - PANEL_MARGIN * 2, h: TITLE_H },
+    rowH: PARTY_ROW_H,
+    rows,
+    footer: {
+      x: x + PANEL_MARGIN,
+      y: y + PANEL_MARGIN + TITLE_H + visibleRows * PARTY_ROW_H,
+      w: w - PANEL_MARGIN * 2,
+      h: PARTY_FOOTER_H,
+    },
+    visibleRows,
+    scrollable: n > visibleRows,
+  };
+}
+
+/** 第 `i` 行的矩形;可见区外返回 `null`(调用方跳过,不画到面板外)。 */
+export function partyRowRect(layout: PartyPanelLayout, i: number): PanelRect | null {
+  const k = Math.trunc(Number.isFinite(i) ? i : -1);
+  if (k < 0 || k >= layout.rows.length) return null;
+  return layout.rows[k]!;
+}

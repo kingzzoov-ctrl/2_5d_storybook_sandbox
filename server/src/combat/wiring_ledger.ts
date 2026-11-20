@@ -183,12 +183,15 @@ export const COMBAT_WIRING_LEDGER: readonly CombatWiringRow[] = Object.freeze([
   {
     symbol: 'carrySlots',
     module: 'server/src/combat/progression.ts',
-    status: WIRING_STATUS.UNWIRED,
-    evidence: '\\.carrySlots\\b',
+    status: WIRING_STATUS.WIRED,
+    wiredAt: 'server/src/net/room.ts#carryCapacityOf(容量闸的唯一口径)',
+    evidence: '\\bcarryCapacityOfLevel\\s*\\(|\\bcarrySlotsOf\\b',
     reason:
-      '背包容量槽数。唯一真实的容量闸在 net/room.ts#carryCapacityOf,它**内联**了 8 + (lv-1);'
-      + 'net/** 不在本轮写域,接上去会让「容量由谁说了算」变成两份 ⇒ 待 owner 裁决单一口径。'
-      + '(注意 mobs/taming.ts 的 carrySlots() 是宠物负载槽,同名不同概念,故用 .carrySlots 取证。)',
+      '★ WS-FND-152(owner 裁定「全接」):背包容量槽数此前**无读者** —— 唯一真实的容量闸'
+      + '(`net/room.ts#carryCapacityOf`)内联了同一条算式 `8 + (lv-1)`,于是改档案/改冻结层都不影响房间容量。'
+      + '现在房间侧改调本层的 `carryCapacityOfLevel`(与 `statsAtLevel` 同源),并优先读世界源的'
+      + ' `carrySlotsOf(userId)`(档案字段)。'
+      + '(注意 `mobs/taming.ts` 的 `carrySlots()` 是宠物负载槽,同名不同概念 —— 别混。)',
   },
   {
     symbol: 'ghostDamageMul',

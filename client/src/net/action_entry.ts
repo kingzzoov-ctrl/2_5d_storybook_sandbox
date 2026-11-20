@@ -244,6 +244,18 @@ export interface PlaceAutomationInput {
 }
 
 /**
+ * `SET_PARTY_MODE` 的入参(★ WS-FND-151)。
+ *
+ * `partyMode` 是**冻结层 `PARTY_MODES` 的 key**(`BRIDGE_CTF` 等),不是下标 ——
+ * 服务端 `net/actions/admin.ts:66` 读的就是 `ctx.payload.partyMode` 并原样交给
+ * `setPartyModeBy(actorId, mode: PartyMode)`。
+ */
+export interface SetPartyModeInput {
+  /** 模式 key(非空字符串;合法性由 `ui/party_panel.partyModeIntent` 在选之前拦)。 */
+  partyMode?: unknown;
+}
+
+/**
  * 动作回执的最小形状 —— 与 `net/session.ts` 的 `ActionResultFrame` **结构兼容**
  * (那边多一个 `t`,结构上无妨),但本文件不 import 它:本层零依赖。
  */
@@ -558,6 +570,33 @@ export function placeAutomationRequest(input: PlaceAutomationInput = {}): BuildO
   return { ok: true, request: { action: 'PLACE_AUTOMATION', payload } };
 }
 
+/**
+ * `SET_PARTY_MODE` —— **设模式**(改的是全房"这一局玩什么",不是开局)。
+ *
+ * ## 与 `START_PARTY` 的分工(别弄反)
+ * ```
+ * SET_PARTY_MODE  设模式:写 state.meta.partyMode(影响全房,含正在跑的那局)
+ * START_PARTY     开局   :只把**房间已选**的模式开成一局(`V` 走的是这条)
+ * ```
+ * 服务端两条都有执行层(`server/src/net/actions/start_party.ts` 的文件头逐字写着),
+ * 客户端此前**零入口** —— 缺的不是一行转发,而是 `ui/party_panel.ts` 那块选择器。
+ *
+ * ⚠️ 本层**不核对 key 是否合法**(词表在冻结层,选择器已经拦过):把"非法 key"
+ * 在这里判一遍就是第二份实现,而与冻结层漂了没人会知道。
+ * 权限(OWNER/ADMIN)也**不在这里判** —— 那是服务端 `authorize` 的事,
+ * 被拒时会回一条带理由的 `PERMISSION` 回执。
+ */
+export function setPartyModeRequest(input: SetPartyModeInput = {}): BuildOutcome {
+  const mode = input.partyMode;
+  if (typeof mode !== 'string' || mode.length === 0) {
+    return {
+      ok: false,
+      reason: 'SET_PARTY_MODE 需要 partyMode(冻结层 PARTY_MODES 的模式 key,如 BRIDGE_CTF)',
+    };
+  }
+  return { ok: true, request: { action: 'SET_PARTY_MODE', payload: { partyMode: mode } } };
+}
+
 /* ═══════════════════════════ 4. 回执 → 玩家能读的一句话(纯) ═══════════════════════════ */
 
 /** 动作的**显示名**(只影响文案,不影响协议)。 */
@@ -574,6 +613,8 @@ const LABELS: Readonly<Record<string, string>> = {
   BUY_ITEM: '购买',
   USE_ALCHEMY_FURNACE: '炼金台',
   PLACE_AUTOMATION: '放自动化件',
+  /* ★ WS-FND-151:模式面板选完模式后,回执那一行读作「派对模式 → 已发」/「派对模式 ✗ ...」 */
+  SET_PARTY_MODE: '派对模式',
 };
 
 /** 把载荷压成一小段可读文本(对象/数组跳过 —— 一行 HUD 塞不下嵌套明细)。 */
@@ -707,6 +748,15 @@ export class ActionEntry {
   /** 落一件自动化件(`kind`)/ 播一颗种子(`itemId`)到某一格。 */
   placeAutomation(input: PlaceAutomationInput = {}): EntryOutcome {
     return this.submit(placeAutomationRequest(input));
+  }
+
+  /**
+   * 设派对模式(★ WS-FND-151:选择器在 `ui/party_panel.ts`,本方法只发一条报文)。
+   *
+   * ⚠️ **不是**开局:`START_PARTY` 仍由 `V` 走,那条只开"房间已选"的模式。
+   */
+  setPartyMode(input: SetPartyModeInput = {}): EntryOutcome {
+    return this.submit(setPartyModeRequest(input));
   }
 
   /**

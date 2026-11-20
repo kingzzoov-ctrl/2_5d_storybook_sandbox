@@ -1,16 +1,21 @@
 /**
- * WS-FND-145 —— **客户端入口台账剩下的 8 条**(+ 两条非 `RoomAction` 的缺口)逐条处置。
+ * WS-FND-145 —— **客户端入口台账剩下的管理类动作**(+ 两条非 `RoomAction` 的缺口)逐条处置。
  *
  * ## 修的是什么(第十轮之后的状态)
  *
  * 第十轮补了 `1`/`2`/`3`/`4` 四条入口,`CLIENT_ENTRY_LEDGER` 里**仍有 8 条 `missing`**,
  * 而且它们只有一句理由 —— "服务端有执行层、客户端没有入口"这件事在玩家/后来者眼里
- * 与"这个键坏了"同形。本轮的裁决是**第二个选项**:
+ * 与"这个键坏了"同形。当时的裁决是**第二个选项**:
  * ```
- * 不接裸键(它们都是房间管理类:{SET_ROOM_ACCESS…WIRE_EDIT})
+ * 不接裸键(它们都是房间管理类:{SET_ROOM_ACCESS...WIRE_EDIT})
  * ⇒ 在台账里登记为「服务端已实现、客户端**刻意不提供**」
  *   并写清 why(为什么刻意)/ unblock(解锁它的那一件事)/ today(玩家今天能做到哪一步)
  * ```
+ * ★ 那 8 条里 `SET_PARTY_MODE` **已经接线**(WS-FND-151:模式面板 `M` + J/L/Enter,
+ * `net/action_entry.setPartyMode` 发一条 `{ action, partyMode }`)⇒ 台账里它是 `wired`、
+ * 登记已删,**剩 7 条**仍是「刻意不提供」,本套件逐条钉这 7 条(理由仍需非空:
+ * why / unblock / today 三段)。判据钉的是**当前**事实,不是修前的快照 ——
+ * 钉死"它必须还 missing"会反过来禁止修复。
  * 另外两条不是 `RoomAction` 的缺口(急单 rush 的开局与交付、分拣带的 `lane` 形态)
  * 用同一套口径补齐,而不是留在"只说了缺什么"。
  *
@@ -71,11 +76,22 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
 const read = (rel: string): string => readFileSync(join(ROOT, rel), 'utf8');
 
-/** 本轮逐条处置的 8 条(`RoomAction` 名,**字面量**写死 —— 不拿台账当期望值)。 */
+/**
+ * **仍未接线**的管理类动作(`RoomAction` 名,**字面量**写死 —— 不拿台账当期望值)。
+ *
+ * ★ 接线后应改 wired:`SET_PARTY_MODE` 原本也在这张表里(8 条),WS-FND-151 把缺的
+ *   那块 UI(模式选择器 + `net/action_entry.setPartyMode`)接上之后,它从 `missing`
+ *   翻成 `wired`,对应登记也从 `CLIENT_ENTRY_HOLDS` 删除(自检要求"已接的不许还留
+ *   登记")。继续钉 8 条会逼后来者把真入口退回 missing —— 那是让判据禁止修复。
+ *   `SET_PARTY_MODE` 的**新**位置由下面 `PARTY_MODE_WIRED` 单独钉。
+ */
 const MANAGEMENT_ACTIONS: readonly string[] = [
-  'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
+  'SET_ROOM_ACCESS', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
   'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'WIRE_EDIT',
 ];
+
+/** 本轮**翻成 wired** 的那一条(登记已删;它必须仍逐键在台账里且有见证)。 */
+const PARTY_MODE_WIRED = 'SET_PARTY_MODE';
 
 /** 剥注释(**保留字符串字面量**;口径与 WS-FND-138 一致,`//` 前排除 `:`)。 */
 function stripComments(src: string): string {
@@ -161,9 +177,10 @@ const mk = (sock: FakeSocket, inputs: EntryInputs = HOST_INPUTS) =>
 
 /* ═══════════════════════════ 1 ═══════════════════════════ */
 
-test('FND145-1 8 条 missing 逐条:台账有该条 + 登记有 why/unblock/today(理由非空)', () => {
+test('FND145-1 7 条 missing 逐条:台账有该条 + 登记有 why/unblock/today(理由非空)', () => {
   eq([...CLIENT_ENTRY_HOLDS.map((h) => h.action)].sort(), [...MANAGEMENT_ACTIONS].sort(),
-    '★ 登记表必须**恰好**覆盖这 8 条(多一条 = 无主登记;少一条 = 有人没裁决)');
+    '★ 登记表必须**恰好**覆盖这 7 条(多一条 = 无主登记;少一条 = 有人没裁决)' +
+    '(SET_PARTY_MODE 接线后登记已删 —— 它多出来就说明"已接的还挂着登记")');
 
   for (const action of MANAGEMENT_ACTIONS) {
     const row = clientEntryRow(action);
@@ -188,7 +205,15 @@ test('FND145-1 8 条 missing 逐条:台账有该条 + 登记有 why/unblock/toda
       `${action} 仍是 missing ⇒ 不许有见证片段(有片段就等于说"接上了")`);
   }
 
-  /* 两条非 RoomAction 的缺口:同一套口径 */
+  /* ★ 接线后应改 wired:`SET_PARTY_MODE` 已在 WS-FND-151 接上(`M` 面板)⇒ 台账是 wired、
+     有见证片段、且**不在**登记表里。它不是"漏登记",而是**接完了**。
+     这三条一起钉,防止有人把登记补回去、或者把 witness 删掉却留着 wired。 */
+  const partyRow = clientEntryRow(PARTY_MODE_WIRED);
+  ok(partyRow !== null, `★ ${PARTY_MODE_WIRED} 仍必须逐键在台账里(逐条覆盖 RoomAction)`);
+  eq(partyRow?.status, ClientEntryStatus.WIRED, `★ ${PARTY_MODE_WIRED} 已接线 ⇒ 状态必须是 wired`);
+  ok(clientEntryWitnessOf(PARTY_MODE_WIRED) !== '', `${PARTY_MODE_WIRED} 标为 wired ⇒ 必须有见证片段`);
+  eq(clientHoldRow(PARTY_MODE_WIRED), null,
+    `★ ${PARTY_MODE_WIRED} 不许还留在 CLIENT_ENTRY_HOLDS 里(已接线的行不许有"刻意不提供"的登记)`);
   eq([...CLIENT_ENTRY_GAPS.map((g) => g.what)].length, 2, '非 RoomAction 的缺口恰好两条(急单 / lane)');
   for (const g of CLIENT_ENTRY_GAPS) {
     eq(g.kind, ClientHoldKind.DELIBERATE, `${g.what} 的判定档位必须是 deliberate`);
@@ -264,6 +289,14 @@ test('FND145-3 客户端源码里**零入口**(剥注释、排除台账);注入�
     ok(!codeHas(files, `"${action}"`, LEDGER_FILE), `${action} 的双引号字面量同理`);
   }
 
+  /* ★ 接线后应改 wired:正对照 —— `SET_PARTY_MODE` 现在**必须**出现在客户端代码里
+     (`ui/party_panel.ts` 的 `PARTY_MODE_ACTION` / `main.ts` 的选中回调)。
+     没有这一条,上面 7 条的"零入口"就分不清"真没接"与"源根本没有它"。 */
+  ok(codeHas(files, PARTY_MODE_WIRED, LEDGER_FILE),
+    `★ ${PARTY_MODE_WIRED} 已接线 ⇒ 客户端源码里必须真的出现它(接线后应改 wired 的那一条)`);
+  ok(clientEntryWitnessOf(PARTY_MODE_WIRED) !== '',
+    `★ ${PARTY_MODE_WIRED} 的见证片段必须来自台账(而不是这里另写一份字符串)`);
+
   /* 负对照:塞一行"偷偷接上"的源码 ⇒ 同一条判据必须命中(不是恒真) */
   const injected: CodeFile[] = [
     ...files,
@@ -328,7 +361,7 @@ test('FND145-4 假 socket 经生产 sessionPorts 捕获**全部键位**的报文
 
 /* ═══════════════════════════ 5 ═══════════════════════════ */
 
-test('FND145-5 `partyMode` 只出现在 START_PARTY 的**回声**上,从不发 SET_PARTY_MODE', () => {
+test('FND145-5 `partyMode` 在 `V` 上只作 START_PARTY 的**回声**(设模式是 `M` 的事,不走 `V`)', () => {
   const sock = fakeSocket();
   const binding = mk(sock, { ...HOST_INPUTS, partyModeEcho: () => 'BRIDGE_CTF' });
   binding.handleKey('v');
@@ -337,7 +370,9 @@ test('FND145-5 `partyMode` 只出现在 START_PARTY 的**回声**上,从不发 S
   ok(sock.sent.every((m) => m.action !== 'SET_PARTY_MODE'),
     'SET_PARTY_MODE 一条都不许出现(它改了赛制,而 `V` 只开那一局)');
 
-  /* 三张键位表里没有任何一格指向管理类动作 */
+  /* 三张键位表里没有任何一格指向**仍未接线**的管理类动作;`SET_PARTY_MODE` 已接线,
+     但它的入口在模式面板组(`PARTY_SELECT_KEYS`)里,**不占**这三张表的任何一格
+     (`M` 与 `1..4` 互斥由 `keyGroups()` 钉;见 WS-FND-138 FND138-2 / WS-FND-151)。 */
   const actions = [
     ...Object.values(ACTION_KEYS).map((s) => s.action),
     ...Object.values(ENTRY_KEYS).map((s) => s.slot),
@@ -346,6 +381,8 @@ test('FND145-5 `partyMode` 只出现在 START_PARTY 的**回声**上,从不发 S
   for (const action of MANAGEMENT_ACTIONS) {
     ok(!actions.includes(action), `${action} 不许藏在键位表里(台账说它 missing)`);
   }
+  ok(!actions.includes(PARTY_MODE_WIRED),
+    `★ ${PARTY_MODE_WIRED} 已接线,但入口在模式面板(M / J / L / Enter)里 —— 不许同时占字母表/热键的格子`);
 });
 
 /* ═══════════════════════════ 6 ═══════════════════════════ */
@@ -435,7 +472,7 @@ test('FND145-8 急单评级真的读得到:回执 `effect.rushGrade` → 状态�
 
 /* ═══════════════════════════ 9 ═══════════════════════════ */
 
-test('FND145-9 PLAY.md:10 条逐条点名 + 「刻意不提供」+ 出路;删一行 ⇒ 检测器报红', () => {
+test('FND145-9 PLAY.md:7 条 missing 逐条点名 + 已接的那条如实标出 + 「刻意不提供」+ 出路;删一行 ⇒ 检测器报红', () => {
   const play = read('PLAY.md');
   eq(playProblems(play), [], 'PLAY.md 的登记节必须自洽(每一条:动作 / 为什么 / 出路 / 今天)');
 
@@ -463,6 +500,16 @@ function playProblems(play: string): string[] {
     /* 查的是**那一行**(`| \`ACTION\` |`),不是"这个词在文里出现过" ——
        否则删掉表格行也不报红(同一个词可能出现在别的句子里)。 */
     if (!play.includes(`| \`${action}\` |`)) p.push(`PLAY.md 没点名 ${action}(表体缺那一行)`);
+  }
+
+  /* ★ 接线后应改 wired:PLAY.md 必须**点明** `SET_PARTY_MODE` 已有入口(`M` 面板),
+     而不是把它继续列进「刻意不提供」的表体 —— 文档滞后会教后来者"这个入口还没做",
+     然后真的有人去补第二套 UI。 */
+  if (!play.includes(PARTY_MODE_WIRED)) {
+    p.push(`PLAY.md 没写已接线的 ${PARTY_MODE_WIRED}(WS-FND-151 之后它有 \`M\` 入口)`);
+  }
+  if (play.includes(`| \`${PARTY_MODE_WIRED}\` |`)) {
+    p.push(`★ PLAY.md 仍把 ${PARTY_MODE_WIRED} 列在「刻意不提供」的表体里 ⇒ 文档过期(它已接线)`);
   }
   return p;
 }
@@ -502,14 +549,31 @@ function docProblems(doc: string): string[] {
   if (!section.includes('lane')) p.push('§2.9.1 没写分拣带的 `lane`');
   if (!section.includes('急单')) p.push('§2.9.1 没写急单');
 
-  /* 逐行:表体每一行都得有 判定 / 为什么 / 出路 / 今天 四格且非空 */
+  /* ★ 接线后应改 wired:§2.9.1 必须把 `SET_PARTY_MODE` 记成**已接**
+     (它已在 WS-FND-151 接上 `M` 面板),而不是继续写「刻意不提供」。
+     文档比代码更容易腐烂:代码里有入口、文档说"没做" ⇒ 后来者会去补第二套 UI。 */
+  const partyLine = section.split('\n').find((l) => l.startsWith(`| \`${PARTY_MODE_WIRED}\` |`));
+  if (partyLine === undefined) {
+    p.push(`§2.9.1 表体少了 ${PARTY_MODE_WIRED} 那一行(已接线也要留档:改"判定"列,不删行)`);
+  } else if (!(partyLine.split('|')[2] ?? '').includes('已接')) {
+    p.push(`★ §2.9.1 仍把 ${PARTY_MODE_WIRED} 记成「刻意不提供」⇒ 文档过期(它已在 WS-FND-151 接线)`);
+  }
+
+  /* 逐行:表体每一行都得有 判定 / 为什么 / 出路 / 今天 四格且非空。
+     行数仍是 10:8 条管理类(SET_PARTY_MODE 换判定、不删行)+ 急单 + lane。 */
   const rows = section.split('\n').filter((l) => l.startsWith('| `') || l.startsWith('| 急单') || l.startsWith('| 分拣带'));
   if (rows.length !== 10) p.push(`§2.9.1 的表体必须恰好 10 行(8 条管理类 + 急单 + lane),实际 ${rows.length}`);
   for (const line of rows) {
     const cells = line.split('|').slice(1, -1).map((c) => c.trim());
     const label = cells[0] ?? '?';
     if (cells.length !== 5) { p.push(`${label} 那一行不是 5 列(判定/为什么/出路/今天)`); continue; }
-    if (!(cells[1] ?? '').startsWith('刻意不提供')) p.push(`${label} 的判定列不是「刻意不提供」`);
+    /* 判定列:仍未接的 7 条与两条缺口必须逐字「刻意不提供」;
+       已接线的那一行必须从「已接」开头(上面那条已单独查过,这里不重复报)。 */
+    if (label === `\`${PARTY_MODE_WIRED}\``) {
+      if (!(cells[1] ?? '').includes('已接')) p.push(`${label} 的判定列必须写「已接」(markdown 加粗不影响判定)`);
+    } else if (!(cells[1] ?? '').startsWith('刻意不提供')) {
+      p.push(`${label} 的判定列不是「刻意不提供」(仍 missing 的动作不许自认已接)`);
+    }
     if ((cells[2] ?? '').length < 10) p.push(`${label} 的"为什么"太短`);
     if ((cells[3] ?? '').length < 5) p.push(`${label} 没写"解锁它的那一件事"`);
     if ((cells[4] ?? '').length < 2) p.push(`${label} 没写"今天能做到哪一步"`);

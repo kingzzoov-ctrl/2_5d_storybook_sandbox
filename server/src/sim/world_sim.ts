@@ -276,8 +276,9 @@ import {
  * 未使用变量,反而诱导后人「清理」掉它 —— 那正是这个缺陷会复发的原因。
  */
 import '../wiring/components.ts';
-/* ★ D-07:昼夜边界**只有一处**(`isNight(hour)`,405 感光器也用它)—— 这里只借用,不重写。 */
-import { isNight as isNightAtHour } from '../wiring/components.ts';
+/* ★ D-07 / WS-FND-153:昼夜边界**只有一处**(`NIGHT_WINDOW` + `isNight(hour)`,405 感光器、
+   夜行怪刷新门、世界钟全用它)—— 这里只借用,不重写,也不另带一份边界数值。 */
+import { isNight as isNightAtClock } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
 import { MOB_CORPSE_FRAMES, MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, warnHitsPlayer, BLIND_VIEW_MUL, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
@@ -313,6 +314,18 @@ import {
   reflectFrom,
   pvpVerdict,
   targetFromStats,
+  /* ★ WS-FND-152:受击击退的完整参数(伤害 / 质量 / 方向)+ 连击窗口。
+     `hitKnockbackOf` 是 D-09 那条算式的**唯一实现**(上界 2 格没变);
+     `massNormalizedCells` / `knockbackDirection` 供 `applyKnockback` 复用,
+     免得「质量归一」与「方向」两处各写一份。 */
+  hitKnockbackOf,
+  massNormalizedCells,
+  knockbackDirection,
+  HIT_KNOCKBACK_MAX_CELLS,
+  HIT_KNOCKBACK_DAMAGE_PER_CELL,
+  HIT_KNOCKBACK_MASS_REF,
+  nextComboState,
+  type ComboState,
   type AttackInput as PipelineAttackInput,
   type DotTask,
   type DamageResult as PipelineDamageResult,
@@ -325,6 +338,8 @@ import {
   ARMOR_BY_ID,
   Element,
   BREACH_PICK,
+  /* ★ WS-FND-152:锻造产物按稀有度三档加成(0 / +1 / +2)的唯一换算点。 */
+  applyForgeTierBonus,
   type SkillDef,
   type WeaponDef,
 } from '../combat/weapons.ts';
@@ -2420,7 +2435,21 @@ export class WorldSim {
     itemIds: readonly number[],
     opts: { playerName?: string; seed?: number; lvProf?: number; useDew?: boolean; x?: number; y?: number } = {},
   ): Promise<
-    | { ok: true; result: Extract<ForgeResult, { ok: true }>; consumed: { itemId: number; count: number }[]; spawned: { x: number; y: number } }
+    | {
+      ok: true;
+      result: Extract<ForgeResult, { ok: true }>;
+      consumed: { itemId: number; count: number }[];
+      spawned: { x: number; y: number };
+      /**
+       * ★ WS-FND-152:**按稀有度分档后的产物战斗点数**(`atk` / `def`)。
+       *
+       * 修前 `rarity_tier` 只是入库行上的一个字段(`ai_item_instances.rarity_tier`),
+       * 战斗侧一个数都不受影响 —— 「越稀有越强」在玩法上**不存在**。
+       * 现在同一份产物返回里带出分档后的点数(`rolled.atk/def` + 0/+1/+2),
+       * 档位表在 `combat/weapons.ts#FORGE_TIER_STAT_BONUS`(★ 待平衡(owner))。
+       */
+      crafted: { rarityTier: number; bonus: number; atk: number; def: number };
+    }
     | { ok: false; stage: 'INVENTORY' | 'GATE' | 'LLM' | 'ROLL'; message: string }
   > {
     /*
@@ -2491,7 +2520,21 @@ export class WorldSim {
       y,
       count: 1,
     } as GroundItem);
-    return { ok: true, result, consumed, spawned: { x, y } };
+    /* ★ WS-FND-152:稀有度分档加成(0 / +1 / +2)落到产物的战斗点数上。
+       换算只在 `combat/weapons.ts#applyForgeTierBonus` 一处 —— 这里只做投影,不重算档位。 */
+    const craftedRolled = applyForgeTierBonus(result.instance.rolled, result.instance.rarity_tier);
+    return {
+      ok: true,
+      result,
+      consumed,
+      spawned: { x, y },
+      crafted: {
+        rarityTier: result.instance.rarity_tier,
+        bonus: craftedRolled.bonus,
+        atk: craftedRolled.atk,
+        def: craftedRolled.def,
+      },
+    };
   }
 
   /** 地面某件材料的**总件数**(单一计数实现:`forgeAlchemy` 的早退与原子扣料共用)。 */
@@ -2801,14 +2844,28 @@ export class WorldSim {
       return { outcome: 'OUT_OF_AOI', hit: null, rejected: 'LOS_BLOCKED' };
     }
 
+    /* ★ WS-FND-152:**连击窗口**在服务端落地(`comboMul` 修前恒 1.0)。
+       口径见 `combat/damage.ts#nextComboState`:
+       ```text
+       距上一击 ≤ COMBO_WINDOW_SEC(0.6 秒)⇒ 连击数 +1 ⇒ 第 3 段起 ×1.25
+       超窗 / 从未命中              ⇒ 回到第 1 段(×1.00)
+       ```
+       时间基用**世界时钟**(`frameCount × DT`),与 D-07 同源,不读挂钟。
+       ⚠️ 只在**真的打中**(未落空 / 未闪避)时提交状态:落空不该把连段数推上去。
+       自报 `comboMul` 仍由 `attackMob` 的夹具通道保留(WS-07 的反作弊判据在**报文层**
+       拦这个字段),生产入口不再自己传数字。 */
+    const combo = nextComboState(this.combos.get(playerId) ?? null, this.frameCount * DT);
     const hit = this.attackMob(playerId, mobId, {
       level: this.levelOf(playerId),
       wearing: this.wearingOf(playerId),
-      comboMul: 1.0,
+      comboMul: combo.mul,
       ...(opts.fromDeg !== undefined ? { fromDeg: opts.fromDeg } : {}),
       /* ★ [Q]:意图原样转发。技能本身由 attackMob 从**武器**取,不从这里传定义。 */
       ...(opts.useSkill === true ? { useSkill: true } : {}),
     });
+    if (hit !== null && !hit.result.outOfReach && !hit.result.dodged && hit.segments > 0) {
+      this.combos.set(playerId, combo.state);
+    }
     return { outcome: 'OK', hit, rejected: null };
   }
 
@@ -3852,6 +3909,26 @@ export class WorldSim {
     return p;
   }
 
+
+  /**
+   * ★ WS-FND-152:该玩家的**背包容量槽数**(权威读口,给 `net/room.ts` 的容量闸用)。
+   *
+   * ## 为什么这个读口必须存在
+   *
+   * 房间侧的 `carryCapacityOf` 修前**内联**了 `8 + (lv-1)` —— 于是「容量由谁说了算」
+   * 有两份,改档案(`progressOf(id).carrySlots`)**一点反应都没有**,而这条静默
+   * 没有任何判据看得见(`WS-FND-148` FND148-7 就是按「改成 99 仍是 8」钉的)。
+   * 现在房间先问本方法:有档案就用档案字段(`recompute` 每级重算,含天赋摊平),
+   * 没有档案才回落到等级派生(`progression.carryCapacityOf` 里那一份)。
+   *
+   * ⚠️ **不建档案**:查一个没参与过任何结算的玩家返回 `null`,而不是顺手给他开一份
+   *    lv1/exp0 的档案(那会污染「有没有档案」这个可观测值 —— `settleKill` 里
+   *    踩过同一个坑,见那里的注释)。
+   */
+  carrySlotsOf(playerId: string): number | null {
+    const p = this.progresses.get(playerId);
+    return p === undefined ? null : p.carrySlots;
+  }
   /** 某玩家当前成长档案的快照(供断言;不存在则返回 null)。 */
   progressSnapshotOf(playerId: string): PlayerProgress | null {
     return this.progresses.get(playerId) ?? null;
@@ -4465,6 +4542,18 @@ export class WorldSim {
   private readonly knockbacks = new Map<string, { dx: number; dy: number; left: number }>();
 
   /**
+   * 每个玩家的**连击状态**(WS-FND-152)。
+   *
+   * 为什么要存在世界侧:连段倍率来自**输入节奏**,而「上一次命中在什么时候」是
+   * 服务端才知道的事实 —— 客户端自报 `comboMul` 是 CR-14 U2 同族缺口(WS-07 在
+   * 报文层就把这个字段拒了)。⇒ 真值只能由权威侧记。
+   *
+   * 惰性条目:只在**真的命中**后写入(`attackMobAuthorized`),所以
+   * 「从没打过怪的玩家」在这张表里没有条目(= 没有连击)。
+   */
+  private readonly combos = new Map<string, ComboState>();
+
+  /**
    * 因**撞墙 / 出界**而提前结束的击退次数(诊断与断言用)。
    *
    * 为什么要有它:"被墙拦住"这个事实若不可观测,「击退真的被墙挡下了」与
@@ -4481,7 +4570,7 @@ export class WorldSim {
    * 而这里要的是"**我**被打中之后被推多远" —— 同一个物理量在两个语义下不是一回事。
    * 裁决原文给了这条换算,所以数不是发明的;要改这个数需要新裁决。
    */
-  private static readonly KNOCKBACK_DAMAGE_PER_CELL = 20;
+  private static readonly KNOCKBACK_DAMAGE_PER_CELL = HIT_KNOCKBACK_DAMAGE_PER_CELL;
   /**
    * 受击击退的**总位移上限**(格)。**必须有上限**:`applyKnockback` 一次性把位移写进位置,
    * 没有上限时一次 100 伤害会推 5 格(观感与救援半径都崩)。
@@ -4498,7 +4587,7 @@ export class WorldSim {
    * 于是**任何**调用方(受击点 / Boss 环形波 / 脚本 / 测试)给多大的距离都被钳在这里,
    * 不存在「绕过受击点就不受上界约束」的第二条路。
    */
-  static readonly KNOCKBACK_MAX_CELLS = 2;
+  static readonly KNOCKBACK_MAX_CELLS = HIT_KNOCKBACK_MAX_CELLS;
 
   /**
    * 击退的**质量归一基准**(格)。`位移 = 距离 × (基准 / 质量)`:质量为 1(=`MASS_PLAYER`,
@@ -4509,7 +4598,7 @@ export class WorldSim {
    * `physics.applyImpulse` 的 `Δv = J / m`。两条路径各自归一,否则「轻的推得远、重的推得近」
    * 只在纵向速度上成立、水平位移上不成立。
    */
-  static readonly KNOCKBACK_MASS_REF = 1;
+  static readonly KNOCKBACK_MASS_REF = HIT_KNOCKBACK_MASS_REF;
 
   /* ══════════════════ 世界时钟(★ D-07:20 分钟一天,0 帧 = 06:00)══════════════════ */
 
@@ -4536,14 +4625,44 @@ export class WorldSim {
   }
 
   /**
+   * 最近一次**昼夜判据**读到的钟点(★ WS-FND-153:可观测)。
+   *
+   * 为什么要存这一份读数:判据需要能断言「电路侧 / 刷怪侧真的拿到了世界钟」,
+   * 而不是拿某个缺省值(0)在跑。凡是问过 `dayNight()` 的地方(电路环境键
+   * `hour` / `night`、`isNightNow()`、刷怪夜行门)都会把它刷新到**同一次**读数。
+   *
+   * `0` 表示「还没有任何昼夜判据跑过」,不是「世界时间是 00:00」——
+   * 真要 0 点,`hourOfDay()` 会如实给出 0,而这里记的也是 0。
+   */
+  lastHourOfDay = 0;
+
+  /**
+   * 昼夜判据的**唯一读数口**(★ WS-FND-153)。
+   *
+   * 四个消费者全部经由本方法取值,所以「`hourOfDay` 与 `isNight` 是同一个事实」
+   * 不是靠约定,而是**同一次调用**:
+   *   1 电路环境键 `hour`(405 感光器、426 洒水器的入参,见 `automationEnvOf`);
+   *   2 电路环境键 `night`(405 的强制夜电平);
+   *   3 `isNightNow()`(房间系统 / 存档快照 / 温室);
+   *   4 `spawnWorld().isNight`(刷怪夜行门 `decideSpawn` 的 `DAYLIGHT`)。
+   *
+   * 边界不在这里定:仍然只在 `wiring/components.ts` 的 `NIGHT_WINDOW` / `isNight`。
+   */
+  private dayNight(): { hour: number; isNight: boolean } {
+    const hour = this.hourOfDay();
+    this.lastHourOfDay = hour;
+    return { hour, isNight: isNightAtClock(hour) };
+  }
+
+  /**
    * 现在是夜里吗?(★ D-07)
    *
    * 边界**不在这里定** —— 直接委托 `wiring/components.ts` 的 `isNight(hour)`,
-   * 那是 405 昼夜感光器用的同一个函数(19:00–06:00 为夜)。
+   * 那是 405 昼夜感光器 / 刷怪门用的同一个函数(夜的口径见 `NIGHT_WINDOW`)。
    * 两处各写一份边界必然漂(本仓已踩过多次)。
    */
   isNightNow(): boolean {
-    return isNightAtHour(this.hourOfDay());
+    return this.dayNight().isNight;
   }
 
   /**
@@ -4581,9 +4700,12 @@ export class WorldSim {
    * 上限 40(见 `COMPONENT_PRODUCER_LEDGER`),每慢帧至多几十次 ⇒ 不进性能预算讨论。
    */
   private automationEnvOf(key: string, comp?: ComponentNode): number {
-    /* ── 与位置无关的键 ── */
-    if (key === 'hour') return this.hourOfDay();
-    if (key === 'night') return this.isNightNow() ? 1 : 0;
+    /* ── 与位置无关的键 ──
+       `hour` / `night` 走**同一次** `dayNight()` 读数(★ WS-FND-153):
+       电路侧拿到的钟点就是 `hourOfDay()`,不是任何缺省值(旧写法在环境口
+       缺席时 `param('hour')` = 0 ⇒ `isNight(0)` = 夜 ⇒ 405 恒亮)。 */
+    if (key === 'hour') return this.dayNight().hour;
+    if (key === 'night') return this.dayNight().isNight ? 1 : 0;
     if (key === 'morningTick') return this.isMorningSlowFrame() ? 1 : 0;
     /* ── 逐格键:没有位置就没有答案(旧行为等价于这一支恒 0)── */
     if (comp === undefined) return 0;
@@ -4712,19 +4834,21 @@ export class WorldSim {
     const b = this.physics.bodies.get(playerId);
     if (b === undefined) return false;
     if (!Number.isFinite(distance) || distance <= 0) return false;
-    const dx = b.x - fromX;
-    const dy = b.y - fromY;
-    const len = Math.hypot(dx, dy);
+    /* ★ WS-FND-152:**方向 / 质量归一 / 上界**三条现在都在 `combat/damage.ts` 一处
+       (`knockbackDirection` / `massNormalizedCells` / `HIT_KNOCKBACK_MAX_CELLS`)。
+       本方法只做「施加」——慢帧两段推 + 搬家窗口。
+       逐位等价:质量 = 基准值时 `massNormalizedCells` 原样返回,方向仍是 (dx/len, dy/len)
+       ⇒ `WS-FND-53` / `WS-FND-98` 的 `1e-9` 精度判据一位不动。 */
+    const dir = knockbackDirection(fromX, fromY, b.x, b.y);
     /* 完全重合时没有方向可言 ⇒ 不击退(而不是随便挑一个方向)。 */
-    if (!(len > 0)) return false;
-    /* ① 质量归一(非法质量在 `safeMass` 里被拒绝 ⇒ 这里的分母一定是正有限整数)。 */
-    const mass = safeMass(b.mass);
-    const normalized = distance * (WorldSim.KNOCKBACK_MASS_REF / mass);
-    /* ② 总位移上界。`normalized` 理论上有限(distance 已过 `isFinite`、mass 是正整数);
-       再兜一次是为了「上界」这条承诺本身不依赖上游:`!(cells > 0)` 同时挡住 0 与 NaN。 */
+    if (dir.len === 0) return false;
+    /* 1 质量归一(非法质量在 `safeMass` 里被拒绝 ⇒ 这里的分母一定是正有限数)。 */
+    const normalized = massNormalizedCells(distance, safeMass(b.mass));
+    /* 2 总位移上界。`normalized` 理论上有限;再兜一次是为了「上界」这条承诺本身不依赖上游
+       (`!(cells > 0)` 同时挡住 0 与 NaN)。 */
     const cells = Math.min(WorldSim.KNOCKBACK_MAX_CELLS, normalized);
     if (!(cells > 0)) return false;
-    this.knockbacks.set(playerId, { dx: (dx / len) * cells, dy: (dy / len) * cells, left: WorldSim.KNOCKBACK_STEPS });
+    this.knockbacks.set(playerId, { dx: dir.dirX * cells, dy: dir.dirY * cells, left: WorldSim.KNOCKBACK_STEPS });
     return true;
   }
 
@@ -4766,6 +4890,16 @@ export class WorldSim {
   /** 这个玩家正在被击退?(= 位置搬家的窗口) */
   knockbackOf(playerId: string): boolean {
     return this.knockbacks.has(playerId);
+  }
+
+  /**
+   * 该玩家当前的**连击状态**(没打过 ⇒ `null`)。
+   *
+   * ★ WS-FND-152:这是「服务端真的有连段状态机」的**可观测证据** —— 修前
+   * `attackMobAuthorized` 恒传 `comboMul: 1.0`,外面**看不出**它有没有算过。
+   */
+  comboOf(playerId: string): ComboState | null {
+    return this.combos.get(playerId) ?? null;
   }
 
   /* ══════════ ★ WS-FND-122:218 和平盾的**真实开关**(写口 + 读口)══════════
@@ -5020,6 +5154,8 @@ export class WorldSim {
     /* ★ 第四条:打盹玩法表(与上面那条连接态标记**不是**同一张,见 docblock)。 */
     this.afkRuns.delete(id);
     this.knockbacks.delete(id);
+    /* ★ WS-FND-152:连击状态也按 id 索引 —— 漏清会让同名重连**继承上一轮的连段数**。 */
+    this.combos.delete(id);
     /* ★ WS-FND-122:和平盾开关与起跳冷却同样按 id 索引 —— 漏清 ⇒ 同名重连
        会继承上一轮的**开盾状态**(凭空免疫整蛊)与**起跳冷却**。 */
     this.shieldOn.delete(id);
@@ -6242,6 +6378,8 @@ export class WorldSim {
     this.sprayUntil.clear();
     this.tendUntil.clear();
     this.knockbacks.clear();
+    /* ★ WS-FND-152:连击状态是**这一代世界**的战斗节奏,重建即归零。 */
+    this.combos.clear();
     this.downedStates.clear();
     this.liveBubbles.clear();
     this.foodBuffs.clear();
@@ -7074,12 +7212,22 @@ export class WorldSim {
         /* ★ D-09(owner,2026-11-16):受击击退 = `min(2, 实际伤害 / 20)` 格,方向**远离攻击者**。
            裁决给了数值(伤害折算 + 上限 2 格)⇒ 按它接,且**位移仍走 `applyKnockback`**
            (慢帧推 + 搬家窗口),不写速度。
+           ★ WS-FND-152:算式不再写在这里 —— `hitKnockbackOf` 是 D-09 的**唯一实现**,
+           而这次击退的**完整参数**(伤害 / 受击者质量 / 方向两端)在这里一次给齐。
+           `cells` **不含**质量归一(那一步在 `applyKnockback` 里只做一次,见那里的注释)。
            ⚠️ 若这条把 `WS-10` 的救援判据打红:**按 D-09 重钉那条判据**,不许改回 no-op。 */
-        const pushCells = Math.min(
-          WorldSim.KNOCKBACK_MAX_CELLS,
-          res.applied / WorldSim.KNOCKBACK_DAMAGE_PER_CELL,
-        );
-        if (from !== null && pushCells > 0) this.applyKnockback(res.playerId, from.x, from.y, pushCells);
+        const hitBody = this.physics.bodies.get(res.playerId);
+        if (from !== null && hitBody !== undefined) {
+          const kb = hitKnockbackOf({
+            damage: res.applied,
+            targetMass: safeMass(hitBody.mass),
+            fromX: from.x,
+            fromY: from.y,
+            toX: hitBody.x,
+            toY: hitBody.y,
+          });
+          if (kb.applied) this.applyKnockback(res.playerId, from.x, from.y, kb.cells);
+        }
         /* ── ★ D1:击退**写回 PhysicsBody**(`physics.applyImpulse`)──
            与上一段 `applyKnockback` 不是同一件事的两份实现,而是**两个分量**:
            ```
@@ -8652,6 +8800,9 @@ export class WorldSim {
       floorAt: (x: number, y: number) => this.grid.floorIdAt(x, y),
       blocked: (x: number, y: number) => this.grid.objIdAt(x, y) !== 0,
       townCenter: () => ({ x: (this.sizeCells / 2) | 0, y: (this.sizeCells / 2) | 0 }),
+      /* ★ WS-FND-153:夜行门的**输入就是世界钟**(`isNightNow()` ⇒ `dayNight()`),
+         不是任何"恒 false"的默认值 —— 这里一旦断开,NOCTURNAL 生物就永不刷新,
+         而且白天/夜里都刷不出来的现象与"这个群系没有夜行怪"不可区分。 */
       isNight: () => this.isNightNow(),
       /* ★ 房间号喂给刷怪器:它据此向 provider 问「本房间的安全区半径」
          (此前只有一个常量 `TOWN_SAFE_RADIUS` ⇒ `MODIFY_TOWN` 改了也不生效)。

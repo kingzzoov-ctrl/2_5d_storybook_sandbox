@@ -85,6 +85,164 @@ export const MOB_MASS_DEFAULT = 1.0;
  */
 export const DEFAULT_UNARMED_KNOCKBACK = 2.0;
 
+/* ═══════════ 受击击退的**完整参数**(mass + 方向;★ D-09 的上界不变,WS-FND-152)═══════════
+ *
+ * ## 修前是什么样(为什么说「参数不全」)
+ *
+ * D-09 给的只是**一条算式** `min(2, 实际伤害 / 20)` 格,它写在 `world_sim.ts` 的
+ * 受击点里,而「推多远」所需的另外两个输入(**受击者质量**、**方向**)散落在
+ * `WorldSim.applyKnockback` 内部自己算 —— 没有一处能把「这一次击退用的是什么参数」
+ * 作为**一个东西**拿出来看/断言。⇒ 这里把三者收成一份**请求 → 计划**:
+ *
+ * ```text
+ * 请求  {damage, targetMass, from → to}                ← 受击点收集
+ * 计划  {cells, dirX, dirY, applied}                   ← 纯函数算完,调用方只施加
+ * ```
+ *
+ * ## 三条数各自的口径(一个都没改)
+ *
+ * | 常量 | 值 | 出处 |
+ * | :--- | :--- | :--- |
+ * | `HIT_KNOCKBACK_DAMAGE_PER_CELL` | 20 | **D-09 裁决原文**(每 20 点伤害推 1 格) |
+ * | `HIT_KNOCKBACK_MAX_CELLS` | 2 | **D-09 裁决原文**(上界 2 格;WS-FND-53/98 逐位钉着) |
+ * | `HIT_KNOCKBACK_MASS_REF` | 1 | `MASS_PLAYER` 与 `physics.safeMass` 的兜底值(质量 1 ⇒ 位移逐位不变) |
+ *
+ * ⚠️ 质量归一**只做一次**:`cells` 里**不含**质量(`hitKnockbackOf` 只做 D-09 那一条),
+ *    归一在 `massNormalizedCells` 里,由 `WorldSim.applyKnockback` 调一次。
+ *    两边都乘就是平方 —— 那会让 20 质量的 Boss 只被推 1/400。
+ */
+export const HIT_KNOCKBACK_DAMAGE_PER_CELL = 20;
+export const HIT_KNOCKBACK_MAX_CELLS = 2;
+export const HIT_KNOCKBACK_MASS_REF = 1;
+
+/** 受击点的**全部输入**(伤害、受击者质量、方向的两端)。 */
+export interface HitKnockbackRequest {
+  /** 实际承伤(格/秒换算的基数,不是武器击退量) */
+  damage: number;
+  /** 受击者质量(`PhysicsBody.mass`;非法值由 `massNormalizedCells` 退化) */
+  targetMass: number;
+  /** 攻击者位置(方向 = 受击者远离它) */
+  fromX: number;
+  fromY: number;
+  /** 受击者位置 */
+  toX: number;
+  toY: number;
+}
+
+/** 一次击退的**计划**:位移(格)、单位方向、是否成立。 */
+export interface HitKnockbackPlan {
+  /** 位移(格),已含 D-09 的上界;质量归一在 `massNormalizedCells` */
+  cells: number;
+  /** 单位向量(受击者 → 远离攻击者);不成立时为 0 */
+  dirX: number;
+  dirY: number;
+  /** `false` ⇒ 本次不击退(伤害 ≤ 0 / 两点重合) */
+  applied: boolean;
+}
+
+/**
+ * 「受击者 → 远离攻击者」的单位方向。
+ *
+ * 两点重合时返回 `len = 0`(**没有方向可言**),由调用方判 `applied:false` ——
+ * 随便挑一个方向是编造,不是默认值。
+ */
+export function knockbackDirection(
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+): { dirX: number; dirY: number; len: number } {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 0)) return { dirX: 0, dirY: 0, len: 0 };
+  return { dirX: dx / len, dirY: dy / len, len };
+}
+
+/**
+ * 质量归一:`位移 × (基准 / 质量)`,质量为基准值时**逐位不变**。
+ *
+ * 非有限 / ≤ 0 的质量**退化**为基准值(不是「推无穷远」):那与
+ * `physics.safeMass` 的兜底同口径,且保证本函数输出恒有限。
+ */
+export function massNormalizedCells(cells: number, mass: number): number {
+  const m = Number.isFinite(mass) && mass > 0 ? mass : HIT_KNOCKBACK_MASS_REF;
+  return cells * (HIT_KNOCKBACK_MASS_REF / m);
+}
+
+/**
+ * 受击击退的**唯一算式**(D-09):`cells = min(2, 伤害 / 20)`,方向 = 远离攻击者。
+ *
+ * @returns `applied:false` ⇒ 调用方**不许**施加(零副作用)。
+ */
+export function hitKnockbackOf(req: HitKnockbackRequest): HitKnockbackPlan {
+  const dir = knockbackDirection(req.fromX, req.fromY, req.toX, req.toY);
+  const dmg = Number.isFinite(req.damage) && req.damage > 0 ? req.damage : 0;
+  const cells = Math.min(HIT_KNOCKBACK_MAX_CELLS, dmg / HIT_KNOCKBACK_DAMAGE_PER_CELL);
+  if (!(cells > 0) || dir.len === 0) return { cells: 0, dirX: 0, dirY: 0, applied: false };
+  return { cells, dirX: dir.dirX, dirY: dir.dirY, applied: true };
+}
+
+/* ═══════════ 连击(普攻连段)窗口 —— ★ 待平衡(owner),WS-FND-152 ═══════════
+ *
+ * ## 为什么走**伤害**而不是计分
+ *
+ * `comboMul` 早就写在八步公式的第 1 步里(`base = ATK × 等级 × 武器 × **连段** × 技能`),
+ * 而生产侧**恒传 1.0** —— `attackMobAuthorized` 的注释直说「服务端目前没有连段状态机,
+ * 凭空造一个属超范围」。要接的就**是**这个已经存在的乘区;接到计分上则是另造一套
+ * 「连击分」口径(比分表里今天没有这一维),等于新玩法而不是接线。
+ *
+ * ## 口径(三段)
+ *
+ * ```text
+ * 命中(未落空/未闪避)且距上一击 ≤ COMBO_WINDOW_SEC ⇒ 连击数 +1(封顶链长)
+ * 超出窗口 / 从未命中过                        ⇒ 连击数回到 1
+ * 倍率 = COMBO_CHAIN_MUL[count - 1](1.00 / 1.00 / 1.25)
+ * ```
+ *
+ * 窗口是**闭区间**(恰好 0.6 秒仍算连击):边界值由判据钉住,避免 `>` 与 `>=` 之争。
+ * 时间基一律用「世界时钟」(帧序派生),不用挂钟 —— 与 `D-07` 同源。
+ */
+/** 连击窗口(秒)。**待平衡(owner)**:手册没给窗口长度,取 0.6 秒(三段的输入节奏)。 */
+export const COMBO_WINDOW_SEC = 0.6;
+
+/**
+ * 普攻连段倍率链(**手册 §4 的 1.00 / 1.00 / 1.25**)。
+ *
+ * 第 3 段起维持 1.25(链不再变长):继续放大会让「连打」变成唯一解。
+ * 上界仍由 `sanitizeComboMul` / `MAX_COMBO_MUL` 兜住。
+ */
+export const COMBO_CHAIN_MUL: readonly number[] = Object.freeze([1.0, 1.0, 1.25]);
+
+/** 一个玩家的连击状态(**权威**在编排层,这里只是纯数据)。 */
+export interface ComboState {
+  /** 连击数,`1..COMBO_CHAIN_MUL.length` */
+  count: number;
+  /** 上一击的**世界时间**(秒) */
+  lastHitSec: number;
+}
+
+/**
+ * 推进一格连击状态(纯函数)。
+ *
+ * @param prev   上一击的状态;`null` = 从未命中过
+ * @param nowSec 本次命中的世界时间(秒)
+ * @returns 新状态 + 这次该用的连段倍率 + 是否落在窗口内
+ */
+export function nextComboState(
+  prev: ComboState | null,
+  nowSec: number,
+): { state: ComboState; mul: number; index: number; inWindow: boolean } {
+  const t = Number.isFinite(nowSec) ? nowSec : 0;
+  const inWindow = prev !== null
+    && Number.isFinite(prev.lastHitSec)
+    && t - prev.lastHitSec <= COMBO_WINDOW_SEC
+    && t >= prev.lastHitSec;
+  const count = inWindow ? Math.min(COMBO_CHAIN_MUL.length, prev!.count + 1) : 1;
+  const index = Math.min(COMBO_CHAIN_MUL.length, Math.max(1, count)) - 1;
+  return { state: { count, lastHitSec: t }, mul: COMBO_CHAIN_MUL[index], index, inWindow };
+}
+
 /**
  * 生物自身的元素属性表 —— **只收名称/行为里明确带元素语义的生物**。
  *

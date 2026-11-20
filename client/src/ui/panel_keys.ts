@@ -50,10 +50,38 @@ export const PANEL_KEYS: Readonly<Record<string, UiPanel>> = {
   /* ★ 第七轮 P1:画架从 `e` 挪到 `h` —— `e` 是 ACTION_KEYS 的「拆除」 */
   h: UiPanel.PIXEL_EASEL,
   p: UiPanel.PITCH_EDITOR,
+  /* ★ WS-FND-151:派对**模式选择面板**。`m` 是空闲字母(`{ j, l, m }` 之一)——
+     它既不在 ACTION_KEYS(q/e/g/f)也不在 ENTRY_KEYS(n/k/o/u/v/t)/ HOTBAR(1..4)里,
+     所以「按一下只做一件事」由 `keyGroups()` 的互斥判据钉住,不靠人肉核对。 */
+  m: UiPanel.PARTY,
 };
 
 /** 画架工具键(只在画架打开时有效):撤销 / 重做 / 清空 / 填充 */
 export const EASEL_TOOL_KEYS: readonly string[] = ['z', 'y', 'x', 'c'];
+
+/**
+ * **模式面板的选中键**(★ WS-FND-151)。
+ *
+ * ## 为什么不是数字键 1..4
+ * 四个模式看着像 `1/2/3/4`,但那四个键已经是 `HOTBAR_KEYS`(驯养/购买/炼金/放件)
+ * ⇒ 面板开着时按 `2` 会**同时**买一件货并选第二档:一次按键两件事,而两边都不报错
+ * (正是 `panel_keys.ts` 文件头在骂的那个形态)。
+ *
+ * ## 所以用**空闲字母 + Enter**
+ * `ui/panel_keys.ts` 文件头记的空闲集是 `{ j, l, m }`:`m` 给了面板开关,
+ * 剩下的 `j` / `l`(`l` 右、`j` 下 —— vim 手位)给光标,`Enter` 给确认。
+ * 三个键都进 `keyGroups()`,与任何既有组撞车都会**当场红**。
+ */
+export const PARTY_PANEL_KEYS = {
+  prev: 'j',
+  next: 'l',
+  confirm: 'enter',
+} as const;
+
+/** 模式面板的选中键清单(喂给 `keyGroups()` 做互斥判定) */
+export const PARTY_SELECT_KEYS: readonly string[] = [
+  PARTY_PANEL_KEYS.prev, PARTY_PANEL_KEYS.next, PARTY_PANEL_KEYS.confirm,
+];
 
 /** demo Boss 血条开关键(只在快照里没有权威 boss 时有意义) */
 export const BOSS_DEMO_KEY = 'b';
@@ -94,6 +122,10 @@ export function keyGroups(): KeyGroup[] {
     { name: 'MOVE_KEYS(WASD + 方向键)', keys: move },
     { name: 'PANEL_KEYS(面板)', keys: Object.keys(PANEL_KEYS) },
     { name: 'EASEL_TOOL_KEYS(画架工具)', keys: EASEL_TOOL_KEYS },
+    /* ★ WS-FND-151:模式面板的选中键。**进这张表**是本任务的一条硬要求:
+       面板开着时按 J/L/Enter 只能移动光标/确认 —— 若它们同时属于别的组,
+       就会是"一次按键两件事"(而两边都不报错)。 */
+    { name: 'PARTY_SELECT_KEYS(模式面板:选/确认)', keys: PARTY_SELECT_KEYS },
     { name: '单键(搜/缩/关/Boss/攻击)', keys: [SEARCH_KEY, ...ZOOM_KEYS, CLOSE_PANEL_KEY, BOSS_DEMO_KEY, ATTACK_KEY] },
   ];
 }
@@ -138,8 +170,8 @@ export const PANEL_LABEL: Readonly<Record<string, string>> = {
   RECIPE_TREE: '配方',
   PIXEL_EASEL: '画架',
   PITCH_EDITOR: '音高',
+  PARTY: '模式(派对)',
 };
-
 /**
  * 一行面板提示(`I 背包 · R 配方 · H 画架 · P 音高`)。
  *

@@ -62,7 +62,8 @@ import {
 /* ★ 第七轮审计 P1(『e』双绑):面板键位表搬到 `ui/panel_keys.ts`。
    留在本文件里的话「键集互不重叠」这条判据读不到它(本文件顶层 import three + 碰 document,
    node 里加载不了)⇒ 判据只能靠手写清单,而手写清单正是这次漏掉 `e` 的地方。 */
-import { BOSS_DEMO_KEY, CLOSE_PANEL_KEY, SEARCH_KEY, ZOOM_KEYS, panelKeyHints, panelKeyOf } from '../ui/panel_keys.ts';
+/* ★ WS-FND-151:模式面板的选中键(`j` / `l` / `enter`)—— 与其它组互斥,见 `keyGroups()`。 */
+import { BOSS_DEMO_KEY, CLOSE_PANEL_KEY, PARTY_PANEL_KEYS, SEARCH_KEY, ZOOM_KEYS, panelKeyHints, panelKeyOf } from '../ui/panel_keys.ts';
 /* ★ 第七轮审计 P1:`wildlife` / 其他 `players` 此前**零渲染出口** ——
    判定(该画谁、画在哪、什么颜色)在 `stage/entity_sprites.planEntitySprites`(纯函数、可单测),
    本文件只做「按计划建/改/删 Sprite」这一段。
@@ -94,6 +95,20 @@ import {
    文本拼装)全在 `ui/party_hud.ts`(纯函数、零 DOM ⇒ 可被 node 直接断言),
    本文件只把它的输出每帧写进 `#hint` 与自检口径。 */
 import { partyHudOf, type PartyHudView } from '../ui/party_hud.ts';
+/* ★ WS-FND-151:`SET_PARTY_MODE` 的**选择器**(纯逻辑)+ 急行开工条件清单(三态)。
+   接线前那 8 条管理类动作全部登记为"客户端刻意不提供",其中 `SET_PARTY_MODE`
+   的理由写得最具体:「四选一要选择器 + 权限位」。这个文件就是补那块选择器。 */
+import {
+  PARTY_MODE_COUNT,
+  movePartyCursor,
+  partyModeOptionAt,
+  partyPanelOf,
+} from '../ui/party_panel.ts';
+import {
+  RUSH_SNAPSHOT_GAP,
+  rushReadinessOf,
+  type RushReadinessInput,
+} from '../ui/rush_readiness.ts';
 /* ★ 第六轮审计 P1/P3:接线台账。**生产里也读它** —— `summary().wiring.ledger`
    把"哪些装配函数仍未接"变成自检口径里的读数;只有测试读它的话,
    这块信息在真机上就又不可见了(那正是本轮要消灭的形态)。 */
@@ -237,6 +252,16 @@ export interface BootHandle {
    * 本文件的 `keydown` 监听比 `main.ts` 先注册,所以同一次按键里它已经更新过 `searchMode`。
    */
   textInputActive: () => boolean;
+  /**
+   * ★ WS-FND-151:接上「选中的模式怎么发出去」。
+   *
+   * ## 为什么是注入而不是本文件自己发
+   * 本文件不持有 `SessionHandle`(那是 `main.ts` 的装配根),而报文必须经
+   * `net/action_entry.ts` 的三支分流(参数不对 / 未连接 / 发)⇒ 这里只留一个
+   * **端口**:`(mode, key) => 一句玩家读得到的话`。
+   * `null` = 单机(`?server=off`)⇒ 选中时如实说"未联机",而不是静默。
+   */
+  setPartyModeSink: (fn: ((mode: number, key: string) => string) | null) => void;
 }
 
 /**
@@ -719,6 +744,12 @@ export function boot(container: HTMLElement): BootHandle {
     }
     const party = partyHudOf(authority.state.meta);
     if (party.active) parts.push(party.text);
+    /* ★ WS-FND-151:急行开工条件(三项三态)与模式面板的那一行 —— 都在 `#hint` 里
+       如实报;未知就写"未知",不省略(省略会与"没这一条"同形)。 */
+    parts.push(rushReadinessOf(rushAuthorityInput(), RUSH_SNAPSHOT_GAP).text);
+    if (uiFsm.activePanel === UiPanel.PARTY) {
+      parts.push(partyPanelOf(authority.state.meta, partyCursor).hint);
+    }
     parts.push(`缩放 ${isoCam.zoom}×([ / ])`);
     if (searchMode) parts.push(`搜索 "${invQuery}"(Enter 收下 / Esc 清空)`);
     if (lastMove !== '') parts.push(`拖拽 ${lastMove}`);
@@ -830,6 +861,50 @@ export function boot(container: HTMLElement): BootHandle {
   let bossGhost = 1;
   /** demo 用的「Boss 是否在场」开关(仅当快照里没有 boss 时生效) */
   let bossActive = false;
+
+  /* ── ★ WS-FND-151:派对**模式选择面板**的状态 ──
+
+     `partyCursor`  键盘光标(0 起,行下标;`j`/`l` 移动)
+     `partyModeNote` **入口回的那一句话**(成功 / 被拒 / 未连接都由
+                     `net/action_entry` 给,本文件不自己编词)
+     `partyModeSink` 发报文的端口,由 `main.ts` 注入(它才是装配根)
+
+     ⚠️ 面板的**内容**不在这里拼:`partyPanelOf(meta, cursor)` 每帧现算
+     (`ui/party_panel.ts`),名字与规则来自冻结层 `PARTY_MODES` ——
+     本文件只保存"光标停在哪"与"上一次选的结果"。 */
+  let partyCursor = 0;
+  let partyModeNote = '';
+  let partyModeSink: ((mode: number, key: string) => string) | null = null;
+
+  /**
+   * 急行开工三条件的**权威输入**。
+   *
+   * ⚠️ 今天**三项都只能给 `null`**(= 未知):线快照 `RoomState` 只有
+   * `meta / players / wildlife / bosses`,**没有 rooms、没有器件格**
+   * (`shared/types/wire.ts`)。世界侧那三条判定在
+   * `server/src/sim/world_sim.ts::stepRushEntry` 里,客户端拿不到。
+   * ⇒ 如实报 `?`(未知),**不假装 0**:假装 0 会让玩家反复去拆/重建一个
+   * 其实早就满足的条件。字段一上线,这里换成真值即可(判据盯着这一处)。
+   */
+  const rushAuthorityInput = (): RushReadinessInput => ({
+    canteen: null,
+    stations: null,
+    actorAtStation: null,
+  });
+
+  /** 选中某一档 → 经注入的端口发报文(单机时如实拒绝)。 */
+  const selectPartyMode = (mode: number): void => {
+    const opt = partyModeOptionAt(mode);
+    if (opt === null) {
+      partyModeNote = `没有第 ${String(mode)} 档模式(共 ${PARTY_MODE_COUNT} 档)`;
+      return;
+    }
+    partyCursor = opt.mode - 1;
+    partyModeNote = partyModeSink === null
+      ? `${opt.name} ✗ 未联机(单机模式不发报文)`
+      : partyModeSink(opt.mode, opt.key);
+    clickSound();
+  };
   /** 本帧该显示的 boss:HUD 的**唯一**数据源(权威优先,demo 兜底)。 */
   const bossView = (): BossHudView | null => {
     const authoritative = bossHudFrom(authority.state);
@@ -1202,6 +1277,22 @@ export function boot(container: HTMLElement): BootHandle {
     panel: (): string => uiFsm.activePanel,
     state: (): string => uiFsm.state,
     /**
+     * ★ WS-FND-151:选中第 `mode` 档(自检/截图脚本用)。
+     *
+     * headless Chrome 发不了键盘事件(`--screenshot` 只加载一次),
+     * 所以「面板画出来了吗 / 选了之后真的发报文了吗」必须有一个**显式**钩子。
+     * 返回值是入口回的那句话(成功 / 被拒 / 未联机都由 `net/action_entry` 决定)。
+     */
+    selectPartyMode: (mode: number): string => {
+      selectPartyMode(mode);
+      return partyModeNote;
+    },
+    /** 面板当前的光标与行数(`PARTY_MODES.length` 的镜像;用于断言"档数一致") */
+    partyPanel: (): { rows: number; cursor: number; currentMode: number } => {
+      const p = partyPanelOf(authority.state.meta, partyCursor);
+      return { rows: p.rows.length, cursor: p.cursor, currentMode: p.currentMode };
+    },
+    /**
      * 把**相机**搬到某格(自检截图用)。
      *
      * ⚠️ 它**不动玩家** —— 玩家位置唯一来源是权威状态(`telegraphCenterOf`),
@@ -1309,6 +1400,10 @@ export function boot(container: HTMLElement): BootHandle {
         ? `预警 ${bv.telegraph.shape} r=${bv.telegraph.radius.toFixed(1)} 格`
         : (bv !== null && bv.phases.length > 0 ? String(bv.phases[bv.phaseIndex]?.telegraph ?? '') : ''),
       party: partyHudOf(authority.state.meta),
+      /* ★ WS-FND-151:模式面板的内容(纯逻辑现算)+ 急行条件清单 */
+      partyPanel: partyPanelOf(authority.state.meta, partyCursor),
+      partyModeNote,
+      rush: rushReadinessOf(rushAuthorityInput(), RUSH_SNAPSHOT_GAP),
       blueprintNote: bpSummary,
       /* ★ 提示行说清"谁动"与"谁跟":WASD 动的是**角色**,相机是**跟随** ——
          接线前这里写的是「WASD 平移」,那句话现在是错的,而错文案没人会去测。
@@ -1414,6 +1509,10 @@ export function boot(container: HTMLElement): BootHandle {
           durationSec: 0.5,
           velocity: 0.9,
         });
+      } else if (hit.kind === 'partyMode') {
+        /* ★ WS-FND-151:点模式面板的某一行 = 选中它(与 `Enter` 走同一条路:
+           光标先对齐,再交给注入的端口发报文)。 */
+        selectPartyMode(hit.mode);
       }
       e.preventDefault();
       return;
@@ -1538,6 +1637,31 @@ export function boot(container: HTMLElement): BootHandle {
     const key = e.key.toLowerCase();
     const panel = panelKeyOf(key);
     if (panel !== null) { setPanel(panel); return; }
+    /* ★ WS-FND-151:模式面板的选中键(`j` / `l` / `enter`)。
+
+       键位表在 `ui/panel_keys.PARTY_PANEL_KEYS` 并进 `keyGroups()` —— 与其它组
+       撞车会**当场红**;`1..4` 因此**不能**当模式键(它们是 `HOTBAR_KEYS`)。
+       ⚠️ 搜索态在上面第一支就 `return` 了(与 `net/key_guard.ts` 同一条口径:
+          文本输入态里这些键一律让路)⇒ 在搜索框打字不会误选模式。 */
+    if (uiFsm.activePanel === UiPanel.PARTY) {
+      if (key === PARTY_PANEL_KEYS.prev) {
+        partyCursor = movePartyCursor(partyCursor, -1);
+        clickSound();
+        e.preventDefault();
+        return;
+      }
+      if (key === PARTY_PANEL_KEYS.next) {
+        partyCursor = movePartyCursor(partyCursor, 1);
+        clickSound();
+        e.preventDefault();
+        return;
+      }
+      if (key === PARTY_PANEL_KEYS.confirm) {
+        selectPartyMode(partyCursor + 1);
+        e.preventDefault();
+        return;
+      }
+    }
     switch (key) {
       /* ★ 6 档缩放:`[` 缩小 / `]` 放大。两个键都只调 `stepZoom`(端点不越界),
          然后重建相机 —— 只写 `isoCam.zoom` 而不 `syncCamera()` 的话,
@@ -1922,6 +2046,8 @@ export function boot(container: HTMLElement): BootHandle {
     setPoseSource: (fn) => { poseSource = fn; },
     /* ★ 第七轮审计 P2:`main.ts` 的动作键监听靠它判断"现在是不是在打字" */
     textInputActive: () => searchMode,
+    /* ★ WS-FND-151:模式面板的发文端口由 `main.ts` 注入(它持有 socket) */
+    setPartyModeSink: (fn) => { partyModeSink = fn; },
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.length,
@@ -2180,6 +2306,33 @@ export function boot(container: HTMLElement): BootHandle {
             scoreA: p.scoreA,
             scoreB: p.scoreB,
             text: p.text,
+          };
+        })(),
+        /* ★ WS-FND-151:模式面板 + 急行开工条件 —— 让"面板列了几档 / 选中发了没 /
+         * 三条前置各是什么态"在自检口径里**可读**,而不是只能靠看图。 */
+        partyPanel: (() => {
+          const p = partyPanelOf(authority.state.meta, partyCursor);
+          return {
+            total: PARTY_MODE_COUNT,
+            rows: p.rows.length,
+            cursor: p.cursor,
+            currentMode: p.currentMode,
+            currentName: p.currentName,
+            selectedKey: p.selected === null ? null : p.selected.key,
+            note: partyModeNote,
+            open: uiFsm.activePanel === UiPanel.PARTY,
+          };
+        })(),
+        rush: (() => {
+          const r = rushReadinessOf(rushAuthorityInput(), RUSH_SNAPSHOT_GAP);
+          return {
+            total: r.total,
+            met: r.met,
+            unmet: r.unmet,
+            unknown: r.unknown,
+            text: r.text,
+            states: r.rows.map((x) => `${x.id}:${x.state}`),
+            note: r.note,
           };
         })(),
         /* 接线台账(生产读点):哪些装配函数**仍未接**、每条的原因在

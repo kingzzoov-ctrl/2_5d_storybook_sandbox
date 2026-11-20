@@ -62,6 +62,10 @@ import {
 } from './schema.ts';
 import { MAX_LEVEL } from '../../../shared/types/entities.ts';
 import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
+/* ★ WS-FND-152:背包容量槽数的**唯一出处**(与冻结层 `statsAtLevel` 同源)。
+   修前本文件内联 `8 + (lv-1)` —— 那是同一条规则的第二份实现,改冻结层/改档案都不会
+   让容量动一位,而两份数恰好相等 ⇒ 没有判据看得出它们已经分开。 */
+import { carryCapacityOfLevel } from '../combat/progression.ts';
 /* ★ 第六轮:`meta.partyTimer/scoreA/scoreB` 的**数据源**在本房间的派对赛局记录里
    (`START_PARTY` 写的那份,单例模块)。只读两个导出,不碰它的写口。 */
 import { PartyPhase, endParty, partyStateOf } from './actions/start_party.ts';
@@ -93,6 +97,45 @@ export const EVICT_MS = 24 * 60 * 60 * 1000;
 export const HEARTBEAT_TIMEOUT_MS = 5_000;
 /** 每帧最多处理的动作条数(防止单帧被灌爆)。 */
 export const MAX_ACTIONS_PER_TICK = 64;
+
+/**
+ * ★ **自动存档的墙钟周期 = 30 秒**(owner 裁定 2026-11-20:像 Minecraft 一样
+ * 自动保存 —— **不提供**手动 `SAVE`/`LOAD` 动作)。
+ *
+ * ## 为什么是「周期」而不是「手动动作」
+ * 手动存档在多人房里没有正确答案:谁有权存?存的是谁的世界?而丢档的代价由
+ * 玩家承担(他可以「忘了存」)。⇒ 存档是**服务端职责**,与帧循环同一个生命周期。
+ *
+ * ## 两条触发轨,取**先到者**
+ * ```
+ * 帧节流  AUTOSAVE_FRAME_INTERVAL = 20 帧(20Hz ⇒ 1 秒)  ← 既有口径(WS-FND-02 C25 钉着)
+ * 墙钟轨  AUTOSAVE_INTERVAL_MS    = 30 秒                ← 本常量
+ * ```
+ * 保留帧节流不是遗留:它是「20Hz 下不许每帧写库」的**下界**(去掉就退化成 20Hz
+ * 写库,C25 当场红);墙钟轨补的是帧节流**保证不了**的那一半 —— 房间被低频驱动
+ * (`step()` 一秒才来一次、或长时间没人推进)时,「至少每 30 秒落一次盘」才是
+ * 可兑现的承诺。
+ *
+ * ## 失败面全部是可观测量
+ * `lastSaveAt` / `saveCount` / `lastSaveError` / `saveFailCount` / `saveErrors`
+ * —— 失败**不抛**(那会让一帧的写库错误掀掉整个房间),但也**不静默**
+ * (见 `saveWorldNow()`)。丢档最怕的不是写失败,是**没人知道**它失败过。
+ */
+export const AUTOSAVE_INTERVAL_MS = 30_000;
+
+/** 帧节流:每 20 帧一次低频落盘(20Hz ⇒ 1 秒;`tests/WS-FND-02` C25 钉着这个数)。 */
+export const AUTOSAVE_FRAME_INTERVAL = 20;
+
+/** 存档失败日志的环形上限(诊断够用即可,不随房间寿命增长)。 */
+export const SAVE_ERROR_LOG_MAX = 8;
+
+/**
+ * 触发一次存档的**原因**(写进 `lastSaveReason`,失败日志里也带)。
+ *
+ * 为什么要有它:只看 `saveCount` 涨了,分不清「周期到了」与「玩家退出触发的」
+ * —— 而这两件事在排查「为什么这一版存档里少了一个人」时是完全不同的答案。
+ */
+export type AutosaveReason = 'frame' | 'interval' | 'leave' | 'dispose' | 'reset' | 'manual';
 
 /**
  * `meta.partyTimer` 的上界:24 小时。
@@ -925,6 +968,18 @@ export interface WorldSaveHost {
    */
   levelOf?(playerId: string): number;
   /**
+   * ★ WS-FND-152:该玩家的**背包容量槽数**(权威 = 成长档案的 `carrySlots`)。
+   *
+   * 为什么需要这个读口:修前 `carryCapacityOf` **内联**了 `8 + (lv-1)` ——
+   * 那条算式与 `progression.statsAtLevel` 是同一条规则的**两份实现**,
+   * 于是「改档案 / 改冻结层」都不会让房间容量动一位,而两者数值恰好相等,
+   * **没有判据能看出它们已经分开**。现在房间先问这一口。
+   *
+   * 可选(与 `levelOf?` 同一取舍):老的世界源没实现它时,容量回落到
+   * `combat/progression.ts#carryCapacityOfLevel(level)` —— 仍是同一出处,不报错。
+   */
+  carrySlotsOf?(playerId: string): number | null;
+  /**
    * 把一次**已获准**的移动写进世界(权威位置 = `physics.bodies`)。
    *
    * ## 为什么需要它(task-58 的缺口)
@@ -1468,8 +1523,10 @@ export interface SimReadView {
  * ## ⚠️ 为什么 `level` 要夹上界,而 `hp`/`maxHp` 不夹
  *
  * `level` 夹一次(与既有 `syncLevelProjections` 同口径),理由是本字段的
- * **消费者不夹**:`carryCapacityOf` 直接 `8 + (lv - 1)`。若投影越界,
- * 房间容量口径与 `progression.statsAtLevel`(已钳)就分歧了。
+ * **消费者不夹**:`carryCapacityOf` 现在**不再自己算**(WS-FND-152:改调
+ * `combat/progression.ts#carryCapacityOfLevel`,与 `statsAtLevel` 同一出处)。
+ * 但投影仍必须夹:档案 `carrySlots` 走的是玩家等级,而等级越界会让
+ * `state.players[].level` 与档案等级分歧 —— 那正是这一行的由来。
  * 而 `hp`/`maxHp` 的钳制**已经在 `VitalsSystem` 内**(`syncMaxHp` 策略 C),
  * ⇒ 在这里再钳一次就是**第二份实现**(本仓明确的缺陷形态)。
  * ⇒ 分工:上界统一一处(`vitals` 管生命、`progression` 管等级),
@@ -1786,6 +1843,48 @@ export class RoomRuntime {
     hpSkipped: number;
     memRow: number;
   } | null = null;
+
+  /* ══════════ ★ 自动存档的可观测面(owner 裁定:像 Minecraft 一样自动保存)══════════
+   *
+   * 这几个格**不是第二份真值**:真值仍在库(`users.hp` / `rooms.mob_mem_json`),
+   * 它们只回答「上一次存档什么时候发生、成了几次、失败过没有」——
+   * 也就是「丢了档的话,能不能当场看出来」。修前这三个问题**没有任何答案**:
+   * 落盘只在 `step()` 里被顺手调一下,成没成只体现在 `lastSaveReport`
+   * (而它答的是「写了几条」,不是「写没写成」)。
+   */
+
+  /** 最近一次**成功**存档的时刻(注入时钟);null = 从未存过。 */
+  lastSaveAt: number | null = null;
+  /** 成功存档的**累计次数**(幂等重存也算一次 —— 数据不变,见 `saveWorldNow`)。 */
+  saveCount = 0;
+  /** 存档失败的累计次数(与 `lastSaveError` 成对读)。 */
+  saveFailCount = 0;
+  /**
+   * 最近一次存档失败的错因;null = 无失败。
+   *
+   * ⚠️ 失败**不抛**也**不清空**旧存档:库还留着上一版,而这件事必须被看见
+   * (`console` 之外还有 `saveErrors` 环形日志 + 这个字段)。
+   */
+  lastSaveError: string | null = null;
+  /** 触发最近一次存档的**原因**(周期 / 离场 / 销毁 / 重置)。 */
+  lastSaveReason: AutosaveReason | null = null;
+  /** 存档失败日志(环形,最多 `SAVE_ERROR_LOG_MAX` 条)。 */
+  readonly saveErrors: { at: number; reason: AutosaveReason; message: string }[] = [];
+  /**
+   * 上一次**跳过**存档的原因(`no-db` / `no-host`);null = 最近一次没有跳过。
+   *
+   * 与 `lastSaveError` 互斥且分工明确:跳过是「本来就没得存」(纯内存模式 /
+   * 本房间没有模拟层),失败是「该存没存成」。把两者混成一个字段会让
+   * 「测试里的内存模式」看起来像「生产在丢档」。
+   */
+  lastSaveSkipReason: 'no-db' | 'no-host' | null = null;
+  /**
+   * 墙钟轨的水位(= 最近一次存档时刻;构造时 = 建房时刻)。
+   *
+   * 与 `lastSaveAt` 分开的理由:`lastSaveAt` 是**对外**的读数(可被手动改),
+   * 而这条是调度用的内部水位 —— 让它俩共用一个字段等于把调度状态暴露成公开 API。
+   */
+  private lastAutosaveAtMs: number;
   /**
    * 上一次读档恢复:`restoreFromProfile` 返回的**生效玩家数**;null = 从未尝试。
    *
@@ -1907,6 +2006,9 @@ export class RoomRuntime {
     this.state = createRoomState(this.id);
     this.ac = new AntiCheatRoom();
     this.lastActivityMs = this.clock.nowMs();
+    /* ★ 墙钟轨的水位从这里开始 —— 建房即「刚存过」,否则首帧就会因为
+       `now - 0 >= 30s` 而误触发一次存档(开机顺序就会变成「先落盘再热闹」)。 */
+    this.lastAutosaveAtMs = this.lastActivityMs;
     /* ── 身份鉴权(审计 P0-1):私钥 + 强制开关 + 房主凭证 ──
        顺序有要求:`authSecret` 必须先于 `ownerToken`(后者要签名),
        而两者都必须在 `this.id` / `this.clock` 之后(载荷里要 roomId 与过期时刻)。 */
@@ -2354,6 +2456,12 @@ export class RoomRuntime {
 
   close(): boolean {
     if (this.status === RoomStatus.CLOSED) return false;
+    /* ★ owner 裁定「销毁即存」(2026-11-20):`room.colyseus.ts` 的 `onDispose`
+       与命令式 `CLOSE_ROOM` 都落到本方法 —— 这是「房间实例即将消失」的
+       **唯一**存档时机。放在改状态**之前**:存档会写 `last_active_at`,
+       它描述的是「最后一帧世界还活着」,不该被「已关闭」抢先盖掉。
+       幂等:第 2 次 `close()` 在上一行就早退了,不会重复存。 */
+    this.saveWorldNow('dispose');
     this.status = RoomStatus.CLOSED;
     /* ★ WS-FND-123:退订世界总线 —— 房间关闭后世界可能还活着(装配层可能复用
        host),留着订阅会让播报继续堆进一个已关闭房间的 outbox(纯泄漏)。 */
@@ -2490,6 +2598,11 @@ export class RoomRuntime {
   leave(userId: string): boolean {
     const s = this.members.get(userId);
     if (!s) return false;
+    /* ★ owner 裁定「离场即存」(2026-11-20):先落盘、**再**摘席位。
+       反序的话离场者已从 `vitals` 里被摘掉 ⇒ 他这一局的血量/进度永远存不进去
+       (库里留着的是上一版的旧值,而没有任何东西会报错)。
+       `purgeSeat` 之后的下一次存档(周期 / 销毁)因此**不含这个幽灵实体**。 */
+    this.saveWorldNow('leave');
     this.purgeSeat(userId);
     if (s.role === RoomRole.OWNER && this.members.size > 0) {
       /* 房主走了:把 OWNER 传给最早的在线 ADMIN/MEMBER。 */
@@ -2770,6 +2883,13 @@ export class RoomRuntime {
        `beginSleep` 仍可能把**上一世代**的窗口原样返回(「刚上床就已睡了一半」)。
        换代点是**唯一**的:RESET_WORLD 成功这一刻(与 `startWorldPartyRun` 同一位置)。 */
     if (outcome.ok && action === RoomAction.RESET_WORLD) bumpSleepGeneration(this.id);
+    /* ★ owner 裁定「重置即存」(2026-11-20):`RESET_WORLD` 成功 ⇒ **立刻**落一次盘。
+       为什么不能等周期:重置之后世界里所有刚体/血量/生物 mem 都换了一代,
+       若在下一个周期到点之前进程退出,库里留着的是**旧世代**的状态,而回执
+       已经告诉玩家「世界换了」—— 那正是「回执与存档两份真值」的形态。
+       ⚠️ 只存**新世界**(旧世界由宿主的 `resetWorld` 走归档,见 D-06);
+          本行不碰归档,也不改 DDL。 */
+    if (outcome.ok && action === RoomAction.RESET_WORLD) this.saveWorldNow('reset');
     /* ★ WS-FND-123(P1-4/P1-5):回执出口。只在**成功**回执上加新键,
        失败回执的形状一个字节都不动(既有断言不受影响)。 */
     return outcome.ok ? this.withPartyReceipt(outcome) : outcome;
@@ -3437,16 +3557,27 @@ export class RoomRuntime {
   }
 
   /**
-   * 权威背包容量 —— 由**等级**决定,不是客户端自报值。
+   * 权威背包容量 —— 不是客户端自报值(WS-FND-152 起也不再是**第二份**口径)。
    *
-   * 口径:`statsAtLevel(L).carrySlots = 8 + (L-1)`(见 `progression.ts`)。
-   * 本方法内联同一公式而非 import 该模块 —— 因为 `progression.ts` 目前在
-   * 可达性白名单里(待接线),网络层不该依赖一个尚未接入的模块。
-   * 两者数值必须一致,由 `tests/WS-07.test.ts` 钉住。
+   * ## 两个来源,按优先级
+   *
+   * ```text
+   * 1 世界源的 `carrySlotsOf(userId)`  ← 成长档案的 carrySlots(每级由 recompute 重算,
+   *                                      带天赋摊平)⇒ 改档案真的会改容量
+   * 2 回落到 `carryCapacityOfLevel(level)` ← 与冻结层 statsAtLevel 同源
+   * ```
+   *
+   * 修前这里是内联的 `8 + (lv - 1)`:与 `progression.statsAtLevel` 是同一条规则的
+   * **两份实现**。两份数今天恰好相等 ⇒ **没有任何判据能看出它们已经分开**;
+   * 而改冻结层 / 改档案都不会让房间容量动一位。判据:`tests/WS-FND-152`。
    */
   carryCapacityOf(userId: string): number {
+    const fromWorld = this.worldSaveHost?.carrySlotsOf?.(userId) ?? null;
+    if (fromWorld !== null && Number.isFinite(fromWorld) && fromWorld > 0) {
+      return Math.trunc(fromWorld);
+    }
     const lv = this.state.players.find((p) => p.id === userId)?.level ?? 1;
-    return 8 + (lv - 1);
+    return carryCapacityOfLevel(lv);
   }
 
   /** 本地总量记账(仅 `db === null` 时参与计算;有库时以库为准)。 */
@@ -3529,6 +3660,87 @@ export class RoomRuntime {
     return out;
   }
 
+  /* ── 4.35 自动存档(★ owner 裁定 2026-11-20:像 Minecraft 一样自动保存)── */
+
+  /**
+   * **存一次世界** —— 自动存档的**唯一落点**(全部触发源都经这里,
+   * 不另立第二套存档格式)。
+   *
+   * ## 为什么是「唯一落点」
+   * 存档动作此前**只**在 `step()` 的 20 帧节流里出现过一次;而「离场 / 销毁 /
+   * 重置」这三种时机各自都需要同一件事。若三处各写一遍 `host.saveToDb(...)`,
+   * 那么「失败怎么记」「报告怎么填」「水位怎么推」就会长出**三份口径** ——
+   * 本仓 1 号病根(两份实现)的最小形态。⇒ 三处只决定**何时**调,本方法决定**怎么调**。
+   *
+   * ## 复用既有存档路径
+   * 落盘走 `host.saveToDb(db, roomId, nowMs)`(HP → `users.hp`、生物 mem →
+   * `rooms.mob_mem_json`),读回走 `loadFromDb` / `restoreFromProfile`。
+   * 本方法**不引入任何新格式**、不写新表、不改 DDL。
+   *
+   * ## 失败**不抛**,但绝不静默
+   * ``` 
+   * 抛出去 ⇒ 一次写库失败会掀掉整个房间(离场路径还会吞掉席位回收);
+   * 静默   ⇒ 表现与「存成功了」逐字相同 —— 本仓反复记的那类缺陷。
+   * ```
+   * ⇒ 记 `lastSaveError` / `saveFailCount` / `saveErrors[]`,并且**不动** `lastSaveAt`
+   *   与 `saveCount`(那两个数只描述**成功过**的次数与时刻)。
+   *
+   * @param reason 触发原因(周期 / 离场 / 销毁 / 重置 / 手动)。
+   * @returns `true` = 这一次真的写进了库;`false` = 跳过(无库/无世界源)或失败。
+   *          ⚠️ 调用方**不要**把它当错误处理依据 —— 它们看 `lastSaveError` 与
+   *          `lastSaveSkipReason`(两者互斥,不会同时非空)。
+   */
+  saveWorldNow(reason: AutosaveReason = 'manual'): boolean {
+    const db = this.db;
+    const host = this.worldSaveHost;
+    const now = this.clock.nowMs();
+    /* 没有库 / 没有世界源 / 老宿主没实现 `saveToDb` ⇒ **什么都不做**。
+       不写 `lastSaveAt`、不产 `lastSaveReport` —— 不撒谎说存过了
+       (与 step 里那段 `if (this.worldSaveHost)` 同一 null 契约)。 */
+    if (db === null || host === null || typeof host.saveToDb !== 'function') {
+      this.lastSaveSkipReason = db === null ? 'no-db' : 'no-host';
+      return false;
+    }
+    try {
+      const r = host.saveToDb(db, this.id, this.lastActivityMs);
+      /* 报告与库是**同一份**写入的结果:报告的 tick 取**存档后**的房间帧号,
+         与 `world_tick` 同版(否则读回时两者会差一帧)。 */
+      this.lastSaveReport = {
+        tick: this.state.meta.tick,
+        hpSaved: r.hpSaved,
+        hpSkipped: r.hpSkipped,
+        memRow: r.memRow,
+      };
+      this.lastSaveAt = now;
+      this.lastAutosaveAtMs = now;
+      this.lastSaveReason = reason;
+      this.saveCount += 1;
+      this.lastSaveError = null;
+      this.lastSaveSkipReason = null;
+      return true;
+    } catch (e) {
+      const message = ((e as Error)?.message ?? String(e)).slice(0, 160);
+      this.lastSaveError = `自动存档失败(${reason}):${message}`;
+      this.saveFailCount += 1;
+      this.saveErrors.push({ at: now, reason, message });
+      if (this.saveErrors.length > SAVE_ERROR_LOG_MAX) this.saveErrors.shift();
+      return false;
+    }
+  }
+
+  /**
+   * 本帧该不该自动存档 —— 返回**原因**(`null` = 本帧不存),而不是布尔:
+   * 「周期到点」与「帧节流到点」在排查存档频率时是两个答案,不该被压成一个 `true`。
+   *
+   * 判序(帧节流优先):它同时是 `world_tick` 的写点(C25 钉着第 20 帧),
+   * 两轨都到点时按帧节流记账能保持既有的 tick 语义。
+   */
+  private autosaveDue(): AutosaveReason | null {
+    if (this.state.meta.tick % AUTOSAVE_FRAME_INTERVAL === 0) return 'frame';
+    if (this.clock.nowMs() - this.lastAutosaveAtMs >= AUTOSAVE_INTERVAL_MS) return 'interval';
+    return null;
+  }
+
   /* ── 4.4 每帧推进 ── */
 
   /**
@@ -3605,35 +3817,30 @@ export class RoomRuntime {
     this.syncPartyHud();
 
     this.checkIdleSleep();
+    /* ══════════ ★ 自动存档(owner 裁定 2026-11-20:不提供手动 SAVE/LOAD)══════════
+     * 两条轨取**先到者**,见 `AUTOSAVE_INTERVAL_MS` / `autosaveDue()`:
+     *   · 帧节流(每 `AUTOSAVE_FRAME_INTERVAL` 帧 = 1 秒)—— 既有口径,C25 钉着;
+     *   · 墙钟(每 `AUTOSAVE_INTERVAL_MS` = 30 秒)—— 低频驱动下的保底。
+     * 落盘动作本身**只有一个实现**(`saveWorldNow()`):这里只决定「何时」。
+     */
     if (this.db) {
       /* 世界帧号低频落盘(每 20 帧 = 1 秒),避免 20Hz 写库。 */
-      if (this.state.meta.tick % 20 === 0) {
+      if (this.state.meta.tick % AUTOSAVE_FRAME_INTERVAL === 0) {
         this.db.update('rooms', { id: this.id }, {
           world_tick: this.state.meta.tick,
           last_active_at: this.lastActivityMs,
         });
-        /* ── 同一时机把「运行时状态」也落盘(WS-05 D7 + WS-04 §430)──
-           刻意复用这条 20 帧节流,而不是另起一个计时器:
-           两者都是「世界状态低频落盘」,同样的理由(20Hz 写库会打爆 I/O),
-           同样的时机(每秒一次)才自洽 —— 两个独立周期会让读回的
-           帧号与存档内容互相错位。
-
-           为什么放在 world_tick **之后**:`saveToDb` 里 `saveRoomMobMem`
-           也会写 `last_active_at`,先写帧号再写内容,两者落在同一秒;
-           顺序固定,读回时 `world_tick` 与 `mob_mem_json` 必然同版。
-
-           `worldSaveHost` 为 null 时**什么都不做** —— 不撒谎说存过了。 */
-        if (this.worldSaveHost) {
-          const r = this.worldSaveHost.saveToDb(this.db, this.id, this.lastActivityMs);
-          this.lastSaveReport = {
-            tick: this.state.meta.tick,
-            hpSaved: r.hpSaved,
-            hpSkipped: r.hpSkipped,
-            memRow: r.memRow,
-          };
-        }
       }
+      const due = this.autosaveDue();
+      if (due !== null) this.saveWorldNow(due);
+      /* ⚠️ 为什么 `world_tick` 写在**存档之前**:`saveToDb` 里 `saveRoomMobMem`
+         也会写 `last_active_at`,先写帧号再写内容,两者落在同一秒;
+         顺序固定,读回时 `world_tick` 与 `mob_mem_json` 必然同版。
+
+         `worldSaveHost` 为 null 时 `saveWorldNow` **什么都不做**(只记
+         `lastSaveSkipReason`)—— 不撒谎说存过了。 */
     }
+
     /* ⚠️ 必须在 `if (this.db)` **之外** —— 等级投影与有没有数据库无关。
        (放进去的话,纯内存模式 `db === null` 就永远不同步等级,
        而那正是测试最常用的形态。) */
@@ -4009,8 +4216,9 @@ export class RoomRuntime {
    *
    * 理由不是「模拟层可能溢出」(`combatantStats`
    * 内部已钳到 `MAX_LEVEL`),而是**本字段的消费者不钳**:
-   * `carryCapacityOf` 直接 `8 + (lv - 1)`,而 `progression.statsAtLevel` 的口径
-   * 是 `8 + (L-1)` 且 `L` 已被钳 ⇒ 投影越界会让两处口径分歧。
+   * `CarrySystem` 的容量闸读 `state.players[].level`(经 `carryCapacityOf` ⇒
+   * `progression.carryCapacityOfLevel`,与 `statsAtLevel` 同一出处),它**不会**再
+   * 自己钳一次 ⇒ 投影越界(level=31)就会让「容量 = 8+30」这类越界值直接生效。
    * 该上界此前是**惰性**的(level 恒 1),接线后即时生效 ——
    * 由 `WS-07 E18` 两侧扫描钉住(level=30 ⇒ 37;level=31 ⇒ 仍 37)。
    */

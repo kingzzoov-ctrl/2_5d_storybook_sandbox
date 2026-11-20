@@ -996,6 +996,65 @@ export function levelDamageMul(level: number): number {
   return statsAtLevel(Math.max(1, Math.min(MAX_LEVEL, level))).dmgMul;
 }
 
+/* ═══════════ 锻造按稀有度**分档**加成(★ 待平衡(owner),WS-FND-152)═══════════
+ *
+ * ## 手册没给数值 ⇒ 三档 + 具名常量
+ *
+ * 炼金/锻造产物带 `ItemInstanceStats.rarity_tier`(0 凡品 / 1 奇巧 / 2 秘宝 /
+ * 3 神来之笔 —— `alchemy/attributes.ts` 的四档)。手册只说了「越稀有越强」,
+ * **没有任何一行给加成数值**。owner 裁定「全接」⇒ 按**三档**落地:
+ *
+ * ```text
+ * 档 0  稀有度 0(凡品)                         ⇒ +0
+ * 档 1  稀有度 1(奇巧)                         ⇒ +1
+ * 档 2  稀有度 2 与 3(秘宝 / 神来之笔)          ⇒ +2
+ * ```
+ *
+ * 为什么是**平加**而不是百分比:产物的 `rolled.atk/def`(见 `shared/types/alchemy.ts`)
+ * 是**绝对点数**,而锻造出的奇物今天没有「基准攻击力」这个量可以乘 —— 对 60 攻的产物
+ * `+10%` 是 66、对 20 攻的产物是 22,两个数差 3 倍,反而让「稀有」与「数值」脱钩。
+ * 平加只有一格,可断言、可手算。
+ *
+ * ⚠️ 三档是**封顶**的:稀有度 3 与 2 同档(+2)。**待平衡(owner)**:真要分四档,
+ *    把 `FORGE_TIER_STAT_BONUS` 换成四元数组,消费点(`WorldSim.forgeAlchemy`)自动跟上。
+ */
+export const FORGE_TIER_STAT_BONUS: readonly number[] = Object.freeze([0, 1, 2]);
+
+/**
+ * 稀有度 → 锻造加成档位(`FORGE_TIER_STAT_BONUS` 的下标)。
+ *
+ * 非法 / 负数 / 非有限 tier 一律按**最低档**(0)处理:锻造产物是玩家资产,
+ * 「参数坏了就白送 +2」比「按最保守档」危险得多(fail-closed)。
+ */
+export function forgeTierIndexOf(rarityTier: number): number {
+  const top = FORGE_TIER_STAT_BONUS.length - 1;
+  if (!Number.isFinite(rarityTier)) return 0;
+  const i = Math.trunc(rarityTier);
+  if (i <= 0) return 0;
+  return Math.min(top, i);
+}
+
+/** 稀有度 → 平加点数(0 / +1 / +2)。 */
+export function forgeTierBonusOf(rarityTier: number): number {
+  return FORGE_TIER_STAT_BONUS[forgeTierIndexOf(rarityTier)];
+}
+
+/**
+ * 把分档加成落到产物的**战斗点数**上(`atk` / `def`)。
+ *
+ * 只读 `rolled.atk` / `rolled.def` 两项:那是这套产物在战斗侧唯一被消费的两个数
+ * (`hp/impulse/util` 今天没有任何战斗消费者,给它们加点是**第二个真值**)。
+ * 非法点数按 0 处理,输出恒有限。
+ */
+export function applyForgeTierBonus(
+  rolled: { atk: number; def: number },
+  rarityTier: number,
+): { atk: number; def: number; bonus: number } {
+  const bonus = forgeTierBonusOf(rarityTier);
+  const base = (v: number): number => (Number.isFinite(v) && v > 0 ? v : 0);
+  return { atk: base(rolled.atk) + bonus, def: base(rolled.def) + bonus, bonus };
+}
+
 /* ───────────────────────────── 嘲讽/仇恨工具 ───────────────────────────── */
 
 /** 242 大声公扩音喇叭:强制 8 格内怪物仇恨转向。 */

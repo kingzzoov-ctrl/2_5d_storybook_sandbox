@@ -8,7 +8,7 @@
  * | # | 审计原话 | 核实结论 | 本套件怎么钉 |
  * | :-- | :--- | :--- | :--- |
  * | 1 | 35 件玩具仅 3 件进生产,缺玩家→玩家 `applyPrank` 入口,`PRANK` 分支仍 `NONE` | **已过期**(入口在 w49 接上了),**但台账在撒谎** | FND148-1/2/3:半径真的决定成败、34 件逐件可判、台账与 `itemUseKind` 逐 ID 对账 |
- * | 2 | `TALENTS`/`activeTalents` 未接生产 | **部分成立**:`dmgMul` 已接、梦境启示两个数值已接、`carrySlots` 与其余 16 个字段未接 | FND148-4/5/6/7:行为正例 + 逐条台账 + 反向扫描 + 注入 |
+ * | 2 | `TALENTS`/`activeTalents` 未接生产 | **部分成立**:`dmgMul` 已接、梦境启示两个数值已接、`carrySlots` **已接(WS-FND-152)**,其余 16 个字段未接 | FND148-4/5/6/7:行为正例 + 逐条台账 + 反向扫描 + 注入 |
  * | 3 | 急单 `stock` 恒空、房间等级未接入 | **成立**(房间等级早已登记;`stock` 未登记) | FND148-8/9:空表的两个可观测退化、真库存的行为差异、台账与生产对账 |
  * | 4 | `mobs/taming.ts` 27 导出 0 引用 | **已过期(WS-FND-146)** | FND148-10:复用行为 + 容器往返,只此一行 |
  *
@@ -362,15 +362,24 @@ test('FND148-6 ★★ 其余 5 条天赋未接:台账 + 反向扫描 + 注入;�
     '★ 世界侧调用点从未传 reviveTimeMul ⇒ 急救快手在生产里恒不生效(与台账 UNWIRED 一致)');
 });
 
-test('FND148-7 ★★ carrySlots 未接:档案改到 99,房间容量仍是 8(行为)', () => {
+test('FND148-7 ★★ carrySlots **已接**(WS-FND-152 反转):档案改到 99 ⇒ 房间容量 99;复原 ⇒ 8', () => {
+  /* ★ 2026-11-19(owner 裁定「全接」/ WS-FND-152):本条此前钉的是「档案改成 99,
+     房间容量仍是 8」—— 那条**不是**目标行为,而是「`net/room.ts#carryCapacityOf`
+     内联了 `8 + (lv-1)`」这件事实的写照。容量闸现在读世界源的 `carrySlotsOf`
+     (档案字段),没有世界源才回落到 `progression.carryCapacityOfLevel`(同一出处)。
+     ⇒ 判据按新口径反转:**改档案必须真的改容量**(否则「接线」是空话)。 */
   const r = room({ players: ['p1'] });
-  eq(r.rt.carryCapacityOf('p1'), 8, '前置:lv1 的容量闸 = 8 + (1−1)');
+  eq(r.rt.carryCapacityOf('p1'), 8, '前置:lv1 无档案 ⇒ 容量闸 = 8(等级派生)');
   r.sim.progressOf('p1').carrySlots = 99;
-  eq(r.rt.carryCapacityOf('p1'), 8, '★ 档案 carrySlots=99 **不影响**容量闸 ⇒ 该字段仍无读者');
+  eq(r.rt.carryCapacityOf('p1'), 99, '★ 档案 carrySlots=99 ⇒ 容量闸 99(该字段**有**读者)');
+  r.sim.progressOf('p1').carrySlots = 8;
+  eq(r.rt.carryCapacityOf('p1'), 8, '★ 复原(负对照):容量跟着回到 8,不是只读一次的快照');
   const row = PROGRESS_FIELD_WIRING.find((x) => x.field === 'carrySlots');
-  eq(row?.status, 'UNWIRED', '台账把 carrySlots 记为 UNWIRED(与上面的行为一致)');
+  eq(row?.status, 'WIRED', '台账把 carrySlots 记为 WIRED(与上面的行为一致)');
   ok(String(SOURCES.get('server/src/net/room.ts')).includes('carryCapacityOf('),
-    '容量闸就在 net/room.ts(口径只有一份,故不改)');
+    '容量闸仍在 net/room.ts(写入口只有一处)');
+  ok(!/8\s*\+\s*\(\s*lv\s*-\s*1\s*\)/.test(stripCommentsForAudit(String(SOURCES.get('server/src/net/room.ts')))),
+    '★ 内联算式已删(剥注释后仍无):容量口径只剩 `progression.carryCapacityOfLevel` 一处');
 });
 
 /* ══════════════ 3. 急单 stock ══════════════ */

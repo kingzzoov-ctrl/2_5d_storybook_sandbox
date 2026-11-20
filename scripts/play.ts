@@ -37,6 +37,16 @@
  * 不做鉴权:本地单人/联机试玩,`?server=` 指哪连哪 —— 这不是部署脚本
  * 不做"登录":userId 由 URL/hello 决定(见 ws_server 的契约 §12.2)
  * ```
+ *
+ * ## 存档(★ 2026-11-20 owner 裁定:像 Minecraft 一样自动保存)
+ *
+ * ```
+ * 默认    ./.data/world.db   ← 文件库;`--db <path>` 换路径
+ *         ⇒ 房间自动存档:30 秒周期 + 玩家离场 + 房间销毁 + 世界重置(见 net/room.ts)
+ * --memory 显式内存模式      ← 不落盘,退出即丢(「只看一眼」的试玩用)
+ * ```
+ * **没有**手动 `SAVE` / `LOAD` 动作 —— 存的就是同一个世界:库在,重启接着玩;
+ * 关掉进程时库里留的是**最后一次自动存档**(本脚本在 `SIGINT` 时会额外存一次)。
  */
 
 import { spawn } from 'node:child_process';
@@ -44,7 +54,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assemble } from '../server/src/index.ts';
+import { DEFAULT_DB_PATH, assemble } from '../server/src/index.ts';
 import { startWsServer } from '../server/src/net/ws_server.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -61,6 +71,16 @@ const WEB_PORT = numArg('web-port', 5173);
 /** 世界边长(格)。96 足够走一圈看到地形、怪与屋顶;**再大会拖慢首帧建面**。 */
 const WORLD_CELLS = numArg('size', 96);
 
+/* ── 存档目标(★ 2026-11-20 owner 裁定:自动保存)──
+   `--memory` = 显式内存模式:`--db` 与默认路径都不生效,进程退出即丢。
+   为什么用**显式开关**而不是「路径为空就不存」:后者会让「忘了配」与
+   「我不要存」在行为上完全一样,而这正是 owner 要消灭的那种静默。 */
+const MEMORY_MODE = argv.includes('--memory');
+const DB_FLAG_AT = argv.indexOf('--db');
+const DB_PATH = DB_FLAG_AT >= 0 ? (argv[DB_FLAG_AT + 1] ?? '') : '';
+/** 落盘目标(内存模式下为 `null`,永不打开)。 */
+const DB_TARGET: string | null = MEMORY_MODE ? null : (DB_PATH !== '' ? DB_PATH : DEFAULT_DB_PATH);
+
 const log = (m: string): void => { console.log(`  [play] ${m}`); };
 
 async function main(): Promise<void> {
@@ -71,7 +91,17 @@ async function main(): Promise<void> {
     ownerId: 'u_host',
     sizeCells: WORLD_CELLS,
     mobs: true,
+    /* ★ 两种模式**互斥且显式**:内存模式给 `memory: true`,否则给文件路径。
+       不给路径又不给 `--memory` ⇒ 走 `DEFAULT_DB_PATH`(而不是悄悄不落盘)。 */
+    ...(DB_TARGET === null ? { memory: true } : { dbPath: DB_TARGET }),
   });
+  log(DB_TARGET === null
+    ? '存档:内存模式(--memory)⇒ 不落盘,退出即丢'
+    + `;房间仍会按 AUTOSAVE_INTERVAL_MS 调 saveWorldNow(只是没有库可写)`
+    : `存档:${DB_TARGET}(文件库)⇒ 30 秒周期 + 离场 + 销毁 + 重置 自动保存`);
+  if (assembled.runtime.db === null && DB_TARGET !== null) {
+    log(`⚠️ 期望文件库(${DB_TARGET})但 db 仍是 null —— 落盘不会发生`);
+  }
 
   /* ── 1b 预热世界(★ 2026-11-14)──
      生物是按**配表速率**逐只刷出来的(慢帧 2Hz × `BIOME_SPAWN.perChunk`),
@@ -102,6 +132,33 @@ async function main(): Promise<void> {
   });
   log(`WS 服务端:ws://127.0.0.1:${srv.port}/ws`);
 
+  /* ── 2b 自动存档的**日志观测点**(owner 裁定要求「失败不能静默」)──
+     每 10 秒对比一次房间的存档计数:变了就报「存了几次 / 最近何时」,
+     失败就报错因(并把 `lastSaveError` 打全)。
+     ⚠️ 这里**只读**房间的观测量(`saveCount` / `lastSaveAt` / `lastSaveError`),
+     不触发存档、不碰库 —— 触发点全在 `room.ts` 里(周期/离场/销毁/重置)。 */
+  let seenSaveCount = 0;
+  let seenSaveError: string | null = null;
+  const saveWatch = setInterval(() => {
+    const rt = assembled.runtime;
+    if (rt.saveCount !== seenSaveCount) {
+      seenSaveCount = rt.saveCount;
+      const when = rt.lastSaveAt === null ? '?' : new Date(rt.lastSaveAt).toLocaleTimeString();
+      log(`自动存档 #${rt.saveCount}(原因 ${rt.lastSaveReason ?? '?'} · ${when})`);
+    }
+    if (rt.lastSaveError !== null && rt.lastSaveError !== seenSaveError) {
+      seenSaveError = rt.lastSaveError;
+      log(`⚠️ ${rt.lastSaveError}(累计失败 ${rt.saveFailCount} 次)`);
+    }
+  }, 10_000);
+  /* `unref`:本定时器不该让进程活着(退出由 ws/浏览器那侧决定)。 */
+  if (typeof saveWatch.unref === 'function') saveWatch.unref();
+  if (DB_TARGET !== null) {
+    log(`存档观测:` + `saveCount=${assembled.runtime.saveCount}`
+      + ` · lastSaveAt=${String(assembled.runtime.lastSaveAt)}`
+      + ` · lastSaveError=${String(assembled.runtime.lastSaveError)}`);
+  }
+
   /* ── 3 客户端 dev server ── */
   const webUrl = `http://localhost:${WEB_PORT}/`;
   const playUrl = `${webUrl}?server=${encodeURIComponent(`ws://127.0.0.1:${srv.port}/ws`)}`;
@@ -125,7 +182,21 @@ async function main(): Promise<void> {
   console.log('');
 
   const shutdown = (): void => {
-    log('正在关闭…');
+    log('正在关闭...');
+    /* ★ **最后存一次**(owner 裁定:关闭不该丢最后一段进度)。
+       走 `close()` 而不是直接 `saveWorldNow()`:它同时是「房间销毁」的语义
+       (colyseus 的 `onDispose` 也是这条),于是存档 + 状态置 CLOSED 一起完成,
+       不会留下「进程要没了而库里房间还标着 OPEN」。 */
+    try {
+      assembled.runtime.close();
+    } catch (e) {
+      log(`⚠️ 关闭时存档失败:${(e as Error).message}`);
+    }
+    const rt = assembled.runtime;
+    log(`存档统计:成功 ${rt.saveCount} 次 · 失败 ${rt.saveFailCount} 次`
+      + ` · 最近 ${rt.lastSaveAt === null ? '从未' : new Date(rt.lastSaveAt).toLocaleTimeString()}`
+      + (rt.lastSaveError === null ? '' : ` · 最近错因:${rt.lastSaveError}`));
+    clearInterval(saveWatch);
     try { web?.kill(); } catch { /* 已退出 */ }
     void srv.close();
     setTimeout(() => process.exit(0), 50);

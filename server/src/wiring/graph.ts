@@ -135,8 +135,21 @@ export interface ComponentContext {
   /** 读取/写入持久化运行态 */
   st(key: string): number;
   setSt(key: string, v: number): void;
-  /** 静态参数读取;静态表没有该键时退回**世界环境口**(见 `EnvSource`) */
+  /**
+   * 静态参数读取;静态表没有该键时退回**世界环境口**(见 `EnvSource`)。
+   *
+   * ⚠️ 两个口都没有时返回 `0` —— 那是「**没有事实**」,不是「事实等于 0」。
+   * 需要区分这两者的件请先问 `hasWorldEnv()`(见 `WS-FND-153` 的 405)。
+   */
   param(key: string): number;
+  /**
+   * 本图**挂上了世界环境读数口**吗?(★ WS-FND-153)
+   *
+   * 为什么要它:夜的定义(`isNight`)在 `hour = 0` 时为真 —— 0 点确实是夜。
+   * 于是一旦环境口缺席,`param('hour')` 的 0 会让 405 感光器**恒亮**,
+   * 而且与"真的入夜"不可区分。件用本方法把「没有事实」与「事实是 0」分开。
+   */
+  hasWorldEnv(): boolean;
   /** 共享跑酷计时器(411 开表 / 412 停表) */
   race: { running: number; startTick: number; elapsedTicks: number; finishMs: number };
 }
@@ -799,6 +812,10 @@ export class SignalGraph {
            只有知道"哪一件在问"才答得出来 —— 漏传就退回"只有全局键有值"。 */
         return comp.params[key] ?? graph.envOf(key, comp);
       },
+      hasWorldEnv(): boolean {
+        /* 「世界会说 0」与「世界不说话」在这里分开(见 `ComponentContext.hasWorldEnv`)。 */
+        return graph.hasEnvSource();
+      },
       race: this.race,
     };
   }
@@ -814,6 +831,18 @@ export class SignalGraph {
    */
   setEnvSource(fn: EnvSource | null): void {
     this.envSrc = fn;
+  }
+
+  /**
+   * 本图**挂着**世界环境读数口吗?(★ WS-FND-153)
+   *
+   * 与 `envOf()` 的区别不是"能不能读到数",而是"**有没有事实**":
+   *   · 没挂 ⇒ `envOf(key)` 与 `param(key)` 的 0 是「没有事实」;
+   *   · 挂了且世界说 0 点 ⇒ 那个 0 是「事实就是 0 点」(夜)。
+   * 405 昼夜感光器必须区分这两者,否则环境口一缺席就恒亮。
+   */
+  hasEnvSource(): boolean {
+    return this.envSrc !== null;
   }
 
   /**

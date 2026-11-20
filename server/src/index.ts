@@ -109,7 +109,7 @@ import { sleepStateOf } from './net/actions/sleep.ts';
 import { setTownRadiusProvider } from './mobs/spawner.ts';
 import { townSafeRadiusProvider } from './net/actions/modify_town.ts';
 import { RoomRuntime, type RoomRuntimeOptions, type WorldSaveHost } from './net/room.ts';
-import { AccessMode, archiveWorldSnapshot } from './db/repo.ts';
+import { AccessMode, archiveWorldSnapshot, createUser, getUser } from './db/repo.ts';
 import type { DbLike } from './db/repo.ts';
 /* ★ task-70:生产入口终于有了 `driver.sqlite.ts` 的**消费者**。
    接线前实测:`db/driver.sqlite.ts` 与 `db/memory_db.ts` 都只被**测试**引用
@@ -118,6 +118,29 @@ import type { DbLike } from './db/repo.ts';
    ⇒ 见 `AssembleDeps.dbPath` 与 `resolveDb`。 */
 import { openNodeSqlite } from './db/driver.sqlite.ts';
 import type { Clock } from './net/anticheat.ts';
+/* ★ owner 裁定 2026-11-20(自动存档):默认文件库**先建目录再开库** ——
+   `node:sqlite` 的 `DatabaseSync(path)` 不会替调用方建父目录,而默认路径
+   `./.data/world.db` 的父目录在全新克隆里并不存在(开库当场 ENOENT)。
+   只 import 两个 `node:` 内建:模块加载期**不碰文件系统**(见文件末尾的
+   `invokedDirectly`,以及 `tests/WS-FND-09` 的 FND9-11)。 */
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+
+/**
+ * **服务端默认存档文件**(owner 裁定 2026-11-20:像 Minecraft 一样自动保存)。
+ *
+ * ## 为什么是相对路径
+ * `scripts/play.ts` 用 `process.cwd()` 解析它 ⇒ 在仓根跑 `npm run play`,
+ * 存档就落在 `<仓根>/.data/world.db`(`*.db` 已在 `.gitignore` 里)。
+ * 换目录跑 = 另一个世界,这是**刻意的**:「我这一局的档在哪」由启动目录回答,
+ * 不需要额外的配置项去记。
+ *
+ * ## 为什么不是 `:memory:`
+ * 内存库的存档在进程退出时**全部消失** —— 那正是 owner 这次裁定要修的东西
+ * (「像 Minecraft 一样自动保存」的前提是**有地方存**)。内存模式保留为
+ * **显式**选项(`--memory` / `AssembleDeps.memory`),不是默认值。
+ */
+export const DEFAULT_DB_PATH = '.data/world.db';
 
 /** 装配一次世界 + 运行时所需的全部外部依赖。 */
 export interface AssembleDeps {
@@ -157,9 +180,26 @@ export interface AssembleDeps {
    *
    * `deps.db` 显式给了就用它(测试要注内存库);否则若给了 `dbPath` 就开真库;
    * 两者都没有 ⇒ `null`(纯内存,现状不变)。
-   * ⇒ 顺序是「**显式注入 > 文件路径 > 无**」,不猜。
+   * ⇒ 顺序是「**显式注入 > 显式内存模式 > 文件路径 > 环境变量 > 默认文件库**」,不猜。
+   *
+   * ⚠️ 最后那一段(默认文件库)**只在服务端入口 `createServer()` 生效**,
+   *   `assemble()` / `resolveAssembly()` 的零参默认仍是 `null`:
+   *   `tests/WS-FND-37` 把「零参默认 = null」钉成 **B 路/A 路一致性**的判据,
+   *   在那条判据改写之前,把默认值下沉到 `resolveDb` 会让两条既有断言变红。
+   *   ⇒ 裁决落在**入口**(知道自己在跑服务的那一层),而不是解析器 —— 见 `createServer`。
    */
   dbPath?: string;
+  /**
+   * ★ **显式内存模式**(owner 裁定 2026-11-20):`true` = 不落盘,进程退出即丢。
+   *
+   * 存在的理由:自动存档成为默认之后,「我不想在磁盘上留东西」必须有**一条明确
+   * 的声明路径**,而不是靠「忘了配路径」。CLI 侧对应 `node scripts/play.ts --memory`。
+   *
+   * 优先级:它只输给显式的 `db`(注对象时调用方自己负责语义),
+   * 但**赢过** `dbPath` / `PI_DB_PATH` / 默认文件库 —— 显式关掉就是关掉,
+   * 不许被环境变量静默推翻(与 `db: null` 的负对照同一纪律)。
+   */
+  memory?: boolean;
   /** 世界边长(格),直接透传给 `WorldSim`。 */
   sizeCells?: number;
   /** 模拟随机流;注入后同种子完全可复现(测试用)。 */
@@ -380,6 +420,15 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
      分两次解析在 `dbPath` 下会开两条连接、在 `:memory:` 下会是**两个库** ——
      于是"重置归档了一行,房间里读不到"这种静默错就有了入口。 */
   const db = resolveDb(deps);
+  /* ★ owner 裁定 2026-11-20(自动存档):**我们自己开的**文件库必须先有房主。
+     `Repo.createRoom` 对不存在的房主**直接抛**(「房主不存在」),而
+     `RoomRuntime` 的构造器第一步就是 `createRoom` ⇒ 一个全新的
+     `./.data/world.db` 上,`assemble({ dbPath })` **根本走不过去**
+     (实测:`npm run play` 第一次运行就停在装配那一步)。
+     ⇒ 装配层补这一行。它不替**注入的**库做(`deps.db` 由调用方自己负责 ——
+       那正是 `tests/**` 里那些夹具的既有语义,不该被这里静默改掉)。
+     ⚠️ 只补**房主**:其他用户由 `room.join()` 按需建(`room.ts` 的既有行为)。 */
+  if (db !== null && deps.db === undefined) ensureOwnerUser(db, deps.ownerId ?? 'u_owner', deps.clock?.nowMs() ?? Date.now());
   const host = createHost(deps, db);
   const roomId = deps.roomId ?? 'room_main';
 
@@ -420,42 +469,96 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
 }
 
 /**
- * 解析 `deps` 里的数据库来源(task-70)。
+ * **打开一个可直接用的文件库**(建目录 → 开库 → 建表/迁移)。
+ *
+ * ## 为什么这三步必须一起做(而不是只 `openNodeSqlite`)
+ * 实测过的两个坑,都是「开得开、但一写就炸」:
+ * ```
+ * 1 `DatabaseSync('./.data/world.db')` 的父目录不存在 ⇒ ENOENT(开库当场抛)
+ * 2 开得开但**没建表** ⇒ 第一次 `saveToDb` 抛 `no such table: users`
+ *   ⇒ 而那正是自动存档第一次触发时(离场 / 30 秒 / 销毁)才发生的事,
+ *     表现为「玩了几分钟,退出时控制台一条错,档没了」
+ * ```
+ * ⇒ `bootstrap()`(migrate + 归档 checksum 校验)与 `bootstrapWorldArchives()`
+ *   (建第 10 张表,`RESET_WORLD` 的归档要有地方写)都在这里做一次。
+ *
+ * ⚠️ **只对我们自己开的库**做:注入的 `deps.db`(测试的 `MemoryDb` 等)
+ *   由调用方自己 `migrate` —— 在装配层替它建表会掩盖「测试漏了 migrate」。
+ */
+function openDbFile(path: string, nowMs: number): DbLike {
+  /* `:memory:` 没有目录可言(`dirname(':memory:')` = '.',建它无害但没意义)。 */
+  if (path !== ':memory:') {
+    const dir = dirname(path);
+    if (dir !== '' && dir !== '.') mkdirSync(dir, { recursive: true });
+  }
+  const db = openNodeSqlite(path);
+  /* 失败**不吞**:迁移漂移是 fail-closed 的(见 `SqliteDb.bootstrap` 的 docblock),
+     在这里吞掉等于「带着不确定的结构跑起来」。 */
+  db.bootstrap(nowMs);
+  db.bootstrapWorldArchives(nowMs);
+  return db;
+}
+
+/**
+ * 确保 `ownerId` 在 `users` 里存在(**只对**装配层自己开的库调用)。
+ *
+ * 为什么需要它:`repo.createRoom` 有一条守卫「房主不存在」,而
+ * `RoomRuntime` 的构造器第一步就是 `createRoom`。于是「默认文件库」这件事
+ * 在**全新**路径上第一次就会撞上它 —— 而报错发生在装配,离「存档」很远,
+ * 容易被当成两件不相干的事(实测就是如此)。
+ *
+ * 幂等:已存在就什么都不做(`getUser` 先查)。显示名取 id —— 本仓没有
+ * 「真实昵称」这一格,也不该在装配层编一个。
+ */
+function ensureOwnerUser(db: DbLike, ownerId: string, nowMs: number): void {
+  if (ownerId === '' || getUser(db, ownerId) !== undefined) return;
+  createUser(db, { id: ownerId, displayName: ownerId, nowMs });
+}
+
+/**
+ * 解析 `deps` 里的数据库来源(task-70;owner 裁定 2026-11-20 起有**内存模式**)。
  *
  * ## 为什么把它抽成一个函数
  *
- * 「显式注入 > 文件路径 > 无」这个**优先级**本身是一条规则,
+ * 「显式注入 > 内存模式 > 文件路径 > 环境变量 > 无」这个**优先级**本身是一条规则,
  * 散在 `assemble()` 里会与 `rtOpts` 的构造纠缠,看不清。
- * 抽出来之后它有一个**可单测的单一入口**,也便于将来加第三来源。
+ * 抽出来之后它有一个**可单测的单一入口**,也便于将来加第五来源。
  *
  * ## 为什么开库放在这里而不是模块顶层
  *
  * 模块顶层开库会在**任何** import 本文件的场合(包括
  * `scripts/verify.ts` 的「入口可加载性」子进程检查)都去碰文件系统 ——
  * 那会让一个只读的加载性检查产生副作用。故只在**真的装配**时开。
+ *
+ * ## 为什么零参默认仍是 `null`(而不是 `DEFAULT_DB_PATH`)
+ *
+ * `tests/WS-FND-37` 把「`resolveAssembly()` 零参 ⇒ `db === null`」钉成
+ * **A 路/B 路一致性 + 负对照入口**的判据。默认文件库是 **owner 的裁决**,
+ * 它落在**知道自己在跑服务**的那一层(`createServer` / `scripts/play.ts`),
+ * 不落在解析器 —— 否则那两条断言会把「默认值变了」误报成「两条路分叉了」。
  */
 function resolveDb(deps: AssembleDeps): DbLike | null {
+  const now = deps.clock?.nowMs() ?? Date.now();
   /* 1 显式注入优先 —— 测试与别处已有连接都走这条,行为与接线前**逐字一致**。 */
   if (deps.db !== undefined) return deps.db;
-  /* 2 给了路径 ⇒ 开真库。`openNodeSqlite` 是零依赖实现(见其 docblock)。 */
+  /* 2 显式内存模式 —— 赢过下面所有「会落盘」的来源(见 `AssembleDeps.memory`)。 */
+  if (deps.memory === true) return null;
+  /* 3 给了路径 ⇒ 开真库(建目录 + 建表,见 `openDbFile`)。 */
   if (typeof deps.dbPath === 'string' && deps.dbPath !== '') {
-    return openNodeSqlite(deps.dbPath);
+    return openDbFile(deps.dbPath, now);
   }
-  /* 3 **部署开关**:`PI_DB_PATH`。
+  /* 4 **部署开关**:`PI_DB_PATH`。
    *
    * 为什么要有这一条:在此之前,`assemble()` 与 B 路(`net/room.colyseus.ts`)在生产
    * 都拿不到库 ⇒ 「落盘 / 读档」两条路**永不执行**,而写代码的人以为它们在跑。
-   * 但"默认往磁盘写"又不是我能替 owner 定的(存哪?谁清?)。
-   *
-   * ⇒ 折中且**显式**:默认仍然 `null`(与今天逐字一致),只有环境变量给了路径才开库。
-   *   于是"生产能落盘"是一条**可开关、可验证**的行为,不是某个默认值悄悄决定的。
-   *   `PI_DB_PATH=:memory:` 也能用(内存库:路径会真的执行,但不留文件)。
+   * `PI_DB_PATH=:memory:` 也能用(内存库:路径会真的执行,但不留文件)。
    */
   const fromEnv = typeof process !== 'undefined' ? process.env?.PI_DB_PATH : undefined;
   if (typeof fromEnv === 'string' && fromEnv !== '') {
-    return openNodeSqlite(fromEnv);
+    return openDbFile(fromEnv, now);
   }
-  /* 4 都没有 ⇒ 纯内存(现状:不落盘)。 */
+  /* 5 都没有 ⇒ `null`(不落盘)。**入口**会在需要时补上 `DEFAULT_DB_PATH`,
+     见 `createServer` —— 这里不补,理由见上。 */
   return null;
 }
 
@@ -468,7 +571,8 @@ function resolveDb(deps: AssembleDeps): DbLike | null {
  * —— 同一个装配语义有两种答案,而两者都"看起来合理"。
  *
  * 规则与 `resolveDb` 逐条相同:
- *   1 显式 `db` 优先;2 给了 `dbPath` ⇒ 开真库;3 都没有 ⇒ `null`(**不落盘**)。
+ *   1 显式 `db` 优先;2 `memory: true` ⇒ `null`;3 给了 `dbPath` ⇒ 开真库;
+ *   4 `PI_DB_PATH`;5 都没有 ⇒ `null`(**不落盘** —— 落到**入口**去补默认值)。
  *
  * ⚠️ 第 3 条是**刻意的现状**,不是遗漏:生产里至今没有任何地方给 B 路提供库
  *   (`withDeps` 零调用点,Colyseus 也不会把 deps 传给 `onCreate`),
@@ -494,14 +598,47 @@ export interface AssembledServer {
 }
 
 /**
+ * ★ **服务端默认存档路径的落点**(owner 裁定 2026-11-20:像 Minecraft 一样自动保存)。
+ *
+ * ## 为什么补默认值的动作在**入口**,不在 `resolveDb`
+ *
+ * 「默认落盘」是 owner 对**生产服务**的裁决;而 `resolveDb` 是**两条装配路共用**
+ * 的解析器,`tests/WS-FND-37` 在那里钉着「零参默认 = `null`」这条
+ * A/B 一致性与负对照的判据。把默认值下沉进去,红的是那两条断言 ——
+ * 而它们红的时候**看起来像「两条路分叉了」**,不是「默认值变了」。
+ * ⇒ 裁决放在唯一知道「我在跑服务」的那一层:`createServer()` 与 `scripts/play.ts`。
+ *
+ * ## 谁**赢**过这个默认值
+ * ```
+ * deps.db 有键       ⇒ 用它(含 null:调用方显式接管语义)
+ * deps.memory        ⇒ 不落盘(显式内存模式)
+ * deps.dbPath        ⇒ 用它
+ * PI_DB_PATH 有值    ⇒ 用它(env 是**部署**开关,该盖过默认值,否则线上没法定制路径)
+ * 都没有             ⇒ DEFAULT_DB_PATH
+ * ```
+ */
+function withServerDbDefaults(deps: AssembleDeps): AssembleDeps {
+  if (deps.db !== undefined) return deps;
+  if (deps.memory === true) return deps;
+  if (typeof deps.dbPath === 'string' && deps.dbPath !== '') return deps;
+  const fromEnv = typeof process !== 'undefined' ? process.env?.PI_DB_PATH : undefined;
+  if (typeof fromEnv === 'string' && fromEnv !== '') return deps;
+  return { ...deps, dbPath: DEFAULT_DB_PATH };
+}
+
+/**
  * 装配一个可用的服务端(**只装配,不监听端口**)。
  *
  * 为什么不在本函数里 `listen`:`scripts/verify.ts` 的「入口可加载性」检查会在
  * **子进程**里加载本文件,若是这里起了服务,CI 会挂住。⇒ 监听留给显式的
  * CLI 分支(见文件末尾的 `isMain` 段)。
+ *
+ * ★ 2026-11-20:本入口**默认落盘**(`DEFAULT_DB_PATH`),除非调用方显式给
+ *   `memory: true`。这是 owner「像 Minecraft 一样自动保存」裁定的**装配侧**一半;
+ *   另一半是房间的周期/离场/销毁/重置自动存档(见 `net/room.ts` 的 `saveWorldNow`)。
  */
 export function createServer(deps: AssembleDeps = {}): AssembledServer {
-  const assembled = assemble(deps);
+  const assembled = assemble(withServerDbDefaults(deps));
   const rooms = new Map<string, RoomRuntime>();
   rooms.set(assembled.runtime.id, assembled.runtime);
 
@@ -511,6 +648,10 @@ export function createServer(deps: AssembleDeps = {}): AssembledServer {
     `  契约方法:saveToDb=${typeof assembled.host.saveToDb}`
       + ` / attackMobAuthorized=${typeof assembled.host.attackMobAuthorized}`
       + ` / levelOf=${typeof assembled.host.levelOf}`,
+    /* ★ 自动存档的**可观测前提**:没有库就没有档 —— 摘要里必须一眼看出来。 */
+    `  数据库:${assembled.runtime.db === null
+      ? 'null(内存模式:不落盘,退出即丢)'
+      : '已开库(周期/离场/销毁/重置自动存档生效)'}`,
     `  运行时字段 worldSaveHost:${assembled.runtime.worldSaveHost === null ? 'null(异常)' : '非 null'}`,
   ].join('\n');
 

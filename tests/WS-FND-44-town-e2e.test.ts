@@ -32,13 +32,23 @@ function makeRoom(): Room {
   return { rt: a.runtime, roomId };
 }
 
-/** 最小可用的 `SpawnWorld` 替身:`inSafeZone` 只读 `townCenter()` 与 `roomId()`。 */
+/**
+ * 最小可用的 `SpawnWorld` 替身:`inSafeZone` 只读 `townCenter()` 与 `roomId()`。
+ *
+ * ★ WS-FND-153 之后 `decideSpawn` 的夜行门**无条件**先取一次 `world.isNight()`
+ * (旧写法 `NOCTURNAL.has(mobId) && !world.isNight()` 靠 `&&` 短路,替身漏这一口
+ * 也不会炸 ⇒ 替身能"靠短路过关")。所以替身必须回答这一问,否则本套件每一条断言
+ * 都会先死于 `world.isNight is not a function`,而不是死于它真正要钉的安全区。
+ * 值给 `false`(白天):本套件的点用 `ctxAt()` 造,不带 `mobId` ⇒ 不是夜行怪,
+ * 昼夜与本套件要证明的"半径改动真的生效"无关。
+ */
 const worldFor = (roomId: string): SpawnWorld => ({
   roomId: () => roomId,
-  /* `decideSpawn` 除安全区外还会问"这一格挡不挡 / 什么地面" ⇒ 替身给全它读的那几项。 */
+  /* `decideSpawn` 除安全区外还会问"这一格挡不挡 / 什么地面 / 现在是不是夜" ⇒ 替身给全它读的那几项。 */
   blocked: () => false,
   floorAt: () => 0,
   objAt: () => 0,
+  isNight: () => false,
   townCenter: () => ({ x: 16, y: 16 }),
 } as unknown as SpawnWorld);
 

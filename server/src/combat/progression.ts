@@ -251,13 +251,14 @@ export const PROGRESS_FIELD_WIRING: readonly ProgressFieldRow[] = Object.freeze(
   },
   {
     field: 'carrySlots',
-    status: TALENT_WIRING_STATUS.UNWIRED,
-    at: 'server/src/net/room.ts#carryCapacityOf(内联 `8 + (lv-1)`)',
-    evidence: '\\.carrySlots\\b',
+    status: TALENT_WIRING_STATUS.WIRED,
+    at: 'server/src/net/room.ts#carryCapacityOf(改调 carrySlotsOf 读口 / carryCapacityOfLevel)',
+    evidence: '\\bcarryCapacityOfLevel\\s*\\(|\\bcarrySlotsOf\\b',
     reason:
-      '唯一真实的容量闸在 `net/room.ts#carryCapacityOf`,它**内联**了同一条公式;改成读档案会让'
-      + '「容量由谁说了算」从一份变成两份(`net/**` 不在本轮写域)。判据用行为给证:'
-      + '把档案 carrySlots 改成 99,房间容量仍是 8。',
+      'WS-FND-152(owner 裁定「全接」):容量闸不再内联 `8 + (lv-1)`。房间侧 `carryCapacityOf` 先问世界源的'
+      + ' `carrySlotsOf(userId)`(= 档案 `carrySlots`,带天赋/加成),没有世界源时回落到 '
+      + '`progression.carryCapacityOfLevel(lv)`(同一出处 `statsAtLevel`)。⇒ 改档案或改冻结层,容量都会跟着动;'
+      + '判据 `tests/WS-FND-152`(把档案 carrySlots 改成 99 ⇒ 房间容量 99,复原 ⇒ 回到等级派生的 8)。',
   },
 ]);
 
@@ -464,6 +465,47 @@ function recompute(p: PlayerProgress): PlayerProgress {
     for (const [k, v] of Object.entries(t.effects)) flags[k] = v;
   }
   return { ...p, maxHp: s.maxHp, dmgMul: s.dmgMul, carrySlots: s.carrySlots, talentFlags: flags };
+}
+
+/* ───────────────────── 背包容量槽数(WS-FND-152:容量闸的唯一出处)───────────────────── */
+
+/**
+ * 等级 → 背包容量槽数。**唯一出处是冻结层** `statsAtLevel(...).carrySlots`。
+ *
+ * ## 为什么需要这个名字(修的是什么)
+ *
+ * 修前 `net/room.ts#carryCapacityOf` **内联**了一份同样的算式
+ * (`8 + (lv - 1)`),于是「容量由谁说了算」有两份:
+ * ```text
+ * 改冻结层的 statsAtLevel        ⇒ 世界侧(档案)跟着变,房间容量不动   ← 静默分叉
+ * 改 room.ts 的那一行            ⇒ 只有房间变,档案与世界侧不认
+ * ```
+ * 两份数今天恰好相等,所以**没有一条判据能看出它们已经分开**。
+ * ⇒ 算式只留在这里,房间侧改调本函数(判据:`tests/WS-FND-152`)。
+ */
+export function carryCapacityOfLevel(level: number): number {
+  const lv = Number.isFinite(level)
+    ? Math.max(1, Math.min(MAX_LEVEL, Math.trunc(level)))
+    : 1;
+  return statsAtLevel(lv).carrySlots;
+}
+
+/**
+ * 档案 → 背包容量槽数(**容量闸的权威口径**)。
+ *
+ * 优先用档案里的 `carrySlots`(它由 `recompute` 每级重算,并带天赋/加成),
+ * 字段非法或缺失时回落到**等级派生**的同一口径 —— 于是「档案被篡改」这件事
+ * 可以被判据看见(改到 99 ⇒ 容量真的是 99),而不是像修前那样被内联算式无视。
+ *
+ * @param progress `null` = 这个玩家还没有档案 ⇒ 按 Lv.1 的容量(8 格)
+ */
+export function carryCapacityOf(
+  progress: Pick<PlayerProgress, 'level' | 'carrySlots'> | null,
+): number {
+  if (progress === null) return carryCapacityOfLevel(1);
+  const own = progress.carrySlots;
+  if (Number.isFinite(own) && own > 0) return Math.trunc(own);
+  return carryCapacityOfLevel(progress.level);
 }
 
 export interface LevelUpEvent {

@@ -142,7 +142,24 @@ export const GLOBAL_MOB_CAP = 200;
 export const NOCTURNAL: ReadonlySet<string> = new Set([
   'mob_bat_sonic', 'mob_tanuki', 'mob_lava_elem', 'mob_scorpion', 'mob_thunder_sprite',
 ]);
+/** 昼行怪 = `NOCTURNAL` 之外的全部(判据用它做反例,不新立名单)。 */
+export function isNocturnal(mobId: string): boolean {
+  return NOCTURNAL.has(mobId);
+}
 
+/**
+ * **昼夜适配的唯一一处**(★ WS-FND-153):这个物种此刻允许刷新吗?
+ *
+ * - 昼行怪:`true`(昼夜都刷,昼夜不改变它的概率);
+ * - 夜行怪:只在 `night === true` 时 `true`(白天由 `decideSpawn` 判 `DAYLIGHT`)。
+ *
+ * ⚠️ 这里**不含任何数值**:刷不刷的**速率**仍然来自内容表(`BIOME_SPAWN.perChunk` ×
+ * `intervalSec`,见 `spawnsPerCheck`),`night` 只决定「这一枪能不能打出去」。
+ * 「夜里刷得更多」是**名额在夜里被让给夜行怪**的结果,不是另加的倍率。
+ */
+export function nightGateAllows(mobId: string, night: boolean): boolean {
+  return !isNocturnal(mobId) || night;
+}
 export const SpawnReject = {
   OK: 'OK',
   HARD_CAP: 'HARD_CAP',
@@ -264,7 +281,10 @@ export function decideSpawn(
   const light = lightSuppressed(world, ctx.x, ctx.y);
   if (light.suppressed) return { spawn: false, reason: light.reason };
 
-  if (NOCTURNAL.has(ctx.mobId) && !world.isNight()) {
+  /* ★ WS-FND-153:昼夜适配只在这一处问 `world.isNight()`,而它的答案来自世界钟
+     (`WorldSim.isNightNow()` ⇒ `hourOfDay()` ⇒ `NIGHT_WINDOW`)。判定顺序不变:
+     夜行门仍放在最贵的光照抑制之后(白天先按光照/名额短路,与修前一致)。 */
+  if (!nightGateAllows(ctx.mobId, world.isNight())) {
     return { spawn: false, reason: SpawnReject.DAYLIGHT };
   }
   return { spawn: true, reason: SpawnReject.OK };

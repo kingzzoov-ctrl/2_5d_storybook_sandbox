@@ -152,12 +152,47 @@ export function relayTicksFor(setting: number): number {
   return RELAY_DELAY_TICKS[idx];
 }
 
-/** 昼夜感光器 405:按世界时间判定夜晚。 */
-export const NIGHT_START_HOUR = 19;
-export const NIGHT_END_HOUR = 6;
-export function isNight(hour: number): boolean {
+/**
+ * 夜的**唯一定义**(★ WS-FND-153)。
+ *
+ * 全仓只有这一处写 `19` / `6`。引用它的有四处,**没有第二份**:
+ *   1 `isNight(hour)` —— 405 昼夜感光器的输入判据;
+ *   2 `WorldSim.isNightNow()`(⇒ 电路环境键 `night`,`sim/world_sim.ts`);
+ *   3 `mobs/spawner.ts` 的夜行门(`decideSpawn` 的 `DAYLIGHT`,NOCTURNAL 只在夜里刷);
+ *   4 判据 `WS-FND-59`(世界钟)与 `WS-FND-153`(昼夜接线)。
+ *
+ * 数值是 D-07 的既有口径(19:00 入夜、06:00 天亮),**本项不改任何数值**。
+ * 冻结:改边界必须改这**一个**对象,而不是某处的字面量。
+ */
+export const NIGHT_WINDOW: Readonly<NightWindow> = Object.freeze({ startHour: 19, endHour: 6 });
+
+/** 夜的起点小时。**派生**自 `NIGHT_WINDOW`,不是第二份事实源。 */
+export const NIGHT_START_HOUR = NIGHT_WINDOW.startHour;
+/** 夜的终点小时(天亮)。**派生**自 `NIGHT_WINDOW`。 */
+export const NIGHT_END_HOUR = NIGHT_WINDOW.endHour;
+
+export interface NightWindow {
+  /** 入夜小时(含)。 */
+  readonly startHour: number;
+  /** 天亮小时(不含)。 */
+  readonly endHour: number;
+}
+
+/**
+ * `hour` 落在 `win` 的夜里吗?纯函数、窗口可注入。
+ *
+ * 为什么要有 `win` 参数:`isNight` 只是 `win = NIGHT_WINDOW` 的那一次调用
+ * ⇒ 判据可以用**另一个窗口**当场证明「判定真的跟着这个常量走」(而不是
+ * 函数体内另有一份字面量)。
+ */
+export function isNightAtHour(hour: number, win: NightWindow = NIGHT_WINDOW): boolean {
   const h = ((hour % 24) + 24) % 24;
-  return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR;
+  return h >= win.startHour || h < win.endHour;
+}
+
+/** 昼夜感光器 405 / 世界钟共用:按世界时间判定夜晚(边界见 `NIGHT_WINDOW`)。 */
+export function isNight(hour: number): boolean {
+  return isNightAtHour(hour, NIGHT_WINDOW);
 }
 
 /** 音高匹配 408/419:半音差在容差内即算命中(默认 0 = 精确音高)。 */
@@ -451,11 +486,25 @@ registerComponentKind('SENSOR_PULSE_BUTTON', (ctx) => {
   for (const c of ctx.comp.outputs) out(ctx, c, lit);
 });
 
-/** 405 昼夜星光感光器:夜晚输出 1,白天输出 0。 */
+/**
+ * 405 昼夜星光感光器:夜晚输出 1,白天输出 0。
+ *
+ * ★ WS-FND-153:钟点的**来源**必须是事实,不能是"缺省值"。
+ *
+ * `param()` 在静态表与环境口都没有该键时返回 `0`(旧契约)。对 `hour` 这是
+ * 灾难性的巧合:`isNight(0)` = **夜** ⇒ 一旦世界环境口没挂上(`installWorldEnv`
+ * 被摘 / 裸 `SignalGraph`),感光器就**恒亮**,而且看上去和"真的入夜了"一模一样。
+ *
+ * ⇒ 现在先问「有没有世界环境口」(`ctx.hasWorldEnv()`),没有就把"不知道"如实
+ * 报成 0(不亮),而不是拿 0 点冒充满世界时间。摆放者手填的静态 `params.hour`
+ * 仍然算已知事实(单测/蓝图里手设钟点的用法保持不变)。
+ */
 registerComponentKind('SENSOR_LIGHT_DAYNIGHT', (ctx) => {
+  /* ⚠️ 三个键各自读一次:`&&` 短路会让台账里的键问不到(见 426 的同型注释)。 */
   const hour = ctx.param('hour');
   const forceNight = ctx.param('night') > 0;
-  const on = forceNight || isNight(hour);
+  const hourKnown = ctx.hasWorldEnv() || ctx.comp.params.hour !== undefined;
+  const on = forceNight || (hourKnown && isNight(hour));
   ctx.setSt('night', on ? 1 : 0);
   for (const c of ctx.comp.outputs) out(ctx, c, on);
 });

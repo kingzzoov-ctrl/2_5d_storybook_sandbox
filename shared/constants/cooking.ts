@@ -30,14 +30,23 @@ export interface FoodParamSlot {
   note: string;
 }
 
-/** 6 个参数槽的登记表(中性默认,**待平衡**)。 */
+/**
+ * 6 个参数槽的登记表(中性默认 + **待平衡**注记)。
+ *
+ * ★ WS-FND-152 起,五个槽(除 `gatherMul`)另有一条**保守默认剂量**的落地路径:
+ *   落点不在本表 —— 在 `server/src/combat/cooking.ts` 的 `FOOD_PARAM_DEFAULT_DOSE`
+ *   (每槽一行 `待平衡(owner)` 注释,集中一处便于 owner 一次改完)。
+ *   为什么把数放在那边而不是这里:本文件**生产侧零 importer**(只有门禁与类型反向引用),
+ *   写在这里的数没有任何消费者;而 owner 这一轮的裁决是「全接」,不是「再登记一处」。
+ *   `neutral` 仍然**只**是单位元,一个字节都没动(判据 `tests/WS-FND-66` 逐槽比对)。
+ */
 export const FOOD_PARAM_SLOTS: readonly FoodParamSlot[] = [
-  { key: 'defFlat', kind: 'flat', neutral: 0, note: '待平衡:手册未给数值,当前只有中性默认 0' },
-  { key: 'moveMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1' },
-  { key: 'gravityMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1' },
-  { key: 'jumpMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1' },
-  { key: 'gatherMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1' },
-  { key: 'expMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1' },
+  { key: 'defFlat', kind: 'flat', neutral: 0, note: '待平衡:手册未给数值;中性默认 0,保守默认剂量在 combat/cooking.ts#FOOD_PARAM_DEFAULT_DOSE(+2)' },
+  { key: 'moveMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值;中性默认 1,保守默认剂量在 combat/cooking.ts#FOOD_PARAM_DEFAULT_DOSE(×1.10)' },
+  { key: 'gravityMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值;中性默认 1,保守默认剂量在 combat/cooking.ts#FOOD_PARAM_DEFAULT_DOSE(×0.90)' },
+  { key: 'jumpMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值;中性默认 1,保守默认剂量在 combat/cooking.ts#FOOD_PARAM_DEFAULT_DOSE(×1.05)' },
+  { key: 'gatherMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值,当前只有中性默认 1(602 的 1.20 来自内容行,不走默认剂量)' },
+  { key: 'expMul', kind: 'mul', neutral: 1, note: '待平衡:手册未给数值;中性默认 1,保守默认剂量在 combat/cooking.ts#FOOD_PARAM_DEFAULT_DOSE(×1.05)' },
 ];
 
 /** 参数槽总数(判据:恒等于 `FoodBuffParams` 的键数)。 */

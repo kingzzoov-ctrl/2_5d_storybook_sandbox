@@ -39,8 +39,12 @@
 | 13 | 「有实现、有判据、没接进生产路径」的缝 | **未达成**(已量化,未清零) | `docs/WIRING-LEDGER.md` §2.10(表体实算,唯一真值源)+ `server/src/combat/wiring_ledger.ts` / `client/src/wiring_ledger.ts` 的双向判据(`WS-FND-118` / `WS-FND-121`) | 2026-11-19 |
 | 14 | 真机 FPS / `colyseus.js` × vite 8 兼容 | **未达成**(等 owner 提供环境,已从台账未关闭里移出) | `node scripts/fps-probe.ts` 的真机读数;`docs/MEASUREMENTS-S5.md` §1/§2 | 2026-11-17(D-19) |
 | 15 | 文档里「手抄的实测数字」 | **未达成**(锚点只覆盖 README / HANDOVER 的那几行) | `sync-docs.ts` 的手工数字扫描(告警,列出 `文件:行`) | 2026-11-19 |
+| 16 | 存档 · 自动保存已接 | 达成 | `tests/WS-FND-150-autosave.test.ts`(周期 `AUTOSAVE_INTERVAL_MS` / 离场 / `RESET_WORLD` 三处触发)+ 生产面 `server/src/net/room.ts` · `WorldSim.saveToDb`;既有锚点 `tests/WS-07.test.ts` · `WS-FND-104-archive-integrity.test.ts` | 2026-11-20 |
+| 17 | 派对急行 UI 已接 | 达成 | `tests/WS-FND-151-party-ui.test.ts`(模式面板 / 比分 HUD / 急行条件清单)+ `client/src/ui/party_panel.ts` · `client/src/ui/rush_readiness.ts` · `client/src/wiring_ledger.ts` 的 `SET_PARTY_MODE`(原 `missing`)+ 世界侧真值 `server/src/coop/rush_actions.ts#RUSH_ACTION_LEDGER` · `tests/WS-FND-120-party-coop-wired.test.ts` | 2026-11-20 |
+| 18 | 天赋 × 料理 → 击退 / 连击已接(数值待平衡) | 达成(边界:只判「接上且有判据」,**手感/数值不在此列** —— `COMBO_WINDOW_SEC` / 锻造档位在套件内标「待平衡」) | `tests/WS-FND-152-combat-effects-wired.test.ts`(料理 5 buff / 击退全参数 / 连击窗口 / carry 容量)+ 真值源 `server/src/combat/progression.ts#TALENT_WIRING_STATUS` · `docs/WIRING-LEDGER.md` R6-CBT-2 · `tests/WS-FND-111-combat-numeric-bounds.test.ts` | 2026-11-20 |
+| 19 | 昼夜(世界时钟)已接 | 达成 | `tests/WS-FND-153-daynight-wired.test.ts`(夜行门吃真世界钟:白天 `DAYLIGHT` 拒、夜里放行)+ 生产面 `server/src/mobs/spawner.ts#isNightNow` / `NIGHT_WINDOW` · `server/src/wiring/components.ts` 的 `dayNight`;既有锚点 `WS-FND-59-world-clock.test.ts` · `WS-FND-64-world-clock-wiring.test.ts` | 2026-11-20 |
 
-⇒ **判据:本表 15 项全部「达成」或「达成(边界)」才算完成。今天:12 项达成(其中 6 项带边界)/ 3 项未达成(#13 #14 #15)。**
+⇒ **判据:本表 19 项全部「达成」或「达成(边界)」才算完成。今天:16 项达成(其中 7 项带边界)/ 3 项未达成(#13 #14 #15)。**
 
 ### 复算(三条命令,别抄数)
 
