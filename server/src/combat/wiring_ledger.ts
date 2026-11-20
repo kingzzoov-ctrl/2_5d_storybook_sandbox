@@ -174,11 +174,16 @@ export const COMBAT_WIRING_LEDGER: readonly CombatWiringRow[] = Object.freeze([
   {
     symbol: 'talentFlags',
     module: 'server/src/combat/progression.ts',
-    status: WIRING_STATUS.UNWIRED,
+    status: WIRING_STATUS.WIRED,
+    wiredAt: 'server/src/sim/world_sim.ts#exportPlayerSnapshots(天赋随档案快照落库)',
     evidence: '\\.talentFlags\\b',
     reason:
-      '写入点 = recompute(每级重算);读取点 = 0。真正的天赋生效点只有 settleMobExp 读等级'
-      + '(isTalentUnlocked),不读本表。整表登记,不许把「写进 talentFlags」说成「已生效」。',
+      '★ 第十一轮(审计 FND118-10/12):本行此前写 UNWIRED —— 「读取点 = 0」在写它的时候是'
+      + '真的,但 R2 的档案快照线给 `world_sim.ts#exportPlayerSnapshots` 加了一个真读者:'
+      + '`row.talent = Object.keys(p.talentFlags).sort()`(每名玩家的天赋 id 列表随快照落库,'
+      + '重连/换房后能读回来)。⇒ 按**实测**改成 WIRED(消费点在 world_sim,不在定义模块内)。'
+      + '整表登记仍在:不许把「写进 talentFlags」说成「天赋数值已生效」—— 天赋是否改数值由'
+      + '`TALENT_EFFECT_WIRING`(progression.ts)逐条对账,那是另一件事。',
   },
   {
     symbol: 'carrySlots',
@@ -248,6 +253,29 @@ export const COMBAT_WIRING_LEDGER: readonly CombatWiringRow[] = Object.freeze([
       + ' ⇒ 撤下,等 owner 定受击击退口径。',
   },
 
+  /* ★ 第十一轮补登(测量法:全仓 `\bSYM\b` 逐名 grep —— server/src + client/src + shared
+     三层里**除定义处之外零命中**,连测试都没读)。它们与 `PRANK_HAMMER_KNOCKBACK` 是同一类:
+     内容表给了数值,而对应的机制**没有任何执行点** ⇒ 只能写 UNWIRED,不能写「已生效」。 */
+  {
+    symbol: 'TAUNT_RADIUS',
+    module: 'server/src/combat/weapons.ts',
+    status: WIRING_STATUS.UNWIRED,
+    evidence: '\\bTAUNT_RADIUS\\b',
+    reason:
+      '242 大声公扩音喇叭「强制 8 格内怪物仇恨转向」的半径常量,全仓**零读者**(生产与测试都没有):'
+      + '怪物仇恨表在 `mobs/aggr.ts` 那一侧另有口径,而「谁被嘲讽转向」是玩法裁决(要不要覆盖仇恨表)'
+      + '不在战斗侧自行放开 ⇒ 如实登记为未接,别把它读成「嘲讽已生效」。',
+  },
+  {
+    symbol: 'KAIROS_CRIT_BONUS',
+    module: 'server/src/combat/weapons.ts',
+    status: WIRING_STATUS.UNWIRED,
+    evidence: '\\bKAIROS_CRIT_BONUS\\b',
+    reason:
+      '251 黄金凯旋小号「全队暴击率 +15%」的加成常量,全仓**零读者**(生产与测试都没有):'
+      + '它要接的是「队伍范围 + 持续时长」两条规则(谁是队友 / 加成何时失效),而那两条今天只'
+      + '存在于派对与 buff 两套机制里 ⇒ 接上去就是第二份口径,等 owner 定再动。',
+  },
   /* ═══════════════ 丙 RESERVED:预留(有下游,今天没人读)═══════════════ */
   {
     symbol: 'shieldLeft',

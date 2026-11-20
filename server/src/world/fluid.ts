@@ -346,6 +346,31 @@ export class FluidField {
     return s;
   }
 
+  /**
+   * ★ WS-FND-164:水位表的**观测签名**(FNV-1a 32 位)。
+   *
+   * ## 为什么是一个签名而不是一个 `dirty` 布尔
+   *
+   * 「存档该不该重写水位」必须能判:每 30 秒无条件把整表写一遍,在 512×512 上
+   * 就是 1MB/次(≈2KB/s 的纯浪费),而水位在「水已平衡」时**一毫格都没动**。
+   * 直接在 `step` 里埋一个脏标记要改的写入点有十几处(通量落账 / 相变 /
+   * `digCanal` / `setCell` / `addWater` / 内部 `lavaIdx`),漏一处就是**静默不存**
+   * —— 那比多算一次便宜得多。
+   * 签名则是:一次 O(格数) 扫,拿到的就是「当前水位长什么样」。
+   * 相同 ⇒ 不必重写(`amount` 是唯一真相,签名只读它)。
+   *
+   * ⚠️ 它是**启发式**而不是证明:两个不同的水位表理论上可能撞哈希。所以它只用来
+   *    **避免多余写入**,不用来「判断两份世界是否相等」—— 判据要比的是逐格水位。
+   */
+  levelsSignature(): number {
+    let h = 0x811c9dc5;
+    const a = this.amount;
+    for (let i = 0; i < a.length; i += 1) {
+      h = Math.imul(h ^ (a[i] >>> 0), 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  }
+
   /** 按流体种类统计总量。 */
   totalsByKind(): Record<FluidKind, number> {
     const out: Record<string, number> = {
@@ -907,3 +932,130 @@ export function makeSealedPool(width: number, height: number, fill: number): Flu
 
 /** 2Hz 帧时长(秒),文档与超时判定共用。 */
 export const FLUID_FRAME_SECONDS = SLOW_DT;
+
+/* ═══════════ 8. 水位表存档格式(★ WS-FND-164:chunk 脏页存档的流体那一半)═══════════
+ *
+ * ## 为什么流体要有自己的字节格式,而不是塞进 chunk 行
+ *
+ * `room_chunks` 的一行是「一块 1KB 地形」,而水位是**房间级**的连续场
+ * (`FluidField` 是 `sizeCells × sizeCells` 一整片,不按块切)。
+ * 塞进某一块的行里就会出现「水位属于哪一块」这个错误问题。
+ *
+ * ## 格式(自描述、定长、可拒收)
+ *
+ * ```text
+ * [0,4)    magic 'FLV1'(逐字节 0x46 0x4c 0x56 0x31)
+ * [4,8)    uint32 LE width
+ * [8,12)   uint32 LE height
+ * [12,..)  width × height 个 int32 LE amount(逐行,与 `index(x, y)` 同序)
+ * ```
+ *
+ * ## 三件刻意不做的事
+ *
+ * 1 **不存 `base` / `solid` / `elev` / 活跃集 / 相变队列**。前三条是地形的
+ *    **投影**(`WorldSim.setCell` 在写地形时同步),读档时按恢复出来的地形重投影
+ *    才是唯一真相;后两条是**性能缓存**(见 `activeArr` 的注释),落进存档就会
+ *    长出第二份可能与 `amount` 矛盾的真相。
+ * 2 **不做稀疏表**:密表长度 = `12 + 4·w·h`,一眼能算、拒绝条件简单
+ *    (`长度必须恰好相等`)。稀疏表在「大半个世界都湿」时与密表同量级,却多一层
+ *    「哪些格在表里」的语义(而那正是 `amount` 已经回答的事)。
+ * 3 **不在这一层判字节上限**:上限是存储层的事(`db/repo.ts` 的 1 MiB blob 闸)。
+ *    这里只保证「解出来的场与字节自洽」。
+ */
+
+/** 水位表字节格式的 magic(与 `WORLD_ARCHIVE_MAGIC` 一样是自描述头)。 */
+export const FLUID_AMOUNT_MAGIC = 'FLV1';
+
+/** 水位表头的字节数(magic + width + height)。 */
+export const FLUID_AMOUNT_HEADER_BYTES = 12;
+
+/** magic 的四个 ASCII 字节(`'FLV1'`)。 */
+const FLUID_AMOUNT_MAGIC_BYTES: readonly number[] = [0x46, 0x4c, 0x56, 0x31];
+
+/** 解出来的水位表(与 `FluidField.amount` 同序)。 */
+export interface FluidAmountsBlob {
+  width: number;
+  height: number;
+  amount: Int32Array;
+}
+
+/** 把当前水位表打成 `FLV1` 字节(`12 + 4·w·h`)。 */
+export function packFluidAmounts(fluid: FluidField): Uint8Array {
+  const w = fluid.width;
+  const h = fluid.height;
+  const out = new Uint8Array(FLUID_AMOUNT_HEADER_BYTES + w * h * 4);
+  out[0] = FLUID_AMOUNT_MAGIC_BYTES[0];
+  out[1] = FLUID_AMOUNT_MAGIC_BYTES[1];
+  out[2] = FLUID_AMOUNT_MAGIC_BYTES[2];
+  out[3] = FLUID_AMOUNT_MAGIC_BYTES[3];
+  const dv = new DataView(out.buffer);
+  dv.setUint32(4, w, true);
+  dv.setUint32(8, h, true);
+  for (let i = 0; i < fluid.amount.length; i += 1) {
+    dv.setInt32(FLUID_AMOUNT_HEADER_BYTES + i * 4, fluid.amount[i], true);
+  }
+  return out;
+}
+
+/**
+ * 读一份水位表字节。
+ *
+ * **坏输入一律 `null`**(不抛、不猜):magic 不对 / 头截断 / `w·h` 与剩余长度
+ * 对不上 / 尺寸非正 —— 四种都在这里变成「这份水位不可用」,由调用方决定是
+ * 「不写水位」还是「如实失败」。半个水位场比没有水位场更坏(读的人分不出
+ * 「这里本来就没水」与「这里的字节丢了」)。
+ */
+export function readFluidAmounts(blob: Uint8Array): FluidAmountsBlob | null {
+  if (!(blob instanceof Uint8Array) || blob.byteLength < FLUID_AMOUNT_HEADER_BYTES) return null;
+  for (let i = 0; i < 4; i += 1) {
+    if (blob[i] !== FLUID_AMOUNT_MAGIC_BYTES[i]) return null;
+  }
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const w = dv.getUint32(4, true);
+  const h = dv.getUint32(8, true);
+  if (w <= 0 || h <= 0) return null;
+  if (blob.byteLength !== FLUID_AMOUNT_HEADER_BYTES + w * h * 4) return null;
+  const amount = new Int32Array(w * h);
+  for (let i = 0; i < amount.length; i += 1) {
+    amount[i] = dv.getInt32(FLUID_AMOUNT_HEADER_BYTES + i * 4, true);
+  }
+  return { width: w, height: h, amount };
+}
+
+/**
+ * 把一份水位表铺回场上(与 `packFluidAmounts` 对偶)。
+ *
+ * **逐格走 `setCell({ amount })`**,绝不直接写 `amount[]`:那会绕过活跃集合
+ * (`markActive`),这些水位下一帧**不会被推进**(表现成「水面不流动」而不报错)。
+ * 与 `world_sim.applyRestoreWrite` 的第 4.5 步同一口径。
+ *
+ * 三本账分开报(不合并成「写了 N 格」):实心格被拒(`setCell` 抛 `RangeError`)
+ * 与越界格是**两种不同的坏输入**,合并之后就分不清「存档里有水在墙里」与
+ * 「存档的尺寸比世界大」。
+ */
+export function applyFluidAmounts(
+  fluid: FluidField,
+  blob: FluidAmountsBlob,
+): { applied: number; skippedSolid: number; outOfBounds: number } {
+  let applied = 0;
+  let skippedSolid = 0;
+  let outOfBounds = 0;
+  for (let y = 0; y < blob.height; y += 1) {
+    for (let x = 0; x < blob.width; x += 1) {
+      const amount = blob.amount[y * blob.width + x];
+      if (amount <= 0) continue;
+      if (!fluid.inBounds(x, y)) {
+        outOfBounds += 1;
+        continue;
+      }
+      try {
+        fluid.setCell(x, y, { amount });
+        applied += 1;
+      } catch {
+        /* 实心格不存水(`setCell` 的口径):水位落在墙里 ⇒ 那一格不铺,如实计数。 */
+        skippedSolid += 1;
+      }
+    }
+  }
+  return { applied, skippedSolid, outOfBounds };
+}

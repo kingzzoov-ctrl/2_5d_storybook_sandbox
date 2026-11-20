@@ -739,6 +739,67 @@ export class NetPersistRoom extends Room<RoomSchema> {
     }
   }
 
+  /**
+   * ★ WS-FND-163(A2):Colyseus 的**自动 patch 定时器**也要过席位判据。
+   *
+   * ## 修前缺陷(`USE_COLYSEUS_PATCH = true` 时才可达)
+   * 两条下行通道,修前只有一条有判据:
+   * ```text
+   * stepTick → broadcast('delta', packet, { except })   ← WS-FND-162 修过(过席位)
+   * 50ms patch 表 → Room.broadcastPatch()               ← 修前**完全不过判据**
+   * ```
+   * `Room.broadcastPatch()` 把 `this.clients` **整份**交给
+   * `SchemaSerializer.applyPatches(clients)`,而 `this.clients` 里仍有被踢者
+   * (`kick()` 只走 `leave()`:**摘席位、不断连接**)⇒ 一旦把
+   * `USE_COLYSEUS_PATCH` 打开,「踢」在下行上**立刻失效**:被踢者继续收 patch。
+   * 这正是 WS-FND-161 / -162 修过的同一形态**第三个入口** ——
+   * 前两处(`ws_server.ts` 的收件人集、装配层的 delta 广播)都已过判据,
+   * 只有 patch 表绕过去了。
+   *
+   * ## 判据复用 `deltaExclusions`(不新造第二条)
+   * 取键 = `seatKeyOf`(与 onJoin / onLeave / onMessage **同一处**),
+   * 判定 = `runtime.isSeated`(席位真账 = `RoomRuntime.members`)。
+   * 本层**不**另记一本「谁被踢过」的账:那种账要在入场 / 重连 / 断线 / 销毁
+   * 四条路径上都记得清,漏一条就是「被踢者复活」。
+   * 三态也逐条同款:在席位 ⇒ 收;不在 ⇒ 裁;**`isSeated` 自己抛 ⇒ 收**(fail-open)。
+   *
+   * ## 为什么要临时换 `this.clients`(而不是自己重写一遍 patch 投递)
+   * `SchemaSerializer.applyPatches(clients)` 是**同步**的:它按传入数组逐个
+   * `client.raw(patches)`,**自己既不读 `this.clients`、也没有 `except` 参数**
+   * (实测 `@colyseus/core/build/serializer/SchemaSerializer.js`)。
+   * 而 `Room.broadcastPatch()` 内部把 `this.clients` 传进去 ⇒ 想按席位裁,
+   * 只能让那一次调用的 `clients` 换成「去掉被裁者」的数组。
+   * ```text
+   * 换 → super.broadcastPatch() → finally 换回
+   * 同步段内不会有人观察这个数组:Colyseus 的增删在 _onJoin / _onLeave,
+   * 都不在 patch 调用栈里(换回失败会让下一帧把整个连接集丢掉 ⇒ 必须 finally)
+   * ```
+   * ⇒ 本方法**不复制** patch 语义(时钟推进 / `onBeforePatch` / after-patch 队列
+   * 全由 `super` 负责),只把「这一次的收件人」按席位判据裁一次。
+   *
+   * ## 常规路径零改动
+   * 没人被裁(全员在席位)⇒ 直接 `super.broadcastPatch()`,与修前逐字相同。
+   * 单通道模式(`USE_COLYSEUS_PATCH = false`,默认)下 patch 定时器根本不存在,
+   * 本方法只会在测试直接调用时跑到 —— 判据不依赖那个开关是开的
+   * (见 `tests/WS-FND-163`:它在**关着**的情况下直接调生产方法)。
+   */
+  override broadcastPatch(): boolean {
+    const except = deltaExclusions(
+      this.clients,
+      (c) => this.seatKeyOf(c),
+      (u) => this.runtime.isSeated(u),
+    );
+    if (except.length === 0) return super.broadcastPatch();
+    const holder = this as unknown as { clients: readonly unknown[] };
+    const all = this.clients;
+    holder.clients = all.filter((c) => !except.includes(c));
+    try {
+      return super.broadcastPatch();
+    } finally {
+      holder.clients = all;
+    }
+  }
+
   /** 客户端输入:移动 / 攻击 / 物品。**只有这些入口**能改权威状态。 */
   private registerHandlers(): void {
     this.onMessage('move', (client, msg: { tick: number; x: number; y: number; z: number; speedMul?: number }) => {

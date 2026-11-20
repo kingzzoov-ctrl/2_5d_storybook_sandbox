@@ -58,7 +58,20 @@ import {
   migrateStartingInventory,
   readStartingInventoryGrant,
   releaseStartingInventoryGrant,
+  /* ★ WS-FND-163(A4):玩家背包账的**读口**(repo §15)。写口在存档主机那一侧
+     (`world_sim.saveToDb` 的第 4 参),本文件只负责「导出」与「读回落账」。 */
+  loadPlayerLedger,
+  /* ★ WS-FND-165(B1):两段新落库口 ——
+     1 `savePlayerSnapshots`(repo §18):等级 / 经验 / 天赋 / 位置 / 血量(玩家快照);
+     2 `migrateRoomSystemsIfInstalled`(repo §17):房间系统台账的启动漂移检查。 */
+  savePlayerSnapshots,
+  migrateRoomSystemsIfInstalled,
+  type PlayerSnapshotRow,
+  /* ★ WS-FND-163(A1):`room_events` 有界保留的**周期轨**(见 `maybeTrimEvents`)。
+     修前它只挂在写入路径上(`writeEvent` 内部)与 VACUUM 上 ⇒ 只读房永不 trim。 */
+  trimEvents,
   type DbLike,
+  type PlayerLedgerSnapshot,
   type StartingInventoryGrantRecord,
 } from '../db/repo.ts';
 import {
@@ -74,6 +87,12 @@ import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
    修前本文件内联 `8 + (lv-1)` —— 那是同一条规则的第二份实现,改冻结层/改档案都不会
    让容量动一位,而两份数恰好相等 ⇒ 没有判据看得出它们已经分开。 */
 import { carryCapacityOfLevel } from '../combat/progression.ts';
+/* ★ WS-FND-163(A3):快照的**范围裁剪**半径 = 既有 AOI 唤醒半径(32 格,
+   `server/src/mobs/aoi.ts`)。不新造一个数:同一个「多远算近」的语义在
+   攻击结算(`OUT_OF_AOI`)与生物唤醒上都用它,再造一份就是第二份口径。
+   ⚠️ net → mobs 的依赖边在本仓**已有先例**(`net/actions/modify_town.ts`
+   取 `mobs/spawner.ts` 的 `TOWN_SAFE_RADIUS`),不是新开的层间边。 */
+import { AOI_WAKE_DISTANCE } from '../mobs/aoi.ts';
 /* ★ WS-FND-155:起始背包 —— **发什么**在冻结表 `shared/constants/starting_inventory.ts`,
    本文件不复制内容表、也不猜容量:「装不装得下」问 `carryCapacityOf`(与容量闸同源),
    截断/截断回执全在那个纯函数 `planStartingInventory` 里。 */
@@ -142,6 +161,53 @@ export const AUTOSAVE_INTERVAL_MS = 30_000;
 
 /** 帧节流:每 20 帧一次低频落盘(20Hz ⇒ 1 秒;`tests/WS-FND-02` C25 钉着这个数)。 */
 export const AUTOSAVE_FRAME_INTERVAL = 20;
+
+/**
+ * ★ WS-FND-165(B1):**玩家快照的周期轨** —— 具名间隔(10 秒)。
+ *
+ * ## 修前缺陷(实测)
+ * ```text
+ * users.level / pos_x / pos_y / hp  只在 join / 断线那一刻定格(重连快照那条路)
+ * users.exp / talent_json           生产 **0 写入**
+ * ```
+ * ⇒ 进程崩在两次入场之间,这一段期间的等级 / 经验 / 位置 / 血量**全丢**。
+ *
+ * ## 为什么是独立的一条轨,而不是合并进 `AUTOSAVE_INTERVAL_MS`
+ * 两者是**不同性质**的写:自动存档写的是「世界」(生物 mem / 背包账 / 台账),
+ * 这条写的是「人」(等级 / 经验 / 天赋 / 位置 / 血量)。合成一条的后果是
+ * 「想让人物状态更及时 ⇒ 连带把整份世界存档频率提上去」(或反之),而那两个
+ * 频率本来就该各自调。⇒ 各给一个**具名常量**,谁也别搭谁的便车。
+ *
+ * 10 秒的口径:一次崩溃最多丢 10 秒的移动/血量(与 `HEARTBEAT_TIMEOUT_MS`
+ * 同一量级),而写入量是「在场玩家数 × 一次事务 / 10s」—— 与 30 秒的整份
+ * 世界存档相比仍是小头。
+ */
+export const PLAYER_SNAPSHOT_INTERVAL_MS = 10_000;
+
+/**
+ * ★ WS-FND-163(A1):`room_events` **有界保留的周期轨** —— 具名间隔(30 秒)。
+ *
+ * ## 修前缺陷
+ * `repo.ts#trimEvents` 早就写好且**幂等**,但它的触发点只有两个:
+ * ```text
+ * 1 writeEvent 内部(写入路径)  ⇒ 有写入才会 trim
+ * 2 VACUUM / 外部维护           ⇒ 不在进程生命周期里
+ * ```
+ * ⇒ **只读房**(没人写审计流水:零违规、房间状态不变)永远不会 trim;
+ *   而「库不会涨」这条承诺不该依赖「恰好有人在写流水」。
+ *
+ * ## 为什么是**独立**的轨,而不是搭在存档周期(`saveWorldNow`)上
+ * 后者会在三种情形下**什么都不做**(没有库 / 没有世界源 / 上次失败仍在退避窗)。
+ * 搭在它上面 ⇒ 「没有世界源的房间,审计流水永不回收」—— 那与修前那个
+ * 「只读房永不 trim」是同一个缺陷换个入口。
+ * ⇒ 本轨只依赖「有库 + `step()` 被驱动」,与存档能不能做成**无关**。
+ *
+ * ## 与 `AUTOSAVE_INTERVAL_MS` 同为 30 秒但**不共用**常量
+ * 两者是两条独立承诺(「世界状态多久落一次盘」/「审计流水多久收一次」),
+ * 合并成一个常量会让「单独调其中一个」变成「顺手把另一个也改了」——
+ * 而那两个数之间没有任何必须相等的关系。
+ */
+export const EVENT_TRIM_INTERVAL_MS = 30_000;
 
 /**
  * 存档失败日志的环形上限(诊断够用即可,不随房间寿命增长)。
@@ -875,11 +941,60 @@ export interface UseItemOutcome {
 }
 
 export interface WorldSaveHost {
+  /*
+   * ★ WS-FND-163(A4):`playerLedgers` = 本房间的**玩家背包账**(按件账 + 总量账)。
+   *
+   * ## 为什么是可选参数
+   * 手写 host 假件(`tests/**` / `scripts/**`)与老实现只声明三个参数本来就合法:
+   * 少了它 ⇒ 存档**不写背包**、`ledgerSaved` 缺省(`room.ts` 按 `?? 0` 读),
+   * 而不是编译期红 —— 与 `setPlayerAfk` / `resetWorld` 那一族可选成员的取舍同源。
+   * 生产宿主(`world_sim.saveToDb`)实现了它,`index.ts` 的装配不需要改。
+   *
+   * ## 为什么返回字段也是可选的
+   * 老宿主的返回值里没有这三个数 ⇒ 「这一次有没有写背包」是 `undefined`。
+   * 房间侧按 `?? 0` 读并放进 `lastSaveReport` —— 「没写」与「写了 0 个」在
+   * 报告里是同一个数,所以判据要同时看**库里的行**(见 `tests/WS-FND-163`
+   * 的注入那条:拿掉这个参数 ⇒ 库里永远没有背包账)。
+   */
   saveToDb(
     db: DbLike,
     roomId: string,
     nowMs: number,
-  ): { hpSaved: number; hpSkipped: number; memRow: number };
+    playerLedgers?: ReadonlyMap<string, PlayerLedgerSnapshot>,
+  ): {
+    hpSaved: number;
+    hpSkipped: number;
+    memRow: number;
+    ledgerSaved?: number;
+    ledgerSkipped?: number;
+    ledgerDropped?: number;
+    /* ★ WS-FND-165(B1):房间系统台账那一段的落地数(1 = 写进去了一行)。
+       老宿主(只有前三段)⇒ 这三个键缺省,房间侧按 `?? 0` 读(与上面同一处置)。 */
+    systemsRow?: number;
+    systemsKeys?: number;
+    systemsDropped?: number;
+  };
+  /* ══════════ ★ WS-FND-165(B1):冷启动恢复 + 周期玩家快照的三条声明 ══════════
+   *
+   * 与上面 `playerLedgers` 同一取舍:**可选**(`?`)。手写 host 假件
+   * (`tests/**` / `scripts/**`)不实现它们本来就合法 —— 那种宿主走
+   * 「能力缺失」分支(本文件显式记 `skipReason`),**不许**静默假装做过。
+   *
+   * 1 `restoreRoomSystemsFromDb`  —— 结算幂等台账的**读口**(冷启动那一次):
+   *    修前 `roomSystemsState.settled` / `roomDayIndex` 只活在内存 ⇒ 同一张订单
+   *    跨进程能再成交一次。返回 `reason` 如实区分 no-table / no-row / corrupt。
+   * 2 `exportPlayerSnapshots`    —— 周期快照的**导出**(等级/经验/天赋/位置/血量)。
+   * 3 `restoreProgressionFromDb` —— 入场时把**经验/天赋**读回世界(修前 exp 归零)。
+   */
+  restoreRoomSystemsFromDb?(
+    db: DbLike,
+    roomId: string,
+  ): { applied: boolean; added: number; keys: number; dayIndex: number; dropped: number; reason: string };
+  exportPlayerSnapshots?(): readonly PlayerSnapshotRow[];
+  restoreProgressionFromDb?(
+    db: DbLike,
+    playerId: string,
+  ): { applied: boolean; level: number; exp: number; talent: number; reason: string };
   /**
    * 玩家对某只生物发起一次**权威**攻击(等级/装备由模拟层自己派生)。
    *
@@ -1938,6 +2053,16 @@ export class RoomRuntime {
     hpSaved: number;
     hpSkipped: number;
     memRow: number;
+    /* ★ WS-FND-163(A4):背包账那一段的落地数。老宿主 / 空账 ⇒ 记 0
+       (报告里这两个键**恒定出现**,读的人不必先判 undefined)。 */
+    ledgerSaved: number;
+    ledgerDropped: number;
+    /* ★ WS-FND-165(B1):房间系统台账那一段(结算幂等键集 + 房内第几天)。
+       `systemsKeys` 是**真正落库**的键数 —— 「这一次到底把幂等账写进去没有」
+       由此可断言,不必靠读的人相信它写了(老宿主 ⇒ 记 0,与上面同一处置)。 */
+    systemsRow: number;
+    systemsKeys: number;
+    systemsDropped: number;
   } | null = null;
 
   /* ══════════ ★ 自动存档的可观测面(owner 裁定:像 Minecraft 一样自动保存)══════════
@@ -1981,6 +2106,26 @@ export class RoomRuntime {
    * 而这条是调度用的内部水位 —— 让它俩共用一个字段等于把调度状态暴露成公开 API。
    */
   private lastAutosaveAtMs: number;
+
+  /* ── ★ WS-FND-163(A1):`room_events` 有界保留的周期轨(可观测面)──────────
+   *
+   * 与存档那一族同一纪律:真值仍在库里(`room_events` 的行数),
+   * 这里只回答「上一次收是什么时候、收掉几条、失败过没有」——
+   * 修前这三个问题**没有答案**(trim 只在写入路径上发生,而只读房压根不写)。
+   */
+  /** 事件保留轨的水位(= 上一次 trim 时刻;构造时 = 建房时刻)。 */
+  private lastEventTrimAtMs: number;
+  /** 最近一次事件保留的结果;`null` = 从未跑过。 */
+  lastEventTrim: { at: number; removed: number } | null = null;
+  /** 成功跑过的事件保留次数(与 `lastEventTrim` 成对读)。 */
+  eventTrimCount = 0;
+  /**
+   * 最近一次事件保留的错因;`null` = 没有失败。
+   *
+   * ⚠️ 与存档失败同一取舍:trim 失败**不抛**(一次 DELETE 失败不该掀掉整帧),
+   * 但**不静默** —— 否则「审计流水不再回收」会表现成「没有任何事情发生」。
+   */
+  lastEventTrimError: string | null = null;
 
   /**
    * ★ P1(2026-11-21)自动存档双轨倒置修点:上一次**尝试**存档的房间帧号
@@ -2168,6 +2313,9 @@ export class RoomRuntime {
     /* ★ 墙钟轨的水位从这里开始 —— 建房即「刚存过」,否则首帧就会因为
        `now - 0 >= 30s` 而误触发一次存档(开机顺序就会变成「先落盘再热闹」)。 */
     this.lastAutosaveAtMs = this.lastActivityMs;
+    /* ★ WS-FND-163(A1):事件保留轨的水位同款 —— 建房即「刚收过」,
+       否则首帧就会因为 `now - 0 >= 30s` 而误触发一次 trim(无害但会污染判据读数)。 */
+    this.lastEventTrimAtMs = this.lastActivityMs;
     /* ── 身份鉴权(审计 P0-1):私钥 + 强制开关 + 房主凭证 ──
        顺序有要求:`authSecret` 必须先于 `ownerToken`(后者要签名),
        而两者都必须在 `this.id` / `this.clock` 之后(载荷里要 roomId 与过期时刻)。 */
@@ -2232,6 +2380,12 @@ export class RoomRuntime {
         nowMs: this.clock.nowMs(),
       });
     }
+    /* ★ WS-FND-165(B1) ①:玩家快照轨的水位 —— 建房即「刚存过」(与 `lastAutosaveAtMs`
+       同一理由:否则首帧就会因为 `now - 0 >= 10s` 而误触发一次写库)。
+       ② **冷启动恢复结算台账**:必须在建房之后、任何人入场之前
+       (位置理由见 `restoreRoomSystems` 的 docblock)。 */
+    this.lastPlayerSnapshotAtMs = this.lastActivityMs;
+    this.restoreRoomSystems();
   }
 
   /* ══════════════ ★ WS-FND-155:起始背包(只与入场段有关)══════════════
@@ -2602,6 +2756,18 @@ export class RoomRuntime {
             50ms 后跳成 7 件」那种一帧的错。
          ⚠️ 计划被拒(容量非法 / 表内容非法)**不抛**:入场不该因为一份起始礼物失败,
             但必须留回执(`lastStartingInventory`),不许静默什么都不发。 */
+      /* ★ WS-FND-163(A4):**读回落账** —— 背包账的恢复点。
+         位置是契约:必须在 `startingInventory` **之前**,否则「手里已有东西」
+         这条闸(闸 2)看到的还是空账 ⇒ 老玩家会被再发一次起始包;
+         也必须在 `restoreFromProfile` **之后**(容量按恢复后的档案算,与起始包同一理由)。 */
+      this.restorePlayerLedger(input.userId);
+      /* ★ WS-FND-165(B1):**成长档案**读回(经验 / 天赋 / 等级)。
+         位置:紧挨着背包账读回 —— 两者都是「库里的玩家存档 → 权威层」,
+         且都必须在 `grantStartingInventory` 之前(那条路的闸 2 看的是「他有没有东西」)。
+         ⚠️ 与 `restoreFromProfile` **不重复**:那条走重连快照(level/hp/位置),
+         这条走 `users.exp` / `users.talent_json`(修前它们**生产 0 写入**)。
+         失败不抛(入场不该因为一份经验起不来),但记 `lastProgressionRestore*`。 */
+      this.restorePlayerProgression(input.userId);
       this.grantStartingInventory(input.userId);
 
       this.touch(now);
@@ -4346,6 +4512,128 @@ export class RoomRuntime {
       m.set(id, next > 0 ? next : 0);
     }
   }
+
+  /* ══════════ ★ WS-FND-163(A4):背包账的**落库导出**与**读回落账** ══════════
+   *
+   * ## 修前形态(本轮最优先的那条)
+   * 自动存档(`saveWorldNow`)只保证「起始包**不重发**」——
+   * 那是 `user_starting_inventory` 台账,它回答「发过没有」,**不是**「手里有什么」。
+   * 而这两张表(`itemCounts` / `inventoryTotals`)只活在房间里:
+   * ```text
+   * users.inventory_json   从 createUser 起就是 '{}',之后再没有生产写点
+   * ai_item_instances      addItemInstance 只有测试调用
+   * ```
+   * ⇒ 「自动存档」在背包这一维上是**空的**:进程一停,背包回到空,
+   *   而库里那一行还在(只是从未变过)⇒ 没有任何东西会红。
+   *
+   * ## 两份账都要落,而且**分开**落
+   * 按件账是明细,总量账是容量闸的基准之一(见 `authoritativeItemTotal`)。
+   * 只落明细 ⇒ 读回时总量得重算(而「重算」正是本仓点名的那条静默改数);
+   * 只落总量 ⇒ 明细没了,`USE_ITEM` 的按件判据(白名单)直接失效。
+   * ⇒ 两份都写进同一行(repo §15 的 `$total` + 数字键),读口如实报 `drift`。
+   */
+
+  /**
+   * 把本房间的玩家背包账导出成落库形状(存档主机与存档报告共用)。
+   *
+   * 空账**不导出**:一个从未拿到东西的玩家不该在库里占一行,
+   * 也不该把别人(或上一局)的账覆盖成空。
+   */
+  exportPlayerLedgers(): Map<string, PlayerLedgerSnapshot> {
+    const out = new Map<string, PlayerLedgerSnapshot>();
+    const ids = new Set<string>([...this.itemCounts.keys(), ...this.inventoryTotals.keys()]);
+    for (const userId of ids) {
+      const counts = this.itemCounts.get(userId) ?? new Map<number, number>();
+      let sum = 0;
+      for (const n of counts.values()) if (n > 0) sum += n;
+      const total = this.inventoryTotals.get(userId) ?? sum;
+      if (sum === 0 && total === 0) continue;
+      out.set(userId, { counts, total });
+    }
+    return out;
+  }
+
+  /**
+   * 上一次**读回落账**的读数(诊断;判据用它区分「库里没有账」与「读回成空」)。
+   *
+   * `null` = 本房间还没读过;`applied: false` 的三种成因各不相同:
+   * ```text
+   * 没有库            db === null
+   * 本地已有账        内存账比库新(离场已存过一次;存失败时库里那份更旧)⇒ 不覆盖
+   * 库里没有可用账    没有 users 行 / 还是 '{}' / 格式读不懂(repo §15)
+   * ```
+   */
+  lastLedgerRestore: {
+    readonly userId: string;
+    readonly applied: boolean;
+    /** 读回的按件条目数。 */
+    readonly counts: number;
+    /** 读回的总量账。 */
+    readonly total: number;
+    /** 库里两账不一致(总量账漂了)—— 如实上报,不在这里替它改数。 */
+    readonly drift: boolean;
+  } | null = null;
+
+  /** 背包账读回失败时的错因;`null` = 没有失败。 */
+  lastLedgerError: string | null = null;
+
+  /**
+   * ★ WS-FND-163(A4):从库里读回**这个玩家**的背包账(入场时调一次)。
+   *
+   * ## 为什么只在「本房间没有这个人的账」时才读
+   * 内存账永远不比库旧:
+   * ```text
+   * 离场前已经存过一次(leave() 先 saveWorldNow('leave') 再 purgeSeat)
+   * 存失败时库里那份才是**更旧的**(失败已记账,但没有改库)
+   * ```
+   * ⇒ 无条件覆盖写会把「这一局刚产出的东西」抹成「上一次的存档」。
+   * 这条边界的判据在 `tests/WS-FND-163`(负对照:本地有账 ⇒ 库里的旧值不生效)。
+   */
+  restorePlayerLedger(userId: string): boolean {
+    const db = this.db;
+    if (db === null) {
+      this.lastLedgerRestore = { userId, applied: false, counts: 0, total: 0, drift: false };
+      return false;
+    }
+    if (this.itemCounts.has(userId) || this.inventoryTotals.has(userId)) {
+      this.lastLedgerRestore = { userId, applied: false, counts: 0, total: 0, drift: false };
+      return false;
+    }
+    let row: ReturnType<typeof loadPlayerLedger>;
+    try {
+      row = loadPlayerLedger(db, userId);
+    } catch (e) {
+      /* 读库失败**不抛**:背包读不回来不该让入场失败(与 `grantStartingInventory`
+         的「入场不因一份礼物失败」同一取舍),但绝不静默。 */
+      this.lastLedgerError =
+        `背包账读回失败(${((e as Error)?.message ?? String(e)).slice(0, 120)})`.slice(0, 160);
+      this.lastLedgerRestore = { userId, applied: false, counts: 0, total: 0, drift: false };
+      return false;
+    }
+    if (row === undefined) {
+      this.lastLedgerRestore = { userId, applied: false, counts: 0, total: 0, drift: false };
+      return false;
+    }
+    /* 空账(库里存成 0 件)⇒ 什么都不落:Map 里多一条空账只是垃圾,
+       而「他确实没有东西」这个事实不需要一条记录来表达。 */
+    if (row.counts.size === 0 && row.total === 0) {
+      this.lastLedgerRestore = { userId, applied: false, counts: 0, total: 0, drift: row.drift };
+      return false;
+    }
+    const counts = new Map<number, number>();
+    for (const [itemId, qty] of row.counts) {
+      if (Number.isInteger(itemId) && itemId > 0 && Number.isInteger(qty) && qty > 0) {
+        counts.set(Math.trunc(itemId), Math.trunc(qty));
+      }
+    }
+    if (counts.size > 0) this.itemCounts.set(userId, counts);
+    this.inventoryTotals.set(userId, row.total);
+    this.lastLedgerError = null;
+    this.lastLedgerRestore = {
+      userId, applied: true, counts: counts.size, total: row.total, drift: row.drift,
+    };
+    return true;
+  }
   drainViolations(): Violation[] {
     const out = this.pendingViolations;
     this.pendingViolations = [];
@@ -4365,9 +4653,10 @@ export class RoomRuntime {
    * 本仓 1 号病根(两份实现)的最小形态。⇒ 三处只决定**何时**调,本方法决定**怎么调**。
    *
    * ## 复用既有存档路径
-   * 落盘走 `host.saveToDb(db, roomId, nowMs)`(HP → `users.hp`、生物 mem →
-   * `rooms.mob_mem_json`),读回走 `loadFromDb` / `restoreFromProfile`。
-   * 本方法**不引入任何新格式**、不写新表、不改 DDL。
+   * 落盘走 `host.saveToDb(db, roomId, nowMs, playerLedgers)`(HP → `users.hp`、
+   * 生物 mem → `rooms.mob_mem_json`、★ WS-FND-163:玩家背包账 →
+   * `users.inventory_json`),读回走 `loadFromDb` / `restoreFromProfile` /
+   * `restorePlayerLedger`。本方法**不引入任何新格式**、不写新表、不改 DDL。
    *
    * ## 失败**不抛**,但绝不静默
    * ``` 
@@ -4400,7 +4689,12 @@ export class RoomRuntime {
     this.autosaveInFlight = true;
     this.lastSaveAttemptTick = this.state.meta.tick;
     try {
-      const r = host.saveToDb(db, this.id, this.lastActivityMs);
+      /* ★ WS-FND-163(A4):背包账(**按件账 + 总量账**)与 HP / 生物 mem
+         **同一次写入、同一个落点** —— 存档动作仍然只有一个实现。
+         传的是**导出结果**(空账就是空 Map):「这一次写了几份」由报告如实带出来,
+         不在这里猜,也不另开第二条存档路径。 */
+      const playerLedgers = this.exportPlayerLedgers();
+      const r = host.saveToDb(db, this.id, this.lastActivityMs, playerLedgers);
       /* 报告与库是**同一份**写入的结果:报告的 tick 取**存档后**的房间帧号,
          与 `world_tick` 同版(否则读回时两者会差一帧)。 */
       this.lastSaveReport = {
@@ -4408,6 +4702,13 @@ export class RoomRuntime {
         hpSaved: r.hpSaved,
         hpSkipped: r.hpSkipped,
         memRow: r.memRow,
+        /* 老宿主(没有这三个数)⇒ 如实记 0:报告里恒定出现,读的人不必先判 undefined。 */
+        ledgerSaved: r.ledgerSaved ?? 0,
+        ledgerDropped: r.ledgerDropped ?? 0,
+        /* ★ WS-FND-165(B1):台账那一段 —— 老宿主(没有这三个数)⇒ 如实记 0。 */
+        systemsRow: r.systemsRow ?? 0,
+        systemsKeys: r.systemsKeys ?? 0,
+        systemsDropped: r.systemsDropped ?? 0,
       };
       this.lastSaveAt = now;
       this.lastAutosaveAtMs = now;
@@ -4460,6 +4761,235 @@ export class RoomRuntime {
     };
   }
 
+  /* ══════════ ★ WS-FND-165(B1):玩家快照的周期轨(等级 / 经验 / 天赋 / 位置 / 血量)══════════
+   *
+   * ## 它补的是哪一段
+   * ```text
+   * users.exp / talent_json        生产 **0 写入**(createUser 之后再没有写点)
+   * users.level / pos_x / pos_y    只在 join / 断线那一刻定格
+   * ```
+   * ⇒ 两次入场之间的一切(打怪涨的经验、走到哪里、掉了多少血)在崩溃时**全丢**。
+   * 本轨按 `PLAYER_SNAPSHOT_INTERVAL_MS` 落库,把「定格在入场那一刻」变成「最近 10 秒」。
+   *
+   * ## 状态是**字段**而不是局部变量
+   * 与 `lastSaveAt` / `maybeTrimEvents` 同一取舍:调度状态 приватно,但必须**可观测**
+   * (`lastPlayerSnapshotAt` / `playerSnapshotCount` / …),否则「轨没跑」与
+   * 「跑了但没人需要」从外面看不出区别(live-path 那类缺陷)。
+   */
+
+  /** 周期快照的水位(建房即「刚存过」,否则首帧就会因为 `now - 0 >= 10s` 误触发)。 */
+  private lastPlayerSnapshotAtMs: number;
+  /** 偶发写库失败时的退避窗(帧);成功即归零。 */
+  private playerSnapshotBackoffFrames = 0;
+  private lastPlayerSnapshotAttemptTick = -1;
+  /** 成功落盘次数(**失败不计**:与 `saveCount` 同一口径)。 */
+  playerSnapshotCount = 0;
+  /** 最近一次**成功**落盘的时刻;`null` = 还没成功过。 */
+  lastPlayerSnapshotAt: number | null = null;
+  /** 最近一次成功落盘的报告(几人的快照真的写进了库)。 */
+  lastPlayerSnapshotReport: {
+    tick: number; saved: number; skipped: number; dropped: number; reason: string;
+  } | null = null;
+  /** 最近一次失败的错因;`null` = 没有失败。 */
+  lastPlayerSnapshotError: string | null = null;
+  /** 跳过原因(`no-db` / `no-host` / `no-capability`);成功时归 `null`。 */
+  lastPlayerSnapshotSkipReason: string | null = null;
+  /** 最近的失败(环形,最多 8 条)—— 与 `saveErrors` 同一处置。 */
+  readonly playerSnapshotErrors: { at: number; reason: string; message: string }[] = [];
+  /**
+   * ★ 冷启动恢复房间系统台账的读数(`null` = 本房间还没试过)。
+   *
+   * 为什么必须可观测:台账是「哪几张单已结算」的唯一跨进程真值;
+   * `reason: 'corrupt'` 意味着**重放窗口可能是开的**,而那件事必须看得见,
+   * 不许被一句「恢复失败但房间照常跑」盖过去。
+   */
+  lastRoomSystemsRestore: {
+    readonly applied: boolean;
+    readonly added: number;
+    readonly keys: number;
+    readonly dayIndex: number;
+    readonly dropped: number;
+    readonly reason: string;
+  } | null = null;
+  /** 最近一次入场读回**成长档案**(等级/经验/天赋)的读数;`null` = 还没试过。 */
+  lastProgressionRestore: {
+    readonly userId: string;
+    readonly applied: boolean;
+    readonly level: number;
+    readonly exp: number;
+    readonly talent: number;
+    readonly reason: string;
+  } | null = null;
+  /** 成长档案读回失败时的错因;`null` = 没有失败。 */
+  lastProgressionRestoreError: string | null = null;
+
+  /**
+   * ★ WS-FND-165(B1):**冷启动恢复结算台账**(构造期调一次)。
+   *
+   * 位置:建房之后、任何人入场之前。此刻世界是全新的(台账空、日号 0),
+   * 而库里的那份才是「这间房以前结算过什么」⇒ 必须**先**并进来,
+   * 否则第一张老订单就会被当成新订单再成交一次(这正是本次要修的缺陷)。
+   *
+   * 失败**不抛**(与 `maybeTrimEvents` 同一取舍:冷启动不该因为一份台账起不来),
+   * 但如实分类记进 `lastRoomSystemsRestore`,并由 `reason` 区分
+   * 「没有库 / 宿主没这能力 / 库里没有 / 库里读不懂」。
+   */
+  restoreRoomSystems(): boolean {
+    const host = this.worldSaveHost;
+    /* 顺序固定(与 `saveWorldNow` 的 null 契约同一写法):
+       1 没有库          ⇒ no-db(纯内存模式没有跨进程真值)
+       2 宿主没有这个能力 ⇒ no-capability(手写假件 / 老宿主,不假装做过)
+       3 库**没装过**本迁移 ⇒ no-table,**直接跳过读口** —— 这一条不只是措辞:
+         `MemoryDb.get()` 对不存在的表会**顺手建一张空表**,于是「读一次」会在内存
+         夹具上凭空多出第 10 张表,把既有判据(`tests/WS-FND-156` FND156-7 的
+         「只多了台账这一张」)打红。库从没装过 ⇒ 本来就没有台账可读。 */
+    if (this.db === null) {
+      this.lastRoomSystemsRestore = {
+        applied: false, added: 0, keys: 0, dayIndex: 0, dropped: 0, reason: 'no-db',
+      };
+      return false;
+    }
+    if (host === null || typeof host.restoreRoomSystemsFromDb !== 'function') {
+      this.lastRoomSystemsRestore = {
+        applied: false, added: 0, keys: 0, dayIndex: 0, dropped: 0, reason: 'no-capability',
+      };
+      return false;
+    }
+    try {
+      /* 台账表的**启动漂移检查**:装过本迁移的库 ⇒ 幂等 DDL + checksum 判定,
+         漂移 ⇒ 抛(与起始包台账/归档同一条 fail-closed 纪律);没装过 ⇒ 什么都不做
+         ⇒ 下面直接记 no-table,一个字节都不碰库。 */
+      const boot = migrateRoomSystemsIfInstalled(this.db, this.clock.nowMs());
+      if (!boot.installed) {
+        this.lastRoomSystemsRestore = {
+          applied: false, added: 0, keys: 0, dayIndex: 0, dropped: 0, reason: 'no-table',
+        };
+        return false;
+      }
+      const r = host.restoreRoomSystemsFromDb(this.db, this.id);
+      this.lastRoomSystemsRestore = {
+        applied: r.applied, added: r.added, keys: r.keys,
+        dayIndex: r.dayIndex, dropped: r.dropped, reason: r.reason,
+      };
+      return r.applied;
+    } catch (e) {
+      this.lastRoomSystemsRestore = {
+        applied: false, added: 0, keys: 0, dayIndex: 0, dropped: 0,
+        reason: `failed:${((e as Error)?.message ?? String(e)).slice(0, 120)}`,
+      };
+      return false;
+    }
+  }
+
+  /**
+   * ★ WS-FND-165(B1):**把在场玩家的快照写进库**(周期轨的唯一落点)。
+   *
+   * ## 与 `saveWorldNow` 的分工
+   * ```text
+   * saveWorldNow        写「世界」:HP / 生物 mem / 背包账 / 结算台账(30 秒 + 事件触发)
+   * savePlayerSnapshotsNow 写「人」:等级 / 经验 / 天赋 / 位置 / 血量(10 秒)
+   * ```
+   * 两者共用**同一份** repo 写口风格(事务 + 计数 + 失败不抛但可读),但**不**共用一个方法:
+   * 合并会让「玩家状态的及时性」与「世界存档的频率/成本」互相绑架。
+   *
+   * ## 没有宿主导出能力时**跳过**,且跳过原因可读
+   * 手写 host 假件没有 `exportPlayerSnapshots` ⇒ 记 `no-capability` 而不抛
+   * (与 `saveWorldNow` 的 `no-host` 同一处置)。
+   *
+   * @returns `true` = 这一次真的写进了库(至少一行有效);`false` = 跳过或失败。
+   */
+  savePlayerSnapshotsNow(reason: string = 'manual'): boolean {
+    const db = this.db;
+    const host = this.worldSaveHost;
+    const now = this.clock.nowMs();
+    if (db === null || host === null || typeof host.exportPlayerSnapshots !== 'function') {
+      this.lastPlayerSnapshotSkipReason = db === null
+        ? 'no-db'
+        : (host === null ? 'no-host' : 'no-capability');
+      return false;
+    }
+    this.lastPlayerSnapshotAttemptTick = this.state.meta.tick;
+    try {
+      const rows = host.exportPlayerSnapshots();
+      const r = savePlayerSnapshots(db, rows, now);
+      this.lastPlayerSnapshotReport = {
+        tick: this.state.meta.tick, saved: r.saved, skipped: r.skipped, dropped: r.dropped, reason,
+      };
+      this.lastPlayerSnapshotAt = now;
+      this.playerSnapshotCount += 1;
+      this.lastPlayerSnapshotError = null;
+      this.lastPlayerSnapshotSkipReason = null;
+      this.playerSnapshotBackoffFrames = 0;
+      return r.saved > 0;
+    } catch (e) {
+      const message = ((e as Error)?.message ?? String(e)).slice(0, 160);
+      this.lastPlayerSnapshotError = `玩家快照落库失败(${reason}):${message}`;
+      this.playerSnapshotErrors.push({ at: now, reason, message });
+      if (this.playerSnapshotErrors.length > 8) this.playerSnapshotErrors.shift();
+      /* 退避:与自动存档同一取法(第一次失败 ⇒ 一个周期窗,之后翻倍、封顶)。 */
+      this.playerSnapshotBackoffFrames = this.playerSnapshotBackoffFrames === 0
+        ? AUTOSAVE_FRAME_INTERVAL
+        : Math.min(this.playerSnapshotBackoffFrames * 2, AUTOSAVE_BACKOFF_MAX_FRAMES);
+      return false;
+    }
+  }
+
+  /**
+   * 本帧该不该写玩家快照(周期轨;`step()` 顶部调用,与 `maybeTrimEvents` 逐字同款)。
+   *
+   * 闸:退避窗未过 ⇒ 不写;距上次成功不足 `PLAYER_SNAPSHOT_INTERVAL_MS` ⇒ 不写。
+   * `CLOSED` 房间不再推进(席位已由装配层收走)。
+   */
+  maybeSavePlayerSnapshots(): boolean {
+    if (this.db === null) return false;
+    if (this.status === RoomStatus.CLOSED) return false;
+    const now = this.clock.nowMs();
+    const sinceAttempt = this.state.meta.tick - this.lastPlayerSnapshotAttemptTick;
+    if (this.playerSnapshotBackoffFrames > 0 && sinceAttempt < this.playerSnapshotBackoffFrames) {
+      return false;
+    }
+    if (now - this.lastPlayerSnapshotAtMs < PLAYER_SNAPSHOT_INTERVAL_MS) return false;
+    this.lastPlayerSnapshotAtMs = now;
+    return this.savePlayerSnapshotsNow('interval');
+  }
+
+  /**
+   * ★ WS-FND-165(B1):入场时读回**成长档案**(经验 / 天赋 / 等级)。
+   *
+   * 修前这一段是空的:`restoreFromProfile` 只带回 level/hp/位置,而
+   * `users.exp` / `talent_json` **没有任何写点** ⇒ 「重启后等级在、经验归零」。
+   * 现在入场顺路问一次库(有宿主能力才问;没有 ⇒ 记 `no-capability`,不假装)。
+   */
+  restorePlayerProgression(userId: string): boolean {
+    const host = this.worldSaveHost;
+    const db = this.db;
+    if (
+      db === null || host === null
+      || typeof host.restoreProgressionFromDb !== 'function'
+    ) {
+      this.lastProgressionRestore = {
+        userId, applied: false, level: 0, exp: 0, talent: 0,
+        reason: db === null ? 'no-db' : 'no-capability',
+      };
+      return false;
+    }
+    try {
+      const r = host.restoreProgressionFromDb(db, userId);
+      this.lastProgressionRestore = {
+        userId, applied: r.applied, level: r.level, exp: r.exp, talent: r.talent, reason: r.reason,
+      };
+      if (r.applied) this.lastProgressionRestoreError = null;
+      return r.applied;
+    } catch (e) {
+      this.lastProgressionRestoreError =
+        `成长档案读回失败(${((e as Error)?.message ?? String(e)).slice(0, 120)})`.slice(0, 160);
+      this.lastProgressionRestore = {
+        userId, applied: false, level: 0, exp: 0, talent: 0, reason: 'failed',
+      };
+      return false;
+    }
+  }
+
   /**
    * 本帧该不该自动存档 —— 返回**原因**(`null` = 本帧不存),而不是布尔:
    * 「周期到点」与「冷启动帧节流」在排查存档频率时是两个答案,不该压成一个 `true`。
@@ -4506,6 +5036,50 @@ export class RoomRuntime {
     return null;
   }
 
+  /**
+   * ★ WS-FND-163(A1):`room_events` 有界保留的**周期轨**(具名间隔 30 秒)。
+   *
+   * ## 为什么必须有这条轨
+   * `repo.ts#trimEvents` 是幂等的,但修前它的触发点只有「写入流水」与
+   * 「VACUUM / 外部维护」—— 于是**只读房**(没人写审计流水)永远不会 trim,
+   * 「库不会涨」这条承诺退化成「恰好有人在写流水」。
+   *
+   * ## 调用点为什么在 `step()` 的**顶部**(早于 `status !== OPEN` 早退)
+   * 只读房的典型形态就是 `SLEEPING`:玩家全走了、房间不再推进帧号。
+   * 把本方法放在那行早退**之后**,它就永远跑不到 —— 与修前是同一个缺陷。
+   * 与 `retryPendingWorldRemovals()` 同一位置、同一理由(见 `step()` 顶部)。
+   *
+   * ## 闸与水位
+   * 距上次 trim 不足 `EVENT_TRIM_INTERVAL_MS` ⇒ **立刻返回 0、一行都不碰**
+   * (判据是水位而不是「调用次数」;幂等由 `trimEvents` 自己保证 ——
+   * 未超上限时它同样返回 0)。
+   *
+   * ## 失败不抛但绝不静默
+   * 一次 DELETE 失败不该掀掉整帧(与 `saveWorldNow` 同一取舍),
+   * 但「流水不再回收」必须可读 ⇒ `lastEventTrimError` + `lastEventTrim` 如实留证。
+   *
+   * @returns 本次真的删掉的行数(未到点 / 未超上限 / 失败 ⇒ 0)
+   */
+  maybeTrimEvents(): number {
+    if (this.db === null) return 0;
+    const now = this.clock.nowMs();
+    if (now - this.lastEventTrimAtMs < EVENT_TRIM_INTERVAL_MS) return 0;
+    this.lastEventTrimAtMs = now;
+    try {
+      const removed = trimEvents(this.db);
+      this.lastEventTrim = { at: now, removed };
+      this.eventTrimCount += 1;
+      this.lastEventTrimError = null;
+      return removed;
+    } catch (e) {
+      const message = ((e as Error)?.message ?? String(e)).slice(0, 160);
+      this.lastEventTrimError = `事件流水保留失败(${message})`;
+      /* 失败**不**推进成功计数,但留一条读数(removed: 0 与实际一致)。 */
+      this.lastEventTrim = { at: now, removed: 0 };
+      return 0;
+    }
+  }
+
   /* ── 4.4 每帧推进 ── */
 
   /**
@@ -4523,6 +5097,18 @@ export class RoomRuntime {
        `CLOSED` 例外:房间已销毁,回收没有意义(席位由装配层 onDispose 收)。
        这两步**都不推进 `meta.tick`** ⇒ F07「休眠房不推进帧号」照旧成立。 */
     this.retryPendingWorldRemovals();
+    /* ★ WS-FND-163(A1):`room_events` 有界保留的周期轨 —— 位置与上面那行
+       **逐字同款**:在 `status !== OPEN` 早退**之前**。只读房的形态正是
+       `SLEEPING`(玩家全走了、帧号不再推进),放在早退之后就永远跑不到,
+       那与修前「只读房永不 trim」是同一个缺陷。
+       ⚠️ 与存档轨**无关**:没有世界源 / 存档正在退避时本轨照跑
+       (理由见 `EVENT_TRIM_INTERVAL_MS` 的注释)。 */
+    this.maybeTrimEvents();
+    /* ★ WS-FND-165(B1):玩家快照的**周期轨** —— 与上面那行逐字同款
+       (在 `status !== OPEN` 早退**之前**,因为休眠房里也要把人物状态落住;
+        本轨自带 `PLAYER_SNAPSHOT_INTERVAL_MS` 水位 + 失败退避)。
+       ⚠️ 与自动存档轨**无关**:存档在退避 / 没有世界源时本轨照跑。 */
+    this.maybeSavePlayerSnapshots();
     if (this.status !== RoomStatus.CLOSED) this.reapExpiredDisconnects();
     if (this.status !== RoomStatus.OPEN) return new Uint8Array(0);
     this.state.meta.tick += 1;
@@ -5386,12 +5972,79 @@ export class RoomRuntime {
        `kick()` / `leave()` 走的是 `purgeSeat()` → `clearSeatTraces()`,它把席位
        **从表里删掉** ⇒ 「被踢 / 离场」与「断线待重连」在**同一张表**上可分。
 
-       ## 边界(如实标注,不是遗漏)
-       这是**席位级**裁剪:仍在席位上的人拿到的仍是**整房**快照。
-       按人做 AOI 级实体裁剪要动编码层(`shared/net/delta.ts` 的 `encodeFull`),
-       不在本条的写域内 —— 但**口径不会有第二处**:谁在成员表里,谁才拿得到东西。 */
+      ## ★ WS-FND-163(A3):**AOI 级裁剪**(修前是席位级 —— 成员拿到**整房**)
+      席位级只回答「他还在不在房里」,答不了「他看得见谁」。修前成员那份仍是
+      `encodeFull(整房)` ⇒ 地图另一端的人的血量 / 朝向 / 移动**每帧都进**他的包。
+
+      ## 权威可见性判据**只有一个**:`visibleStateFor(userId)`
+      ```text
+      席位级:谁在成员表里   ← 本方法下面那一行(`members.has`),唯一实现
+      AOI 级:谁在视距内     ← `visibleStateFor`,唯一实现
+      ```
+      两条判据各只有一处,装配层(Colyseus / 裸 WS)都**不另算距离**:
+      它们手上的快照就是这一份。⇒「谁看得见谁」在系统里不存在第二份口径,
+      也就不存在「两个投递层各裁一遍、结果不一致」的形态(与 WS-FND-161 / -162
+      对席位判据的处置同款)。
+
+      ## 裁剪口径(用**既有** AOI 常量,不新造一个数)
+      ```text
+      半径 = AOI_WAKE_DISTANCE(32 格,server/src/mobs/aoi.ts)
+      距离 = 二维欧氏(x / y;协议与生物唤醒都是 2D ⇒ z 不参与)
+      含边界(与 aoi.ts 的 <= 同口径)
+      自己恒在(自己那个实体行是排除不掉的:客户端会把自己删掉)
+      players / wildlife 按各自的权威坐标判;boss **不裁**(见下一条边界)
+      ```
+      ## 边界(如实标注,不是遗漏)
+      * **boss 不参与裁剪**:线上格式里 `BossState` **没有位置字段**
+        (`shared/types/wire.ts` 只有 `telegraphX/Y` —— 那是**地面预警锚点**,
+        不是怪的位置)。拿预警锚点当怪的位置是**猜**,会造出第二份事实源 ⇒ 不猜:
+        boss 的字段仍然进包;这条边界写在这里,免得下一个人以为裁过了。
+      * **没有滞后**(与 aoi.ts 一致):边界上来回横跳会让实体反复进出包,
+        那算带宽问题,不算判据问题;要治它得先有一条明确的滞后常量。 */
     if (!this.members.has(userId)) return new Uint8Array(0);
-    return encodeFull(this.state, this.state.meta.tick).bytes;
+    return encodeFull(this.visibleStateFor(userId), this.state.meta.tick).bytes;
+  }
+
+  /**
+   * ★ WS-FND-163(A3):**这个玩家看得见的世界** —— 可见性判据的**唯一**实现。
+   *
+   * ## 为什么返回「一份状态」而不是「一个过滤谓词」
+   * 编码器(`encodeFull`)只认 `RoomState`。返回**浅拷贝 + 过滤后的数组**
+   * ⇒ 不改编码层(`shared/net/delta.ts`)、不改线上格式,而且「不可见 ⇒ 不发」
+   * 在协议上就是**明确定义的**:FULL 报文里没有的实体,客户端按「整体替换」
+   * 删掉它(`applyPacket` 的 FULL 分支)—— 实体走进视距时下一帧自然回来。
+   *
+   * ## 零改动短路
+   * 全员可见时**原样返回 `this.state`**(不复制、不过滤)⇒ 常规路径与修前
+   * 逐字节相同,这条裁剪对绝大多数帧(大家挤在一起)是零成本的。
+   *
+   * ## 视野源 = `state.players` 里**自己那一行**
+   * 不是世界刚体:两者在客户端预测 / 回滚时会短暂不同,而线上的一切都由
+   * `state` 决定(发送端与判据端读同一份坐标,不会互相打架)。
+   *
+   * ⚠️ 不要在这里加第二层判断(视线 / 阵营 / 隐身):那属于玩法裁决,
+   * 加进来就等于长出第二个可见性口径。
+   *
+   * ⚠️ fail-open:自己在 `state.players` 里没有行(极端:投影尚未跑)⇒
+   * 退回**整房**。宁可多发,不静默把人裁成空世界(与 `ws_server.ts#seatAlive`
+   * 、`deltaExclusions` 的取舍同款)。
+   */
+  private visibleStateFor(userId: string): RoomState {
+    const state = this.state;
+    const me = state.players.find((p) => p.id === userId);
+    if (me === undefined) return state;
+    const limit = AOI_WAKE_DISTANCE * AOI_WAKE_DISTANCE;
+    const near = (x: number, y: number): boolean => {
+      const dx = x - me.x;
+      const dy = y - me.y;
+      return dx * dx + dy * dy <= limit;
+    };
+    const players = state.players.filter((p) => p.id === userId || near(p.x, p.y));
+    const wildlife = state.wildlife.filter((w) => near(w.x, w.y));
+    if (players.length === state.players.length && wildlife.length === state.wildlife.length) {
+      return state;
+    }
+    return { ...state, players, wildlife };
   }
 
   /** 供断言:把快照解码回来对照。 */

@@ -86,6 +86,19 @@ export const TABLE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
      由本常量表派生,不登记就写不进真库。主键 = `user_id` ⇒ 「一个玩家一行」
      由库层唯一约束保证(并发占位的抓手)。 */
   user_starting_inventory: ['user_id'],
+  /* ★ WS-FND-165 房间系统台账(独立 DDL 文件 `schema_room_systems.sql`,见 §17)。
+     与上面两张表同一处置:登记在这里 `driver.sqlite.ts` 的表名白名单才认得它,
+     而 `MemoryDb.insert` 也需要主键列名(不登记 ⇒ 内存夹具插不进去)。
+     主键 = `room_id` ⇒ 「一间房一份台账」由库层唯一约束保证。 */
+  room_systems_state: ['room_id'],
+  /* ★ WS-FND-164 世界存档(独立 DDL 文件 `schema_world_persistence.sql`,见 §19)。
+     两张表各一种粒度(见该 SQL 的文件头):
+       `room_chunk_roofs` = 屋顶旁路层,主键与 `room_chunks` 逐列相同;
+       `room_world_state` = 世界身份 + 水位表,**一房间一行**。
+     登记在这里的唯一目的与归档表 / 台账表相同:`driver.sqlite.ts` 的表名白名单
+     由本常量表派生,不登记就写不进真库;`MemoryDb.insert` 也要主键列名。 */
+  room_chunk_roofs: ['room_id', 'chunk_x', 'chunk_y'],
+  room_world_state: ['room_id'],
 };
 
 /* ═══════════════════════════ 2. DDL 载入与迁移 ═══════════════════════════ */
@@ -136,6 +149,15 @@ export function knownMigrationVersions(): number[] {
     MIGRATION_BASELINE_VERSION,
     WORLD_ARCHIVE_MIGRATION_VERSION,
     STARTING_INVENTORY_MIGRATION_VERSION,
+    /* ★ WS-FND-165:房间系统台账(结算幂等键集 + 房内第几天)。
+       加进「认识的全集」是**兼容既有库**的那一半:老库(v1/v2/v3)照样通过
+       `assertMigrationVersionSupported` —— 这一段不要求任何既有版本行存在,
+       只在**第一次存档房间系统状态时**就地补表并登记 v4(见 §17)。 */
+    ROOM_SYSTEMS_MIGRATION_VERSION,
+    /* ★ WS-FND-164:世界存档(chunk 脏页 + 屋顶旁路层 + 水位表)。加进「认识的全集」
+       与上一条同一理由:老库(v1/v2/v3/v4)照样过护栏,这一段只在**第一次存档世界时**
+       就地补两张表并登记 v5(见 §19)。 */
+    WORLD_PERSISTENCE_MIGRATION_VERSION,
   ];
 }
 
@@ -667,16 +689,34 @@ export function loadChunkCells(
   return unpackChunkBlob(row.tiles_blob);
 }
 
-/** 批量存盘:一次事务写 N 块,返回实际写入块数。任何一块长度非法则整批回滚。 */
+/**
+ * 批量存盘:一次事务写 N 块,返回实际写入块数。任何一块长度非法则整批回滚。
+ *
+ * ## ★ WS-FND-164:`roofs` 让「一块地形」在一次事务里写全
+ *
+ * 屋顶层(`Chunk.roofs`)不在 32 位单元里,只能落到 `room_chunk_roofs`(见
+ * `schema_world_persistence.sql` 的文件头)。两行必须**同一个事务**:
+ * 只写进去一半(地形新、屋顶旧)会让「关掉 host 再读回」得到一个**没人下过**
+ * 的世界,而这种半态在回执上完全看不出来。
+ *
+ * `roofs` 可省:省略 ⇒ 不碰 `room_chunk_roofs`(老调用方与「只关心地形」的
+ * 测试逐字兼容 —— 它们拿到的仍是「写了 N 块」这个数)。
+ */
 export function saveChunkBatch(
   db: DbLike,
   roomId: string,
-  chunks: readonly { cx: number; cy: number; blob: Uint8Array }[],
+  chunks: readonly { cx: number; cy: number; blob: Uint8Array; roofs?: Uint8Array }[],
   nowMs: number,
 ): number {
-  for (const c of chunks) assertChunkBlob(c.blob);
+  for (const c of chunks) {
+    assertChunkBlob(c.blob);
+    if (c.roofs !== undefined) assertRoofsBlob(c.roofs);
+  }
   return db.transaction(() => {
-    for (const c of chunks) saveChunk(db, roomId, c.cx, c.cy, c.blob, nowMs);
+    for (const c of chunks) {
+      saveChunk(db, roomId, c.cx, c.cy, c.blob, nowMs);
+      if (c.roofs !== undefined) saveChunkRoofs(db, roomId, c.cx, c.cy, c.roofs, nowMs);
+    }
     return chunks.length;
   });
 }
@@ -1881,4 +1921,1008 @@ export function countStartingInventoryGrants(db: DbLike): number {
     if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
     throw e;
   }
+}
+
+/* ═══════════ 15. 玩家背包账落库(按件账 + 总量账)═══════════
+ *
+ * ## 缺陷形态(本轮修点,A4)
+ *
+ * 自动存档此前只保证「起始包**不重发**」—— 那是 `user_starting_inventory`
+ * 台账(§14),它回答的是「发过没有」,**不是**「手里有什么」。
+ * 而背包账全在房间内存里(`room.ts` 的 `itemCounts` / `inventoryTotals`),
+ * 库里两个可能的落点**都没有生产写口**:
+ * ```text
+ * users.inventory_json   createUser 写 '{}' 之后再没有写点
+ * ai_item_instances      addItemInstance 只有测试调用
+ * ```
+ * ⇒ 收下起始包、采集、合成……全在内存,进程一停背包回到空,
+ *   而且**没有任何东西会红**(库里那一行还在,只是从未变过)。
+ * 「自动存档」这句话在背包这一维上是空的。
+ *
+ * ## 落点为什么是 `users.inventory_json`(既有列,不加表)
+ * ```text
+ * 1 契约 §2.3 第 8 项的**明细权威**就是它(见 room.ts 的投影表);
+ * 2 表数与迁移版本集合被既有判据逐行锁着(见 §13 / §14 的说明:
+ *   WS-07 锁建表数、WS-FND-156 断言加入口后 schema_migrations 仍是 [1, 3])
+ *   ⇒ 新表 / 新迁移会当场把它们打红;
+ * 3 既有列 + 既有行 = 「一个玩家一份账」,与 `users.hp`(§11)同一形状。
+ * ```
+ *
+ * ## 账格式(键序固定 ⇒ 同一份账写成**逐字节相同**的 JSON)
+ * ```json
+ * { "$v": 1, "$total": 10, "101": 7, "116": 3 }
+ * ```
+ *   · **数字键** = 按件账(itemId → 件数,只写 > 0 的项):与契约里那份
+ *     `{"101":20,"116":5}` **同形**,旧读者(若有)读到的仍是明细;
+ *   · `$total` = **总量账**(调用方给的原值,**不在这里重算**):
+ *     两账分开存才能**对账** —— 读口把「`$total` 与 Σ明细 不一致」如实报成
+ *     `drift`,而不是替它圆场(那正是本仓反复点名的静默改数);
+ *   · `$v` = 账格式版本。读不懂的版本 ⇒ `undefined`(**不猜**),理由见
+ *     `loadPlayerLedger`。
+ *
+ * ## 坏条目:跳过 + 计数,不抛
+ * `itemId` 非正整数 / 件数非正有限整数 ⇒ 跳过并计入 `dropped`;
+ * 条目数超 `PLAYER_LEDGER_ITEM_MAX` ⇒ 按 itemId 升序截断,余下计入 `dropped`。
+ * 抛错会让「一个坏条目」把**整份存档**连坐丢掉(与 `totalItemsOf` 同源取舍)。
+ */
+
+/** 玩家背包账的**账格式版本**(落进 `users.inventory_json` 的 `$v`)。 */
+export const PLAYER_LEDGER_VERSION = 1;
+
+/** 总量账在 JSON 里的保留键。非数字键 ⇒ 结构上不可能与 itemId 撞。 */
+export const PLAYER_LEDGER_TOTAL_KEY = '$total';
+
+/** 账格式版本在 JSON 里的保留键。 */
+export const PLAYER_LEDGER_VERSION_KEY = '$v';
+
+/** 单玩家**落库条目上限**(防「一个玩家把库写爆」)。超出按 itemId 升序截断。 */
+export const PLAYER_LEDGER_ITEM_MAX = 4096;
+
+/**
+ * 一次落库的输入:一个玩家的两份账。
+ *
+ * ⚠️ `counts` 收 `ReadonlyMap`(房间侧的既有形状),`total` 是**独立的一份账**
+ * (房间侧 `inventoryTotals`,增量式)—— 不在这里由明细重算,
+ * 否则「两账已经漂了」这件事会被写库这一步悄悄抹平。
+ */
+export interface PlayerLedgerSnapshot {
+  readonly counts: ReadonlyMap<number, number>;
+  readonly total: number;
+}
+
+/** 一个玩家的落库结果。`row === 0` = 库里没有这个 `users` 行 ⇒ 这次**没落地**。 */
+export interface PlayerLedgerWriteReport {
+  /** `UPDATE users` 的影响行数。 */
+  row: number;
+  /** 写进 JSON 的按件条目数。 */
+  kept: number;
+  /** 被跳过的坏条目数(非整数 id / 非正件数 / 超条目上限)。 */
+  dropped: number;
+  /** 实际写下的总量账(非法输入按 0 写)。 */
+  total: number;
+}
+
+/** 读回的一份账(与 `PlayerLedgerSnapshot` 对偶,+ 两个诊断量)。 */
+export interface PlayerLedgerRead {
+  readonly counts: Map<number, number>;
+  /** 库里那个 `$total`(读不出来时退化为 Σ明细 —— 见 `drift`)。 */
+  readonly total: number;
+  /** `true` = 库里两账**不一致**(总量账漂了)。读口如实报,不替它圆场。 */
+  readonly drift: boolean;
+  readonly version: number;
+}
+
+/**
+ * 序列化一份账(唯一实现;`savePlayerLedgers` 用它)。
+ *
+ * 键序固定(`$v` → `$total` → itemId 升序)⇒ **同一份账两次落库逐字节相同**,
+ * 于是「存档幂等」这条能按字节断言,而不是按「字段在不在」断言。
+ */
+function serializePlayerLedger(
+  ledger: PlayerLedgerSnapshot,
+): { json: string; kept: number; dropped: number; total: number } {
+  const entries: [number, number][] = [];
+  let dropped = 0;
+  for (const [rawId, rawQty] of ledger.counts) {
+    const id = typeof rawId === 'number' ? rawId : Number(rawId);
+    const qty = typeof rawQty === 'number' ? rawQty : Number(rawQty);
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(qty) || qty <= 0) {
+      dropped += 1;
+      continue;
+    }
+    entries.push([id, Math.trunc(qty)]);
+  }
+  entries.sort((a, b) => a[0] - b[0]);
+  if (entries.length > PLAYER_LEDGER_ITEM_MAX) {
+    dropped += entries.length - PLAYER_LEDGER_ITEM_MAX;
+    entries.length = PLAYER_LEDGER_ITEM_MAX;
+  }
+  const rawTotal = ledger.total;
+  const total = Number.isFinite(rawTotal) && rawTotal >= 0 ? Math.trunc(rawTotal) : 0;
+  const obj: Record<string, number> = {
+    [PLAYER_LEDGER_VERSION_KEY]: PLAYER_LEDGER_VERSION,
+    [PLAYER_LEDGER_TOTAL_KEY]: total,
+  };
+  let kept = 0;
+  for (const [id, qty] of entries) {
+    obj[String(id)] = qty;
+    kept += 1;
+  }
+  return { json: JSON.stringify(obj), kept, dropped, total };
+}
+
+/**
+ * 解析一份账(外部输入 ⇒ **容错**),读不懂的形态一律 `undefined`。
+ *
+ * ## 为什么版本号不认识就返回 `undefined`(而不是「尽量读」)
+ * 账格式将来会变;`$v` 不认识说明写它的程序与读它的程序**不是同一版**。
+ * 按当前口径硬读会把「另一版格式」读成一份**看起来正常**的账,
+ * ⇒ 玩家背包被静默改写。⇒ 不猜:当作「没有账」,由调用方走「新玩家」那条路。
+ *
+ * ## `drift` 的口径
+ * `$total` 读得出且与 Σ明细 不等 ⇒ `true`(两份账漂了);
+ * `$total` 读不出(缺失/非法)⇒ 以 Σ明细为总量,且**不**报 drift
+ * (那时「以明细为准」是唯一可解释的选择,不是漂移)。
+ */
+function parsePlayerLedger(raw: unknown): PlayerLedgerRead | undefined {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  const version = Number(obj[PLAYER_LEDGER_VERSION_KEY]);
+  if (!Number.isInteger(version) || version !== PLAYER_LEDGER_VERSION) return undefined;
+  const counts = new Map<number, number>();
+  let sum = 0;
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === PLAYER_LEDGER_VERSION_KEY || key === PLAYER_LEDGER_TOTAL_KEY) continue;
+    const id = Number(key);
+    const qty = typeof value === 'number' ? value : Number(value);
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(qty) || qty <= 0) continue;
+    counts.set(id, Math.trunc(qty));
+    sum += Math.trunc(qty);
+  }
+  const storedTotal = Number(obj[PLAYER_LEDGER_TOTAL_KEY]);
+  const readable = Number.isInteger(storedTotal) && storedTotal >= 0;
+  return {
+    counts,
+    total: readable ? storedTotal : sum,
+    drift: readable ? storedTotal !== sum : false,
+    version,
+  };
+}
+
+/**
+ * 批量落库玩家背包账(唯一写口;一次调用 = **一个事务**)。
+ *
+ * ## 与 `saveVitalsToUsers`(§11)**逐条同款**的三点
+ * ```text
+ * 1 skipped 而不是抛错:DB 里没有 users 行是**正常**情形(尚未建号的访客 /
+ *   测试里的模拟 id)—— 一个人的缺失不该把整批存档连坐丢掉;
+ *   但它**必须可观测**(返回值),否则门禁会失去分辨力;
+ * 2 一次事务:第 3 个人写失败时前 2 个不许已经落库(半截存档不可重试);
+ * 3 每个 id 只写**一份**账(`users.inventory_json` 覆盖写),不做第二份真值。
+ * ```
+ *
+ * ⚠️ `updated_at` 一并推进:这一行的内容确实变了(与 `savePlayerState` 同口径)。
+ */
+export function savePlayerLedgers(
+  db: DbLike,
+  ledgers: ReadonlyMap<string, PlayerLedgerSnapshot>,
+  nowMs: number,
+): { saved: number; skipped: number; rows: number; dropped: number } {
+  return db.transaction(() => {
+    let saved = 0;
+    let skipped = 0;
+    let rows = 0;
+    let dropped = 0;
+    /* 按键排序 ⇒ 写入顺序确定(同一份账两次落库的影响行数与字节完全一致)。 */
+    for (const userId of [...ledgers.keys()].sort()) {
+      const ledger = ledgers.get(userId);
+      if (ledger === undefined || typeof userId !== 'string' || userId.length === 0) {
+        skipped += 1;
+        continue;
+      }
+      if (!getUser(db, userId)) {
+        skipped += 1;
+        continue;
+      }
+      const ser = serializePlayerLedger(ledger);
+      rows += db.update('users', { id: userId }, {
+        inventory_json: ser.json,
+        updated_at: nowMs,
+      });
+      saved += 1;
+      dropped += ser.dropped;
+    }
+    return { saved, skipped, rows, dropped };
+  });
+}
+
+/**
+ * 读回一个玩家的背包账(与 `savePlayerLedgers` 对偶)。
+ *
+ * `undefined` 的三种含义**互不相同**,调用方按同一处置(「他没有可用的账」),
+ * 但它们各自的成因写在这里,免得下一次有人把它们压成一个:
+ * ```text
+ * 1 没有这个 users 行             ⇒ 还没建号
+ * 2 inventory_json 还是 '{}'      ⇒ 从来没有存过背包(新玩家)
+ * 3 格式读不懂(JSON 坏 / $v 不认识)⇒ 不猜(见 parsePlayerLedger)
+ * ```
+ * 三种都**不是**「背包是空的」这个断言 —— 「空背包」的形态是
+ * `counts.size === 0 && total === 0` 且 `version` 认识。
+ */
+export function loadPlayerLedger(db: DbLike, userId: string): PlayerLedgerRead | undefined {
+  if (typeof userId !== 'string' || userId.length === 0) return undefined;
+  const row = getUser(db, userId);
+  if (!row) return undefined;
+  return parsePlayerLedger(row.inventory_json);
+}
+/* ═══════════ 17. 房间系统台账(WS-FND-165:结算幂等跨进程)═══════════
+ *
+ * ## 修前形态(B1 审计实测)
+ *
+ * `WorldSim` 的 `roomSystemsState.settled`(幂等键集)与 `roomDayIndex`(房内第几天)
+ * **只活在字段里**:进程一停就归零 ⇒ 同一个 `orderId`(百货 / 炼金)可以**再成交一次**,
+ * 牧场「第 0 天」也会**再结算一次** —— 而这两条都是钱,不是显示问题。
+ *
+ * ## 落点为什么是**独立的旁表**(理由与 §13/§14 同源)
+ *
+ * `schema.sql` 的 checksum 已登记在既有库的 `schema_migrations`(version = 1):
+ * 往 `rooms` 上加一列会改掉整份 schema.sql 的 checksum ⇒ **每一个旧库**启动即 drift
+ * 并 fail-closed 拒绝启动。故走自己的 DDL 文件 + 自己的迁移版本(4):
+ * 老库(v1 / v2 / v3 任意组合)**原地补表**,既有表与既有行一个都不动。
+ *
+ * ## 写入侧的容错纪律与 §15(背包账)不同
+ *
+ * 背包账读不回来只影响一个人;而幂等键集读不回来会**重开重放窗口** ⇒
+ * 这里把「读不懂」**如实分类**返回(调用方按 `reason` 记录/断言),
+ * **不猜成「没有台账」**,也**不抛**(抛会让整间房起不来)。
+ */
+
+/** 台账表名(与 DDL 文件里那张表逐字一致)。 */
+export const ROOM_SYSTEMS_TABLE = 'room_systems_state';
+
+/** 台账 DDL 的文件产物名。**独立于 `schema.sql`**(理由见该 SQL 的文件头)。 */
+export const ROOM_SYSTEMS_SCHEMA_FILE_NAME = 'schema_room_systems.sql';
+
+/** 台账迁移在 `schema_migrations` 里的版本号(基线 1 / 归档 2 / 起始包 3 / 本表 4)。 */
+export const ROOM_SYSTEMS_MIGRATION_VERSION = 4;
+export const ROOM_SYSTEMS_MIGRATION_NAME = 'ws_fnd165_room_systems_state';
+
+/** `settled_json` 的**格式版本**(落进 JSON 的 `$v`;不认识的版本一律不猜)。 */
+export const ROOM_SYSTEMS_STATE_VERSION = 1;
+/** 格式版本键(与背包账的 `$v` 同名同义)。 */
+export const ROOM_SYSTEMS_VERSION_KEY = '$v';
+
+/**
+ * 键集上限(`settled_json` 里最多带几个键)。
+ *
+ * 口径与 `systems/idempotency.ts:SETTLEMENT_LEDGER_CAPACITY` **一致**(4096):
+ * 内存台账的容量就是它,落库侧比内存更宽毫无意义;比内存更窄则会**静默丢掉**
+ * 内存里还在的键 ⇒ 重启后那条键又能重放一次。取「与内存一致」是唯一不引入
+ * 第二个数字的取法 ⇒ 这里**不**新造调参。
+ */
+export const ROOM_SYSTEMS_MAX_KEYS = 4096;
+
+/** 台账 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
+export function roomSystemsSqlPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), ROOM_SYSTEMS_SCHEMA_FILE_NAME);
+}
+
+export function readRoomSystemsSql(path: string = roomSystemsSqlPath()): string {
+  return readFileSync(path, 'utf8');
+}
+
+/** 一条结算键:`key` = 幂等键(`ECO_RANCH@DAY:7`),`at` = 首次成功结算的逻辑时刻。 */
+export interface RoomSystemsKeyEntry {
+  key: string;
+  at: number;
+}
+
+/** 一间房的房间系统台账快照(落库形状;与 `WorldSim.exportRoomSystemsSnapshot` 对偶)。 */
+export interface RoomSystemsSnapshot {
+  /** 房内「第几天」(0 起整数;非法值在写入侧静默钳到 0)。 */
+  dayIndex: number;
+  /** 结算键集,**按入账顺序**(读回时还原 FIFO 淘汰序)。 */
+  keys: readonly RoomSystemsKeyEntry[];
+}
+
+/**
+ * 读回结果。`ok:false` 的三种成因**互不相同**,刻意不压成一个 `undefined`:
+ * ```text
+ * no-table  这个库从没存过房间系统状态(老库 / 全新库)   —— 正常
+ * no-row    这间房没有台账行(第一次跑)                 —— 正常
+ * corrupt   有一行但内容读不懂(JSON 坏 / $v 不认识)     —— **必须可断言**:
+ *           它意味着「重放窗口可能是开的」,不许静默当成「没有台账」
+ * ```
+ * `dropped` 是**逐条**被丢掉的键数(单条脏数据只影响那一条,不拖垮整份台账)。
+ */
+export type RoomSystemsRead =
+  | { ok: true; state: RoomSystemsSnapshot; dropped: number }
+  | { ok: false; reason: 'no-table' | 'no-row' | 'corrupt'; dropped: number };
+
+export interface RoomSystemsMigrateResult {
+  applied: boolean;
+  version: number;
+  checksum: string;
+  /** 已存在同版本但 checksum 不一致 = 漂移(调用方决定是否 fail-closed)。 */
+  drift: boolean;
+}
+
+/**
+ * 建台账表 + 登记迁移版本。**幂等**(DDL 全是 `CREATE TABLE IF NOT EXISTS`)。
+ *
+ * 判序与 §13/§14 逐字相同:「先读版本 → 护栏 → 漂移 → 才 exec DDL」——
+ * 对旧库先 exec 会在发现结构不认识之前**已经动过库**。
+ */
+export function migrateRoomSystems(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): RoomSystemsMigrateResult {
+  const ddl = readRoomSystemsSql(ddlPath);
+  const checksum = checksumOf(ddl);
+  const rows = readMigrationRows(db);
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find(
+    (r) => Number((r as MigrationRow).version) === ROOM_SYSTEMS_MIGRATION_VERSION,
+  ) as MigrationRow | undefined;
+  if (existing && existing.checksum !== checksum) {
+    return { applied: false, version: ROOM_SYSTEMS_MIGRATION_VERSION, checksum, drift: true };
+  }
+  db.exec(ddl);
+  if (existing) {
+    return { applied: false, version: ROOM_SYSTEMS_MIGRATION_VERSION, checksum, drift: false };
+  }
+  db.insert('schema_migrations', {
+    version: ROOM_SYSTEMS_MIGRATION_VERSION,
+    name: ROOM_SYSTEMS_MIGRATION_NAME,
+    checksum,
+    applied_at: nowMs,
+  });
+  return { applied: true, version: ROOM_SYSTEMS_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/** 这个库里**装过**房间系统台账迁移吗(登记行在 ⇒ 装过)。 */
+export function roomSystemsMigrationInstalled(db: DbLike): boolean {
+  const rows = readMigrationRows(db);
+  return rows.some((r) => Number((r as MigrationRow).version) === ROOM_SYSTEMS_MIGRATION_VERSION);
+}
+
+/** `migrateRoomSystemsIfInstalled` 的结果(比迁移结果多一个 `installed`)。 */
+export interface RoomSystemsBootCheck extends RoomSystemsMigrateResult {
+  /** `false` = 这个库从没装过本台账 ⇒ 本轮**没有**建它(见函数注释)。 */
+  installed: boolean;
+}
+
+/**
+ * **启动检查**:装过本迁移的库 ⇒ 跑一遍(幂等 DDL + checksum 漂移检测);
+ * 没装过的库 ⇒ 什么都不做(全新库不许在这里多出一张表 —— 建表数被既有判据锁着)。
+ */
+export function migrateRoomSystemsIfInstalled(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): RoomSystemsBootCheck {
+  if (!roomSystemsMigrationInstalled(db)) {
+    return {
+      applied: false, version: ROOM_SYSTEMS_MIGRATION_VERSION,
+      checksum: '', drift: false, installed: false,
+    };
+  }
+  return { ...migrateRoomSystems(db, nowMs, ddlPath), installed: true };
+}
+
+/** 把一份快照序列化成落库字节(唯一实现;顺序即入账顺序)。 */
+function serializeRoomSystems(snapshot: RoomSystemsSnapshot): {
+  dayIndex: number; json: string; keys: number; dropped: number;
+} {
+  const dayIndex = Number.isFinite(snapshot.dayIndex) && snapshot.dayIndex > 0
+    ? Math.trunc(snapshot.dayIndex)
+    : 0;
+  let dropped = 0;
+  const seen = new Set<string>();
+  const keys: RoomSystemsKeyEntry[] = [];
+  for (const raw of snapshot.keys ?? []) {
+    const key = typeof raw?.key === 'string' ? raw.key.trim() : '';
+    const at = Number.isFinite(raw?.at) ? Math.trunc(raw.at) : 0;
+    if (key === '') { dropped += 1; continue; }
+    /* 同一键只留**一条**(去重不合并:值只用于报错,不参与判定)。 */
+    if (seen.has(key)) { dropped += 1; continue; }
+    seen.add(key);
+    keys.push({ key, at });
+  }
+  /* 超上限 ⇒ 丢**最老**的(与内存台账的 FIFO 淘汰同一取法:能重放的只可能在最近这一端)。 */
+  while (keys.length > ROOM_SYSTEMS_MAX_KEYS) { keys.shift(); dropped += 1; }
+  return {
+    dayIndex,
+    keys: keys.length,
+    dropped,
+    json: JSON.stringify({
+      [ROOM_SYSTEMS_VERSION_KEY]: ROOM_SYSTEMS_STATE_VERSION,
+      keys,
+    }),
+  };
+}
+
+/**
+ * 写一间房的房间系统台账(第一次写会**就地补表**并登记 v4)。
+ *
+ * ## 返回值都是判据
+ * ```text
+ * row      实际写入行数(1 = 落地;0 = 行在一次读-写之间消失,不该发生 ⇒ 可断言)
+ * keys     真正落库的键数(超上限时小于入参 —— 「丢了几个」在 dropped 里)
+ * dropped  输入侧被丢掉的条目数(空键 / 重复键 / 超上限)
+ * ```
+ * 漂移 ⇒ **fail-closed 抛错**:判据建在没核对过的结构上,比「这一次没存」更坏。
+ */
+export function saveRoomSystemsState(
+  db: DbLike,
+  roomId: string,
+  snapshot: RoomSystemsSnapshot,
+  nowMs: number,
+): { row: number; keys: number; dropped: number } {
+  if (typeof roomId !== 'string' || roomId.length === 0) {
+    throw new Error('房间系统台账需要非空 roomId');
+  }
+  if (!Number.isFinite(nowMs)) throw new Error('房间系统台账需要 nowMs(Unix 毫秒)');
+  const migration = migrateRoomSystems(db, nowMs);
+  if (migration.drift) {
+    throw new Error(
+      `房间系统台账迁移 checksum 漂移(schema_migrations.version=${ROOM_SYSTEMS_MIGRATION_VERSION}`
+      + ' 的登记与 schema_room_systems.sql 对不上)⇒ 拒绝写入(不静默降级):'
+      + '它记的是「哪几张单已结算」,结构没判清就写,重启后会变成可重复结算',
+    );
+  }
+  const ser = serializeRoomSystems(snapshot);
+  const patch: Row = {
+    day_index: ser.dayIndex,
+    settled_json: ser.json,
+    key_count: ser.keys,
+    saved_at: nowMs,
+  };
+  const existing = db.get(ROOM_SYSTEMS_TABLE, { room_id: roomId });
+  if (existing === undefined) {
+    db.insert(ROOM_SYSTEMS_TABLE, { room_id: roomId, ...patch });
+    return { row: 1, keys: ser.keys, dropped: ser.dropped };
+  }
+  const row = db.update(ROOM_SYSTEMS_TABLE, { room_id: roomId }, patch);
+  return { row, keys: ser.keys, dropped: ser.dropped };
+}
+
+/**
+ * 读回一间房的房间系统台账(与 `saveRoomSystemsState` 对偶)。
+ *
+ * 只有 `no such table` 被降级成 `no-table`(老库还没跑过本段迁移 —— 那是
+ * 「从没存过」,不是故障);其余错误照旧冒泡(否则一次磁盘故障会被伪装成
+ * 「没有台账」⇒ 重放窗口静默打开)。
+ */
+export function loadRoomSystemsState(db: DbLike, roomId: string): RoomSystemsRead {
+  if (typeof roomId !== 'string' || roomId.length === 0) {
+    return { ok: false, reason: 'no-row', dropped: 0 };
+  }
+  let row: Row | undefined;
+  try {
+    row = db.get(ROOM_SYSTEMS_TABLE, { room_id: roomId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) {
+      return { ok: false, reason: 'no-table', dropped: 0 };
+    }
+    throw e;
+  }
+  if (!row) return { ok: false, reason: 'no-row', dropped: 0 };
+  const dayRaw = Number(row.day_index);
+  const dayIndex = Number.isFinite(dayRaw) && dayRaw > 0 ? Math.trunc(dayRaw) : 0;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(String(row.settled_json ?? ''));
+  } catch {
+    return { ok: false, reason: 'corrupt', dropped: 0 };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'corrupt', dropped: 0 };
+  }
+  const env = parsed as Record<string, unknown>;
+  if (Number(env[ROOM_SYSTEMS_VERSION_KEY]) !== ROOM_SYSTEMS_STATE_VERSION) {
+    return { ok: false, reason: 'corrupt', dropped: 0 };
+  }
+  if (!Array.isArray(env.keys)) return { ok: false, reason: 'corrupt', dropped: 0 };
+  let dropped = 0;
+  const seen = new Set<string>();
+  const keys: RoomSystemsKeyEntry[] = [];
+  for (const raw of env.keys as unknown[]) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) { dropped += 1; continue; }
+    const e = raw as Record<string, unknown>;
+    const key = typeof e.key === 'string' ? e.key.trim() : '';
+    if (key === '' || seen.has(key)) { dropped += 1; continue; }
+    seen.add(key);
+    keys.push({ key, at: Number.isFinite(Number(e.at)) ? Math.trunc(Number(e.at)) : 0 });
+  }
+  while (keys.length > ROOM_SYSTEMS_MAX_KEYS) { keys.shift(); dropped += 1; }
+  return { ok: true, state: { dayIndex, keys }, dropped };
+}
+
+/* ═══════════ 18. 玩家快照(WS-FND-165:等级 / 经验 / 天赋 / 位置 / 血量)═══════════
+ *
+ * ## 修前形态(B1 审计实测)
+ * ```text
+ * users.exp / users.talent_json   生产 **0 写入**(createUser 之后就再没有写点)
+ * users.level / pos_x / pos_y / hp 只在 join / 断线那一刻定格(走重连快照那条路)
+ * ⇒ 进程崩在两次入场之间:这一段期间的经验、等级、位置、血量**全丢**
+ * ```
+ * 本节是**周期存档**要用的批量写口:等级 / 经验 / 天赋 / 位置 / 血量 一次事务落库。
+ *
+ * ## 为什么不另写一份 UPDATE
+ * 单行写入复用 `savePlayerState` —— 数值钳制、`updated_at`、「users 行是否存在」
+ * 都已经在那里有唯一实现 ⇒ 本节只做「批量 + 事务 + 计数」,不引入第二份字段口径。
+ */
+
+/** 一名玩家的快照行(结构化:调用方不必 import 模拟层类型)。 */
+export interface PlayerSnapshotRow {
+  userId: string;
+  level: number;
+  exp: number;
+  hp: number;
+  x: number;
+  y: number;
+  z: number;
+  /** 已解锁天赋 id 列表(`users.talent_json`)。**省略** ⇒ 不碰那一列。 */
+  talent?: readonly string[];
+}
+
+/** 快照里最多记几个天赋 id(内容层今天 6 个;给将来留余量,不是玩法调参)。 */
+export const PLAYER_SNAPSHOT_MAX_TALENTS = 64;
+
+/**
+ * 批量落盘玩家快照(周期存档的写口)。
+ *
+ * ## 三条纪律
+ * ```text
+ * 1 一次事务:第 3 个人写失败时前 2 个不许已经落库(半截存档不可重试)
+ * 2 「没有 users 行」= skipped,不是错误(访客 id 只活在房间/世界侧)
+ * 3 数值一律**静默钳制**(level 1..30 / exp ≥ 0 / hp ≥ 0 / 坐标非有限 ⇒ 0):
+ *   这些是战斗与移动里高频变化的派生量,抛错会让一次落盘连带丢整个事务
+ * ```
+ * `talent_json` 只在**明确给了** `talent` 时写 —— 「没带这一项」与「他一个天赋
+ * 都没有」是两件事,省缺省值把后者写成前者就是静默改数。
+ */
+export function savePlayerSnapshots(
+  db: DbLike,
+  rows: readonly PlayerSnapshotRow[],
+  nowMs: number,
+): { saved: number; skipped: number; dropped: number } {
+  if (!Number.isFinite(nowMs)) throw new Error('玩家快照需要 nowMs(Unix 毫秒)');
+  return db.transaction(() => {
+    let saved = 0;
+    let skipped = 0;
+    let dropped = 0;
+    /* 按 id 排序 ⇒ 写入顺序确定(同一份快照两次落库的行数与字节完全一致)。 */
+    const sorted = [...rows].sort((a, b) => String(a?.userId).localeCompare(String(b?.userId)));
+    for (const r of sorted) {
+      const id = typeof r?.userId === 'string' ? r.userId : '';
+      if (id === '' || !getUser(db, id)) { skipped += 1; continue; }
+      const patch: Partial<PlayerRecord> = {
+        level: clampIntQuiet(r.level, 1, MAX_LEVEL),
+        exp: Math.max(0, Math.trunc(Number.isFinite(r.exp) ? r.exp : 0)),
+        hp: Number.isFinite(r.hp) ? Math.trunc(r.hp) : 0,
+        pos_x: Number.isFinite(r.x) ? r.x : 0,
+        pos_y: Number.isFinite(r.y) ? r.y : 0,
+        pos_z: Number.isFinite(r.z) ? r.z : 0,
+      };
+      if (r.talent !== undefined) {
+        const seen = new Set<string>();
+        for (const t of r.talent) {
+          const tid = typeof t === 'string' ? t.trim() : '';
+          if (tid === '' || seen.has(tid) || seen.size >= PLAYER_SNAPSHOT_MAX_TALENTS) {
+            dropped += 1;
+            continue;
+          }
+          seen.add(tid);
+        }
+        patch.talent_json = JSON.stringify([...seen]);
+      }
+      savePlayerState(db, id, patch, nowMs);
+      saved += 1;
+    }
+    return { saved, skipped, dropped };
+  });
+}
+
+/**
+ * 读回玩家快照(与 `savePlayerSnapshots` 对偶)。
+ *
+ * 只读**显式给出的** ID:把全表用户读进来会让「谁该被还原」取决于库里恰好有谁
+ * (与 `loadVitalsFromUsers` 同一理由)。不存在的行 / 读不懂的 `talent_json`
+ * 一律降级(`talent: []`),不让一行脏数据把读档整体拖垮(与 `parsePlayerLedger`
+ * 同一取舍,但**方向相反**:这里是「读不回来就当他没天赋」,而背包账读不回来
+ * 会**拒绝覆盖**(见 §15)—— 因为装备丢了会白嫖,天赋丢了只是少个被动)。
+ */
+export function loadPlayerSnapshots(db: DbLike, ids: readonly string[]): PlayerSnapshotRow[] {
+  const out: PlayerSnapshotRow[] = [];
+  for (const id of [...ids].sort()) {
+    const u = getUser(db, id);
+    if (!u) continue;
+    let talent: string[] = [];
+    try {
+      const parsed = JSON.parse(String(u.talent_json ?? '[]'));
+      if (Array.isArray(parsed)) {
+        talent = parsed.filter((t): t is string => typeof t === 'string' && t !== '');
+      }
+    } catch { talent = []; }
+    out.push({
+      userId: u.id,
+      level: clampIntQuiet(u.level, 1, MAX_LEVEL),
+      exp: Number.isFinite(Number(u.exp)) ? Math.max(0, Math.trunc(Number(u.exp))) : 0,
+      hp: Number.isFinite(Number(u.hp)) ? Math.trunc(Number(u.hp)) : 0,
+      x: Number.isFinite(Number(u.pos_x)) ? Number(u.pos_x) : 0,
+      y: Number.isFinite(Number(u.pos_y)) ? Number(u.pos_y) : 0,
+      z: Number.isFinite(Number(u.pos_z)) ? Number(u.pos_z) : 0,
+      talent,
+    });
+  }
+  return out;
+}
+
+/* ═══════ 19. 世界存档:chunk 脏页 + 屋顶旁路层 + 世界状态(★ WS-FND-164)═══════
+ *
+ * ## 这一段补的是哪一刀(B1 审计实测的 P0)
+ *
+ * ```text
+ * §7 的 saveChunk / saveChunkBatch / loadChunk 在此之前生产 **0 调用**
+ *   ⇒ 进程一停,地形与玩家建造全丢,世界按 seed 从空场重新开始;
+ * §13 的归档行(room_world_archives)也只写不读 ⇒ 那份"可回滚快照"没人取得回来。
+ * ```
+ *
+ * 本节只做**存储**:脏页 chunk 的落库/读回、屋顶旁路层、房间级世界状态。
+ * 「什么时候存、读回来怎么铺进世界」是宿主(`sim/world_sim.ts` 的
+ * `saveToDb` / `restoreWorldFromDb`)的事,本节不认识 `WorldSim`(与 §11/§13 同一分层)。
+ *
+ * ## 为什么是**独立 DDL + 懒建表**(而不是动 `schema.sql`)
+ *
+ * 见 `schema_world_persistence.sql` 的文件头:`room_chunks.tiles_blob` 被锁在
+ * 恰好 1024 字节(屋顶层不在那 32 位里),而水位是房间级的连续场;
+ * 改 `schema.sql` 一个字符就会让**每一个旧库**在启动时判成 checksum drift 并
+ * fail-closed。⇒ 走自己的 DDL 产物 + 自己的迁移版本(v5),
+ * `migrateWorldPersistence` 在**第一次存档时**跑一次(幂等 DDL),既有库原地升版。
+ *
+ * ## 三件刻意不做的事
+ *
+ * 1 **不在这里解水位字节**:`fluid_blob` 的格式(`FLV1`)定义在 `world/fluid.ts`,
+ *    本节只当它是一坨带上限的字节(本模块的跨层 import 仍然只有
+ *    `world/archive.ts` 那一条,理由见文件头第 1 条)。
+ * 2 **不做增量 diff**:脏页的粒度是**整块 1KB**(判据在 `world/chunk.ts` 的
+ *    `isSaveDirty`)。按格 diff 会把「一块 1KB 的行」变成「一串补丁」,
+ *    而回放补丁需要一条版本链 —— 那是另一套东西,不是本段要修的缺陷。
+ * 3 **不主动删旧世代的字节**(除了显式 `forgetRoomWorldSave`):`seed` 变了才清,
+ *    见 `WorldStateRecord.seed` 的注释(**读侧**也会比对,不靠写侧自觉)。
+ */
+
+/** 本段 DDL 的文件产物名。**独立于 `schema.sql`**(理由见本节头)。 */
+export const WORLD_PERSISTENCE_SCHEMA_FILE_NAME = 'schema_world_persistence.sql';
+
+/** 屋顶旁路层表名(与 DDL 文件里那张表逐字一致)。 */
+export const CHUNK_ROOFS_TABLE = 'room_chunk_roofs';
+
+/** 世界状态表名(与 DDL 文件里那张表逐字一致)。 */
+export const WORLD_STATE_TABLE = 'room_world_state';
+
+/** 本段迁移在 `schema_migrations` 里的版本号(基线 1 / 归档 2 / 台账 3 / 房间系统 4)。 */
+export const WORLD_PERSISTENCE_MIGRATION_VERSION = 5;
+export const WORLD_PERSISTENCE_MIGRATION_NAME = 'ws_fnd164_world_persistence';
+
+/**
+ * 单块屋顶 RLE 的字节上限。
+ *
+ * 全空块 = 3 字节(256 个零格 = 127 + 127 + 2 的零游程,`encodeRoofRle` 的每段
+ * 零游程最多 127 格);满屋顶块 = `256 × 3 = 768` 字节 ⇒ 4096 是「明显不是屋顶层
+ * = 坏数据」的闸,不是压缩估计。
+ * (与 DDL 里 `length(roofs_blob) <= 4096` 那条 CHECK 同一个数,值只在这里写一次。)
+ */
+export const ROOFS_BLOB_MAX_BYTES = 4096;
+
+/** 本段 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
+export function worldPersistenceSqlPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), WORLD_PERSISTENCE_SCHEMA_FILE_NAME);
+}
+
+export function readWorldPersistenceSql(path: string = worldPersistenceSqlPath()): string {
+  return readFileSync(path, 'utf8');
+}
+
+export interface WorldPersistenceMigrateResult {
+  applied: boolean;
+  version: number;
+  checksum: string;
+  /** 已存在同版本但 checksum 不一致 = 漂移(写入侧 fail-closed)。 */
+  drift: boolean;
+}
+
+/**
+ * 建两张世界存档表 + 登记迁移版本。**幂等**。
+ *
+ * 判序与 §13 / §14 逐条相同(审计 P1):「先读版本 → 护栏 → 漂移 → 才 exec DDL」。
+ * 漂移 ⇒ 调用方(`WorldSim.saveDirtyChunksToDb`)**拒写** —— 表结构与 DDL 对不上时
+ * 写进去的脏页属于哪一版结构没人说得清,而它**正是读档原料**。
+ */
+export function migrateWorldPersistence(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): WorldPersistenceMigrateResult {
+  const ddl = readWorldPersistenceSql(ddlPath);
+  const checksum = checksumOf(ddl);
+  const rows = readMigrationRows(db);
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find(
+    (r) => Number((r as MigrationRow).version) === WORLD_PERSISTENCE_MIGRATION_VERSION,
+  ) as MigrationRow | undefined;
+  if (existing && existing.checksum !== checksum) {
+    return { applied: false, version: WORLD_PERSISTENCE_MIGRATION_VERSION, checksum, drift: true };
+  }
+  db.exec(ddl);
+  if (existing) {
+    return { applied: false, version: WORLD_PERSISTENCE_MIGRATION_VERSION, checksum, drift: false };
+  }
+  db.insert('schema_migrations', {
+    version: WORLD_PERSISTENCE_MIGRATION_VERSION,
+    name: WORLD_PERSISTENCE_MIGRATION_NAME,
+    checksum,
+    applied_at: nowMs,
+  });
+  return { applied: true, version: WORLD_PERSISTENCE_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/** 这个库里**装过**世界存档迁移吗(登记行在 ⇒ 装过)。 */
+export function worldPersistenceInstalled(db: DbLike): boolean {
+  const rows = readMigrationRows(db);
+  return rows.some((r) => Number((r as MigrationRow).version) === WORLD_PERSISTENCE_MIGRATION_VERSION);
+}
+
+/**
+ * 屋顶层字节的**唯一**校验口径(写侧;读侧另判长度与可解性)。
+ *
+ * 抛而不是钳:`roofs_blob` 是读档原料 —— 存进去一个被截断的屋顶层,读回来就是
+ * 「这一块没有屋顶」(玩家盖的屋顶静默消失),而写入方拿到的是"成功"。
+ * 与 `assertChunkBlob` 同一条取舍。
+ */
+export function assertRoofsBlob(blob: Uint8Array): void {
+  if (!(blob instanceof Uint8Array)) throw new Error('roofs_blob 必须是 Uint8Array');
+  if (blob.byteLength === 0) {
+    /* 空屋顶层仍然有 3 字节(`encodeRoofRle` 对全零块给出 127+127+2 的零游程)——
+       0 字节只可能来自「忘了编码」,不能当成「没有屋顶」放过去。 */
+    throw new Error('roofs_blob 不能是 0 字节(全空屋顶层的 RLE 是 3 个零游程字节)');
+  }
+  if (blob.byteLength > ROOFS_BLOB_MAX_BYTES) {
+    throw new Error(
+      `roofs_blob ${blob.byteLength} 字节超出上限 ${ROOFS_BLOB_MAX_BYTES}`
+      + ' —— 拒绝写入而不是截断(截断的屋顶层读回来就是「这一块没有屋顶」)',
+    );
+  }
+}
+
+/** 写一块屋顶层。行不存在则插入(与 `saveChunk` 同形状)。 */
+export function saveChunkRoofs(
+  db: DbLike,
+  roomId: string,
+  chunkX: number,
+  chunkY: number,
+  roofsBlob: Uint8Array,
+  nowMs: number,
+): void {
+  assertRoofsBlob(roofsBlob);
+  const key = { room_id: roomId, chunk_x: chunkX, chunk_y: chunkY };
+  if (db.get(CHUNK_ROOFS_TABLE, key)) {
+    db.update(CHUNK_ROOFS_TABLE, key, { roofs_blob: roofsBlob, updated_at: nowMs });
+    return;
+  }
+  db.insert(CHUNK_ROOFS_TABLE, {
+    room_id: roomId,
+    chunk_x: chunkX,
+    chunk_y: chunkY,
+    roofs_blob: roofsBlob,
+    updated_at: nowMs,
+  });
+}
+
+/** 读一块屋顶层。行不存在 / 字节不是 `Uint8Array` / 超上限 ⇒ `undefined`(不编一个空层)。 */
+export function loadChunkRoofs(
+  db: DbLike,
+  roomId: string,
+  chunkX: number,
+  chunkY: number,
+): Uint8Array | undefined {
+  const row = db.get(CHUNK_ROOFS_TABLE, { room_id: roomId, chunk_x: chunkX, chunk_y: chunkY });
+  if (row === undefined) return undefined;
+  const blob = row.roofs_blob;
+  if (!(blob instanceof Uint8Array) || blob.byteLength === 0) return undefined;
+  if (blob.byteLength > ROOFS_BLOB_MAX_BYTES) return undefined;
+  return blob;
+}
+
+/** 本房间已落盘的地形块坐标(按 (cy, cx) 升序 ⇒ 读档顺序确定、可复现)。表还没建 ⇒ `[]`。 */
+export function listRoomChunkCoords(db: DbLike, roomId: string): { cx: number; cy: number }[] {
+  let rows: ChunkRecord[];
+  try {
+    rows = db.select('room_chunks', { room_id: roomId }) as unknown as ChunkRecord[];
+  } catch (e) {
+    /* 「表还没建」= 这个库从没跑过基线迁移 / 还没存过任何一块 ⇒ 没有坐标可读。
+       其余错误照旧冒泡(磁盘/权限故障被伪装成「没有存档」就是一张空地图)。 */
+    if (/no such table/i.test((e as Error)?.message ?? '')) return [];
+    throw e;
+  }
+  return rows
+    .map((r) => ({ cx: Number(r.chunk_x), cy: Number(r.chunk_y) }))
+    .filter((c) => Number.isInteger(c.cx) && Number.isInteger(c.cy))
+    .sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
+}
+
+/** 本房间已落盘的地形块数(诊断 / 判据的观测口径;表还没建 ⇒ 0)。 */
+export function countRoomChunks(db: DbLike, roomId: string): number {
+  try {
+    return db.select('room_chunks', { room_id: roomId }).length;
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+    throw e;
+  }
+}
+
+/** 本房间已落盘的屋顶层行数(与 `countRoomChunks` 对偶;表还没建 ⇒ 0)。 */
+export function countRoomChunkRoofs(db: DbLike, roomId: string): number {
+  try {
+    return db.select(CHUNK_ROOFS_TABLE, { room_id: roomId }).length;
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+    throw e;
+  }
+}
+
+/**
+ * 一行世界状态。
+ *
+ * `seed` 是**世代替换的判据**(读写两侧都用它):
+ *   * 写侧:库里 `seed` ≠ 本世界的 `worldSeed` ⇒ 先 `forgetRoomWorldSave` 再写
+ *     (`reset_world` 换了种子之后,旧世代的 chunk 行必须作废,否则下一次启动
+ *     会把**重置前**的世界读回来);
+ *   * 读侧:同一个比对 ⇒ 不匹配就**不恢复**(如实报 `seed-mismatch`)。
+ */
+export interface WorldStateRecord {
+  room_id: string;
+  seed: number;
+  size_cells: number;
+  biome: string;
+  frame: number;
+  /** `FLV1` 字节(格式定义在 `world/fluid.ts`);`null` = 这份存档没存水位。 */
+  fluid_blob: Uint8Array | null;
+  updated_at: number;
+}
+
+/**
+ * 写世界状态(一房间一行,覆盖写)。`fluid` 省略 ⇒ 这一行**不带水位**
+ * (与「水位是全零」是两件事:前者是「没存过」,后者是「存了但全干」)。
+ *
+ * 水位超 1 MiB ⇒ **如实抛**(不截断):半个水位场读回来分不清「这里本来没水」
+ * 与「这里的字节丢了」—— 与 §13 对非 `WSA1` 快照的取舍一致。
+ */
+export function saveWorldState(
+  db: DbLike,
+  input: {
+    roomId: string;
+    seed: number;
+    sizeCells: number;
+    biome: string;
+    frame: number;
+    fluid?: Uint8Array | null;
+    nowMs: number;
+  },
+): void {
+  if (typeof input.roomId !== 'string' || input.roomId.length === 0) {
+    throw new Error('世界状态需要 roomId(非空字符串)');
+  }
+  if (!Number.isFinite(input.seed) || !Number.isInteger(input.seed)) {
+    throw new Error(`世界状态的 seed 必须是有限整数(实得 ${String(input.seed)})`);
+  }
+  const sizeCells = clampInt(input.sizeCells, 1, 4096, 'sizeCells');
+  const frame = clampInt(input.frame, 0, Number.MAX_SAFE_INTEGER, 'frame');
+  const fluid = input.fluid ?? null;
+  if (fluid !== null) {
+    if (!(fluid instanceof Uint8Array)) throw new Error('fluid_blob 必须是 Uint8Array');
+    if (fluid.byteLength > BLOB_MAX_BYTES) {
+      throw new Error(
+        `fluid_blob ${fluid.byteLength} 字节超出上限 ${BLOB_MAX_BYTES}`
+        + ' —— 拒绝写入而不是截断(截断的水位场读回来是半个世界的水)',
+      );
+    }
+  }
+  const key = { room_id: input.roomId };
+  const row = {
+    room_id: input.roomId,
+    seed: Math.trunc(input.seed),
+    size_cells: sizeCells,
+    biome: typeof input.biome === 'string' ? input.biome : '',
+    frame,
+    fluid_blob: fluid,
+    updated_at: input.nowMs,
+  };
+  if (db.get(WORLD_STATE_TABLE, key)) {
+    db.update(WORLD_STATE_TABLE, key, row);
+    return;
+  }
+  db.insert(WORLD_STATE_TABLE, row);
+}
+
+/**
+ * 读世界状态。表还没建 / 这个房间没有行 ⇒ `undefined`(「没存过」,不是故障)。
+ *
+ * 其余错误照旧冒泡:一次磁盘/权限故障被伪装成「没存过」的后果是
+ * **一张空地图**被当成「新世界」启动 —— 那正是本段要修的那把刀。
+ */
+export function loadWorldState(db: DbLike, roomId: string): WorldStateRecord | undefined {
+  if (typeof roomId !== 'string' || roomId.length === 0) return undefined;
+  let row: Row | undefined;
+  try {
+    row = db.get(WORLD_STATE_TABLE, { room_id: roomId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return undefined;
+    throw e;
+  }
+  if (!row) return undefined;
+  const blob = row.fluid_blob;
+  return {
+    room_id: String(row.room_id),
+    seed: Number(row.seed) || 0,
+    size_cells: Number(row.size_cells) || 0,
+    biome: typeof row.biome === 'string' ? row.biome : '',
+    frame: Number(row.frame) || 0,
+    fluid_blob: blob instanceof Uint8Array && blob.byteLength > 0 ? blob : null,
+    updated_at: Number(row.updated_at) || 0,
+  };
+}
+
+/**
+ * 丢掉某房间**整个**世界存档(地形行 + 屋顶行 + 状态行),返回各删了几行。
+ *
+ * 两个调用点(`sim/world_sim.ts`):
+ *   * 写侧发现 `seed` 不一致(重置换了世界世代)⇒ 先清后写;
+ *   * 读侧**不调用本函数**:库里那一代的 `seed` 与「房间配置里的 seed」不一致时,
+ *     按**库里的**种子恢复(`seedAdopted`,见 `restoreWorldFromDb`)——
+ *     `reset_world` 刻意不改房间的 `worldSeed`(见 `net/actions/reset_world.ts`),
+ *     把库清掉等于把上一次重置**回退掉**。
+ * 表还没建 ⇒ 0(没有行可删,不是故障)。
+ */
+export function forgetRoomWorldSave(
+  db: DbLike,
+  roomId: string,
+): { chunks: number; roofs: number; state: number } {
+  const wipe = (table: string): number => {
+    let rows: Row[];
+    try {
+      rows = db.select(table, { room_id: roomId });
+    } catch (e) {
+      if (/no such table/i.test((e as Error)?.message ?? '')) return 0;
+      throw e;
+    }
+    let removed = 0;
+    for (const r of rows) {
+      if (table === WORLD_STATE_TABLE) {
+        removed += db.delete(table, { room_id: roomId });
+        continue;
+      }
+      removed += db.delete(table, {
+        room_id: roomId,
+        chunk_x: Number(r.chunk_x),
+        chunk_y: Number(r.chunk_y),
+      });
+    }
+    return removed;
+  };
+  return {
+    chunks: wipe('room_chunks'),
+    roofs: wipe(CHUNK_ROOFS_TABLE),
+    state: wipe(WORLD_STATE_TABLE),
+  };
 }

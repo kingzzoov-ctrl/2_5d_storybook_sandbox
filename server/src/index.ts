@@ -404,6 +404,28 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
     /* ★ D-06:归档口。`null` = 没有库 ⇒ 重置回 `archiveError`(如实)。 */
     archiveSink,
   } as ConstructorParameters<typeof WorldSim>[0]);
+  /* ★ WS-FND-164(B1 审计 P0):**库里有本房间的世界 ⇒ 读回来**,不按 seed 重生成。
+   *
+   * ## 为什么挂在这里
+   * `createHost()` 是**两条路共同的**造世界入口(`assemble()` 与
+   * `room.colyseus.ts` 的 `resolveRoomHost()`),读档必须和造世界同处一地 ——
+   * 挂在其中一条路上,另一条路上的进程就会得到一张空地图,而那种缺陷不报错。
+   *
+   * ## 三态(都由宿主自己判定,这里不替它猜)
+   * ```text
+   * archiveDb === null  ⇒ 没有库 ⇒ 不读(applied:false, reason:'no-db')
+   * 库里没有本房间存档   ⇒ 按 seed 新建(applied:false, reason:'no-save')
+   * 库里有存档          ⇒ 逐块读回并重建(applied:true;缺的块按新世界默认格)
+   * ```
+   * 「读不回来」与「按 seed 新建」都是**正常路径**,所以这里不抛错;
+   * 读档口自己会把块数 / 缺块 / 水位格数报出来(`restoreWorldFromDb` 的回执),
+   * 需要断言的调用方直接读那个方法即可(它就在返回的 host 上)。
+   *
+   * ⚠️ 放在 `wireHost()` **之前**:`rebuildWorld` 会换掉世界子系统(地形 / 流体 /
+   * 物理 / 生物),而 `wireHost` 挂的是与世代无关的接线(归档口 / 计分 sink /
+   * 睡眠读口 / 城镇半径 provider)。先读档再接线 ⇒ 不存在"接线挂在已被换掉的对象上"。
+   * `archiveDb` 是「本房间正在用的那个库」(名字来自 D-06,值 = `db ?? deps.db`)。 */
+  sim.restoreWorldFromDb(archiveDb, roomId);
   wireHost(sim, roomId);
   return sim;
 }

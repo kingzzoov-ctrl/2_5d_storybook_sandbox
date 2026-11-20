@@ -192,3 +192,85 @@ export function settlementSeenAt(ledger: SettlementLedger, key: string): number 
 export function settlementKeyCount(ledger: SettlementLedger): number {
   return ledger.claims.size;
 }
+/* ══════════ ★ WS-FND-165(B1):台账的**导出**与**合并**(跨进程恢复)══════════
+ *
+ * 这一对函数存在的唯一理由:`roomSystemsState.settled` 修前**只活在内存里**,
+ * 于是进程一停,同一个 `orderId` 就能再成交一次。落库/读回的序列化在
+ * `db/repo.ts` §17;本文件只提供「台账 ⇄ 条目数组」这一层,
+ * 并且仍然守住「只有 `claimSettlement` 与下面这个合并口能写 `claims`」。
+ */
+
+/**
+ * 导出全部条目(顺序 = **入账顺序**,即 FIFO 淘汰序)。
+ *
+ * `order` 缺省的旧夹具(只给了 `claims`)⇒ 回落到 `Map` 的插入顺序 ——
+ * 与 `claimSettlement` 懒建 `order` 的行为一致,不额外排序(`at` 相同的键
+ * 排序不稳定,而「同一份台账导出两次逐字节一致」是落盘幂等的前提)。
+ */
+export function settlementEntries(ledger: SettlementLedger): { key: string; at: number }[] {
+  const out: { key: string; at: number }[] = [];
+  const seen = new Set<string>();
+  for (const key of ledger.order ?? []) {
+    const at = ledger.claims.get(key);
+    if (at === undefined || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, at });
+  }
+  for (const [key, at] of ledger.claims) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, at });
+  }
+  return out;
+}
+
+/**
+ * 把**外部读回来**的条目并进台账(唯一的「外部写入口」)。
+ *
+ * ## 三条纪律
+ * ```text
+ * 1 只并**缺失**的键:`claims` 里已有的键**一律不覆盖**(内存里的 at 才是本进程
+ *   见过的那一次;覆盖它等于把「重复不覆盖」这条既有判据从库那头绕过去);
+ * 2 顺序仍是入账顺序:先补 order(旧夹具可能没有这一维),再逐条 push,
+ *   满了按 FIFO 淘汰**最老**一条 —— 与 claimSettlement 同一把尺子;
+ * 3 计数如实:added = 真正新增的键,dropped = 非法条目(空键 / 非有限 at),
+ *   kept = 合并后台账里的键数。**没有**「猜一个值」这条路。
+ * ```
+ * ⚠️ 本函数**不**判「这一条该不该结算」——那是结算路径的事;它只恢复事实。
+ */
+export function mergeSettlementLedger(
+  ledger: SettlementLedger,
+  entries: readonly { key: string; at: number }[],
+  capacity: number = SETTLEMENT_LEDGER_CAPACITY,
+): { added: number; kept: number; dropped: number } {
+  const order = ledger.order ?? (ledger.order = []);
+  const inOrder = new Set(order);
+  for (const key of ledger.claims.keys()) {
+    if (!inOrder.has(key)) {
+      inOrder.add(key);
+      order.push(key);
+    }
+  }
+  let added = 0;
+  let dropped = 0;
+  for (const e of entries ?? []) {
+    const key = typeof e?.key === 'string' ? e.key.trim() : '';
+    if (key === '' || !Number.isFinite(e?.at)) { dropped += 1; continue; }
+    if (ledger.claims.has(key)) continue;   /* ★ 已有 ⇒ 一位不动 */
+    ledger.claims.set(key, Math.trunc(e.at));
+    order.push(key);
+    inOrder.add(key);
+    added += 1;
+  }
+  const cap = Number.isFinite(capacity) && capacity > 0
+    ? Math.trunc(capacity)
+    : SETTLEMENT_LEDGER_CAPACITY;
+  while (order.length > cap) {
+    const oldest = order.shift();
+    if (oldest !== undefined) {
+      ledger.claims.delete(oldest);
+      inOrder.delete(oldest);
+    }
+  }
+  return { added, kept: ledger.claims.size, dropped };
+}

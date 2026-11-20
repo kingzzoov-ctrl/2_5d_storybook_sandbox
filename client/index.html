@@ -17,52 +17,125 @@
     -webkit-tap-highlight-color: transparent;
     overscroll-behavior: none;
     touch-action: none;
+    /* ★ WS-FND-166:长按画布时 iOS/Android 会**选中文本**并弹原生菜单
+       («拷贝/查找»),把摇杆拖拽从中间打断 —— 玩家读到的只有"游戏卡了"。
+       逐条关掉:选中(user-select)、iOS 的长按弹窗(-webkit-touch-callout)。
+       ⚠️ 与 `main.ts` 的 `suppressNativeGestures(window)`(拦 contextmenu/selectstart)
+       是**两道**保险:CSS 管"选不选得中",事件管"弹不弹菜单"。 */
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  /* 覆盖层(#app 内的画布/摇杆/按钮条/镜像面板)一律不吃文本选择 */
+  #app, #app * {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
   #app { width: 100%; height: 100%; position: relative; }
   /* three 的 canvas 撑满容器 */
   #app canvas { display: block; width: 100% !important; height: 100% !important; }
   /* 提示条:键位一多就一行放不下 ⇒ 允许换行并限宽(否则会溢出视口,后半截看不见)。
      文案与 `main.ts` / `net/action_binding.ts` 的两张键位表逐键对应;`PLAY.md` 是它的长版。 */
+  /* 提示条:键位一多就一行放不下 ⇒ 允许换行并限宽(否则会溢出视口,后半截看不见)。
+     文案与 `main.ts` / `net/action_binding.ts` 的两张键位表逐键对应;`PLAY.md` 是它的长版。
+     ★ WS-FND-167:a11y —— 字号 ≥13px(可读基线)、描边用**实色**(旧值
+     `rgba(120,150,210,.22)` 压在底色上实测 ≈1.4:1,低于 WCAG 1.4.11 的 3:1)。
+     口径常量与对比度判据在 `client/src/ui/a11y.ts`(那里的 `MIN_TEXT_PX` /
+     `A11Y_EDGE` 与本处逐字一致)。 */
   #hint {
     position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
-    font-size: 12px; color: #8fa6c8; background: rgba(18,24,38,.8);
+    font-size: 13px; color: #b9cbe6; background: rgba(18,24,38,.92);
     padding: 6px 14px; border-radius: 12px; pointer-events: none;
-    border: 1px solid rgba(120,150,210,.22);
+    border: 1px solid #7f9dc9;
     white-space: normal; max-width: min(94vw, 900px); text-align: center; line-height: 1.55;
   }
   #fatal {
     display: none; position: fixed; inset: 0; padding: 24px;
-    background: #121a2b; font: 13px/1.7 ui-monospace, Menlo, Consolas, monospace;
-    color: #ff9d9d; z-index: 100; overflow: auto; white-space: pre-wrap;
+    background: #121a2b; font: 14px/1.7 ui-monospace, Menlo, Consolas, monospace;
+    color: #ffb0b0; z-index: 100; overflow: auto; white-space: pre-wrap;
   }
   /* 状态条:连接 / 坐标 / 最近一次命中 —— 「连没连上、打没打中」要在屏幕上看得见 */
   #status {
     position: fixed; top: 10px; left: 10px;
-    font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
-    color: #a8f0c8; background: rgba(14,20,32,.78);
+    font: 13px/1.6 ui-monospace, Menlo, Consolas, monospace;
+    color: #a8f0c8; background: rgba(14,20,32,.9);
     padding: 8px 12px; border-radius: 10px; pointer-events: none;
-    border: 1px solid rgba(120,200,160,.25); white-space: pre;
+    border: 1px solid #8fe0a8; white-space: pre;
   }
-  #status.bad { color: #ffcf8f; border-color: rgba(220,170,90,.35); }
+  #status.bad { color: #ffcf8f; border-color: #ffb0b0; }
+  /* ★ WS-FND-167:加载指示 —— 修前"有没有在加载"只能靠看画面;失败时也在这里出原因。 */
+  #bootstatus {
+    position: fixed; top: 10px; right: 10px;
+    font: 13px/1.55 ui-monospace, Menlo, Consolas, monospace;
+    color: #b9cbe6; background: rgba(14,20,32,.9);
+    padding: 8px 12px; border-radius: 10px; pointer-events: none;
+    border: 1px solid #7f9dc9;
+  }
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div id="status">连接中…</div>
-<div id="hint">WASD/方向键 移动 · 左键/空格 攻击(空格同时锁存一次跳跃,服务端认 jump ⇒ 挥刀 + 起跳;能不能起跳由世界侧判) · Q 放置 · E 拆除 · G 丢下 · F 拾取 · N 合成 · K 睡觉 · O/U 开箱 · V 派对开局 · T 用道具 · 1 驯养 · 2 购买 · 3 炼金台 · 4 放件/播种 · 5 采集(面前那格的自然资源;可采集性与工具由服务端判) · M 派对模式面板(J/L 选 · Enter 定 ⇒ 发 SET_PARTY_MODE) · I 背包 · R 配方 · H 画架 · P 音高 · [ ] 缩放 · / 搜索 · Esc 关面板/清空搜索 · B Boss · Z/Y/X/C 画架工具 · 背包格子拖拽=本地整理(不发报文) · 手机单指拖动移动 · 左下角常显「急行开工 已知 N/3 满足(?=未知)」</div>
-<pre id="fatal"></pre>
-<script type="module">
+<!-- ★ WS-FND-167:a11y —— 面板全部画在 canvas 上(读屏器看不到),这几行是 DOM 里的
+     真文本:`role` / `aria-label` / `aria-live` 让读屏器能读,`tabindex="0"` 让键盘 Tab 能到。
+     完整的面板文本镜像由 `client/src/ui/a11y.ts` 在 `#app` 里建(`#a11y_panels`)。 -->
+<div id="status" role="status" aria-live="polite" aria-label="连接状态与诊断" tabindex="0">连接中…(等待 WebSocket 与欢迎帧)</div>
+<!-- 加载指示:图集/场景到底在加载还是已经失败,不再只写进 summary -->
+<div id="bootstatus" role="status" aria-live="polite" aria-label="加载状态">加载中…(三维场景 / 图集)</div>
+<div id="hint" role="note" aria-label="键位提示">WASD/方向键 移动 · 左键/空格 攻击(空格同时锁存一次跳跃,服务端认 jump ⇒ 挥刀 + 起跳;能不能起跳由世界侧判) · Q 放置 · E 拆除 · G 丢下 · F 拾取 · N 合成 · K 睡觉 · O/U 开箱 · V 派对开局 · T 用道具 · 1 驯养 · 2 购买 · 3 炼金台 · 4 放件/播种 · 5 采集(面前那格的自然资源;可采集性与工具由服务端判) · M 派对模式面板(J/L 选 · Enter 定 ⇒ 发 SET_PARTY_MODE) · I 背包 · R 配方 · H 画架 · P 音高 · [ ] 缩放 · / 搜索 · Esc 关面板/清空搜索 · B Boss · Z/Y/X/C 画架工具 · 背包格子拖拽=本地整理(不发报文) · 手机单指拖动移动 · 手机轻点=攻击(拖动=移动)、右上角按钮条=面板入口与攻击/关闭 · 左下角常显「急行开工 已知 N/3 满足(?=未知)」</div>
+<pre id="fatal" role="alert" aria-live="assertive" tabindex="0"></pre>
+<script id="boot_fallback">
   /*
-   * 启动失败时把错误直接显示出来 —— headless 截图能拍到,
-   * 避免「白屏但控制台里其实有异常」这种查不出来的情况。
+   * ★ WS-FND-167 缺口 3(实测):主模块脚本 src/main.ts 404 时页面**纯白屏**。
+   *
+   * 为什么原来那两个监听救不回来:
+   *   · `window.onerror` / `unhandledrejection` 捕的是**运行时**异常;
+   *     而 module 脚本 404 是**资源加载失败** —— 它不冒泡,只在 window 的
+   *     **捕获阶段**（第三个参数 true)可见,且 `event.target` 是那个 `<script>`;
+   *   · `main.ts` 的 try/catch 只包同步的 `boot()` —— 模块图根本没跑起来时,
+   *     那一行代码**一次都没执行过**。
+   * ⇒ 这段是**非 module** 脚本(先于模块执行),三条路都兜住:
+   * ```text
+   * 1 资源级 error(捕获阶段)        ⇒ 写明「哪个 URL 加载失败」
+   * 2 运行时异常 / 未处理的 rejection ⇒ 原样显示
+   * 3 看门狗:到点还没见到 __stageReady ⇒ 判「模块没跑起来」(404 / 解析失败)
+   * ```
+   * 三者都走 `window.__fatal` **一个出口**(`main.ts` 也用它 —— 不造第二套文案)。
+   * 判据 `tests/WS-FND-167-resilience.test.ts` 用桩 DOM **真的执行**这段(不是读字符串)。
    */
-  const showFatal = (msg) => {
-    const el = document.getElementById('fatal');
-    el.style.display = 'block';
-    el.textContent = String(msg);
-  };
-  window.addEventListener('error', (e) => showFatal(e.error?.stack || e.message));
-  window.addEventListener('unhandledrejection', (e) => showFatal(e.reason?.stack || e.reason));
+  (function () {
+    var shown = false;
+    function show(msg) {
+      if (shown) return;
+      shown = true;
+      window.__fatalShown = true;
+      var el = document.getElementById('fatal');
+      if (!el) return;
+      el.style.display = 'block';
+      el.textContent = String(msg);
+    }
+    window.__fatal = show;
+    window.addEventListener('error', function (ev) {
+      var t = ev && ev.target;
+      if (t && t !== window && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+        show('启动脚本加载失败:' + (t.src || t.href || '(未知地址)') + '\n'
+          + '常见原因:地址 404(文件被移动/改名)、dev server 未启动、构建产物缺失。\n'
+          + '页面不会自己恢复 —— 修好源文件后刷新。');
+        return;
+      }
+      show((ev && ev.error && ev.error.stack) || (ev && ev.message) || '脚本错误');
+    }, true);
+    window.addEventListener('unhandledrejection', function (ev) {
+      show((ev && ev.reason && ev.reason.stack) || (ev && ev.reason) || '未处理的 Promise 拒绝');
+    });
+    var WATCHDOG_MS = 8000;
+    window.__bootWatchdog = setTimeout(function () {
+      if (typeof window.__stageReady === 'function') return;
+      show('启动超时:' + WATCHDOG_MS + 'ms 内 src/main.ts 没有跑起来。\n'
+        + '最常见的原因是它 404(路径/文件名不对)或模块解析失败 ⇒ 页面停在白屏。\n'
+        + '排查:浏览器 Network 里看 src/main.ts 的状态码,以及控制台第一条报错。');
+    }, WATCHDOG_MS);
+  })();
 </script>
 <script type="module" src="./src/main.ts"></script>
 </body>

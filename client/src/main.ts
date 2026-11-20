@@ -19,7 +19,10 @@
  */
 
 import { boot, type BootHandle } from './three/boot.ts';
-import { createSession, type SessionHandle } from './net/session.ts';
+import {
+  CONNECT_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, RECONNECT_FACTOR, RECONNECT_MAX_MS,
+  createSession, type SessionHandle,
+} from './net/session.ts';
 import {
   ACTION_KEYS, FACING_DEFAULT, cellInFront, cellUnder, describeActionResult,
   facingLabel, keyHints, nextFacing, type Facing,
@@ -48,9 +51,28 @@ import {
    本文件只剩三根线:落指 → `show`、拖动 → `moveTo`、抬手/取消 → `hide`。
    —— 只画不接 = 玩家仍然看不见手柄,而那**不会**让任何断言变红。 */
 import { createJoystickUI } from './ui/joystick_ui.ts';
+/* ═══ ★ WS-FND-166:触屏入口(手机没有键盘,而 `PANEL_KEYS` 全是字母键)═══
+   判定全在**纯模块**里(可单测),本文件只接线:
+   ```
+   net/touch_intent.ts  「轻点算不算攻击」(拖动 / 长按 / 非法读数都得说得出话)
+   ui/touch_bar.ts      屏幕按钮(攻击 + 每个 `PANEL_KEYS` 面板 + 关)的布局/命中/DOM
+   ui/mobile_shell.ts   原生手势抑制(contextmenu/selectstart)+ reduced-motion 判定
+   ```
+   ⇒ 修前的三件真机事故:①触屏**永远打不出攻击**(摇杆 `preventDefault` 抑制了
+   兼容 `mousedown`);②手指按在面板上拖动时摇杆照样开(角色一边走);
+   ③手机**打不开任何面板**。 */
+import { TAP_MAX_MS, TAP_MAX_TRAVEL_PX, tapAttackVerdict } from './net/touch_intent.ts';
+import { createTouchBar, panelOfButtonId, touchButtons, type TouchButtonId } from './ui/touch_bar.ts';
+import { SUPPRESSED_GESTURES, suppressNativeGestures } from './ui/mobile_shell.ts';
+/* `UiPanel` 在本仓同时是**值**(词表)与**类型**(同名的 `type`)—— 一次 import 都拿得到。 */
+import { UiPanel } from './ui/state_machine.ts';
 import { telegraphCenterOf } from './net/telegraph_center.ts';
 /* ★ 第六轮审计 P1:派对模式的**下标 → 名字**换算(词表来自冻结层 `PARTY_MODES`),
    同时服务于 `#hint`(boot.ts)与 `START_PARTY` 的模式回声(本文件)。 */
+/* ★ WS-FND-167:a11y 最低限度层 —— 字号/对比度常量 + 面板的 role/aria-label/Tab 可达镜像。
+   修前面板全画在 canvas 上(读屏器零可达、键盘 Tab 一个都到不了),而画布那层不在本文件
+   写域内 ⇒ 这里的镜像面板与 DOM HUD 用**同一份**达标口径(`ui/a11y.ts` 的常量 + 对比度判据)。 */
+import { MIN_TEXT_PX, a11yStyleProblems, createA11yMirror } from './ui/a11y.ts';
 import { partyModeName } from './ui/party_hud.ts';
 import { localPlayerZOf } from './net/height_placement.ts';
 import { DT } from '../../shared/types/physics.ts';
@@ -59,7 +81,30 @@ declare global {
   interface Window {
     /** 供自检/截图脚本读取运行状态 */
     __stageReady?: () => Record<string, unknown>;
+    /**
+     * ★ WS-FND-167:`client/index.html` 的**非 module** 兜底脚本挂的致命错误出口。
+     * 模块脚本自己 404 时,那段代码是唯一还能跑的东西(它先于模块执行)⇒ 两处**同一出口**。
+     */
+    __fatal?: (msg: string) => void;
+    /** ★ WS-FND-167:启动看门狗句柄(`main()` 跑完必须撤掉,否则 8s 后会误报白屏)。 */
+    __bootWatchdog?: ReturnType<typeof setTimeout>;
+    /** ★ WS-FND-167:兜底脚本已经显示过致命错误(`true` = `#fatal` 里已有内容)。 */
+    __fatalShown?: boolean;
   }
+}
+
+/**
+ * ★ WS-FND-167:致命错误的**唯一出口**。
+ *
+ * 先走 `window.__fatal`(index.html 的兜底脚本:它做了"只显示一次"的去重,并且
+ * 在模块脚本 404 时也活着);它不在(比如单测里直接 import 本模块)才自己写 DOM。
+ */
+function reportFatal(msg: string): void {
+  if (typeof window.__fatal === 'function') { window.__fatal(msg); return; }
+  const el = document.getElementById('fatal');
+  if (el === null) return;
+  el.style.display = 'block';
+  el.textContent = String(msg);
 }
 
 /**
@@ -98,13 +143,11 @@ function main(): void {
   try {
     handle = boot(root);
   } catch (e) {
-    /* 启动失败直接把错误显示出来 —— headless 截图能拍到,
-       避免「白屏但控制台里其实有异常」这种查不出来的情况。 */
-    const el = document.getElementById('fatal');
-    if (el) {
-      el.style.display = 'block';
-      el.textContent = `启动失败:\n${(e as Error).stack ?? String(e)}`;
-    }
+    /* 启动失败直接把错误显示出来 —— headless 截图能拍到(fps-probe 判 `#fatal` 非空),
+       避免「白屏但控制台里其实有异常」这种查不出来的情况。
+       ★ WS-FND-167:走**唯一出口** `reportFatal`(index.html 那段非 module 脚本挂的
+       `window.__fatal`;模块脚本自己 404 时这里根本执行不到,由那段兜底)。 */
+    reportFatal(`启动失败:\n${(e as Error).stack ?? String(e)}`);
     throw e;
   }
 
@@ -129,6 +172,15 @@ function main(): void {
    * 现在它同时进 HUD(状态条)与 `__stageReady`(机读),不再被覆盖。
    */
   let lastReject = '';
+  /**
+   * ★ WS-FND-167:最近一条 `onState` 的 **detail**(状态本身的具名原因)。
+   *
+   * 修前 `detail` 只在 `failed` / 带拒因的 `closed` 时被 warn 一句,界面上**从不显示**
+   * ⇒ "连接超时:8000ms 内未建立连接(地址…)"这种具名原因没人看得到,
+   * 玩家读到的仍是 `连接 connecting`。现在它进 HUD 第一行(与状态同一个字符串)。
+   * ⚠️ 只在有 detail 时覆盖:状态变 `live` 时不清空 —— 上一轮的失败原因要留着可读。
+   */
+  let lastStateDetail = '';
   /**
    * 「最近真的碰过的那件」物品 id。
    *
@@ -258,19 +310,36 @@ function main(): void {
       /* ★ 复用 boot 的 store —— 别让两个 store 各写各的(见上) */
       store: handle.store,
       /* ★ WS-FND-113 第 4 处:被动断开 ⇒ 自动重连(主动 `close()` 不重连)。
-         没有它,"重连路径"在生产里根本不存在,那一堆复位也就无从触发。 */
+         没有它,"重连路径"在生产里根本不存在,那一堆复位也就无从触发。
+         ★ WS-FND-167:1500 是**退避基数**(不再是固定间隔)—— 间隔按
+         `backoffDelayMs(次数, 基数, 上限 30s, 倍率 2)` 指数增长并封顶,
+         死服务不再每 1.5s 无限空转;成功 `open` 后退避计数归零。 */
       autoReconnectMs: 1500,
+      /* ★ WS-FND-167 缺口 1:连接 / 握手都**具名超时** —— 黑洞端口连事件都不来,
+         不设超时的话状态会永久停在 `connecting`,界面上永远写着"连接中"。 */
+      connectTimeoutMs: CONNECT_TIMEOUT_MS,
+      handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+      reconnectMaxMs: RECONNECT_MAX_MS,
+      reconnectFactor: RECONNECT_FACTOR,
       events: {
         /* 帧到达:渲染循环自己在读 `handle.store`,这里**不需要**触发重画。
            只把"坏包/空帧"留痕,便于自检脚本读。 */
         onFrame: () => { /* 渲染循环每帧自读 store */ },
         /* ★ 第十轮 P3:**拒因不许被 close 盖掉**。修前这里只对 `'failed'` 告警,
            而服务端的拒绝随即把状态推成 `'closed'`(带同一条拒因)⇒ 「为什么被拒」
-           只留在一次瞬时 `failed` 上,现场只剩「断了」。⇒ `closed` 带 detail 时也打。 */
+           只留在一次瞬时 `failed` 上,现场只剩「断了」。⇒ `closed` 带 detail 时也打。
+           ★ WS-FND-167:同一句话也进 HUD(`lastStateDetail`)—— 超时/拒因/版本不符
+           都不再只在控制台里(界面上必须读得到"到底卡在哪一步")。 */
         onState: (s, detail) => {
+          if (detail !== undefined && detail !== '') lastStateDetail = detail;
           if (s === 'failed' || (s === 'closed' && detail !== undefined)) {
             console.warn(`[session] ${s}:`, detail);
           }
+        },
+        /* ★ WS-FND-167:重连排程 ⇒ 界面显示"第几次、多久后"。
+           修前只有"断了"这一个事实 ⇒ 状态条永远在转,玩家不知道还要等多久。 */
+        onRetryScheduled: ({ attempt, delayMs }) => {
+          lastStateDetail = `第 ${attempt} 次重连已排程:${(delayMs / 1000).toFixed(1)}s 后重拨`;
         },
         /* ★ 第十轮 P3:`session` 的 `onReject` / `lastReject` / `rejectedFrames`
            三个出口此前在客户端**零消费者**。现在接上,并做**分档**:
@@ -332,6 +401,25 @@ function main(): void {
   const statusEl = document.getElementById('status');
   let lastHit = '还没打过';
   const lastHp = new Map<string, number>();
+  /* ── ★ WS-FND-167:加载指示 + 面板文本镜像(a11y)──
+     修前两件事都不可见:
+     ```text
+     a 图集加载失败只进 `summary()` ⇒ 屏幕上只是"背包格变色块",**原因读不到**;
+     b 面板全画在 canvas 上 ⇒ 读屏器零可达、键盘 Tab 一个面板都到不了。
+     ```
+     ⇒ 这里各接一条:加载指示读 `summary()`(`atlasOk` / `atlasErr`),镜像面板读
+     **同一串** HUD 文本(`ui/a11y.ts` 的 role/aria-label/Tab 可达 + 字号/对比度常量)。 */
+  const bootStatusEl = document.getElementById('bootstatus');
+  const hintEl = document.getElementById('hint');
+  const a11y = createA11yMirror();
+  /* 挂到 `#app`(与摇杆同一层):`position:fixed` 的镜像面板不参与画布布局。 */
+  a11y.mount(root);
+  /** 第一份权威数据(或单机)是不是已经到了 —— 隐藏"加载中"的唯一判据。 */
+  let readySeen = session === null;
+  /** 慢档读数(每 500ms 拉一次 `summary()`;按帧拉太贵 —— 它会投影所有立牌)。 */
+  let lastPollMs = 0;
+  let atlasNote = '图集 加载中…(格子暂为色块占位)';
+  let panelNote = '面板 无';
 
   /**
    * 最近的怪 —— 从**权威快照**取(`store.state.wildlife`)。
@@ -354,15 +442,78 @@ function main(): void {
     return best;
   };
 
-  /** 左键 / 空格:打**最近**那只(距离与伤害都由服务端判,客户端只给目标)。 */
-  const attackNearest = (): void => {
-    if (session === null) { lastHit = '未联机,打不了'; return; }
+  /* ═══ ★ WS-FND-166:触屏按钮条(手机没有键盘 ⇒ 面板一个都打不开)═══
+     面板键位表 `PANEL_KEYS` 全是字母键(i/r/h/p/m);真机上**没有任何键盘**。
+     屏幕按钮是"最低方案",而它按下去走的是**同一台状态机**(`boot.togglePanel`
+     → `setPanel`),不是另开一条开关面板的路。 */
+  const detachGestures = suppressNativeGestures(window);
+  let lastTouchButton = '还没按过';
+  let lastTouchIntent = `还没碰过屏幕(轻点上限 ${TAP_MAX_MS}ms / ${TAP_MAX_TRAVEL_PX}px)`;
+  /** 被 UI 吃掉、因而**没有**开摇杆的指针数(自检口径:> 0 = 互斥真生效过) */
+  let uiPointerSuppressions = 0;
+  /** 轻点被判成攻击的次数(`0` 且一直为 0 ⇒ 触屏攻击这条出口没跑起来) */
+  let tapAttacks = 0;
+  const nowMs = (): number => (
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now()
+  );
+  const touchBar = createTouchBar((id: TouchButtonId): void => {
+    lastTouchButton = id;
+    if (id === 'attack') { attackNearest('button'); return; }
+    if (id === 'close') { handle.closePanel(); return; }
+    const panel = panelOfButtonId(id);
+    if (panel !== null) handle.togglePanel(panel);
+  });
+  touchBar.mount(root);
+
+  /**
+   * ★ WS-FND-166:**UI 与摇杆 / 攻击的互斥** —— 先判 UI,再判摇杆。
+   *
+   * ## 修前是什么样(实测)
+   *
+   * 摇杆只管"指针类型"(`pointerType !== 'mouse'`),而它的监听挂在 `window`
+   * **冒泡层**:手指按在背包面板上往下拖时,`boot` 的画布监听**先**执行并拿起格子,
+   * `main` 的 window 监听**随后**照样开摇杆 ⇒ 「单指拖背包时角色一边走」。
+   * 两条监听各自都"工作正常",所以没有任何断言会红。
+   *
+   * ## 现在
+   * 「这一下归不归 UI」由**纯判定**回答(`boot.uiHitAt` → `ui/panel_hit.uiConsumesPoint`,
+   * 面板容器也算)加上触摸条自己的命中(`hitTouchBar`) ⇒ 与事件注册顺序无关。
+   */
+  function pointerConsumedByUi(x: number, y: number): boolean {
+    return touchBar.hitAt(x, y) !== null || handle.uiHitAt(x, y);
+  }
+
+  /**
+   * 左键 / 轻点 / 「攻」按钮:打**最近**那只(距离与伤害都由服务端判,客户端只给目标)。
+   * `source` 只进那句话 —— 让「这一刀是哪条入口打出来的」可读(`__stageReady.lastTouchIntent`)。
+   */
+  function attackNearest(source: 'mouse' | 'tap' | 'button' = 'mouse'): void {
+    if (session === null) { lastHit = `未联机,打不了(${source})`; return; }
     const w = nearestWildlife(predictor.pos);
     if (w === null) { lastHit = '附近没有怪'; return; }
     session.sendAttack({ mobId: w.mobId });
-    lastHit = `已发攻击 → ${w.mobId}(${w.d.toFixed(1)} 格)`;
-  };
-  window.addEventListener('mousedown', (ev) => { if (ev.button === 0) attackNearest(); });
+    lastHit = `已发攻击(${source}) → ${w.mobId}(${w.d.toFixed(1)} 格)`;
+  }
+  /**
+   * 攻击的**指针入口**(★ WS-FND-166)。
+   *
+   * 修前只挂 `mousedown`,而摇杆对**每一次触摸**都 `preventDefault()`
+   * ⇒ 浏览器不再补发兼容的 `mousedown` ⇒ **手机上永远打不出攻击**,
+   * 而控制台一句话都不说。现在三条出口:
+   * ```
+   * 鼠标左键(`pointerdown` + `pointerType === 'mouse'`)  ⇒ 即刻攻击
+   * 触屏轻点(抬手判定,见 `onStickEnd`)                  ⇒ 不拖动就等于攻击
+   * 屏幕「攻」按钮(触摸条)                              ⇒ 确定性入口
+   * ```
+   * ⚠ 先判 UI:按在面板/按钮上的那一下不该挥刀(与摇杆互斥同一口径)。
+   */
+  window.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    if (pointerConsumedByUi(ev.clientX, ev.clientY)) return;
+    if (ev.pointerType === 'mouse') attackNearest('mouse');
+  });
   /**
    * 空格 = **攻击**(这条监听),而同一个键在 `net/input.ts` 的 `InputSource.press`
    * 里**同时**会锁存一次 `jump`。
@@ -389,15 +540,51 @@ function main(): void {
     if (ev.key === ' ' || ev.code === 'Space') { ev.preventDefault(); attackNearest(); }
   });
 
-  /** 每 tick 刷一次状态条(连接态不是 live 时变黄 —— 一眼能看出「没连上」)。 */
+  /**
+   * 每 tick 刷一次状态条(连接态不是 live 时变黄 —— 一眼能看出「没连上」)。
+   *
+   * ★ WS-FND-167:这个函数产出的是**唯一一份** HUD 文本 —— `#status`(看)与
+   * `#a11y_panels`(读屏器 / Tab)写的是**同一个数组**。两处各拼一份的话,
+   * "屏幕上写了、读屏器念的是别的"这种漂移没人测得出来。
+   */
   const paintStatus = (
     pos: { x: number; y: number },
     near: { mobId: string; hp: number; maxHp: number; d: number } | null,
   ): void => {
-    if (statusEl === null) return;
     const st = session?.state ?? 'offline';
-    statusEl.textContent = [
-      `连接 ${st}`,
+    /* ── ★ WS-FND-167:连接那三行:状态 + **具名 detail** + 阶段 + 退避排程 ──
+       修前只有 `连接 connecting` 这一行:黑洞端口永远停在"连接中",而"第几次重试、
+       下次什么时候拨"在界面上**根本不存在**(只在 `session` 的内部字段里)。 */
+    const sessionLine = `连接 ${st}${lastStateDetail === '' ? '' : `:${lastStateDetail}`}`;
+    const phaseLine = session === null
+      ? '连接阶段 单机(未联机,不发包)'
+      : session.lastTimeout !== null
+        ? `连接阶段 已判死:${session.lastTimeout.kind === 'connect' ? '连接' : '握手'}超时`
+          + ` ${(session.lastTimeout.ms / 1000).toFixed(1)}s —— ${session.lastTimeout.text}`
+        : st === 'connecting'
+          ? `连接阶段 连接中...(建立连接上限 ${(CONNECT_TIMEOUT_MS / 1000).toFixed(0)}s /`
+            + ` 之后等 welcome 上限 ${(HANDSHAKE_TIMEOUT_MS / 1000).toFixed(0)}s,超时会写明原因)`
+          : st === 'live' ? '连接阶段 已握手(收到 welcome)' : '连接阶段 未连接';
+    const retryLine = session === null || session.retryDelayMs === null || session.nextRetryAtMs === null
+      ? '重试 无(当前没有在排)'
+      : `重试 第 ${session.retryCount} 次 · 下次约`
+        + ` ${(Math.max(0, session.nextRetryAtMs - Date.now()) / 1000).toFixed(1)}s 后`
+        + `(退避 ${(session.retryDelayMs / 1000).toFixed(1)}s / 上限 ${(RECONNECT_MAX_MS / 1000).toFixed(0)}s)`;
+    /* ── ★ WS-FND-167 缺口 4:坏包 / 空帧 / 旧帧 / 载荷丢帧 / 拒收**上界面** ──
+       修前这几个计数只有 `__stageReady` 里有(而这个字段得开 devtools 才读得到)
+       ⇒ "确实在丢数据"在画面上完全看不见。 */
+    const diagLine = session === null
+      ? '诊断 单机(无会话)'
+      : `诊断 坏包 ${handle.store.decodeErrors} 空帧 ${handle.store.emptyFrames}`
+        + ` 旧帧 ${handle.store.staleFrames} 丢帧 ${session.droppedFrames} 拒收 ${session.rejectedFrames}`
+        + (session.lastDropReason === null ? '' : ` · 最近丢帧:${session.lastDropReason}`);
+    const lines = [
+      sessionLine,
+      phaseLine,
+      retryLine,
+      diagLine,
+      /* ★ WS-FND-167:图集/加载那一行 —— 失败时把**原因**写出来(修前只进 summary)。 */
+      atlasNote,
       `坐标 ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}`,
       near === null
         ? '附近 无怪'
@@ -420,8 +607,21 @@ function main(): void {
       lastItemId === 0
         ? '热键 1/2/3/4 需要「最近物品」(按 E 或 F 先拿一件)'
         : '热键 1/2/3/4 就绪(1 驯养 · 2 购买 · 3 炼金台 · 4 放自动化件)',
-    ].join('\n');
-    statusEl.classList.toggle('bad', st !== 'live');
+    ];
+    if (statusEl !== null) {
+      statusEl.textContent = lines.join('\n');
+      statusEl.classList.toggle('bad', st !== 'live');
+    }
+    /* ★ WS-FND-167:a11y —— 同一份文本按面板归档(读屏器 / Tab 到 `#a11y_panels` 时念)。
+       `panel` 那块给的是"当前面板 + 站在哪",`hint` 那块直接取 `#hint` 的文本(一处文案)。 */
+    a11y.update({
+      session: [sessionLine, phaseLine, retryLine].join('\n'),
+      diagnostics: [diagLine, lastReject === '' ? '拒绝 (无)' : lastReject, lastHit].join('\n'),
+      load: `${atlasNote}\n${panelNote}`,
+      panel: [`当前面板 ${panelNote.replace(/^面板 /, '')}`, `坐标 ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}`,
+        `最近物品 ${lastItemId === 0 ? '(还没有)' : lastItemId}`].join('\n'),
+      hint: hintEl?.textContent ?? '键位提示不可读(#hint 缺失)',
+    });
   };
   /* ── 动作键位(2026-11-14 第二轮):让「建造 / 拆掉 / 丢下 / 捡起」在浏览器里真的能按 ──
 
@@ -495,18 +695,32 @@ function main(): void {
   const stickUI = createJoystickUI();
   stickUI.mount(root);
   let stickPointerId: number | null = null;
+  /**
+   * ★ WS-FND-166:落指读数(轻点判定用)—— `null` = 这一指针没在摇杆上。
+   * 只有**真的开了摇杆**的落指才记,被 UI 吃掉的那些不参与(否则"按面板"会被判成轻点攻击)。
+   */
+  let stickTap: { at: number; x: number; y: number } | null = null;
+  /**
+   * 触屏落指:开摇杆。★ WS-FND-166 两处新增(理由见上面「互斥」那段):
+   * ```
+   * 1 `pointerConsumedByUi` ⇒ **先判 UI 再判摇杆**
+   *   (修前手指按在背包上往下拖时,这个 window 监听照样开摇杆 ⇒ 角色一边走)
+   * 2 记下 `stickTap` ⇒ 抬手时判「轻点 = 攻击」(`onStickEnd`,判定在 `net/touch_intent.ts`)
+   * ```
+   */
   const onStickDown = (ev: PointerEvent): void => {
     if (ev.pointerType === 'mouse') return; /* 桌面用 WASD:鼠标左键是攻击,不弹摇杆 */
-    if (stickPointerId !== null) return; /* 只跟第一根手指:第二根按下不该改方向 */
+    if (pointerConsumedByUi(ev.clientX, ev.clientY)) { uiPointerSuppressions += 1; return; }
+    if (stickPointerId !== null) return; /* 只跟第一根手指 */
     stickPointerId = ev.pointerId;
+    stickTap = { at: nowMs(), x: ev.clientX, y: ev.clientY };
     stick.begin(ev.clientX, ev.clientY);
-    /* 手柄出现在**手指底下**(浮动摇杆):手机上的落点由拇指决定,
-       固定角落会逼玩家先去找手柄。 */
+    /* 手柄出现在**手指底下**(浮动摇杆),固定角落会逼玩家先去找手柄 */
     stickUI.show(ev.clientX, ev.clientY);
-    /* 触屏的 `pointerdown` 之后浏览器还会补发一次**兼容的** `mousedown`,
-       而 `attackNearest` 挂在 `mousedown` 上 ⇒ 表现是「想走路,结果挥了一刀」。
-       挡掉它:这一下是移动输入,不是攻击输入(鼠标在上面的 `return` 里已经走了)。
-       ⚠️ 不挡 `pointermove`/`pointerup`,画布的拖动与 UI 命中都还在指针事件上。 */
+    /* 挡掉浏览器补发的**兼容的** `mousedown` ⇒「想走路,结果挥了一刀」。
+       ⚠️ 修前攻击**只**挂 `mousedown`,这一挡顺手把触屏攻击也挡死了(真机实测:
+       手机上永远打不出攻击)。现在攻击改挂**指针事件**(鼠标左键即刻 + 触屏轻点
+       + 屏幕「攻」按钮)⇒ 挡掉兼容 `mousedown` 是安全的,而且仍然必要。 */
     ev.preventDefault();
   };
   const onStickMove = (ev: PointerEvent): void => {
@@ -523,9 +737,22 @@ function main(): void {
        (帽停在最后那一点),而逻辑早已归零 —— 玩家会以为还在走。 */
   const onStickEnd = (ev: PointerEvent): void => {
     if (stickPointerId !== ev.pointerId) return;
+    const tap = stickTap;
     stickPointerId = null;
+    stickTap = null;
     stick.end();
     stickUI.hide();
+    /* ★ WS-FND-166:抬手判「轻点 = 攻击」(判定在 `net/touch_intent.ts`,纯、可单测)。
+       ⚠️ 只有 `pointerup` 参与:`pointercancel` 是系统打断(来电 / 系统手势),
+         那一刻挥刀不是玩家的意思 —— 判定里那条"非法读数不攻击"是同一纪律。 */
+    if (tap !== null && ev.type === 'pointerup') {
+      const verdict = tapAttackVerdict({
+        durationMs: nowMs() - tap.at,
+        travelPx: Math.hypot(ev.clientX - tap.x, ev.clientY - tap.y),
+      });
+      lastTouchIntent = verdict.reason;
+      if (verdict.attack) { tapAttacks += 1; attackNearest('tap'); }
+    }
   };
   window.addEventListener('pointerdown', onStickDown);
   window.addEventListener('pointermove', onStickMove);
@@ -554,8 +781,11 @@ function main(): void {
     seeded = false;
     /* 2 输入序号:回零 —— 它就是"这条连接上的第几条命令"(服务端按连接记账)。 */
     input.reset();
-    /* 3 摇杆:逻辑与视觉一起归零,指针也不再认作"第一根手指"(否则第二根手指点不动)。 */
+    /* 3 摇杆:逻辑与视觉一起归零,指针也不再认作"第一根手指"(否则第二根手指点不动)。
+       ★ WS-FND-166:落指读数(`stickTap`)也必须清 —— 否则重连后抬手会把上一轮的
+       落指当成"轻点"而白挥一刀。 */
     stickPointerId = null;
+    stickTap = null;
     stick.end();
     stickUI.hide();
   };
@@ -632,6 +862,46 @@ function main(): void {
       }
       lastHp.set(near.mobId, near.hp);
     }
+    /* ── ★ WS-FND-167 缺口 5:加载指示 + 慢档读数 ──
+       1 **加载指示**:修前"有没有在加载"完全不可见 —— 只等 HUD 出数,而一旦连不上
+         就永远没有数(HUD 的坐标是预测器的本地值,所以"看起来在动"其实说明不了任何事)。
+         判据只有一条:第一份**权威**数据到了(联机时 = 握手给了自己的 id)或本来就没会话
+         (`?server=off`)。判死(failed/closed)时也撤掉 —— 那时该看的是超时/拒因那几行。
+       2 **慢档 500ms**:`summary()` 会投影所有立牌,按帧拉太贵 ⇒ 每 500ms 一次,
+         把 `atlasOk` / `atlasErr` / 当前面板变成屏幕上读得到的字。 */
+    if (!readySeen) {
+      const dead = session !== null && (session.state === 'failed' || session.state === 'closed');
+      if (session === null || handle.store.localPlayerId !== '' || dead) {
+        readySeen = true;
+        if (bootStatusEl !== null) bootStatusEl.style.display = 'none';
+      }
+    }
+    const nowMs = Date.now();
+    if (nowMs - lastPollMs >= 500) {
+      lastPollMs = nowMs;
+      try {
+        const s = handle.summary() as {
+          atlasOk?: unknown;
+          atlasErr?: unknown;
+          wiring?: { stateMachine?: { panel?: unknown } };
+        };
+        if (s.atlasOk === true) {
+          atlasNote = '图集 已就绪';
+        } else if (typeof s.atlasErr === 'string' && s.atlasErr !== '') {
+          atlasNote = `图集 ✗ ${s.atlasErr}(格子是色块占位;资源名 atlas_sprites.png)`;
+        } else {
+          atlasNote = '图集 加载中…(格子暂为色块占位)';
+        }
+        const panel = s.wiring?.stateMachine?.panel;
+        panelNote = `面板 ${typeof panel === 'string' && panel !== '' ? panel : '无'}`;
+        /* ★ WS-FND-166:触摸条**高亮当前面板**(玩家一眼看出按哪个会关掉)。
+           值就是 `UiPanel` 的字符串词表 —— 这里不另做映射,避免第二份对照表。 */
+        touchBar.setActivePanel(typeof panel === 'string' ? (panel as UiPanel) : UiPanel.NONE);
+      } catch (e) {
+        /* ⚠️ 读数失败**不许**把 HUD 打崩:如实写一句并留着上一帧的值。 */
+        atlasNote = `图集 状态读不到(handle.summary 抛错:${(e as Error).message})`;
+      }
+    }
     paintStatus(p, near);
   }, DT * 1000);
 
@@ -643,6 +913,33 @@ function main(): void {
        否则只能靠看控制台,而那正是它静默一整轮的原因。 */
     lastReject,
     serverContentClaim: session?.serverContentClaim ?? null,
+    /* ── ★ WS-FND-167:连接超时 / 退避 / 诊断计数都进**机读口径** ──
+       修前这几件事只有 `session` 的内部字段(JS 里读不到)与 `atlasErr`(只在 summary 里)
+       ⇒ "到底卡在哪一步、下次什么时候重拨、丢了多少帧"在自检脚本里读不出来。 */
+    lastStateDetail,
+    connectTimeoutMs: CONNECT_TIMEOUT_MS,
+    handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+    reconnectMaxMs: RECONNECT_MAX_MS,
+    reconnectFactor: RECONNECT_FACTOR,
+    lastTimeout: session?.lastTimeout ?? null,
+    retryCount: session?.retryCount ?? 0,
+    retryDelayMs: session?.retryDelayMs ?? null,
+    nextRetryAtMs: session?.nextRetryAtMs ?? null,
+    droppedFrames: session?.droppedFrames ?? 0,
+    lastDropReason: session?.lastDropReason ?? null,
+    rejectedFrames: session?.rejectedFrames ?? 0,
+    decodeErrors: handle.store.decodeErrors,
+    emptyFrames: handle.store.emptyFrames,
+    bootReady: readySeen,
+    bootStatusVisible: bootStatusEl === null ? null : bootStatusEl.style.display !== 'none',
+    atlasNote,
+    panelNote,
+    /* ── ★ WS-FND-167:a11y 口径 —— 字号/对比度是否达标、镜像面板里到底写了什么 ──
+       这两项一起读才分得清"常量达标但没接上"与"接上了但写的是空串"。 */
+    a11yTextPx: MIN_TEXT_PX,
+    a11yProblems: a11yStyleProblems(),
+    a11yMounted: a11y.mounted,
+    a11yPanels: a11y.textOf(),
     /* ★ 2026-11-14(task-83 选乙):预测链路也进自检口径 —— */
     /* 否则「输入有没有真的产生命令」只能靠看控制台,而那正是它静默一整轮的原因。 */
     inputKeys: input.pressedCount,
@@ -669,6 +966,25 @@ function main(): void {
        否则「摇杆视觉到底弹没弹」只能靠肉眼看截图 —— 而那正是它静默一整轮的原因。 */
     joystickVisible: stickUI.visible,
     joystickMounted: stickUI.mounted,
+    /* ═══ ★ WS-FND-166:触屏入口的**读数**(手机上的"打不出攻击 / 面板打不开"必须可读)═══
+       四个字段各有分工,少一个就分不清是哪一半坏了:
+       ```
+       touchBarMounted   触摸条挂上了吗(没挂 ⇒ 面板**一个都打不开**)
+       touchButtons      画出几个按钮(0 = 手机上没有任何面板入口)
+       lastTouchButton   最后按了哪个按钮(空 ⇒ 屏幕按钮这条路从没跑过)
+       tapAttacks        轻点被判成攻击的次数(0 且一直 0 ⇒ 触屏攻击那条出口没通)
+       uiPointerSuppressions  被 UI 吃掉、因而**没开摇杆**的指针数(>0 ⇒ 互斥真生效过)
+       gestureSuppressed 抑制了哪几个原生手势(空 ⇒ 长按会弹菜单/选文本)
+       ```
+       ⚠️ 这些都取**生产变量**,不是脚本自己推断的(`lastTouchIntent` 是判定给的那句话)。 */
+    touchBarMounted: touchBar.mounted,
+    touchButtons: touchBar.buttonCount,
+    touchButtonLabels: touchButtons().map((b) => b.label).join(''),
+    lastTouchButton,
+    lastTouchIntent,
+    tapAttacks,
+    uiPointerSuppressions,
+    gestureSuppressed: [...SUPPRESSED_GESTURES],
     ackedSeq: predictor.lastAckedSeq,
     prunedCmds: predictor.prunedTotal,
     /* ★ 2026-11-15:动作入口也进自检口径。否则「按 N 到底发没发」只能靠肉眼看画面 ——
@@ -701,10 +1017,22 @@ function main(): void {
     /* 搜索框里打字时动作键是否被挡掉(拉 `boot` 的 searchMode) */
     textInputActive: handle.textInputActive(),
   });
+  /* ★ WS-FND-167:`main()` 跑到这里说明模块**真的**跑起来了 ⇒ 撤掉启动看门狗。
+     不撤的话:8s 后它会因为"没见到 `__stageReady`"再显示一次致命错误(误报白屏)。
+     ⚠️ `__stageReady` 已经赋值 ⇒ 就算漏撤,看门狗自己也会先 `return`(双保险)。 */
+  if (window.__bootWatchdog !== undefined) {
+    clearTimeout(window.__bootWatchdog);
+    window.__bootWatchdog = undefined;
+  }
   window.addEventListener('beforeunload', () => {
     detachInput();
     detachStick();
     stickUI.dispose();
+    /* ★ WS-FND-166:触屏按钮条与手势抑制器也必须卸干净(否则第二次 `main()` 会叠加) */
+    touchBar.dispose();
+    detachGestures();
+    /* ★ WS-FND-167:镜像面板的 DOM 也归零(节点与引用都不留)。 */
+    a11y.dispose();
     clearInterval(inputLoop);
     session?.close();
     detachActionKeys();

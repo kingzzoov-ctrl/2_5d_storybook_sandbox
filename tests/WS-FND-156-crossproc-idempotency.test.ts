@@ -371,7 +371,13 @@ test('FND156-8 ★★ `RESET_WORLD` 不清台账:重置后换实例重进仍 SKI
   const g = makeRoom({ db, roomId });
   g.rt.join({ userId: OWNER });
   eq(lastReport(g.rt).verdict, 'SKIPPED', '★★ 重置后换实例重进仍不发(7 件变 14 会红)');
-  eq(g.rt.authoritativeItemTotal(OWNER), 0, '★ 一件都没多发');
+  /* ★ WS-FND-163(A4)之后「一件都没多发」换了读数:新实例会把**他自己的**背包账
+     从 `users.inventory_json` 读回来(那是他本来就有的东西,不是新发的)。
+     ⇒ 判据取**本次发放的件数**(真重发会是 7 ⇒ 红);总量则应当等于第一间房
+     发出去的那一份(即「读回来的正是他自己的」)。 */
+  eq(lastReport(g.rt).granted.length, 0, '★ 一件都没多发(本次发放 0 件)');
+  eq(g.rt.authoritativeItemTotal(OWNER), lastReport(f.rt).total,
+    '★ 而总量 = **读回来的他自己的**那份(与第一间房发出去的一致),不是新发的');
 });
 
 /* ═════════════════ 9. 无库模式(--memory)的语义 ═════════════════ */

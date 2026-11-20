@@ -38,7 +38,10 @@
 import { SLOW_TICK_HZ, TICK_HZ, DT, BASE_MOVE_SPEED } from '../../../shared/types/physics.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
-import { Chunk, chunkKey, type TileFields } from '../world/chunk.ts';
+/* ★ WS-FND-164:`encodeRoofRle` / `decodeRoofRle` 是屋顶旁路层的**唯一**编解码器
+   (屋顶不在 32 位单元里 ⇒ 它必须与地形分开存,见 `db/schema_world_persistence.sql`)。
+   存档写一侧用它编码、读档一侧用它解码,不在本文件另写一份 RLE。 */
+import { Chunk, CHUNK_W, chunkKey, encodeRoofRle, decodeRoofRle, type TileFields } from '../world/chunk.ts';
 /* ★ WS-FND-77 / D-19:四个房间系统 + 料理 3 字段的**世界侧单一装配点**。
    `systems/**` 里那四个模块在此之前**零生产调用点**(只有 tests/WS-FND-75 在用),
    于是「牧场日结 / 温室生长 / 炼金首创陈列 / 百货购买」在运行期一件都不发生。
@@ -62,16 +65,22 @@ import {
 import { sprinklerCells, type Weather } from '../systems/greenhouse.ts';
 import { feedItemOf, type RanchAnimal, type RanchDayResult } from '../systems/ranch.ts';
 import { buy, buyOnce, CONTENT_PRICE_TABLE, type BuyResult, type PriceTable } from '../systems/depot.ts';
+/* ★ WS-FND-165(B1):结算台账的**跨进程**那一半 —— 导出/合并走
+   `systems/idempotency.ts` 的既有纯函数(唯一写 `claims` 的入口),本文件只搬运。 */
+import { mergeSettlementLedger, settlementEntries } from '../systems/idempotency.ts';
 /* ★ A-3:炼金的**中性初判**不在这里发明 —— 复用 `alchemy/**` 既有的口径:
    `NEUTRAL_AFFINITY`(0.7 = 不倾斜)与 `S_LOGIC_BASE + SPAN × affinity`
    (`gate.ts:204` 的公式,本文件只照它算默认值,允许调用方显式覆盖)。 */
 import { S_LOGIC_BASE, S_LOGIC_SPAN, S_LOGIC_FLOOR, S_LOGIC_CEIL } from '../alchemy/gate.ts';
 import { NEUTRAL_AFFINITY } from '../alchemy/degrade.ts';
 /* ★ B:把归档回滚计划**真的应用**到世界上(此前计划层是纯数据,没人接)。
-   只 import **类型** —— 运行期不依赖 `world/archive.ts`(它反过来认识
-   `Chunk`,不依赖 sim)。 */
-import type { RestorePlan } from '../world/archive.ts';
-import { FluidField, FLUID_CELL_BUDGET } from '../world/fluid.ts';
+   ★ WS-FND-164:除了类型,本段还要**取料口**的两个纯函数 ——
+   `decodeWorldArchive`(字节 → 结构化对象)与 `planRestore`(对象 → 操作清单)。
+   理由:归档行此前「只写不读」,`restoreWorldFromArchive` 是第一个读它的生产路径;
+   而解码/计划**只能有一份实现**(在 `world/archive.ts`),本文件不重写任何一条
+   解码规则。方向仍是单向:`world/archive.ts` 只认识 `Chunk`,不认识 sim。 */
+import { decodeWorldArchive, planRestore, type RestorePlan } from '../world/archive.ts';
+import { FluidField, FLUID_CELL_BUDGET, packFluidAmounts, readFluidAmounts, applyFluidAmounts } from '../world/fluid.ts';
 /* ★ WS-FND-98:`safeMass` 是「质量归一 / 非法质量拒绝」的**唯一入口**(见 `physics/world.ts` §0)。 */
 import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, JUMP_VZ, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
@@ -421,6 +430,34 @@ import {
   loadVitalsFromUsers,
   saveRoomMobMem,
   loadRoomMobMem,
+  /* ★ WS-FND-163(A4):玩家背包账的**落库口**(repo §15)。落点与账格式
+     在那一段的段头写着 —— 这里只搬函数与类型,不重新实现序列化。 */
+  savePlayerLedgers,
+  type PlayerLedgerSnapshot,
+  /* ★ WS-FND-165(B1):两段落库口 ——
+     1 `save/loadRoomSystemsState`(repo §17):结算幂等键集 + 房内第几天;
+     2 `save/loadPlayerSnapshots`(repo §18):等级 / 经验 / 天赋 / 位置 / 血量。 */
+  saveRoomSystemsState,
+  loadRoomSystemsState,
+  savePlayerSnapshots,
+  loadPlayerSnapshots,
+  /* ★ WS-FND-164(B1):世界存档的四段落库口 / 读口(repo §19)—— 地形脏页、
+     屋顶旁路层、世界状态(水位 + 身份)、以及**归档回滚**的取料口。
+     为什么由世界侧持有:存档的**内容**是世界的世代(地形 / 水位 / 帧号),
+     库层只认识行与字节(见 repo §19 段头)。 */
+  saveChunkBatch,
+  loadChunkCells,
+  loadChunkRoofs,
+  migrateWorldPersistence,
+  worldPersistenceInstalled,
+  saveWorldState,
+  loadWorldState,
+  listRoomChunkCoords,
+  forgetRoomWorldSave,
+  loadWorldArchive,
+  type RoomSystemsRead,
+  type RoomSystemsSnapshot,
+  type PlayerSnapshotRow,
   type DbLike,
 } from '../db/repo.ts';
 /*
@@ -481,6 +518,16 @@ export const SIM_FAST_DT = DT;
 
 /** 一帧慢帧的现实时长(秒)。 */
 export const SIM_SLOW_DT = 1 / SLOW_TICK_HZ;
+/**
+ * ★ WS-FND-164:水位表字节的**本仓上限**(= `repo.BLOB_MAX_BYTES` 的同一个 1 MiB)。
+ *
+ * 为什么在这里再写一个数而不是 import:`world_sim` 的库层依赖是一条**注入的参数**
+ * (`db`),它只 import 库层的**函数与类型**;再牵一个「存储上限」的常量过来会让
+ * 「模拟层知道库的列宽」这件事变成常规。这里要的是**同一个口径**而不是同一个符号:
+ * `12 + 4·w·h ≤ 1048576` ⇒ 512×512 世界(1048588 字节)刚好超限 ⇒
+ * `saveDirtyChunksToDb` 如实跳过水位并报 `fluidSkipped: 1`(不截断)。
+ */
+export const WORLD_SAVE_FLUID_MAX_BYTES = 1048576;
 /**
  * 玩家语义的**物质层**契约(放置 / 破坏 / 地面物品)。
  *
@@ -5995,10 +6042,98 @@ export class WorldSim {
     db: DbLike,
     roomId: string,
     nowMs: number,
-  ): { hpSaved: number; hpSkipped: number; memRow: number } {
+    /*
+     * ★ WS-FND-163(A4):玩家背包账(**按件账 + 总量账**)。
+     *
+     * ## 为什么走**参数**而不是 WorldSim 的字段
+     * 背包账的持有者是**房间**(`room.ts` 的 `itemCounts` / `inventoryTotals`),
+     * 不是模拟层 —— 见 `inventoryDetailOf` 的注释:模拟层**没有**背包明细,
+     * 让它编一份出来就是第二份事实源。⇒ 由调用方(房间)导出后传进来。
+     *
+     * ## 省略 / 传空 Map 的语义
+     * 省略(老调用方,3 参)⇒ 本段**不写背包**、返回 `ledgerSaved: 0`,
+     * `users.inventory_json` 一个字节都不动 —— 与接线前逐字兼容,
+     * 且「没写」这件事**在返回值里看得见**(不静默)。
+     */
+    playerLedgers?: ReadonlyMap<string, PlayerLedgerSnapshot>,
+  ): {
+    hpSaved: number;
+    hpSkipped: number;
+    memRow: number;
+    /** 真正写进 `users.inventory_json` 的玩家数(背包账那一段)。 */
+    ledgerSaved: number;
+    /** 库里有账但 `users` 行不存在 / 键非法的人数(正常情形:未建号的访客)。 */
+    ledgerSkipped: number;
+    /** 被跳过的坏条目总数(非整数 id / 非正件数 / 超条目上限)。 */
+    ledgerDropped: number;
+    /**
+     * ★ WS-FND-165(B1):房间系统台账那一行的写入结果(1 = 落地)。
+     *
+     * `row` 为 0 **不该发生**(写入侧是「没有行就 INSERT」);把它返回出来是为了
+     * 让「这一次到底写没写进去」可断言,而不是靠读的人相信它写了。
+     */
+    systemsRow: number;
+    /** 真正落库的结算键数(超上限时小于内存台账 —— 「丢了几个」在 systemsDropped)。 */
+    systemsKeys: number;
+    /** 输入侧被丢掉的台账条目数(空键 / 重复键 / 超上限)。 */
+    systemsDropped: number;
+    /**
+     * ★ WS-FND-164:地形脏页那一段的读数(见 `saveDirtyChunksToDb`)。
+     *
+     * 全部**每字段必现**(不用可选键):「这一轮一个字节都没写」与「这一轮写了 0 块」
+     * 必须能从回执上区分 —— 前者是空闲世界的**正确状态**(没有脏块 + 水位签名没变),
+     * 后者是缺陷(有脏块却写不进去)。
+     */
+    chunksSaved: number;
+    /** 本次真正落库的地形字节(1024 × chunksSaved)。 */
+    chunkBytes: number;
+    /** 本次落库的屋顶层字节(RLE;全空块 1 字节)。 */
+    roofsBytes: number;
+    /** 存档**前**的脏块数(= 本轮应当被写掉的数量)。 */
+    dirtyChunks: number;
+    /** 世界上现有地形块总数(全量存盘的成本口径;见 `CHUNK_FULL_SAVE_BYTES`)。 */
+    totalChunks: number;
+    /** 世界状态行是否写了(0/1)。`1` 时 `worldStateBytes` 才算数。 */
+    worldStateRow: number;
+    /** 世界状态那一行的字节数(身份字段 + 水位表;不下发,只进成本账)。 */
+    worldStateBytes: number;
+    /** 因**世代更换**(seed 变了)被清掉的旧行数(地形 + 屋顶 + 状态)。 */
+    generationWiped: number;
+  } {
+    /* 顺序固定(HP → mem → 背包账 → 房间系统台账 → **地形脏页**)⇒ 返回值可复现,
+       且各段一个事务。 */
     const v = saveVitalsToUsers(db, this.exportVitals(), nowMs);
-        const memRow = saveRoomMobMem(db, roomId, this.exportMobMem(), nowMs);
-    return { hpSaved: v.saved, hpSkipped: v.skipped, memRow };
+    const memRow = saveRoomMobMem(db, roomId, this.exportMobMem(), nowMs);
+    const led = playerLedgers
+      ? savePlayerLedgers(db, playerLedgers, nowMs)
+      : { saved: 0, skipped: 0, rows: 0, dropped: 0 };
+    /* ★ 房间系统台账(**幂等键集 + 房内第几天**)。它是**世界自己的**状态
+       (持有者不是房间、也不是玩家)⇒ 由本节自己导出,不走参数
+       —— 与背包账的取舍相反,理由在 §17 的段头:谁持有,谁导出。 */
+    const sys = saveRoomSystemsState(db, roomId, this.exportRoomSystemsSnapshot(), nowMs);
+    /* ★ WS-FND-164:地形脏页 + 屋顶旁路层 + 世界状态(水位 / 身份)。
+       只写**被改动过**的块(`Chunk.isSaveDirty`),不每 30 秒重写全图 ——
+       成本账见 `saveDirtyChunksToDb` 的 docblock。 */
+    const ck = this.saveDirtyChunksToDb(db, roomId, nowMs);
+    return {
+      hpSaved: v.saved,
+      hpSkipped: v.skipped,
+      memRow,
+      ledgerSaved: led.saved,
+      ledgerSkipped: led.skipped,
+      ledgerDropped: led.dropped,
+      systemsRow: sys.row,
+      systemsKeys: sys.keys,
+      systemsDropped: sys.dropped,
+      chunksSaved: ck.chunksSaved,
+      chunkBytes: ck.chunkBytes,
+      roofsBytes: ck.roofsBytes,
+      dirtyChunks: ck.dirtyChunks,
+      totalChunks: ck.totalChunks,
+      worldStateRow: ck.worldStateRow,
+      worldStateBytes: ck.worldStateBytes,
+      generationWiped: ck.generationWiped,
+    };
   }
 
   /**
@@ -6015,6 +6150,603 @@ export class WorldSim {
     const hpApplied = this.importVitals(loadVitalsFromUsers(db, this.vitals.ids()));
     const mem = this.importMobMem(loadRoomMobMem(db, roomId));
     return { hpApplied, memApplied: mem.applied, memSkipped: mem.skipped };
+  }
+
+  /* ═══════ ★ WS-FND-164:世界存档(chunk 脏页 + 屋顶旁路层 + 水位表)═══════
+   *
+   * ## 修前形态(B1 审计实测)
+   * ```text
+   * repo.saveChunk / saveChunkBatch / loadChunk  生产 **0 调用**
+   * ⇒ 进程一停,地形与玩家建造(E 拆 / Q 放 / 铺地砖 / 上屋顶)全丢,
+   *   世界按 seed 从**空场**重新开始,而库里那一行 users/rooms 还在,
+   *   「存档成功」这句话在**地形**这一维上是空的;
+   * reset_world 的归档行(room_world_archives)同样只写不读 ⇒ 那份
+   *   「可回滚快照」没有任何生产路径取得回来。
+   * ```
+   *
+   * ## 三段的分工
+   * ```text
+   * 写  saveDirtyChunksToDb()      只写**脏块**(判据 = Chunk.isSaveDirty)
+   * 读  restoreWorldFromDb()       库里有存档 ⇒ 逐块读回并重建;没有 ⇒ 按 seed 新建
+   * 回滚 restoreWorldFromArchive() 归档行 → decodeWorldArchive → planRestore → applyRestore
+   * ```
+   *
+   * ## 脏页判据为什么不需要「标脏」调用
+   * `Chunk.version` 只在**真实写入**时自增(`writeCell` / `setRoof` 值变了才动),
+   * 而玩家建造与自然演化(流体相变产物、生物 `placeObj`/`setFloor`、电路回写)
+   * **全部**经 `setCell` ⇒ 一条判定覆盖两条路径,没有「忘了标脏」这个洞。
+   *
+   * ## 成本(30 秒一次自动存档的老口径,`room.ts:AUTOSAVE_INTERVAL_MS`)
+   * ```text
+   * 全量:chunk_radius 4 ⇒ 9×9 = 81 块 × (1024 单元 + 屋顶 RLE 3..768B)
+   *        ⇒ 83 KB(无屋顶世界)~ 140 KB(满屋顶)/次
+   *        ⇒ ≈ 170~280 KB/分钟、≈ 10~17 MB/小时(空闲世界也一样)
+   * 脏页:空闲世界 **0 字节**(没有脏块 + 水位签名不变 ⇒ 一行都不写);
+   *       一次点击(E 拆 / Q 放)= 1 块 ≈ 1027 字节(1024 + 全空屋顶层 3B);
+   *       一片 3×3 的工地 ≈ 9 KB
+   * 水位:`12 + 4·w·h`(64×64 ⇒ 16.4 KB)只在水真的动过之后写一次
+   * ```
+   * ⇒ 稳态成本从「与世界规模成正比」变成「与**改动量**成正比」。
+   */
+
+  /**
+   * 上一次落盘时的水位签名(`FluidField.levelsSignature`)。
+   * `-1` = 还没存过 ⇒ 第一次一定会写(否则「读档后水位没被动过也不该重写」这条
+   * 会把**首次**存档也一起跳掉,库里永远没有水位表)。
+   */
+  private fluidSavedSignature = -1;
+
+  /** 世界上现在有几块**自上次落盘以来被改动过**的地形(0 = 空闲世界,存档零字节)。 */
+  dirtyChunkCount(): number {
+    let n = 0;
+    for (const c of this.grid.chunks.values()) if (c.isSaveDirty()) n += 1;
+    return n;
+  }
+
+  /**
+   * 把**脏块**、它们的屋顶层、以及世界状态(身份 + 水位)写进库。
+   *
+   * 返回值是**成本账**(判据与「每 30 秒写多少字节」的估算都读它):
+   * `chunksSaved × 1024` = 地形字节,`roofsBytes` = 屋顶 RLE 字节,
+   * `worldStateBytes` = 世界状态那一行(含水位表)。**空闲世界全为 0**。
+   *
+   * ## 世代更换(seed 变了)⇒ 先清后写
+   * `reset_world` 换了种子之后,库里上一代的 chunk 行必须作废 —— 否则下一次启动
+   * 会把**重置前**的世界读回来(而那是一条没人下过的指令)。判据是
+   * `room_world_state.seed ≠ this.worldSeed`,清理走 `forgetRoomWorldSave`
+   * (两张表 + 状态行),清完这一轮按**全量**写(`forceAll`):新世代里
+   * 「谁的 `version` 是 0」与「谁没被改过」不再是同一件事。
+   *
+   * ## 漂移 ⇒ 拒写(fail-closed)
+   * `migrateWorldPersistence` 报 checksum 漂移 ⇒ 抛。写进去的脏页属于哪一版
+   * 结构说不清,而它正是**读档原料**(与归档写入同一条纪律)。抛出去让自动存档
+   * 走它自己的退避(`room.ts` 的 `autosaveBackoffFrames`),不静默降级。
+   */
+  saveDirtyChunksToDb(
+    db: DbLike,
+    roomId: string,
+    nowMs: number,
+    forceAll = false,
+  ): {
+    chunksSaved: number;
+    chunkBytes: number;
+    roofsBytes: number;
+    dirtyChunks: number;
+    totalChunks: number;
+    worldStateRow: number;
+    worldStateBytes: number;
+    fluidBytes: number;
+    /** `1` = 水位表超 1 MiB 而**没有**写(如实报,不截断)。 */
+    fluidSkipped: number;
+    generationWiped: number;
+  } {
+    const totalChunks = this.grid.chunks.size;
+    const empty = {
+      chunksSaved: 0, chunkBytes: 0, roofsBytes: 0, dirtyChunks: 0, totalChunks,
+      worldStateRow: 0, worldStateBytes: 0, fluidBytes: 0, fluidSkipped: 0, generationWiped: 0,
+    };
+    /* 没有房间号 ⇒ 这不是"房间世界"(纯对象用法,17 个套件都是这样)=>{
+       一个字节都不写,也不建表。 */
+    if (typeof roomId !== 'string' || roomId.length === 0) return empty;
+
+    const mig = migrateWorldPersistence(db, nowMs);
+    if (mig.drift) {
+      throw new Error(
+        `世界存档迁移 checksum 漂移(schema_migrations.version=${'5'} 的登记与 `
+        + 'schema_world_persistence.sql 对不上)⇒ 拒绝写入(不静默降级):'
+        + '存档是读档原料,结构没判清就写进去,重启后读回来的是"哪个版本"都说不清的东西',
+      );
+    }
+
+    /* 世代判据:库里那一代的 seed 与本世界不同 ⇒ 整代作废。 */
+    const prev = loadWorldState(db, roomId);
+    let generationWiped = 0;
+    let writeAll = forceAll;
+    if (prev !== undefined && prev.seed !== this.worldSeed) {
+      const wiped = forgetRoomWorldSave(db, roomId);
+      generationWiped = wiped.chunks + wiped.roofs + wiped.state;
+      writeAll = true;
+    }
+
+    /* 脏页筛选(顺序确定:按 (cy, cx) ⇒ 同一份世界两次存档的字节序列可复现)。 */
+    const items: { cx: number; cy: number; blob: Uint8Array; roofs: Uint8Array; version: number }[] = [];
+    for (const c of [...this.grid.chunks.values()].sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx))) {
+      if (!writeAll && !c.isSaveDirty()) continue;
+      items.push({
+        cx: c.cx, cy: c.cy,
+        blob: c.serialize(),
+        /* 屋顶层恒写:一块地形要么整行新、要么整行旧(见 `saveChunkBatch`)。 */
+        roofs: encodeRoofRle(c.roofs),
+        /* 抓**写的时候**的版本:落盘的是这一版字节,水位就推到这一版。 */
+        version: c.version,
+      });
+    }
+    let chunkBytes = 0;
+    let roofsBytes = 0;
+    for (const it of items) {
+      chunkBytes += it.blob.byteLength;
+      roofsBytes += it.roofs.byteLength;
+    }
+    if (items.length > 0) {
+      saveChunkBatch(db, roomId, items, nowMs);
+      /* ★ 只在**写库成功之后**推水位 —— 抛错那一轮不算存过(下一轮还要写)。 */
+      for (const it of items) {
+        const c = this.grid.getChunk(it.cx, it.cy);
+        if (c !== undefined) c.markSaved(it.version);
+      }
+    }
+
+    /* 世界状态:身份 + 水位。没有脏块、水位也没动、且库里已经有行 ⇒ 一行都不写。 */
+    const sig = this.fluid.levelsSignature();
+    const fluidChanged = sig !== this.fluidSavedSignature;
+    let worldStateRow = 0;
+    let worldStateBytes = 0;
+    let fluidBytes = 0;
+    let fluidSkipped = 0;
+    if (prev === undefined || items.length > 0 || fluidChanged || generationWiped > 0) {
+      let fluid: Uint8Array | undefined;
+      if (fluidChanged) {
+        const packed = packFluidAmounts(this.fluid);
+        if (packed.byteLength <= WORLD_SAVE_FLUID_MAX_BYTES) {
+          fluid = packed;
+          fluidBytes = packed.byteLength;
+        } else {
+          /* 超 1 MiB(≈ 512×512 世界)==> 如实跳过并报数,**不截断**:
+             半个水位场读回来分不清「这里本来没水」与「这里的字节丢了」。 */
+          fluidSkipped = 1;
+        }
+      }
+      saveWorldState(db, {
+        roomId,
+        seed: this.worldSeed,
+        sizeCells: this.sizeCells,
+        biome: this.biomeName,
+        frame: this.frameCount,
+        fluid: fluid ?? null,
+        nowMs,
+      });
+      worldStateRow = 1;
+      worldStateBytes = 12 + 4 * this.fluid.width * this.fluid.height;
+    }
+    if (fluidChanged && fluidSkipped === 0) this.fluidSavedSignature = sig;
+
+    return {
+      chunksSaved: items.length,
+      chunkBytes,
+      roofsBytes,
+      dirtyChunks: items.length,
+      totalChunks,
+      worldStateRow,
+      worldStateBytes: worldStateRow === 1 ? (fluidBytes + 64) : 0,
+      fluidBytes,
+      fluidSkipped,
+      generationWiped,
+    };
+  }
+
+  /**
+   * 从库里**读回本房间的世界**(与 `saveDirtyChunksToDb` 对偶)。
+   *
+   * ## 判序
+   * ```text
+   * 1 没有库 / 库里没有本房间的存档        ⇒ applied:false(按 seed 新建,**不是故障**)
+   * 2 边长不符(size_cells ≠ 本世界)      ⇒ applied:false + size-mismatch(边界都按它构造)
+   * 3 rebuildWorld(存档的 seed)           ⇒ 世界世代换成**库里那一代**
+   * 4 逐块读回(cells + 屋顶 RLE)         ⇒ 缺哪一块就**跳过**(回退:该块按新世界默认格)
+   * 5 地形 → 流体场的投影                  ⇒ 走 `this.setCell`(唯一入口,不重写 elev/solid 规则)
+   * 6 水位表                                ⇒ 逐格 `setCell({amount})`(不直写 amount[])
+   * 7 帧号 / 生物 / 掉落                    ⇒ 只还原帧号(生物与掉落不在本存档的范围内,
+   *                                            它们的落点是归档快照与 `saveRoomMobMem`)
+   * ```
+   *
+   * ## 为什么 seed **以库为准**(`seedAdopted`)
+   * `reset_world` 刻意**不改房间的 `worldSeed`**(见 `net/actions/reset_world.ts` 的
+   * 「不改房间的 worldSeed」),而世界内部的种子确实换了 ⇒ 重启时
+   * 「房间配置里的 seed」与「库里那一代世界的 seed」本来就会不一致。
+   * 这时按**库**的 seed 恢复才是「世界继续活下去」;按配置的 seed 重建等于
+   * 把上一次重置**回退掉**。两者都如实报(`seedAdopted` + 两个种子),不由读的人猜。
+   *
+   * ## 逐格一致的判据
+   * 「关掉 host → 新 host 读回 → 逐格一致」比的是 `grid` 的 packed 单元、`roofs`、
+   * `fluid.amount` 三张表的**每一位**(见 `tests/WS-FND-164` 的 1~4 条)。
+   */
+  restoreWorldFromDb(db: DbLike | null, roomId: string): {
+    applied: boolean;
+    reason: string;
+    seed: number;
+    storedSeed: number;
+    seedAdopted: boolean;
+    frame: number;
+    chunksLoaded: number;
+    /** 库里有行但地形字节解不开的块数(只有这种块才**回退**成默认格)。 */
+    chunksMissing: number;
+    roofsLoaded: number;
+    roofsMissing: number;
+    fluidCells: number;
+    fluidSkippedSolid: number;
+    fluidUnreadable: number;
+  } {
+    const base = {
+      applied: false, reason: '', seed: this.worldSeed, storedSeed: this.worldSeed,
+      seedAdopted: false, frame: this.frameCount, chunksLoaded: 0, chunksMissing: 0,
+      roofsLoaded: 0, roofsMissing: 0, fluidCells: 0, fluidSkippedSolid: 0, fluidUnreadable: 0,
+    };
+    if (db === null) return { ...base, reason: 'no-db' };
+    if (typeof roomId !== 'string' || roomId.length === 0) return { ...base, reason: 'no-room' };
+    /* ★ 「装过世界存档迁移吗」必须先判,再碰那两张表。
+     *
+     * 两个理由:
+     * 1 语义:没有登记行 ⇒ 本库**从来没存过**世界(这一段是「第一次存档时才建表」);
+     * 2 实测的坑:`MemoryDb.get/select` 对**未建的表**是**自动建一张空表**再返回
+     *   (不是抛 `no such table`)⇒ 无条件先读一次会让「只跑过基线迁移的旧库」
+     *   凭空多出一张 `room_world_state`,把既有的「旧库迁移后表数」判据打红
+     *   (`tests/WS-FND-156` 的 FND156-7 实测红过一次)。真 SQLite 不会建表,但
+     *   **两种后端的行为必须一致**才对得起那条判据。 */
+    if (!worldPersistenceInstalled(db)) return { ...base, reason: 'no-save' };
+
+    const state = loadWorldState(db, roomId);
+    const coords = listRoomChunkCoords(db, roomId);
+    if (state === undefined && coords.length === 0) {
+      /* 库里没有本房间的世界 ⇒ 保持「按 seed 新建」的空场(这才是「缺块回退生成」的全集形态:
+         本仓**没有** seed 驱动的固定地形生成器,「按 seed 生成」== 默认格,故回退 = 不铺)。 */
+      return { ...base, reason: 'no-save' };
+    }
+    if (state !== undefined && state.size_cells !== 0 && state.size_cells !== this.sizeCells) {
+      return {
+        ...base,
+        reason: `size-mismatch(存档 ${state.size_cells} 格 vs 世界 ${this.sizeCells} 格)`,
+        storedSeed: state.seed,
+      };
+    }
+
+    const seed = state !== undefined ? state.seed : this.worldSeed;
+    const seedAdopted = seed !== this.worldSeed;
+    this.rebuildWorld(seed);
+    if (state !== undefined && state.biome !== '') this.biomeName = state.biome;
+
+    let chunksLoaded = 0;
+    let chunksMissing = 0;
+    let roofsLoaded = 0;
+    let roofsMissing = 0;
+    for (const { cx, cy } of coords) {
+      let cells: Uint32Array | undefined;
+      try {
+        cells = loadChunkCells(db, roomId, cx, cy);
+      } catch {
+        /* `loadChunkCells` 对「长度不是 1024 的 blob」是**抛**(`assertChunkBlob`),
+           而库里的一行坏字节**不该**把整个 host 的启动打掉 —— 那一块按缺块处理,
+           并计入 `chunksMissing`(可观测),不静默当成「那里本来什么都没有」。 */
+        cells = undefined;
+      }
+      if (cells === undefined) {
+        /* 行在、字节不合法(长度不是 1024 / 不是 BLOB)==> 这一块**回退**成默认格,
+           并如实计数:静默跳过会让「玩家建造丢了」看起来像「那里本来什么都没有」。 */
+        chunksMissing += 1;
+        continue;
+      }
+      const chunk = new Chunk(cx, cy);
+      chunk.cells.set(cells);
+      const roofsBlob = loadChunkRoofs(db, roomId, cx, cy);
+      if (roofsBlob !== undefined) {
+        try {
+          decodeRoofRle(roofsBlob, chunk.roofs);
+          roofsLoaded += 1;
+        } catch {
+          /* 屋顶 RLE 截断/越界 ⇒ `decodeRoofRle` 抛(它拒绝静默写 0)⇒ 这一块按「无屋顶」算,
+             并计数。地形仍然是读回来的那一份(不因屋顶坏了把整块丢掉)。 */
+          roofsMissing += 1;
+        }
+      } else {
+        roofsMissing += 1;
+      }
+      this.grid.chunks.set(chunkKey(cx, cy), chunk);
+      chunksLoaded += 1;
+    }
+
+    /* 地形 → 流体场:elev 决定水往哪走、obj(351~371)挡住水。**只经 `this.setCell`**,
+       不在这里重写一份投影规则(两份必然漂移 —— 那正是 US5「水穿墙」的成因)。 */
+    for (const c of this.grid.chunks.values()) {
+      for (let i = 0; i < c.cells.length; i += 1) {
+        const f = unpackTile(c.cells[i]);
+        this.setCell(c.cx * CHUNK_W + (i & (CHUNK_W - 1)), c.cy * CHUNK_W + (i >> 4), { elev: f.elev, obj: f.obj });
+      }
+    }
+
+    let fluidCells = 0;
+    let fluidSkippedSolid = 0;
+    let fluidUnreadable = 0;
+    if (state !== undefined && state.fluid_blob !== null) {
+      const amounts = readFluidAmounts(state.fluid_blob);
+      if (amounts === null || amounts.width !== this.fluid.width || amounts.height !== this.fluid.height) {
+        /* 尺寸不符 / magic 不对 ⇒ **整份**水位不可用(半份水位场更坏)。
+           注意 `rebuildWorld` 已把流体场换成空场 ⇒ 这里**不留下半场水**。 */
+        fluidUnreadable = 1;
+      } else {
+        const r = applyFluidAmounts(this.fluid, amounts);
+        fluidCells = r.applied;
+        fluidSkippedSolid = r.skippedSolid;
+      }
+    }
+    this.fluidSavedSignature = this.fluid.levelsSignature();
+    if (state !== undefined) this.frameCount = Math.max(0, Math.trunc(state.frame));
+
+    /* 读回来的块是**干净的**:刚写的库不该被当成脏页再写一遍。
+       (`setCell` 的投影会顺带把每块都标脏 —— 这里把位图与水位一起归零。) */
+    for (const c of this.grid.chunks.values()) {
+      c.clearDirty();
+      c.markSaved();
+    }
+    this.syncPlayers();
+    this.roomsDirty = true;
+    return {
+      applied: true,
+      reason: 'ok',
+      seed: this.worldSeed,
+      storedSeed: state !== undefined ? state.seed : this.worldSeed,
+      seedAdopted,
+      frame: this.frameCount,
+      chunksLoaded,
+      chunksMissing,
+      roofsLoaded,
+      roofsMissing,
+      fluidCells,
+      fluidSkippedSolid,
+      fluidUnreadable,
+    };
+  }
+
+  /**
+   * **归档回滚**:按归档句柄把旧世界铺回来(★ D-06 的「可回滚快照」这一半)。
+   *
+   * ## 为什么需要它(修前:归档只写不读)
+   * `reset_world` 把旧世界写成一行 `room_world_archives` 之后,**没有任何生产路径**
+   * 读它 —— 于是「归档」在功能上等于一份取证材料,而回执里那句
+   * `effect.archive = 'ARCHIVED'` 会让客户端以为世界可以回来。
+   * 本方法把那条链补完:
+   * ```text
+   * loadWorldArchive(id)  →  decodeWorldArchive  →  planRestore  →  applyRestore
+   * ```
+   * 三段**都不在这里重写**(解码 / 计划 / 写入各自只有一个实现点),
+   * 本方法只负责「取料 → 串起来 → 如实转述回执」。
+   *
+   * ## 边界(谁来决定"能不能回滚")
+   * 这是**宿主能力**,不是策略:要不要给玩家开这条命令、要不要先归档当前世界,
+   * 属于 owner 裁决(见 `net/actions/reset_world.ts` 的「不做回滚到上一版」)。
+   * 动作层今天**没有**任何命令路由到这里 ⇒ 已归档的世界**可以**读回来,
+   * 但没有任何 UI/回执宣称它可以一键回滚。
+   *
+   * ## 回滚成功后存档怎么办
+   * 回滚改了世界 ⇒ 库里的 chunk 存档已经不是这个世界了。两步都做:
+   *   1 `forgetRoomWorldSave`(整代清空,避免「旧行 + 新世界」混在一起);
+   *   2 立刻按**全量**重写一遍(`forceAll`)—— 否则在「清空」与「下一次自动存档」
+   *      之间崩一次,读档就会拿到一张空地图。
+   */
+  restoreWorldFromArchive(
+    db: DbLike,
+    archiveId: string,
+    opts: { nowMs?: number } = {},
+  ): {
+    ok: boolean;
+    code?: RestoreFailCode;
+    reason?: string;
+    applied?: { chunks: number; players: number; mobs: number; ground: number; fluid: number; seed: number; frame: number };
+    /** 回滚后是否把存档按新世界重写了一遍(`false` = 回滚没成 / 没有房间号)。 */
+    resaved: boolean;
+  } {
+    const rec = loadWorldArchive(db, archiveId);
+    if (rec === undefined) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.BAD_ARCHIVE,
+        reason: `归档 ${archiveId} 取不到或不完整(行不存在 / BLOB 不是 Uint8Array / 字节数与摘要不符)`,
+        resaved: false,
+      };
+    }
+    if (this.roomId !== '' && rec.room_id !== this.roomId) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.SHAPE,
+        reason: `归档 ${archiveId} 属于房间 ${rec.room_id},与本世界 ${this.roomId} 不同 ⇒ 拒绝跨房回滚`,
+        resaved: false,
+      };
+    }
+    let plan: RestorePlan;
+    try {
+      plan = planRestore(decodeWorldArchive(rec.snapshot_blob), null);
+    } catch (err) {
+      return {
+        ok: false,
+        code: RESTORE_FAIL.BAD_ARCHIVE,
+        reason: `坏档:归档 ${archiveId} 解不开(${thrownText(err)})⇒ 拒绝,世界一字未改`,
+        resaved: false,
+      };
+    }
+    const r = this.applyRestore(plan);
+    if (!r.ok) return { ...r, resaved: false };
+    /* 存档跟上回滚后的世界(见 docblock 第 1/2 步)。 */
+    let resaved = false;
+    if (this.roomId !== '') {
+      forgetRoomWorldSave(db, this.roomId);
+      this.fluidSavedSignature = -1;
+      this.saveDirtyChunksToDb(db, this.roomId, Number.isFinite(opts.nowMs) ? Math.trunc(opts.nowMs as number) : Date.now(), true);
+      resaved = true;
+    }
+    return { ok: true, applied: r.applied, resaved };
+  }
+
+  /* ══════ ★ WS-FND-165(B1):房间系统台账的**导出 / 读回**(跨进程幂等)══════
+   *
+   * ## 修前形态(实测)
+   * `roomSystemsState.settled` 与 `roomDayIndex` 只活在字段里 ⇒ 进程一停就归零,
+   * 同一个 `orderId`(百货 / 炼金)能**再成交一次**,牧场「第 N 天」也能**再结算一次**。
+   *
+   * ## 分工(与 HP / mem 同一取舍)
+   * ```text
+   * 写  saveToDb()   —— 每次自动存档顺手落一行(repo §17),不另开存档路径
+   * 读  本方法       —— **独立**读口,不塞进 loadFromDb:
+   *      loadFromDb 会连 HP / 生物 mem 一起灌回,而生产里没有任何地方需要
+   *      「开局把整份存档灌进新世界」(玩家是入场时逐人恢复的)⇒ 把两者绑在一起
+   *      会让「只想恢复台账」的调用点被迫做一件它没打算做的事。
+   * ```
+   *
+   * ## 合并语义:只增不减
+   * ```text
+   * 键集  只并**缺失**的键(已结算过的键一位不动;由 mergeSettlementLedger 守)
+   * 日号  max(本进程, 库里)—— 覆盖会更坏:世界已经过了 3 天而库里写着 2 天时,
+   *       把它退回 2 会让第 2/3 天**再结算一次**(归零正是本次要修的那个缺陷)
+   * ```
+   * corrupt(库里有行但读不懂)⇒ **不猜成空台账**:applied:false + reason 如实返回,
+   * 由调用方记录/断言 —— 重放窗口在这种情形下是开的,这件事必须看得见。
+   */
+
+  /** 导出房间系统台账快照(落库形状;saveToDb 用它,判据也可以直接读它)。 */
+  exportRoomSystemsSnapshot(): RoomSystemsSnapshot {
+    return {
+      dayIndex: this.roomDayIndex,
+      keys: settlementEntries(this.roomSystemsState.settled),
+    };
+  }
+
+  /**
+   * 从库读回房间系统台账并**并进**当前世界(与 `saveToDb` 的台账段对偶)。
+   *
+   * @returns added = 真正新增的键数;keys = 合并后的键数;dayIndex = 生效的日号;
+   *          reason = ok / no-table / no-row / corrupt(后三者都**没动**任何一位)。
+   */
+  restoreRoomSystemsFromDb(
+    db: DbLike,
+    roomId: string,
+  ): {
+    applied: boolean; added: number; keys: number; dayIndex: number; dropped: number; reason: string;
+  } {
+    const read: RoomSystemsRead = loadRoomSystemsState(db, roomId);
+    if (!read.ok) {
+      return {
+        applied: false,
+        added: 0,
+        keys: this.roomSystemsState.settled.claims.size,
+        dayIndex: this.roomDayIndex,
+        dropped: read.dropped,
+        reason: read.reason,
+      };
+    }
+    const merged = mergeSettlementLedger(this.roomSystemsState.settled, read.state.keys);
+    this.roomDayIndex = Math.max(this.roomDayIndex, read.state.dayIndex);
+    return {
+      applied: true,
+      added: merged.added,
+      keys: merged.kept,
+      dayIndex: this.roomDayIndex,
+      dropped: read.dropped + merged.dropped,
+      reason: 'ok',
+    };
+  }
+
+  /* ══════ ★ WS-FND-165(B1):玩家快照的**导出 / 读回**(等级 / 经验 / 天赋)══════
+   *
+   * ## 修前形态(实测)
+   * ```text
+   * users.exp / users.talent_json  生产 **0 写入**(createUser 之后再没有写点)
+   * ⇒ 重启后等级在(重连快照里有 level)、**经验归零**
+   * ```
+   * 导出这一份是为了周期落库(repo §18);读回那一份是为了「重建之后经验还在」。
+   */
+
+  /**
+   * 导出全部玩家的快照(**不建档案** —— 与 levelOf / carrySlotsOf 同一纪律)。
+   *
+   * talent 只在**有档案**时带上:没有档案 = 没参与过任何结算 ⇒ 省掉这一列,
+   * 而不是写一个空数组(«没带» 与 «没有天赋» 是两件事,repo §18 靠 undefined 区分)。
+   */
+  exportPlayerSnapshots(): PlayerSnapshotRow[] {
+    const out: PlayerSnapshotRow[] = [];
+    for (const id of [...this.playerIds].sort()) {
+      const p = this.progresses.get(id);
+      const b = this.physics.bodies.get(id);
+      const row: PlayerSnapshotRow = {
+        userId: id,
+        level: p?.level ?? 1,
+        exp: p?.exp ?? 0,
+        hp: this.vitals.get(id)?.hp ?? 0,
+        x: b?.x ?? 0,
+        y: b?.y ?? 0,
+        z: b?.z ?? 0,
+      };
+      if (p !== undefined) row.talent = Object.keys(p.talentFlags).sort();
+      out.push(row);
+    }
+    return out;
+  }
+
+  /**
+   * 从库读回一名玩家的**成长档案**(等级 / 经验 / 天赋)并落进权威层。
+   *
+   * ## 顺序是硬约束
+   * ```text
+   * 1 setLevel(...)   —— 它按既有语义把 exp **清 0** ⇒ 必须**先**做等级
+   * 2 exp 落位        —— 见下面那条「只在档内经验为 0 时采用」
+   * 3 syncMaxHp(...)  —— 等级变了而 vitals 上限还是旧档的值 = 一进场就掉血/爆血
+   * ```
+   * 与 restoreFromProfile 第 3/4 步同一条纪律(先抬上限再灌血),只是这里没有血量。
+   *
+   * ## 两条「只增不减」的判据(与台账合并同一取法)
+   * ```text
+   * level 取 max(本进程, 库里)  —— 覆盖会把高等级**降回**旧档
+   * exp   只在「本进程这一档的经验为 0」时采用库里的值 —— 那正是刚被
+   *       restoreFromProfile 建出来的空档;手上有经验的档更新,不许被旧快照抹掉
+   * ```
+   * ★ 这里**不走 gainExp**:那是「打怪涨经验」的语义(按升级重新结算溢出与连升),
+   *   读档要的是「这一份值就是权威」。用 gainExp 会把同一段经验**再结算一次**。
+   */
+  restoreProgressionFromDb(
+    db: DbLike,
+    playerId: string,
+  ): { applied: boolean; level: number; exp: number; talent: number; reason: string } {
+    const row = loadPlayerSnapshots(db, [playerId])[0];
+    const cur = this.progresses.get(playerId);
+    if (row === undefined) {
+      return {
+        applied: false,
+        level: cur?.level ?? 1,
+        exp: cur?.exp ?? 0,
+        talent: 0,
+        reason: 'no-row',
+      };
+    }
+    const level = Math.max(cur?.level ?? 1, row.level);
+    const base = cur ?? createProgress(playerId);
+    let p = setLevel(base, level);
+    if ((cur?.exp ?? 0) === 0) p = { ...p, exp: row.exp };
+    this.progresses.set(playerId, p);
+    const derived = this.maxHpForLevel(playerId, p.level);
+    if (derived !== null) this.syncMaxHp(playerId, derived);
+    return {
+      applied: true,
+      level: p.level,
+      exp: p.exp,
+      talent: (row.talent ?? []).length,
+      reason: 'ok',
+    };
   }
 
   /* ═══════════════ 世界重置(★ D-06:归档 + 内存重建)═══════════════

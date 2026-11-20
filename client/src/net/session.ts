@@ -35,6 +35,57 @@ import {
 } from '../../../shared/net/delta.ts';
 import { ClientStateStore, type ApplyResult } from './state_store.ts';
 
+/* ═══ ★ WS-FND-167:连接 / 握手**具名超时** + 重连**指数退避**(纯常量 + 纯函数) ═══
+ *
+ * 修前实测(审计 B3)的两个缺口:
+ * ```text
+ * 1 黑洞端口:TCP 一直不回 ⇒ `open` / `error` / `close` **三个事件一个都不来**
+ *   ⇒ 状态永久停在 `connecting`,界面永远写着"连接中",而没有任何一处会超时。
+ * 2 死服务:`close` 每 1.5s 来一次,而重连间隔**固定 1.5s**、无上限也无退避
+ *   ⇒ 空转永不停止,界面上也看不出"下一次什么时候拨"。
+ * ```
+ * ⇒ 两组数各自单一职责:`CONNECT_TIMEOUT_MS` 管"连上"、`HANDSHAKE_TIMEOUT_MS`
+ *   管"welcome 到"(两者是**不同**的失败,文案必须分得开),退避三件套管"下一次拨"。
+ * ⚠️ 超时**不是**新状态:落到既有的 `failed`(带具名 detail),这样 UI 与自检脚本
+ *   不需要学第二套状态机。
+ */
+
+/** 连接(等 socket `open`)超时:超过它还没连上 ⇒ 判「连接超时」。 */
+export const CONNECT_TIMEOUT_MS = 8000;
+/** 握手(等 `welcome`)超时:连上了但服务端不回握手 ⇒ 判「握手超时」。 */
+export const HANDSHAKE_TIMEOUT_MS = 8000;
+/** 退避上限:再久也不超过它(固定间隔 ⇒ 空转;无上限 ⇒ 服务恢复后仍要干等)。 */
+export const RECONNECT_MAX_MS = 30000;
+/** 退避倍率(指数底)。 */
+export const RECONNECT_FACTOR = 2;
+
+/**
+ * 第 `attempt` 次重连的间隔(毫秒)—— **纯函数**,导出以便直接断言单调性与上限。
+ *
+ * ```text
+ * delay = min(上限, 基数 × 倍率^(attempt − 1))
+ * ```
+ *
+ * ⚠️ 坏值一律**不猜**:
+ * ```text
+ * 基数 <= 0 / 非有限 / attempt < 1  ⇒ 0(等于"不重连",与接线前逐字相同)
+ * 倍率 < 1                          ⇒ 回落到 RECONNECT_FACTOR(否则间隔**越等越短**)
+ * 上限非法                          ⇒ 用 RECONNECT_MAX_MS
+ * ```
+ */
+export function backoffDelayMs(
+  attempt: number,
+  baseMs: number,
+  maxMs: number = RECONNECT_MAX_MS,
+  factor: number = RECONNECT_FACTOR,
+): number {
+  const a = Math.floor(attempt);
+  if (!(baseMs > 0) || !Number.isFinite(baseMs) || !Number.isFinite(a) || a < 1) return 0;
+  const cap = Number.isFinite(maxMs) && maxMs > 0 ? maxMs : RECONNECT_MAX_MS;
+  const f = Number.isFinite(factor) && factor >= 1 ? factor : RECONNECT_FACTOR;
+  return Math.min(cap, Math.round(baseMs * Math.pow(f, a - 1)));
+}
+
 /** 握手:客户端 → 服务端。`contentClaim` 阶段 3 留空(见文件头)。 */
 export interface HelloFrame {
   t: 'hello';
@@ -142,6 +193,13 @@ export interface SessionEvents {
    * `pending` 全是上一轮的账,而表现只是"偶尔不走 / 偶尔回弹"。
    */
   onOpen?: (epoch: number) => void;
+  /**
+   * ★ WS-FND-167:排了一次**自动重连**时调用(带退避后的间隔)。
+   *
+   * 修前只有"断了"这一个事实,没有"下一次什么时候拨" ⇒ 界面只能永远转圈。
+   * `attempt` 从 1 起(成功 `open` 后归零),与 `SessionHandle.retryCount` 同一个数。
+   */
+  onRetryScheduled?: (info: { attempt: number; delayMs: number }) => void;
 }
 
 /**
@@ -230,6 +288,24 @@ export interface SessionHandle {
    * ★ WS-FND-113:已建立的连接数(`1` = 只有首连;`>= 2` = 重连过)。
    * 与 `onOpen` 的实参是**同一个数**(一处来源,不造第二份计数)。
    */
+  /**
+   * ★ WS-FND-167:已排过几次**自动重连**(成功 `open` 后归零)。
+   * 与 `onRetryScheduled` 的 `attempt` **同一个数**(一处来源,不造第二份计数)。
+   */
+  readonly retryCount: number;
+  /** ★ WS-FND-167:下一次重连的**退避间隔**(毫秒;没有在排 = `null`)。 */
+  readonly retryDelayMs: number | null;
+  /** ★ WS-FND-167:下一次重连的**绝对时刻**(`Date.now()` 口径;没有在排 = `null`)。 */
+  readonly nextRetryAtMs: number | null;
+  /**
+   * ★ WS-FND-167:最近一次**超时**的具名原因(`null` = 本次连接没超时过)。
+   *
+   * 与 `state === 'failed'` 的 `detail` 是**同一句话**(一处文案、两处可读):
+   * 状态会被随后的 `close` / 重连覆盖,**这个字段只在 `open` 时清空**。
+   * `kind` 分开 `connect`(没连上)与 `handshake`(连上了但 welcome 没来)——
+   * 两者的修法完全不同(查端口 vs 查服务端握手),混成一句就会指错方向。
+   */
+  readonly lastTimeout: { kind: 'connect' | 'handshake'; ms: number; text: string } | null;
   readonly epoch: number;
   /**
    * ★ WS-FND-113:主动重连 —— 关掉当前 socket,换一条重新握手。
@@ -469,6 +545,18 @@ export interface SessionOptions {
    * 不让它再把自己拉起来,否则关页面会变成"重连到别人都走了还在拨"。
    */
   autoReconnectMs?: number;
+  /**
+   * ★ WS-FND-167:连接(socket `open`)超时(毫秒)。省略 ⇒ `CONNECT_TIMEOUT_MS`;
+   * `<= 0` ⇒ **不设**(只给单测/冒烟用 —— 生产**不许**省略:黑洞端口会永远停在
+   * "连接中",而 `open` / `error` / `close` 一个事件都不会来)。
+   */
+  connectTimeoutMs?: number;
+  /** ★ WS-FND-167:握手(`welcome`)超时(毫秒)。省略 ⇒ `HANDSHAKE_TIMEOUT_MS`;`<= 0` ⇒ 不设。 */
+  handshakeTimeoutMs?: number;
+  /** ★ WS-FND-167:退避**上限**(毫秒)。省略 ⇒ `RECONNECT_MAX_MS`(无上限 = 服务回来还要干等)。 */
+  reconnectMaxMs?: number;
+  /** ★ WS-FND-167:退避**倍率**。省略 ⇒ `RECONNECT_FACTOR`;`< 1` 视为 2(间隔越等越短会加剧空转)。 */
+  reconnectFactor?: number;
   events: SessionEvents;
 }
 
@@ -499,6 +587,18 @@ export function createSession(opts: SessionOptions): SessionHandle {
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   /** 调用方**主动** `close()` ⇒ 不再自动重连(见 `autoReconnectMs`)。 */
   let closedByCaller = false;
+  /* ★ WS-FND-167:超时与退避的状态 —— 四个字段各管一件事,别合并。 */
+  /** 连接(等 `open`)定时器;`null` = 当前没在等。 */
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 握手(等 `welcome`)定时器;`null` = 当前没在等。 */
+  let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 已排过几次自动重连(`open` 时归零)。 */
+  let retryCount = 0;
+  /** 下一次重连的退避间隔与绝对时刻(`null` = 没在排)。 */
+  let retryDelayMs: number | null = null;
+  let nextRetryAtMs: number | null = null;
+  /** 最近一次超时的具名原因(见 `SessionHandle.lastTimeout`)。 */
+  let lastTimeout: { kind: 'connect' | 'handshake'; ms: number; text: string } | null = null;
 
   const setState = (s: SessionState, detail?: string): void => {
     state = s;
@@ -516,18 +616,60 @@ export function createSession(opts: SessionOptions): SessionHandle {
   };
 
   /**
+   * ★ WS-FND-167:被**超时**判死的那条 socket(按连接记,`null` = 没有)。
+   *
+   * 为什么需要它:超时之后我们会自己 `sock.close()`,而那次 `close` / `error`
+   * 回调会**紧接着**把状态覆盖成一句 "closed" / "socket error" ⇒ 具名原因在
+   * 现场消失(与 WS-FND-134 的"拒因被 close 盖掉"是同一个病)。
+   * ⚠️ 按 **socket** 而不是按一个布尔值:换连接之后布尔值会把新连接的正常错误吞掉。
+   */
+  let timedOutSocket: WebSocketLike | null = null;
+
+  /** 取消超时定时器(再次 `dial` / 握手完成 / 掉线 / 调用方收尾时都要调)。 */
+  const clearTimeouts = (): void => {
+    if (connectTimer !== null) { clearTimeout(connectTimer); connectTimer = null; }
+    if (handshakeTimer !== null) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+  };
+
+  /** Node 里别让"待重连 / 待超时"把进程吊住(与 `ws_server.ts` 的 broadcaster 同一做法)。 */
+  const unrefTimer = (t: ReturnType<typeof setTimeout>): void => {
+    if (typeof t.unref === 'function') t.unref();
+  };
+
+  /**
    * 排一次自动重连。**只排一次**(`retryTimer !== null` 直接返回):
    * 断开事件会连着来(`error` 之后紧接 `close`)⇒ 排两次会同时拨两条连接,
    * 后一条顶掉前一条,表现是"刚连上又断",而日志里看不出成对关系。
+   *
+   * ★ WS-FND-167:间隔 = `backoffDelayMs(retryCount + 1, 基数, 上限, 倍率)`。
+   * 修前用的是**写死的基数**(生产给 1500)⇒ 死服务每 1.5s 空转、无上限、界面
+   * 也看不出"下一次什么时候拨"。`retryCount` 只在**成功 `open`** 时归零:
+   * 连续失败一路退避到上限,而真的连上过一次之后立刻回到基数(服务恢复时不再干等)。
    */
   const scheduleRetry = (): void => {
     if (closedByCaller) return;
-    const ms = opts.autoReconnectMs ?? 0;
-    if (!(ms > 0) || retryTimer !== null) return;
-    const t = setTimeout(() => { retryTimer = null; dial(); }, ms);
+    const base = opts.autoReconnectMs ?? 0;
+    if (!(base > 0) || retryTimer !== null) return;
+    const attempt = retryCount + 1;
+    const delayMs = backoffDelayMs(
+      attempt, base,
+      opts.reconnectMaxMs ?? RECONNECT_MAX_MS,
+      opts.reconnectFactor ?? RECONNECT_FACTOR,
+    );
+    const t = setTimeout(() => {
+      retryTimer = null;
+      retryDelayMs = null;
+      nextRetryAtMs = null;
+      dial();
+    }, delayMs);
     /* Node 里别让"待重连"把进程吊住(与 `ws_server.ts` 的 broadcaster 同一做法)。 */
-    if (typeof t.unref === 'function') t.unref();
+    unrefTimer(t);
     retryTimer = t;
+    /* 三个读数与那次 `setTimeout` **同一个数**(一处来源:界面/自检都读它们)。 */
+    retryCount = attempt;
+    retryDelayMs = delayMs;
+    nextRetryAtMs = Date.now() + delayMs;
+    opts.events.onRetryScheduled?.({ attempt, delayMs });
   };
 
   /**
@@ -536,12 +678,39 @@ export function createSession(opts: SessionOptions): SessionHandle {
    */
   function dial(): void {
   try {
+    /* ★ WS-FND-167:换一条连接 ⇒ 上一条的"等 open / 等 welcome"定时器必须作废,
+       否则它们会在**新**连接上开火,把一条正在握手的连接判成超时。 */
+    clearTimeouts();
     setState('connecting');
     const sock = make(opts.url);
     socket = sock;
     /* 二进制帧给 ArrayBuffer —— 实测内置客户端在 `arraybuffer` 下
        `ev.data instanceof ArrayBuffer` 为真,可直接喂 `decodePacket`。 */
     socket.binaryType = 'arraybuffer';
+
+    /* ── ★ WS-FND-167 缺口 1:黑洞端口连**事件**都不来,只有定时器救得回来 ──
+       实测:`open` / `error` / `close` 三者一个都不来 ⇒ 不设超时这里就是死路,
+       而界面上永远写着"连接中"(`setState('connecting')` 之后就再没下文)。
+       `connectMs <= 0` = 显式关掉(只给单测);生产由 `main.ts` 显式传值。 */
+    const connectMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
+    const handshakeMs = opts.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+    if (connectMs > 0) {
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        /* 两道门:老 socket 的超时不算本次;已经 live/failed 的更不算。 */
+        if (socket !== sock || state !== 'connecting') return;
+        const text = `连接超时:${connectMs}ms 内未建立 WebSocket(${opts.url})`
+          + ' —— 端口不通 / 服务未启动 / 被防火墙丢包(不是"正在连",是"连不上")';
+        lastTimeout = { kind: 'connect', ms: connectMs, text };
+        /* ★ WS-FND-167:记下"是这条 socket 被超时判死的" ⇒ 随后那次 close/error
+           不许用一句 "closed" / "socket error" 把具名原因盖掉(见那两个回调)。 */
+        timedOutSocket = sock;
+        setState('failed', text);
+        try { sock.close(); } catch { /* 已经坏掉:幂等 */ }
+        scheduleRetry();
+      }, connectMs);
+      unrefTimer(connectTimer);
+    }
 
       sock.addEventListener('open', (() => {
         /* ★ WS-FND-113:连接**真的**建立起来了 —— 先报 `epoch`,再发握手。
@@ -551,6 +720,29 @@ export function createSession(opts: SessionOptions): SessionHandle {
         /* ★ WS-FND-134(P1):新连接开始 ⇒ 清掉**上一条连接**的拒因
            (否则本次断开会把上一轮的 reject 当成这次的原因报出来)。 */
         lastReject = null;
+        /* ★ WS-FND-167:新连接起来了 ⇒ 上一条被超时判死的记录作废。 */
+        timedOutSocket = null;
+        /* ★ WS-FND-167:连上了 ⇒ "等 open"的超时**作废**,退避计数归零(下次断从基数重来),
+           然后开始"等 welcome"的计时 —— 这是**另一种**失败(修法不同),不共用定时器。 */
+        clearTimeouts();
+        retryCount = 0;
+        retryDelayMs = null;
+        nextRetryAtMs = null;
+        lastTimeout = null;
+        if (handshakeMs > 0) {
+          handshakeTimer = setTimeout(() => {
+            handshakeTimer = null;
+            if (socket !== sock || state !== 'connecting') return;
+            const text = `握手超时:${handshakeMs}ms 内未收到 welcome(${opts.url})`
+              + ' —— TCP 通了但服务端没回握手(没起 ws 路由 / 协议或内容指纹对不上)';
+            lastTimeout = { kind: 'handshake', ms: handshakeMs, text };
+            timedOutSocket = sock;
+            setState('failed', text);
+            try { sock.close(); } catch { /* 已经坏掉:幂等 */ }
+            scheduleRetry();
+          }, handshakeMs);
+          unrefTimer(handshakeTimer);
+        }
         opts.events.onOpen?.(epoch);
         /* 连接建立后**先**发握手。上行也走 1 字节类型头,服务端据此分流。 */
         const hello: HelloFrame = {
@@ -637,6 +829,8 @@ export function createSession(opts: SessionOptions): SessionHandle {
             serverClaim = w.contentClaim;
             store.setLocalPlayerId(w.playerId);
             opts.events.onWelcome?.(w);
+            /* ★ WS-FND-167:握手真的完成了 ⇒ "等 welcome"的超时作废。 */
+            clearTimeouts();
             setState('live');
           } else if (w.t === 'actionResult') {
             /* ★ 2026-11-14:动作回执。**五种结果都送达**(OK / INVALID /
@@ -685,6 +879,13 @@ export function createSession(opts: SessionOptions): SessionHandle {
            ⇒ 玩家/自检脚本只能看到"断了、重连",**拒因在状态流里消失**。
            ⚠️ 只在**本次连接**收过 reject 时带(`open` 时清空),否则会把上一轮
            无关的拒因挂到这一次的断开上(那会指错对象)。 */
+        /* ★ WS-FND-167:被**超时**判死的那次 close 也必须带上具名原因 ——
+           否则"连接超时:…"立刻被覆盖成一句 "closed"(与上面拒因同一种病)。 */
+        if (timedOutSocket === sock && lastTimeout !== null) {
+          setState('closed', lastTimeout.text);
+          scheduleRetry();
+          return;
+        }
         setState('closed', lastReject === null ? undefined : describeReject(lastReject));
         scheduleRetry();
       }) as never);
@@ -692,6 +893,9 @@ export function createSession(opts: SessionOptions): SessionHandle {
         /* 连接层错误:不抛(未连接的会话是正常状态,不是异常)。
            与 close 同一道门:老 socket 的错误不再算本次会话的失败。 */
         if (socket !== sock) return;
+        clearTimeouts();
+        /* ★ WS-FND-167:超时已经判死 ⇒ 不许用一句 "socket error" 盖掉具名原因。 */
+        if (timedOutSocket === sock) { scheduleRetry(); return; }
         setState('failed', 'socket error');
         scheduleRetry();
       }) as never);
@@ -707,6 +911,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
     get store() { return store; },
     get state() { return state; },
     get serverContentClaim() { return serverClaim; },
+    /* ★ WS-FND-167:超时与退避的四个读数 —— 界面 / 自检脚本都读它们,不靠看日志。 */
+    get retryCount() { return retryCount; },
+    get retryDelayMs() { return retryDelayMs; },
+    get nextRetryAtMs() { return nextRetryAtMs; },
+    get lastTimeout() { return lastTimeout; },
     get droppedFrames() { return droppedFrames; },
     get lastDropReason() { return lastDropReason; },
     /* ★ WS-FND-134(P1):被拒的**证据**。两个读数分开:
@@ -742,6 +951,8 @@ export function createSession(opts: SessionOptions): SessionHandle {
      */
     reconnect(): void {
       clearRetry();
+      /* ★ WS-FND-167:主动换连接 ⇒ 老连接的超时定时器一并作废(否则它会在新连接上开火)。 */
+      clearTimeouts();
       const old = socket;
       /* ⚠️ 先摘引用再关:老 socket 的 `close` 回调据此判"这不是掉线"
          (见 `dial` 里那道 `socket !== sock` 的门)。 */
@@ -753,6 +964,7 @@ export function createSession(opts: SessionOptions): SessionHandle {
       /* 主动关闭 ⇒ 不再自动重连(见 `autoReconnectMs` 的说明)。 */
       closedByCaller = true;
       clearRetry();
+      clearTimeouts();
       const cur = socket;
       socket = null;
       if (cur !== null) { try { cur.close(); } catch { /* 已关:幂等 */ } }

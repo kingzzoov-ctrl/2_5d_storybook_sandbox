@@ -533,6 +533,23 @@ export class Chunk {
   dirtyCount: number;
   /** 单调递增版本号,任何实际写入 +1 */
   version: number;
+  /**
+   * ★ WS-FND-164:**存档水位** —— 上一次**成功落盘**时的 `version`。
+   *
+   * ## 为什么它就是「脏页」判据(而不是再开一张位图)
+   *
+   * `version` 只在**真实写入**时自增:`writeCell` 只有值真的变了才动、
+   * `setRoof` 只有屋顶换了才动,`markDirtyIndex` 每调用一次 +1。
+   * 于是「本块自上次落盘以来被改过」== `version !== savedVersion` —— 一条判定,
+   * 读写两侧共用同一个数。
+   *
+   * 谁写:`world_sim.saveToDb` / `restoreWorldFromDb`(**只在写库成功之后**)。
+   * 谁读:同一处的脏页筛选。
+   * ⚠️ 它**不是** `dirty` 位图的替代:`dirty` 是「哪些格脏」(网络增量 / 流体唤醒
+   *    用的逐格账),`savedVersion` 是「这一整块要不要重写」(1KB 一行)。粒度不同,
+   *    清一个不代表清另一个。
+   */
+  savedVersion = 0;
 
   /** 本分片常驻字节:打包 1KB + 屋顶 512B + 3 张 32B 位图 = 1632 */
   static readonly RESIDENT_BYTES = CHUNK_BYTES + CHUNK_CELLS * 2 + DIRTY_BYTES * 3;
@@ -549,6 +566,7 @@ export class Chunk {
     this.lava = new Uint32Array(DIRTY_WORDS);
     this.dirtyCount = 0;
     this.version = 0;
+    this.savedVersion = 0;
     this.cells.fill(fill >>> 0);
   }
 
@@ -703,6 +721,35 @@ export class Chunk {
       this.dirty[w] &= ~b;
       this.dirtyCount -= 1;
     }
+  }
+
+  /* ── 存档水位(★ WS-FND-164)── */
+
+  /**
+   * 本块自上次**成功落盘**以来是否被改动过。
+   *
+   * `version` 是「真实写入」的单调计数(`writeCell` / `setRoof` 只在值变了才 +1),
+   * 所以这一条就是脏页判定 —— 玩家建造(E 拆 / Q 放 / 铺地砖 / 上屋顶)与
+   * 自然演化(流体相变产物、生物 `placeObj`/`setFloor`、电路回写)全部经
+   * `setCell` ⇒ 都会让 `version` 前进,无需任何额外「标脏」调用。
+   *
+   * ⚠️ `version` 也覆盖**读档/回滚**写入的块(`Chunk.deserializeSnapshot` 把
+   *    归档里的 `version` 原样搬回来)⇒ 回滚之后这些块会被判成脏、并在下一次
+   *    自动存档时落库。这是刻意的:回滚改的是世界,存档必须跟上。
+   */
+  isSaveDirty(): boolean {
+    return this.version !== this.savedVersion;
+  }
+
+  /**
+   * 记下「这一版已经落盘」。
+   *
+   * 默认取当前 `version`;显式传值只用于「写的时候抓的是哪一版」——
+   * 写库期间世界还在推进(同步写不会,但签名留出这条语义),落盘的是旧字节时
+   * 就不能把水位推到新的 `version`(那会**吞掉**中间那次写入)。
+   */
+  markSaved(version: number = this.version): void {
+    this.savedVersion = version >>> 0;
   }
 
   /** 位扫描遍历脏格,不扫 256 次。 */
@@ -881,9 +928,9 @@ export class Chunk {
     c.lava.set(this.lava);
     c.dirtyCount = this.dirtyCount;
     c.version = this.version;
+    c.savedVersion = this.savedVersion;
     return c;
   }
-
   /** 本分片常驻字节。 */
   byteSize(): number {
     return CHUNK_BYTES + this.roofs.byteLength + DIRTY_BYTES * 3;

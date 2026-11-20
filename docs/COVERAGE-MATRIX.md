@@ -38,12 +38,12 @@ node scripts/coverage-matrix.ts --write    # 重写 §1/§2/§3 三块(保留人
 三档判据的**定义**在 `scripts/coverage-matrix.ts` 文件头(含优先级与边界),这里只抄结果:
 
 <!-- GEN:STATS:BEGIN -->
-total = 2395
-behavior = 1285
+total = 2459
+behavior = 1300
 symbol-only = 15
-none = 1095
-none-prodref-positive = 266
-none-prodref-zero = 829
+none = 1144
+none-prodref-positive = 283
+none-prodref-zero = 861
 src-files = 101
 <!-- GEN:STATS:END -->
 
@@ -255,122 +255,139 @@ none-prodref-zero      连生产引用也没有 ⇒ 多是"本文件内部用"�
 | 163 | `server/src/coop/rush_order.ts:RushSessionSettlement` | type | 4 | 待补 |
 | 164 | `server/src/db/repo.ts:KeyParts` | type | 11 | 待补 |
 | 165 | `server/src/db/repo.ts:OrderBy` | type | 4 | 待补 |
-| 166 | `server/src/db/repo.ts:Row` | type | 25 | 待补 |
-| 167 | `server/src/db/repo.ts:StartingInventoryBootCheck` | type | 2 | 待补 |
-| 168 | `server/src/db/repo.ts:StartingInventoryGrantRecord` | type | 2 | 待补 |
-| 169 | `server/src/db/repo.ts:WorldArchiveBootCheck` | type | 2 | 待补 |
-| 170 | `server/src/db/repo.ts:migrateStartingInventoryIfInstalled` | value | 2 | 待补 |
-| 171 | `server/src/db/repo.ts:releaseStartingInventoryGrant` | value | 2 | 待补 |
-| 172 | `server/src/events/bus.ts:EventPayload` | type | 2 | 待补 |
-| 173 | `server/src/mobs/behaviors.ts:BaseMobAi` | value | 2 | 待补 |
-| 174 | `server/src/mobs/behaviors.ts:MobRuntime` | type | 13 | 待补 |
-| 175 | `server/src/mobs/behaviors.ts:MobWorld` | type | 2 | 待补 |
-| 176 | `server/src/mobs/drops.ts:MobDropResult` | type | 2 | 待补 |
-| 177 | `server/src/mobs/fsm.ts:FsmConfig` | type | 1 | 待补 |
-| 178 | `server/src/mobs/fsm.ts:PROBE_LEN` | value | 1 | 待补 |
-| 179 | `server/src/mobs/geometry.ts:DEG` | value | 15 | 待补 |
-| 180 | `server/src/mobs/geometry.ts:WarnGeom` | type | 59 | 无需(类型导出:无可断言的运行时行为;生产引用按名字计数,只作类型位) |
-| 181 | `server/src/mobs/geometry.ts:WarnShape` | value | 7 | 待补 |
-| 182 | `server/src/mobs/geometry.ts:angleDiffDeg` | value | 3 | 待补 |
-| 183 | `server/src/mobs/geometry.ts:angleToDeg` | value | 6 | 待补 |
-| 184 | `server/src/mobs/geometry.ts:unit` | value | 15 | 待补 |
-| 185 | `server/src/mobs/host.ts:MobHostWorld` | type | 2 | 待补 |
-| 186 | `server/src/mobs/host.ts:MobTickResult` | type | 2 | 待补 |
-| 187 | `server/src/mobs/spawner.ts:MOB_INSTANCE_SEP` | value | 2 | 待补 |
-| 188 | `server/src/mobs/spawner.ts:SpawnContext` | type | 2 | 待补 |
-| 189 | `server/src/mobs/spawner.ts:mobDefOf` | value | 9 | 待补 |
-| 190 | `server/src/mobs/spawner.ts:mobSpeciesId` | value | 8 | 待补 |
-| 191 | `server/src/mobs/spawner.ts:spawnsPerCheck` | value | 2 | 待补 |
-| 192 | `server/src/net/actions/item_source.ts:ownedItemIds` | value | 2 | 待补 |
-| 193 | `server/src/net/actions/material.ts:pickupItem` | value | 2 | 待补 |
-| 194 | `server/src/net/actions/modify_town.ts:modifyTown` | value | 2 | 待补 |
-| 195 | `server/src/net/actions/open_chest.ts:ItemStack` | type | 1 | 待补 |
-| 196 | `server/src/net/actions/open_chest.ts:ownChestContainers` | value | 2 | 待补 |
-| 197 | `server/src/net/actions/open_chest.ts:runChestAction` | value | 2 | 待补 |
-| 198 | `server/src/net/actions/plant_crop.ts:plantSeedAt` | value | 2 | 待补 |
-| 199 | `server/src/net/actions/types.ts:ActionHandler` | type | 47 | 无需(类型导出:函数类型别名无运行时可断言行为,47 处生产引用全是类型位;契约由注册表与各处理器判,见 WS-FND-154 FND154-1) |
-| 200 | `server/src/net/actions/use_alchemy_furnace.ts:forgetFurnaceClaims` | value | 2 | 待补 |
-| 201 | `server/src/net/actions/wire_edit.ts:wireEdit` | value | 2 | 待补 |
-| 202 | `server/src/net/anticheat.ts:Clock` | type | 24 | 待补 |
-| 203 | `server/src/net/anticheat.ts:InventoryCheckResult` | type | 2 | 待补 |
-| 204 | `server/src/net/anticheat.ts:InventoryOp` | type | 6 | 待补 |
-| 205 | `server/src/net/anticheat.ts:Verdict` | type | 3 | 待补 |
-| 206 | `server/src/net/anticheat.ts:Violation` | type | 3 | 待补 |
-| 207 | `server/src/net/anticheat.ts:mintItemSourceToken` | value | 2 | 待补 |
-| 208 | `server/src/net/room.ts:EffectValue` | type | 2 | 待补 |
-| 209 | `server/src/net/room.ts:ItemReadPort` | type | 5 | 待补 |
-| 210 | `server/src/net/schema.ts:removeBoss` | value | 2 | 待补 |
-| 211 | `server/src/net/schema.ts:removeWildlife` | value | 2 | 待补 |
-| 212 | `server/src/net/schema.ts:upsertBoss` | value | 2 | 待补 |
-| 213 | `server/src/net/ws_server.ts:startWsServer` | value | 3 | 待补 |
-| 214 | `server/src/party/actions.ts:REFEREE_DESK_STOP_MODE` | value | 3 | 待补 |
-| 215 | `server/src/party/modes.ts:BRIDGE_BOARD_ITEM_ID` | value | 3 | 待补 |
-| 216 | `server/src/party/modes.ts:PartyContest` | type | 3 | 待补 |
-| 217 | `server/src/party/modes.ts:PartyModeRuntime` | type | 2 | 待补 |
-| 218 | `server/src/party/scoring.ts:Broadcast` | type | 2 | 待补 |
-| 219 | `server/src/party/scoring.ts:Broadcaster` | type | 3 | 待补 |
-| 220 | `server/src/party/scoring.ts:PaintGrid` | type | 3 | 待补 |
-| 221 | `server/src/party/scoring.ts:RaceTimer` | type | 6 | 待补 |
-| 222 | `server/src/party/scoring.ts:RewardLine` | type | 3 | 待补 |
-| 223 | `server/src/party/scoring.ts:TeamKey` | type | 33 | 待补 |
-| 224 | `server/src/party/scoring.ts:TeamScore` | type | 2 | 待补 |
-| 225 | `server/src/party/scoring.ts:modeEndLine` | value | 6 | 待补 |
-| 226 | `server/src/party/scoring.ts:modeStartLine` | value | 2 | 待补 |
-| 227 | `server/src/party/scoring.ts:podiumBroadcast` | value | 2 | 待补 |
-| 228 | `server/src/party/scoring.ts:rankByDescending` | value | 2 | 待补 |
-| 229 | `server/src/physics/carry.ts:ChainNode` | type | 2 | 待补 |
-| 230 | `server/src/physics/carry.ts:JUMP_VZ` | value | 2 | 待补 |
-| 231 | `server/src/physics/carry.ts:ThrowResult` | type | 2 | 待补 |
-| 232 | `server/src/physics/world.ts:KNOCKBACK_STUN_SEC` | value | 2 | 待补 |
-| 233 | `server/src/physics/world.ts:StepReport` | type | 3 | 待补 |
-| 234 | `server/src/physics/world.ts:applyTimedBodyState` | value | 3 | 待补 |
-| 235 | `server/src/prank/actions.ts:CrownKnockOutcome` | type | 2 | 待补 |
-| 236 | `server/src/prank/actions.ts:PrankActionOutcome` | type | 2 | 待补 |
-| 237 | `server/src/prank/immunity.ts:EffectOrigin` | type | 2 | 待补 |
-| 238 | `server/src/prank/immunity.ts:ShieldResolution` | type | 2 | 待补 |
-| 239 | `server/src/prank/toys.ts:PrankToyDef` | type | 3 | 待补 |
-| 240 | `server/src/prank/toys.ts:ToyStateFlag` | type | 5 | 待补 |
-| 241 | `server/src/rooms/effects.ts:RoomEffectState` | type | 3 | 待补 |
-| 242 | `server/src/sim/world_debts.ts:WorldDebtRow` | type | 2 | 待补 |
-| 243 | `server/src/sim/world_sim.ts:WorldArchiveReceipt` | type | 3 | 待补 |
-| 244 | `server/src/sim/world_sim.ts:WorldArchiveRequest` | type | 2 | 待补 |
-| 245 | `server/src/sim/world_sim.ts:WorldArchiveSink` | type | 4 | 待补 |
-| 246 | `server/src/social/afk.ts:AfkPlayer` | type | 2 | 待补 |
-| 247 | `server/src/systems/alchemy_lab.ts:ALCHEMY_LAB_SYSTEM` | value | 2 | 待补 |
-| 248 | `server/src/systems/alchemy_lab.ts:BrewInput` | type | 3 | 待补 |
-| 249 | `server/src/systems/alchemy_lab.ts:BrewOutcome` | type | 3 | 待补 |
-| 250 | `server/src/systems/alchemy_lab.ts:Gallery` | type | 2 | 待补 |
-| 251 | `server/src/systems/alchemy_lab.ts:GalleryEntry` | type | 2 | 待补 |
-| 252 | `server/src/systems/depot.ts:BuyResult` | type | 2 | 待补 |
-| 253 | `server/src/systems/depot.ts:DEPOT_SYSTEM` | value | 2 | 待补 |
-| 254 | `server/src/systems/depot.ts:PriceTable` | type | 3 | 待补 |
-| 255 | `server/src/systems/greenhouse.ts:GREENHOUSE_SYSTEM` | value | 2 | 待补 |
-| 256 | `server/src/systems/greenhouse.ts:Weather` | value | 6 | 待补 |
-| 257 | `server/src/systems/intake.ts:roomSystemsPortOf` | value | 6 | 待补 |
-| 258 | `server/src/systems/ranch.ts:RANCH_SYSTEM` | value | 2 | 待补 |
-| 259 | `server/src/systems/ranch.ts:RanchAnimal` | type | 15 | 待补 |
-| 260 | `server/src/systems/ranch.ts:RanchDayResult` | type | 6 | 待补 |
-| 261 | `server/src/systems/ranch.ts:RanchOnceOutcome` | type | 2 | 待补 |
-| 262 | `server/src/systems/wiring.ts:CropCellState` | type | 3 | 待补 |
-| 263 | `server/src/systems/wiring.ts:GalleryDisplayRow` | type | 4 | 待补 |
-| 264 | `server/src/systems/wiring.ts:GrowInput` | type | 2 | 待补 |
-| 265 | `server/src/systems/wiring.ts:HarvestRow` | type | 6 | 待补 |
-| 266 | `server/src/systems/wiring.ts:gatherMulOf` | value | 1 | 待补 |
-| 267 | `server/src/systems/wiring.ts:producedItemIdOf` | value | 2 | 待补 |
-| 268 | `server/src/wiring/components.ts:SPEC_BY_KIND` | value | 2 | 待补 |
-| 269 | `server/src/wiring/graph.ts:ComponentContext` | type | 2 | 待补 |
-| 270 | `server/src/wiring/graph.ts:ComponentNode` | type | 6 | 待补 |
-| 271 | `server/src/wiring/graph.ts:registerComponentKind` | value | 41 | 待补 |
-| 272 | `server/src/wiring/logistics.ts:ARM_BATCH` | value | 2 | 待补 |
-| 273 | `server/src/wiring/logistics.ts:ArmState` | type | 2 | 待补 |
-| 274 | `server/src/wiring/logistics.ts:ConveyorState` | type | 2 | 待补 |
-| 275 | `server/src/wiring/logistics.ts:DIR_DX` | value | 6 | 待补 |
-| 276 | `server/src/wiring/logistics.ts:DIR_DY` | value | 6 | 待补 |
-| 277 | `server/src/wiring/logistics.ts:DrillState` | type | 2 | 待补 |
-| 278 | `server/src/wiring/logistics.ts:ItemStack` | value | 15 | 待补 |
-| 279 | `server/src/wiring/logistics.ts:LogisticsLine` | type | 6 | 待补 |
-| 280 | `server/src/wiring/logistics.ts:LogisticsTickReport` | type | 2 | 待补 |
-| 281 | `server/src/world/chunk.ts:toBytes` | value | 3 | 待补 |
+| 166 | `server/src/db/repo.ts:PlayerLedgerSnapshot` | type | 6 | 待补 |
+| 167 | `server/src/db/repo.ts:PlayerSnapshotRow` | type | 6 | 待补 |
+| 168 | `server/src/db/repo.ts:RoomSystemsBootCheck` | type | 2 | 待补 |
+| 169 | `server/src/db/repo.ts:RoomSystemsRead` | type | 2 | 待补 |
+| 170 | `server/src/db/repo.ts:RoomSystemsSnapshot` | type | 2 | 待补 |
+| 171 | `server/src/db/repo.ts:Row` | type | 25 | 待补 |
+| 172 | `server/src/db/repo.ts:StartingInventoryBootCheck` | type | 2 | 待补 |
+| 173 | `server/src/db/repo.ts:StartingInventoryGrantRecord` | type | 2 | 待补 |
+| 174 | `server/src/db/repo.ts:WorldArchiveBootCheck` | type | 2 | 待补 |
+| 175 | `server/src/db/repo.ts:forgetRoomWorldSave` | value | 3 | 待补 |
+| 176 | `server/src/db/repo.ts:listRoomChunkCoords` | value | 2 | 待补 |
+| 177 | `server/src/db/repo.ts:migrateRoomSystemsIfInstalled` | value | 4 | 待补 |
+| 178 | `server/src/db/repo.ts:migrateStartingInventoryIfInstalled` | value | 2 | 待补 |
+| 179 | `server/src/db/repo.ts:migrateWorldPersistence` | value | 2 | 待补 |
+| 180 | `server/src/db/repo.ts:releaseStartingInventoryGrant` | value | 2 | 待补 |
+| 181 | `server/src/db/repo.ts:savePlayerLedgers` | value | 2 | 待补 |
+| 182 | `server/src/db/repo.ts:savePlayerSnapshots` | value | 3 | 待补 |
+| 183 | `server/src/db/repo.ts:saveWorldState` | value | 2 | 待补 |
+| 184 | `server/src/db/repo.ts:worldPersistenceInstalled` | value | 2 | 待补 |
+| 185 | `server/src/events/bus.ts:EventPayload` | type | 2 | 待补 |
+| 186 | `server/src/mobs/behaviors.ts:BaseMobAi` | value | 2 | 待补 |
+| 187 | `server/src/mobs/behaviors.ts:MobRuntime` | type | 13 | 待补 |
+| 188 | `server/src/mobs/behaviors.ts:MobWorld` | type | 2 | 待补 |
+| 189 | `server/src/mobs/drops.ts:MobDropResult` | type | 2 | 待补 |
+| 190 | `server/src/mobs/fsm.ts:FsmConfig` | type | 1 | 待补 |
+| 191 | `server/src/mobs/fsm.ts:PROBE_LEN` | value | 1 | 待补 |
+| 192 | `server/src/mobs/geometry.ts:DEG` | value | 15 | 待补 |
+| 193 | `server/src/mobs/geometry.ts:WarnGeom` | type | 59 | 无需(类型导出:无可断言的运行时行为;生产引用按名字计数,只作类型位) |
+| 194 | `server/src/mobs/geometry.ts:WarnShape` | value | 7 | 待补 |
+| 195 | `server/src/mobs/geometry.ts:angleDiffDeg` | value | 3 | 待补 |
+| 196 | `server/src/mobs/geometry.ts:angleToDeg` | value | 6 | 待补 |
+| 197 | `server/src/mobs/geometry.ts:unit` | value | 15 | 待补 |
+| 198 | `server/src/mobs/host.ts:MobHostWorld` | type | 2 | 待补 |
+| 199 | `server/src/mobs/host.ts:MobTickResult` | type | 2 | 待补 |
+| 200 | `server/src/mobs/spawner.ts:MOB_INSTANCE_SEP` | value | 2 | 待补 |
+| 201 | `server/src/mobs/spawner.ts:SpawnContext` | type | 2 | 待补 |
+| 202 | `server/src/mobs/spawner.ts:mobDefOf` | value | 9 | 待补 |
+| 203 | `server/src/mobs/spawner.ts:mobSpeciesId` | value | 8 | 待补 |
+| 204 | `server/src/mobs/spawner.ts:spawnsPerCheck` | value | 2 | 待补 |
+| 205 | `server/src/net/actions/item_source.ts:ownedItemIds` | value | 2 | 待补 |
+| 206 | `server/src/net/actions/material.ts:pickupItem` | value | 2 | 待补 |
+| 207 | `server/src/net/actions/modify_town.ts:modifyTown` | value | 2 | 待补 |
+| 208 | `server/src/net/actions/open_chest.ts:ItemStack` | type | 1 | 待补 |
+| 209 | `server/src/net/actions/open_chest.ts:ownChestContainers` | value | 2 | 待补 |
+| 210 | `server/src/net/actions/open_chest.ts:runChestAction` | value | 2 | 待补 |
+| 211 | `server/src/net/actions/plant_crop.ts:plantSeedAt` | value | 2 | 待补 |
+| 212 | `server/src/net/actions/types.ts:ActionHandler` | type | 47 | 无需(类型导出:函数类型别名无运行时可断言行为,47 处生产引用全是类型位;契约由注册表与各处理器判,见 WS-FND-154 FND154-1) |
+| 213 | `server/src/net/actions/use_alchemy_furnace.ts:forgetFurnaceClaims` | value | 2 | 待补 |
+| 214 | `server/src/net/actions/wire_edit.ts:wireEdit` | value | 2 | 待补 |
+| 215 | `server/src/net/anticheat.ts:Clock` | type | 24 | 待补 |
+| 216 | `server/src/net/anticheat.ts:InventoryCheckResult` | type | 2 | 待补 |
+| 217 | `server/src/net/anticheat.ts:InventoryOp` | type | 6 | 待补 |
+| 218 | `server/src/net/anticheat.ts:Verdict` | type | 3 | 待补 |
+| 219 | `server/src/net/anticheat.ts:Violation` | type | 3 | 待补 |
+| 220 | `server/src/net/anticheat.ts:mintItemSourceToken` | value | 2 | 待补 |
+| 221 | `server/src/net/room.ts:EffectValue` | type | 2 | 待补 |
+| 222 | `server/src/net/room.ts:ItemReadPort` | type | 5 | 待补 |
+| 223 | `server/src/net/schema.ts:removeBoss` | value | 2 | 待补 |
+| 224 | `server/src/net/schema.ts:removeWildlife` | value | 2 | 待补 |
+| 225 | `server/src/net/schema.ts:upsertBoss` | value | 2 | 待补 |
+| 226 | `server/src/net/ws_server.ts:startWsServer` | value | 3 | 待补 |
+| 227 | `server/src/party/actions.ts:REFEREE_DESK_STOP_MODE` | value | 3 | 待补 |
+| 228 | `server/src/party/modes.ts:BRIDGE_BOARD_ITEM_ID` | value | 3 | 待补 |
+| 229 | `server/src/party/modes.ts:PartyContest` | type | 3 | 待补 |
+| 230 | `server/src/party/modes.ts:PartyModeRuntime` | type | 2 | 待补 |
+| 231 | `server/src/party/scoring.ts:Broadcast` | type | 2 | 待补 |
+| 232 | `server/src/party/scoring.ts:Broadcaster` | type | 3 | 待补 |
+| 233 | `server/src/party/scoring.ts:PaintGrid` | type | 3 | 待补 |
+| 234 | `server/src/party/scoring.ts:RaceTimer` | type | 6 | 待补 |
+| 235 | `server/src/party/scoring.ts:RewardLine` | type | 3 | 待补 |
+| 236 | `server/src/party/scoring.ts:TeamKey` | type | 33 | 待补 |
+| 237 | `server/src/party/scoring.ts:TeamScore` | type | 2 | 待补 |
+| 238 | `server/src/party/scoring.ts:modeEndLine` | value | 6 | 待补 |
+| 239 | `server/src/party/scoring.ts:modeStartLine` | value | 2 | 待补 |
+| 240 | `server/src/party/scoring.ts:podiumBroadcast` | value | 2 | 待补 |
+| 241 | `server/src/party/scoring.ts:rankByDescending` | value | 2 | 待补 |
+| 242 | `server/src/physics/carry.ts:ChainNode` | type | 2 | 待补 |
+| 243 | `server/src/physics/carry.ts:JUMP_VZ` | value | 2 | 待补 |
+| 244 | `server/src/physics/carry.ts:ThrowResult` | type | 2 | 待补 |
+| 245 | `server/src/physics/world.ts:KNOCKBACK_STUN_SEC` | value | 2 | 待补 |
+| 246 | `server/src/physics/world.ts:StepReport` | type | 3 | 待补 |
+| 247 | `server/src/physics/world.ts:applyTimedBodyState` | value | 3 | 待补 |
+| 248 | `server/src/prank/actions.ts:CrownKnockOutcome` | type | 2 | 待补 |
+| 249 | `server/src/prank/actions.ts:PrankActionOutcome` | type | 2 | 待补 |
+| 250 | `server/src/prank/immunity.ts:EffectOrigin` | type | 2 | 待补 |
+| 251 | `server/src/prank/immunity.ts:ShieldResolution` | type | 2 | 待补 |
+| 252 | `server/src/prank/toys.ts:PrankToyDef` | type | 3 | 待补 |
+| 253 | `server/src/prank/toys.ts:ToyStateFlag` | type | 5 | 待补 |
+| 254 | `server/src/rooms/effects.ts:RoomEffectState` | type | 3 | 待补 |
+| 255 | `server/src/sim/world_debts.ts:WorldDebtRow` | type | 2 | 待补 |
+| 256 | `server/src/sim/world_sim.ts:WorldArchiveReceipt` | type | 3 | 待补 |
+| 257 | `server/src/sim/world_sim.ts:WorldArchiveRequest` | type | 2 | 待补 |
+| 258 | `server/src/sim/world_sim.ts:WorldArchiveSink` | type | 4 | 待补 |
+| 259 | `server/src/social/afk.ts:AfkPlayer` | type | 2 | 待补 |
+| 260 | `server/src/systems/alchemy_lab.ts:ALCHEMY_LAB_SYSTEM` | value | 2 | 待补 |
+| 261 | `server/src/systems/alchemy_lab.ts:BrewInput` | type | 3 | 待补 |
+| 262 | `server/src/systems/alchemy_lab.ts:BrewOutcome` | type | 3 | 待补 |
+| 263 | `server/src/systems/alchemy_lab.ts:Gallery` | type | 2 | 待补 |
+| 264 | `server/src/systems/alchemy_lab.ts:GalleryEntry` | type | 2 | 待补 |
+| 265 | `server/src/systems/depot.ts:BuyResult` | type | 2 | 待补 |
+| 266 | `server/src/systems/depot.ts:DEPOT_SYSTEM` | value | 2 | 待补 |
+| 267 | `server/src/systems/depot.ts:PriceTable` | type | 3 | 待补 |
+| 268 | `server/src/systems/greenhouse.ts:GREENHOUSE_SYSTEM` | value | 2 | 待补 |
+| 269 | `server/src/systems/greenhouse.ts:Weather` | value | 6 | 待补 |
+| 270 | `server/src/systems/idempotency.ts:mergeSettlementLedger` | value | 2 | 待补 |
+| 271 | `server/src/systems/idempotency.ts:settlementEntries` | value | 2 | 待补 |
+| 272 | `server/src/systems/intake.ts:roomSystemsPortOf` | value | 6 | 待补 |
+| 273 | `server/src/systems/ranch.ts:RANCH_SYSTEM` | value | 2 | 待补 |
+| 274 | `server/src/systems/ranch.ts:RanchAnimal` | type | 15 | 待补 |
+| 275 | `server/src/systems/ranch.ts:RanchDayResult` | type | 6 | 待补 |
+| 276 | `server/src/systems/ranch.ts:RanchOnceOutcome` | type | 2 | 待补 |
+| 277 | `server/src/systems/wiring.ts:CropCellState` | type | 3 | 待补 |
+| 278 | `server/src/systems/wiring.ts:GalleryDisplayRow` | type | 4 | 待补 |
+| 279 | `server/src/systems/wiring.ts:GrowInput` | type | 2 | 待补 |
+| 280 | `server/src/systems/wiring.ts:HarvestRow` | type | 6 | 待补 |
+| 281 | `server/src/systems/wiring.ts:gatherMulOf` | value | 1 | 待补 |
+| 282 | `server/src/systems/wiring.ts:producedItemIdOf` | value | 2 | 待补 |
+| 283 | `server/src/wiring/components.ts:SPEC_BY_KIND` | value | 2 | 待补 |
+| 284 | `server/src/wiring/graph.ts:ComponentContext` | type | 2 | 待补 |
+| 285 | `server/src/wiring/graph.ts:ComponentNode` | type | 6 | 待补 |
+| 286 | `server/src/wiring/graph.ts:registerComponentKind` | value | 41 | 待补 |
+| 287 | `server/src/wiring/logistics.ts:ARM_BATCH` | value | 2 | 待补 |
+| 288 | `server/src/wiring/logistics.ts:ArmState` | type | 2 | 待补 |
+| 289 | `server/src/wiring/logistics.ts:ConveyorState` | type | 2 | 待补 |
+| 290 | `server/src/wiring/logistics.ts:DIR_DX` | value | 6 | 待补 |
+| 291 | `server/src/wiring/logistics.ts:DIR_DY` | value | 6 | 待补 |
+| 292 | `server/src/wiring/logistics.ts:DrillState` | type | 2 | 待补 |
+| 293 | `server/src/wiring/logistics.ts:ItemStack` | value | 15 | 待补 |
+| 294 | `server/src/wiring/logistics.ts:LogisticsLine` | type | 6 | 待补 |
+| 295 | `server/src/wiring/logistics.ts:LogisticsTickReport` | type | 2 | 待补 |
+| 296 | `server/src/world/chunk.ts:CHUNK_W` | value | 4 | 待补 |
+| 297 | `server/src/world/chunk.ts:toBytes` | value | 3 | 待补 |
+| 298 | `server/src/world/fluid.ts:applyFluidAmounts` | value | 2 | 待补 |
 <!-- GEN:ROWS:END -->
 
 ## 3 导出普查(逐符号)
@@ -484,10 +501,10 @@ server/src/db/driver.sqlite.ts | t | none | SqlConnection VacuumReport
 server/src/db/memory_db.ts | v | behavior | FOREIGN_KEYS MemoryDb checkExprUnsupported checkPasses parseCheckExpr splitStatements
 server/src/db/memory_db.ts | v | none | blankComments splitTopLevel
 server/src/db/memory_db.ts | t | none | CheckExpr
-server/src/db/repo.ts | v | behavior | AccessMode BLOB_MAX_BYTES EquipSlot MAX_LEVEL MIGRATION_BASELINE_VERSION PartyMode RECONNECT_SNAPSHOT_MAX_BYTES ROOM_EVENT_LIST_FETCH_MAX ROOM_EVENT_LIST_MAX ROOM_EVENT_LIST_OVERFETCH ROOM_EVENT_RETAIN_LOW_WATER ROOM_EVENT_RETAIN_MAX RoomRole RoomStatus STARTING_INVENTORY_MIGRATION_VERSION STARTING_INVENTORY_TABLE STARTING_INVENTORY_VERSION TABLE_PRIMARY_KEYS WORLD_ARCHIVE_MIGRATION_VERSION WORLD_ARCHIVE_TABLE addItemInstance archiveWorldSnapshot badQuantityRowCount checksumOf chunksUpdatedSince claimStartingInventoryGrant clampInt consumeItem countStartingInventoryGrants countWorldArchives createRoom createUser eventIdRetryCount getRecipe getRoom getUser incrementCraftCount listEvents listItems listRooms listTopRecipes listWorldArchives loadChunk loadChunkCells loadReconnectSnapshot loadRoomMobMem loadVitalsFromUsers loadWorldArchive migrate migrateStartingInventory migrateWorldArchives migrateWorldArchivesIfInstalled packChunkBlob readMigrationRows readSchemaSql readStartingInventoryGrant readStartingInventorySql readWorldArchiveSql resetBadQuantityRowCount resetEventIdRetryCount saveChunk saveChunkBatch savePlayerState saveReconnectSnapshot saveRoomMobMem saveVitalsToUsers schemaSqlPath setPartyMode setRoomStatus startingInventoryMigrationInstalled totalItemsOf trimEvents unpackChunkBlob upsertRecipe upsertRoomPlayer worldArchiveSqlPath writeEvent
-server/src/db/repo.ts | v | none | MIGRATION_BASELINE_NAME SCHEMA_FILE_NAME STARTING_INVENTORY_MIGRATION_NAME STARTING_INVENTORY_SCHEMA_FILE_NAME WORLD_ARCHIVE_KEEP_PER_ROOM WORLD_ARCHIVE_MAX_BYTES WORLD_ARCHIVE_MIGRATION_NAME WORLD_ARCHIVE_SCHEMA_FILE_NAME assertChunkBlob assertMigrationVersionSupported clampIntQuiet knownMigrationVersions listRoomPlayers migrateStartingInventoryIfInstalled pruneWorldArchives releaseStartingInventoryGrant removeRoomPlayer startingInventorySqlPath touchRoom worldArchiveMigrationInstalled
+server/src/db/repo.ts | v | behavior | AccessMode BLOB_MAX_BYTES CHUNK_ROOFS_TABLE EquipSlot MAX_LEVEL MIGRATION_BASELINE_VERSION PartyMode RECONNECT_SNAPSHOT_MAX_BYTES ROOM_EVENT_LIST_FETCH_MAX ROOM_EVENT_LIST_MAX ROOM_EVENT_LIST_OVERFETCH ROOM_EVENT_RETAIN_LOW_WATER ROOM_EVENT_RETAIN_MAX ROOM_SYSTEMS_MIGRATION_VERSION ROOM_SYSTEMS_TABLE RoomRole RoomStatus STARTING_INVENTORY_MIGRATION_VERSION STARTING_INVENTORY_TABLE STARTING_INVENTORY_VERSION TABLE_PRIMARY_KEYS WORLD_ARCHIVE_MIGRATION_VERSION WORLD_ARCHIVE_TABLE addItemInstance archiveWorldSnapshot badQuantityRowCount checksumOf chunksUpdatedSince claimStartingInventoryGrant clampInt consumeItem countRoomChunks countStartingInventoryGrants countWorldArchives createRoom createUser eventIdRetryCount getRecipe getRoom getUser incrementCraftCount listEvents listItems listRooms listTopRecipes listWorldArchives loadChunk loadChunkCells loadChunkRoofs loadPlayerLedger loadPlayerSnapshots loadReconnectSnapshot loadRoomMobMem loadRoomSystemsState loadVitalsFromUsers loadWorldArchive loadWorldState migrate migrateStartingInventory migrateWorldArchives migrateWorldArchivesIfInstalled packChunkBlob readMigrationRows readSchemaSql readStartingInventoryGrant readStartingInventorySql readWorldArchiveSql resetBadQuantityRowCount resetEventIdRetryCount saveChunk saveChunkBatch saveChunkRoofs savePlayerState saveReconnectSnapshot saveRoomMobMem saveRoomSystemsState saveVitalsToUsers schemaSqlPath setPartyMode setRoomStatus startingInventoryMigrationInstalled totalItemsOf trimEvents unpackChunkBlob upsertRecipe upsertRoomPlayer worldArchiveSqlPath writeEvent
+server/src/db/repo.ts | v | none | MIGRATION_BASELINE_NAME PLAYER_LEDGER_ITEM_MAX PLAYER_LEDGER_TOTAL_KEY PLAYER_LEDGER_VERSION PLAYER_LEDGER_VERSION_KEY PLAYER_SNAPSHOT_MAX_TALENTS ROOFS_BLOB_MAX_BYTES ROOM_SYSTEMS_MAX_KEYS ROOM_SYSTEMS_MIGRATION_NAME ROOM_SYSTEMS_SCHEMA_FILE_NAME ROOM_SYSTEMS_STATE_VERSION ROOM_SYSTEMS_VERSION_KEY SCHEMA_FILE_NAME STARTING_INVENTORY_MIGRATION_NAME STARTING_INVENTORY_SCHEMA_FILE_NAME WORLD_ARCHIVE_KEEP_PER_ROOM WORLD_ARCHIVE_MAX_BYTES WORLD_ARCHIVE_MIGRATION_NAME WORLD_ARCHIVE_SCHEMA_FILE_NAME WORLD_PERSISTENCE_MIGRATION_NAME WORLD_PERSISTENCE_MIGRATION_VERSION WORLD_PERSISTENCE_SCHEMA_FILE_NAME WORLD_STATE_TABLE assertChunkBlob assertMigrationVersionSupported assertRoofsBlob clampIntQuiet countRoomChunkRoofs forgetRoomWorldSave knownMigrationVersions listRoomChunkCoords listRoomPlayers migrateRoomSystems migrateRoomSystemsIfInstalled migrateStartingInventoryIfInstalled migrateWorldPersistence pruneWorldArchives readRoomSystemsSql readWorldPersistenceSql releaseStartingInventoryGrant removeRoomPlayer roomSystemsMigrationInstalled roomSystemsSqlPath savePlayerLedgers savePlayerSnapshots saveWorldState startingInventorySqlPath touchRoom worldArchiveMigrationInstalled worldPersistenceInstalled worldPersistenceSqlPath
 server/src/db/repo.ts | t | behavior | DbLike ItemInstanceRecord RecipeRecord
-server/src/db/repo.ts | t | none | ChunkRecord EventWriteReport KeyParts MigrateResult MigrationRow OrderBy PlayerRecord RoomRecord Row StartingInventoryBootCheck StartingInventoryGrantRecord StartingInventoryMigrateResult VitalsSaveReport WorldArchiveBootCheck WorldArchiveMigrateResult WorldArchiveRecord WorldArchiveSummary WorldArchiveWriteResult
+server/src/db/repo.ts | t | none | ChunkRecord EventWriteReport KeyParts MigrateResult MigrationRow OrderBy PlayerLedgerRead PlayerLedgerSnapshot PlayerLedgerWriteReport PlayerRecord PlayerSnapshotRow RoomRecord RoomSystemsBootCheck RoomSystemsKeyEntry RoomSystemsMigrateResult RoomSystemsRead RoomSystemsSnapshot Row StartingInventoryBootCheck StartingInventoryGrantRecord StartingInventoryMigrateResult VitalsSaveReport WorldArchiveBootCheck WorldArchiveMigrateResult WorldArchiveRecord WorldArchiveSummary WorldArchiveWriteResult WorldPersistenceMigrateResult WorldStateRecord
 server/src/events/bus.ts | v | behavior | EventBus HISTORY_CAPACITY MAX_EVENTS_PER_FRAME MAX_HANDLERS_PER_EVENT MAX_REENTRY_DEPTH
 server/src/events/bus.ts | t | none | BusFrameStats DeliveryRecord EventHandler EventPayload GameEvent
 server/src/index.ts | v | behavior | DEFAULT_DB_PATH assemble createHost createServer resolveAssembly
@@ -580,7 +597,7 @@ server/src/net/room.colyseus.ts | v | behavior | NetPersistRoom deltaExclusions 
 server/src/net/room.colyseus.ts | v | none | USE_COLYSEUS_PATCH gameServerConfig patchEnabled
 server/src/net/room.colyseus.ts | t | behavior | NetPersistRoomOptions
 server/src/net/room.colyseus.ts | t | none | RoomCreateOptions
-server/src/net/room.ts | v | behavior | ACTION_PERMISSION AFK_TIMEOUT_MS AUTOSAVE_FRAME_INTERVAL AUTOSAVE_INTERVAL_MS IDLE_SLEEP_MS JOIN_TOKEN_MAX_TTL_MS JOIN_TOKEN_TTL_MS MAX_ACTIONS_PER_TICK MAX_PARTY_TIMER_SEC MEMBER_PRESENCE_LABEL MemberPresence PERMISSION_MATRIX RECONNECT_GRACE_MS RoomAction RoomRegistry RoomRuntime bootstrap can projectInventoryTotal projectPlayer
+server/src/net/room.ts | v | behavior | ACTION_PERMISSION AFK_TIMEOUT_MS AUTOSAVE_FRAME_INTERVAL AUTOSAVE_INTERVAL_MS EVENT_TRIM_INTERVAL_MS IDLE_SLEEP_MS JOIN_TOKEN_MAX_TTL_MS JOIN_TOKEN_TTL_MS MAX_ACTIONS_PER_TICK MAX_PARTY_TIMER_SEC MEMBER_PRESENCE_LABEL MemberPresence PERMISSION_MATRIX PLAYER_SNAPSHOT_INTERVAL_MS RECONNECT_GRACE_MS RoomAction RoomRegistry RoomRuntime bootstrap can projectInventoryTotal projectPlayer
 server/src/net/room.ts | v | none | EVICT_MS HEARTBEAT_TIMEOUT_MS SAVE_ERROR_LOG_MAX registryRoomIds signRoomToken verifyRoomToken
 server/src/net/room.ts | t | behavior | ActionOutcome ActionPayload EffectRecord PlayerProjection SimReadView WorldSaveHost
 server/src/net/room.ts | t | symbol-only | RoomRuntimeOptions
@@ -628,7 +645,7 @@ server/src/rooms/effects.ts | t | none | ElementResistSink RoomEffectInput RoomE
 server/src/sim/world_debts.ts | v | behavior | WORLD_DEBTS WORLD_DEBT_STATUS pendingBalanceRows worldDebtLedgerVerdict worldDebtOf worldDebtVerdict
 server/src/sim/world_debts.ts | t | none | WorldDebtEvidence WorldDebtRow WorldDebtStatus
 server/src/sim/world_sim.ts | v | behavior | FAST_PER_SLOW RESTORE_FAIL SIM_FAST_DT SIM_SLOW_DT WorldSim mulberry32
-server/src/sim/world_sim.ts | v | none | warnRadiusOf wireTelegraphShapeOf
+server/src/sim/world_sim.ts | v | none | WORLD_SAVE_FLUID_MAX_BYTES warnRadiusOf wireTelegraphShapeOf
 server/src/sim/world_sim.ts | t | none | MaterialApi PlayerProfile RestoreFailCode SimFrameReport WorldArchiveReceipt WorldArchiveRequest WorldArchiveSink WorldArchiveTrimReceipt WorldResetResult WorldSimOptions
 server/src/social/afk.ts | v | behavior | CROSS_ROOM_FEE_RATIO DEEP_SLEEP_AFTER_SEC DEW_FIRE_BONUS DEW_SEC_PER_UNIT DEW_TATAMI_BONUS DOZE_AFTER_SEC DOZE_STATE KITE_CATCH_PENALTY_MS MAILBOX_CAPACITY MAIL_TTL_SEC MARATHON_LENGTH STALL_ITEM_ID TRACK_KIND VIVARIUM VIVARIUM_CAMERA_SHOTS WHITE_NOISE_MIX afkExpRatio badgeFor buyFromStall createAfkPlayer createMailbox createStall createTrack createVivarium dewRatePerSec enterVivarium exitVivarium goBackground goForeground leaveMail likeMail listItem patDozing pruneMailbox suggestedPrice tickAfk tickVivarium trackCaught trackFinish trackPodiumText trackStandings trackStart whiteNoiseMasterGain
 server/src/social/afk.ts | v | none | BED_HP_PER_SEC CROSS_ROOM_MAX_QTY DEEP_SLEEP_MUL DEW_PAT_BONUS KITE_LENGTH MAILBOX_ITEM_ID MAIL_LIKE_BADGES STALL_SLOT_COUNT STICKER_COUNT SUGGESTED_PRICE_MUL assertSocialRefsClosed
@@ -644,6 +661,7 @@ server/src/systems/greenhouse.ts | v | none | CROP_PRODUCT_NAME_BY_CROP GREENHOU
 server/src/systems/greenhouse.ts | t | behavior | SortFilter
 server/src/systems/greenhouse.ts | t | none | CellGrowthInput CellGrowthResult CropCell
 server/src/systems/idempotency.ts | v | behavior | SETTLEMENT_LEDGER_CAPACITY SETTLEMENT_ROOMS claimSettlement createSettlementLedger settleKeyOf settlementKeyCount settlementSeenAt
+server/src/systems/idempotency.ts | v | none | mergeSettlementLedger settlementEntries
 server/src/systems/idempotency.ts | t | behavior | SettlementLedger
 server/src/systems/idempotency.ts | t | none | DaySettlementScope OrderSettlementScope SettlementClaim SettlementScope
 server/src/systems/intake.ts | v | behavior | SOWABLE_ITEM_IDS addPetToRanch addSortFilter sowableReasonOf
@@ -673,8 +691,9 @@ server/src/world/archive.ts | t | none | ArchiveChunk ArchiveFluidField ArchiveF
 server/src/world/chunk.ts | v | behavior | BARE_GROUND_MU Chunk DIRTY_BYTES DIRTY_WORDS EMPTY_TILE FLOOR_BURN_BY_SLOT FLOOR_DEFAULT_MU FLOOR_META FLOOR_MU_BY_SLOT FLOOR_PALETTE FLOOR_SLOT_MASK FLOOR_SPEED_MUL_BY_SLOT ROOF_BITS ROOF_CAPABLE ROOF_ID_MAX ROOF_META SPEED_MUL_DEFAULT VERTICAL_STACK assertRoofId chunkKey decodeRoofRle encodeRoofRle floorIdOfSlot floorMeta floorMu floorSlotOfId idx inChunkBounds isRoofId muOfSlot popcount32 roofAlphaOf roofSpanOf speedMulOfSlot worldToChunk
 server/src/world/chunk.ts | v | none | BUILDING_MAX BUILDING_MIN CHUNK_MASK CHUNK_SHIFT CHUNK_W DEFAULT_MU FLOOR_BASE_COUNT FLOOR_ID_MAX FLOOR_ID_MIN FLOOR_UGC_FIRST FLOOR_UGC_ID FLOOR_UGC_LAST LAYER_FIELD PACKED_LAYERS SurfaceKind VerticalLayer floorBurn toBytes
 server/src/world/chunk.ts | t | none | FloorMeta LayerSpec RoofMeta TileView WorldToChunk
-server/src/world/fluid.ts | v | behavior | CAP FLUID_CELL_BUDGET FLUID_FRAME_SECONDS FluidField FluidKind OBSIDIAN_ID PHASE_MIN_AMOUNT PUMICE_ID VISCOSITY_FLOW baseOfFluidKind fluidKindOfBase makeSealedPool
-server/src/world/fluid.ts | t | none | FluidCellInit FluidStepReport
+server/src/world/fluid.ts | v | behavior | CAP FLUID_CELL_BUDGET FLUID_FRAME_SECONDS FluidField FluidKind OBSIDIAN_ID PHASE_MIN_AMOUNT PUMICE_ID VISCOSITY_FLOW baseOfFluidKind fluidKindOfBase makeSealedPool packFluidAmounts readFluidAmounts
+server/src/world/fluid.ts | v | none | FLUID_AMOUNT_HEADER_BYTES FLUID_AMOUNT_MAGIC applyFluidAmounts
+server/src/world/fluid.ts | t | none | FluidAmountsBlob FluidCellInit FluidStepReport
 server/src/world/grid.ts | v | behavior | CanalResult DIR_NAMES DIR_VECTORS WorldGrid digToDeep findCanalIntakes isCanalIntake
 server/src/world/grid.ts | v | none | isInsideChunk
 server/src/world/grid.ts | t | none | GridStats TerrainSource

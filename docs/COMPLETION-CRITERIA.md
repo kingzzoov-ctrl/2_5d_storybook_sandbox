@@ -47,8 +47,12 @@
 | 21 | 并发公平与证据 | 达成(边界:单线程内以**注入交错**制造并发,不是真多进程调度;覆盖面只有「同帧动作预算」与「同库并发发放」两处) | `tests/WS-FND-135-hotpath-and-reap.test.ts` FND135-9/10(单帧预算 = **帧**预算、多连接共享不按连接分桶;被拒**计数 + 明细**就是证据面)· `tests/WS-FND-156-crossproc-idempotency.test.ts` FND156-6(两个实例共享一个库并发 join:一方赢 / 败方撤回首份 / 台账只留一行) | 2026-11-20 |
 | 22 | 性能预算入闸(性能回归有牙) | 达成 | `scripts/verify.ts` 的 `PERF_BUDGET*` 常量 + `judgePerfSample` / `runPerfBudgetCheck`(**进程内**接门禁);每条判据的正例 + 反例 + 「改预算常量立即反映」在 `tests/WS-FND-158-perf-budget.test.ts` | 2026-11-20 |
 | 23 | 起始背包「已发」跨进程幂等 | 达成(边界:无库模式 `db === null` 退化为**进程内账**,它自己就是那条唯一账,如实标出) | `tests/WS-FND-156-crossproc-idempotency.test.ts` FND156-1..9(库层台账 = 唯一的跨进程真值)· 实现面 `server/src/db/repo.ts`(发放台账 `user_starting_inventory`)+ `server/src/net/room.ts`(先查库 → 未领才发 → 发成功再写库,失败撤回) | 2026-11-20 |
+| 24 | 世界持久化(chunk 脏页 / 屋顶旁路 / 水位表落库 + 重启读回) | **未达成**(本轮门禁快照:`WS-FND-164` 套件尚未产出结果行、`tests/WS-FND-164` 有 TS2339;落库/读回接线进行中) | `tests/WS-FND-164-world-persistence.test.ts` + 实现/真值源 `server/src/db/schema_world_persistence.sql` · `server/src/db/repo.ts` §18 · `server/src/world/chunk.ts` 存档水位 · `server/src/world/fluid.ts` 水位表存档 | 2026-11-20(本轮快照) |
+| 25 | 跨进程幂等与经验(结算台账 + 玩家等级/经验快照) | **未达成**(本轮门禁快照:FND165-1/2/9/12 红;`exp=0` 说明击杀经验未落库) | `tests/WS-FND-165-restart-semantics.test.ts` + 实现/真值源 `server/src/db/schema_room_systems.sql` · `server/src/db/repo.ts` §17/§18 · `server/src/systems/idempotency.ts`(导出/合并)· `server/src/sim/world_sim.ts`(B1 落库口) | 2026-11-20(本轮快照) |
+| 26 | 触屏与窄屏可达(虚拟摇杆触屏 + 面板夹进视口) | **未达成**(本轮门禁快照:`WS-FND-166` 套件未落;`client/src/net/touch_intent.ts` / `client/src/ui/touch_bar.ts` 仍列「新增未登记不可达」) | `client/src/ui/panel_layout.ts#panelRectOf`(唯一一处夹取)· `client/src/net/touch_intent.ts` · `client/src/ui/touch_bar.ts`;判据套件 **WS-FND-166** 待落 | 2026-11-20(本轮快照) |
+| 27 | 连接超时与降级(连接/握手具名超时 + 重连指数退避 + 兜底致命出口) | 达成(边界:真机网络抖动未测,证据是桩 DOM / 纯函数) | `tests/WS-FND-167-resilience.test.ts`(17/17)+ 实现/真值源 `client/src/net/session.ts#CONNECT_TIMEOUT_MS` / `HANDSHAKE_TIMEOUT_MS` / `backoffDelayMs` · `client/src/main.ts#reportFatal` · `client/index.html` 非 module 兜底脚本 | 2026-11-20 |
 
-⇒ **判据:本表 23 项全部「达成」或「达成(边界)」才算完成。今天:20 项达成(其中 10 项带边界)/ 3 项未达成(#13 #14 #15)。**
+⇒ **判据:本表 27 项全部「达成」或「达成(边界)」才算完成。今天:21 项达成(其中 11 项带边界)/ 6 项未达成(#13 #14 #15 #24 #25 #26)。**
 
 ### 复算(三条命令,别抄数)
 

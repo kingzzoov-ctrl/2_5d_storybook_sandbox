@@ -185,11 +185,13 @@ export const WIRING_LEDGER: readonly WiringEntry[] = [
   {
     symbol: 'layoutRecipePanel',
     definedIn: 'client/src/ui/panel_layout.ts',
-    status: WiringStatus.BLOCKED,
-    callSites: 0,
-    reason: '它把配方树摆在**左上**(PANEL_MARGIN),而 `ui_binding.drawRecipe` 现在画在右上'
-      + '(`w - 320 - 16`)且与背包面板共享同一列。迁移位置是可见的布局变更,'
-      + '需要截图基线确认不与背包/画架重叠,本轮登记。',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: '★ 第十一轮(审计 WS-FND-121-12):本行此前写 blocked —— 「定义文件之外 0 处调用」'
+      + '在写它的时候是真的;本轮「触屏与窄屏」线把绘制层改成了**唯一出处**:'
+      + '`client/src/three/ui_binding.ts` 的 `const L = layoutRecipePanel(this.w, this.h, tree.nodeCount)`'
+      + '(命中检测与绘制读同一个 `L.panel`,修前两边各自手写 `w - 320 - 16` / 行高算式)。'
+      + '⇒ 按**实测**改成 wired(见证片段见 `WIRED_WITNESS`,判据 `tests/WS-FND-166` 也逐字读这一行)。',
   },
   {
     symbol: 'indentRecipeRows',
@@ -322,6 +324,10 @@ export const WIRED_WITNESS: Readonly<Record<string, string>> = {
   layoutBlueprintHud: 'layoutBlueprintHud(this.w, this.h, true)',
   rectVisible: 'rectVisible(box, this.w, this.h)',
   partyModeName: 'partyModeName(handle.store.state.meta.partyMode)',
+  /* ★ 第十一轮(审计 WS-FND-121-12):绘制层改成读 `layoutRecipePanel`(唯一
+     布局出处)⇒ 这一条从 blocked 翻成 wired。见证片段取**调用点**那一行,
+     而不是定义行 —— 定义行永远存在,等于没有声明「接上了」。 */
+  layoutRecipePanel: 'layoutRecipePanel(this.w, this.h, tree.nodeCount)',
   /* ★ 第十轮(WS-FND-138):四个补入口的构建器 + 两张新表 —— 见证片段取**调用点**,
      而不是定义行(定义行永远存在,等于没有声明"接上了")。 */
   breedTameRequest: 'return this.submit(breedTameRequest(input));',

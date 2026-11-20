@@ -33,6 +33,10 @@ import { EASEL_SIZE, PALETTE_SIZE } from './pixel_easel.ts';
    这里记一笔免得下次再放错。 */
 import { PITCH_BRICK_COLS, PITCH_BRICK_ROWS } from '../audio.ts';
 
+/* ★ WS-FND-166:`panelRectOf()` 要按 `UiPanel` 查表 —— 命中/绘制/「算不算按在 UI 上」
+   因此共用**同一批**布局函数(纯模块,零 DOM)。 */
+import { UiPanel } from './state_machine.ts';
+
 /** 面板矩形(CSS 像素) */
 export interface PanelRect {
   x: number;
@@ -41,9 +45,75 @@ export interface PanelRect {
   h: number;
 }
 
+/**
+ * ★ WS-FND-166:一个矩形**夹进视口**的结果 —— 全仓唯一一处做这件事。
+ *
+ * ## 为什么必须有它(实测踩过)
+ *
+ * 修前 5 个布局函数各写一份 `x = max(0, …)` / `y = max(0, …)`,而**尺寸**完全没夹:
+ * ``` 
+ * 音高面板   恒 16×26 + 32 = 448px 宽(360px 手机:右边界越界 88px)
+ * 画架面板   恒 336 + 32  = 368px 宽(360px 手机:越界 8px)
+ * 配方面板   这里写 300,绘制层另写 320 ⇒ 两处各算一份,窄屏从**左边界**出去
+ * ```
+ * 越界的后果不是"难看":命中测试 `inRect` 用的是同一个矩形 ⇒ 越界的那几列
+ * **数学上永远点不到**。而位置夹取只救边缘,救不了"比视口还大"的面板。
+ *
+ * ⇒ 现在:位置与尺寸都在本函数里夹,各布局函数只回答"内容想要多大"
+ * (`content`),绘制与命中读**同一个** `rect`。
+ *
+ * ## 返回值
+ * ```
+ * rect         夹取后的可用矩形(保证 x>=0, y>=0, x+w<=vw, y+h<=vh)
+ * content      内容**想要**的尺寸(未夹)—— 调用方据此画裁剪/滚动条
+ * scale        内容被等比压小的比例(1 = 没压)
+ * scrollable   内容比视口大 ⇒ 需要滚动(此时 scrollMax* 给出可滚动距离)
+ * ```
+ * 非法输入(`NaN` / 负数 / 0)一律当 1:让 `NaN` 流进 `fillRect` 的结果是
+ * 面板**整个消失**,而控制台一句话都不说。
+ */
+export interface FitRect {
+  rect: PanelRect;
+  content: { w: number; h: number };
+  scale: number;
+  scrollable: boolean;
+  scrollMaxX: number;
+  scrollMaxY: number;
+}
+
+/** 有限的数,否则退回 `fallback`(负对照:`NaN` / `Infinity` 不许流进布局)。 */
+function finiteOr(v: number, fallback: number): number {
+  return Number.isFinite(v) ? v : fallback;
+}
+
+/** 把一个矩形夹进 `viewportW × viewportH`(位置 + 尺寸,单一事实源)。 */
+export function fitPanelRect(r: PanelRect, viewportW: number, viewportH: number): FitRect {
+  const vw = Math.max(1, finiteOr(viewportW, 1));
+  const vh = Math.max(1, finiteOr(viewportH, 1));
+  const w = Math.max(1, finiteOr(r.w, 1));
+  const h = Math.max(1, finiteOr(r.h, 1));
+  const fw = Math.min(w, vw);
+  const fh = Math.min(h, vh);
+  const x = Math.min(Math.max(finiteOr(r.x, 0), 0), Math.max(0, vw - fw));
+  const y = Math.min(Math.max(finiteOr(r.y, 0), 0), Math.max(0, vh - fh));
+  return {
+    rect: { x, y, w: fw, h: fh },
+    content: { w, h },
+    scale: Math.min(1, vw / w, vh / h),
+    scrollable: w > vw + 0.5 || h > vh + 0.5,
+    scrollMaxX: Math.max(0, w - fw),
+    scrollMaxY: Math.max(0, h - fh),
+  };
+}
+
 /** 背包/配方面板几何 */
 export interface InventoryPanelLayout {
   panel: PanelRect;
+  /**
+   * 夹取结果(★ WS-FND-166)—— 绘制/命中读 `panel`,而"内容想要多大 / 会不会被裁"
+   * 在这一份里,**不另算**。
+   */
+  fit: FitRect;
   /** 标题栏 */
   title: PanelRect;
   /** 分类标签条(12 个分类) */
@@ -69,6 +139,16 @@ export const CELL_PX = 30;
  * 所以夹在这个下限:宁可面板略微超出,也不让格子小到不可用。
  */
 export const CELL_PX_MIN = 18;
+
+/**
+ * 格子尺寸的**硬下限**(★ WS-FND-166)。
+ *
+ * `CELL_PX_MIN`(18)是"点得准"的期望值,但它是**愿望**,不是几何约束:
+ * 10 行 × 18px + 106px = 286px,在 200px 高的浮窗里必然越界。
+ * ⇒ 真正的下限是 8(再小就不是"点不准"而是"点不到"),它之下才允许裁剪
+ * (`fitPanelRect().scrollable === true`)。
+ */
+export const CELL_PX_HARD_MIN = 8;
 /** 面板外边距 */
 export const PANEL_MARGIN = 16;
 /** 标题栏高度 */
@@ -90,7 +170,7 @@ export function layoutInventoryPanel(viewportW: number, viewportH: number): Inve
   const cols = SLOTS_PER_ROW;
   const rows = SLOTS_PER_PAGE_ROWS;
   /**
-   * 格子尺寸**随视口收窄**。
+   * 格子尺寸**随视口收窄** —— ★ WS-FND-166 起**两个方向都算**。
    *
    * ## 为什么不能固定 `CELL_PX`(实测踩过)
    *
@@ -98,23 +178,39 @@ export function layoutInventoryPanel(viewportW: number, viewportH: number): Inve
    * 但窄屏(如 360px)会**直接溢出屏幕右侧 150px** —— 格子画到视口外,
    * 指针也永远点不到那些格子(命中测试用的是同一份布局)。
    *
-   * 所以按可用宽度反算格子大小,并夹在 `[CELL_PX_MIN, CELL_PX]`:
-   * 桌面维持原尺寸不变,窄屏等比缩小以保证「面板始终在视口内」。
-   * 这与 `layoutFitsViewport` 的不变量一致,测试对 360/640/1920 三档都断言。
+   * ## 为什么还要看**高度**(第二轮审计 P1)
+   *
+   * 只看宽度的第二条:`10 行 × 20px + 106px = 306px`,在 360×300 的横屏/浮窗里
+   * 面板底部从**下边界**出去 —— 而"靠右下"给的 `y = Math.max(0, …)` 只救上边界。
+   * ⇒ 格子取 `min(按宽, 按高)`;宽度那一路仍以 `CELL_PX_MIN` 为期望下限,
+   *   真正的硬下限是 `CELL_PX_HARD_MIN`(8)。
    */
-  const avail = Math.max(1, viewportW - PANEL_MARGIN * 2);
-  const cell = Math.max(CELL_PX_MIN, Math.min(CELL_PX, Math.floor(avail / cols)));
+  const availW = Math.max(1, viewportW - PANEL_MARGIN * 2);
+  const availH = Math.max(1, viewportH - PANEL_MARGIN * 2 - TITLE_H - TAB_H - PAGER_H);
+  const byW = Math.floor(availW / cols);
+  const byH = Math.floor(availH / rows);
+  const cell = Math.max(CELL_PX_HARD_MIN, Math.min(Math.max(CELL_PX_MIN, Math.min(CELL_PX, byW)), byH));
   const gridW = cols * cell;
   const gridH = rows * cell;
   const w = gridW + PANEL_MARGIN * 2;
   const h = TITLE_H + TAB_H + gridH + PAGER_H + PANEL_MARGIN * 2;
-  /* 面板靠右下:左侧留给 HUD,中间留给世界 */
-  const x = Math.max(0, viewportW - w - PANEL_MARGIN);
-  const y = Math.max(0, viewportH - h - PANEL_MARGIN);
+  /* 面板靠右下:左侧留给 HUD,中间留给世界。
+     ★ 位置与**尺寸**一起夹(`fitPanelRect`):只夹位置救不了"比视口还大"的面板
+       (`content` / `scrollable` 因此也一起报出来,而不是让越界悄悄发生)。 */
+  const fit = fitPanelRect({
+    x: viewportW - w - PANEL_MARGIN,
+    y: viewportH - h - PANEL_MARGIN,
+    w,
+    h,
+  }, viewportW, viewportH);
+  const panel = fit.rect;
+  const x = panel.x;
+  const y = panel.y;
   const gridX = x + PANEL_MARGIN;
   const gridY = y + PANEL_MARGIN + TITLE_H + TAB_H;
   return {
-    panel: { x, y, w, h },
+    panel,
+    fit,
     title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: gridW, h: TITLE_H },
     tabStrip: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN + TITLE_H, w: gridW, h: TAB_H },
     cell,
@@ -157,18 +253,47 @@ export interface RecipeRowLayout {
 export const RECIPE_ROW_H = 20;
 /** 每级缩进 */
 export const RECIPE_INDENT_PX = 16;
+/**
+ * 配方树最多画几行(★ WS-FND-166:绘制层与 `panelRectOf` 共用这一个上限)。
+ *
+ * 修前绘制层写死 `Math.min(20, tree.nodeCount)`,而布局默认 18 ⇒ 面板高矮两个口径。
+ */
+export const RECIPE_MAX_ROWS = 20;
+/**
+ * 配方面板**底部信息带**的高度(加工台 + 节点/深度两行)。
+ *
+ * ★ WS-FND-166:修前这两行画在 `panel.y + h - 42` / `- 24`,而 `h` 是绘制层
+ * 自己拼的 `30 + rows*18 + 74` —— 与布局那条路**两套高度**。现在高度只有布局一处,
+ * 底部带显式留出来(`h − (标题 + 行区)` 恒 ≥ `RECIPE_FOOTER_H`)。
+ */
+export const RECIPE_FOOTER_H = 40;
+
+/**
+ * 配方面板**宽度上限**(★ WS-FND-166)。
+ *
+ * 修前是两处各写一份:本文件写 300,而绘制层(`three/ui_binding.ts` 的 `drawRecipe`)
+ * 另写 `w = 320` 且从**右边界**贴边 ⇒ 在视口 < 336 时面板从**左边界**出去,
+ * 而命中用的是本文件那一份 ⇒ 画出来的地方点不到、点得到的地方没画。
+ * 现在只有这一处:绘制与命中都读 `layoutRecipePanel().panel`。
+ */
+export const RECIPE_PANEL_W_MAX = 320;
+/** 配方面板宽度下限(再窄就装不下"· 名字 ×N"这一行) */
+export const RECIPE_PANEL_W_MIN = 160;
 
 /**
  * 配方树的左侧面板几何。
  *
  * 行数由调用方给的节点数决定(`buildRecipeTree().nodeCount` 或 `flattenTree().length`),
  * 所以本函数不假设固定行数 —— 配方深度是数据驱动的。
+ *
+ * ★ WS-FND-166:宽度按视口算(`[RECIPE_PANEL_W_MIN, RECIPE_PANEL_W_MAX]`),
+ * 行数再按**可用高度**反算,最后整块夹进视口 —— 于是窄屏不会"从左边出去"。
  */
 export function layoutRecipePanel(
   viewportW: number,
   viewportH: number,
   nodeCount: number,
-  maxVisibleRows = 18,
+  maxVisibleRows = RECIPE_MAX_ROWS,
 ): {
   panel: PanelRect;
   title: PanelRect;
@@ -177,23 +302,36 @@ export function layoutRecipePanel(
   scrollable: boolean;
 } {
   const n = Math.max(0, Math.trunc(nodeCount));
-  const visibleRows = Math.max(1, Math.min(maxVisibleRows, n));
-  const w = 300;
-  const h = TITLE_H + visibleRows * RECIPE_ROW_H + PANEL_MARGIN * 2;
-  /* 靠左上,与右下角的背包错开 */
-  const x = PANEL_MARGIN;
-  const y = PANEL_MARGIN;
+  /* 可用高度只留给"行区" —— 标题与上下边距是固定的 */
+  const availRows = Math.max(1, Math.floor(
+    (viewportH - PANEL_MARGIN * 2 - TITLE_H - RECIPE_FOOTER_H) / RECIPE_ROW_H,
+  ));
+  const visibleRows = Math.max(1, Math.min(maxVisibleRows, Math.max(1, n), availRows));
+  const w = Math.max(
+    RECIPE_PANEL_W_MIN,
+    Math.min(RECIPE_PANEL_W_MAX, viewportW - PANEL_MARGIN * 2),
+  );
+  const h = TITLE_H + visibleRows * RECIPE_ROW_H + RECIPE_FOOTER_H + PANEL_MARGIN * 2;
+  /* 靠左上,与右下角的背包错开;位置与尺寸一起夹(与其它面板同一条口径) */
+  const panel = fitPanelRect({
+    x: PANEL_MARGIN,
+    y: PANEL_MARGIN,
+    w,
+    h,
+  }, viewportW, viewportH).rect;
+  const x = panel.x;
+  const y = panel.y;
   const rows: RecipeRowLayout[] = [];
   for (let i = 0; i < visibleRows; i += 1) {
     rows.push({
-      rect: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN + TITLE_H + i * RECIPE_ROW_H, w: w - PANEL_MARGIN * 2, h: RECIPE_ROW_H },
+      rect: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN + TITLE_H + i * RECIPE_ROW_H, w: panel.w - PANEL_MARGIN * 2, h: RECIPE_ROW_H },
       depth: 0,
       indent: 0,
     });
   }
   return {
-    panel: { x, y, w, h: Math.min(h, viewportH - PANEL_MARGIN * 2) },
-    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: w - PANEL_MARGIN * 2, h: TITLE_H },
+    panel,
+    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: panel.w - PANEL_MARGIN * 2, h: TITLE_H },
     rows,
     visibleRows,
     scrollable: n > visibleRows,
@@ -217,6 +355,8 @@ export function indentRecipeRows(rows: readonly RecipeRowLayout[], depths: reado
 
 export interface EaselPanelLayout {
   panel: PanelRect;
+  /** ★ WS-FND-166:夹取结果(`panel` 与"内容想要多大"都在这一份里) */
+  fit: FitRect;
   title: PanelRect;
   /** 16×16 画布 */
   canvas: PanelRect;
@@ -233,31 +373,66 @@ export interface EaselPanelLayout {
 export const PALETTE_COLS = 8;
 export const PALETTE_ROWS_UI = 4;
 
+/**
+ * 像素画架几何。
+ *
+ * ## 面板宽度**必须能装下工具条那一行文字**(不改的理由,实测踩过)
+ *
+ * 初版是 `max(224, 176) + 32 = 256`,但工具条文字
+ * `[Z] 撤销(64)  [Y] 重做(0)  [X] 清空  [C] 填充` 在 12px 等宽字体下约 317px ——
+ * 直接**溢出到面板外面**(截图实测:字飘在草地上)。所以宽度取三者最大值加内边距:
+ * 画布、调色盘、**工具条文字预留**(见 `EASEL_TOOLBAR_RESERVE_PX`)。
+ *
+ * ## ★ WS-FND-166:尺寸随视口缩放(修前恒 368×416)
+ *
+ * 修前面板恒 368px 宽,360px 的手机上右边界越界 8px;矮屏(360×360)时高度也越界。
+ * 而命中用**同一个矩形** ⇒ 越界的那部分不是"难点",是**点不到**。
+ * ⇒ 现在:图素边长 / 调色格边长 / 工具条预留都按可用宽高等比缩,
+ *   画布再按剩余高度二次夹(宁可画布小,也不让工具条被裁掉)。
+ */
 export function layoutEaselPanel(viewportW: number, viewportH: number): EaselPanelLayout {
-  const pixel = 14;
-  const canvasSize = pixel * EASEL_SIZE;
-  const palCell = 22;
+  const availW = Math.max(1, viewportW - PANEL_MARGIN * 2);
+  const availH = Math.max(1, viewportH - PANEL_MARGIN * 2);
+  /** 设计档下的自然宽度(工具条预留 + 两侧边距) */
+  const naturalW = EASEL_TOOLBAR_RESERVE_PX + PANEL_MARGIN * 2;
+  const wScale = Math.min(1, availW / naturalW);
+  const palCell = Math.max(
+    EASEL_PALETTE_CELL_MIN,
+    Math.min(EASEL_PALETTE_CELL_PX, Math.floor(EASEL_PALETTE_CELL_PX * wScale)),
+  );
   const palW = PALETTE_COLS * palCell;
-  /**
-   * 面板宽度**必须能装下工具条那一行文字**。
-   *
-   * ## 为什么不能取 `max(canvas, palette)`
-   *
-   * 初版是 `max(224, 176) + 32 = 256`,但工具条文字
-   * `[Z] 撤销(64)  [Y] 重做(0)  [X] 清空  [C] 填充` 在 12px 等宽字体下约 317px ——
-   * 直接**溢出到面板外面**(截图实测:字飘在草地上)。
-   *
-   * 所以宽度取三者的最大值加内边距:画布、调色盘、**加上工具条文字预留**。
-   * 这个数改了要让工具条排版跟着变 —— 见 `toolbarTextWidthPx`。
-   */
-  const toolbarReserve = EASEL_TOOLBAR_RESERVE_PX;
-  const w = Math.max(canvasSize, palW, toolbarReserve) + PANEL_MARGIN * 2;
-  const h = TITLE_H + canvasSize + PANEL_MARGIN + PALETTE_ROWS_UI * palCell + 28 + PANEL_MARGIN * 2;
-  const x = Math.max(0, Math.round((viewportW - w) / 2));
-  const y = Math.max(0, Math.round((viewportH - h) / 2));
+  const toolbarReserve = Math.max(
+    EASEL_TOOLBAR_RESERVE_MIN,
+    Math.round(EASEL_TOOLBAR_RESERVE_PX * wScale),
+  );
+  /* 高度:标题 + 画布 + 间隔 + 调色盘 + 工具条 + 外侧 —— 画布最多能占多少 */
+  const fixedH = TITLE_H + PANEL_MARGIN + EASEL_TOOLBAR_H + PANEL_MARGIN * 2;
+  const maxCanvasH = Math.max(
+    EASEL_PIXEL_MIN * EASEL_SIZE,
+    availH - fixedH - PALETTE_ROWS_UI * palCell,
+  );
+  const pixel = Math.max(EASEL_PIXEL_MIN, Math.min(
+    EASEL_PIXEL_PX,
+    Math.floor((EASEL_PIXEL_PX * availW) / naturalW),
+    Math.floor(maxCanvasH / EASEL_SIZE),
+  ));
+  const canvasSize = pixel * EASEL_SIZE;
+  const w = Math.min(availW, Math.max(canvasSize, palW, toolbarReserve) + PANEL_MARGIN * 2);
+  const h = TITLE_H + canvasSize + PANEL_MARGIN + PALETTE_ROWS_UI * palCell
+    + EASEL_TOOLBAR_H + PANEL_MARGIN * 2;
+  const fit = fitPanelRect({
+    x: Math.round((viewportW - w) / 2),
+    y: Math.round((viewportH - h) / 2),
+    w,
+    h,
+  }, viewportW, viewportH);
+  const panel = fit.rect;
+  const x = panel.x;
+  const y = panel.y;
   return {
-    panel: { x, y, w, h },
-    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: w - PANEL_MARGIN * 2, h: TITLE_H },
+    panel,
+    fit,
+    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: panel.w - PANEL_MARGIN * 2, h: TITLE_H },
     canvas: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN + TITLE_H, w: canvasSize, h: canvasSize },
     pixel,
     palette: {
@@ -270,8 +445,8 @@ export function layoutEaselPanel(viewportW: number, viewportH: number): EaselPan
     toolbar: {
       x: x + PANEL_MARGIN,
       y: y + PANEL_MARGIN + TITLE_H + canvasSize + PANEL_MARGIN + PALETTE_ROWS_UI * palCell,
-      w: w - PANEL_MARGIN * 2,
-      h: 28,
+      w: panel.w - PANEL_MARGIN * 2,
+      h: EASEL_TOOLBAR_H,
     },
   };
 }
@@ -284,6 +459,19 @@ export function layoutEaselPanel(viewportW: number, viewportH: number): EaselPan
  * 「各面板宽度 ≥ 其最长文字所需宽度」而不必重复那个魔数。
  */
 export const EASEL_TOOLBAR_RESERVE_PX = 336;
+
+/** 图素边长**设计档**(1280 宽桌面;窄屏按可用宽度等比缩) */
+export const EASEL_PIXEL_PX = 14;
+/** 图素边长硬下限(再小就不是"像素画",而是噪声) */
+export const EASEL_PIXEL_MIN = 4;
+/** 调色格边长设计档 */
+export const EASEL_PALETTE_CELL_PX = 22;
+/** 调色格边长硬下限(拇指仍点得到) */
+export const EASEL_PALETTE_CELL_MIN = 6;
+/** 工具条行高(标题下方那一行 [Z]/[Y]/[X]/[C]) */
+export const EASEL_TOOLBAR_H = 28;
+/** 工具条文字预留的**最小**宽度(窄屏等比缩之后的兜底) */
+export const EASEL_TOOLBAR_RESERVE_MIN = 120;
 
 /** 调色盘第 `i` 色的矩形(索引夹紧到 [0,PALETTE_SIZE)) */
 export function paletteRect(layout: EaselPanelLayout, index: number): PanelRect {
@@ -302,10 +490,12 @@ export function paletteRect(layout: EaselPanelLayout, index: number): PanelRect 
 
 export interface PitchPanelLayout {
   panel: PanelRect;
+  /** ★ WS-FND-166:夹取结果(绘制/命中读 `panel`,越界与否读这一份) */
+  fit: FitRect;
   title: PanelRect;
   /** 32 个音高砖(2 行 × 16 列) */
   bricks: PanelRect[];
-  /** 每块尺寸 */
+  /** 每块尺寸(★ WS-FND-166:**随视口收窄**,不再是恒定的 `BRICK_W`) */
   brickW: number;
   brickH: number;
   /**
@@ -319,6 +509,14 @@ export interface PitchPanelLayout {
 
 export const BRICK_W = 26;
 export const BRICK_H = 34;
+/**
+ * 砖宽的**硬下限**(★ WS-FND-166)。
+ *
+ * 修前砖宽恒 26 ⇒ 面板恒 `16×26 + 32 = 448px`;360px 的手机上右边界越界 88px,
+ * 而命中用同一个矩形 ⇒ 右侧 3 列**数学上点不到**。窄屏时必须能缩到 18(实测的
+ * 360px 档),10 是"再小就不值得画"的那条线。
+ */
+export const PITCH_BRICK_W_MIN = 10;
 /** 底部信息行高度(必须计入 `panel.h`,否则会与砖块重叠) */
 export const PITCH_FOOTER_H = 22;
 /**
@@ -331,7 +529,19 @@ export const PITCH_BOTTOM_CLEARANCE = 56;
 
 export function layoutPitchPanel(viewportW: number, viewportH: number): PitchPanelLayout {
   const total = PITCH_BRICK_COLS * PITCH_BRICK_ROWS;
-  const w = PITCH_BRICK_COLS * BRICK_W + PANEL_MARGIN * 2;
+  /**
+   * ★ WS-FND-166:砖宽**随视口收窄**(修前是恒定的 `BRICK_W`)。
+   *
+   * 越界不是"难看":`inRect` 用的是**同一个**矩形 ⇒ 右边界外的那几列
+   * 不是"难点",是**点不到**。所以面板宽度必须 ≤ 视口可用宽度。
+   */
+  const availW = Math.max(1, viewportW - PANEL_MARGIN * 2 * 2);
+  const brickW = Math.max(
+    PITCH_BRICK_W_MIN,
+    Math.min(BRICK_W, Math.floor(availW / PITCH_BRICK_COLS)),
+  );
+  const gridW = PITCH_BRICK_COLS * brickW;
+  const w = Math.min(Math.max(1, viewportW - PANEL_MARGIN * 2), gridW + PANEL_MARGIN * 2);
   /**
    * 高度**要为底部那行「已选 N 档」留位置**。
    *
@@ -345,31 +555,40 @@ export function layoutPitchPanel(viewportW: number, viewportH: number): PitchPan
    * 让绘制方按 `footer` 定位而不是自己用 `panel.h - 20` 猜。
    */
   const h = TITLE_H + PITCH_BRICK_ROWS * BRICK_H + PITCH_FOOTER_H + PANEL_MARGIN * 2;
-  const x = Math.max(0, Math.round((viewportW - w) / 2));
-  /* 距底部留出 `PITCH_BOTTOM_CLEARANCE`,让开 index.html 里的 `#hint` 提示条 —— 
-     只留 PANEL_MARGIN 会正好压在提示条上(截图实测)。 */
-  const y = Math.max(0, viewportH - h - PITCH_BOTTOM_CLEARANCE);
+  /* 距底部留出 `PITCH_BOTTOM_CLEARANCE`,让开 index.html 里的 `#hint` 提示条 ——
+     只留 PANEL_MARGIN 会正好压在提示条上(截图实测)。位置与尺寸一起夹:
+     矮视口时 `viewportH - h - CLEARANCE` 是负的,夹取之后面板仍在屏内。 */
+  const fit = fitPanelRect({
+    x: Math.round((viewportW - w) / 2),
+    y: viewportH - h - PITCH_BOTTOM_CLEARANCE,
+    w,
+    h,
+  }, viewportW, viewportH);
+  const panel = fit.rect;
+  const x = panel.x;
+  const y = panel.y;
   const bricks: PanelRect[] = [];
   for (let i = 0; i < total; i += 1) {
     const row = Math.floor(i / PITCH_BRICK_COLS);
     const col = i % PITCH_BRICK_COLS;
     bricks.push({
-      x: x + PANEL_MARGIN + col * BRICK_W,
+      x: x + PANEL_MARGIN + col * brickW,
       y: y + PANEL_MARGIN + TITLE_H + row * BRICK_H,
-      w: BRICK_W,
+      w: brickW,
       h: BRICK_H,
     });
   }
   return {
-    panel: { x, y, w, h },
-    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: w - PANEL_MARGIN * 2, h: TITLE_H },
+    panel,
+    fit,
+    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: gridW, h: TITLE_H },
     bricks,
-    brickW: BRICK_W,
+    brickW,
     brickH: BRICK_H,
     footer: {
       x: x + PANEL_MARGIN,
       y: y + PANEL_MARGIN + TITLE_H + PITCH_BRICK_ROWS * BRICK_H,
-      w: w - PANEL_MARGIN * 2,
+      w: gridW,
       h: PITCH_FOOTER_H,
     },
   };
@@ -391,15 +610,18 @@ export function brickRect(layout: PitchPanelLayout, p: number): PanelRect | null
  * 这里只回答「把它摆在屏幕上方哪里」——
  * 所以两个函数是**顺序关系**而非重复:`layoutHpBar(Hp, hp, viewportW, phases)` 拿到
  * 条内布局,本函数给它的可视区域。
+ *
+ * ★ WS-FND-166:与其它面板走**同一条**夹取 —— `max(120, …)` 那个硬下限
+ * 在超窄视口(如 100px 浮窗)下会让条子从右边出去,而它同样是可点的区域。
  */
 export function layoutBossHudBand(viewportW: number, viewportH: number): PanelRect {
   const w = Math.min(HP_BAR_WIDTH, Math.max(120, viewportW - 80));
-  return {
+  return fitPanelRect({
     x: (viewportW - w) / 2,
     y: HP_BAR_TOP_MARGIN,
     w,
     h: HP_BAR_HEIGHT,
-  };
+  }, viewportW, viewportH).rect;
 }
 
 /** 血条可视区是否宽到能显示阶段名(太窄就只画条) */
@@ -420,7 +642,13 @@ export function layoutBlueprintHud(viewportW: number, viewportH: number, hasSele
   const w = 260;
   const h = 26;
   return {
-    hint: { x: Math.round((viewportW - w) / 2), y: viewportH - h - 44, w, h },
+    /* ★ WS-FND-166:同一条夹取 —— 260px 的提示条在窄屏上会从左边出去 */
+    hint: fitPanelRect({
+      x: Math.round((viewportW - w) / 2),
+      y: viewportH - h - 44,
+      w,
+      h,
+    }, viewportW, viewportH).rect,
     visible: hasSelection,
   };
 }
@@ -451,6 +679,8 @@ export function layoutFitsViewport(l: { panel: PanelRect }, viewportW: number, v
  */
 export interface PartyPanelLayout {
   panel: PanelRect;
+  /** ★ WS-FND-166:夹取结果(与其它面板同一条口径) */
+  fit: FitRect;
   title: PanelRect;
   /** 每行高度(行内两行文字:名字 / 规则) */
   rowH: number;
@@ -468,6 +698,13 @@ export interface PartyPanelLayout {
 export const PARTY_PANEL_W = 520;
 /** 一行的高度(名字一行 + 规则一行) */
 export const PARTY_ROW_H = 46;
+/**
+ * 模式面板最多画几行(★ WS-FND-166)。
+ *
+ * 绘制层与 `panelRectOf()` **共用这一个上限** —— 否则"按在面板空白处算不算 UI"
+ * 会用另一个高度算,而那正是「单指拖背包时角色同时走路」的形态。
+ */
+export const PARTY_MAX_ROWS = 8;
 /** 底部提示条高度 */
 export const PARTY_FOOTER_H = 22;
 
@@ -475,7 +712,7 @@ export function layoutPartyPanel(
   viewportW: number,
   viewportH: number,
   rowCount: number,
-  maxVisibleRows = 8,
+  maxVisibleRows = PARTY_MAX_ROWS,
 ): PartyPanelLayout {
   const n = Math.max(0, Math.trunc(Number.isFinite(rowCount) ? rowCount : 0));
   const availH = viewportH - PANEL_MARGIN * 2 - TITLE_H - PARTY_FOOTER_H;
@@ -483,27 +720,37 @@ export function layoutPartyPanel(
   const visibleRows = Math.max(1, Math.min(Math.max(1, maxVisibleRows), Math.max(1, n), Math.max(1, byH)));
   const w = Math.max(180, Math.min(PARTY_PANEL_W, viewportW - PANEL_MARGIN * 2));
   const h = TITLE_H + visibleRows * PARTY_ROW_H + PARTY_FOOTER_H + PANEL_MARGIN * 2;
-  /* 居中:它是"做决定"的面板,不该贴在角落(背包在右下、配方在左上)。 */
-  const x = Math.max(0, Math.round((viewportW - w) / 2));
-  const y = Math.max(0, Math.round((viewportH - h) / 2));
+  /* 居中:它是"做决定"的面板,不该贴在角落(背包在右下、配方在左上)。
+     ★ WS-FND-166:位置与**尺寸**一起夹 —— 超窄视口下 `max(180, …)` 那个下限会让
+     面板从右边出去,而命中用同一个矩形(`inRect`)。 */
+  const fit = fitPanelRect({
+    x: Math.round((viewportW - w) / 2),
+    y: Math.round((viewportH - h) / 2),
+    w,
+    h,
+  }, viewportW, viewportH);
+  const panel = fit.rect;
+  const x = panel.x;
+  const y = panel.y;
   const rows: PanelRect[] = [];
   for (let i = 0; i < visibleRows; i += 1) {
     rows.push({
       x: x + PANEL_MARGIN,
       y: y + PANEL_MARGIN + TITLE_H + i * PARTY_ROW_H,
-      w: w - PANEL_MARGIN * 2,
+      w: panel.w - PANEL_MARGIN * 2,
       h: PARTY_ROW_H,
     });
   }
   return {
-    panel: { x, y, w, h },
-    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: w - PANEL_MARGIN * 2, h: TITLE_H },
+    panel,
+    fit,
+    title: { x: x + PANEL_MARGIN, y: y + PANEL_MARGIN, w: panel.w - PANEL_MARGIN * 2, h: TITLE_H },
     rowH: PARTY_ROW_H,
     rows,
     footer: {
       x: x + PANEL_MARGIN,
       y: y + PANEL_MARGIN + TITLE_H + visibleRows * PARTY_ROW_H,
-      w: w - PANEL_MARGIN * 2,
+      w: panel.w - PANEL_MARGIN * 2,
       h: PARTY_FOOTER_H,
     },
     visibleRows,
@@ -516,4 +763,42 @@ export function partyRowRect(layout: PartyPanelLayout, i: number): PanelRect | n
   const k = Math.trunc(Number.isFinite(i) ? i : -1);
   if (k < 0 || k >= layout.rows.length) return null;
   return layout.rows[k]!;
+}
+
+/**
+ * ★ WS-FND-166:面板容器矩形 —— 绘制 / 命中 / 「这一下算不算按在 UI 上」的**唯一**入口。
+ *
+ * ## 为什么必须是入口而不是各调用点自己算
+ *
+ * 修前有三条路各算各的:
+ * ```
+ * ui_binding.drawInventory   用 resize 时缓存的 this.inv
+ * ui_binding.hit             用 lastInvLayout(绘制时存的)或 this.inv
+ * boot.onPointerDown         只看 ui.hit() 的**格子级**结果 ⇒ 按在面板空白处返回
+ *                            'none' ⇒ 摇杆 / 世界拖动照常拿到这一下
+ * ```
+ * 第三条正是实测的「单指拖背包时角色同时走路」—— 两条监听各自都"工作正常"。
+ * 判定必须能在 node 里断言,所以它落在本模块(纯、零 DOM),而不是事件回调里。
+ *
+ * ## 参数
+ *
+ * `recipeNodes` / `partyRows` 决定那两个**行数驱动**的布局有多高;不传时给保守上界
+ * (与绘制层的上限同款)⇒ 「按在面板上」判得更宽一点,而不是漏判
+ * (漏判的那一下会**同时**走路)。
+ */
+export function panelRectOf(
+  panel: UiPanel,
+  viewportW: number,
+  viewportH: number,
+  recipeNodes = RECIPE_MAX_ROWS,
+  partyRows = PARTY_MAX_ROWS,
+): PanelRect | null {
+  switch (panel) {
+    case UiPanel.INVENTORY: return layoutInventoryPanel(viewportW, viewportH).panel;
+    case UiPanel.RECIPE_TREE: return layoutRecipePanel(viewportW, viewportH, recipeNodes).panel;
+    case UiPanel.PIXEL_EASEL: return layoutEaselPanel(viewportW, viewportH).panel;
+    case UiPanel.PITCH_EDITOR: return layoutPitchPanel(viewportW, viewportH).panel;
+    case UiPanel.PARTY: return layoutPartyPanel(viewportW, viewportH, partyRows).panel;
+    default: return null;
+  }
 }

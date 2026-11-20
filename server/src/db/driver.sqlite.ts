@@ -47,6 +47,9 @@ import {
   TABLE_PRIMARY_KEYS,
   migrate,
   migrateStartingInventoryIfInstalled,
+  /* ★ WS-FND-165:房间系统台账(结算幂等键集)的启动漂移检查 —— 与上面两段同一处置。 */
+  migrateRoomSystemsIfInstalled,
+  type RoomSystemsBootCheck,
   migrateWorldArchives,
   migrateWorldArchivesIfInstalled,
   schemaSqlPath,
@@ -193,6 +196,17 @@ export class SqliteDb implements DbLike {
         + '台账判「已领」靠的是这张表,带着不确定的结构跑起来会重复发或永不发',
       );
     }
+    /* ★ WS-FND-165(B1):房间系统台账的启动检查(装过才查)。
+       同一处置:这张表记的是「哪几张单已结算 / 房内第几天」,它的 DDL 漂移会让
+       「已结算」判断建在一个没人核对过的结构上 ⇒ 拒绝启动,而不是等到某次成交。 */
+    const rs = this.checkRoomSystems(nowMs);
+    if (rs.drift && failClosed) {
+      throw new Error(
+        'room_systems_state 的迁移 checksum 漂移(schema_room_systems.sql 被改过,'
+        + '而库里的表没跟着改)⇒ 拒绝启动(fail-closed):'
+        + '结算幂等靠的是这张表,带着不确定的结构跑起来会让同一张订单再成交一次',
+      );
+    }
     /* ★ 审计 P2 维护位:启动期检查一次「库是否已经膨胀到该重写」。
        结果落在 `this.lastVacuum` 上 —— 「有没有做、为什么没做」必须可观测。
        注意 VACUUM 是整库重写,**只**在启动期做,不挂写入路径。 */
@@ -202,6 +216,17 @@ export class SqliteDb implements DbLike {
   /** 归档迁移的启动检查(装过才查;返回值可观测,便于装配层记录/判定)。 */
   checkWorldArchives(nowMs: number): WorldArchiveBootCheck {
     return migrateWorldArchivesIfInstalled(this, nowMs);
+  }
+
+  /**
+   * ★ WS-FND-165(B1):房间系统台账迁移的启动检查(装过才查;返回值可观测)。
+   *
+   * 装过 ⇒ 幂等 DDL + checksum 漂移判定(漂移在 `bootstrap` 里 fail-closed);
+   * 没装过 ⇒ **不建那张表**(全新库不许在这里多出第 10 张表 —— 建表数被既有判据锁着),
+   * 它由第一次存档房间系统状态时就地补上(`saveRoomSystemsState` → `migrateRoomSystems`)。
+   */
+  checkRoomSystems(nowMs: number): RoomSystemsBootCheck {
+    return migrateRoomSystemsIfInstalled(this, nowMs);
   }
 
   /** ★ WS-FND-156:起始背包台账迁移的启动检查(装过才查;返回值可观测)。 */

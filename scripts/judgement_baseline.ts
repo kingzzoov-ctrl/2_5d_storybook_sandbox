@@ -607,7 +607,43 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
      那时要做的仍是先看是哪一对容器,而不是接着抬。
   ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
      只读水位这一个数字 = 拿汇总数替代逐条判定。 */
-export const G_CANDIDATE_WATERMARK = 81; /*
+/* 2026-11-20(第十一轮):81 → **91**。命令 `node scripts/judgement_audit.ts --baseline`,读数 **91** ⇒ 按**实测**重钉。
+  增量 **+10**,逐条核对后**全部**落在本批**并行四线**(163~167)新增的类型容器上 ——
+  本次整改**没有新增任何类型容器**(它只在 `WS-FND-163` 的夹具下方插了 5 行锚点注释,
+  那两个替身因此由 408/435 移到 **413/440**,容器与字段集一字未改),
+  三种来源,按形态分三组:
+  ── A 组(8 条)本轮新套件 `WS-FND-163-boundary-closures` 自己声明的一份网络替身,与**既有两个套件的同名夹具**
+     各成一对 —— 即本文件反复记过的「同名夹具在各套件各声明一份」(测试替身,不是两份生产实现):
+   1) `tests/WS-FND-106-connection-lifecycle.test.ts:142` `StubClient` ↔ `PatchClient`@`WS-FND-163:413`
+      共享[sessionId,send,leave] / 独有A[sent,left] / 独有B[state,patchBytes,patchCalls,raw,enqueueRaw]
+   2) `tests/WS-FND-106-connection-lifecycle.test.ts:163` `RoomInternals` ↔ `PatchRoom`@`WS-FND-163:440`
+      共享[runtime,autoDispose,onCreate,onJoin,setSimulationInterval,stepTick] / 独有A[seatKeys,state,maxClients,...] / 独有B[clients,serializer,broadcastPatch]
+   3) `tests/WS-FND-131-lifecycle-atomic.test.ts:154` `StubClient` ↔ `PatchClient`@`WS-FND-163:413`(同 1 的字段集)
+   4) `tests/WS-FND-131-lifecycle-atomic.test.ts:172` `RoomInternals` ↔ `PatchRoom`@`WS-FND-163:440`
+      共享[runtime,onJoin,onCreate,setSimulationInterval] / 独有A[seatKeys,state,onLeave,setState,onMessage] / 独有B[clients,autoDispose,serializer,stepTick,broadcastPatch]
+   5) `tests/WS-FND-160-room-longrun-concurrency.test.ts:703` `RoomInternals` ↔ `PatchRoom`@`WS-FND-163:440`
+      共享[runtime,onCreate,setSimulationInterval] / 独有A[onDispose,setState,onMessage] / 独有B[clients,autoDispose,serializer,onJoin,stepTick,broadcastPatch]
+   6) `tests/WS-FND-162-snapshot-per-user.test.ts:102` `StubClient` ↔ `PatchClient`@`WS-FND-163:413`
+      共享[sessionId,send,leave,enqueueRaw] / 独有A[sent,leaveCalls,rawFrames] / 独有B[state,patchBytes,patchCalls,raw]
+   7) `tests/WS-FND-162-snapshot-per-user.test.ts:127` `RoomInternals` ↔ `PatchRoom`@`WS-FND-163:440`
+      共享[clients,runtime,autoDispose,setSimulationInterval,onCreate,onJoin,stepTick] / 独有A[maxClients,seatKeys] / 独有B[serializer,broadcastPatch]
+   8) `tests/WS-FND-163-boundary-closures.test.ts:440` `PatchRoom` ↔ `RoomInternals`@`tests/WS-FND-50-gateway-colyseus.test.ts:128`
+      共享[runtime,setSimulationInterval,onJoin,stepTick] / 独有A[clients,autoDispose,serializer,onCreate,broadcastPatch] / 独有B[constructor,roomId,roomName,maxClients,state,_simulationInterval]
+      ⚠️ 1..7 的方向都是「新替身 ← 旧替身」;8 是同一份新替身与 `WS-FND-50` 那份**多跳**上溯的替身配对。
+  ── B 组(1 条)本轮「触屏与窄屏」线新增的命中测试模块,与绘制层状态容器共享面板字段
+     (「谁持有 UI 状态」与「谁判命中」是同概念的两次声明,各自带独有字段):
+   9) `client/src/three/ui_binding.ts:90` `UiDrawState` ↔ `UiHitArgs`@`client/src/ui/panel_hit.ts:146`
+      共享[panel,view,easel,partyPanel] / 独有A[openProgress,dragging,dragFrom,hoverSlot,invQuery,...(+16)] / 独有B[recipeNodes]
+  ── C 组(1 条)本轮 `ui/panel_layout.ts` 新增的派对面板布局,与既有的配方面板布局共享三项面板字段
+     (两份「面板几何」各带自己的行/砖块字段 —— 层内有意传递):
+  10) `client/src/ui/panel_layout.ts:491` `PitchPanelLayout` ↔ `PartyPanelLayout`@`panel_layout.ts:680`
+      共享[panel,fit,footer] / 独有A[bricks,brickW,brickH] / 独有B[rowH,rows,visibleRows,scrollable]
+  ⚠️ 十对**没有一条**是生产侧的两份实现:A 组是测试替身,B/C 组是同一模块内两个面板/两套状态的几何声明。
+  ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响 ——
+     那时要做的仍是先看是哪一对容器(先读 [共享]/[独有]),而不是接着抬。
+  ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
+     只读水位这一个数字 = 拿汇总数替代逐条判定。 */
+export const G_CANDIDATE_WATERMARK = 91; /*
   2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
    —— ⚠️ **多出的那一条与本轮改动无关,A/B 已证明**(Q4):
    把本批新增的文件移走后再跑同一条命令,**仍是 75** ⇒ 增量不来自本次改动面,

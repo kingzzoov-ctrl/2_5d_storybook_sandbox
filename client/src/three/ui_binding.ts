@@ -23,6 +23,7 @@
 
 import {
   CELL_INSET,
+  PANEL_MARGIN,
   type InventoryPanelLayout,
   type PanelRect,
   type PitchPanelLayout,
@@ -34,11 +35,29 @@ import {
   layoutInventoryPanel,
   layoutPartyPanel,
   layoutPitchPanel,
+  /* ★ WS-FND-166:`drawRecipe` 必须读**同一个**布局(修前自己写 w=320/h=…) */
+  layoutRecipePanel,
   paletteRect,
   partyRowRect,
   rectVisible,
   slotRect,
 } from '../ui/panel_layout.ts';
+/* ★ WS-FND-166:命中测试的**判定**搬到了 `ui/panel_hit.ts`(纯逻辑、node 里可断言)。
+   本文件只做转发 —— 修前它住在 `UiOverlay` 的方法里,而那个类碰 `document`
+   ⇒ 「窄屏右边界外的格子永远点不到」这条**一条断言都写不了**。 */
+import {
+  hitUiPanel,
+  type TabCategories,
+  type UiHit as PanelUiHit,
+  type UiHitArgs,
+  type UiHitLayouts,
+} from '../ui/panel_hit.ts';
+/* ★ WS-FND-166:`prefers-reduced-motion` 也必须覆盖**面板**动画(修前只有摇杆有)。 */
+import { panelAnimAlpha, prefersReducedMotion } from '../ui/mobile_shell.ts';
+
+/* 命中结果的类型现在只有一处定义(`ui/panel_hit.ts`);这里 **re-export**,
+   于是 `boot.ts` 的 `import { type UiHit } from './ui_binding.ts'` 不用改。 */
+export type { UiHit } from '../ui/panel_hit.ts';
 import {
   BUCKETS,
   INVENTORY_SLOTS,
@@ -64,23 +83,8 @@ import { type PitchInfo, PITCH_TABLE } from '../audio.ts';
 import { ATLAS_CELL, ATLAS_COLS, cellIndexFromId } from '../stage/assembly_math.ts';
 import { type UiPanel } from '../ui/state_machine.ts';
 
-/** 指针命中结果 */
-export type UiHit =
-  | { kind: 'slot'; indexInPage: number; slot: number }
-  | { kind: 'tab'; category: string | null }
-  | { kind: 'pager'; delta: number }
-  | { kind: 'easel'; x: number; y: number }
-  | { kind: 'palette'; index: number }
-  | { kind: 'brick'; pitch: number }
-  /**
-   * ★ WS-FND-151:点了模式面板的某一行。
-   *
-   * `mode` 是**线上下标(1 起)**;谁来发报文由 `boot.ts` 决定(它持有选择器与报文口),
-   * 本层只回答"点中了哪一档"。
-   */
-  | { kind: 'partyMode'; mode: number }
-  | { kind: 'toolbar'; action: 'undo' | 'redo' | 'clear' }
-  | { kind: 'none' };
+/* ⚠ 命中结果的类型(`UiHit`)定义在 `ui/panel_hit.ts`(纯逻辑层),
+   本文件在文件头 re-export 它 —— 这里**不再**写第二份。 */
 
 /** 覆盖层绘制所需的一切状态 —— 由 `boot.ts` 每帧组装 */
 export interface UiDrawState {
@@ -194,6 +198,22 @@ const C = {
 /** 等宽字体栈(与 HUD 一致) */
 const MONO = 'ui-monospace,Menlo,Consolas,monospace';
 
+/**
+ * ★ WS-FND-166:背包的分类标签 —— **绘制与命中同一份**。
+ *
+ * 顺序就是命中区(每个标签的 x 由 `tabStrip.w / length` 平分)⇒ 两处各写一份
+ * 会让"点上去选中了隔壁那个分类",而这种错位看起来只是"偶尔点不准"。
+ */
+const INVENTORY_TABS: readonly { category: string | null; label: string; color: string }[] = [
+  { category: null, label: '全部', color: '#dcd2b8' },
+  ...BUCKETS.map((b) => ({ category: b.category as string | null, label: b.label, color: b.color })),
+];
+
+/** 标签的**类别序列**(喂给 `ui/panel_hit.ts` 的命中判定;导出给 `boot.uiHitAt`) */
+export function inventoryTabCategories(): TabCategories {
+  return INVENTORY_TABS.map((t) => t.category);
+}
+
 function roundRect(ctx: CanvasRenderingContext2D, r: PanelRect, radius = 6): void {
   const rr = Math.min(radius, r.w / 2, r.h / 2);
   ctx.beginPath();
@@ -228,8 +248,19 @@ export class UiOverlay {
   private pitch!: PitchPanelLayout;
   /** 最近一次绘制的背包布局(命中测试要用同一份,避免两处各算一次) */
   private lastInvLayout: InventoryPanelLayout | null = null;
+  /**
+   * ★ WS-FND-166:`prefers-reduced-motion` —— **面板动画也在它管辖范围内**。
+   *
+   * 修前只有摇杆(`ui/joystick_ui.ts`)读了这条偏好;面板照旧淡入并上移。
+   * 在**构造时**取一次(这个偏好不会在一次会话里频繁变,而每帧问一次
+   * `matchMedia` 会在渲染循环里多一次样式重算)。
+   */
+  private readonly reduceMotion: boolean = false;
 
   constructor(container: HTMLElement) {
+    this.reduceMotion = prefersReducedMotion(
+      typeof window === 'undefined' ? null : window,
+    );
     this.canvas = document.createElement('canvas');
     /* 覆盖层**不吃指针事件**:世界拖动/拾取仍走 window,避免面板把镜头锁死 */
     this.canvas.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:20;';
@@ -267,13 +298,19 @@ export class UiOverlay {
     return this.inv;
   }
 
+  /** ★ WS-FND-166:音高布局(同上 —— 命中读的就是绘制用的那一份) */
+  get pitchLayout(): PitchPanelLayout {
+    return this.pitch;
+  }
+
   /* ────────────────────── 绘制 ────────────────────── */
 
   draw(s: UiDrawState): void {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
-    /* 打开动画:整体淡入 + 轻微上移,进度来自 state_machine.openingProgress */
-    const a = 0.35 + 0.65 * s.openProgress;
+    /* 打开动画:整体淡入,进度来自 state_machine.openingProgress。
+       ★ WS-FND-166:reduced-motion ⇒ 恒 1(直接出现,不淡入;判定在 `ui/mobile_shell.ts`) */
+    const a = panelAnimAlpha(s.openProgress, this.reduceMotion);
 
     /* 预警圈画在最底层:它属于世界,不属于面板 */
     this.drawTelegraphRing(s, a);
@@ -345,8 +382,8 @@ export class UiOverlay {
       L.title.x, L.title.y + L.title.h / 2,
     );
 
-    /* 分类标签条:12 个分类,按桶宽平分 */
-    const tabs = [{ category: null as string | null, label: '全部', color: '#dcd2b8' }, ...BUCKETS.map((b) => ({ category: b.category as string | null, label: b.label, color: b.color }))];
+    /* 分类标签条:12 个分类,按桶宽平分(★ WS-FND-166:与命中用**同一份** `INVENTORY_TABS`) */
+    const tabs = INVENTORY_TABS;
     const tabW = L.tabStrip.w / tabs.length;
     ctx.font = `10px ${MONO}`;
     ctx.textAlign = 'center';
@@ -425,10 +462,14 @@ export class UiOverlay {
   private drawRecipe(s: UiDrawState, a: number): void {
     const ctx = this.ctx;
     const tree = s.recipe!;
-    const w = 320;
-    const rowsN = Math.min(20, tree.nodeCount);
-    const h = 30 + rowsN * 18 + 74;
-    const panel: PanelRect = { x: this.w - w - 16, y: 16, w, h };
+    /**
+     * ★ WS-FND-166:**宽度/高度/行数全部来自布局**(修前这里自己写 `w = 320`、
+     * `h = 30 + rows*18 + 74`,而命中用的是 `panel_layout` 的另一份 ⇒
+     * 视口 < 336 时"画出来的地方点不到、点得到的地方没画")。
+     */
+    const L = layoutRecipePanel(this.w, this.h, tree.nodeCount);
+    const panel = L.panel;
+    const rowsN = L.visibleRows;
     fillPanel(ctx, panel, a);
 
     ctx.save();
@@ -436,25 +477,28 @@ export class UiOverlay {
     ctx.font = `13px ${MONO}`;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'top';
-    ctx.fillText(`配方  #${s.recipeId} ×${s.recipeBatches}`, panel.x + 12, panel.y + 10);
+    ctx.fillText(`配方  #${s.recipeId} ×${s.recipeBatches}`, panel.x + PANEL_MARGIN, panel.y + 8);
 
     /* 缺料提示:来自 checkCraft/missingReport(不是自己拼的字符串) */
     ctx.font = `11px ${MONO}`;
     ctx.fillStyle = s.recipeNote ? C.bad : C.ok;
-    ctx.fillText(s.recipeNote || '材料齐备,可合成', panel.x + 12, panel.y + 28);
+    ctx.fillText(s.recipeNote || '材料齐备,可合成', panel.x + PANEL_MARGIN, panel.y + 26);
 
-    /* 叶子清单:来自 sortedLeaves */
-    let y = panel.y + 46;
+    /* 叶子清单:来自 sortedLeaves;行矩形来自布局(行高只有一个出处) */
     ctx.fillStyle = C.dim;
-    for (const leaf of sortedLeaves(tree).slice(0, rowsN)) {
-      ctx.fillText(`· ${leaf.name} ×${leaf.need}`, panel.x + 16, y);
-      y += 18;
+    const leaves = sortedLeaves(tree).slice(0, rowsN);
+    for (let i = 0; i < leaves.length; i += 1) {
+      const row = L.rows[i];
+      if (row === undefined) break;
+      ctx.fillText(`· ${leaves[i]!.name} ×${leaves[i]!.need}`, row.rect.x + 4, row.rect.y + 4);
     }
-    /* 加工台 */
+    /* 加工台 + 节点/深度:**底部信息带**里(高度由布局显式留出,见 `RECIPE_FOOTER_H`) */
     const st = tree.stations.length > 0 ? `加工台 ${tree.stations.join(', ')}` : '无需加工台';
     ctx.fillStyle = C.dim;
-    ctx.fillText(st, panel.x + 12, panel.y + h - 42);
-    ctx.fillText(`节点 ${tree.nodeCount} · 深度 ${tree.maxDepth}${tree.hasCycle ? ' · 有环!' : ''}`, panel.x + 12, panel.y + h - 24);
+    const tailY = panel.y + panel.h - PANEL_MARGIN - 32;
+    ctx.fillText(st, panel.x + PANEL_MARGIN, tailY);
+    ctx.fillText(`节点 ${tree.nodeCount} · 深度 ${tree.maxDepth}${tree.hasCycle ? ' · 有环!' : ''}`,
+      panel.x + PANEL_MARGIN, tailY + 17);
     ctx.restore();
   }
 
@@ -780,85 +824,24 @@ export class UiOverlay {
     s: {
       panel: UiPanel;
       view: InventoryView;
-      activeCategory: string | null;
       easel: PixelEasel;
       /* ★ WS-FND-151:模式面板的命中要用它的行数(行矩形来自 `layoutPartyPanel`) */
       partyPanel: PartyPanelView;
     },
     px: number,
     py: number,
-  ): UiHit {
-    const inRect = (r: PanelRect): boolean => px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
-
-    if (s.panel === 'INVENTORY' || s.panel === 'RECIPE_TREE') {
-      const L = this.lastInvLayout ?? this.inv;
-      if (!inRect(L.panel)) return { kind: 'none' };
-      /* 分类标签 */
-      if (inRect(L.tabStrip)) {
-        const tabs = [null, ...BUCKETS.map((b) => b.category)];
-        const tabW = L.tabStrip.w / tabs.length;
-        const i = Math.min(tabs.length - 1, Math.max(0, Math.floor((px - L.tabStrip.x) / tabW)));
-        return { kind: 'tab', category: tabs[i] ?? null };
-      }
-      /* 分页 */
-      if (inRect(L.pager)) {
-        return { kind: 'pager', delta: px < L.pager.x + L.pager.w / 2 ? -1 : 1 };
-      }
-      /* 格子 */
-      const col = Math.floor((px - L.gridX) / L.cell);
-      const row = Math.floor((py - L.gridY) / L.cell);
-      if (col >= 0 && col < L.cols && row >= 0 && row < L.rows) {
-        const i = row * L.cols + col;
-        const slot = s.view.page * 160 + i;
-        return { kind: 'slot', indexInPage: i, slot };
-      }
-      return { kind: 'none' };
-    }
-
-    if (s.panel === 'PIXEL_EASEL') {
-      const L = layoutEaselPanel(this.w, this.h);
-      if (inRect(L.canvas)) {
-        const x = Math.floor((px - L.canvas.x) / L.pixel);
-        const y = Math.floor((py - L.canvas.y) / L.pixel);
-        if (s.easel.inBounds(x, y)) return { kind: 'easel', x, y };
-        return { kind: 'none' };
-      }
-      if (inRect(L.palette)) {
-        const col = Math.floor((px - L.palette.x) / L.paletteCell);
-        const row = Math.floor((py - L.palette.y) / L.paletteCell);
-        const idx = row * 8 + col;
-        if (idx >= 0 && idx < PALETTE_SIZE) return { kind: 'palette', index: idx };
-      }
-      if (inRect(L.toolbar)) {
-        const third = L.toolbar.w / 3;
-        const k = Math.floor((px - L.toolbar.x) / third);
-        return { kind: 'toolbar', action: k === 0 ? 'undo' : k === 1 ? 'redo' : 'clear' };
-      }
-      return { kind: 'none' };
-    }
-
-    if (s.panel === 'PITCH_EDITOR') {
-      for (const b of this.pitch.bricks) {
-        if (inRect(b)) {
-          const idx = this.pitch.bricks.indexOf(b);
-          return { kind: 'brick', pitch: idx };
-        }
-      }
-      return { kind: 'none' };
-    }
-    if (s.panel === 'PARTY') {
-      const L = layoutPartyPanel(this.w, this.h, s.partyPanel.rows.length);
-      if (!inRect(L.panel)) return { kind: 'none' };
-      for (let i = 0; i < L.rows.length; i += 1) {
-        const r = L.rows[i]!;
-        if (inRect(r)) {
-          const row = s.partyPanel.rows[i];
-          return row === undefined ? { kind: 'none' } : { kind: 'partyMode', mode: row.mode };
-        }
-      }
-      return { kind: 'none' };
-    }
-    return { kind: 'none' };
+  ): PanelUiHit {
+    /* ★ WS-FND-166:判定在 `ui/panel_hit.ts`(纯逻辑、node 里可断言)⇒ 这里只是薄转发。
+       布局用**绘制同一份**:背包取 `lastInvLayout ?? this.inv`,`pitch` 取 resize 时
+       算好的那一份 ⇒ 「画在哪」与「点在哪」不可能分叉。 */
+    const args: UiHitArgs = {
+      panel: s.panel,
+      view: s.view,
+      easel: s.easel,
+      partyPanel: s.partyPanel,
+    };
+    const layouts: UiHitLayouts = { inv: this.lastInvLayout ?? this.inv, pitch: this.pitch };
+    return hitUiPanel(args, layouts, inventoryTabCategories(), this.w, this.h, px, py);
   }
 
   /** 某格位的 tooltip 文本(直接来自 inventory,不在这里拼字符串) */

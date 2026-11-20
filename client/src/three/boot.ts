@@ -141,7 +141,11 @@ import {
   pitchBrickPosition,
 } from '../audio.ts';
 import { BOSS_LIST } from '../../../shared/constants/bosses.ts';
-import { UiOverlay, type UiDrawState, type UiHit } from './ui_binding.ts';
+import { UiOverlay, inventoryTabCategories, type UiDrawState, type UiHit } from './ui_binding.ts';
+/* ★ WS-FND-166:「这一下算不算按在 **UI** 上」的判定住在 `ui/panel_hit.ts`(纯、零 DOM、
+   node 里可断言)。修前 boot 只看"命中了哪个格子"⇒ 按在**面板空白处**返回 `none`
+   ⇒ 世界拖动与 window 上的虚拟摇杆**同时**吃掉这一下(实测:单指拖背包时角色一边走)。 */
+import { uiConsumesPoint, type UiHitArgs, type UiHitLayouts } from '../ui/panel_hit.ts';
 import { createAudio, type AudioHandle } from './audio_out.ts';
 /* task-67 阶段 3:玩家位置改由**权威状态**提供(不再从 `pan` 抄,见 S1 注释)。
    这两个模块都**纯**(零三方、零 DOM)⇒ 可被 WS-12 直接 import 断言。 */
@@ -262,6 +266,26 @@ export interface BootHandle {
    * `null` = 单机(`?server=off`)⇒ 选中时如实说"未联机",而不是静默。
    */
   setPartyModeSink: (fn: ((mode: number, key: string) => string) | null) => void;
+  /**
+   * ★ WS-FND-166:触屏按钮条的开合入口。
+   *
+   * ## 为什么需要它
+   * 面板键位表(`ui/panel_keys.PANEL_KEYS`)全是字母键(`i/r/h/p/m`),
+   * 而手机**没有键盘** ⇒ 真机上五个面板一个都打不开。屏幕按钮是"最低方案",
+   * 而按一下要走的是**同一台状态机**(不是另开一条开关面板的路)。
+   */
+  togglePanel: (panel: UiPanel) => void;
+  /** 触屏按钮条的「关」(`OPEN/OPENING/ERROR` → `CLOSED`,合法迁移)。 */
+  closePanel: () => void;
+  /**
+   * ★ WS-FND-166:**这一下算不算按在 UI 上**(面板容器 ∩ 面板内的部件)。
+   *
+   * ## 为什么必须由宿主(而不是事件顺序)决定
+   * 摇杆与攻击的监听都挂在 `window`(冒泡层),而同一次指针事件会**先**经过画布。
+   * 「谁先执行」是注册顺序的函数,一旦有人插一条监听就翻车 —— 而且不报错。
+   * ⇒ 这里给一个**纯判定**(`ui/panel_hit.uiConsumesPoint`),`main.ts` 先问它。
+   */
+  uiHitAt: (x: number, y: number) => boolean;
 }
 
 /**
@@ -1517,6 +1541,13 @@ export function boot(container: HTMLElement): BootHandle {
       e.preventDefault();
       return;
     }
+    /* ★ WS-FND-166:面板**容器**内也算 UI。修前这里只看"命中了哪个格子",
+       按在面板空白处返回 `none` ⇒ 世界拖动(以及 `window` 上的虚拟摇杆)**同时**
+       吃掉这一下 —— 实测表现是「单指拖背包时角色一边走」。 */
+    if (uiHitAt(e.clientX, e.clientY)) {
+      e.preventDefault();
+      return;
+    }
     /* 面板外:开始世界拖动,同时记录蓝图框选起点 */
     drag = { x: e.clientX, y: e.clientY };
     bpDrag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY };
@@ -1765,6 +1796,41 @@ export function boot(container: HTMLElement): BootHandle {
      否则 `drag` 永远非 null,而跟随在 `drag !== null` 期间是**暂停**的
      ⇒ 相机再也不跟随,且屏幕上只表现为"镜头不动了"。这是静默降级,必须有出口。 */
   window.addEventListener('pointercancel', onPointerUp);
+
+  /**
+   * ★ WS-FND-166:**这一下算不算按在 UI 上**(面板容器 ∩ 面板内的部件)。
+   *
+   * ## 为什么必须有这个判定(实测踩过)
+   *
+   * 摇杆(`main.ts` 的 `window.pointerdown`)与攻击都挂在 **window 冒泡层**,
+   * 而这一层**不知道** `boot` 的 UI 是否已经消费了这一下:
+   * ```
+   * 手指按在背包面板上往下拖 ⇒ UI 收到(拿起格子)  + 摇杆也收到(角色开始走)
+   * ```
+   * 两条监听各自都"工作正常",合起来是「单指拖背包时角色一边走」。
+   * 现在判定是一个**纯函数**(`ui/panel_hit.uiConsumesPoint`:先问部件,再问容器),
+   * `main.ts` 先调它 ⇒ 与事件注册顺序无关,且能在 node 里断言。
+   */
+  function uiHitAt(x: number, y: number): boolean {
+    const st = uiState();
+    const args: UiHitArgs = {
+      panel: st.panel,
+      view: st.view,
+      easel: st.easel,
+      partyPanel: st.partyPanel,
+      recipeNodes: st.recipe?.nodeCount ?? 0,
+    };
+    const layouts: UiHitLayouts = { inv: ui.invLayout, pitch: ui.pitchLayout };
+    return uiConsumesPoint(
+      args, layouts, inventoryTabCategories(),
+      window.innerWidth, window.innerHeight, x, y,
+    );
+  }
+
+  /** ★ WS-FND-166:触屏按钮条的「关」—— 走**同一台**状态机的合法迁移。 */
+  function closePanel(): void {
+    if (uiFsm.state !== 'CLOSED') uiFsm.transition('CLOSED', 'touch-close');
+  }
 
   /**
    * 造一个**逻辑相机**并把它对准「跟随出来的相机聚焦点 + 高度分量」。
@@ -2048,6 +2114,11 @@ export function boot(container: HTMLElement): BootHandle {
     textInputActive: () => searchMode,
     /* ★ WS-FND-151:模式面板的发文端口由 `main.ts` 注入(它持有 socket) */
     setPartyModeSink: (fn) => { partyModeSink = fn; },
+    /* ★ WS-FND-166:触屏按钮条(手机没有键盘)—— 开合走**同一台**状态机。
+       `togglePanel` 复用 `setPanel`(同键再按 = 关),不是另写一条开关路。 */
+    togglePanel: (panel) => { setPanel(panel); },
+    closePanel: () => { closePanel(); },
+    uiHitAt: (x, y) => uiHitAt(x, y),
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.length,
