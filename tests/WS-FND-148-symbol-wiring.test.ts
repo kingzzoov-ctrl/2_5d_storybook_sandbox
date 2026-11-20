@@ -103,6 +103,8 @@ function room(opts: { items?: readonly number[]; players?: readonly string[] } =
   const sim = a.host as unknown as WorldSimType;
   const players = opts.players ?? ['p1', 'p2'];
   for (const id of players) a.runtime.join({ userId: id });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of players) for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
   for (const id of players) {
     if (!sim.physics.bodies.has(id)) sim.addPlayer(id, 8, 8);
   }

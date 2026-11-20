@@ -81,6 +81,10 @@ function makeRoom(roomId: string): { rt: ReturnType<typeof assemble>['runtime'];
   });
   a.runtime.join({ userId: 'p1' });
   a.runtime.join({ userId: 'p2' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1', 'p2']) {
+    for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
+  }
   return { rt: a.runtime, sim: a.host as unknown as SimHandle };
 }
 

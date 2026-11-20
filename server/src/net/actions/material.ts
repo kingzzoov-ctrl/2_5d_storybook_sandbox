@@ -93,7 +93,7 @@ export function gatherCountFor(gatherMul: number, roll: number): number {
  * 结果一致;而把 tick 掺进种子又保证「换个格子、换个时刻重拆」会拿到新的 roll
  * —— 不能靠原地反复放块把 20% 固定成必中。
  */
-function gatherRollFor(actorId: string, x: number, y: number, objId: number, tick: number): number {
+export function gatherRollFor(actorId: string, x: number, y: number, objId: number, tick: number): number {
   return seededRoll(fnv1a(`${actorId}|${x}|${y}|${objId}|${tick}`))();
 }
 

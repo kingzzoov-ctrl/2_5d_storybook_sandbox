@@ -50,7 +50,7 @@
  * ⇒ 第二张表用**数字键**,语义是「动作热键条」(不在 WASD 手位上、不参与任何既有前缀):
  * ```
  * 1 驯养(BREED_TAME) · 2 购买(BUY_ITEM) · 3 炼金台(USE_ALCHEMY_FURNACE)
- * 4 放自动化件(PLACE_AUTOMATION,键盘路径走**播种形态**)
+ * 4 放自动化件(PLACE_AUTOMATION,键盘路径走**播种形态**) · 5 采集(GATHER)
  * ```
  * ⚠️ 两张表**分开**还有一个硬理由:`ENTRY_KEYS` 的条数被既有判据钉着
  *   (`WS-FND-35` FND35-8 与 `WS-FND-126` FND126-2 都断言"六个槽位")。
@@ -68,6 +68,7 @@ import {
   type CraftInput,
   type EntryOutcome,
   type PlaceAutomationInput,
+  type GatherInput,
   type UseItemInput,
 } from './action_entry.ts';
 
@@ -82,7 +83,7 @@ import {
  */
 export type EntrySlot =
   | 'craft' | 'sleep' | 'openChest' | 'useOwnChest' | 'startParty' | 'useItem'
-  | 'breedTame' | 'buyItem' | 'useAlchemyFurnace' | 'placeAutomation';
+  | 'breedTame' | 'buyItem' | 'useAlchemyFurnace' | 'placeAutomation' | 'gather';
 
 /**
  * 槽位 → **玩家读到的名字**。UI 按钮的标题取这里(提示行也取这里)——
@@ -99,6 +100,8 @@ export const ENTRY_SLOTS: Readonly<Record<EntrySlot, string>> = {
   buyItem: '购买',
   useAlchemyFurnace: '炼金台',
   placeAutomation: '放自动化件/播种',
+  /* ★ WS-FND-154:采集(§3.1 自然资源的物件;可采集性 / 工具 / 距离全在服务端判)。 */
+  gather: '采集(面前那格的自然资源)',
 };
 
 /** 一条键位定义:这个键属于哪个槽位。 */
@@ -158,6 +161,12 @@ export const HOTBAR_KEYS: Readonly<Record<string, EntryKeySpec>> = {
   /* `4` 放自动化件 / 播种:键盘路径走**播种形态**(只给 `itemId`),
      组件形态(`kind`)由按钮 / 后续面板给 —— 客户端不持有 kind 名单。 */
   4: { slot: 'placeAutomation' },
+  /* ★ WS-FND-154:`5` 采集(`GATHER`)。为什么**不是**让既有 `F`(拾取)改道 ——
+     客户端快照里**没有**格子物件数据(`RoomState` 只有 meta/players/wildlife/bosses)
+     ⇒ 「面前有没有可采集物」在客户端**判不出来**,让 `F` 一按两义就是拿一次按键去猜
+     (猜错 = 拾取被吞 / 采集发不出,而两边都不报错)。数字热键条本来就是为
+     「服务端已实现、客户端要补入口」的动作准备的第二张表,`5` 是它的下一格。 */
+  5: { slot: 'gather' },
 };
 
 /**
@@ -215,6 +224,13 @@ export interface EntryInputs {
   useAlchemyFurnace?(): AlchemyFurnaceInput;
   /** `PLACE_AUTOMATION` 的参数(`x` / `y` + `kind` 或 `itemId`)。 */
   placeAutomation?(): PlaceAutomationInput;
+
+  /**
+   * `GATHER` 的参数(★ WS-FND-154:目标格 `x` / `y`,由宿主用 `cellInFront` 算)。
+   *
+   * **可选**:省略时键盘路径按 `{}` 调构建器 ⇒ 入口回一句可读的话,不静默。
+   */
+  gather?(): GatherInput;
 }
 
 /** 一次触发可显式给的参数(按钮路径用;省略的项回落到 `EntryInputs`)。 */
@@ -236,6 +252,8 @@ export interface TriggerArgs {
   useAlchemyFurnace?: AlchemyFurnaceInput;
   /** `PLACE_AUTOMATION` 的参数。 */
   placeAutomation?: PlaceAutomationInput;
+  /** `GATHER` 的参数(★ WS-FND-154:目标格 `x` / `y`;省略则入口回一句「需要 x / y」)。 */
+  gather?: GatherInput;
 }
 
 /* ═══════════════════════════ 3. 键盘目标(结构化,不引 DOM 类型) ═══════════════════════════ */
@@ -310,16 +328,19 @@ export function createActionBinding(opts: {
         return entry.useAlchemyFurnace(args.useAlchemyFurnace ?? inputs.useAlchemyFurnace?.() ?? {});
       case 'placeAutomation':
         return entry.placeAutomation(args.placeAutomation ?? inputs.placeAutomation?.() ?? {});
+
+      case 'gather':
+        return entry.gather(args.gather ?? inputs.gather?.() ?? {});
     }
   };
 
   /**
    * 键盘 → 结局。**两张表都查**:先字母表(`ENTRY_KEYS`,六个),
-   * 再数字热键表(`HOTBAR_KEYS`,四个)。
+   * 再数字热键表(`HOTBAR_KEYS`,五个:1 驯养 / 2 购买 / 3 炼金台 / 4 放件 / 5 采集)。
    *
    * ⚠️ 两张表都不命中 ⇒ `null`(交回别的监听器,本层不吞任何键)。
    *   命中即触发 —— 即使参数不全也返回一个结局(`sent: false` + 一句可读理由),
-   *   那条"按了必须有话说"的纪律对四个新槽位同样成立。
+   *   那条"按了必须有话说"的纪律对五个新槽位同样成立(★ WS-FND-154 补了 `5` 采集)。
    */
   const handleKey = (key: string, args?: TriggerArgs): EntryOutcome | null => {
     const k = key.toLowerCase();

@@ -90,6 +90,10 @@ function makeRoom(deps: { withGuest?: boolean } = {}): Room {
   const promoted = rt.setMemberRole('p1', 'p2', RoomRole.ADMIN);
   ok(promoted.ok, '测试前置:p2 应能升为 ADMIN(否则它没有 publicStorage)');
   if (deps.withGuest) rt.join({ userId: 'g', asGuest: true });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1', 'p2', 'g']) {
+    for (const id of rt.authoritativeItemIds(u)) rt.applyInventory(u, { ops: [{ itemId: id, delta: -rt.authoritativeItemCount(u, id) }] });
+  }
   registerChest(roomId, CX, CY);
   return { rt, roomId };
 }

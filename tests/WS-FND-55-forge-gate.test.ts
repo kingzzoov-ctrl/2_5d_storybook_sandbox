@@ -82,6 +82,8 @@ function scene(opts: { asGuest?: boolean } = {}): Scene {
     rng: mulberry32(seq * 7 + 1),
   });
   a.runtime.join({ userId: 'p1', asGuest: opts.asGuest === true });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   return { a, rt: a.runtime };
 }
 

@@ -31,6 +31,8 @@ function makeRoom(): Room {
     mobs: true, biome: 'MEADOW', rng: mulberry32(61),
   });
   a.runtime.join({ userId: 'p1' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   const sim = a.host as unknown as WorldSim;
   sim.advance(3000);
   return { rt: a.runtime, sim, roomId };

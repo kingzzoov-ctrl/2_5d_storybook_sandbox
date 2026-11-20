@@ -17,6 +17,9 @@
  *   它让 "台账过期" 变成一次**红色的测试**,而不是一次谁都没发现的文档腐烂。
  *   ⚠️ 新增/删除 `server/src` 的导出后,修法是 `node scripts/coverage-matrix.ts --write`,
  *      不是改断言。
+ * 5 接线:门禁里**真的会调它**(FND143-13:进程内调用 + 结果进 `pass`/`fail`),
+ *   且台账漂移时**门禁**也红(FND143-14)。前 12 条只证「工具对」,这一条证
+ *   「它住在门禁里」—— 否则台账过期只红测试,不红「唯一的完成定义」。
  * ```
  *
  * ## 为什么用**假的 root**
@@ -431,6 +434,94 @@ test('FND143-12 真仓:docs/COVERAGE-MATRIX.md 与实测一致(台账过期 = �
     .map((x) => x.status);
   ok(statuses.length > 0, '待处置清单必须有行');
   eq(statuses.filter((s) => !statusOk(s)), [], '台账里的状态列必须全部合法');
+});
+
+/* ═══════════════ 4 接线:门禁真的会调它 + 台账漂移 ⇒ 门禁红 ═══════════════
+ *
+ * 前 12 条说明「工具对不对」;这一段说明「**它有没有住在门禁里**」——
+ * 工具再对,只要门禁不调它,台账过期就还只是一份没人跑的文档
+ * (这正是接线要消掉的状态:台账过期只红一个测试套件)。
+ */
+
+/** 门禁源码(两条接线判据共用;只读一次)。 */
+const VERIFY_SRC = readFileSync(join(defaultRoot(), 'scripts', 'verify.ts'), 'utf8');
+
+/** 门禁用来把「台账里的自称」与「代码算出的正解」对账的那条守卫。 */
+const FULL_RUN_GUARD = 'if (!frozenOnly && !only) {';
+
+test('FND143-13 接线:门禁**进程内**调它,且在全量口径里把结果算进 pass/fail', () => {
+  /* 1 进程内 import。子进程形态的失效形态是「脚本被删 / 改名 ⇒ 静默变成没跑」。 */
+  ok(VERIFY_SRC.includes("import { runCheck as runCoverageMatrixCheck } from './coverage-matrix.ts';"),
+    'verify.ts 必须**进程内** import 本工具的 runCheck(别名 runCoverageMatrixCheck)');
+  ok(!/spawnSync\([\s\S]{0,400}?coverage-matrix/.test(VERIFY_SRC),
+    '不许用子进程形态调它 —— 子进程在「脚本被删 / 改名」时会静默变成「没跑」');
+  /* 2 调用点在**全量口径守卫**里,而且守卫**直接包住**这次调用 */
+  const at = VERIFY_SRC.indexOf('runCoverageMatrixCheck({');
+  ok(at >= 0, 'verify.ts 里找不到 runCoverageMatrixCheck({ 调用点 —— 接线被删了');
+  const guardAt = VERIFY_SRC.lastIndexOf(FULL_RUN_GUARD, at);
+  ok(guardAt >= 0, `调用点前面必须有一个 \`${FULL_RUN_GUARD}\` 守卫(局部口径里比全量台账必然假红)`);
+  ok(!VERIFY_SRC.slice(guardAt + FULL_RUN_GUARD.length, at).includes('\n}'),
+    '守卫必须**直接包住**这次调用(否则它可能落在别的块里 = 口径不对)');
+  /* 与 `checkCountAudit` 对齐:两者性质相同(「台账里的自称」vs「代码算出的正解」) */
+  const auditAt = VERIFY_SRC.indexOf('if (!frozenOnly && !only) checkCountAudit();');
+  ok(auditAt >= 0 && auditAt < guardAt, '位置应与 `checkCountAudit()` 那行对齐(在它之后)');
+  /* 3 结果真的进 verdict:不一致 ⇒ fail() ⇒ failures += 1 ⇒ 退出码非零 */
+  ok(VERIFY_SRC.includes('if (!cm.ok) fail('),
+    '不一致必须调 `fail(` —— 只 console.log 的话门禁读不到它,等于没接');
+  ok(/const fail = \(msg: string\): void => \{\s*\n\s*failures \+= 1;/.test(VERIFY_SRC),
+    'fail() 必须累加 failures(否则「接了」只是打得好看)');
+  ok(VERIFY_SRC.includes('if (failures > 0) process.exitCode = 1;'),
+    'failures > 0 必须驱动非零退出码 —— 否则这条接线不会让门禁红');
+});
+
+test('FND143-14 台账漂移 ⇒ 门禁红:在**真台账**上造三种漂移,每种都必须被点名', () => {
+  const root = defaultRoot();
+  const ledger = readFileSync(join(root, LEDGER_REL), 'utf8');
+  const r = buildMatrix({ root });
+  /* 0 前提:真台账此刻必须一致 —— 否则「漂移被抓」什么都没测到 */
+  eq(checkLedger(r, ledger).problems, [],
+    '前提不成立:真台账此刻已与实测不一致 ⇒ 先 node scripts/coverage-matrix.ts --write');
+
+  /* 1 普查块少一条(新增/消失的导出必须红,并**点名**是哪一个) */
+  const census = blockOf(ledger, BLOCKS.census) ?? '';
+  const censusLines = census.split('\n').filter((l) => l.trim() !== '');
+  ok(censusLines.length > 0, '普查块必须非空(否则本条无意义)');
+  const droppedCensus = censusLines[0] as string;
+  const droppedName = (droppedCensus.split(' | ')[3] ?? '').trim().split(/\s+/)[0] ?? '';
+  ok(droppedName !== '', `普查行必须能解析出符号名(实测行:${droppedCensus})`);
+  const byCensus = checkLedger(r, ledger.replace(droppedCensus, ''));
+  eq(byCensus.ok, false, '普查块漏一条必须红');
+  ok(byCensus.problems.some((p) => p.includes('普查块比实测少')),
+    `必须报「普查块比实测少」(实测消息:${byCensus.problems.join(' / ')})`);
+  ok(byCensus.problems.some((p) => p.includes(droppedName)),
+    `必须**指名**漏掉的是哪个符号(${droppedName};实测消息:${byCensus.problems.join(' / ')})`);
+
+  /* 2 状态列写错方向(只允许 待补 / 已补(判据名) / 无需(理由)) */
+  ok(ledger.includes('| 待补 |'), '真台账里必须有 待补 行(否则本条无意义)');
+  const byStatus = checkLedger(r, ledger.replace('| 待补 |', '| 已补 |'));
+  eq(byStatus.ok, false, '状态列写法非法必须红');
+  ok(byStatus.problems.some((p) => p.includes('状态列写法非法')),
+    `必须报状态列问题(实测消息:${byStatus.problems.join(' / ')})`);
+
+  /* 3 待处置清单漏登记一条(实测有、台账无) */
+  const rowsBlock = blockOf(ledger, BLOCKS.rows) ?? '';
+  const rows = parseRows(rowsBlock);
+  ok(rows.length > 0, '待处置清单必须非空(否则本条无意义)');
+  const first = rows[0] as { file: string; name: string };
+  const key = `${first.file}:${first.name}`;
+  const removedRow = rowsBlock.split('\n').find((l) => l.includes(key)) ?? '';
+  ok(removedRow !== '', `清单里必须能找到 ${key} 那一行`);
+  const byRow = checkLedger(r, ledger.replace(removedRow, ''));
+  eq(byRow.ok, false, '待处置清单漏登记必须红');
+  ok(byRow.problems.some((p) => p.includes('漏登记')),
+    `必须报漏登记(实测消息:${byRow.problems.join(' / ')})`);
+  ok(byRow.problems.some((p) => p.includes(key)), `必须指名漏的是哪一条(${key})`);
+
+  /* 4 三种漂移走的是**同一条链**,而这链条由 FND143-13 钉住:
+       `!cm.ok` ⇒ `fail(` ⇒ `failures += 1` ⇒ `process.exitCode = 1` */
+  ok(VERIFY_SRC.includes('if (!cm.ok) fail(')
+    && VERIFY_SRC.includes('if (failures > 0) process.exitCode = 1;'),
+    '漂移被检出之后,门禁侧必须把 `!cm.ok` 接到 fail() 与退出码上(否则漂移只红测试、不红门禁)');
 });
 
 report('WS-FND-143-coverage-matrix');

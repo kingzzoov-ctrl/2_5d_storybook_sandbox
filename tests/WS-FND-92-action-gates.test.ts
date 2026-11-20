@@ -116,6 +116,8 @@ function makeRoom(role: 'OWNER' | 'GUEST' = 'OWNER'): Room {
     rng: mulberry32(92),
   });
   a.runtime.join({ userId: 'p1', asGuest: role === 'GUEST' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   const sim = a.host as unknown as Room['sim'];
   /* 权威位置由测试**显式**摆:距离闸读的就是它(`physics.bodies`)。 */
   sim.addPlayer('p1', 10.5, 10.5);
@@ -258,6 +260,8 @@ test('FND92-5 判序:权限先于距离(GUEST 远距 ⇒ PERMISSION,不是「太
   reset();
   const room = makeRoom('GUEST');
   room.rt.join({ userId: 'g', asGuest: true });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of room.rt.authoritativeItemIds('g')) room.rt.applyInventory('g', { ops: [{ itemId: id, delta: -room.rt.authoritativeItemCount('g', id) }] });
   /* `g` 摆到超距处:两个闸都会拒 ⇒ 谁在前面决定 kind。 */
   room.sim.addPlayer('g', CX + 9, CY + 9);
 

@@ -77,6 +77,25 @@ type Room = {
   at: { x: number; y: number };
 };
 
+/**
+ * 把 **WS-FND-155 的起始背包**从账上清掉,回到「空手 Lv.1」的起点。
+ *
+ * 为什么本套件需要它:155 之后**每个新入场的玩家**都会带一份 7 件起始包,
+ * 而本套件多条断言数的是**绝对件数**(「101 也不该进账 ⇒ 期望 0」)——
+ * 不清掉,那个 0 会变成 2(起始包里的 101×2),而那是**前提变了**,不是判据坏了。
+ *
+ * 清账走生产同一条路(负 delta 的 ops,不需要产出凭证)。
+ */
+function clearStartingPack(rt: Room['rt'], userId: string): void {
+  const ops = rt.authoritativeItemIds(userId)
+    .map((itemId) => ({ itemId, delta: -rt.authoritativeItemCount(userId, itemId) }))
+    .filter((op) => op.delta !== 0);
+  if (ops.length === 0) return;
+  const r = rt.applyInventory(userId, { ops });
+  ok(r.allowed, `前置:清空起始背包必须放行(被拒 ${r.rejectCode ?? '?'})`);
+  eq(rt.authoritativeItemTotal(userId), 0, '前置:清完账上真的是 0 件');
+}
+
 let seq = 0;
 
 function makeRoom(tag: string): Room {
@@ -94,6 +113,8 @@ function makeRoom(tag: string): Room {
     rng: mulberry32(87),
   });
   a.runtime.join({ userId: 'p1' });
+  /* ★ WS-FND-155:`join` 现在会发一份起始背包(7 件)⇒ 本套件要的是**空手**起点。 */
+  clearStartingPack(a.runtime, 'p1');
   const sim = a.host as unknown as SimLike;
   const at = { x: 4.5, y: 4.5 };
   sim.addPlayer('p1', at.x, at.y);

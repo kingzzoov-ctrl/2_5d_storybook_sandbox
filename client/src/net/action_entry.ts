@@ -244,6 +244,20 @@ export interface PlaceAutomationInput {
 }
 
 /**
+ * `GATHER` 的入参(★ WS-FND-154)—— 只有**目标格**两个整数(键名取自
+ * `ActionPayload` 的 `x` / `y`,与 `PLACE_BLOCK` / `BREAK_BLOCK` 同键)。
+ *
+ * 客户端**不报**「那一格是什么」:快照里没有格子物件数据,而采什么由服务端从
+ * 内容表判(§3.1 自然资源的物件,见 `server/src/net/actions/gather.ts`)。
+ */
+export interface GatherInput {
+  /** 目标格 x(整数)。 */
+  x?: unknown;
+  /** 目标格 y(整数)。 */
+  y?: unknown;
+}
+
+/**
  * `SET_PARTY_MODE` 的入参(★ WS-FND-151)。
  *
  * `partyMode` 是**冻结层 `PARTY_MODES` 的 key**(`BRIDGE_CTF` 等),不是下标 ——
@@ -571,6 +585,24 @@ export function placeAutomationRequest(input: PlaceAutomationInput = {}): BuildO
 }
 
 /**
+ * `GATHER` —— 采**面前那格**上的可采集物(★ WS-FND-154)。
+ *
+ * 为什么在入口就要求**整数格**:服务端拿 `Math.floor(x)` 去查格上物件,而浮点坐标
+ * (如 12.53)与「玩家以为的那一格」可能差一格 —— 与 `placeAutomation` 的端口必须走
+ * `cellUnder` 是同一个理由(修一次,两处同口径)。
+ *
+ * ⚠️ 本层**不判**那一格能不能采:可采集性(内容表类别)/ 工具族 / 距离三件事只在
+ *   `server/src/net/actions/gather.ts` 一处判。客户端替它猜 = 第二份实现,且客户端
+ *   快照里**没有**格子物件数据(猜也猜不出来)。
+ */
+export function gatherRequest(input: GatherInput = {}): BuildOutcome {
+  if (!isInt(input.x) || !isInt(input.y)) {
+    return { ok: false, reason: 'GATHER 需要 x / y(整数:目标格坐标,取你面前那格)' };
+  }
+  return { ok: true, request: { action: 'GATHER', payload: { x: input.x, y: input.y } } };
+}
+
+/**
  * `SET_PARTY_MODE` —— **设模式**(改的是全房"这一局玩什么",不是开局)。
  *
  * ## 与 `START_PARTY` 的分工(别弄反)
@@ -613,6 +645,8 @@ const LABELS: Readonly<Record<string, string>> = {
   BUY_ITEM: '购买',
   USE_ALCHEMY_FURNACE: '炼金台',
   PLACE_AUTOMATION: '放自动化件',
+  /* ★ WS-FND-154:采集。没有这一行,被拒时状态行会显示原始动作名 `GATHER ✗ ...`。 */
+  GATHER: '采集',
   /* ★ WS-FND-151:模式面板选完模式后,回执那一行读作「派对模式 → 已发」/「派对模式 ✗ ...」 */
   SET_PARTY_MODE: '派对模式',
 };
@@ -748,6 +782,17 @@ export class ActionEntry {
   /** 落一件自动化件(`kind`)/ 播一颗种子(`itemId`)到某一格。 */
   placeAutomation(input: PlaceAutomationInput = {}): EntryOutcome {
     return this.submit(placeAutomationRequest(input));
+  }
+
+  /**
+   * 采集(★ WS-FND-154):采「面前那格」上的**可采集物**(内容表 §3.1 自然资源)。
+   *
+   * ⚠️ 与 `placeAutomation` 同一条纪律:参数只是**格坐标**,「那一格能不能采」
+   * (可采集性 / 工具 / 距离)全在服务端一处判 —— 客户端没有格子物件数据,
+   * 替它猜就是第二份实现。
+   */
+  gather(input: GatherInput = {}): EntryOutcome {
+    return this.submit(gatherRequest(input));
   }
 
   /**

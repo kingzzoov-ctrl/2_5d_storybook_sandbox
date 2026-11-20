@@ -3554,6 +3554,23 @@ test('H17 两类定义的字段**顺序**也一致(装配层的字段顺序 = �
 
 /* ═══════════ CR-14 U1:装配层回归(判据必须来自服务端)═══════════ */
 
+/**
+ * 把 **WS-FND-155 的起始背包**从账上清掉,回到「空手 Lv.1」的起点。
+ *
+ * 本段的用例把 Lv.1 的 8 格容量当成**全部可用**:起始包一进来就占了 7 格
+ * (`+8` 那批会直接 `7+8 > 8` 被拒、`+3` 也会被拒)⇒ 那是**前提变了**,
+ * 不是容量判据坏了。清账走生产同一条路(负 delta 的 ops,不需要产出凭证)。
+ */
+function clearStartingPack(rt: RoomRuntime, userId: string): void {
+  const ops = rt.authoritativeItemIds(userId)
+    .map((itemId) => ({ itemId, delta: -rt.authoritativeItemCount(userId, itemId) }))
+    .filter((op) => op.delta !== 0);
+  if (ops.length === 0) return;
+  const r = rt.applyInventory(userId, { ops });
+  ok(r.allowed, `前置:清空起始背包必须放行(被拒 ${r.rejectCode ?? '?'})`);
+  eq(rt.authoritativeItemTotal(userId), 0, '前置:清完账上真的是 0 件');
+}
+
 /* 为什么单独一段:前面的 `checkInventory` 单测守的是**函数契约**,
    而 CR-14 U1 的缺陷在**装配** —— 网络层把客户端值当判据传进来。
    只补函数级测试挡不住这类回归,必须在**真实入口**(`RoomRuntime.applyInventory`)
@@ -3563,6 +3580,7 @@ test('CR-14 U1 装配层:凭空产出被拒(客户端无法自行扩 allowedSour
   const rt = new RoomRuntime({ roomId: 'cr14', ownerId: 'p0', clock: fixedClock(1000) });
   rt.state.meta.tick = 1;
   rt.join({ userId: 'atk' } as never);
+  clearStartingPack(rt, 'atk');   /* ★ WS-FND-155:清掉起始包 ⇒ 本用例要的是空手起点 */
   (rt.state.players as { id: string; level: number }[]).push({ id: 'atk', level: 1 } as never);
 
   /* 客户端在 source 里塞什么都无效 —— 凭证只能由服务端 grantItemSource 授予 */
@@ -3575,6 +3593,7 @@ test('CR-14 U1 装配层:容量由等级派生,超容量报 OVERFLOW', () => {
   const rt = new RoomRuntime({ roomId: 'cr14', ownerId: 'p0', clock: fixedClock(1000) });
   rt.state.meta.tick = 1;
   rt.join({ userId: 'atk' } as never);
+  clearStartingPack(rt, 'atk');   /* ★ WS-FND-155:清掉起始包 ⇒ 本用例要的是空手起点 */
   (rt.state.players as { id: string; level: number }[]).push({ id: 'atk', level: 1 } as never);
 
   /* capacity 必须是服务端按等级算出的值,而不是某个可传入的量 */
@@ -3594,6 +3613,7 @@ test('CR-14 U1 装配层:NEGATIVE 分支可达(旧版因 beforeTotal 反推而�
   const rt = new RoomRuntime({ roomId: 'cr14', ownerId: 'p0', clock: fixedClock(1000) });
   rt.state.meta.tick = 1;
   rt.join({ userId: 'atk' } as never);
+  clearStartingPack(rt, 'atk');   /* ★ WS-FND-155:清掉起始包 ⇒ 本用例要的是空手起点 */
   (rt.state.players as { id: string; level: number }[]).push({ id: 'atk', level: 1 } as never);
 
   rt.grantItemSource('atk', 'chop:x');
@@ -3611,6 +3631,7 @@ test('CR-14 U1 装配层:合法操作不被误拒 + 凭证不跨 tick', () => {
   const rt = new RoomRuntime({ roomId: 'cr14', ownerId: 'p0', clock: fixedClock(1000) });
   rt.state.meta.tick = 1;
   rt.join({ userId: 'atk' } as never);
+  clearStartingPack(rt, 'atk');   /* ★ WS-FND-155:清掉起始包 ⇒ 本用例要的是空手起点 */
   (rt.state.players as { id: string; level: number }[]).push({ id: 'atk', level: 1 } as never);
 
   rt.grantItemSource('atk', 'chop:y');
@@ -4395,7 +4416,7 @@ test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是
         加动作就得在这里加一行,否则下面那条**集合相等**会红 —— 这是**有意的**信号
         (第 23 个 `USE_ITEM` 就是这么补进来的),不是「忘了同步」。
         ⚠️ 判据从「数量相等」升为「逐项相等」:漏登记、写错名、重复都会红。 */
-  const executable = ['MOVE', 'ATTACK', 'PLACE_BLOCK', 'BREAK_BLOCK', 'PICKUP_ITEM',
+  const executable = ['MOVE', 'ATTACK', 'PLACE_BLOCK', 'BREAK_BLOCK', 'GATHER', 'PICKUP_ITEM',
     'DROP_ITEM', 'CRAFT', 'USE_ALCHEMY_FURNACE', 'OPEN_CHEST', 'USE_OWN_CHEST', 'SLEEP',
     'START_PARTY', 'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
     'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME',

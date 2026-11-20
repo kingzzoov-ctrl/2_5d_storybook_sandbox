@@ -96,6 +96,27 @@ const simOf = (host: WorldSaveHost): SimHandle => host as unknown as SimHandle;
 let roomSeq = 0;
 type Room = { rt: RoomRuntime; sim: SimHandle; roomId: string };
 
+/**
+ * 把 **WS-FND-155 的起始背包**从账上清掉,回到「空手 Lv.1」的起点。
+ *
+ * 为什么本套件需要它:155 之后**每个新入场的玩家**都会带一份 7 件的起始包
+ * (占容量!),而本套件测的是「容量上界 / 守恒 / 整批零副作用」这些
+ * **以空背包为前提**的判据 ⇒ 不清掉,`+8` 那一批会因为 `7+8 > 8` 直接被
+ * `ITEM_OVERFLOW` 拒(实测 10 条红),而那是**前提变了**,不是判据坏了。
+ *
+ * 清账走生产同一条路(负 delta 的 ops:不需要产出凭证)——
+ * 不是绕过容量闸,而是**用**它:清完总量真的回到 0。
+ */
+function clearStartingPack(rt: RoomRuntime, userId: string): void {
+  const ops = rt.authoritativeItemIds(userId)
+    .map((itemId) => ({ itemId, delta: -rt.authoritativeItemCount(userId, itemId) }))
+    .filter((op) => op.delta !== 0);
+  if (ops.length === 0) return;
+  const r = rt.applyInventory(userId, { ops });
+  ok(r.allowed, `前置:清空起始背包必须放行(被拒 ${r.rejectCode ?? '?'})`);
+  eq(rt.authoritativeItemTotal(userId), 0, '前置:清完账上真的是 0 件');
+}
+
 /** 建一个**真装配**出来的房间(不手搓 `rtOpts` —— 那会绕开 `assemble()` 的接线)。 */
 function makeRoom(o: { db?: MemoryDb | null } = {}): Room {
   roomSeq += 1;
@@ -110,6 +131,8 @@ function makeRoom(o: { db?: MemoryDb | null } = {}): Room {
     db: o.db ?? null,
   });
   a.runtime.join({ userId: 'p1' }); // OWNER:既有 `publicStorage` 也有 `baseline`
+  /* ★ WS-FND-155:`join` 现在会发一份起始背包(7 件)⇒ 本套件要的是**空手**起点。 */
+  clearStartingPack(a.runtime, 'p1');
   return { rt: a.runtime, sim: simOf(a.host), roomId };
 }
 

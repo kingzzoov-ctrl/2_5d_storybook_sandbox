@@ -79,6 +79,8 @@ function makeRoom(sizeCells = 48, asGuest = false): Room {
     rng: mulberry32(5),
   });
   a.runtime.join({ userId: 'p1', asGuest });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   const sim = a.host as unknown as SimLike;
   /* 世界侧要"认识"这个玩家:`playerPosition` 读的是**物理刚体**,
      而刚体由 `addPlayer` 建。生产路径里它由第一次 `applyMove` 建 ——

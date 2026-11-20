@@ -66,6 +66,15 @@ import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
    修前本文件内联 `8 + (lv-1)` —— 那是同一条规则的第二份实现,改冻结层/改档案都不会
    让容量动一位,而两份数恰好相等 ⇒ 没有判据看得出它们已经分开。 */
 import { carryCapacityOfLevel } from '../combat/progression.ts';
+/* ★ WS-FND-155:起始背包 —— **发什么**在冻结表 `shared/constants/starting_inventory.ts`,
+   本文件不复制内容表、也不猜容量:「装不装得下」问 `carryCapacityOf`(与容量闸同源),
+   截断/截断回执全在那个纯函数 `planStartingInventory` 里。 */
+import {
+  STARTING_INVENTORY,
+  planStartingInventory,
+  type StartingInventoryEntry,
+  type StartingInventoryPlan,
+} from '../../../shared/constants/starting_inventory.ts';
 /* ★ 第六轮:`meta.partyTimer/scoreA/scoreB` 的**数据源**在本房间的派对赛局记录里
    (`START_PARTY` 写的那份,单例模块)。只读两个导出,不碰它的写口。 */
 import { PartyPhase, endParty, partyStateOf } from './actions/start_party.ts';
@@ -173,6 +182,11 @@ export const RoomAction = {
   PLACE_BLOCK: 'PLACE_BLOCK',
   BREAK_BLOCK: 'BREAK_BLOCK',
   PICKUP_ITEM: 'PICKUP_ITEM',
+  /* ★ WS-FND-154:**采集**(对「可采集物」,即内容表 §3.1 自然资源的物件)。
+     与 `BREAK_BLOCK`(权限位 build、对任意物件)是两件事:采集是**基础生存动作**
+     (权限位 baseline,游客也能采),前置 = 距离 + 工具(工具族词条由内容表派生),
+     判序与零副作用面见 `actions/gather.ts` 的文件头。 */
+  GATHER: 'GATHER',
   DROP_ITEM: 'DROP_ITEM',
   CRAFT: 'CRAFT',
   USE_ALCHEMY_FURNACE: 'USE_ALCHEMY_FURNACE',
@@ -261,6 +275,10 @@ export const ACTION_PERMISSION: Readonly<Record<RoomAction, keyof RolePermission
   BUY_ITEM: 'baseline',
   PLACE_BLOCK: 'build',
   BREAK_BLOCK: 'build',
+  /* ★ WS-FND-154:采集是**基础生存动作**(手册 §7.1 的 GUEST 是「能玩能捡」)。
+     「这一格能不能采」「工具够不够」「站得够不够近」三件事全在动作层判
+     (`actions/gather.ts`),不由权限位表达 —— 权限位只回答「你是谁」。 */
+  GATHER: 'baseline',
   CRAFT: 'build',
   PLACE_AUTOMATION: 'wiring',
   WIRE_EDIT: 'wiring',
@@ -1783,6 +1801,37 @@ export interface ItemReadPort {
 export type InventoryDetailSource = 'host' | 'room' | 'none';
 
 /**
+ * ★ WS-FND-155:起始背包的**发放回执**(可观测面;`RoomRuntime.lastStartingInventory`)。
+ *
+ * 三态**不许合并**(合并就是「把不确定说成确定」):
+ * ```text
+ * GRANTED  真的写进账了(件数 / 截断都在下面两份清单里)
+ * SKIPPED  没发,而且说得出为什么:已经发过 / 权威账里已有东西
+ * FAILED   本该发,计划被拒(容量非法 / 表内容非法)⇒ **一个数都没动**
+ * ```
+ * `rolledBack: true` = 发过又被「入场失败」撤回(`granted` 原样保留 ——
+ * 那条记录说的是「当时打算发什么」,不是「现在账里有什么」)。
+ *
+ * 放在这里(而不是 `net/actions/**`)的理由:发放**只发生在入场段**
+ * (`join` 与重连分支),它不是可被客户端触发的动作 —— 本仓「动作 = 一条 `RoomAction`」
+ * 的台账(WS-FND-18 / WS-FND-95)因此不受影响。
+ */
+export interface StartingInventoryReport {
+  readonly userId: string;
+  readonly verdict: 'GRANTED' | 'SKIPPED' | 'FAILED';
+  /** 真的进了账的那几件(容量不够时末项可能是部分的)。 */
+  readonly granted: readonly StartingInventoryEntry[];
+  /** 因容量被丢掉的那几件(如实列出:回执与断言都读它)。 */
+  readonly truncated: readonly StartingInventoryEntry[];
+  /** `granted` 的件数合计(账面上**新增**的件数)。 */
+  readonly total: number;
+  /** 这次用的容量(`carryCapacityOf` 的返回值,不是本文件猜的数)。 */
+  readonly capacity: number;
+  readonly reason: string;
+  readonly rolledBack: boolean;
+}
+
+/**
  * 单个房间的运行时。**不 import colyseus** —— colyseus 的 Room 只是薄装配层
  * (`room.colyseus.ts`),把它的 onTick/onJoin 转发到这里的方法。
  */
@@ -2075,6 +2124,62 @@ export class RoomRuntime {
     }
   }
 
+  /* ══════════════ ★ WS-FND-155:起始背包(只与入场段有关)══════════════
+   *
+   * ## 发什么
+   * `shared/constants/starting_inventory.ts#STARTING_INVENTORY`(冻结表,7 件:
+   * 101×2 / 106×2 / 118×2 / 201×1)。**一个 id 都不新造**,本文件不挑物品、
+   * 也不复述那张表 —— 表动了这里自动跟着动。
+   *
+   * ## 什么时候发:**只在玩家首次出现时**,判据三条(全在一处)
+   * ```text
+   * 1 本房间实例里**没发过**这个 id    ← startingInventoryGranted:Set<string>
+   * 2 权威账里**一件都没有**(总量 0) ← 「他不是一个空手的新玩家」的负向佐证
+   * 3 装得下 且 内容合法               ← planStartingInventory(见下)
+   * ```
+   * 三条全过才写账;**任何一条不过都只留回执、一个数都不动**(`verdict: SKIPPED/FAILED`)。
+   *
+   * ## 为什么判据是「房间账」而不是「世界账」
+   *   · 世界侧的 `WorldSim.addPlayer` 返回值(`CREATED` / `RELOCATED`)**不够用**:
+   *     退房会 `removePlayer` 清掉世界侧台账,同名重进又是 `CREATED` ——
+   *     它只说「这一轮刚登记」,不说「以前没来过」;
+   *   · 而背包账**本来就在房间**(`itemCounts` / `inventoryTotals`;模拟层**不**持有
+   *     背包明细,见 `inventoryDetailSource` 的注释:让世界侧编一份出来就是第二份
+   *     事实源)。⇒「发什么」与「发过没有」落在同一个对象上,天然同源。
+   *   · 结果:宽限期内重连(`resumed`)、退房重进、宽限超期重进、`RESET_WORLD`
+   *     之后再来 —— **一次都不会重复发**。重连那一条也调本方法(必然 SKIPPED),
+   *     这样**每一次入场都有如实回执**,而不是「没调就等于没发」。
+   *
+   * ## 与容量闸一致
+   * 容量**不在这里算**:问 `carryCapacityOf(userId)`(唯一出处是成长档案
+   * `carrySlots` / `statsAtLevel`,WS-FND-152)。计划由
+   * `planStartingInventory(容量, 表)` 出:装不下就按表序截断,丢掉的项进回执。
+   * 本类**只写**账,不另立第二份「够不够」的判定。
+   *
+   * ## 写账走哪条路
+   * `applyItemCountDelta`(按件账的**唯一**写入口)+ `projectInventoryTotalFor`
+   * (总量按明细**重算**,不累加)。这里**不**走 `applyInventory`:那条路判的是
+   * **客户端报文**(凭证链 / `allowedSources` 查的是「客户端凭空产出」),服务端
+   * 自己发的东西没有「凭证」可言 —— 硬塞一张反而要给用途枚举加一项
+   * (`anticheat.ts`,本轮写域外)。
+   *
+   * ## 已知边界(如实记)
+   * `startingInventoryGranted` 是**房间实例**的内存账:服务重启后同一 id 会再发一次
+   * —— 与既有的 `itemCounts` / `inventoryTotals` 同一世代(它们也不跨进程)。要跨进程
+   * 幂等,得把「已发」写进库(`rooms` / `repo.ts` 的写域),不在本轮。闸 2 把这条边界
+   * 当场收窄一半:库里 / 账里已经有东西的 id 一律不发。
+   */
+  private readonly startingInventoryGranted = new Set<string>();
+
+  /**
+   * 最近一次起始背包发放的**回执**(可观测;`null` = 还没有过任何一次入场尝试)。
+   *
+   * 三态与 `auditJoin` 同族:`GRANTED` 真发了 / `SKIPPED` 没发且**说得出为什么**
+   * (已经发过、账里已有东西)/ `FAILED` 本该发而计划被拒(**一个都没写**)。
+   * `rolledBack: true` = 发过又被入场失败撤回(见 `rollbackStartingInventory`)。
+   */
+  lastStartingInventory: StartingInventoryReport | null = null;
+
   /* ── 4.1 加入 / 重连 ── */
 
   /**
@@ -2171,6 +2276,10 @@ export class RoomRuntime {
         existing.afkSinceMs = null;
         existing.lastSeenMs = now;
         this.touch(now);
+        /* ★ WS-FND-155:**重连也走同一条发放尝试** —— 三条守卫都是幂等的,故这里
+           必然 SKIPPED;这么做的价值是「每一次入场都有如实回执」,而不是靠
+           「没调就等于没发」去推断重连有没有重复发。 */
+        this.grantStartingInventory(input.userId);
         const snapshot = this.snapshotFor(input.userId);
         if (this.db) {
           saveReconnectSnapshot(this.db, this.id, input.userId, snapshot, now);
@@ -2328,6 +2437,16 @@ export class RoomRuntime {
        *   放在 `ac.join` 之后是为了让「反作弊播种」与「读档」贴在一起更好读。 */
       if (restoredPose !== null) this.projectAllPlayers();
 
+      /* ★★ WS-FND-155:起始背包 = 进场段的**最后一件事**。位置是契约,三条都有理由:
+         ① 在 `addPlayer` **之后** —— 与读档、反作弊播种同一条「先登记再按 id 操作」的纪律;
+         ② 在 `restoreFromProfile` **之后** —— 容量按**恢复后**的档案算(30 级 = 37 格);
+            放在读档前会让高等级老玩家的包被 Lv.1 的 8 格截断,而那不是他的容量;
+         ③ 在 `encodeFull` **之前** —— 首帧快照与账一致,不出现「先告诉客户端 0 件、
+            50ms 后跳成 7 件」那种一帧的错。
+         ⚠️ 计划被拒(容量非法 / 表内容非法)**不抛**:入场不该因为一份起始礼物失败,
+            但必须留回执(`lastStartingInventory`),不许静默什么都不发。 */
+      this.grantStartingInventory(input.userId);
+
       this.touch(now);
 
       const snapshot = encodeFull(this.state, this.state.meta.tick).bytes;
@@ -2347,6 +2466,11 @@ export class RoomRuntime {
       }
       return { ok: true, role, token, snapshot, resumed: false };
     } catch (e) {
+      /* ★ WS-FND-155:入场中途抛 ⇒ **起始背包也要一起撤回**。否则权威账里会留下一份
+         谁都看不见的起始包(这个 id 连席位都没有),而「发过没有」那条幂等账会一直
+         记着 发过了 ⇒ 同名重试永远拿不到包。撤回走同一条按件写入口(减 delta),
+         顺序在 `rollbackJoin` **之前**:先清账,再收席位与实体。 */
+      const packRolledBack = this.rollbackStartingInventory(input.userId);
       const rb = this.rollbackJoin(input.userId, prevPlayerRow, worldAdded);
       const why = (e as Error).message.slice(0, 120);
       return {
@@ -2354,7 +2478,8 @@ export class RoomRuntime {
         /* ★ WS-FND-134(P2):入场中途抛错(已回滚)与"策略拒绝"分开档 ——
            前者是**缺陷信号**(该叫醒人),后者是正常业务(该给玩家一句话)。 */
         code: 'JOIN_FAILED',
-        reason: `加入失败(已回滚:world=${rb.world}${rb.restoredRow ? ',旧实体行已还原' : ''}):${why}`,
+        reason: `加入失败(已回滚:world=${rb.world}${rb.restoredRow ? ',旧实体行已还原' : ''}`
+          + `${packRolledBack ? ',起始背包已撤回' : ''}):${why}`,
       };
     }
   }
@@ -2422,6 +2547,126 @@ export class RoomRuntime {
     if (!worldAdded) return { world: 'skipped', restoredRow };
     const removed = this.removeFromWorld(userId);
     return { world: removed ? 'removed' : 'pending', restoredRow };
+  }
+
+  /**
+   * ★ WS-FND-155:**发放起始背包**(入场段唯一的写法;判据的完整说明见类里那段注释)。
+   *
+   * ## 三条守卫,顺序固定(先便宜后昂贵,且**都不写账**)
+   * ```text
+   * 1 房间账:这个 id 已经发过      ⇒ SKIPPED —— 这就是「只在首次出现时发」的判据本身
+   * 2 权威账:手里已有东西(总量>0) ⇒ SKIPPED —— 他不是「空手的新玩家」
+   * 3 计划  :容量(问 carryCapacityOf)+ 内容合法 + 截断 ⇒ 拒了就 FAILED,零副作用
+   * ```
+   * 三条全过才写:一次 `applyItemCountDelta`(**按件账唯一写入口**)+
+   * 一次 `projectInventoryTotalFor`(总量按明细**重算**)。⇒ 不新增第二个背包真值。
+   *
+   * ## 为什么这里不经 `applyInventory`
+   * 那条路判的是**客户端报文**(凭证链 + `allowedSources` 查「凭空产出」),
+   * 服务端自己发的东西不该装成客户端报了一笔 —— 见类里那段注释。
+   *
+   * ## 失败为什么不抛
+   * 入场不该因为一份起始礼物失败。但**不许静默**:拒因逐字进
+   * `lastStartingInventory.reason`(`FAILED`),而且一个数都没写。
+   */
+  grantStartingInventory(userId: string): StartingInventoryReport {
+    const capacity = this.carryCapacityOf(userId);
+    const record = (r: StartingInventoryReport): StartingInventoryReport => {
+      this.lastStartingInventory = r;
+      return r;
+    };
+    const base: Omit<StartingInventoryReport, 'verdict' | 'reason'> = {
+      userId, granted: [], truncated: [], total: 0, capacity, rolledBack: false,
+    };
+
+    /* 闸 1:本房间实例里**已经发过**这个 id(重连 / 重进 / 世界换代后回来都撞这一条)。 */
+    if (this.startingInventoryGranted.has(userId)) {
+      return record({
+        ...base,
+        verdict: 'SKIPPED',
+        reason: '本房间已经给他发过起始背包 ⇒ 不重复发(重连 / 重进 / 重置世界之后都不发)',
+      });
+    }
+
+    /* 闸 2:权威账里已经有东西 ⇒ 他不是「空手的新玩家」。
+       库基线也算(它由 `authoritativeItemTotal` 与房间账相加)⇒ 将来背包真的落库后,
+       这条会挡住「新房间实例 + 老存档」这种**跨进程**的重复发放。 */
+    const owned = this.authoritativeItemTotal(userId);
+    if (owned > 0) {
+      return record({
+        ...base,
+        verdict: 'SKIPPED',
+        reason: `权威账里已经有 ${owned} 件 ⇒ 不是空手新玩家,不发起始背包`,
+      });
+    }
+
+    /* 闸 3:计划 —— 容量 / 内容合法性 / 按优先级截断,全在冻结层那一个纯函数里
+       (本类不复制那张表,也不另写一份「够不够」)。 */
+    const plan: StartingInventoryPlan = planStartingInventory(capacity);
+    if (!plan.ok || plan.total < 1) {
+      return record({
+        ...base,
+        truncated: plan.truncated,
+        verdict: 'FAILED',
+        reason: plan.ok
+          ? '起始背包表是空的 ⇒ 一个都不发(fail-closed;不谎报「发了」)'
+          : plan.reason,
+      });
+    }
+
+    /* 发放:与 `applyInventory` 放行之后**同一对**写口。 */
+    this.applyItemCountDelta(
+      userId,
+      plan.granted.map((g) => ({ itemId: g.itemId, delta: g.count })),
+    );
+    this.projectInventoryTotalFor(userId);
+    this.startingInventoryGranted.add(userId);
+    return record({
+      ...base,
+      verdict: 'GRANTED',
+      granted: plan.granted,
+      truncated: plan.truncated,
+      total: plan.total,
+      reason: plan.reason,
+    });
+  }
+
+  /**
+   * ★ WS-FND-155:把**这一次**刚发出去的起始背包撤回来(入场失败时唯一的回滚点)。
+   *
+   * ## 为什么必须显式撤回
+   * 入场失败只回滚**席位痕迹**(`members` / `state.players` / 反作弊 / 世界侧刚体),
+   * 而背包账是**另一对表**(`itemCounts` / `inventoryTotals`)—— 它不在
+   * `clearSeatTraces()` 的清单里。⇒ 不撤就是两件事同时发生:
+   * ```text
+   * 1 权威账里留下一份谁都看不见的起始包(这个 id 连席位都没有);
+   * 2 幂等账记着「发过了」⇒ 同名重试**永远**拿不到包(而且不报错)。
+   * ```
+   *
+   * 撤回走**减 delta**,与发放**同一条**按件写入口(`applyItemCountDelta`),
+   * 再按明细重算总量:两份账不会一个人一套写法。
+   *
+   * 幂等 / 定向:`lastStartingInventory` 不是这个人的、或那份回执不是 `GRANTED`、
+   * 或已经撤过 ⇒ 什么都不做并返回 `false`(调用方据此决定要不要在 `reason` 里点名)。
+   *
+   * @returns `true` = 这次**确实**撤了一份回去。
+   */
+  private rollbackStartingInventory(userId: string): boolean {
+    const rep = this.lastStartingInventory;
+    if (rep === null || rep.userId !== userId) return false;
+    if (rep.verdict !== 'GRANTED' || rep.rolledBack || rep.granted.length === 0) return false;
+    for (const g of rep.granted) {
+      if (g.count > 0) this.applyItemCountDelta(userId, [{ itemId: g.itemId, delta: -g.count }]);
+    }
+    this.projectInventoryTotalFor(userId);
+    /* ★ 幂等账也要解掉 —— 否则这条 id 从此被记为「发过」,而账里一件都没有。 */
+    this.startingInventoryGranted.delete(userId);
+    this.lastStartingInventory = {
+      ...rep,
+      rolledBack: true,
+      reason: `${rep.reason} ⇒ 入场失败,已整批撤回`,
+    };
+    return true;
   }
 
   /**

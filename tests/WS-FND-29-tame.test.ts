@@ -91,6 +91,10 @@ function makeRoom(roomId: string, extraMembers: readonly string[] = []): Room {
   });
   a.runtime.join({ userId: 'p1' });
   for (const u of extraMembers) a.runtime.join({ userId: u });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1', ...extraMembers]) {
+    for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
+  }
   return { rt: a.runtime, total: a.runtime as unknown as TotalLike, roomId };
 }
 
@@ -296,6 +300,8 @@ test('FND29-6 失败路径两侧都不变(半步事务对照:繁殖未达标)', 
 test('FND29-7 权限:`baseline` —— GUEST 能投喂,不在房里的一律 PERMISSION', () => {
   const { rt, total } = makeRoom('r_tame_7');
   rt.join({ userId: 'g', asGuest: true });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of rt.authoritativeItemIds('g')) rt.applyInventory('g', { ops: [{ itemId: id, delta: -rt.authoritativeItemCount('g', id) }] });
   seed(rt, 'g', FOOD, 1);
   seed(rt, 'p1', FOOD, 1);
 

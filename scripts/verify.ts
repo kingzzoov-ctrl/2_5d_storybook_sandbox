@@ -31,6 +31,7 @@ import {
 import { CarryReject } from '../server/src/physics/carry.ts';
 import { DamageKind, ITEM } from '../server/src/mobs/behaviors.ts';
 import { runSelfcheck } from './invariants.ts';
+import { runCheck as runCoverageMatrixCheck } from './coverage-matrix.ts';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -8036,6 +8037,32 @@ if (!frozenOnly && !docsOnly && !contentOnly && !only) await checkIntegration();
        而本道比的是**全量**自称 ⇒ 在局部口径里报它会误导。
    ⚠️ 函数定义在本文件靠前处(紧跟 `checkJudgementAudit`),调用点在这里。 */
 if (!frozenOnly && !only) checkCountAudit();
+
+/* ★ 2026-11-19(第十一轮):**导出覆盖矩阵台账** —— 与上面「不变量自检」同一形态(进程内调用)。
+ *
+ * ## 接线前的事实(为什么要接)
+ * 这个工具建好了、台账也在仓里,却**只在 `tests/WS-FND-143` 里活着**:
+ *   · 台账过期 ⇒ 红的只是那一个测试套件,而「唯一的完成定义」是 `node scripts/verify.ts` 全绿;
+ *   · 于是「忘了跑 --write」与「台账是对的」在**门禁口径**里不可区分(陷阱 126)。
+ * 接上之后:台账与实测不一致 ⇒ 本道当场红,并**点名**是哪一条
+ * (漏登记 / 多登记 / 状态列写法非法)。
+ *
+ * ## 为什么用进程内调用而不是 `spawnSync`
+ * 与 `runSelfcheck()` 同一条理由:`runCheck()` 是纯读函数(只读源码与台账)⇒ 进程内调用会把它
+ * **算进 `pass`/`fail` 计数与退出码**;子进程形态在「脚本被删 / 改名」时会静默变成「没跑」,
+ * 而「没跑」与「一致」在输出上长得一模一样。
+ *
+ * ## 为什么位置与 `checkCountAudit()` 对齐、守卫也相同
+ * 两者性质相同(「文档/台账里的自称」 vs 「代码算出的正解」),且都是**只读文件 + 全量口径**
+ * ⇒ 局部口径(`--only WS-XX` / `--frozen`)里比它必然假红。
+ * ⚠️ 不排除 `--docs`:`--docs` 的语义正是「只检查文档」,而这份台账就是文档。 */
+if (!frozenOnly && !only) {
+  const cm = runCoverageMatrixCheck({ root: ROOT, ledgerPath: join(ROOT, 'docs', 'COVERAGE-MATRIX.md') });
+  if (!cm.ok) fail(`导出覆盖矩阵台账与实测不一致:${cm.problems.slice(0, 3).join('; ')}`);
+  else pass(`导出覆盖矩阵台账与实测一致(导出 ${cm.report.totals.exports}:`
+    + `behavior ${cm.report.totals.behavior} / symbol-only ${cm.report.totals.symbolOnly}`
+    + ` / none ${cm.report.totals.none})`);
+}
 
 /* ★ task-75:门禁自检(见 `checkGateSelfcheck` 的长注释)。
    ⚠️ 位置在 `verifyReadmeNumbers()` **之后**:`--lenient` 下它会 `advise()`,

@@ -133,6 +133,8 @@ test('FND53-6 ★ 世界侧同样生效:慢帧推进让层数过期(不是只有
   const a = assemble({ roomId: 'r_bub_window', ownerId: 'p1', sizeCells: 24, mobs: false });
   a.runtime.join({ userId: 'p1' });
   a.runtime.join({ userId: 'p2' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1', 'p2']) for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
   const sim = a.host as unknown as WorldSim;
   for (const id of ['p1', 'p2']) {
     if (!sim.physics.bodies.has(id)) sim.addPlayer(id, 12.5, 12.5);

@@ -150,7 +150,16 @@ test('FND150-2 服务端入口 createServer 默认落盘;`memory: true` 是**显
   /* 1 默认支:不传 db/dbPath ⇒ 入口补上 `DEFAULT_DB_PATH`。
      ⚠️ 先建库 + 房主(`createRoom` 要求房主存在)。这一步同时**证明**入口真的
      用了默认路径 —— 若它开到别处去,房主就不在,装配当场抛「房主不存在」。 */
-  const existedBefore = existsSync(DEFAULT_DB_PATH);
+  /* ⚠️ 健壮性(2026-11-20):**不依赖「文件原本不存在」** —— 上一次运行 / 别处
+     残留的 `.data/world.db` 会让下面 `seedFileDb` 的 `createUser` 撞
+     「用户已存在:u_owner」。`.data/` 是测试产物(`*.db` 已 gitignore),不是源码
+     ⇒ 先**清态**(把残留的默认库连 `-wal`/`-shm` 一并删掉),再走原判据。 */
+  const dropDefaultDb = (): void => {
+    for (const p of [DEFAULT_DB_PATH, `${DEFAULT_DB_PATH}-wal`, `${DEFAULT_DB_PATH}-shm`]) {
+      try { rmSync(p, { force: true }); } catch { /* 不存在 / 仍被持有 */ }
+    }
+  };
+  dropDefaultDb();
   seedFileDb(DEFAULT_DB_PATH);
   const srv = createServer({
     roomId: 'room_entry', ownerId: OWNER, clock: fixedClock(T0).clock, sizeCells: 8,
@@ -162,16 +171,12 @@ test('FND150-2 服务端入口 createServer 默认落盘;`memory: true` 是**显
   ok(existsSync(DEFAULT_DB_PATH), `默认库文件应存在:${DEFAULT_DB_PATH}`);
   ok(srv.summary.includes('已开库'), '摘要应如实报告「已开库」');
 
-  /* 清理:本测试之前没有这个文件 ⇒ 别把测试副作用留在仓里(`*.db` 已 gitignore,
-     但「跑一次测试多一个档」不是我们想要的卫生标准)。
+  /* 清理:**无条件**把本测试写下的默认库清掉(它从空态开始,结束时也回到空态)——
+     `*.db` 已 gitignore,但「跑一次测试多一个档」不是我们想要的卫生标准。
      Windows 上文件被连接持有 ⇒ 先关句柄再删(否则 EPERM)。 */
-  if (!existedBefore) {
-    try { (entryRt?.db as unknown as { close?: () => void } | null)?.close?.(); } catch { /* 已关 */ }
-    rmSync(DEFAULT_DB_PATH, { force: true });
-    rmSync(`${DEFAULT_DB_PATH}-wal`, { force: true });
-    rmSync(`${DEFAULT_DB_PATH}-shm`, { force: true });
-    try { rmSync(dirname(DEFAULT_DB_PATH), { recursive: false }); } catch { /* 目录非空 */ }
-  }
+  try { (entryRt?.db as unknown as { close?: () => void } | null)?.close?.(); } catch { /* 已关 */ }
+  dropDefaultDb();
+  try { rmSync(dirname(DEFAULT_DB_PATH), { recursive: false }); } catch { /* 目录非空 */ }
 
   /* 2 显式内存模式:同一条入口,`memory: true` ⇒ 不落盘。 */
   const mem = createServer({

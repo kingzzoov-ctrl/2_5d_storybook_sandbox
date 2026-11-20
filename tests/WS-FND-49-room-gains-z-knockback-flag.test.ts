@@ -175,6 +175,8 @@ test('FND49-11 ★ 被泡泡困住 ⇒ 不能移动(227 的"困住 5 秒"不再�
   const a = assemble({ roomId: 'r_trap_wire', ownerId: 'p1', sizeCells: 32, mobs: false });
   a.runtime.join({ userId: 'p1' });
   a.runtime.join({ userId: 'p2' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1', 'p2']) for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
   const sim = a.host as unknown as WorldSim;
   if (!sim.physics.bodies.has('p1')) sim.addPlayer('p1', 12.5, 12.5);
   if (!sim.physics.bodies.has('p2')) sim.addPlayer('p2', 13.5, 12.5);

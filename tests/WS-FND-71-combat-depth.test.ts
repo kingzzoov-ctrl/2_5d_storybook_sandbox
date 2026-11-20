@@ -60,6 +60,8 @@ function roomScene(sizeCells = 24): RoomScene {
   const a = assemble({ roomId: `r71q_${Math.random().toString(36).slice(2, 8)}`, ownerId: 'p1', sizeCells, mobs: false, rng: mulberry32(7) });
   const sim = a.host as unknown as WorldSim;
   a.runtime.join({ userId: 'p1' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   if (!sim.physics.bodies.has('p1')) sim.addPlayer('p1', 8, 8);
   return { sim, rt: a.runtime };
 }

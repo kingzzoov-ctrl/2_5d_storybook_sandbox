@@ -170,6 +170,8 @@ const HOST_INPUTS: EntryInputs = {
   buyItem: () => ({ itemId: 151, qty: 1 }),
   useAlchemyFurnace: () => ({ itemId: 151 }),
   placeAutomation: () => ({ x: 5, y: 6, itemId: 151 }),
+  /* ★ WS-FND-154:采集的目标格(面前那格)。 */
+  gather: () => ({ x: 7, y: 8 }),
 };
 
 const mk = (sock: FakeSocket, inputs: EntryInputs = HOST_INPUTS) =>
@@ -313,7 +315,7 @@ test('FND145-4 假 socket 经生产 sessionPorts 捕获**全部键位**的报文
   const sock = fakeSocket();
   const binding = mk(sock);
   const keys = [...Object.keys(ENTRY_KEYS), ...Object.keys(HOTBAR_KEYS)];
-  eq(keys, ['n', 'k', 'o', 'u', 'v', 't', '1', '2', '3', '4'],
+  eq(keys, ['n', 'k', 'o', 'u', 'v', 't', '1', '2', '3', '4', '5'],
     '键位集合逐字(两表拼起来才是完整入口;这里不写"若干个")');
 
   const outs = keys.map((k) => binding.handleKey(k));
@@ -333,7 +335,9 @@ test('FND145-4 假 socket 经生产 sessionPorts 捕获**全部键位**的报文
     { itemId: 151, qty: 1, action: 'BUY_ITEM' },
     { itemId: 151, action: 'USE_ALCHEMY_FURNACE' },
     { x: 5, y: 6, itemId: 151, action: 'PLACE_AUTOMATION' },
-  ], '★ 十条报文的键集合与取值都必须逐字正确(键多了/少了都会被这条抓住)');
+    /* ★ WS-FND-154:采集(目标格 = 面前那格;载荷只有 x / y)。 */
+    { x: 7, y: 8, action: 'GATHER' },
+  ], '★ 十一条报文的键集合与取值都必须逐字正确(键多了/少了都会被这条抓住)');
 
   const known = new Set<string>(Object.values(RoomAction) as unknown as string[]);
   for (const got of sock.sent) {

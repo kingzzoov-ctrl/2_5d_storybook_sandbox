@@ -122,6 +122,10 @@ function makeRoom(where: RoomKind, asGuest = false): Fixture {
   });
   a.runtime.join({ userId: owner });
   if (asGuest) a.runtime.join({ userId: actor, asGuest: true });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of asGuest ? [owner, actor] : [owner]) {
+    for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
+  }
   const sim = a.host as unknown as WorldSim;
 
   let at = { x: 12.5, y: 12.5 };

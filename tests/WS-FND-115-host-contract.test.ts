@@ -90,6 +90,12 @@ function makeRoom(roomId: string) {
     roomId, ownerId: 'p1', clock: { nowMs: () => 0 }, sizeCells: 16, mobs: false,
   });
   a.runtime.join({ userId: 'p1' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
+  /* ★ WS-FND-155:发放起始背包**必然跑一次总量投影**(总量账必须与按件账一致)⇒
+     本套件那条「还没跑过投影」的前置在此归零。⚠️ 不是把可观测面藏起来:
+     归零之后第一次真投影照样会被下面的断言抓到(它们读的是那次调用的结果)。 */
+  (a.runtime as unknown as { lastInventoryProjection: unknown }).lastInventoryProjection = null;
   return a;
 }
 

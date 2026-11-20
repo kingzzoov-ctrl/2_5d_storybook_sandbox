@@ -100,6 +100,19 @@ export function ownedItemCount(ctx: ActionContext, itemId: number): number | nul
   const n = port.itemCountOf(ctx.actorId, itemId);
   return Number.isFinite(n) ? n : 0;
 }
+/**
+ * 该玩家**真的**持有的全部 `itemId`(宿主未接读口 ⇒ `null` —— 与
+ * `ownedItemCount` 的空值语义**一致**:「没接」不是「空背包」)。
+ *
+ * 消费者:`actions/gather.ts` 的工具前置(「背包里有没有带某词条的工具」)。
+ * ⚠️ 仍是**只读**窄化:写入口只有 `RoomRuntime.applyItemCountDelta` 那一个。
+ */
+export function ownedItemIds(ctx: ActionContext): number[] | null {
+  const port = portOf(ctx);
+  if (typeof port.itemIdsOf !== 'function') return null;
+  const ids = port.itemIdsOf(ctx.actorId);
+  return Array.isArray(ids) ? ids.filter((n) => Number.isFinite(n)) : null;
+}
 
 /** 整份「物品 id → 件数」明细(只含 > 0);宿主未接读口 ⇒ `null`。 */
 export function authoritativeStock(ctx: ActionContext): Record<number, number> | null {

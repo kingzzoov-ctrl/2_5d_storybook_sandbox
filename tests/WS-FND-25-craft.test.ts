@@ -55,6 +55,8 @@ function makeRoom(asGuest = false): Room {
     rng: mulberry32(11),
   });
   a.runtime.join({ userId: 'p1', asGuest });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const id of a.runtime.authoritativeItemIds('p1')) a.runtime.applyInventory('p1', { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount('p1', id) }] });
   /* ★ D-11(2026-11-16):本套件的样例 `#245` 是 **505 高级锻造台**出的件 ⇒ 按裁决,
      未解锁时 `CRAFT` 必须拒。所以夹具要把"已解锁"这个事实**如实**建立起来:
      解锁的唯一产出点是 room effects(`stepRoomEffects`),这里推一慢帧建记录,再置真

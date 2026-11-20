@@ -1,5 +1,5 @@
 /**
- * **动作 → 处理器**的唯一一张表(`RoomAction` **24** 个动作的**执行层归属**)。
+ * **动作 → 处理器**的唯一一张表(`RoomAction` **25** 个动作的**执行层归属**)。
  *
  * ## 为什么是 `Readonly<Record<RoomAction, ActionHandler>>` 而不是手搓 `switch`
  *
@@ -10,8 +10,8 @@
  *
  * ## 文件互斥(为什么每个动作各占一个模块)
  *
- * 24 个动作**全部已登记**;其中 22 个各有真实现(`admin.ts` 5 个 / `material.ts` 4 个
- * 按**族**分文件,其余 15 个各占一个模块:`craft.ts` / `sleep.ts` / ...)。
+ * 25 个动作**全部已登记**;其中 23 个各有真实现(`admin.ts` 5 个 / `material.ts` 4 个 /
+ * `gather.ts` 1 个,按**族或动作**分文件,其余 13 个各占一个模块:`craft.ts` / `sleep.ts` / ...)。
  * 余下 2 个 —— `MOVE` / `ATTACK` —— 仍回 `NOT_IMPLEMENTED`(见下方 ★)。
  * ⇒ 改某个动作时**只改它自己那个文件**,本文件与 `room.ts` 一个字都不用动。
  *
@@ -44,9 +44,10 @@ import { wireEdit } from './wire_edit.ts';
 import { breedTame } from './breed_tame.ts';
 import { useItem } from './use_item.ts';
 import { buyItem } from './buy_item.ts';
+import { gather } from './gather.ts';
 
 /**
- * 24 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
+ * 25 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
  *
  * ★ 「接线缺口」的历史清单见 `docs/TASK-96-action-landing-gaps.md`(当时记的 13 处未接线,
  *   现已全部接线);今天仍回 `NOT_IMPLEMENTED` 的只剩 `MOVE` / `ATTACK`,这是**刻意**的
@@ -57,6 +58,9 @@ export const ACTION_HANDLERS: Readonly<Record<RoomAction, ActionHandler>> = {
   ATTACK: attack,
   PLACE_BLOCK: placeBlock,
   BREAK_BLOCK: breakBlock,
+  /* ★ WS-FND-154:采集(§3.1 自然资源的物件)。与 `BREAK_BLOCK` 共用**同一个**
+     格上清除口(`MaterialApi.breakBlock`),本表只是多一支判定层。 */
+  GATHER: gather,
   PICKUP_ITEM: pickupItem,
   DROP_ITEM: dropItem,
   CRAFT: craft,

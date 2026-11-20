@@ -226,6 +226,14 @@ function main(): void {
         const cell = cellUnder(predictor.pos);
         return { x: cell.x, y: cell.y, itemId: lastItemId };
       },
+      /* ★ WS-FND-154:采集(`5`)—— 目标是**面前那格**,与 `Q`/`E` 同一个 `cellInFront`
+         口径(`net/action_target.ts` 的朝向说明)。客户端**不判**「那一格能不能采」:
+         可采集性(内容表 §3.1 自然资源)/ 工具族词条 / 采集半径三件事只在服务端
+         `net/actions/gather.ts` 一处判 —— 快照里也没有格子物件数据可判。 */
+      gather: () => {
+        const cell = cellInFront(predictor.pos, facing);
+        return { x: cell.x, y: cell.y };
+      },
     },
   });
   /* 键位:薄绑定。`window` 满足结构化目标 `KeyEventTarget`,不需要 jsdom 也照样能驱动。 */

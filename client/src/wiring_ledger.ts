@@ -247,6 +247,13 @@ export const WIRING_LEDGER: readonly WiringEntry[] = [
     reason: 'net/action_binding.ts 的 trigger 的 placeAutomation 分支(键位 HOTBAR_KEYS 的 `4`)',
   },
   {
+    symbol: 'gatherRequest',
+    definedIn: 'client/src/net/action_entry.ts',
+    status: WiringStatus.WIRED,
+    callSites: 1,
+    reason: 'net/action_binding.ts 的 trigger 的 gather 分支(键位 HOTBAR_KEYS 的 `5`)',
+  },
+  {
     symbol: 'HOTBAR_KEYS',
     definedIn: 'client/src/net/action_binding.ts',
     status: WiringStatus.WIRED,
@@ -321,6 +328,8 @@ export const WIRED_WITNESS: Readonly<Record<string, string>> = {
   buyItemRequest: 'return this.submit(buyItemRequest(input));',
   useAlchemyFurnaceRequest: 'return this.submit(useAlchemyFurnaceRequest(input));',
   placeAutomationRequest: 'return this.submit(placeAutomationRequest(input));',
+  /* ★ WS-FND-154:采集。见证片段取**调用点**(定义行永远存在,等于没有声明「接上了」)。 */
+  gatherRequest: 'return this.submit(gatherRequest(input));',
   HOTBAR_KEYS: 'ENTRY_KEYS[k] ?? HOTBAR_KEYS[k]',
   DRAG_UPLINK: '本地整理视图(不发报文:${DRAG_UPLINK};刷新/重连即回原序)',
 };
@@ -461,6 +470,16 @@ export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
     status: ClientEntryStatus.WIRED,
     reason: '★ 第十轮补:键盘走**播种形态**(只给 itemId);组件形态(kind)由按钮路径给 ——'
       + '客户端不持有 wiring 的 kind 名单(见 CLIENT_ENTRY_GAPS 的 lane 行)',
+  },
+  {
+    action: 'GATHER', serverPath: 'net/actions/gather.ts', entry: '5(HOTBAR_KEYS)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ WS-FND-154 补:目标格 = 宿主用 `cellInFront` 算的**面前那格**;'
+      + '可采集性(内容表 §3.1 自然资源)/ 工具族词条 / 采集半径三件事**全在服务端判**'
+      + '(`server/src/net/actions/gather.ts`),客户端不报「那一格是什么」'
+      + '(快照里没有格子物件数据)。'
+      + '为什么不让既有 `F`(拾取)改道:同一个理由 —— 客户端**判不出**'
+      + '「面前有没有可采集物」,让一个键两义就是拿一次按键去猜。',
   },
   /* ── ★ WS-FND-145:剩下的 8 条**全部**裁决为「服务端已实现、客户端刻意不提供」──
      逐条的「为什么」与「解锁它的那一件事」在 `CLIENT_ENTRY_HOLDS`(同一份数据;
@@ -725,6 +744,8 @@ export const CLIENT_ENTRY_WITNESS: Readonly<Record<string, string>> = {
   BUY_ITEM: "action: 'BUY_ITEM'",
   USE_ALCHEMY_FURNACE: "action: 'USE_ALCHEMY_FURNACE'",
   PLACE_AUTOMATION: "action: 'PLACE_AUTOMATION'",
+  /* ★ WS-FND-154:采集。见证片段取**构建器里的动作名**(定义行永远存在,等于没声明)。 */
+  GATHER: "action: 'GATHER'",
   /* ★ WS-FND-151:设模式(模式面板)。见证片段取**构建器里的动作名** —— 定义行
      永远存在,等于没有声明"接上了";这里要求的是"真的有一条报文叫这个名字"。 */
   SET_PARTY_MODE: "action: 'SET_PARTY_MODE'",

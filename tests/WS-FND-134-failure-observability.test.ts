@@ -93,7 +93,17 @@ async function atest(name: string, fn: () => Promise<void>): Promise<void> {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
-/** 握手预算(不是重试):真 socket 在满载门禁下是重尾(理由同 `WS-FND-63`)。 */
+/**
+ * 具名等待上限(不是重试):真 socket 在满载门禁下是重尾(理由同 `WS-FND-63`)。
+ *
+ * ★ 与 `tests/WS-13.test.ts` §6.0 / `tests/WS-FND-65` 同一套:每个常量写清"它在等哪一段",
+ *   等待形态是**条件 + 具名上限**(`waitConn`),而不是"盲等一个 promise"。
+ * ★ 本轮**没有上调任何预算**(上一轮把 open 从 5s 加到 15s 并没修好它):改的是等待形态 ——
+ *   条件成立立刻返回、连接进终态提前结束、失败消息带「等了多久 + opened/helloSent/closed/err」。
+ */
+/** 等:`new WebSocket()` → TCP connect → HTTP Upgrade ⇒ 客户端 `open` 事件到达。 */
+const WS_OPEN_BUDGET_MS = 15000;
+/** 等:握手 / 状态推进(session 进 live、收到 reject、假服务端被连上)。 */
 const WS_HANDSHAKE_BUDGET_MS = 15000;
 
 async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -122,6 +132,59 @@ async function waitUntil(
   }
 }
 
+/**
+ * ★ 轮询等待条件成立 —— 返回**等了多久**(ms);`-1` = 等满上限仍未成立。
+ *
+ * 为什么返回 -1 而**不是抛**(与 `WS-13` §6.0 / `WS-FND-65` 同一形态):
+ *   抛 ⇒ 失败被压成一句「超时 Nms」,而那一刻**现场**(连接终态)还没被读
+ *        ⇒ 报告里「握手真没发生」与「只是慢」不可分;返回 -1 ⇒ 调用点那条
+ *        `ok/eq` **照旧红**,消息里却能同时写「等了多久」+「终态」。
+ * ⚠️ `-1` 不是放行:条件仍为假,断言强度一点没动。
+ */
+async function waitUntilMs(cond: () => boolean, budgetMs: number, stepMs = 5): Promise<number> {
+  const t0 = Date.now();
+  /* ★ 用 `>=` 而不是 `>`:令 `budgetMs = 0` 精确表示"当场只看一眼"(同 `WS-FND-65`)。 */
+  for (;;) {
+    if (cond()) return Date.now() - t0;
+    if (Date.now() - t0 >= budgetMs) return -1;
+    await sleep(stepMs);
+  }
+}
+
+/** 把 `waitUntilMs` 的返回值写成报告里能读的话:≥0 = 成立耗时,<0 = 等满上限仍未成立。 */
+function waitedText(waited: number, budgetMs: number): string {
+  return waited < 0 ? `等满 ${budgetMs}ms 仍不成立` : `等了 ${waited}ms`;
+}
+
+/** 连接级**终态**的原始记录 —— 只用来解释"为什么红",不参与任何判据。 */
+type ConnTrace = {
+  /** `open` 事件到达。⚠️ 它**不等于**握手完成(握手是上行 hello 那一步)。 */
+  opened: boolean;
+  /** 上行 hello 是否真发出去了(`ws.send` 抛过一次的话,这里会留 false + err)。 */
+  helloSent: boolean;
+  closed: { code: number; reason: string } | null;
+  err: string | null;
+};
+
+/** 连接终态的可读文本(写进失败消息)。 */
+function connState(t: ConnTrace): string {
+  const closed = t.closed === null
+    ? 'null'
+    : String(t.closed.code) + (t.closed.reason ? `(${t.closed.reason})` : '');
+  return `opened=${t.opened},helloSent=${t.helloSent},closed=${closed},err=${t.err ?? 'null'}`;
+}
+
+/**
+ * ★ 等一个**连接级**条件成立;连接一旦进终态(error/close ⇒ 事件**不可能**再来),
+ * **提前**结束等待。
+ *
+ * 为什么提前结束**不是**放行:它不改任何状态 ⇒ 调用点断言的原条件此时仍为假
+ *   ⇒ 那条 `ok/eq` **照旧红**;它只是把"白等满上限"换成"立刻红 + 把终态写进消息"。
+ */
+async function waitConn(cond: () => boolean, t: ConnTrace, budgetMs: number): Promise<number> {
+  return await waitUntilMs(() => cond() || t.closed !== null || t.err !== null, budgetMs);
+}
+
 const enc = new TextEncoder();
 
 /** 上行文本帧 = `0x01` + 载荷(契约 §12.1:上行有 tag、下行没有)。 */
@@ -139,6 +202,24 @@ function uplinkBinary(bytes: Uint8Array): Uint8Array {
   out[0] = 0x02;
   out.set(bytes, 1);
   return out;
+}
+
+/**
+ * 上行 hello(§12.1:1 字节类型头 `0x01` + JSON)。
+ *
+ * ★ 顺手把**结果**记进连接终态(`helloSent` / `err`)—— 它**不参与任何判据**,
+ *   只在红的消息里分清「发送这一步就没出去」与「发出去了但对面没回」;
+ *   与 `WS-FND-65` 的 `conn.helloSent` 同一形态。
+ */
+function sendHello(c: RawClient): void {
+  try {
+    c.ws.send(uplinkText(JSON.stringify({
+      t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null,
+    })));
+    c.conn.helloSent = true;
+  } catch (e) {
+    c.conn.err = `hello 发送失败:${e instanceof Error ? e.message : String(e)}`;
+  }
 }
 
 /**
@@ -192,6 +273,8 @@ type RawClient = {
   bin: Uint8Array[];
   opened: Promise<void>;
   done: Promise<void>;
+  /** 连接级**终态**(只用来解释"为什么红",不参与任何判据;见 `connState`)。 */
+  conn: ConnTrace;
 };
 
 function rawConnect(port: number, url: string): RawClient {
@@ -200,6 +283,7 @@ function rawConnect(port: number, url: string): RawClient {
   const out: RawClient = {
     ws: null as unknown as WebSocket, texts, bin,
     opened: null as unknown as Promise<void>, done: null as unknown as Promise<void>,
+    conn: { opened: false, helloSent: false, closed: null, err: null },
   };
   const ws = new WebSocket(`ws://127.0.0.1:${port}${url}`);
   out.ws = ws;
@@ -207,7 +291,7 @@ function rawConnect(port: number, url: string): RawClient {
   let markOpened: () => void = () => undefined;
   out.opened = new Promise<void>((res) => { markOpened = res; });
   out.done = new Promise<void>((res) => {
-    ws.addEventListener('open', () => { markOpened(); });
+    ws.addEventListener('open', () => { out.conn.opened = true; markOpened(); });
     ws.addEventListener('message', ((ev: { data: unknown }) => {
       const d = ev.data;
       if (typeof d === 'string') { texts.push(JSON.parse(d) as Record<string, unknown>); return; }
@@ -216,10 +300,38 @@ function rawConnect(port: number, url: string): RawClient {
         bin.push(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength));
       }
     }) as never);
-    ws.addEventListener('close', () => res());
-    ws.addEventListener('error', () => res());
+    /* ★ 2026-11-20:新增的**终态**监听 —— 修前这两个事件只用来落定 `done`,
+       于是「被拒(1008)/掉线/err」在报告里**完全不可见**,等待只能白等满上限。 */
+    ws.addEventListener('close', ((ev: { code: number; reason: string }) => {
+      out.conn.closed = { code: ev.code, reason: ev.reason };
+      res();
+    }) as never);
+    ws.addEventListener('error', ((ev?: { error?: { name?: string; message?: string } }) => {
+      out.conn.err = ev?.error
+        ? `${ev.error.name ?? 'Error'}: ${ev.error.message ?? ''}`
+        : 'error(无详情)';
+      res();
+    }) as never);
   });
   return out;
+}
+
+/**
+ * ★ 等**连接打开**:条件一成立立刻返回;**连接进终态(error/close)时提前结束**。
+ *
+ * 老写法是 `await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开')` ——
+ * 那是"固定预算 / 盲等一个 promise":它只买得到**时间**,买不到**事实**。
+ *   · 那一刻套件没有任何 error/close 只读点 ⇒ 握手被拒(1008/426)与"只是满载下慢"
+ *     在报告里长得一模一样,消息里只有上限、没有连接终态;
+ *   · 老写法连现场都留不下 ⇒ 报告只能印一句「超时 15000ms:连接打开」。
+ * ⇒ 改成等条件 + 具名上限 `WS_OPEN_BUDGET_MS`,失败消息带「等了多久 + 终态」
+ *   (`opened`/`helloSent`/`closed`/`err`)。**预算没有上调**。
+ * ⚠️ 提前结束**不是**放行:条件此时仍为假 ⇒ 下面那条 `ok` 照旧红;
+ *   它只是把"明知不会再来"的白等 15 秒换成立刻红 + 现场(与 `WS-FND-65` / `WS-13` §6.0 同法)。
+ */
+async function waitOpen(c: RawClient): Promise<void> {
+  const waited = await waitConn(() => c.conn.opened, c.conn, WS_OPEN_BUDGET_MS);
+  ok(c.conn.opened, `连接应打开(${waitedText(waited, WS_OPEN_BUDGET_MS)};${connState(c.conn)})`);
 }
 
 async function teardown(clients: RawClient[], srv: WsServerHandle): Promise<void> {
@@ -290,8 +402,8 @@ async function main(): Promise<void> {
        本用例测的是「被拒时的出口」,不是鉴权。 */
     const c = rawConnect(srv.port, '/ws?userId=u_reject134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
 
       await waitUntil(() => srv.helloRejected() >= 1, 5000, 'hello 被拒被记账', () => srv.helloRejected());
       eq(room.joinCalls, 1, '前置:join 真的被调了一次(否则下面的账是空的)');
@@ -321,8 +433,8 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20, onLog: sink });
     const c = rawConnect(srv.port, '/ws?userId=u_ok134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
       await waitUntil(() => c.texts.length >= 1, 5000, 'welcome 到达', () => c.texts);
       eq(c.texts[0]!.t, 'welcome', '正对照:合法入场收的是 welcome,不是 reject');
       eq(srv.helloRejected(), 0, '★★ 负对照:合法入场 ⇒ hello 被拒计数**不动**(证明它不是\"总是涨\")');
@@ -342,7 +454,7 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20, onLog: sink });
     const c = rawConnect(srv.port, '/ws?userId=u_badjson134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
+      await waitOpen(c);
       /* ★ 注入:一个**开头是 `{` 但截断**的文本帧 ⇒ 走 text 分支、JSON.parse 抛。 */
       c.ws.send(uplinkText('{"t":"hello","protocolVersion":3'));
       await waitUntil(() => srv.uplinkRejected() >= 1, 5000, '坏文本被记账', () => srv.uplinkRejected());
@@ -365,8 +477,8 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20, onLog: () => undefined });
     const c = rawConnect(srv.port, '/ws?userId=u_okbin134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
       await waitUntil(() => c.texts.length >= 1, 5000, 'welcome 到达', () => c.texts);
       eq(srv.uplinkRejected(), 0, '合法 hello ⇒ 载荷层拒收计数不动');
 
@@ -393,8 +505,8 @@ async function main(): Promise<void> {
     const proto = net.Socket.prototype as unknown as { write: unknown };
     const realWrite = proto.write;
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
       await waitUntil(() => c.texts.length >= 1, 5000, 'welcome 到达', () => c.texts);
       eq(srv.writeErrors(), 0, '前置:还没写失败过');
 
@@ -430,8 +542,8 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20, onLog: boom });
     const c = rawConnect(srv.port, '/ws?userId=u_boom134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
       /* 一个坏文本帧 ⇒ 必然触发一次 log(出口会抛)。 */
       c.ws.send(uplinkText('{bad'));
       await waitUntil(() => srv.uplinkRejected() >= 1, 5000, '坏帧被记账(logger 抛也要记)', () => srv.uplinkRejected());
@@ -439,7 +551,7 @@ async function main(): Promise<void> {
       const framesBefore = srv.framesSent();
       await waitUntil(() => srv.framesSent() > framesBefore + 2, 5000, '广播继续跑', () => srv.framesSent());
       eq(srv.uplinkRejected(), 1, '★ logger 抛**不**改变记账(宽容 catch 只吞出口自己的错)');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      sendHello(c);
     } finally {
       await teardown([c], srv);
     }
@@ -452,8 +564,8 @@ async function main(): Promise<void> {
     const srv = await startWsServer({ port: 0, room: room as never, frameMs: 20, onLog: sink });
     const c = rawConnect(srv.port, '/ws?userId=u_internal134');
     try {
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
-      c.ws.send(uplinkText(JSON.stringify({ t: 'hello', protocolVersion: PROTOCOL_VERSION, contentClaim: null })));
+      await waitOpen(c);
+      sendHello(c);
       await waitUntil(() => c.texts.length >= 1, 5000, 'welcome 到达', () => c.texts);
 
       /* 1 注入:派发**抛**(内部错)。 */
@@ -848,7 +960,7 @@ async function main(): Promise<void> {
       /* ⚠️ 这里**刻意不传 onLog** —— 被测的正是\"没注入时默认出口是谁\"。 */
       srv = await startWsServer({ port: 0, room: room as never, frameMs: 20 });
       c = rawConnect(srv.port, '/ws?userId=u_default134');
-      await withTimeout(c.opened, WS_HANDSHAKE_BUDGET_MS, '连接打开');
+      await waitOpen(c);
       c.ws.send(uplinkText('{bad-json'));
       await waitUntil(() => srv!.uplinkRejected() >= 1, 5000, '坏文本被记账', () => srv!.uplinkRejected());
       await waitUntil(() => captured.some((l) => l.startsWith('[ws:uplink]')), 5000,

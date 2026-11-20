@@ -194,17 +194,17 @@ test('FND138-1 ★ 入口键 → 真的发出报文(1/2/3/4 经 sessionPorts 进
 /* ═══════════════════════════ 2 ═══════════════════════════ */
 
 test('FND138-2 键位表:数字热键与既有键组互不重叠,且**没动** ENTRY_KEYS 的六条', () => {
-  eq(Object.keys(HOTBAR_KEYS), ['1', '2', '3', '4'], '数字热键恰好是 1/2/3/4');
+  eq(Object.keys(HOTBAR_KEYS), ['1', '2', '3', '4', '5'], '数字热键恰好是 1/2/3/4/5');
   eq(Object.keys(ENTRY_KEYS).length, 6, '★ 既有字母表仍是六个槽位(别的套件钉着它 —— 分表就是为了不动它)');
-  eq(Object.values(HOTBAR_KEYS).map((s) => s.slot), ['breedTame', 'buyItem', 'useAlchemyFurnace', 'placeAutomation'], '四个键各映射到一个新槽位');
+  eq(Object.values(HOTBAR_KEYS).map((s) => s.slot), ['breedTame', 'buyItem', 'useAlchemyFurnace', 'placeAutomation', 'gather'], '五个键各映射到一个槽位');
   eq(Object.keys(ENTRY_KEYS).filter((k) => Object.keys(HOTBAR_KEYS).includes(k)), [], '两张表之间不许有同名键');
 
   ok(keyGroupsExclusive(), 'keyGroups() 里必须**包含**数字热键组,且全局无冲突');
   eq(keyCollisions(), [], '冲突清单为空');
   const hot = keyGroups().find((g) => g.name.includes('HOTBAR_KEYS'));
   ok(hot !== undefined, '★ 数字热键必须进 keyGroups(不进就等于"没人核对它")');
-  eq(hot?.keys, ['1', '2', '3', '4'], '进判据的正是 1/2/3/4');
-  eq(hotbarKeyHints(), '1 驯养(投喂/驯服/繁殖/牧场) · 2 购买 · 3 炼金台 · 4 放自动化件/播种',
+  eq(hot?.keys, ['1', '2', '3', '4', '5'], '进判据的正是 1/2/3/4/5');
+  eq(hotbarKeyHints(), '1 驯养(投喂/驯服/繁殖/牧场) · 2 购买 · 3 炼金台 · 4 放自动化件/播种 · 5 采集(面前那格的自然资源)',
     '热键提示行由表生成(不手写第二份)');
   ok(!entryKeyHints().includes('1 '), '字母表那行不含数字键(两行各说各的)');
 
@@ -333,7 +333,6 @@ test('FND138-6 重复触发不串包;PLACE_AUTOMATION 的两种形态键集合�
 });
 
 /* ═══════════════════════════ 7 ═══════════════════════════ */
-
 test('FND138-7 逐动作覆盖 `RoomAction`,并逐条与**真源码**对账(wired 有见证 / missing 零出现)', () => {
   const actions = Object.keys(RoomAction) as string[];
   eq([...CLIENT_ENTRY_LEDGER.map((r) => r.action)].sort(), [...actions].sort(),
@@ -364,8 +363,8 @@ test('FND138-7 逐动作覆盖 `RoomAction`,并逐条与**真源码**对账(wire
      —— 缺的那块 UI(`ui/party_panel.ts` 的选择器 + `net/action_entry.setPartyMode`)
      已经落地 ⇒ 这里按**实测**记 17/7,而不是继续钉 16/8。
      (钉旧数的代价不是"数字难看":它会逼着后来者把已接的入口写回 missing,
-      或者把真入口删掉 —— 两种都是把修好的东西退回去。) */
-  eq(wired, 17, '已接线 17 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 4 + 模式面板 1)');
+     已经落地 ⇒ 这里按**实测**记 18/7,而不是继续钉 17/7。
+  eq(wired, 18, '已接线 18 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 5 + 模式面板 1)');
   eq(missing, 7, '登记"服务端有、客户端零入口"7 条(SET_PARTY_MODE 已于 WS-FND-151 接线)');
   eq(CLIENT_ENTRY_LEDGER.length, actions.length, '台账条数 = RoomAction 键数(两者派生,不写死)');
 
@@ -447,12 +446,12 @@ test('FND138-11 手册与提示条:键位 / 空格一键两义 / 相机跟随 / 
   const play = read('PLAY.md');
   const html = read('client/index.html');
   eq(docProblems(play, html), [], 'PLAY.md 与 client/index.html 必须自洽且与代码一致');
-  eq(play.includes('23 个 `RoomAction`'), false, '旧数字 23 必须消失');
-  eq(play.includes('「22 个动作的归属」'), false, '旧数字 22(动作归属)必须消失');
+  eq(play.includes('24 个 `RoomAction`'), false, '旧数字 24 必须消失');
+  eq(play.includes('「24 个动作的归属」'), false, '旧数字 24(动作归属)必须消失');
 
   /* ── 注入验证:把**修前**的两处文本塞回去 ⇒ 同一条判据必须报红 ── */
   const stale = play
-    .replace('24 个 `RoomAction` 里 **22 个已接线**', '23 个 `RoomAction` 里 **21 个已接线**')
+    .replace('25 个 `RoomAction` 里 **23 个已接线**', '24 个 `RoomAction` 里 **22 个已接线**')
     .replace('相机跟着**权威位置**走', 'WASD 现在**同时**在平移相机')
     .concat('\nWASD 现在**同时**在平移相机,所以角色不会走出画面 —— 但那是巧合\n');
   const problems = docProblems(stale, html);
@@ -474,9 +473,9 @@ function docProblems(play: string, html: string): string[] {
     p.push('PLAY.md 仍在说「WASD 同时在平移相机 ⇒ 那是巧合」——代码已改成相机跟随权威位置');
   }
   if (!play.includes('相机跟着**权威位置**走')) p.push('PLAY.md 没写明相机跟随权威位置(committed 的行为)');
-  if (play.includes('23 个 `RoomAction`')) p.push('PLAY.md 的 RoomAction 总数过期(23 ⇒ 实测 24)');
-  if (!play.includes('24 个 `RoomAction`')) p.push('PLAY.md 未写 24 个 RoomAction');
-  if (!play.includes('22 个已接线')) p.push('PLAY.md 未写 22 个已接线');
+  if (play.includes('24 个 `RoomAction`')) p.push('PLAY.md 的 RoomAction 总数过期(24 ⇒ 实测 25)');
+  if (!play.includes('25 个 `RoomAction`')) p.push('PLAY.md 未写 25 个 RoomAction');
+  if (!play.includes('23 个已接线')) p.push('PLAY.md 未写 23 个已接线');
   if (!play.includes('一键两义')) p.push('PLAY.md 没写空格的一键两义(攻击 + 跳跃锁存)');
   if (!play.includes('锁存一次跳跃')) p.push('PLAY.md 没写跳跃锁存这件事');
   if (!play.includes('本地整理视图')) p.push('PLAY.md 没写背包拖拽=本地整理视图');

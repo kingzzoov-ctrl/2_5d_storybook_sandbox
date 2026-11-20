@@ -570,7 +570,30 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
   ⚠️ 抬水位不关告警:守卫比的仍是**总命中数**,下次再出现这类配对还会响 —— 先看是哪一对,而不是接着抬。
   ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
      只读水位这一个数字 = 拿汇总数替代逐条判定。 */
-export const G_CANDIDATE_WATERMARK = 76; /*
+/* 2026-11-20(第十一轮):76 → **81**。命令 `node scripts/judgement_audit.ts --baseline`,读数 **81** ⇒ 按**实测**重钉。
+  增量 **+5**,逐条核对后**全部**落在本批并行接线的新测试夹具上(无一条来自本条线的改动):
+   1) `tests/WS-FND-105-action-ledgers.test.ts:53` `Rig` ↔ `Rig`@`tests/WS-FND-154-gather.test.ts:122`
+      共享[ctx,counts,sources,revoked,limits] / 独有A[state,batches] / 独有B[dropped,cells,gatherMul,...]
+   2) `tests/WS-FND-105-action-ledgers.test.ts:63` `RigOptions` ↔ `RigOptions`@`tests/WS-FND-154-gather.test.ts:138`
+      共享[tick,actorId,owns,capacity] / 独有A[roomId,host] / 独有B[cells,gatherMul,allowed,...]
+   3) `tests/WS-FND-107-idempotency-hardening.test.ts:206` `Rig` ↔ `Rig`@`tests/WS-FND-154-gather.test.ts:122`
+      共享[ctx,counts,sources,revoked] / 独有A[batches,furnaceCalls] / 独有B[dropped,cells,limits,...]
+   4) `tests/WS-FND-107-idempotency-hardening.test.ts:220` `RigOptions` ↔ `RigOptions`@`tests/WS-FND-154-gather.test.ts:138`
+      共享[actorId,tick,owns] / 独有A[state,rejectFirst,rejectReason] / 独有B[cells,gatherMul,...]
+   5) `tests/WS-FND-154-gather.test.ts:122` `Rig` ↔ `RigOptions`@`tests/WS-FND-154-gather.test.ts:138`
+      共享[cells,gatherMul,allowed,hasMaterials,hasReadPort] / 独有A[ctx,counts,sources,revoked,dropped,limits]
+  ⇒ 五条是**同一形态**:并行批次的新套件 `WS-FND-154` 自己声明了一份 `Rig`/`RigOptions`,与既有两个套件的
+     **同名夹具**、以及它自己的 options 各成一对 —— 即本文件反复记过的「同名夹具在各套件各声明一份」
+     (测试替身,不是两份生产实现),属已登记过的类型,不是缺陷形态。
+  ⚠️ 归属核实(可复核):本批 Z1 的 `server/src/net/actions/gather.ts` / `item_source.ts#ownedItemIds` /
+     `material.ts#gatherRollFor` 与 Z2 的 `shared/constants/starting_inventory.ts` 都是 const/function
+     (不声明"共享 ≥3 领域字段且各有独有"的类型容器)⇒ 它们**不直接**产生 G 配对;
+     +5 的落点只在 `tests/WS-FND-154-gather.test.ts` 这一个新文件上(逐条见上)。
+  ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响;
+     那时要做的仍是先看是哪一对容器,而不是接着抬。
+  ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
+     只读水位这一个数字 = 拿汇总数替代逐条判定。 */
+export const G_CANDIDATE_WATERMARK = 81; /*
   2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
    —— ⚠️ **多出的那一条与本轮改动无关,A/B 已证明**(Q4):
    把本批新增的文件移走后再跑同一条命令,**仍是 75** ⇒ 增量不来自本次改动面,

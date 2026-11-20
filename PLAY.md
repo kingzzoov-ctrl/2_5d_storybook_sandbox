@@ -57,6 +57,7 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 | **`2`** | **购买**:在无人货摊(515)买「最近碰过的那件」1 个 |
 | **`3`** | **炼金台**:投「最近碰过的那件」进炼金炉(站在炼金实验室里才成) |
 | **`4`** | **放自动化件 / 播种**:在**你脚下那格**落一件(键盘走播种形态) |
+| **`5`** | **采集**:采**面前**那格的**可采集物**(内容表 §3.1 自然资源的物件)。前置 = 距离(3 格内)+ 工具(工具族词条由内容表派生,徒手类资源不要求),拒因如实回执 |
 | **`I`** / **`R`** / **`H`** / **`P`** / **`M`** | 背包 / 配方 / 画架 / 音高 / **派对模式**面板(开/关;`M` 再按一次或 `Esc` 关闭) |
 | **`[`** / **`]`** | 缩放(6 档:0.5× ~ 2×) |
 | **`/`** | 背包/配方**搜索**(进搜索态后动作键让路;`Enter` 收下 / `Esc` 清空) |
@@ -86,6 +87,18 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 **不是键坏了**。这是如实拒绝,不是静默:凭空编一个 id 只会换来服务端一句 `INVALID`,
 而那会掩盖真正的原因。
 
+**新玩家开局不是两手空空**(WS-FND-155):进场时服务端发一份**起始背包** —— 内容表在
+`shared/constants/starting_inventory.ts#STARTING_INVENTORY`,取的是内容表里**最低阶可造物**
+的材料(101 暖松原木×2 / 106 云母圆石×2 / 118 柔韧风草×2)加**一件基础工具**(201 暖松石刃斧×1)
+⇒ **不必先拆方块**就有材料可用。三条如实说明:
+
+- 只在**首次出现**时发:宽限期内的重连、退房重进、`RESET_WORLD` 之后再来 —— **都不重复发**;
+- 包**占容量**(Lv.1 = 8 格):装不下就按优先级截断;发了几件 / 截掉哪几件写在回执
+  `RoomRuntime.lastStartingInventory` 里,**不静默**;
+- 它**不改上面那条前置**:`Q` / `G` / `F` / `N` / `T` / `2` / `3` / `4` 仍然要一个
+  「最近物品 id」,而那个 id 只能来自回执 ⇒ **第一步仍然是「碰一件东西」**
+  (为了拿到 id,不是为了拿到材料)。
+
 **建造闭环**:按 `E` 拆一块(拿到那一件的 id,同时把它记成「最近物品」)→ 按 `Q` 放回去。放的位置是
 **你面前那一格**(目标格由 `client/src/net/action_target.ts` 算,与服务端同一取整口径)。
 
@@ -105,11 +118,12 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
   撞成同一个键。所以刷怪**按物种去重**,`BIOME_SPAWN.hardCap`(草甸 14 只)目前达不到 ——
   实测 96×96 世界预热 2 分钟后约 5-8 只。要「一片草甸上十几只」必须先拆实例 id 与物种 id,
   那是独立一件(见 `server/src/sim/world_sim.ts` 的 `trySpawnOne` 注释)。
-- **动作执行层**:24 个 `RoomAction` 里 **22 个已接线**;`MOVE` / `ATTACK` 两个**刻意**不进
+- **动作执行层**:25 个 `RoomAction` 里 **23 个已接线**(WS-FND-154 补的就是 `GATHER`);
+  `MOVE` / `ATTACK` 两个**刻意**不进
   `action` 通道(走专用报文,保住「绝对位置 + tick」的坐标契约)。逐条状态与仍未做的三处
   写在 [`docs/TASK-96-action-landing-gaps.md`](docs/TASK-96-action-landing-gaps.md)。
   **客户端这一侧**的入口逐动作登记在 `client/src/wiring_ledger.ts` 的
-  `CLIENT_ENTRY_LEDGER`(24 条,含"服务端有、客户端按不到"的那 8 条)。
+  `CLIENT_ENTRY_LEDGER`(25 条,含"服务端有、客户端按不到"的那 8 条)。
 - **生物 FSM 状态不下发**:`WildlifeState.fsm` 是 wire 上的 `uint8`,而模拟层的
   `MobFsmState` 是字符串枚举,两者之间**没有定义过映射表** ⇒ 快照里恒为 0(wire 默认值),
   而不是硬塞一个没有含义的编号。客户端目前不需要它。
@@ -124,9 +138,11 @@ node scripts/play.ts --port 9001 --web-port 5174 --size 64 --warmup 2400
 ### 服务端**已实现**、客户端**刻意不提供**的动作(逐条,不许当成已支持)
 
 出处只有一处:`client/src/wiring_ledger.ts` —— **台账** `CLIENT_ENTRY_LEDGER`
-(逐动作覆盖 `RoomAction` 的 24 条)+ **登记** `CLIENT_ENTRY_HOLDS`(八条管理类)
+(逐动作覆盖 `RoomAction` 的 25 条)+ **登记** `CLIENT_ENTRY_HOLDS`(八条管理类)
 + 非 `RoomAction` 的 `CLIENT_ENTRY_GAPS`(急单 / 分拣带道号)。
-第十轮补上的四条入口:`1` 驯养 / `2` 购买 / `3` 炼金台 / `4` 放自动化件。
+第十轮补上的四条入口:`1` 驯养 / `2` 购买 / `3` 炼金台 / `4` 放自动化件;★ **WS-FND-154**
+补上第五条:**`5` 采集**(`GATHER`,采**面前**那格的**可采集物**;能不能采 / 工具够不够 /
+站得够不够近三件事**全在服务端判**,判序见 `server/src/net/actions/gather.ts` 的文件头)。
 
 **剩下八条全部裁决为「服务端已实现、客户端刻意不提供」**(不是"还没做")。它们都是
 **房间管理类**动作:缺的不是一行转发,而是那块 UI(表单 / 成员表 / 确认框 / 线框数据);
@@ -226,7 +242,7 @@ node tests/WS-FND-19-spawn.test.ts   # 只跑「生物真的刷出来了吗」
   把 `decideSpawn` 的判定绕过去,只有它会红。
 - 「600 帧 0 只」曾是**探针实测**(`assemble({mobs:true})` → `step(null)` × 600 →
   `cloneState().wildlife.length === 0`);修好后同一条探针给出第 269 帧出现第一只。
-- 「24 个动作的归属」由 `tests/WS-FND-18-action-ownership.test.ts` 钉住:
+- 「25 个动作的归属」由 `tests/WS-FND-18-action-ownership.test.ts` 钉住:
   已接线 / 专用通道 / 显式未实装三分,新增动作而不作决定会**当场红**。
   同一个问题在**客户端**那一侧的判据是 `tests/WS-FND-138-client-entry-parity.test.ts`
   (入口键 → 真的发出报文;`missing` 的动作必须逐条有理由)。

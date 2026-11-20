@@ -59,6 +59,8 @@ function scene(seed: number, playerX: number, playerY: number, opts: { pot: bool
   });
   const sim = a.host as unknown as WorldSim;
   a.runtime.join({ userId: 'p1' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。 */
+  for (const u of ['p1']) for (const id of a.runtime.authoritativeItemIds(u)) a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
   if (opts.pot) sim.setCell(POT_X, POT_Y, { obj: SOUP_POT });
   sim.setCell(5, 5, { obj: ONSEN_LANTERN });
   if (sim.physics.bodies.has('p1')) sim.setPlayerPos('p1', playerX, playerY);

@@ -56,6 +56,13 @@ function makeRoom(role: 'OWNER' | 'GUEST' = 'OWNER'): Room {
   const sim = a.host as unknown as WorldSim;
   a.runtime.join({ userId: 'p1', asGuest: role === 'GUEST' });
   a.runtime.join({ userId: 'p2' });
+  /* ★ WS-FND-155:入场会发起始背包(7 件,占容量)⇒ 本套件的判据以「空背包」为前提,先清掉。
+     (清账走生产同一条路:负 delta 的 ops,不需要产出凭证。) */
+  for (const u of ['p1', 'p2']) {
+    for (const id of a.runtime.authoritativeItemIds(u)) {
+      a.runtime.applyInventory(u, { ops: [{ itemId: id, delta: -a.runtime.authoritativeItemCount(u, id) }] });
+    }
+  }
   /* `join` 会走房间的登记路径;若世界侧还没认识这两个人(取决于装配细节),
      显式补一次 —— `addPlayer` 是幂等语义的公开口。 */
   for (const id of ['p1', 'p2']) {
