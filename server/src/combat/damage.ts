@@ -183,7 +183,7 @@ export function hitKnockbackOf(req: HitKnockbackRequest): HitKnockbackPlan {
   return { cells, dirX: dir.dirX, dirY: dir.dirY, applied: true };
 }
 
-/* ═══════════ 连击(普攻连段)窗口 —— ★ 待平衡(owner),WS-FND-152 ═══════════
+/* ═══════════ 连击(普攻连段)窗口 —— ★ 已裁(owner,D-20):保留默认值(原「待平衡(owner)」标记作废),WS-FND-152 ═══════════
  *
  * ## 为什么走**伤害**而不是计分
  *
@@ -203,7 +203,7 @@ export function hitKnockbackOf(req: HitKnockbackRequest): HitKnockbackPlan {
  * 窗口是**闭区间**(恰好 0.6 秒仍算连击):边界值由判据钉住,避免 `>` 与 `>=` 之争。
  * 时间基一律用「世界时钟」(帧序派生),不用挂钟 —— 与 `D-07` 同源。
  */
-/** 连击窗口(秒)。**待平衡(owner)**:手册没给窗口长度,取 0.6 秒(三段的输入节奏)。 */
+/** 连击窗口(秒)。**已裁(owner,D-20):保留默认值** —— 手册没给窗口长度,取 0.6 秒(三段的输入节奏);原「待平衡(owner)」标记作废,值一字未改,裁定原文见 `docs/DECISIONS.md` D-20。 */
 export const COMBO_WINDOW_SEC = 0.6;
 
 /**

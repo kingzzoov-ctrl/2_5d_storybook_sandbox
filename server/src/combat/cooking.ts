@@ -99,13 +99,13 @@ export interface FoodDef {
  *   本常量只是给"没意见"一个名字,让上面那句错写无从下笔。
  */
 const MU_OVERRIDE_NONE = 0;
-/* ═══════════ 料理 5 槽的**保守默认剂量**(★ 待平衡(owner),WS-FND-152)═══════════
+/* ═══════════ 料理 5 槽的**保守默认剂量**(★ 已裁(owner,D-20):保留默认值 —— 原「待平衡(owner)」标记作废;WS-FND-152)═══════════
  *
  * ## 为什么这五个数在这里,而不在内容层 `shared/constants/cooking.ts`
  *
  * 那个文件登记的是**中性值**(0 / 1 = 单位元),并明写「手册没给这 6 个槽的任何强度
  * 数值 ⇒ 不发明平衡」。owner 2026-11-19 裁定「全接」:数值仍未给,于是按**保守默认
- * + 具名常量 + `待平衡(owner)` 标记**落地。数字放在这里而不是内容层,理由是可执行性:
+ * + 具名常量 + 标记**落地(★ owner 2026-11-21 裁定 **D-20:保留默认值** —— 原「待平衡(owner)」标记作废,数值一字未改)。数字放在这里而不是内容层,理由是可执行性:
  * 内容层今天**生产侧零 importer**(它只被门禁与类型反向引用,见 `scripts/verify.ts`
  * 的不可达白名单),把数写过去就又是一个没人读的常量 —— 正是本任务要修的病
  * (「只算不读」)。⇒ 数写在这里,**唯一消费点在 `dishStatMods`**,内容层只留一句指引。
@@ -118,15 +118,15 @@ const MU_OVERRIDE_NONE = 0;
  * 它自己那一个字段,其余四个保持中性)。
  */
 export const FOOD_PARAM_DEFAULT_DOSE = Object.freeze({
-  /** 待平衡(owner):保守默认 +2 点防御(经 `ARMOR_K/(ARMOR_K+2)` 折算成受击乘区) */
+  /** 已裁(owner,D-20):保留默认值 —— 保守默认 +2 点防御(经 `ARMOR_K/(ARMOR_K+2)` 折算成受击乘区) */
   defFlat: 2,
-  /** 待平衡(owner):保守默认 +10% 移速(速度**上限**乘区;**不是**地面摩擦 μ) */
+  /** 已裁(owner,D-20):保留默认值 —— 保守默认 +10% 移速(速度**上限**乘区;**不是**地面摩擦 μ) */
   moveMul: 1.10,
-  /** 待平衡(owner):保守默认 −10% 重力 */
+  /** 已裁(owner,D-20):保留默认值 —— 保守默认 −10% 重力 */
   gravityMul: 0.90,
-  /** 待平衡(owner):保守默认 +5% 起跳高度 */
+  /** 已裁(owner,D-20):保留默认值 —— 保守默认 +5% 起跳高度 */
   jumpMul: 1.05,
-  /** 待平衡(owner):保守默认 +5% 经验获取 */
+  /** 已裁(owner,D-20):保留默认值 —— 保守默认 +5% 经验获取 */
   expMul: 1.05,
 });
 
@@ -155,7 +155,7 @@ function mods(p: Partial<FoodBuff['statMods']> = {}): FoodBuff['statMods'] {
  * 在手册里只有**机制**、没有任何 `defFlat/moveMul/gravityMul/jumpMul/expMul` 数值。
  * 修前它们的 5 个槽恒为中性 ⇒ 「接上了但永远看不到」与「没接」在本仓不可区分。
  * owner 裁定「全接」后,这五道菜按保守默认落值,于是**每个槽都能被吃到、也能被反向证明**
- * (`tests/WS-FND-152`)。数值仍是 `待平衡(owner)`。
+ * (`tests/WS-FND-152`)。数值已裁(owner,D-20):**保留默认值**(值一字未改,见 `docs/DECISIONS.md` D-20)。
  */
 export function dishStatMods(def: FoodDef): FoodBuff['statMods'] {
   const given = Object.keys(def.statMods).length > 0;

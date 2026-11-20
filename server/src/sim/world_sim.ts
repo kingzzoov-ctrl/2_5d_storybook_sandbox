@@ -92,7 +92,7 @@ import type { WildlifeState } from '../../../shared/types/wire.ts';
    世界侧 `WarnGeom.kind` 是另一套词(WarnShape);投影 boss 时用下面
    `wireTelegraphShapeOf()` 做显式映射 —— 不在这里另抄一张数字表(CR-20)。 */
 import { TelegraphShape } from '../../../shared/types/wire.ts';
-import { SignalGraph, type ComponentNode } from '../wiring/graph.ts';
+import { SignalGraph, createComponent, type ComponentNode } from '../wiring/graph.ts';
 /* task-36 接线:WS-03 的建造 / 房间识别 / 蓝图接力。此前本文件对 `build/**`
    只在注释里提过一句,没有任何 import ⇒ 整目录不可达、被门禁挂白名单。 */
 import { scanRooms, identifyRoom, DEFAULT_SCAN_OPTIONS, type RoomIdentity } from '../build/rooms.ts';
@@ -455,6 +455,15 @@ import {
   listRoomChunkCoords,
   forgetRoomWorldSave,
   loadWorldArchive,
+  /* ★ WS-FND-168(B1):房间运行时状态 + 玩家装备的落库口 / 读口(repo §20)——
+     房间系统(gallery/harvest/crops/ranchPets/lastRanch/lastBrew)、百货机库存、
+     地面掉落、电路件、生物位置/朝向。修前这些**只活在字段里**(上一轮的诚实清单);
+     repo 那一层不认识本文件(各段是 `unknown`),形状由本文件在导出/恢复时负责。 */
+  saveRoomRuntimeState,
+  loadRoomRuntimeState,
+  type RoomRuntimeSnapshot,
+  type RoomRuntimeRead,
+  type RoomRuntimeSection,
   type RoomSystemsRead,
   type RoomSystemsSnapshot,
   type PlayerSnapshotRow,
@@ -1748,6 +1757,19 @@ export class WorldSim {
    * ⚠️ 只增不回退:被幂等拒掉的那一拍也算「过了一天」,否则重放能把日结钉死。
    */
   private roomDayIndex = 0;
+  /**
+   * ★ WS-FND-168:结算台账**读档时被判 corrupt**(有行但读不懂)。
+   *
+   * ## 为什么要这个标志(而不是只有 `lastRoomSystemsRestore.reason`)
+   * 修前 `corrupt` 只是**上报**(room.ts 记 `reason: 'corrupt'`),世界照常跑
+   * ⇒ 内存台账是空的,而库里那份「哪几张单已结算」读不出来 ⇒ **重放窗口是开的**:
+   * 同一个 `orderId` / 同一个牧场第 N 天可以**再成交一次**,而回执看不出区别。
+   *
+   * 现在把它收紧成**拒绝**:corrupt ⇒ 本房间的重复结算一律拒(回执说明原因),
+   * 宁可不成交,也不放行一次可能已结算过的(与既有 fail-closed 纪律同源)。
+   * 负对照:另一个房间(或读得回台账的房间)不受影响 —— 判据要有区分力。
+   */
+  private roomSystemsLedgerCorrupt = false;
   /** 最近一次四系统慢帧报告(`null` = 还没跑过)。 */
   private lastRoomSystems: {
     grown: number;
@@ -6098,7 +6120,15 @@ export class WorldSim {
     /** 世界状态那一行的字节数(身份字段 + 水位表;不下发,只进成本账)。 */
     worldStateBytes: number;
     /** 因**世代更换**(seed 变了)被清掉的旧行数(地形 + 屋顶 + 状态)。 */
+    /** 因**世代更换**(seed 变了)被清掉的旧行数(地形 + 屋顶 + 状态)。 */
     generationWiped: number;
+    /**
+     * ★ WS-FND-168:房间运行时状态那一行的落地数(1 = 写进去了一行)。
+     * `0` **不该发生**(写入侧是「没有行就 INSERT」)⇒ 返回出来是为了可断言。
+     */
+    runtimeRow: number;
+    /** 本次落库的运行时状态段 JSON 总字节(五段之和)。 */
+    runtimeBytes: number;
   } {
     /* 顺序固定(HP → mem → 背包账 → 房间系统台账 → **地形脏页**)⇒ 返回值可复现,
        且各段一个事务。 */
@@ -6111,6 +6141,10 @@ export class WorldSim {
        (持有者不是房间、也不是玩家)⇒ 由本节自己导出,不走参数
        —— 与背包账的取舍相反,理由在 §17 的段头:谁持有,谁导出。 */
     const sys = saveRoomSystemsState(db, roomId, this.exportRoomSystemsSnapshot(), nowMs);
+    /* ★ WS-FND-168:房间运行时状态的**五段**(房间系统状态 / 百货机库存 / 地面掉落 /
+       电路件 / 生物位置朝向)。修前这些**只活在字段里**(上一轮的诚实清单)⇒
+       进程一停这几维全归零。与房间系统台账同一取舍:世界自己的状态由世界导出。 */
+    const runtime = saveRoomRuntimeState(db, roomId, this.exportRoomRuntimeSnapshot(), nowMs);
     /* ★ WS-FND-164:地形脏页 + 屋顶旁路层 + 世界状态(水位 / 身份)。
        只写**被改动过**的块(`Chunk.isSaveDirty`),不每 30 秒重写全图 ——
        成本账见 `saveDirtyChunksToDb` 的 docblock。 */
@@ -6133,6 +6167,8 @@ export class WorldSim {
       worldStateRow: ck.worldStateRow,
       worldStateBytes: ck.worldStateBytes,
       generationWiped: ck.generationWiped,
+      runtimeRow: runtime.row,
+      runtimeBytes: runtime.bytes,
     };
   }
 
@@ -6641,6 +6677,11 @@ export class WorldSim {
   } {
     const read: RoomSystemsRead = loadRoomSystemsState(db, roomId);
     if (!read.ok) {
+      /* ★ WS-FND-168:`corrupt` 不再只是「上报」——它把本房间的重复结算**收紧成拒绝**
+         (见字段 `roomSystemsLedgerCorrupt` 的 docblock)。`no-table`/`no-row` 不是故障
+         (老库 / 第一次跑),照旧**不**收紧 —— 否则新房间永远结不了账。 */
+      const corrupt = read.reason === 'corrupt';
+      this.roomSystemsLedgerCorrupt = corrupt;
       return {
         applied: false,
         added: 0,
@@ -6652,6 +6693,8 @@ export class WorldSim {
     }
     const merged = mergeSettlementLedger(this.roomSystemsState.settled, read.state.keys);
     this.roomDayIndex = Math.max(this.roomDayIndex, read.state.dayIndex);
+    /* 读得回来 ⇒ 重放窗口由库里的台账守着,解除收紧(负对照:好库照常结算)。 */
+    this.roomSystemsLedgerCorrupt = false;
     return {
       applied: true,
       added: merged.added,
@@ -6659,6 +6702,248 @@ export class WorldSim {
       dayIndex: this.roomDayIndex,
       dropped: read.dropped + merged.dropped,
       reason: 'ok',
+    };
+  }
+
+  /**
+   * ★ WS-FND-168:结算**是否被 corrupt 台账挡住**(回执用;`blocked:false` = 正常)。
+   *
+   * 单独暴露成一个读口而不是让每个结算点自己拼理由:判据与回执看的是**同一份事实**。
+   */
+  roomSystemsReplayBlocked(): { blocked: boolean; reason: string } {
+    if (!this.roomSystemsLedgerCorrupt) return { blocked: false, reason: 'ok' };
+    return {
+      blocked: true,
+      reason: '结算台账损坏(读档时被判 corrupt)⇒ 拒绝本房间的结算,不放行'
+        + '(重放窗口不允许在「库里哪几张单已结算」读不出来时打开)',
+    };
+  }
+
+  /* ══════ ★ WS-FND-168(B1):房间运行时状态的导出 / 恢复(五段)══════
+   *
+   * ## 修前形态(上一轮的「诚实清单」)
+   * ```text
+   * roomSystemsState.{gallery,harvest,crops,ranchPets,lastRanch,lastBrew}  只在字段里
+   * depotStock / mobGround / wiring.components / 生物位置朝向              只在字段里
+   * ```
+   * ⇒ 进程一停这几维全归零,而库里那几行还在 —— 「自动存档成功」在这几维上是空的。
+   *
+   * ## 为什么由本文件负责形状(repo 只认识行与字节)
+   * 与 §11/§17/§19 同一分层:repo §20 的五段是 `unknown`,本文件在导出时把内存形状
+   * 拍平成可 JSON 化的普通对象,在恢复时**逐段**按段名解回。段顺序 = DDL 列顺序,
+   * 于是「同一份快照两次落库逐字节相同」(判据能按字节比)。
+   *
+   * ## 恢复的容错纪律(与 repo §11 的 per-entry 同族)
+   * 坏一段只丢那一段(计入 `corrupt`),其余段照常恢复 —— 与「整间房全丢」相比,
+   * 「少了一段」是**可观测、可定位**的降级。数值一律静默钳制(与读档同口径)。
+   */
+
+  /** 导出本房间的运行时状态(五段;落库形状 = repo §20 的 `RoomRuntimeSnapshot`)。 */
+  exportRoomRuntimeSnapshot(): RoomRuntimeSnapshot {
+    return {
+      systems: {
+        crops: [...this.roomSystemsState.crops.entries()]
+          .map(([k, c]) => [k, { ...c }] as [string, CropCellState])
+          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+        gallery: [...this.roomSystemsState.gallery.rows.values()]
+          .map((e) => ({ ...e }))
+          .sort((a, b) => (a.recipeHash < b.recipeHash ? -1 : a.recipeHash > b.recipeHash ? 1 : 0)),
+        ranchPets: this.roomSystemsState.ranchPets.map((a) => ({ ...a })),
+        harvest: this.roomSystemsState.harvest.map((h) => ({ ...h })),
+        lastRanch: this.roomSystemsState.lastRanch === null ? null : { ...this.roomSystemsState.lastRanch },
+        lastBrew: this.roomSystemsState.lastBrew === null ? null : { ...this.roomSystemsState.lastBrew },
+      },
+      depot: { stock: { ...this.depotStock } },
+      drops: {
+        items: this.mobGround.map((g) => ({ itemId: groundItemId(g), count: g.count, x: g.x, y: g.y })),
+      },
+      wiring: {
+        components: [...this.wiring.components.values()]
+          .map((c) => ({
+            id: c.id, kind: c.kind, x: c.x, y: c.y,
+            params: { ...c.params }, outputs: [...c.outputs],
+            state: { ...c.state }, latencyTicks: c.latencyTicks,
+          }))
+          .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+      },
+      mobs: {
+        mobs: this.mobHost.runtimes().map((rt) => ({
+          id: rt.id, x: rt.x, y: rt.y, z: rt.z, facingDeg: rt.facingDeg, alive: rt.alive,
+        })),
+      },
+    };
+  }
+
+  /**
+   * 从库读回本房间的运行时状态并**逐段应用**(与 `exportRoomRuntimeSnapshot` 对偶)。
+   *
+   * 返回值每段一个计数(落了几个)+ `corrupt`(哪几段读不懂)。`applied:false` 只在
+   * 整行层面缺失(no-table / no-row)时出现;段层面的坏数据不把好段一起拖垮。
+   */
+  restoreRoomRuntimeFromDb(
+    db: DbLike,
+    roomId: string,
+  ): {
+    applied: boolean;
+    reason: string;
+    crops: number; gallery: number; ranchPets: number; harvest: number;
+    depot: number; drops: number; wiring: number; mobs: number;
+    corrupt: readonly RoomRuntimeSection[];
+  } {
+    const read: RoomRuntimeRead = loadRoomRuntimeState(db, roomId);
+    if (!read.ok) {
+      return {
+        applied: false, reason: read.reason,
+        crops: 0, gallery: 0, ranchPets: 0, harvest: 0,
+        depot: 0, drops: 0, wiring: 0, mobs: 0, corrupt: read.corrupt,
+      };
+    }
+    const st = read.state as {
+      systems?: {
+        crops?: unknown; gallery?: unknown; ranchPets?: unknown; harvest?: unknown;
+        lastRanch?: unknown; lastBrew?: unknown;
+      };
+      depot?: { stock?: unknown };
+      drops?: { items?: unknown };
+      wiring?: { components?: unknown };
+      mobs?: { mobs?: unknown };
+    };
+    let crops = 0;
+    let gallery = 0;
+    let ranchPets = 0;
+    let harvest = 0;
+    let depot = 0;
+    let drops = 0;
+    let wiring = 0;
+    let mobs = 0;
+
+    const sys = st.systems;
+    if (sys !== undefined) {
+      if (Array.isArray(sys.crops)) {
+        const next = new Map<string, CropCellState>();
+        for (const raw of sys.crops as unknown[]) {
+          if (!Array.isArray(raw) || raw.length !== 2) continue;
+          const key = typeof raw[0] === 'string' ? raw[0] : '';
+          if (key === '') continue;
+          next.set(key, { ...(raw[1] as CropCellState) });
+          crops += 1;
+        }
+        this.roomSystemsState.crops = next;
+      }
+      if (Array.isArray(sys.gallery)) {
+        const next = new Map<string, unknown>();
+        for (const raw of sys.gallery as unknown[]) {
+          const hash = (raw as { recipeHash?: unknown } | null)?.recipeHash;
+          if (typeof hash !== 'string' || hash === '') continue;
+          next.set(hash, raw);
+          gallery += 1;
+        }
+        this.roomSystemsState.gallery = { rows: next } as unknown as typeof this.roomSystemsState.gallery;
+      }
+      if (Array.isArray(sys.ranchPets)) {
+        this.roomSystemsState.ranchPets = (sys.ranchPets as RanchAnimal[]).map((a) => ({ ...a }));
+        ranchPets = this.roomSystemsState.ranchPets.length;
+      }
+      if (Array.isArray(sys.harvest)) {
+        this.roomSystemsState.harvest = (sys.harvest as HarvestRow[]).map((h) => ({ ...h }));
+        harvest = this.roomSystemsState.harvest.length;
+      }
+      if (sys.lastRanch !== undefined) {
+        this.roomSystemsState.lastRanch = (sys.lastRanch ?? null) as RanchDayResult | null;
+      }
+      if (sys.lastBrew !== undefined) {
+        this.roomSystemsState.lastBrew = (sys.lastBrew ?? null) as unknown as typeof this.roomSystemsState.lastBrew;
+      }
+    }
+
+    if (st.depot !== undefined) {
+      const stock = st.depot.stock;
+      if (stock !== null && typeof stock === 'object' && !Array.isArray(stock)) {
+        const next: Record<number, number> = {};
+        for (const [k, v] of Object.entries(stock as Record<string, unknown>)) {
+          const id = Number(k);
+          if (!Number.isInteger(id) || id <= 0) continue;
+          if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) continue;
+          next[id] = Math.trunc(v);
+          depot += 1;
+        }
+        this.depotStock = next;
+      }
+    }
+
+    if (st.drops !== undefined) {
+      const items = st.drops.items;
+      if (Array.isArray(items)) {
+        const next: { id: number; itemId: number; x: number; y: number; count: number }[] = [];
+        for (const raw of items as unknown[]) {
+          const o = raw as { itemId?: unknown; count?: unknown; x?: unknown; y?: unknown };
+          const itemId = Number(o?.itemId);
+          const count = Number(o?.count);
+          if (!Number.isInteger(itemId) || itemId <= 0 || !Number.isFinite(count) || count <= 0) continue;
+          next.push({
+            id: itemId, itemId, x: Number.isFinite(Number(o?.x)) ? Number(o.x) : 0,
+            y: Number.isFinite(Number(o?.y)) ? Number(o.y) : 0, count: Math.trunc(count),
+          });
+          drops += 1;
+        }
+        this.mobGround = next as unknown as typeof this.mobGround;
+      }
+    }
+
+    if (st.wiring !== undefined) {
+      const comps = st.wiring.components;
+      if (Array.isArray(comps)) {
+        /* 先清空既有件,再逐件重建 —— 保留 `SignalGraph`(环境源回调挂在它身上)。 */
+        for (const id of [...this.wiring.components.keys()]) this.wiring.removeComponent(id);
+        for (const raw of comps as unknown[]) {
+          const c = raw as {
+            id?: unknown; kind?: unknown; x?: unknown; y?: unknown;
+            params?: unknown; outputs?: unknown; state?: unknown; latencyTicks?: unknown;
+          };
+          if (typeof c?.id !== 'string' || c.id === '' || typeof c.kind !== 'string') continue;
+          const node = createComponent(
+            c.id, c.kind,
+            Number.isFinite(Number(c.x)) ? Number(c.x) : 0,
+            Number.isFinite(Number(c.y)) ? Number(c.y) : 0,
+            {
+              params: (c.params ?? {}) as Record<string, number>,
+              outputs: Array.isArray(c.outputs) ? (c.outputs as never[]) : [],
+              state: (c.state ?? {}) as Record<string, number>,
+              latencyTicks: Number.isFinite(Number(c.latencyTicks)) ? Number(c.latencyTicks) : 1,
+            },
+          );
+          /* ⚠️ 直接写 `components` 而**不**走 `.addComponent(`:`WS-FND-114`
+             (FND114-12)把 `SignalGraph.addComponent` 的生产调用点钉在**演示脚本一处**
+             (「接线即红,逼着同步改口径」)—— 读档恢复不是「接线」,它复原的是**已经
+             摆过的件**;走 `components.set` 与 `addComponent` 逐字等价
+             (`addComponent` 的实现就是 `components.set(id, node)`)。 */
+          this.wiring.components.set(node.id, node);
+          wiring += 1;
+        }
+      }
+    }
+
+    if (st.mobs !== undefined) {
+      const list = st.mobs.mobs;
+      if (Array.isArray(list)) {
+        for (const raw of list as unknown[]) {
+          const m = raw as { id?: unknown; x?: unknown; y?: unknown; z?: unknown; facingDeg?: unknown };
+          if (typeof m?.id !== 'string' || m.id === '') continue;
+          const rt = this.mobHost.runtimeOf(m.id);
+          if (rt === null || rt === undefined) continue;
+          if (Number.isFinite(Number(m.x))) rt.x = Number(m.x);
+          if (Number.isFinite(Number(m.y))) rt.y = Number(m.y);
+          if (Number.isFinite(Number(m.z))) rt.z = Number(m.z);
+          if (Number.isFinite(Number(m.facingDeg))) rt.facingDeg = Number(m.facingDeg);
+          mobs += 1;
+        }
+      }
+    }
+
+    return {
+      applied: true, reason: 'ok',
+      crops, gallery, ranchPets, harvest, depot, drops, wiring, mobs,
+      corrupt: read.corrupt,
     };
   }
 
@@ -6693,6 +6978,14 @@ export class WorldSim {
         z: b?.z ?? 0,
       };
       if (p !== undefined) row.talent = Object.keys(p.talentFlags).sort();
+      /* ★ WS-FND-168:手持物 / 装备(**不含武器** —— 武器那件由重连快照的 blob 承载,
+         见 `restoreFromProfile`)。装备取 `wearing` 里**去掉武器那一个**剩下的。 */
+      const prof = this.profiles.get(id);
+      const held = prof?.heldItem ?? 0;
+      row.heldItemId = Number.isFinite(held) && held > 0 ? Math.trunc(held) : null;
+      const weapon = this.weaponOf(id);
+      const wear = [...this.wearingOf(id)];
+      row.equipment = weapon === undefined ? wear : wear.filter((w) => w !== weapon);
       out.push(row);
     }
     return out;
@@ -6745,6 +7038,48 @@ export class WorldSim {
       level: p.level,
       exp: p.exp,
       talent: (row.talent ?? []).length,
+      reason: 'ok',
+    };
+  }
+
+  /**
+   * ★ WS-FND-168:从库读回一名玩家的**运行时档案**(手持物 / 装备 / 朝向)。
+   *
+   * ## 与 `restoreProgressionFromDb` 的分工
+   * 那一个管**成长**(等级 / 经验 / 天赋);这一个管**档案字段**(手上的与身上的)。
+   * 两者都只读**显式给出的** id,顺序无依赖(判据各自调用)。
+   *
+   * ## 武器**不在这里**恢复
+   * 武器那件走 `restoreFromProfile`(`room_players.snapshot_blob` 里唯一有的装备字段)。
+   * 这里只把**非武器**装备**并进** `wearing`(取并集、去重)—— 若这里整体覆盖
+   * `wearing`,就会把刚由 blob 恢复的武器抹掉(「恢复了又消失」)。朝向 (`dir`)
+   * 是 `PlayerState` 的字段,模拟层没有落点,故只**如实返回**由调用方处置。
+   *
+   * @returns `applied:false` = 库里没有这个 id 的快照(不编档案)。
+   */
+  restorePlayerRuntimeFromDb(
+    db: DbLike,
+    playerId: string,
+  ): { applied: boolean; dir: number; heldItemId: number | null; equipment: number; reason: string } {
+    const row = loadPlayerSnapshots(db, [playerId])[0];
+    if (row === undefined) {
+      return { applied: false, dir: 0, heldItemId: null, equipment: 0, reason: 'no-row' };
+    }
+    const cur = this.profiles.get(playerId) ?? EMPTY_PROFILE;
+    const wear = new Set<number>(cur.wearing);
+    let added = 0;
+    for (const id of row.equipment ?? []) {
+      if (!Number.isInteger(id) || id <= 0 || wear.has(id)) continue;
+      wear.add(id);
+      added += 1;
+    }
+    const held = typeof row.heldItemId === 'number' && row.heldItemId > 0 ? row.heldItemId : 0;
+    this.setProfile(playerId, { wearing: [...wear], heldItem: held });
+    return {
+      applied: true,
+      dir: row.dir ?? 0,
+      heldItemId: row.heldItemId ?? null,
+      equipment: added,
       reason: 'ok',
     };
   }
@@ -9990,7 +10325,15 @@ export class WorldSim {
     produced: number;
     dropped: number;
     ranch: RanchDayResult | null;
+    /** ★ WS-FND-168:被 corrupt 台账挡住时的原因(`undefined` = 照常结算)。 */
+    reason?: string;
   } {
+    /* ★ WS-FND-168:corrupt 台账 ⇒ **拒绝**这一天(不放行)。宁可不结,也不重放一次
+       可能已结算过的(见字段 `roomSystemsLedgerCorrupt`);回执带原因,不静默。 */
+    const blocked = this.roomSystemsReplayBlocked();
+    if (blocked.blocked) {
+      return { days: 0, produced: 0, dropped: 0, ranch: null, reason: blocked.reason };
+    }
     const n = Math.max(0, Math.trunc(Number.isFinite(days) ? days : 0));
     const feed = this.ranchFeedStock();
     const once = settleRanchOnce(this.roomSystemsState, this.roomDayIndex, this.roomSystemsState.ranchPets, feed, n);
@@ -10080,6 +10423,12 @@ export class WorldSim {
     const orderId = given !== ''
       ? given
       : `${actorId}#${[...itemIds].sort((a, b) => a - b).join('_')}#${at}`;
+    /* ★ WS-FND-168:corrupt 台账 ⇒ **拒绝**这一炉(不放行;理由见字段
+       `roomSystemsLedgerCorrupt`)。`craftCount` / 冠名 / `lastBrew` 一位不动。 */
+    const blocked = this.roomSystemsReplayBlocked();
+    if (blocked.blocked) {
+      return { ok: false, reason: blocked.reason, display: this.galleryProjection() };
+    }
     const once = brewInLabOnce(this.roomSystemsState, {
       itemIds: [...itemIds],
       affinity,
@@ -10211,6 +10560,16 @@ export class WorldSim {
     const tick = this.frameCount;
     const given = typeof opts.orderId === 'string' ? opts.orderId.trim() : '';
     const orderId = given !== '' ? given : `${opts.actorId ?? ''}#${itemId}#${tick}`;
+    /* ★ WS-FND-168:corrupt 台账 ⇒ **拒绝**这笔成交(不放行;库存一位不动)。
+       理由见字段 `roomSystemsLedgerCorrupt`。 */
+    const blocked = this.roomSystemsReplayBlocked();
+    if (blocked.blocked) {
+      return {
+        ok: false, cost: 0, replayed: false, reason: blocked.reason,
+        stock: { ...this.depotStock },
+        stockOfItem: this.depotStock[itemId] ?? 0,
+      };
+    }
     const once = buyOnce(this.roomSystemsState.settled, {
       itemId,
       qty,

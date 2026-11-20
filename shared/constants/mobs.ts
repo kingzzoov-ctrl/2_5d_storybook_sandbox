@@ -35,14 +35,18 @@ const O = Biome.OASIS, D = Biome.DESSERT, K = Biome.SKYSEA, R = Biome.RUINS;
  * 判定侧对缺省值的解释就是**必掉**(`chance = 1`)。这条同时是判据:
  * 「手册没写的仍是必掉」由 `tests/WS-FND-98` 钉住。
  *
- * ## ★ 待平衡(owner) —— WS-FND-147
+ * ## ★ 待平衡(owner) → **已裁(owner,D-21):保留现值** —— WS-FND-147
  *
  * `0.15` 是**占位档位**,不是本层按手感调出来的:手册只给出「稀有材料掉落率 +15%」
- * 这一处口径,而「这个概率乘在什么基数上 / 稀有档要不要再分档 / 是否随群系浮动」
- * 都还没有裁决。台账条目 = `server/src/sim/world_debts.ts` 的 **D4**
+ * 这一处口径。owner 2026-11-21 裁定(D-21,**保留现值**):「这个概率乘在什么基数上 /
+ * 稀有档要不要再分档 / 是否随群系浮动」不再是待裁项 —— 当前口径即 `0.15`,值不改。
+ * 台账条目 = `server/src/sim/world_debts.ts` 的 **D4**
  * (`owner` 字段写成 `待平衡(owner)`,`pendingBalanceRows()` 能把它枚举出来)。
+ * ⚠️ 那个字面 `待平衡(owner)` **按设计保留**:它是 D4 的 evidence needle
+ *   (`world_debts.ts` 的 `evidence[].needle`,`tests/WS-FND-147` FND147-7 逐字核对)
+ *   ⇒ 删它 = 打红判据,不是"清理标记"。裁定性质见 `docs/DECISIONS.md` D-21。
  * ⚠️ 改这个数会打红 `tests/WS-FND-98` FND98-1,**并且**让 D4 的 evidence 失配
- *   ⇒ 必须同时改台账 —— 两处不会静默分叉。
+ *   ⇒ 必须同时改台账(并走新裁定)—— 两处不会静默分叉。
  */
 export const MOB_RARE_DROP_CHANCE = 0.15;
 

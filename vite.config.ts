@@ -76,6 +76,19 @@ function copyAtlasPlugin(): Plugin {
   };
 }
 
+/**
+ * ★ WS-FND-170:**浏览器基线的构建侧口径** —— README「浏览器兼容性基线」一节与
+ * `client/src/ui/a11y.ts` 的 `BROWSER_BASELINE_TEXT` 说的是**同一件事**。
+ *
+ * `es2022` 允许 `??=` / `Array.prototype.at` / `Object.hasOwn` / `structuredClone`
+ * ⇒ 基线 = 原生支持这些的浏览器(约 Chrome 98+ / Edge 98+ / Firefox 94+ / Safari 15.4+)。
+ * 本仓没有 import maps、也不装 polyfill(零依赖硬约束)⇒ 这个 target 是**硬门槛**,
+ * 不是"尽量兼容";且**必须走 Vite 构建**(源码 import 的是 `.ts`,浏览器原生不认)。
+ * ⚠️ 调大它(esnext)会静默抬高基线;调小它会让 README 与 `a11y.ts` 的基线句失真
+ *    ⇒ 判据 `tests/WS-FND-170` 直接读这一行字符串核对,不靠人记。
+ */
+export const BUILD_TARGET = 'es2022';
+
 export default defineConfig({
   root: 'client',
   /* 相对路径,便于之后挂到任意子路径下(不写死 /) */
@@ -86,7 +99,7 @@ export default defineConfig({
     emptyOutDir: true,
     /* 不生成 sourcemap 之外的额外产物;调试期需要 map 便于定位 */
     sourcemap: true,
-    target: 'es2022',
+    target: BUILD_TARGET,
     rollupOptions: {
       output: {
         /*

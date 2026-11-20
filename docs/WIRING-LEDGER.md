@@ -228,14 +228,14 @@ Get-ChildItem tests -Filter *.test.ts |
 | 动作 / 缺口 | 判定 | 为什么刻意不提供 | 解锁它的那一件事 | 玩家今天能做到哪一步 |
 |---|---|---|---|---|
 | `SET_ROOM_ACCESS` | 刻意不提供 | 要房主表单(三选一 + 口令输入 + 回执回读),客户端没有任何房间管理 UI | 房间面板:模式单选 + 口令输入 + `effect.mode` 回读 | 做不到 |
-| `SET_PARTY_MODE` | **已接**(★ WS-FND-151) | 修前缺的是**选择器 + 权限位**:裸键表达不出"选哪一档",而模式影响全房(含正在跑的那局) | 已完成:`ui/party_panel.ts` 列出冻结层 `PARTY_MODES` 的全部模式,`net/action_entry.setPartyMode` 发 `{ action, partyMode }` | `M` 开面板、`J`/`L` 选、`Enter` 定(权限由服务端 `authorize` 判,被拒有回执) |
+| `SET_PARTY_MODE` | **已接**(★ WS-FND-151) | 修前缺的是**选择器 + 权限位**:裸键表达不出"选哪一档",而模式是全房设定 —— ★ owner 已裁(**D-22**):**仅开局前可改**,局中不换本局计分模式,理由 = **已计分的归属无歧义**(有比分落账后再换模式 = 一局里混两套计分规则,名次与奖励判不出归属;现状即"开局定格":`PartyRecord.mode` 为 readonly、`partyPhase() !== 'IDLE'` 时不重开,`state.meta.partyMode` 只是"下一局用哪档 + HUD 显示") | 已完成:`ui/party_panel.ts` 列出冻结层 `PARTY_MODES` 的全部模式,`net/action_entry.setPartyMode` 发 `{ action, partyMode }` | `M` 开面板、`J`/`L` 选、`Enter` 定(权限由服务端 `authorize` 判,被拒有回执) |
 | `KICK_MEMBER` | 刻意不提供 | 踢人不可逆;快照 `PlayerState` 没有 role 字段,列表只能靠猜 | 先下发成员角色,再做成员表 + 踢人按钮 | 做不到 |
 | `SET_MEMBER_ROLE` | 刻意不提供 | `role` 是服务端权限位枚举,快照里没有 ⇒ 表达不出"把谁改成什么" | 成员表(数据来自快照)+ 角色下拉 | 做不到 |
 | `RESET_WORLD` | 刻意不提供 | 不可逆;服务端要 `confirm: true` 字面量(= 二次确认),客户端没有确认框 | 确认对话框(当前种子 / 新种子)挂进房间面板 | 做不到 |
 | `CLOSE_ROOM` | 刻意不提供 | 不可逆(全房被踢);`close()` 是生命周期方法,权限闸在 `actions/admin.ts` | 同 `RESET_WORLD`:面板 + 二次确认 + 权限位 | 做不到 |
 | `MODIFY_TOWN` | 刻意不提供 | 要 `radius` / `name` / `totemCell` 三个自由输入,客户端没有拾取坐标的 UI 与文本输入口 | 城镇面板:点格取 `totemCell` + 半径滑杆 + 名字输入 | 做不到 |
 | `WIRE_EDIT` | 刻意不提供 | 服务端不下发线框数据 ⇒ 没有可编辑的对象(`dir` / `color` / `channel` / `clear` 都相对它才有意义) | 先下发 WireView,再做接线面板 | 做不到 |
-| 急单(rush)开局与交付 | 刻意不提供(世界侧自动) | 三段(`startRushRun` / `submitDelivery` / `settleSession`)全在 `world_sim.tickPartyStep`,都不需要客户端报文 | 不需要新键:玩家侧是工位(`Q` + WASD)与丢货(`G`,`RUSH_DELIVERY_RADIUS = 1`) | 建造工位 → 站上去 → 丢货 = 开工/交付;评级经回执 `effect.rushGrade` 进状态条 |
+| 急单(rush)开局与交付 | 刻意不提供(世界侧自动) | 三段(`startRushRun` / `submitDelivery` / `settleSession`)全在 `world_sim.tickPartyStep`,都不需要客户端报文 | 不需要新键:玩家侧是工位(`Q` + WASD)与丢货(`G`,`RUSH_DELIVERY_RADIUS = 1`) | 建造工位 → 站上去 → 丢货 = 开工/交付;评级经回执 `effect.rushGrade` 进状态条。★ owner 已裁(**D-24**):**世界侧自动触发,不加手动开工入口** —— **玩家看提示行即可,不需操作**(提示行 = `ui/rush_readiness.ts` 的三态条件清单,因为 `world_sim.ts#stepRushEntry` 的三条 `return` 条件不满足时**不报错**,所以必须让玩家看得见"卡在哪一条") |
 | 分拣带 `lane` 配置 | 刻意不提供 | `lane` **不在** `ActionPayload` 契约里(`room.ts` 那一格只有 `kind`)⇒ 客户端不替它发明字段 | 先给 `lane` 一个契约位置,再做接线面板 | 键盘 `4` 只走播种形态 |
 ### 2.10 汇总(按「现状」)
 

@@ -99,6 +99,12 @@ export const TABLE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
      由本常量表派生,不登记就写不进真库;`MemoryDb.insert` 也要主键列名。 */
   room_chunk_roofs: ['room_id', 'chunk_x', 'chunk_y'],
   room_world_state: ['room_id'],
+  /* ★ WS-FND-168 房间运行时状态 + 玩家装备(独立 DDL 文件
+     `schema_room_runtime.sql`,见 §20)。与上面几张表同一处置:登记在这里
+     `driver.sqlite.ts` 的表名白名单才认得它们,`MemoryDb.insert` 也需要主键列名。
+     两张表都非常驻:只有**第一次存档**时才由 `migrateRoomRuntime` 就地补上。 */
+  room_runtime_state: ['room_id'],
+  player_equipment_state: ['user_id'],
 };
 
 /* ═══════════════════════════ 2. DDL 载入与迁移 ═══════════════════════════ */
@@ -158,6 +164,10 @@ export function knownMigrationVersions(): number[] {
        与上一条同一理由:老库(v1/v2/v3/v4)照样过护栏,这一段只在**第一次存档世界时**
        就地补两张表并登记 v5(见 §19)。 */
     WORLD_PERSISTENCE_MIGRATION_VERSION,
+    /* ★ WS-FND-168:房间运行时状态 + 玩家装备(§20)。与上两条同一理由:
+       老库(v1..v5 任意组合)照样过护栏,这一段只在**第一次存档**时就地补两张表
+       并登记 v6 —— 既不要求任何既有版本行存在,也不动 schema.sql 的 checksum。 */
+    ROOM_RUNTIME_MIGRATION_VERSION,
   ];
 }
 
@@ -2472,11 +2482,31 @@ export interface PlayerSnapshotRow {
   y: number;
   z: number;
   /** 已解锁天赋 id 列表(`users.talent_json`)。**省略** ⇒ 不碰那一列。 */
+  /** 已解锁天赋 id 列表(`users.talent_json`)。**省略** ⇒ 不碰那一列。 */
   talent?: readonly string[];
+  /**
+   * ★ WS-FND-168:朝向(`users.dir`,0..3)。**省略** ⇒ 不碰那一列。
+   * 「没带这一项」与「他朝向 0」是两件事(与 `talent` 同一纪律)。
+   */
+  dir?: number;
+  /** ★ WS-FND-168:手持物 id(`users.held_item_id`)。`null` = 明确空手;`省略` = 不碰。 */
+  heldItemId?: number | null;
+  /**
+   * ★ WS-FND-168:装备物品 id(**不含武器** —— 那件已由重连快照 `snapshot_blob`
+   * 承载,见 `world_sim.ts:restoreFromProfile`)。
+   * 落 `player_equipment_state`(§20 的独立 DDL);`省略` ⇒ 不碰那一行。
+   */
+  equipment?: readonly number[];
 }
 
 /** 快照里最多记几个天赋 id(内容层今天 6 个;给将来留余量,不是玩法调参)。 */
 export const PLAYER_SNAPSHOT_MAX_TALENTS = 64;
+
+/**
+ * ★ WS-FND-168:一名玩家的**非武器装备**上限(实战 ≤ 7 个槽;留余量,不是玩法调参)。
+ * 超出按升序截断并计入 `dropped`(与 `PLAYER_LEDGER_ITEM_MAX` 同一处置)。
+ */
+export const PLAYER_EQUIPMENT_MAX = 64;
 
 /**
  * 批量落盘玩家快照(周期存档的写口)。
@@ -2497,6 +2527,18 @@ export function savePlayerSnapshots(
   nowMs: number,
 ): { saved: number; skipped: number; dropped: number } {
   if (!Number.isFinite(nowMs)) throw new Error('玩家快照需要 nowMs(Unix 毫秒)');
+  /* ★ WS-FND-168:装备那一段要 `player_equipment_state`(§20)。迁移**放在事务之前**
+     —— DDL 不该出现在一个写事务里(那是两个不同层级的操作)。只在**确实带了
+     equipment** 时才动库:老调用方(不带装备)逐字兼容,连迁移都不触发。 */
+  if (rows.some((r) => r?.equipment !== undefined)) {
+    const m = migrateRoomRuntime(db, nowMs);
+    if (m.drift) {
+      throw new Error(
+        `房间运行时状态迁移 checksum 漂移(schema_migrations.version=${ROOM_RUNTIME_MIGRATION_VERSION}`
+        + ' 与 schema_room_runtime.sql 对不上)⇒ 拒绝写入玩家装备(不静默降级)',
+      );
+    }
+  }
   return db.transaction(() => {
     let saved = 0;
     let skipped = 0;
@@ -2526,7 +2568,22 @@ export function savePlayerSnapshots(
         }
         patch.talent_json = JSON.stringify([...seen]);
       }
+      /* ★ WS-FND-168:朝向与手持物**只在明确给了**时写(与 talent 同一纪律:
+         「没带这一项」与「他朝向 0 / 空手」是两件事)。 */
+      if (r.dir !== undefined) patch.dir = clampIntQuiet(r.dir, 0, 3);
+      if (r.heldItemId !== undefined) {
+        const held = r.heldItemId;
+        patch.held_item_id = typeof held === 'number' && Number.isInteger(held) && held >= 0
+          ? Math.trunc(held)
+          : null;
+      }
       savePlayerState(db, id, patch, nowMs);
+      /* ★ WS-FND-168:装备(非武器)落 `player_equipment_state`(独立表)。
+         省略 `equipment` ⇒ 不碰那一行(与 `talent_json` 同一取舍)。 */
+      if (r.equipment !== undefined) {
+        const eq = savePlayerEquipmentState(db, id, r.equipment, nowMs);
+        dropped += eq.dropped;
+      }
       saved += 1;
     }
     return { saved, skipped, dropped };
@@ -2554,7 +2611,7 @@ export function loadPlayerSnapshots(db: DbLike, ids: readonly string[]): PlayerS
         talent = parsed.filter((t): t is string => typeof t === 'string' && t !== '');
       }
     } catch { talent = []; }
-    out.push({
+    const row: PlayerSnapshotRow = {
       userId: u.id,
       level: clampIntQuiet(u.level, 1, MAX_LEVEL),
       exp: Number.isFinite(Number(u.exp)) ? Math.max(0, Math.trunc(Number(u.exp))) : 0,
@@ -2563,7 +2620,15 @@ export function loadPlayerSnapshots(db: DbLike, ids: readonly string[]): PlayerS
       y: Number.isFinite(Number(u.pos_y)) ? Number(u.pos_y) : 0,
       z: Number.isFinite(Number(u.pos_z)) ? Number(u.pos_z) : 0,
       talent,
-    });
+    };
+    /* ★ WS-FND-168:朝向 / 手持物 / 装备(读不懂的装备一律降级成 [],
+       与 talent 同一取舍:装不回来只是少件被动,不许把整次读档拖垮)。 */
+    row.dir = clampIntQuiet(u.dir, 0, 3);
+    row.heldItemId = Number.isInteger(Number(u.held_item_id)) && Number(u.held_item_id) >= 0
+      ? Math.trunc(Number(u.held_item_id))
+      : null;
+    row.equipment = loadPlayerEquipmentState(db, u.id).equipment;
+    out.push(row);
   }
   return out;
 }
@@ -2925,4 +2990,405 @@ export function forgetRoomWorldSave(
     roofs: wipe(CHUNK_ROOFS_TABLE),
     state: wipe(WORLD_STATE_TABLE),
   };
+}
+
+/* ══════ 20. 房间运行时状态 + 玩家装备(★ WS-FND-168:诚实清单里仍只在内存的那些)═══════
+ *
+ * 上一轮逐条**诚实登记**但仍**只活在内存**的状态,修前没有任何落库路径:
+ * ```text
+ * roomSystemsState.{gallery,harvest,crops,ranchPets,lastRanch,lastBrew}  只在字段里
+ * depotStock(百货机库存)                                                  只在字段里
+ * mobGround(地面掉落)                                                     只在字段里
+ * wiring.components(电路件的运行态)                                       只在字段里
+ * 生物位置 / 朝向(rooms.mob_mem_json 只存 AI 记忆,**没有位置**)           只在字段里
+ * 玩家装备 / held_item_id / 朝向                                          只在重连 blob 里(除武器)
+ * ```
+ * ⇒ 进程一停这几维全归零,而库里那几行还在 —— 「自动存档成功」在**这几维**上是空的。
+ *
+ * ## 落点为什么是**独立 DDL + 两张懒建表**(理由与 §13/§14/§17/§19 同源)
+ *
+ * `schema.sql` 的 checksum 已登记在既有库的 `schema_migrations`(version = 1):
+ * 往 `rooms` 上加一列会改掉整份 schema.sql 的 checksum ⇒ **每一个旧库**启动即 drift
+ * 并 fail-closed 拒绝启动。故走自己的 DDL 文件 + 自己的迁移版本(6):
+ * 老库(v1..v5 任意组合)**原地补两张表**,既有表与既有行一个都不动。
+ * 建表数与「9 张表」的既有判据不冲突 —— 本段**不在 `migrate()` 里建表**,
+ * 只在**第一次存档**时由 `migrateRoomRuntime()` 就地补上(与归档/起始包/房间系统同一处置)。
+ *
+ * ## 版本标记
+ * 每个 `*_json` 列存 `{ "$v": 1, "data": <载荷> }`。不认识的 `$v` ⇒ 读侧如实标
+ * `corrupt`(**不猜**),于是「写它的程序」与「读它的程序」不是同一版这件事看得见。
+ *
+ * ## 读侧的容错纪律(与 §11 的 per-entry、§17 的 corrupt 同族)
+ * ```text
+ * no-table   这个库从没存过(老库 / 全新库)        —— 正常
+ * no-row     这间房没有运行时状态行(第一次跑)      —— 正常
+ * corrupt    某一段有内容但读不懂(JSON 坏 / $v 不认识)—— **逐段**如实标:
+ *            一段坏了只丢那一段,不把整间房的运行时状态全丢(故分列而不是一坨大 JSON)
+ * ```
+ */
+
+/** 房间运行时状态表名(与 DDL 文件里那张表逐字一致)。 */
+export const ROOM_RUNTIME_TABLE = 'room_runtime_state';
+
+/** 玩家装备表名(与 DDL 文件里那张表逐字一致)。 */
+export const PLAYER_EQUIPMENT_TABLE = 'player_equipment_state';
+
+/** 本段 DDL 的文件产物名。**独立于 `schema.sql`**(理由见本节头)。 */
+export const ROOM_RUNTIME_SCHEMA_FILE_NAME = 'schema_room_runtime.sql';
+
+/** 本段迁移在 `schema_migrations` 里的版本号(基线 1 / 归档 2 / 起始包 3 / 房间系统 4 / 世界存档 5)。 */
+export const ROOM_RUNTIME_MIGRATION_VERSION = 6;
+export const ROOM_RUNTIME_MIGRATION_NAME = 'ws_fnd168_room_runtime';
+
+/** 段信封的格式版本(落进 `*_json` 的 `$v`;不认识的版本一律不猜)。 */
+export const ROOM_RUNTIME_STATE_VERSION = 1;
+/** 格式版本键(与背包账 / 房间系统台账的 `$v` 同名同义)。 */
+export const ROOM_RUNTIME_VERSION_KEY = '$v';
+/** 载荷键(信封里 `$v` 之外的唯一成员)。 */
+export const ROOM_RUNTIME_DATA_KEY = 'data';
+
+/** 单个段 JSON 的字节上限(与 §13/§19 的写入闸同口径)。 */
+export const ROOM_RUNTIME_MAX_BYTES = BLOB_MAX_BYTES;
+
+/** 装备 JSON 的字节上限(装备是一小串 id;见 DDL 文件里的 65536)。 */
+export const PLAYER_EQUIPMENT_MAX_BYTES = 65536;
+
+/** 五段各是什么(顺序 = DDL 里的列顺序 ⇒ 序列化逐字节可复现)。 */
+export type RoomRuntimeSection = 'systems' | 'depot' | 'drops' | 'wiring' | 'mobs';
+export const ROOM_RUNTIME_SECTIONS: readonly RoomRuntimeSection[] = Object.freeze([
+  'systems', 'depot', 'drops', 'wiring', 'mobs',
+] as const);
+
+/** 段 → 列名(**唯一**一处映射;写/读两侧共用,防两份必然漂移的清单)。 */
+const ROOM_RUNTIME_COLUMN: Readonly<Record<RoomRuntimeSection, string>> = Object.freeze({
+  systems: 'systems_json',
+  depot: 'depot_json',
+  drops: 'drops_json',
+  wiring: 'wiring_json',
+  mobs: 'mobs_json',
+});
+
+/**
+ * 一间房的运行时状态快照(**可 JSON 序列化**的载荷)。
+ *
+ * 各段是 `unknown`:本模块**不认识** `WorldSim`(与 §11/§17 同一分层)——
+ * 它的形状由持有者(`sim/world_sim.ts`)在导出/恢复时负责。`省略` 某段 ⇒ 该段写成空串。
+ */
+export interface RoomRuntimeSnapshot {
+  systems?: unknown;
+  depot?: unknown;
+  drops?: unknown;
+  wiring?: unknown;
+  mobs?: unknown;
+}
+
+/** 读回的五段(没存过的段是 `undefined` —— 与「存过但内容为空」区分开)。 */
+export interface RoomRuntimeLoaded {
+  systems?: unknown;
+  depot?: unknown;
+  drops?: unknown;
+  wiring?: unknown;
+  mobs?: unknown;
+}
+
+/**
+ * 读回结果。
+ * ```text
+ * ok:false  reason='no-table'  这个库从没存过运行时状态(老库 / 全新库)
+ * ok:false  reason='no-row'    这间房没有行(第一次跑)
+ * ok:true   corrupt=[...]      **某几段**读不懂(逐段如实标,其余段照常返回)
+ * ```
+ * `ok:false` 只在「整行层面」缺失时出现;段层面的坏数据不把好段一起拖垮。
+ */
+export type RoomRuntimeRead =
+  | { ok: true; state: RoomRuntimeLoaded; dropped: number; corrupt: readonly RoomRuntimeSection[]; bytes: number }
+  | { ok: false; reason: 'no-table' | 'no-row'; dropped: number; corrupt: readonly RoomRuntimeSection[]; bytes: number };
+
+export interface RoomRuntimeMigrateResult {
+  applied: boolean;
+  version: number;
+  checksum: string;
+  /** 已存在同版本但 checksum 不一致 = 漂移(写入侧 fail-closed)。 */
+  drift: boolean;
+}
+
+/** 本段 DDL 全文(用真实文件路径读,与 `readSchemaSql` 同一做法)。 */
+export function roomRuntimeSqlPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), ROOM_RUNTIME_SCHEMA_FILE_NAME);
+}
+
+export function readRoomRuntimeSql(path: string = roomRuntimeSqlPath()): string {
+  return readFileSync(path, 'utf8');
+}
+
+/**
+ * 建两张表 + 登记迁移版本。**幂等**(DDL 全是 `CREATE TABLE IF NOT EXISTS`)。
+ *
+ * 判序与 §13/§14/§17/§19 逐字相同:「先读版本 → 护栏 → 漂移 → 才 exec DDL」——
+ * 对旧库先 exec 会在发现结构不认识之前**已经动过库**。
+ */
+export function migrateRoomRuntime(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): RoomRuntimeMigrateResult {
+  const ddl = readRoomRuntimeSql(ddlPath);
+  const checksum = checksumOf(ddl);
+  const rows = readMigrationRows(db);
+  assertMigrationVersionSupported(rows.map((r) => (r as MigrationRow).version));
+  const existing = rows.find(
+    (r) => Number((r as MigrationRow).version) === ROOM_RUNTIME_MIGRATION_VERSION,
+  ) as MigrationRow | undefined;
+  if (existing && existing.checksum !== checksum) {
+    return { applied: false, version: ROOM_RUNTIME_MIGRATION_VERSION, checksum, drift: true };
+  }
+  db.exec(ddl);
+  if (existing) {
+    return { applied: false, version: ROOM_RUNTIME_MIGRATION_VERSION, checksum, drift: false };
+  }
+  db.insert('schema_migrations', {
+    version: ROOM_RUNTIME_MIGRATION_VERSION,
+    name: ROOM_RUNTIME_MIGRATION_NAME,
+    checksum,
+    applied_at: nowMs,
+  });
+  return { applied: true, version: ROOM_RUNTIME_MIGRATION_VERSION, checksum, drift: false };
+}
+
+/** 这个库里**装过**本段迁移吗(登记行在 ⇒ 装过)。 */
+export function roomRuntimeInstalled(db: DbLike): boolean {
+  const rows = readMigrationRows(db);
+  return rows.some((r) => Number((r as MigrationRow).version) === ROOM_RUNTIME_MIGRATION_VERSION);
+}
+
+/** `migrateRoomRuntimeIfInstalled` 的结果(比迁移结果多一个 `installed`)。 */
+export interface RoomRuntimeBootCheck extends RoomRuntimeMigrateResult {
+  /** `false` = 这个库从没装过本段 ⇒ 本轮**没有**建它(见函数注释)。 */
+  installed: boolean;
+}
+
+/**
+ * **启动检查**:装过本迁移的库 ⇒ 跑一遍(幂等 DDL + checksum 漂移检测);
+ * 没装过的库 ⇒ 什么都不做(全新库不许在这里多出两张表 —— 建表数被既有判据锁着)。
+ */
+export function migrateRoomRuntimeIfInstalled(
+  db: DbLike,
+  nowMs: number,
+  ddlPath?: string,
+): RoomRuntimeBootCheck {
+  if (!roomRuntimeInstalled(db)) {
+    return {
+      applied: false, version: ROOM_RUNTIME_MIGRATION_VERSION,
+      checksum: '', drift: false, installed: false,
+    };
+  }
+  return { ...migrateRoomRuntime(db, nowMs, ddlPath), installed: true };
+}
+
+/** 把一个段的载荷封进 `{$v,data}`(唯一序列化实现;同一载荷两次落库逐字节相同)。 */
+function packSection(value: unknown): string {
+  return JSON.stringify({
+    [ROOM_RUNTIME_VERSION_KEY]: ROOM_RUNTIME_STATE_VERSION,
+    [ROOM_RUNTIME_DATA_KEY]: value ?? null,
+  });
+}
+
+/** 解一个段:读不懂(JSON 坏 / 非对象 / `$v` 不认识 / 缺 `data`)⇒ `undefined`(不猜)。 */
+function unpackSection(raw: unknown): unknown {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const env = parsed as Record<string, unknown>;
+  if (Number(env[ROOM_RUNTIME_VERSION_KEY]) !== ROOM_RUNTIME_STATE_VERSION) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(env, ROOM_RUNTIME_DATA_KEY)) return undefined;
+  return env[ROOM_RUNTIME_DATA_KEY];
+}
+
+/**
+ * 写一间房的运行时状态(**第一次写会就地补表**并登记 v6)。整行覆盖语义:
+ * 未给的段写成空串。任何一段超上限 ⇒ **如实抛**(不截断,与 §13/§19 同一取舍)。
+ *
+ * 返回值都是判据:`row` = 影响行数(1 = 落地;0 = 行在读-写之间消失,不该发生);
+ * `bytes` = 本次写入的段 JSON 总字节;`written` = 真正写下的段数(给了载荷的段)。
+ */
+export function saveRoomRuntimeState(
+  db: DbLike,
+  roomId: string,
+  snapshot: RoomRuntimeSnapshot,
+  nowMs: number,
+): { row: number; bytes: number; written: number } {
+  if (typeof roomId !== 'string' || roomId.length === 0) {
+    throw new Error('房间运行时状态需要非空 roomId');
+  }
+  if (!Number.isFinite(nowMs)) throw new Error('房间运行时状态需要 nowMs(Unix 毫秒)');
+  const migration = migrateRoomRuntime(db, nowMs);
+  if (migration.drift) {
+    throw new Error(
+      `房间运行时状态迁移 checksum 漂移(schema_migrations.version=${ROOM_RUNTIME_MIGRATION_VERSION}`
+      + ' 的登记与 schema_room_runtime.sql 对不上)⇒ 拒绝写入(不静默降级):'
+      + '这些状态是读档原料,结构没判清就写,重启后读回来的是坏状态',
+    );
+  }
+  const snap = (snapshot ?? {}) as Record<string, unknown>;
+  const patch: Row = { saved_at: nowMs };
+  let bytes = 0;
+  let written = 0;
+  for (const section of ROOM_RUNTIME_SECTIONS) {
+    const present = Object.prototype.hasOwnProperty.call(snap, section) && snap[section] !== undefined;
+    if (!present) {
+      patch[ROOM_RUNTIME_COLUMN[section]] = '';
+      continue;
+    }
+    const json = packSection(snap[section]);
+    if (json.length > ROOM_RUNTIME_MAX_BYTES) {
+      throw new Error(
+        `段 ${section} 的 JSON ${json.length} 字节超出上限 ${ROOM_RUNTIME_MAX_BYTES}`
+        + ' —— 拒绝写入而不是截断(截断的段读回来是坏状态)',
+      );
+    }
+    patch[ROOM_RUNTIME_COLUMN[section]] = json;
+    bytes += json.length;
+    written += 1;
+  }
+  const existing = db.get(ROOM_RUNTIME_TABLE, { room_id: roomId });
+  if (existing === undefined) {
+    db.insert(ROOM_RUNTIME_TABLE, { room_id: roomId, ...patch });
+    return { row: 1, bytes, written };
+  }
+  return { row: db.update(ROOM_RUNTIME_TABLE, { room_id: roomId }, patch), bytes, written };
+}
+
+/**
+ * 读一间房的运行时状态(与 `saveRoomRuntimeState` 对偶)。
+ *
+ * 先看 **迁移登记行**:没装过本段 ⇒ `no-table` 且**一个字节都不碰库**
+ * (`MemoryDb.get()` 对不存在的表会顺手建一张空表,那会在内存夹具上凭空多出两张表)。
+ * 装过之后真库的表若被删掉 ⇒ `no such table` 照样降级成 `no-table`。
+ */
+export function loadRoomRuntimeState(db: DbLike, roomId: string): RoomRuntimeRead {
+  if (typeof roomId !== 'string' || roomId.length === 0) {
+    return { ok: false, reason: 'no-row', dropped: 0, corrupt: [], bytes: 0 };
+  }
+  if (!roomRuntimeInstalled(db)) {
+    return { ok: false, reason: 'no-table', dropped: 0, corrupt: [], bytes: 0 };
+  }
+  let row: Row | undefined;
+  try {
+    row = db.get(ROOM_RUNTIME_TABLE, { room_id: roomId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) {
+      return { ok: false, reason: 'no-table', dropped: 0, corrupt: [], bytes: 0 };
+    }
+    throw e;
+  }
+  if (!row) return { ok: false, reason: 'no-row', dropped: 0, corrupt: [], bytes: 0 };
+  const state: RoomRuntimeLoaded = {};
+  const corrupt: RoomRuntimeSection[] = [];
+  let bytes = 0;
+  for (const section of ROOM_RUNTIME_SECTIONS) {
+    const raw = row[ROOM_RUNTIME_COLUMN[section]];
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    bytes += raw.length;
+    const value = unpackSection(raw);
+    if (value === undefined) {
+      corrupt.push(section);
+      continue;
+    }
+    (state as Record<string, unknown>)[section] = value;
+  }
+  return { ok: true, state, dropped: 0, corrupt, bytes };
+}
+
+/** 读回的一名玩家装备。`corrupt` = 有行但读不懂(**不猜**成空装备)。 */
+export interface PlayerEquipmentRead {
+  equipment: readonly number[];
+  corrupt: boolean;
+}
+
+/**
+ * 写一名玩家的**非武器**装备(第一次写会就地补表)。
+ *
+ * 迁移**不在这里重跑**:调用方(`savePlayerSnapshots`)在事务之前已经迁移过
+ * (`roomRuntimeInstalled` 为真)⇒ 这里不再 exec DDL(DDL 不该出现在写事务里)。
+ * 非法 id 静默丢弃并计数(与 `serializePlayerLedger` 同一取舍)。
+ */
+export function savePlayerEquipmentState(
+  db: DbLike,
+  userId: string,
+  equipment: readonly number[],
+  nowMs: number,
+): { kept: number; dropped: number } {
+  if (typeof userId !== 'string' || userId.length === 0) {
+    throw new Error('玩家装备需要非空 userId');
+  }
+  if (!Number.isFinite(nowMs)) throw new Error('玩家装备需要 nowMs(Unix 毫秒)');
+  if (!roomRuntimeInstalled(db)) {
+    const migration = migrateRoomRuntime(db, nowMs);
+    if (migration.drift) {
+      throw new Error(
+        `房间运行时状态迁移 checksum 漂移(schema_migrations.version=${ROOM_RUNTIME_MIGRATION_VERSION}`
+        + ' 与 schema_room_runtime.sql 对不上)⇒ 拒绝写入玩家装备(不静默降级)',
+      );
+    }
+  }
+  const seen = new Set<number>();
+  let dropped = 0;
+  for (const raw of equipment ?? []) {
+    if (!Number.isInteger(raw) || raw <= 0 || seen.has(raw) || seen.size >= PLAYER_EQUIPMENT_MAX) {
+      dropped += 1;
+      continue;
+    }
+    seen.add(raw);
+  }
+  /* 升序 ⇒ 同一份装备两次落库逐字节相同(判据能按字节比)。 */
+  const ids = [...seen].sort((a, b) => a - b);
+  const json = packSection({ equipment: ids });
+  if (json.length > PLAYER_EQUIPMENT_MAX_BYTES) {
+    throw new Error(`玩家装备 JSON ${json.length} 字节超出上限 ${PLAYER_EQUIPMENT_MAX_BYTES}`);
+  }
+  const key = { user_id: userId };
+  const patch: Row = { equipment_json: json, saved_at: nowMs };
+  if (db.get(PLAYER_EQUIPMENT_TABLE, key) === undefined) {
+    db.insert(PLAYER_EQUIPMENT_TABLE, { user_id: userId, ...patch });
+  } else {
+    db.update(PLAYER_EQUIPMENT_TABLE, key, patch);
+  }
+  return { kept: ids.length, dropped };
+}
+
+/**
+ * 读一名玩家的装备(与 `savePlayerEquipmentState` 对偶)。
+ *
+ * 没装过本段 / 没有行 / 这一段空 ⇒ `equipment: []`(正常);有行但读不懂 ⇒
+ * `corrupt: true`(**不猜**成「他没有装备」—— 那与「读坏了」是两件事)。
+ */
+export function loadPlayerEquipmentState(db: DbLike, userId: string): PlayerEquipmentRead {
+  if (typeof userId !== 'string' || userId.length === 0) return { equipment: [], corrupt: false };
+  if (!roomRuntimeInstalled(db)) return { equipment: [], corrupt: false };
+  let row: Row | undefined;
+  try {
+    row = db.get(PLAYER_EQUIPMENT_TABLE, { user_id: userId });
+  } catch (e) {
+    if (/no such table/i.test((e as Error)?.message ?? '')) return { equipment: [], corrupt: false };
+    throw e;
+  }
+  if (!row) return { equipment: [], corrupt: false };
+  const raw = row.equipment_json;
+  if (typeof raw !== 'string' || raw.length === 0) return { equipment: [], corrupt: false };
+  const payload = unpackSection(raw);
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { equipment: [], corrupt: true };
+  }
+  const list = (payload as { equipment?: unknown }).equipment;
+  if (!Array.isArray(list)) return { equipment: [], corrupt: true };
+  const out: number[] = [];
+  for (const v of list) {
+    if (Number.isInteger(v) && (v as number) > 0) out.push(v as number);
+  }
+  return { equipment: out, corrupt: false };
 }

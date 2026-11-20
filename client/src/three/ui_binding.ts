@@ -53,6 +53,13 @@ import {
   type UiHitLayouts,
 } from '../ui/panel_hit.ts';
 /* ★ WS-FND-166:`prefers-reduced-motion` 也必须覆盖**面板**动画(修前只有摇杆有)。 */
+/* ★ WS-FND-170:画布的字号 / 描边 / 配色**唯一来源** —— 与 DOM 层同一个 `ui/a11y.ts`。
+   修前这里自己写 `10px`/`9px` 与 `rgba(120,150,210,.42)`(实测 2.09:1;cellEdge 1.52:1),
+   同一个屏幕两套可读口径;判据 `tests/WS-FND-170-canvas-a11y.test.ts` 钉住"同源"。 */
+import {
+  A11Y_BAD, A11Y_BG, A11Y_DIM, A11Y_EDGE, A11Y_MONO_STACK, A11Y_OK, A11Y_TEXT,
+  CANVAS_FONT_PX, CANVAS_PANEL_FILL_ALPHA, canvasFontText, rgbaOf,
+} from '../ui/a11y.ts';
 import { panelAnimAlpha, prefersReducedMotion } from '../ui/mobile_shell.ts';
 
 /* 命中结果的类型现在只有一处定义(`ui/panel_hit.ts`);这里 **re-export**,
@@ -177,26 +184,46 @@ export interface UiDrawState {
   keysHint: string;
 }
 
-/** 面板配色(与 HUD 同一套绘本基调) */
+/**
+ * 面板配色 —— ★ WS-FND-170:达标色板**全部来自 `ui/a11y.ts`**(这里一个颜色字面量都不写)。
+ *
+ * 修前这两道描边是手写的半透明色,压在面板底上实测:
+ * ```
+ * panelEdge rgba(120,150,210,.42) ⇒ 2.09:1
+ * cellEdge  rgba(140,170,225,.22) ⇒ 1.52:1   (WCAG 1.4.11 要求非文本 ≥ 3:1)
+ * ```
+ * 现在两者都是 `A11Y_EDGE`(#7f9dc9):压 `A11Y_BG` 是 6.26:1,
+ * 压**最坏情况**的面板底(0.94 不透明度叠在白场景上)仍有 5.32:1。
+ */
 const C = {
-  panelBg: 'rgba(20,26,42,.94)',
-  panelEdge: 'rgba(120,150,210,.42)',
-  title: '#e8eefc',
-  dim: '#8fa6c8',
+  panelBg: rgbaOf(A11Y_BG, CANVAS_PANEL_FILL_ALPHA),
+  panelEdge: A11Y_EDGE,
+  title: A11Y_TEXT,
+  dim: A11Y_DIM,
   cellBg: 'rgba(255,255,255,.05)',
-  cellEdge: 'rgba(140,170,225,.22)',
+  cellEdge: A11Y_EDGE,
   hot: 'rgba(255,220,140,.95)',
   /** 拖拽源格的描边(比 `hot` 淡:它不是"目标",只是"正在被搬") */
   hotGhostLine: 'rgba(255,220,140,.45)',
-  ok: '#8fe0a8',
-  bad: '#ff9d9d',
+  ok: A11Y_OK,
+  bad: A11Y_BAD,
   hp: '#e2564a',
   hpGhost: 'rgba(255,255,255,.30)',
   tabOn: 'rgba(255,220,140,.92)',
 } as const;
 
 /** 等宽字体栈(与 HUD 一致) */
-const MONO = 'ui-monospace,Menlo,Consolas,monospace';
+/** 等宽字体栈(★ WS-FND-170:与 DOM 层用**同一个**常量,不再各写一份) */
+const MONO = A11Y_MONO_STACK;
+/**
+ * 画布字号的**唯一来源** —— 串由 `ui/a11y.ts` 的 `canvasFontText()` 生成。
+ *
+ * 修前这里是 9 / 10 / 11 / 12px 四档字面量(分类标签 10px、音名 9px),
+ * 而 DOM 层的基线是 13px ⇒ 同一个屏幕两套可读口径。
+ * ⚠️ 代价如实写:面板布局(`ui/panel_layout.ts`)的行高/行宽是按 9–12px 算的,
+ *    统一到 13px 后长行会更早压到边界 —— 可读性优先,而布局不归本层(不在本层写域)。
+ */
+const FONT = canvasFontText(CANVAS_FONT_PX);
 
 /**
  * ★ WS-FND-166:背包的分类标签 —— **绘制与命中同一份**。
@@ -368,7 +395,7 @@ export class UiOverlay {
 
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = `13px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'middle';
     const total = INVENTORY_SLOTS;
@@ -385,7 +412,7 @@ export class UiOverlay {
     /* 分类标签条:12 个分类,按桶宽平分(★ WS-FND-166:与命中用**同一份** `INVENTORY_TABS`) */
     const tabs = INVENTORY_TABS;
     const tabW = L.tabStrip.w / tabs.length;
-    ctx.font = `10px ${MONO}`;
+    ctx.font = FONT;
     ctx.textAlign = 'center';
     for (let i = 0; i < tabs.length; i += 1) {
       const t = tabs[i]!;
@@ -474,13 +501,13 @@ export class UiOverlay {
 
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = `13px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'top';
     ctx.fillText(`配方  #${s.recipeId} ×${s.recipeBatches}`, panel.x + PANEL_MARGIN, panel.y + 8);
 
     /* 缺料提示:来自 checkCraft/missingReport(不是自己拼的字符串) */
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = s.recipeNote ? C.bad : C.ok;
     ctx.fillText(s.recipeNote || '材料齐备,可合成', panel.x + PANEL_MARGIN, panel.y + 26);
 
@@ -508,7 +535,7 @@ export class UiOverlay {
     fillPanel(ctx, L.panel, a);
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = `13px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'top';
     ctx.fillText(`像素画架 ${EASEL_SIZE}×${EASEL_SIZE} · 覆盖 ${(s.easel.coverage() * 100).toFixed(0)}%`, L.title.x, L.title.y + 6);
@@ -546,7 +573,7 @@ export class UiOverlay {
       ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
     }
     ctx.fillStyle = C.dim;
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     /* 当前色标签画在**调色盘右侧的空白处**,不是画布右边 ——
        画布右边就是面板外了(第一版把「当前色 #D8B98C」写到了草地上)。
        用 `palette` 的右边界 + 一个内边距定位,仍在面板内。 */
@@ -557,7 +584,7 @@ export class UiOverlay {
     );
 
     /* 工具条 */
-    ctx.font = `12px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.dim;
     ctx.fillText(`[Z] 撤销(${s.easel.undoCount})  [Y] 重做(${s.easel.redoCount})  [X] 清空  [C] 填充`, L.toolbar.x, L.toolbar.y + 8);
     ctx.restore();
@@ -569,7 +596,7 @@ export class UiOverlay {
     fillPanel(ctx, L.panel, a);
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = `13px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'top';
     ctx.fillText('八音盒音高砖 2×16 = 32 档', L.title.x, L.title.y + 6);
@@ -584,7 +611,7 @@ export class UiOverlay {
       ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
       ctx.save();
       ctx.fillStyle = on ? '#221a08' : C.dim;
-      ctx.font = `9px ${MONO}`;
+      ctx.font = FONT;
       /* 竖排音名:旋转 −90° 后,**必须把基线设为 middle、对齐设为 center**,
          否则默认的 `top`/`start` 会让文字偏向一侧、糊在砖块边上。
          (drawPitch 开头设过 textBaseline='top',这里要显式覆盖。) */
@@ -599,7 +626,7 @@ export class UiOverlay {
       ctx.textBaseline = 'top';
     }
     ctx.fillStyle = C.dim;
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     /* 用 layout 导出的 `footer` 矩形定位 —— 不用 `panel.h - 20` 自己算,
        那样会在砖块行数变化时再次压到砖上(初版实测过)。 */
     ctx.fillText(`已选 ${popcount(s.pitchMask)} 档 / 共 32 档`, L.footer.x, L.footer.y + 6);
@@ -621,11 +648,11 @@ export class UiOverlay {
     ctx.save();
     ctx.globalAlpha = a;
     ctx.textBaseline = 'top';
-    ctx.font = `13px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.fillText('派对模式(选定后立刻发 SET_PARTY_MODE,影响全房)', L.title.x, L.title.y + 6);
     /* 当前档:来自权威 `meta.partyMode`;没选时用警示色说出来(否则玩家以为已选) */
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = p.currentName === null ? C.bad : C.ok;
     ctx.fillText(p.currentText, L.title.x + L.title.w - ctx.measureText(p.currentText).width, L.title.y + 9);
 
@@ -638,18 +665,18 @@ export class UiOverlay {
       ctx.strokeStyle = row.cursor ? C.hot : (row.current ? C.ok : C.cellEdge);
       ctx.lineWidth = row.cursor ? 2 : 1;
       ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
-      ctx.font = `12px ${MONO}`;
+      ctx.font = FONT;
       ctx.fillStyle = row.current ? C.ok : C.title;
       ctx.fillText(
         `${row.mode}. ${row.name}  ${row.players}  ${row.current ? '● 当前' : '○ 可选'}`,
         r.x + 8, r.y + 5,
       );
-      ctx.font = `10px ${MONO}`;
+      ctx.font = FONT;
       ctx.fillStyle = C.dim;
       ctx.fillText(row.rule, r.x + 8, r.y + 25);
     }
 
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = s.partyModeNote === '' ? C.dim : C.ok;
     const scroll = L.scrollable ? `(还有 ${p.rows.length - L.visibleRows} 档没画下:窗口太矮)` : '';
     ctx.fillText(
@@ -677,7 +704,7 @@ export class UiOverlay {
     const box: PanelRect = { x: band.x - pad, y: band.y - pad - 20, w: band.w + pad * 2, h: band.h + pad * 2 + 20 };
     fillPanel(ctx, box, a * 0.92);
 
-    ctx.font = `12px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = C.title;
     ctx.textBaseline = 'top';
     const labels = bossHudShowsLabels(this.w);
@@ -696,7 +723,7 @@ export class UiOverlay {
     for (const t of L.ticks) ctx.fillRect(L.x + t, L.y, 1, L.height);
 
     /* 血量文本 + 当前阶段名 —— 两者都是**线上**字段(s.boss.hp / s.boss.phaseName) */
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillStyle = '#fff';
     ctx.fillText(hpBarText(Math.round(s.boss.hp), s.boss.baseHp), L.x + 6, L.y + 3);
     ctx.fillStyle = C.dim;
@@ -708,7 +735,7 @@ export class UiOverlay {
     const ctx = this.ctx;
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = `12px ${MONO}`;
+    ctx.font = FONT;
     ctx.textBaseline = 'top';
     if (s.telegraphNote) {
       const w = 420;
@@ -758,11 +785,11 @@ export class UiOverlay {
       const L = this.invLayout;
       if (text !== '') {
         const r = slotRect(L, s.hoverSlot);
-        ctx.font = `11px ${MONO}`;
+        ctx.font = FONT;
         const w = Math.min(320, Math.max(120, ctx.measureText(text).width + 16));
         const box: PanelRect = { x: Math.min(this.w - w - 8, r.x + r.w + 8), y: Math.max(8, r.y - 6), w, h: 22 };
         if (rectVisible(box, this.w, this.h)) {
-          ctx.fillStyle = 'rgba(20,26,42,.96)';
+          ctx.fillStyle = rgbaOf(A11Y_BG, 0.96);
           roundRect(ctx, box, 5);
           ctx.fill();
           ctx.strokeStyle = C.cellEdge;
@@ -782,18 +809,18 @@ export class UiOverlay {
       const h = 22 + s.rush.total * 15 + (s.rush.note === '' ? 0 : 14);
       const box: PanelRect = { x: 16, y: this.h - h - 44, w, h };
       if (rectVisible(box, this.w, this.h)) {
-        ctx.fillStyle = 'rgba(20,26,42,.78)';
+        ctx.fillStyle = rgbaOf(A11Y_BG, CANVAS_PANEL_FILL_ALPHA);
         roundRect(ctx, box, 6);
         ctx.fill();
         ctx.strokeStyle = C.cellEdge;
         ctx.lineWidth = 1;
         ctx.stroke();
-        ctx.font = `11px ${MONO}`;
+        ctx.font = FONT;
         ctx.fillStyle = C.title;
         ctx.fillText(s.rush.text, box.x + 8, box.y + 5);
         let y = box.y + 22;
         for (const r of s.rush.rows) {
-          ctx.font = `10px ${MONO}`;
+          ctx.font = FONT;
           ctx.fillStyle = r.state === 'met' ? C.ok : (r.state === 'unmet' ? C.bad : C.dim);
           ctx.fillText(r.text, box.x + 8, y);
           y += 15;
@@ -806,7 +833,7 @@ export class UiOverlay {
     }
     /* 组合键提示条 */
     ctx.fillStyle = C.dim;
-    ctx.font = `11px ${MONO}`;
+    ctx.font = FONT;
     ctx.fillText(s.keysHint, 16, this.h - 22);
     ctx.restore();
   }

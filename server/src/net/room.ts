@@ -970,9 +970,15 @@ export interface WorldSaveHost {
     ledgerDropped?: number;
     /* ★ WS-FND-165(B1):房间系统台账那一段的落地数(1 = 写进去了一行)。
        老宿主(只有前三段)⇒ 这三个键缺省,房间侧按 `?? 0` 读(与上面同一处置)。 */
+    /* ★ WS-FND-165(B1):房间系统台账那一段的落地数(1 = 写进去了一行)。
+       老宿主(只有前三段)⇒ 这三个键缺省,房间侧按 `?? 0` 读(与上面同一处置)。 */
     systemsRow?: number;
     systemsKeys?: number;
     systemsDropped?: number;
+    /* ★ WS-FND-168(B1):房间运行时状态那一行(五段)的落地数 / 字节。同上可选:
+       老宿主没有它 ⇒ 缺省,不影响任何既有路径。 */
+    runtimeRow?: number;
+    runtimeBytes?: number;
   };
   /* ══════════ ★ WS-FND-165(B1):冷启动恢复 + 周期玩家快照的三条声明 ══════════
    *
@@ -991,6 +997,20 @@ export interface WorldSaveHost {
     roomId: string,
   ): { applied: boolean; added: number; keys: number; dayIndex: number; dropped: number; reason: string };
   exportPlayerSnapshots?(): readonly PlayerSnapshotRow[];
+  /**
+   * ★ WS-FND-168:房间运行时状态(**房间系统状态 / 百货机库存 / 地面掉落 / 电路件 /
+   * 生物位置朝向**)的读口。可选:没有它的宿主不存在这条读路(这是**显式的边界**,
+   * 不是缺陷)—— 与 `restoreRoomSystemsFromDb` 同一处置。
+   */
+  restoreRoomRuntimeFromDb?(
+    db: DbLike,
+    roomId: string,
+  ): {
+    applied: boolean; reason: string;
+    crops: number; gallery: number; ranchPets: number; harvest: number;
+    depot: number; drops: number; wiring: number; mobs: number;
+    corrupt: readonly string[];
+  };
   restoreProgressionFromDb?(
     db: DbLike,
     playerId: string,
@@ -4910,7 +4930,14 @@ export class RoomRuntime {
     }
     this.lastPlayerSnapshotAttemptTick = this.state.meta.tick;
     try {
-      const rows = host.exportPlayerSnapshots();
+      /* ★ WS-FND-168:把**朝向 / 手持物**并进快照行 —— 它们是 `PlayerState` 的字段
+         (模拟层没有它们的落点),由持有 `state` 的房间补上;装备由宿主导出。
+         「房间补 state、宿主导档案」的分工与投影表一致(见 room.ts 的 §投影)。 */
+      const rows = host.exportPlayerSnapshots().map((r) => {
+        const ps = this.state.players.find((p) => p.id === r.userId);
+        if (ps === undefined) return r;
+        return { ...r, dir: ps.dir, heldItemId: ps.heldItemId };
+      });
       const r = savePlayerSnapshots(db, rows, now);
       this.lastPlayerSnapshotReport = {
         tick: this.state.meta.tick, saved: r.saved, skipped: r.skipped, dropped: r.dropped, reason,

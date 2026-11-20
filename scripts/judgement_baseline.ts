@@ -643,7 +643,19 @@ export function findBaseline(detector: string, where: string): BaselineEntry | u
      那时要做的仍是先看是哪一对容器(先读 [共享]/[独有]),而不是接着抬。
   ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有],定性必须看那里;
      只读水位这一个数字 = 拿汇总数替代逐条判定。 */
-export const G_CANDIDATE_WATERMARK = 91; /*
+/* 2026-11-21(第十二轮):91 → **97**。命令 `node scripts/judgement_audit.ts --baseline`,读数 **97** ⇒ 按**实测**重钉。
+  增量 **+6**,逐条核对后**全部**落在本批新增的长跑夹具 `scripts/soak.ts` 上(无一条来自生产实现):
+   1) `scripts/soak.ts:75`  `SoakOptions` ↔ `AssembleDeps`@`server/src/index.ts:146`(配置容器 ↔ 装配入参)
+   2) `scripts/soak.ts:234` `SoakLoad` ↔ `LoadCounters`@`soak.ts:424`(负载累计 ↔ 计数器)
+   3) `scripts/soak.ts:250` `SoakSample` ↔ `SampleInput`@`soak.ts:918`(单点采样输出 ↔ 采样入参)
+   4) `scripts/soak.ts:250` `SoakSample` ↔ `SoakSummary`@`soak.ts:1027`(单点采样 ↔ 汇总)
+   5) `scripts/soak.ts:611` `SoakFixture` ↔ `SampleInput`@`soak.ts:918`(夹具 ↔ 采样入参)
+   6) `scripts/soak.ts:611` `SoakFixture` ↔ `SoakSummary`@`soak.ts:1027`(夹具 ↔ 汇总)
+  ⇒ 六条是**同一形态**:长跑夹具在**同一文件内**为「配置 / 采样 / 汇总 / 夹具」各声明一份容器,
+     字段集互相包含 —— 即本文件反复记过的「层间有意传递 / 同名夹具各声明一份」,不是生产侧的两份实现。
+  ⚠️ 抬水位**不是**关告警:守卫比的仍是**总命中数**,下一次再出现这类配对它照样会响 —— 先看是哪一对容器。
+  ★★ **逐条明细仍是主判据**:`judgement_audit.ts` 的 `i` 行逐对打印 [共享]/[独有];只读水位 = 拿汇总数替代逐条判定。 */
+export const G_CANDIDATE_WATERMARK = 97; /*
   2026-11-19(第九轮):`node scripts/judgement_audit.ts --baseline` 实测 **75** > 水位 74
    —— ⚠️ **多出的那一条与本轮改动无关,A/B 已证明**(Q4):
    把本批新增的文件移走后再跑同一条命令,**仍是 75** ⇒ 增量不来自本次改动面,
