@@ -580,6 +580,34 @@ function assertReconnectSnapshotSize(snapshot: Uint8Array, where: string): void 
     );
   }
 }
+
+/**
+ * ★ 保证 `users` 父行存在(真外键的目标:`room_players.user_id → users.id`)。
+ *
+ * ## 为什么这条必须在**仓储层**,而不是让调用方先建号
+ * 真长跑夹具(文件库 + `PRAGMA foreign_keys = ON`)抓到:
+ * ```text
+ * room.ts:2797  upsertRoomPlayer(...)   →   repo.ts 的 INSERT room_players
+ * schema.sql:131 FOREIGN KEY (user_id) REFERENCES users(id)
+ * driver.sqlite.ts:505  PRAGMA foreign_keys = ON
+ * ⇒ 库里没有 users 行 ⇒ FOREIGN KEY constraint failed ⇒ 整个入场回滚
+ *   (回执 `JOIN_FAILED:加入失败(已回滚...):FOREIGN KEY constraint failed`)
+ * ```
+ * `room.join()` **自己从不建号**(只有 `bootstrap()` / `assemble()` 建**房主**),
+ * 于是「**非房主**第一次进房」在真库上必然失败 —— 而既有测试的夹具都先
+ * `createUser` 了那个 id,所以全仓测试全绿。
+ * ⇒ 「写子行之前先有父行」是这张表**自己的**完整性前提,不该由调用方记住顺序
+ *   (只在 room.ts 里补一次建号也能过,但下一个写入口还会再漏一次)。
+ *
+ * 手法与 `index.ts:ensureOwnerUser` 逐字同款:读不到就按 id 建一个,显示名取 id
+ * (本仓没有「真实昵称」这一格,也不该在这里编一个)。幂等:已是 `users` 行就直接返回。
+ */
+function ensureUserRow(db: DbLike, userId: string, nowMs: number): void {
+  if (userId === '') throw new Error('user_id 不能为空');
+  if (db.get('users', { id: userId })) return;
+  createUser(db, { id: userId, displayName: userId, nowMs });
+}
+
 export function upsertRoomPlayer(
   db: DbLike,
   roomId: string,
@@ -590,6 +618,10 @@ export function upsertRoomPlayer(
 ): void {
   /* ★ 写入侧的字节闸口(§6):与归档同口径 1 MiB,超限**如实拒**(不截断)。 */
   if (snapshot !== undefined) assertReconnectSnapshotSize(snapshot, '重连快照(room_players)');
+  /* ★ P0(2026-11-25 长跑实测):**父行先于子行** —— 见 `ensureUserRow`。
+     放在最前(而不是只插在 insert 分支之前):重连/改角色那条 update 分支也走同一道闸,
+     「库里有这个人」这个前提从此只声明一次。 */
+  ensureUserRow(db, userId, nowMs);
   const key = { room_id: roomId, user_id: userId };
   const existing = db.get('room_players', key);
   if (existing) {

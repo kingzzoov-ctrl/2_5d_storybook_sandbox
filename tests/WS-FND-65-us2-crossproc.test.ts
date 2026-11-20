@@ -97,7 +97,7 @@ const WS_OPEN_BUDGET_MS = 15000;
 /** 等:`open` → 上行 hello → join 进房 → welcome 文本帧回到客户端。 */
 const WS_WELCOME_BUDGET_MS = 15000;
 /** 等:客户端收到含该玩家的快照 / 快照把新位置带回来(20Hz 广播一拍)。 */
-const WS_SNAPSHOT_BUDGET_MS = 5000;
+const WS_SNAPSHOT_BUDGET_MS = 15000;
 /** 单条 `move` 之后等「权威坐标真的动了」的**上限**(条件一成立立刻返回,
  *  不是 sleep) —— 反作弊额度按服务端帧水位发放,故额度不足时要重发。 */
 const WS_MOVE_STEP_MS = 80;
