@@ -19,7 +19,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHUNK_BYTES, CHUNK_CELLS, packTile, unpackTile } from '../shared/types/tile.ts';
-import { BASE_MOVE_SPEED, DT, TICK_HZ, BodyState } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ, SLOW_DT, secondsToTicks, BodyState } from '../shared/types/physics.ts';
 /* task-71:投影的 level 上界。从**冻结层**取 —— 与 `room.ts` 同一个来源,
    不在此处再写一个字面量(那会是第二份实现,对不上时没人会发现)。 */
 import { MAX_LEVEL } from '../shared/types/entities.ts';
@@ -123,6 +123,8 @@ import {
   RECONCILE_DEADZONE,
   RECONCILE_HARD_SNAP,
   SMOOTH_WINDOW_S,
+  SNAPSHOT_BUFFER_S,
+  MAX_EXTRAPOLATE_S,
   INTERP_DELAY_S,
   Interpolator,
   LossyChannel,
@@ -172,11 +174,13 @@ import { resetPartyClock, setPartyClock } from '../server/src/net/actions/start_
 import {
   BASE_ATTACK_INTERVAL_S,
   DEFAULT_LIMITS,
+  FRAME_SECONDS,
   InventoryReject,
   MAX_ATTACK_SPEED_BONUS,
   MAX_ITEM_DELTA_PER_TICK,
   MAX_MOVE_CATCHUP_TICKS,
   MAX_SPEED_BONUS_MUL,
+  SPEED_WINDOW_TICKS,
   AntiCheatRoom,
   ViolationKind,
   advanceServerClock,
@@ -1262,32 +1266,41 @@ test('D04 SMOOTH 在 SMOOTH_WINDOW_S 内单调收敛,无过冲,一个窗口后�
     steps += 1;
   }
 
-  /* 语义判据:一个 SMOOTH_WINDOW_S(=5 帧)后残余应降到 1% 以下。
-   * 「多少步到机器精度」不是设计目标,衰减率才是。 */
+  /* 语义判据:一个 SMOOTH_WINDOW_S(= 0.25 **秒**)后残余应降到 1% 以下。
+   * 「多少步到机器精度」不是设计目标,衰减率才是。
+   * ⚠️ 窗口帧数由**秒**派生(32Hz = 8 帧);旧写法 `eq(framesPerWindow, 5)` 把 20Hz 写死。 */
+  near(SMOOTH_WINDOW_S, 0.25, 1e-12, '平滑窗口 = 0.25 秒(语义源头);帧数由 DT 派生');
   let r2 = { x: 0.4, y: -0.2, z: 0 };
-  const framesPerWindow = Math.round(SMOOTH_WINDOW_S / DT);
-  eq(framesPerWindow, 5, 'SMOOTH_WINDOW_S = 5 帧');
+  const framesPerWindow = Math.max(1, secondsToTicks(SMOOTH_WINDOW_S));
   for (let i = 0; i < framesPerWindow; i += 1) r2 = absorbOffset(r2, DT, SMOOTH_WINDOW_S).rest;
   const residualRatio = Math.hypot(r2.x, r2.y) / startMag;
-  ok(residualRatio < 0.01, `一个窗口后残余 ${(residualRatio * 100).toFixed(2)}% 应 < 1%`);
+  /* 每步残余因子 = 100^(-dt/window) ⇒ 恰好一个窗口(n×dt = window)后残余**正好** 100^-1 = 1%;
+     浮点可能落在 1% 上下,故判据含等号(严格的 `< 0.01` 在 32Hz 下会因 1ulp 误红)。 */
+  ok(residualRatio <= 0.01 + 1e-12,
+    `一个窗口后残余 ${(residualRatio * 100).toFixed(3)}% 应 = 1%`);
 
-  ok(steps >= 15 && steps <= 40, `到 1e-9 的步数 ${steps} 应在 [15,40](指数衰减)`);
+  /* 「到 1e-9 的步数」由**时间**决定:t* = log100(startMag/1e-9) × window ≈ 1.08 秒,
+     故步数 ≈ t* / DT(20Hz ≈ 22,32Hz ≈ 35)—— 秒级语义,不是固定帧数。 */
+  const stepsToEps = (Math.log(startMag / 1e-9) / Math.log(100)) * SMOOTH_WINDOW_S / DT;
+  ok(Math.abs(steps - stepsToEps) <= 2,
+    `到 1e-9 的步数 ${steps} 应 ≈ ${stepsToEps.toFixed(1)}(= log100(startMag/1e-9) × 窗口 / DT)`);
 });
 
 test('D05 输入重演:resimulate + pruneCmds 与逐步预测逐位一致', () => {
   const cmds: InputCmd[] = [
-    { seq: 1, moveX: 1, moveY: 0, jump: false },   // x +0.225
-    { seq: 2, moveX: 1, moveY: 0, jump: false },   // x +0.225
-    { seq: 3, moveX: 0, moveY: 1, jump: false },   // y +0.225
-    { seq: 4, moveX: -1, moveY: 0, jump: false },  // x -0.225
+    { seq: 1, moveX: 1, moveY: 0, jump: false },   // x += 一帧位移
+    { seq: 2, moveX: 1, moveY: 0, jump: false },   // x += 一帧位移
+    { seq: 3, moveX: 0, moveY: 1, jump: false },   // y += 一帧位移
+    { seq: 4, moveX: -1, moveY: 0, jump: false },  // x -= 一帧位移
   ];
   const auth = { x: 0, y: 0, z: 0 };
   const pred = resimulate(auth, cmds);
 
-  /* 手算:x = +0.225 +0.225 -0.225 = +0.225;y = +0.225。
-   * 每帧位移 = BASE_MOVE_SPEED(4.5) × DT(0.05) = 0.225 格。 */
+  /* 手算:净位移 = 每帧位移 × 净帧数(x 净 +1 帧、y 净 +1 帧)。
+     每帧位移 = BASE_MOVE_SPEED / TICK_HZ(= BASE_MOVE_SPEED × DT;
+     20Hz 时是 0.225 格,32Hz 时是 0.140625 格 —— 写死 0.225 就等于把 tick 率写死)。 */
   const perFrame = BASE_MOVE_SPEED * DT;
-  near(perFrame, 0.225, 1e-9, '单帧位移');
+  near(perFrame, BASE_MOVE_SPEED / TICK_HZ, 1e-9, '单帧位移 = 移速 / TICK_HZ');
   near(pred.x, perFrame, 1e-9, 'x 净位移 = 3 帧正向 - 1 帧反向 = 1 帧');
   near(pred.y, perFrame, 1e-9, 'y 净位移 = 1 帧');
   eq(cmds.length, 4, '共 4 条命令,不应被重复应用');
@@ -1380,8 +1393,10 @@ test('D07 抖动不放大:5% 丢包输出的二阶差分 RMS ≤ 无损输出的
 test('D08 缓冲只保留 1 秒历史;静态点插值精确', () => {
   const interp = new Interpolator();
   for (let t = 0; t <= 40; t += 1) interp.push({ tick: t, x: 10 + t * 0.1, y: 20, z: 0 });
-  /* SNAPSHOT_BUFFER_S = 1.0s → 20 tick 窗口:40-20=20 之前的被淘汰,保留 21 项。 */
-  eq(interp.size, 21, '应保留 1 秒(21 项:20..40)');
+  /* SNAPSHOT_BUFFER_S = 1.0 秒 → 窗口帧数 = round(1.0 × TICK_HZ)(32Hz = 32):
+     40-32=8 之前的被淘汰,保留 33 项。 */
+  const windowTicks = Math.round(SNAPSHOT_BUFFER_S * TICK_HZ);
+  eq(interp.size, windowTicks + 1, `应保留 1 秒(${windowTicks + 1} 项:${40 - windowTicks}..40)`);
   eq(interp.latestTick, 40);
 
   /* 线性轨迹上任意子 tick 采样都应精确。 */
@@ -1391,9 +1406,11 @@ test('D08 缓冲只保留 1 秒历史;静态点插值精确', () => {
   near(s.y, 20, 1e-9, 'y 恒定');
 
   /* 端点与越界夹取。 */
-  near(interp.sampleAtTick(20)?.x ?? 0, 12.0, 1e-9, '窗口最左端');
+  /* 窗口最左端由**秒**派生(旧写法 20.0 是「1 秒 = 20 帧」的 20Hz 假设)。 */
+  const leftTick = 40 - Math.round(SNAPSHOT_BUFFER_S * TICK_HZ);
+  near(interp.sampleAtTick(leftTick)?.x ?? 0, 10 + leftTick * 0.1, 1e-9, '窗口最左端');
   near(interp.sampleAtTick(40)?.x ?? 0, 14.0, 1e-9, '最新帧');
-  near(interp.sampleAtTick(-5)?.x ?? 0, 12.0, 1e-9, '早于窗口应夹到最左');
+  near(interp.sampleAtTick(-5)?.x ?? 0, 10 + leftTick * 0.1, 1e-9, '早于窗口应夹到最左');
 });
 
 test('D09 乱序/重复包被丢弃;外推有上限;传送清历史', () => {
@@ -1415,11 +1432,11 @@ test('D09 乱序/重复包被丢弃;外推有上限;传送清历史', () => {
   near(i.sampleAtTick(11)?.x ?? 0, 0.5, 1e-9, '中点 u=0.5');
   near(i.sampleAtTick(10)?.x ?? 0, 0, 1e-9, '左端点');
 
-  /* 外推上限:最多 MAX_EXTRAPOLATE_S × TICK_HZ = 5 帧,之后冻结。 */
+  /* 外推上限:最多 `MAX_EXTRAPOLATE_S` × `TICK_HZ` 帧(32Hz = 8),之后冻结。 */
   const far = i.sampleAtTick(12 + 500);
   ok(far !== undefined);
-  const maxAhead = 5;                    // 0.25s × 20Hz
-  const vPerTick = (1 - 0) / 2;          // 0.5 格/tick
+  const maxAhead = MAX_EXTRAPOLATE_S * TICK_HZ;   /* 秒 → 帧,不写死 5 */
+  const vPerTick = (1 - 0) / 2;                   /* 0.5 格/tick */
   near(far.x, 1 + vPerTick * maxAhead, 1e-6, '外推被钳到 MAX_EXTRAPOLATE_S');
   near(i.sampleAtTick(13)?.x ?? 0, 1 + vPerTick * 1, 1e-6, '1 帧外推');
   near(i.sampleAtTick(30)?.x ?? 0, far.x, 1e-9, '再远也不超过外推上限(冻结)');
@@ -1481,11 +1498,14 @@ test('E02 【作弊1】坐标跳变被拒 + 回退到上一权威坐标', () => 
 
 test('E03 【作弊2】移速上限被拒:单帧合法但累计超速', () => {
   const s = createAcState('speeder', 0, 0, 0, 0);
-  /* 每帧走 0.30 格:单帧上界 = 4.5×1×0.05×1.6 = 0.36,单帧合法。 */
-  const perTick = 0.30;
+  /* 持续 **6.0 格/秒**(= 1.33 × 基线):单帧在**单帧上界**(基线 × slack)内,故单帧跳变放行;
+     但整窗均速超过**窗口上限**(基线 × 容差)⇒ 窗口式检测必须命中。
+     ★ 步长按**速度 × 帧长**推导(不写死 0.30 = 20Hz 口径下的每帧位移)。 */
+  const SPEED_PER_SEC = 6.0;
+  const perTick = SPEED_PER_SEC * FRAME_SECONDS;
   let rejected = false;
   let tick = 0;
-  for (let i = 0; i < 21; i += 1) {
+  for (let i = 0; i < SPEED_WINDOW_TICKS + 1; i += 1) {   // 填满一个窗口即命中
     tick += 1;
     /* ⚠️ 必须同步推进**服务端时钟** —— 与 `room.ts:769-770` 的
        `meta.tick += 1; ac.tick(meta.tick)` 同构。只递增申报的 `intent.tick`
@@ -1496,7 +1516,7 @@ test('E03 【作弊2】移速上限被拒:单帧合法但累计超速', () => {
     const v = checkMove(s, { tick, x: i * perTick, y: 0, z: 0 });
     if (!v.allowed) { rejected = true; break; }
   }
-  ok(rejected, '持续 0.30 格/帧(6 格/秒)应被窗口式检测抓到');
+  ok(rejected, `持续 ${SPEED_PER_SEC} 格/秒(超窗口上限)应被窗口式检测抓到`);
   ok(s.violations.some((v) => v.kind === ViolationKind.SPEED), '应有 SPEED 违规');
 });
 
@@ -1539,7 +1559,8 @@ test('E04b 两个容差语义不可合并:单帧 slack(1.6)≠ 持续 tolerance(
   /* 边界外:1.30× ⇒ 由窗口抓(SPEED),不是单帧跳变 */
   const over = run(1.30, 120, 1);
   ok(over.rejected > 0, '1.30× 应被拒(超越持续容差)');
-  ok(over.firstTick >= 19, `1.30× 应等窗口填满才抓(≈第 20 帧),实际第 ${over.firstTick} 帧`);
+  ok(over.firstTick >= SPEED_WINDOW_TICKS - 1 && over.firstTick <= SPEED_WINDOW_TICKS,
+    `1.30× 应等窗口填满才抓(≈第 ${SPEED_WINDOW_TICKS} 帧),实际第 ${over.firstTick} 帧`);
   /* 单帧量级则立刻抓:2.0× 超过单帧上界 ⇒ 第 1 帧即 TELEPORT */
   eq(run(2.0, 120, 1).firstTick, 1, '2.0× 应在第 1 帧即判(单帧跳变)');
   /* 满加成合法:2.55× **伴随声明** ⇒ 不误伤 */
@@ -1552,7 +1573,7 @@ test('E05 移速加成错报被钳:客户端自称 ×100 也按 2.55 算', () =>
   const s = createAcState('liar', 0, 0, 0, 0);
   const v = checkMove(s, { tick: 1, x: 1.0, y: 0, z: 0 }, DEFAULT_LIMITS);
   eq(v.allowed, false, '1 格/帧(20 格/秒)应被拒,即便自称高倍率');
-  /* 上界依然是 2.55 × 4.5 × 0.05 × 1.6 = 0.918 格。 */
+  /* 上界依然是 2.55 × 4.5 × 帧长 × 1.6(= 基线 × 倍率 × slack,与 tick 率无关)。 */
   near(maxDisplacementPerTick(1e9), 4.5 * MAX_SPEED_BONUS_MUL * DT * 1.6, 1e-9);
 });
 
@@ -1581,8 +1602,9 @@ test('E14 自报 tick 抵赖单帧额度:报 1e9 不能把位移上界放大', (
   const v = checkMove(s, { tick: 1e9, x: 1e5, y: 1e5, z: 0 });
   eq(v.allowed, false, '报 1e9 帧同样无法瞬移');
   eq(v.violation?.kind, ViolationKind.TELEPORT);
-  /* 额度必须仍是「1 帧」的量级,而不是 1e9 帧(默认倍率 1 ⇒ 4.5×0.05×1.6 = 0.360)。 */
-  eq(v.violation?.detail?.includes('0.360'), true, `上界应为单帧量级,实际:${v.violation?.detail}`);
+  /* 额度必须仍是「1 帧」的量级,而不是 1e9 帧(默认倍率 1 ⇒ 基线 × 帧长 × slack)。 */
+  eq(v.violation?.detail?.includes(maxDisplacementPerTick(1).toFixed(3)), true,
+    `上界应为单帧量级(${maxDisplacementPerTick(1).toFixed(3)}),实际:${v.violation?.detail}`);
 });
 
 test('E14b 反例:伪造 tick 必须**同时**被拒且基准不被污染', () => {
@@ -1615,9 +1637,10 @@ test('E14d 上界两侧各扫一点:不只钉住上界值本身', () => {
   eq(UB, 1, '追帧上界 = 1 帧(设计基线:自报 tick 只能确认对齐,不能透支未来)');
   eq(MAX_MOVE_CATCHUP_TICKS, 1, '门禁导出常量同为 1(与限额表一致,防止只改一处)');
 
-  /* 界内:增量 1、满额度位移 ⇒ 放行 */
+  /* 界内:增量 1、**满额度**位移 ⇒ 放行(位移植按单帧额度推导,不写死 0.917) */
+  const QUOTA_MAX = maxDisplacementPerTick(MAX_SPEED_BONUS_MUL);
   const inS = createAcState('in', 0, 0, 0, 0);
-  const inV = checkMove(inS, { tick: 1, x: 0.917, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
+  const inV = checkMove(inS, { tick: 1, x: QUOTA_MAX, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
   eq(inV.allowed, true, '界内满额度位移应放行(否则合法玩家被误伤)');
 
   /* 穿过界:增量 > UB,额度仍锁在 UB 帧 ⇒ 超出了 1 帧额度就必须被拒 */
@@ -1627,10 +1650,10 @@ test('E14d 上界两侧各扫一点:不只钉住上界值本身', () => {
 
   /* 单调性:上界以下与以上的额度必须不同(证明夹取真的生效) */
   const s1 = createAcState('s1', 0, 0, 0, 0);
-  const v1 = checkMove(s1, { tick: 1, x: 0.917, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
+  const v1 = checkMove(s1, { tick: 1, x: QUOTA_MAX, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
   eq(v1.allowed, true);
   const s2 = createAcState('s2', 0, 0, 0, 0);
-  const v2 = checkMove(s2, { tick: 1e9, x: 0.917, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
+  const v2 = checkMove(s2, { tick: 1e9, x: QUOTA_MAX, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
   eq(v2.allowed, true, '大 tick 下的**合法**位移仍应放行(不能矫枉过正)');
 });
 
@@ -1640,8 +1663,10 @@ test('E14e tick 回退(报旧帧)必须拿不到额度,且水位不后退', () =
      —— 于是「报一个比水位小的 tick」成了一条免费的额度来源,
      攻击者只要反复报旧帧就能按报文速率兑现。本任务把它改成 0。
      新的钉法:回退 ⇒ 额度 0 ⇒ 任何位移都被拒;且水位**不得**后退。 */
+  /* ★ 位移按**合法每帧步长**给(基线 × 帧长);报旧帧 ⇒ 额度 0 ⇒ 任何非零位移都被拒。 */
+  const STEP = BASE_MOVE_SPEED * FRAME_SECONDS;
   const s = createAcState('rewind', 100, 0, 0, 0);
-  const v = checkMove(s, { tick: 1, x: 0.35, y: 0, z: 0 });
+  const v = checkMove(s, { tick: 1, x: STEP, y: 0, z: 0 });
   eq(v.allowed, false, '回退帧不得获得额度(旧行为取 1,是缺口的另一半)');
   eq(v.violation?.kind, ViolationKind.TELEPORT, '拒因应为 TELEPORT');
   eq(s.lastMoveTick, 100, '水位不得被回退报文拉低');
@@ -1650,13 +1675,13 @@ test('E14e tick 回退(报旧帧)必须拿不到额度,且水位不后退', () =
   /* 对照:同一时刻报**前进**帧仍正常放行(不能矫枉过正) */
   const ok2 = createAcState('rewind-ok', 100, 0, 0, 0);
   advanceServerClock(ok2, 101);
-  eq(checkMove(ok2, { tick: 101, x: 0.35, y: 0, z: 0 }).allowed, true, '前进 1 帧应放行');
+  eq(checkMove(ok2, { tick: 101, x: STEP, y: 0, z: 0 }).allowed, true, '前进 1 帧应放行');
 
   /* 对照:回退报文不得把已有额度「重置」后再白拿 —— 连发也不给 */
   const flood = createAcState('rewind-flood', 100, 0, 0, 0);
   let allowedCount = 0;
   for (let i = 0; i < 20; i += 1) {
-    if (checkMove(flood, { tick: 1, x: (i + 1) * 0.35, y: 0, z: 0 }).allowed) allowedCount += 1;
+    if (checkMove(flood, { tick: 1, x: (i + 1) * STEP, y: 0, z: 0 }).allowed) allowedCount += 1;
   }
   eq(allowedCount, 0, '连发回退报文不得兑现任何额度');
 });
@@ -1791,7 +1816,10 @@ test('E17b 落后 tick 连发只给有界额度;零位移包不得把水位打�
   const okCase = new AntiCheatRoom();
   okCase.join('now', 0, 0, 0, 0);
   okCase.tick(10);
-  eq(okCase.move({ playerId: 'now', tick: 10, x: 0.3, y: 0, z: 0 }).allowed, true,
+  /* ★ 位移 = **合法每帧步长 × 1.5**(在单帧容差 1.6 内)⇒ 不随 tick 率写死 0.3。 */
+  eq(okCase.move({
+    playerId: 'now', tick: 10, x: BASE_MOVE_SPEED * FRAME_SECONDS * 1.5, y: 0, z: 0,
+  }).allowed, true,
     '声称当前帧的合法位移应放行');
 
   /* (c) 【假绿陷阱】零位移重复包:它是**唯一**能带着更小 tick 通过判定分支的输入,
@@ -1805,7 +1833,9 @@ test('E17b 落后 tick 连发只给有界额度;零位移包不得把水位打�
   /* 先正常前进几帧,把水位抬起来 */
   let rx = 0;
   for (let i = 1; i <= 5; i += 1) {
-    const v = reset.move({ playerId: 'reset', tick: i, x: rx + 0.3, y: 0, z: 0 });
+    const v = reset.move({
+      playerId: 'reset', tick: i, x: rx + BASE_MOVE_SPEED * FRAME_SECONDS, y: 0, z: 0,
+    });
     if (v.allowed) rx += 0.3;
   }
   const before = reset.get('reset')?.lastMoveTick ?? 0;
@@ -1892,14 +1922,18 @@ test('E17e 【如实钉住残留】静默后同帧连发仍可有界获益(未�
    * 同一帧内连发 K ≤ B + 2 包时,拒绝数 ≤ 2 ⇒ 分 ≤ 8 < 12 ⇒ **不被踢**。
    * 承载这条残留的是 `docs/GUARD-AUDIT.md` 与本块注释里写明的那条「有界但未归零」。
    */
-  const STEP = maxDisplacementPerTick(MAX_SPEED_BONUS_MUL);   // 0.918
-  const IDLE = 19;
+  const STEP = maxDisplacementPerTick(MAX_SPEED_BONUS_MUL);   // 满加成单帧额度
+  /* ★ 静默时长按**窗口**推导(不写死 19):刚好**不到**一个窗口 ⇒ 窗口检查看不到时间流逝
+     (`spanTicks < speedWindowTicks`),下一帧连发只能靠单帧额度拦 —— 这正是本残留的形状。
+     `BURST` 比积压(=`IDLE + 1` 帧额度)多 2 包 ⇒ 恰好 2 拒(TELEPORT 权重 4 = 8 分 < 12)。 */
+  const IDLE = SPEED_WINDOW_TICKS - 1;
+  const BURST = IDLE + 3;
   const ac = new AntiCheatRoom();
   ac.join('resid', 0, 0, 0, 0);
-  for (let f = 1; f <= IDLE; f += 1) ac.tick(f);              // 静默 19 帧换积压
+  for (let f = 1; f <= IDLE; f += 1) ac.tick(f);              // 静默换积压
 
   let x = 0, allowed = 0, rejected = 0;
-  for (let i = 0; i < 22; i += 1) {
+  for (let i = 0; i < BURST; i += 1) {
     const v = ac.move({
       playerId: 'resid', tick: IDLE + 1 + i,
       x: x + STEP, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL,
@@ -1937,7 +1971,7 @@ test('E17e 【如实钉住残留】静默后同帧连发仍可有界获益(未�
   let rt = 0, rx = 0, rounds = 0;
   for (let round = 0; round < 10; round += 1) {
     for (let i = 0; i < IDLE; i += 1) { rt += 1; repeat.tick(rt); }
-    for (let i = 0; i < 22; i += 1) {
+    for (let i = 0; i < BURST; i += 1) {
       const v = repeat.move({
         playerId: 'repeat', tick: rt + 1 + i,
         x: rx + STEP, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL,
@@ -1951,8 +1985,12 @@ test('E17e 【如实钉住残留】静默后同帧连发仍可有界获益(未�
   const rst = repeat.get('repeat');
   eq(rst?.kicked, true, '立刻重复该循环必须被踢出(残留不可持续复用)');
   eq(rounds, 2, `实测应在第 2 轮即被踢出,实际跑满 ${rounds} 轮`);
-  ok(rx <= STEP * (IDLE + MAX_MOVE_CATCHUP_TICKS) + 1e-9,
-    `重复循环的总位移 ${rx.toFixed(3)} 格应仍受单次积压上限约束(不得逐轮累加)`);
+  /* ★ 有界的**口径**是「每轮 ≤ 积压上限」,不是「跨轮不累加」:每轮重新静默就重新攒一份积压
+     (残留本身如此)。⚠️ 20Hz 口径下第 2 轮的窗口检查会命中(窗口 20 帧 ≤ 两轮间距),
+     32Hz 口径下窗口 32 帧 > 两轮间距 ⇒ 不命中 —— 那个差别是窗口帧数的算术,
+     不是判据松紧。故上界写成 `轮数 × 单轮积压`(tick 率无关的形式)。 */
+  ok(rx <= rounds * STEP * (IDLE + MAX_MOVE_CATCHUP_TICKS) + 1e-9,
+    `重复循环的总位移 ${rx.toFixed(3)} 格应 ≤ 轮数 × 单轮积压上限(${rounds} × ${STEP.toFixed(3)} × ${IDLE + MAX_MOVE_CATCHUP_TICKS})`);
 });
 
 /* ── E09 族:非有限值与字段缺失(与 CR-14 U2-b 同族) ──
@@ -1983,7 +2021,8 @@ test('E15 非有限坐标/帧号被拒:NaN 与字段缺失都拦得住', () => {
 });
 
 test('E15b 对照:有限值不被误伤(值域门不能变成拒绝服务)', () => {
-  for (const x of [0, 0.1, -0.1, 0.3, 1e-9]) {
+  const LEGIT_STEP = BASE_MOVE_SPEED * FRAME_SECONDS;      // 合法每帧步长(随 tick 率重标定)
+  for (const x of [0, 0.1, -0.1, LEGIT_STEP * 1.5, 1e-9]) {
     const s = createAcState('ok', 0, 0, 0, 0);
     eq(checkMove(s, { tick: 1, x, y: 0, z: 0 }).allowed, true, `有限 x=${x} 应放行`);
   }
@@ -2061,7 +2100,7 @@ test('E14g 吞吐已与**报文速率**解耦:同帧连发不再线性放大(修
      报文能兑现(声称 `lastTick+1` 的那条),其余 `dtTicks = 0` 一律拿不到额度。
      故吞吐上界由**真实帧率**决定,与入站报文数无关 —— 这一条现在是**回归哨兵**:
      若有人把服务端封顶去掉,吞吐会重新随 N 线性增长,此断言立刻变红。 */
-  const STEP = 0.918;            // MAX=1 帧 @2.55 的满额度
+  const STEP = maxDisplacementPerTick(MAX_SPEED_BONUS_MUL);   // 一帧满额度(随 tick 率重标定)
   const run = (N: number): number => {
     const ac = new AntiCheatRoom();
     ac.join('p', 0, 0, 0, 0);
@@ -2081,38 +2120,43 @@ test('E14g 吞吐已与**报文速率**解耦:同帧连发不再线性放大(修
     `单帧总位移 ${at50.toFixed(3)} 格应 ≤ 单帧额度 ${maxDisplacementPerTick(MAX_SPEED_BONUS_MUL).toFixed(3)} 格`);
 
   /* 对照:真实帧率下(每帧推进时钟)额度照常发放,不与上一条冲突。
-     ⚠️ 步长必须用**真实物理位移** 4.5×2.55×0.05 = 0.5737 格/帧,
-     不能用上面的单帧额度 0.918 —— 后者是**单帧跳变容差**(slack 1.6),
-     而持续运动受更紧的**窗口上限**约束:4.5×2.55×1.25×0.05 = 0.7172 格/帧。
-     用 0.918 连走 20 帧 = 18.36 格/0.95 秒 = 19.3 格/秒 > 14.34 ⇒ 第 20 帧
-     本就该判 SPEED(是本测试自己的步长选错,不是实现误伤)。 */
-  const PHYS = BASE_MOVE_SPEED * MAX_SPEED_BONUS_MUL * DT;   // 0.57375
+     ⚠️ 步长必须用**真实物理位移** = 基线 × 倍率 × **帧长**(不能用上面的单帧额度 ——
+     后者是**单帧跳变容差**,slack 1.6),而持续运动受更紧的**窗口上限**约束:
+     基线 × 倍率 × 容差(每秒读数 11.475 格/秒 < 14.34)。
+     用单帧额度连走一整窗 = 1.6 × 容差上限 ⇒ 本就该判 SPEED
+     (是本测试自己的步长选错,不是实现误伤)。 */
+  const PHYS = BASE_MOVE_SPEED * MAX_SPEED_BONUS_MUL * FRAME_SECONDS;
   const ac2 = new AntiCheatRoom();
   ac2.join('q', 0, 0, 0, 0);
   let x2 = 0, allowed2 = 0;
-  for (let f = 1; f <= 20; f += 1) {
+  for (let f = 1; f <= SPEED_WINDOW_TICKS; f += 1) {
     ac2.tick(f);
     const v = ac2.move({ playerId: 'q', tick: f, x: x2 + PHYS, y: 0, z: 0, speedMul: MAX_SPEED_BONUS_MUL });
     if (v.allowed) { allowed2 += 1; x2 += PHYS; }
     else ok(false, `第 ${f} 帧真实物理位移被误伤:${v.violation?.detail}`);
   }
-  eq(allowed2, 20, '20 帧各 1 包应全部放行(帧率配额正常发放)');
+  eq(allowed2, SPEED_WINDOW_TICKS,
+    `${SPEED_WINDOW_TICKS} 帧各 1 包应全部放行(帧率配额正常发放)`);
 });
 
 test('E07 【作弊3】攻速上限被拒:最小间隔 = 0.4s / (1 + bonus)', () => {
   const s = createAcState('macro', 0, 0, 0, 0);
-  const minTicks = BASE_ATTACK_INTERVAL_S * TICK_HZ; // 8 帧
-  eq(minTicks, 8);
-  eq(checkAttack(s, 8).allowed, true, '满 8 帧应允许');
-  const v = checkAttack(s, 10); // 仅 2 帧
-  eq(v.allowed, false, '2 帧内二次攻击应被拒');
+  const minTicks = BASE_ATTACK_INTERVAL_S * TICK_HZ;     // 基线间隔的帧数(随 tick 率重标定)
+  /* ★ 期望侧写**字面量**(不取 `BASE_ATTACK_INTERVAL_S`)⇒ 不是同义反复;
+     常量留在 actual 侧(下面那条 `eq` 锚住它,改值即红)。 */
+  eq(BASE_ATTACK_INTERVAL_S, 0.4, '常量锚点:基线攻速间隔 = 0.4s');
+  near(minTicks / TICK_HZ, 0.4, 1e-12, '最小间隔 = 基线 0.4s(与 tick 率无关)');
+  eq(checkAttack(s, minTicks).allowed, true, `满 ${minTicks} 帧应允许`);
+  const v = checkAttack(s, minTicks + 2); // 只多 2 帧
+  eq(v.allowed, false, '不足最小间隔的二次攻击应被拒');
   eq(v.violation?.kind, ViolationKind.ATTACK_RATE);
 
-  /* 加成上限被钳:自称 +1000% 也只是 2 倍速(4 帧)。 */
+  /* 加成上限被钳:自称 +1000% 也只是 2 倍速 ⇒ 最小间隔**减半**。 */
   const s2 = createAcState('macro2', 0, 0, 0, 0);
+  const half = minTicks / 2;
   eq(checkAttack(s2, 100, 1e6).allowed, true);
-  eq(checkAttack(s2, 102, 1e6).allowed, false, '2 帧 < 4 帧最小间隔');
-  eq(checkAttack(s2, 104, 1e6).allowed, true, '4 帧满足最小间隔');
+  eq(checkAttack(s2, 100 + half - 2, 1e6).allowed, false, '满加成最小间隔减半:不足仍拒');
+  eq(checkAttack(s2, 100 + half, 1e6).allowed, true, '满加成最小间隔满足即放行');
   eq(MAX_ATTACK_SPEED_BONUS, 1.0);
 });
 
@@ -2988,18 +3032,21 @@ test('G04 端到端:四类作弊在完整房间流程中都被拒绝', () => {
   eq(tele.allowed, false, '瞬移应被拒');
   eq(tele.violation?.kind, ViolationKind.TELEPORT);
 
-  /* 2 移速:每帧 0.32 格(6.4 格/秒)。单帧上界 0.72 格 → 单帧合法,
-   *   但 1 秒窗口均速 6.4 > 4.5×1.25=5.625 → 窗口检测应命中 SPEED。
+  /* 2 移速:每帧走 **6.4 格/秒 × 帧长**(单帧在**单帧上界** = 基线 × slack 内 ⇒ 单帧合法),
+   *   但整窗均速 6.4 > 基线 × 容差 = 5.625 → 窗口检测应命中 SPEED。
+   *   ★ 步长按速度 × 帧长推导(不写死 0.32 = 20Hz 口径的每帧位移)。
    *   起点必须是**当前权威坐标**,否则会被先判成瞬移。
    *   ⚠️ 必须每帧 `rt.step()`:服务端时钟只由 `room.ts:770` 推进,
    *   而每帧额度 = `claimedTick - lastMoveTick` —— 不跑 step 就一帧额度都拿不到,
    *   位移检查会被冻结(与 E03/E04 同一根因)。 */
   const startX = rt.playerState('cheat')?.x ?? 0;
+  const SPEED_PER_SEC = 6.4;
+  const SPEED_STEP = SPEED_PER_SEC * FRAME_SECONDS;
   let rejectedSpeed = false;
   let tick = tele.violation?.tick ?? 1;
-  for (let i = 1; i <= 25; i += 1) {
+  for (let i = 1; i <= SPEED_WINDOW_TICKS + 1; i += 1) {
     tick += 1;
-    const v = rt.applyMove('cheat', { tick, x: startX + i * 0.32, y: 0.5, z: 0 });
+    const v = rt.applyMove('cheat', { tick, x: startX + i * SPEED_STEP, y: 0.5, z: 0 });
     if (!v.allowed) {
       ok(v.violation?.kind === ViolationKind.SPEED,
         `应判 SPEED 而非 ${v.violation?.kind}:${v.violation?.detail}`);
@@ -3008,7 +3055,7 @@ test('G04 端到端:四类作弊在完整房间流程中都被拒绝', () => {
     }
     rt.step(null);   // 本帧推进服务端时钟(与 room.ts:769-770 同构)
   }
-  ok(rejectedSpeed, `累计超速应被拒(窗口均速 6.4 格/秒 > 5.625)`);
+  ok(rejectedSpeed, `累计超速应被拒(窗口均速 ${SPEED_PER_SEC} 格/秒 > 上限)`);
 
   /* 3 攻速:同一 tick 连打两次 */
   eq(rt.applyAttack('cheat', 0).allowed, true);
@@ -3710,17 +3757,19 @@ test('WR-14 U2-b 【首要】非数字声明不得让 TELEPORT 检查失效', ()
 });
 
 test('WR-14 U2-b 非数字声明不得让窗口式 SPEED 检查失效', () => {
-  /* 形状照搬 E03:每帧 0.30 格 —— 单帧上限 0.36 内(合法),但 6 格/秒超出窗口上限 5.625。
+  /* 形状照搬 E03:每帧走 **6.0 格/秒 × 帧长** —— 单帧在单帧上界内(合法),
+   * 但整窗均速超出窗口上限(基线 × 容差 = 5.625)。★ 步长按速度 × 帧长推导,不写死 0.30。
    * 声明为 NaN 时帧上限与窗口上限都变 NaN,两道检查同时静默放行。 */
+  const SPEED_STEP = 6.0 * FRAME_SECONDS;
   for (const declared of [JSON.parse('{"speedMul":{}}').speedMul, 'abc']) {
     const s = createAcState('cheat', 0, 0, 0);
     let rejected = false;
-    for (let i = 1; i <= 21; i += 1) {
+    for (let i = 1; i <= SPEED_WINDOW_TICKS + 1; i += 1) {
       advanceServerClock(s, i);   // 与 room.ts:770 同构(见 E03 长注释)
-      const v = checkMove(s, { tick: i, x: i * 0.30, y: 0, z: 0, speedMul: declared });
+      const v = checkMove(s, { tick: i, x: i * SPEED_STEP, y: 0, z: 0, speedMul: declared });
       if (!v.allowed) { rejected = true; break; }
     }
-    ok(rejected, `声明 ${JSON.stringify(declared)}:持续 0.30 格/帧(6 格/秒)应被窗口式检测抓到`);
+    ok(rejected, `声明 ${JSON.stringify(declared)}:持续超窗口上限应被窗口式检测抓到`);
     ok(s.violations.some((v) => v.kind === ViolationKind.SPEED),
       `声明 ${JSON.stringify(declared)}:应有 SPEED 违规`);
   }
@@ -3728,9 +3777,9 @@ test('WR-14 U2-b 非数字声明不得让窗口式 SPEED 检查失效', () => {
   /* 对照组:同样的位移形状,声明合法数值 1.0 时必须被拒 —— 证明上面的红来自 NaN 而非位移本身。 */
   const ctl = createAcState('legal', 0, 0, 0);
   let ctlRejected = false;
-  for (let i = 1; i <= 21; i += 1) {
+  for (let i = 1; i <= SPEED_WINDOW_TICKS + 1; i += 1) {
     advanceServerClock(ctl, i);
-    const v = checkMove(ctl, { tick: i, x: i * 0.30, y: 0, z: 0, speedMul: 1.0 });
+    const v = checkMove(ctl, { tick: i, x: i * SPEED_STEP, y: 0, z: 0, speedMul: 1.0 });
     if (!v.allowed) { ctlRejected = true; break; }
   }
   ok(ctlRejected, '合法声明 1.0 下同一位移形状应被拒(对照组)');
@@ -3741,7 +3790,7 @@ test('WR-14 U2-b 非数字声明不得让 ATTACK_RATE 检查失效', () => {
     const s = createAcState('cheat', 0);
     checkAttack(s, 0, 0);
     let rejected = false;
-    /* 每帧攻击(间隔 1 帧),基线需 8 帧。声明为 NaN 时 minInterval 变 NaN,`< NaN` 恒 false。 */
+    /* 每帧攻击(间隔 1 帧),基线间隔 = `BASE_ATTACK_INTERVAL_S × TICK_HZ` 帧。声明为 NaN 时 minInterval 变 NaN,`< NaN` 恒 false。 */
     for (let t = 1; t <= 10; t += 1) {
       const v = checkAttack(s, t, declared);
       if (!v.allowed) { rejected = true; break; }
@@ -5043,11 +5092,13 @@ test('M6 端到端:经**生产装配**移动后,距离闸不再恒 OUT_OF_AOI �
   eq(before?.hpLoss, 0, '前置:20 格远超裸装 reach ⇒ 一点血没掉');
 
   /* 经 **applyMove** 走近(不是直接改刚体)。
-     ⚠️ 步长必须**合法**:0.3 格/帧 = 6.00 格/秒,超过窗口上限 5.63
-     (`SPEED_WINDOW_TOLERANCE × 4.5`)⇒ 第 19 帧就被拒,玩家只走到 6.2。
-     改用 0.25 格/帧 = 5.00 格/秒(< 5.63),多走几帧到怪旁边。 */
-  const STEP = 0.25;
-  for (let i = 0; i < 80; i += 1) {
+     ⚠️ 步长必须**合法**:5.0 格/秒 < 窗口上限(`SPEED_WINDOW_TOLERANCE × 基线` = 5.625),
+     且按**速度 × 帧长**推导(不写死 0.25 这类 20Hz 口径的每帧位移);
+     帧数由「要走多远」算出 ⇒ 改 tick 率后仍走得到怪身边。 */
+  const SPEED_PER_SEC = 5.0;
+  const STEP = SPEED_PER_SEC * FRAME_SECONDS;
+  const WALK_FRAMES = Math.ceil(20 / STEP) + 2;      // 目标距离 20 格(怪所在处),留 2 帧余量
+  for (let i = 0; i < WALK_FRAMES; i += 1) {
     a.runtime.state.meta.tick += 1;
     a.runtime.ac.tick(a.runtime.state.meta.tick);
     const now = sim.playerPosition('p1')!;
@@ -5192,13 +5243,13 @@ test('N1 ★ 服务器路径真的推进世界:外部 step() × N ⇒ 快帧恰�
 
 test('N2 ★ 一帧 = 一快帧(不双倍):外部 20Hz 与内部双频 1:1', () => {
   /* ## 为什么必须单独钉这条
-     `WorldSim` 内部自管双频(`FAST_PER_SLOW = 10`),而外部已经按 20Hz 驱动
-     ⇒ **两层频率嵌套**。若以为「慢帧 2Hz,外面要乘 10」,就会每慢帧推进两次 AI
-     ⇒ **世界快 2 倍**,而这类错误**不报错、测试也可能照过**
+     `WorldSim` 内部自管双频(`FAST_PER_SLOW` = `secondsToTicks(SLOW_DT)` = 16 @32Hz),
+     而外部已按**快帧**驱动 ⇒ **两层频率嵌套**。若以为「慢帧 2Hz,外面要乘 stride」,
+     就会每慢帧推进两次 AI ⇒ **世界快 2 倍**,而这类错误**不报错、测试也可能照过**
      (`world_sim.ts` 记着同一先例)。
-     `SIM_FAST_DT = 0.05 = 1/20` 与 20Hz **天然对齐,无需换算** —— 见源码注释。 */
-  eq(SIM_FAST_DT, 1 / 20, '前置:SIM_FAST_DT 与 20Hz 天然对齐(无需换算)');
-  eq(FAST_PER_SLOW, 10, '前置:内部每 10 快帧 1 慢帧');
+     `SIM_FAST_DT` 与 1 帧**天然对齐,无需换算** —— 见源码注释。 */
+  near(SIM_FAST_DT, 1 / TICK_HZ, 1e-12, '前置:SIM_FAST_DT = 1/TICK_HZ(改 tick 率无需换算)');
+  eq(FAST_PER_SLOW, secondsToTicks(SLOW_DT), '前置:慢帧 stride = SLOW_DT 秒派生的快帧数');
 
   /* 恰好 1:1 —— 若实现写成 `advance(FAST_PER_SLOW)` 或调两次,这里会红 */
   const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
@@ -5216,7 +5267,8 @@ test('N3 ★ 慢帧算术:**外部标尺**与接线路径给同一个数', () =>
   const ref = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
   const r = ref.run(100);
   eq(r.frames, 100, '外部标尺:run(100).frames = 100');
-  eq(r.slowFrames, 10, '外部标尺:run(100).slowFrames = 10(独立于接线路径)');
+  eq(r.slowFrames, Math.floor(100 / FAST_PER_SLOW),
+    `外部标尺:run(100).slowFrames = floor(100 / ${FAST_PER_SLOW})(独立于接线路径)`);
 
   /* 接线路径:100 次外部 step 必须给出**同一个**帧数 */
   const a = assemble({ clock: fixedClock(1000), combatRng: () => 0.5, sizeCells: 64 });
@@ -5225,9 +5277,9 @@ test('N3 ★ 慢帧算术:**外部标尺**与接线路径给同一个数', () =>
   eq(frameOf(a), r.frames,
     `★ 两条独立路径同数:接线 ${frameOf(a)} vs 标尺 ${r.frames}`);
 
-  /* 慢帧比例也一致:每 10 快帧恰好 1 慢帧(用 run 的比值反推) */
+  /* 慢帧比例也一致:每 FAST_PER_SLOW 快帧恰好 1 慢帧(用 run 的比值反推) */
   eq(Math.floor(r.frames / FAST_PER_SLOW), r.slowFrames,
-    '标尺自洽:floor(100/10) = 10 慢帧');
+    `标尺自洽:floor(100 / ${FAST_PER_SLOW}) = ${Math.floor(100 / FAST_PER_SLOW)} 慢帧`);
 });
 
 test('N4 ★ 翻倍检测:多推一次必须**可观测**(这是本任务最该守的错)', () => {
@@ -5272,12 +5324,17 @@ test('N5 ★ 推进让 `mobPlayers` 刷新 ⇒ 生物 AI 能看见玩家移动',
   const before = sim.mobPlayers.find((m) => m.id === 'p1')?.x;
   ok(before !== undefined, '前置:mobPlayers 里有 p1');
 
+  /* 每帧步长按**速度**派生(= BASE_MOVE_SPEED × DT,32Hz = 0.140625 格/帧)。
+     旧写法写死 +0.3 格/帧,在 20Hz 下是 6 格/秒(合法),在 32Hz 下变成 9.6 格/秒
+     ⇒ 超过 `maxDisplacementPerTick`(4.5 × FRAME_SECONDS × 1.6 = 0.225 格/帧)
+     ⇒ 被判 TELEPORT 拒绝,mobPlayers 自然不动。 */
+  const stepPerTick = BASE_MOVE_SPEED * DT;
   for (let i = 0; i < 5; i += 1) {
     a.runtime.state.meta.tick += 1;
     a.runtime.ac.tick(a.runtime.state.meta.tick);
     const now = sim.playerPosition('p1')!;
     a.runtime.applyMove('p1', {
-      tick: a.runtime.state.meta.tick, x: now.x + 0.3, y: now.y, z: 0, speedMul: 1,
+      tick: a.runtime.state.meta.tick, x: now.x + stepPerTick, y: now.y, z: 0, speedMul: 1,
     } as never);
     a.runtime.step();
   }
@@ -5377,7 +5434,7 @@ test('CR-24:上移的 27 个符号在 schema.ts 与 wire.ts 是同一引用(只�
  *   ⇒ claimedTick = Math.min(intent.tick, lastMoveTick + undefined, lastTick + undefined)
  *                 = NaN
  *   ⇒ dtTicks   = Math.max(0, NaN) = NaN
- *   ⇒ allowed   = 0.36 * NaN = NaN
+ *   ⇒ allowed   = 每帧额度(基线 × 帧长 × slack) × NaN = NaN
  *   ⇒ dist > NaN + 1e-9   **恒 false** ⇒ 全部放行
  * ```
  * ⇒ 这不是「限值被调松」,是「检查**根本没执行**」。
@@ -5556,7 +5613,8 @@ test('CR27-4 ★ 未修版本确实会 fail-open(它们是「有牙的断言」)
     lastMoveTick + naked.maxMoveCatchupTicks,
     lastTick + naked.maxMoveCatchupTicks);
   ok(Number.isNaN(claimedNaked), '裸路径:claimedTick = NaN(这就是 fail-open 的成因)');
-  const allowedNaked = 0.36 * Math.max(0, claimedNaked - lastMoveTick);
+  /* ★ 「一帧额度」按实现推导(不写死 0.36)。 */
+  const allowedNaked = maxDisplacementPerTick(1) * Math.max(0, claimedNaked - lastMoveTick);
   ok(Number.isNaN(allowedNaked), '裸路径:allowed = NaN');
   ok(!(1e5 > allowedNaked + 1e-9),
     '裸路径:NaN 比较**恒 false** ⇒ 10 万格瞬移被判为合法(★ CR-27 本体)');
@@ -5569,7 +5627,7 @@ test('CR27-4 ★ 未修版本确实会 fail-open(它们是「有牙的断言」)
     lastMoveTick + merged.limits.maxMoveCatchupTicks,
     lastTick + merged.limits.maxMoveCatchupTicks);
   ok(Number.isFinite(claimedFixed), '已修:claimedTick 回到有限值');
-  ok(1e5 > 0.36 * Math.max(0, claimedFixed - lastMoveTick) + 1e-9,
+  ok(1e5 > maxDisplacementPerTick(1) * Math.max(0, claimedFixed - lastMoveTick) + 1e-9,
     '已修:同一个瞬移现在**被拒**(判据恢复成 true)');
   /* ★ 并且 —— 已修版本真的会让生产房间拒掉它(不是只有纯函数对)。 */
   const room = quietlyV07(() => new AntiCheatRoom(

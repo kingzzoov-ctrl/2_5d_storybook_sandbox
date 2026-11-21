@@ -7,7 +7,11 @@
 
 import { eq, near, ok, report, test, includes } from '../shared/testing/harness.ts';
 import { WireColor } from '../shared/types/tile.ts';
-import { SLOW_TICK_HZ, SLOW_DT } from '../shared/types/physics.ts';
+/* ⚠️ 两个同名换算:本行的 `secondsToFastTicks` 是 `shared/types/physics.ts` 的
+   **TICK_HZ 快帧**网格(供 tick() 计数用);而 `wiring/graph.ts` 那份
+   `secondsToTicks`(第 24 行)是 **2Hz 慢帧**口径(电路件周期用)。
+   二者语义不同,不可互换 —— 故这里用别名避免读成同一个东西。 */
+import { SLOW_TICK_HZ, SLOW_DT, secondsToTicks as secondsToFastTicks } from '../shared/types/physics.ts';
 
 import {
   ALL_COLORS,
@@ -23,7 +27,7 @@ import {
   registeredKinds,
   secondsToTicks,
 } from '../server/src/wiring/graph.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 import {
   CHANNEL_MAX,
   CHANNEL_MIN,
@@ -1445,8 +1449,8 @@ test('WT-08-54 生产路径:机械臂真的把地面货物投喂给设备', () =
   /* 货物放在机械臂抓取半径内 */
   sim.setGroundItems([{ id: 151, x: 7, y: 8, count: 1 }]);
 
-  /* 机械臂单循环 4 慢帧;推 200 快帧 = 20 慢帧 = 5 个循环 */
-  for (let i = 0; i < 200; i += 1) sim.tick();
+  /* 机械臂单循环 4 慢帧;推 10 秒 = 20 慢帧 = 5 个循环(帧数由秒派生) */
+  for (let i = 0; i < secondsToFastTicks(10); i += 1) sim.tick();
   const st = sim.wiring.get('arm1')!.state;
 
   eq(st.powered, 1, '通电 → powered=1');
@@ -1465,18 +1469,19 @@ test('WT-08-55 生产路径:采矿钻头真的按 10 秒周期产出矿石', () 
   sim.wiring.addWire(3, 3, WireColor.GREEN);
   sim.addWireDrive(3, 3, WireColor.GREEN, true);
 
-  /* ⚠️ 帧数换算容易错(我第一版就错了):DRILL_PERIOD_TICKS=20 是**慢帧**数,
-     而慢帧每 10 快帧一次 ⇒ 10 秒 = 20 慢帧 = **200 快帧**。
-     只推 42 帧只有 4 个慢帧,远不够一个周期,会误判成「没接线」。 */
-  const FAST_PER_SLOW = 10;
-  const needFrames = DRILL_PERIOD_TICKS * FAST_PER_SLOW * 2; /* 2 个周期,留余量 */
+  /* ⚠️ 帧数换算容易错(我第一版就错了):`DRILL_PERIOD_TICKS` 是**慢帧**数,
+     一个周期 = DRILL_PERIOD_SECONDS 秒 = 10 秒。慢帧 stride = FAST_PER_SLOW
+     (由 SLOW_DT 派生,32Hz ⇒ 16)—— 旧的 `FAST_PER_SLOW = 10` 把 20Hz 写死了,
+     400 帧在 32Hz 下只有 25 个慢帧,不够 2 个周期,会被误判成「没接线」。 */
+  const needFrames = secondsToFastTicks(DRILL_PERIOD_SECONDS * 2); /* 2 个周期,留余量 */
+  eq(needFrames, DRILL_PERIOD_TICKS * FAST_PER_SLOW * 2, '秒派生的帧数 = 慢帧数 × stride');
   for (let i = 0; i < needFrames; i += 1) sim.tick();
   const st = sim.wiring.get('drill1')!.state;
 
   eq(st.powered, 1, '通电 → powered=1');
   ok(
     st.produced >= 2,
-    `生产路径上钻头 ${needFrames} 帧(${DRILL_PERIOD_TICKS * 2} 慢帧)应产出 ≥2 块,`
+    `生产路径上钻头 ${needFrames} 帧(${needFrames / FAST_PER_SLOW} 慢帧)应产出 ≥2 块,`
     + `实际 produced=${st.produced}(为 0 说明未接线)`,
   );
 });
@@ -1674,10 +1679,10 @@ test('WT-08-62 可观测性:带内承载的货必须能从件表看到', () => {
   sim.loadConveyorAt(5, 5);
 
   /* ⚠ 必须推过**一个完整慢帧**:件表里的 `item` 由 `tickLogisticsStep()`
-     每慢帧回写一次,而慢帧是第 10、20、30… 快帧。实测:第 1~9 帧读仍是 null,
-     第 10 帧才可见。装载后只推 1 帧就断言可见是**帧数换算错误**
+     每慢帧回写一次,慢帧 stride = FAST_PER_SLOW(32Hz = 16,不是 10)。
+     装载后只推 1 帧(或旧写法的 10 帧)就断言可见是**帧数换算错误**
      (我第一版就犯了这个错,与本套件 WT-08-55 注释里记的是同一类坑)。 */
-  for (let i = 0; i < 10; i += 1) sim.tick();
+  for (let i = 0; i < secondsToFastTicks(SLOW_DT); i += 1) sim.tick();
 
   /* 此后断电:货会一直待在带内不走。若件表看不到它,
      「货在带上等着」与「货被销毁」在外部**完全一样** ——

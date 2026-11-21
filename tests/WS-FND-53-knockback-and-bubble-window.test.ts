@@ -14,6 +14,7 @@
  *
  * ⚠️ 断言右侧一律**字面量 / 由实际伤害算出的期望**(`min(2, dmg/20)`),不从被测模块取期望。
  */
+import { secondsToTicks } from '../shared/types/physics.ts';
 import { test, ok, eq, near, report } from '../shared/testing/harness.ts';
 import { WorldSim } from '../server/src/sim/world_sim.ts';
 import { assemble } from '../server/src/index.ts';
@@ -160,7 +161,9 @@ test('FND53-6 ★ 世界侧同样生效:慢帧推进让层数过期(不是只有
     a.runtime.dispatchAction('p1', RoomAction.USE_ITEM, { itemId: 227, targetId: t });
   eq(trappedOf(fireAt('p3')), false, 'p3 第 1 发不困住');
   eq(trappedOf(fireAt('p3')), false, 'p3 第 2 发不困住');
-  sim.advance(140); /* 14 个慢帧 = 7 秒 > 5 秒窗口 */
+  /* 7 秒 > 5 秒窗口。帧数由 `secondsToTicks` 派生 —— 写死帧数会在改 tick 率时
+     静默把「7 秒」变成别的时长(真正的窗口跨越量是慢帧数 = 7 / SLOW_DT = 14)。 */
+  sim.advance(secondsToTicks(7));
   eq(sim.liveBubbleOf('p3').stacks, 0, '★ 7 秒后层数已过期(世界侧慢帧真的在推进窗口)');
   eq(trappedOf(fireAt('p3')), false, '★ 过期后的这一发只算第 1 发,不困住');
 });

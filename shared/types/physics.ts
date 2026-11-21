@@ -5,10 +5,26 @@
  * 语法约定:禁止 `enum` / `const enum`。
  */
 
-export const TICK_HZ = 20;
-export const DT = 1 / TICK_HZ; // 0.05s
-export const SLOW_TICK_HZ = 2;
-export const SLOW_DT = 1 / SLOW_TICK_HZ; // 0.5s
+export const TICK_HZ = 32;
+/** 标称帧间隔(毫秒)= `1000 / TICK_HZ`(32Hz ⇒ 31.25ms)。 */
+export const TICK_MS = 1000 / TICK_HZ; // 31.25
+export const DT = 1 / TICK_HZ; // 0.03125s
+/** 快帧单步时长(秒)—— 与 `DT` 同源(`SIM_FAST_DT` 取它)。 */
+export const SIM_DT = 1 / TICK_HZ; // 0.03125s
+/**
+ * 慢帧时长(秒)—— **语义源头**:0.5 秒。慢帧频率由它推出,不是反过来。
+ * ⇒ 一个慢帧跨越的快帧数 = `TICK_HZ × SLOW_DT`(32Hz ⇒ 16);
+ *   改 tick 率时**时长不变**,只有帧数跟着换算(见下方 helper)。
+ */
+export const SLOW_DT = 0.5;
+/** 慢帧频率(Hz)= `1 / SLOW_DT`。 */
+export const SLOW_TICK_HZ = 1 / SLOW_DT; // 2
+
+/* ── 帧数 ⇄ 秒 ⇄ 毫秒 的**唯一**换算口(帧数以 `TICK_HZ` 为网格)──
+ * 所有「以帧数计的时长」必须从这里派生:写死帧数会在改 tick 率时**静默改时长**。 */
+export function secondsToTicks(sec: number): number { return Math.round(sec * TICK_HZ); }
+export function ticksToSeconds(n: number): number { return n / TICK_HZ; }
+export function msToTicks(ms: number): number { return Math.round((ms * TICK_HZ) / 1000); }
 
 export const GRAVITY = -18.0;      // 格/秒²
 export const THROW_SPEED_XY = 8.5; // 格/秒

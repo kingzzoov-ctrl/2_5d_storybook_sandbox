@@ -9,15 +9,15 @@
  *
  * ```
  * 1 装配**真实世界**:`assemble({ sizeCells, mobs: true })` ⇒ RoomRuntime + WorldSim
- * 2 起 WS 服务端:startWsServer({ room }) —— 20Hz。房间的 step() 会推进世界
+ * 2 起 WS 服务端:startWsServer({ room }) —— 32Hz。房间的 step() 会推进世界
  *   (`room.ts` 里 task-59 接的 advance(1));世界会跑、怪会动
  * 3 起客户端 dev server(vite)并打印**可直接打开的地址**
  *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来。实测:
- *   预热 1200 帧(60 秒)⇒ 3 只;默认取 2400 帧(120 秒)⇒ 更多。
+ *   预热 1200 帧(37.5 秒)⇒ 3 只;默认取 2400 帧(75 秒)⇒ 更多。
  *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来
  *   └ ★ **D-26(时间口径)**:启动 5 秒后打印**实测节拍**(tick 间隔 / 实际 fps /
  *     世界钟×墙钟倍率)。世界时间 = `帧数 × DT`,**不读挂钟** ⇒
- *     **「1200 游戏秒」不等于「1200 墙钟秒」**(本机实测 62.77ms/帧 ⇒ 倍率 1.2555)。
+ *     **「1200 游戏秒」不等于「1200 墙钟秒」**(本机实测 62.77ms/帧 ⇒ 倍率 32 / 15.93 = 2.0088)。
  * ```
  *
  * ## 为什么必须用 `assemble()` 而不是 `ws_demo.ts`
@@ -62,7 +62,11 @@ import { startWsServer } from '../server/src/net/ws_server.ts';
 
 import { DT } from '../shared/types/physics.ts';
 
-import { formatTickRateLine, tickRateOf, type TickRate } from './soak.ts';
+/* ★ 2026-11-25(tick 口径硬化):WS 广播循环的帧间隔**不再写死**(旧值取自旧的
+   tick 率)。它就该是**标称帧长**(`1000 / TICK_HZ` = `DT × 1000` = 31.25ms),
+   而 `NOMINAL_TICK_MS` 是 `soak.ts` 里唯一的那个派生量(那边已有一份实现,
+   这里再写一个数就是"两处各写一份")。 */
+import { NOMINAL_TICK_MS, formatTickRateLine, tickRateOf, type TickRate } from './soak.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -171,21 +175,25 @@ async function main(): Promise<void> {
   log(`房间 ${assembled.runtime.id} 就绪;host=${assembled.host === null ? 'null(异常)' : '已装配'}`);
 
   /* ── 1c 实测节拍探针(★ D-26:帧数即时间)──
-     世界时间 = `frameCount × DT`(不读挂钟)⇒「20Hz / 50ms」是**物量纲的标称**,
-     不是墙钟承诺:宿主定时器粒度 > 50ms 的机器上,同一段世界时间要更长的墙钟。
+     世界时间 = `frameCount × DT`(不读挂钟)⇒「32Hz / 31.25ms」是**物量纲的标称**,
+     不是墙钟承诺:宿主定时器粒度 > 31.25ms 的机器上,同一段世界时间要更长的墙钟。
      探针只**读** `step` 的调用间隔(不改参数 / 不改返回值),由下面的启动打印给出
      「实测 tick 间隔 / 实际 fps / 世界钟×墙钟倍率」。
-     ⚠️ 必须在 `startWsServer` **之前**装:那个 20Hz 循环每次现取 `room.step`。
-     ⚠️ 本脚本的循环 `frameMs = 20` ⇒ 每次广播推**一**世界帧(50ms 世界时间)
-     ⇒ 标称下世界钟比墙钟**快** 2.5 倍(倍率 = 每世界帧墙钟 ms ÷ DT,< 1)。
-     启动打印里的倍率把它如实算出来 —— 别按「1 世界帧 = 1 墙钟帧」读。 */
+     ⚠️ 必须在 `startWsServer` **之前**装:那个 32Hz 循环每次现取 `room.step`。
+     ⚠️ 本脚本的循环 `frameMs = NOMINAL_TICK_MS`(= `DT × 1000` = 31.25ms)
+     ⇒ 每次广播推**一**世界帧(31.25ms 世界时间)⇒ **标称**下「1 世界帧 = 1 墙钟帧」。
+     实测节拍偏慢时倍率 > 1(本机约 2.0 倍),启动打印如实算出来 ——
+     别按「1 世界帧 = 1 墙钟帧」**读实测那行**。
+     ★ 2026-11-25(口径硬化):这里原来是写死的 `20`。那是**旧口径的帧长**:留着它,
+     世界钟在标称下会比墙钟**快** `NOMINAL_TICK_MS ÷ 20` = 1.5625 倍 —— 与「帧数即时间」
+     的口径直接打架,而这种矛盾**不报错**,只会让读日志的人算错时长。 */
   const tickProbe = installTickProbe(assembled.runtime);
 
-  /* ── 2 WS 服务端(20Hz;room.step 推进世界) ── */
+  /* ── 2 WS 服务端(32Hz;room.step 推进世界) ── */
   const srv = await startWsServer({
     port: WS_PORT,
     room: assembled.runtime as never,
-    frameMs: 20,
+    frameMs: NOMINAL_TICK_MS,
     onLog: (m) => { if (process.env['PLAY_VERBOSE'] === '1') log(`[ws] ${m}`); },
   });
   log(`WS 服务端:ws://127.0.0.1:${srv.port}/ws`);

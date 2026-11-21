@@ -28,7 +28,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 import { eq, ok, near, report, test, mulberry32 } from '../shared/testing/harness.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 import { BodyState } from '../shared/types/physics.ts';
 import {
   COMBAT_WIRING_LEDGER,
@@ -243,7 +243,8 @@ test('FND118-7 ★★ P1:倒地/泡泡两态都封手,复活后**立即**放行(
     '★ 倒地(泡泡未建)⇒ 拒;真值来自 vitals 的瞬时判定');
 
   /* 推进慢帧 ⇒ 建泡泡。此后 canAttack 由 `revive.ts#ghostControl` 给。 */
-  for (let i = 0; i < 10; i += 1) s.tick();
+  /* 泡泡由**慢帧**创建 ⇒ 推满一个慢帧 stride(旧写法 10 编码了 20Hz)。 */
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) s.tick();
   const bubble = s.downedOf('p1');
   ok(bubble !== undefined, '前置:慢帧建出了幽灵泡泡');
   eq(bubble!.state, BodyState.GHOST_BUBBLE, '前置:泡泡态是 GHOST_BUBBLE');

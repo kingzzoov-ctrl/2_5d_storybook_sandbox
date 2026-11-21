@@ -9,9 +9,13 @@
  * 后者会让断言与实现同源:改数值时两边一起变,断言永远通过,等于没测。
  *
  * ```
- * ✅ eq(TICK_HZ, 20, ...)          // 20 抄自手册 L19;代码错了就红
- * ❌ eq(TICK_HZ, PHY.TICK_HZ, ...) // 同义反复,永远绿
+ * ✅ eq(BASE_HP, 100, ...)         // 100 抄自手册;代码错了就红
+ * ❌ eq(BASE_HP, PHY.BASE_HP, ...) // 同义反复,永远绿
  * ```
+ *
+ * ⚠️ **唯一的例外:TICK_HZ / DT**。手册 L19 写的是「Fast Tick = 20Hz / 每 50ms」,
+ * owner 裁决(2026-11-21)把名义 tick 率改成 **32Hz(31.25ms)** ⇒ 这一项**不能再写死**,
+ * 只钉「帧率与帧长互为倒数」的不变式;绝对值的唯一锚点在 `WS-FND-177`(TICK32-1)。
  *
  * ## 为什么只固化「已确认一致」的项
  *
@@ -47,7 +51,7 @@ import {
   bossScaledHp,
 } from '../shared/types/entities.ts';
 import {
-  TICK_HZ, DT, SLOW_TICK_HZ, GRAVITY, THROW_SPEED_XY, THROW_SPEED_Z,
+  TICK_HZ, TICK_MS, msToTicks, DT, SLOW_TICK_HZ, GRAVITY, THROW_SPEED_XY, THROW_SPEED_Z,
   CARRY_Z_STEP, CARRY_MAX_DEPTH, CARRY_SLOWDOWN,
   CATCH_Z_MIN, CATCH_Z_MAX, CATCH_RADIUS,
   RADIUS_PLAYER, RADIUS_WILD, RADIUS_BOSS,
@@ -172,10 +176,13 @@ test('[L50] Chunk 为 16×16、每块 1KB', () => {
  * 3. 双频主循环与物理常数(手册 §2.1 L19~L20、§2.2 L33~L46)
  * ═══════════════════════════════════════════════════════════════════════ */
 
-test('[L19] 高频物理帧 20Hz / 50ms', () => {
-  /* 手册 L19:「Fast Tick = 20Hz,每 50ms 执行一次」 */
-  eq(TICK_HZ, 20, '高频帧频率');
-  near(DT, 0.05, 1e-12, '高频帧步长 = 1/20');
+test('[L19] 高频物理帧:帧率与帧长互相派生(手册 L19 的 20Hz 已被 owner 裁决取代)', () => {
+  /* 手册 L19:「Fast Tick = 20Hz,每 50ms 执行一次」——
+     owner 裁决(2026-11-21)改为 32Hz/31.25ms ⇒ 本项改钉**不变式**(见文件头警告):
+     两个数必须互为倒数,任一个被单独改动都会红。 */
+  eq(TICK_HZ, Math.round(1000 / TICK_MS), 'TICK_HZ 与标称帧间隔互为倒数');
+  near(DT, 1 / TICK_HZ, 1e-12, '高频帧步长 = 1/TICK_HZ');
+  eq(msToTicks(TICK_MS), 1, '标称帧间隔恰好 = 1 帧');
 });
 
 test('[L20] 低频演化帧 2Hz / 500ms', () => {

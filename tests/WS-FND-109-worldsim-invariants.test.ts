@@ -42,7 +42,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -69,7 +69,14 @@ function groundSnapshot(sim: WorldSim): { id: number; x: number; y: number; coun
 }
 
 /** 走够一个慢帧(`FAST_PER_SLOW = 20Hz / 2Hz = 10` 快帧),保证 `tickPartyStep` 真的跑过。 */
-function tickSlow(sim: WorldSim, times = 10): void {
+/**
+ * 推进**恰好一个慢帧**(慢帧 stride = `SLOW_DT` 秒 = `FAST_PER_SLOW` 快帧)。
+ *
+ * ⚠️ 旧写法默认 10 帧把「20Hz 下的一个慢帧」写死了 —— 32Hz 下 10 帧只有 0.31 秒,
+ * 一个慢帧都跑不到 ⇒ 玩法表(`afkRuns` / `lastPartyTick`)永远是空的。
+ * 任意 `FAST_PER_SLOW` 个**连续**帧内恰好命中一个慢帧(`frame % stride === 0`)。
+ */
+function tickSlow(sim: WorldSim, times = FAST_PER_SLOW): void {
   for (let i = 0; i < times; i += 1) sim.tick();
 }
 

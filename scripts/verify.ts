@@ -50,6 +50,13 @@ import {
   planEntitySpritesInto, resetSpritePlanCounters, spritePlanSpecAllocs,
   type EntitySpriteSpec, type EntitySpriteSource,
 } from '../client/src/stage/entity_sprites.ts';
+/* ★ 2026-11-25(tick 口径硬化):`TICK_HZ` / `SLOW_DT` 的**单一事实源**在
+   `shared/types/physics.ts`,本文件**不再**自己写一份(`TICK_HZ = 20` / `DT = 0.05`
+   这两处副本见下方 `checkFrozen()` 的「推导链」与 `checkTickConvention()` 的说明)。
+   门禁里所有「按帧数计的窗口」也从这里派生,不各写一个数。 */
+import {
+  DT, SLOW_DT, SLOW_TICK_HZ, TICK_HZ, TICK_MS, secondsToTicks, ticksToSeconds,
+} from '../shared/types/physics.ts';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -927,16 +934,34 @@ async function checkFrozen(): Promise<void> {
   if (packBad > 0) fail(`位压缩往返错误 ${packBad} 例`);
   else pass('位压缩 20000 组往返 + 字段隔离正确');
 
-  /* 关键物理常数与手册数值一致 */
+  /* 关键物理常数与手册数值一致。
+
+     ★ 2026-11-25(tick 口径硬化):**tick 口径不在这里写第二份**。
+     `TICK_HZ` / `DT` / `TICK_MS` 的单一事实源是 `shared/types/physics.ts` 自己;
+     本表若再写一个 `20` / `0.05` 当"期望值",改 tick 率时就会**两处各写一份**
+     (旧的形态正是 `['TICK_HZ', phy.TICK_HZ, 20]` + `['DT', phy.DT, 0.05]`)——
+     而其中一处漏改时,门禁会用旧数当判据,报出"漂移"却**指错了地方**。
+     ⇒ 改成只断言**推导链自洽**(常量之间的关系)+ 一条**外部语义**
+       (`SLOW_DT` = 0.5 秒 = 手册 L20 的「慢帧每 500ms」,它不是"数"而是"语义",
+        改 tick 率**不该**动它)。
+     ⚠️ 这里**测不到**「`TICK_HZ` 本身取值对不对」—— 它现在是**规定**,不是推导;
+        它有没有被别处重复写死,由 `checkTickConvention()` 扫 `scripts/**`。 */
+  const tickChain: [string, number, number][] = [
+    ['DT = 1/TICK_HZ', phy.DT, 1 / phy.TICK_HZ],
+    ['TICK_MS = 1000/TICK_HZ', phy.TICK_MS, 1000 / phy.TICK_HZ],
+    ['SIM_DT = DT', phy.SIM_DT, phy.DT],
+    ['SLOW_TICK_HZ = 1/SLOW_DT', phy.SLOW_TICK_HZ, 1 / phy.SLOW_DT],
+    ['SLOW_DT = 0.5 秒(手册 L20:慢帧每 500ms)', phy.SLOW_DT, 0.5],
+  ];
   const consts: [string, number, number][] = [
-    ['TICK_HZ', phy.TICK_HZ, 20], ['DT', phy.DT, 0.05],
-    ['SLOW_TICK_HZ', phy.SLOW_TICK_HZ, 2], ['GRAVITY', phy.GRAVITY, -18],
+    ['GRAVITY', phy.GRAVITY, -18],
     ['THROW_SPEED_XY', phy.THROW_SPEED_XY, 8.5], ['THROW_SPEED_Z', phy.THROW_SPEED_Z, 6],
     ['CARRY_Z_STEP', phy.CARRY_Z_STEP, 0.85], ['CARRY_MAX_DEPTH', phy.CARRY_MAX_DEPTH, 4],
     ['CATCH_RADIUS', phy.CATCH_RADIUS, 0.8], ['BASE_MOVE_SPEED', phy.BASE_MOVE_SPEED, 4.5],
     ['CHUNK_BYTES', tile.CHUNK_BYTES, 1024],
   ];
-  const badConst = consts.filter(([, a, b]) => Math.abs(a - b) > 1e-9).map(([n, a, b]) => `${n}=${a}≠${b}`);
+  const badConst = [...consts, ...tickChain]
+    .filter(([, a, b]) => Math.abs(a - b) > 1e-9).map(([n, a, b]) => `${n}=${a}≠${b}`);
   if (badConst.length > 0) fail(`物理/网格常数漂移:${badConst.join(', ')}`);
   else pass('物理与网格常数与手册一致');
 
@@ -5987,6 +6012,335 @@ function countDiffSet(): number {
   return n;
 }
 
+/* ═══════════════ 3.5 tick 口径硬化(2026-11-25)═══════════════
+ *
+ * ## 它防的是什么
+ *
+ * tick 率改成 **32Hz**(每帧 31.25ms)时,**旧口径**的频率 / 帧长 / 步长 / 比值
+ * 这些数字**散落在全仓的代码、注释、断言与打印里**。散落的后果不是"难看",
+ * 而是**同一件事有两份真相**:改了 `physics.ts` 而漏掉某处,那处会继续按旧口径
+ * 计算、继续打印、继续断言,而且**不报错** —— 这正是本仓反复点名的形态
+ * 「改一处必须改两处」。上一轮的实测样本(本轮全部已改):
+ * `verify.ts` 冻结层常数表里的旧频率副本、`perf-bounds.ts` 的帧预算 / 快慢比值、
+ * `play.ts` 的广播循环帧间隔、以及下面双频节奏那条里写死的 `HZ_FAST` / `TOTAL`。
+ *
+ * ## 判据
+ *
+ * **`scripts/**` 里任何写死的 tick 率 / 帧长必须与 `shared/types/physics.ts` 一致。**
+ * 「一致」= 该字面量等于由 `TICK_HZ` / `SLOW_DT` 派生出来的那一组值:
+ * ```text
+ * 频率   TICK_HZ(32)或 SLOW_TICK_HZ(2)          ← 任何 `NN Hz`
+ * 帧长   TICK_MS(31.25)或 SLOW_DT 秒(500)       ← 帧/tick 语境下的 `NN ms`
+ * 比值   TICK_HZ × SLOW_DT(16)                  ← 快帧:慢帧 = `N:1`
+ * 常量   <标识符> = <字面量>(如 `TICK_HZ = 20`)  ← 见下方 `TICK_LIT_ID_SPEC`
+ * ```
+ *
+ * ## 为什么**扫源码**而不是 import 各脚本
+ *
+ * `perf-bounds.ts` / `soak.ts` 是顶层跑基准 / 长跑的入口,import 它们会真的跑一遍
+ * —— 理由与 `checkPerfTagDemotions()` 完全相同。而文本判据在这里**恰当**:
+ * 要证的命题就是「**文件里**写没写这个数」,import 不会告诉我这件事。
+ *
+ * ## 为什么连**注释**一起扫
+ *
+ * 反直觉但必要:本仓的注释是主要文档,旧口径写在注释里**会被人当事实读**,
+ * 而它们恰是改口径时最容易漏的一批(实测:下面双频那节的注释当时正写着
+ * 「旧频率与 2Hz 的比值必须是 10」)。⇒ 注释在射程内,而**历史陈述 /
+ * 实测读数 / 外部事实的转写**进白名单(逐条写明理由)。
+ *
+ * ## 白名单(允许清单必须**显式**,不许"自动放过")
+ *
+ * 三类可以不在射程里:
+ *   1 **外部事实的转写**(手册原文、README 表行)—— 那是**比对对象**,不是本仓口径;
+ *   2 **实测读数**(本机墙钟节拍那类)—— 测量值,换机器就变;
+ *   3 **与被测 tick 无关的独立频率**(如假客户端的**上行节拍**:本仓刻意让它
+ *     与服务端 tick 解耦,它比服务端慢几档)。
+ * 白名单命中**照常打印**(`i` 行):静默豁免与静默跳过是一回事。
+ * 条目按**关键片段**登记而不是行号(行号会飘,见 `judgement_baseline.ts`);
+ * 一条都没命中的条目会被点名(可清理 ⇒ 表不会烂成墓碑)。
+ *
+ * ## 它怎么自证不是恒真
+ *
+ * `scanTickLiterals()` 返回 `files` / `hits` 两个数并要求 `files > 0`
+ * (扫不到文件 ⇒ 结论无意义);命中里 `violations` 与 `exempted` **分开报**
+ * (`hits` = 两者之和,所以"0 处违规"与"规则根本没触发"在输出上可区分 ——
+ * 这正是本仓「跳过必须出声」的同一口径)。
+ * ⚠️ 它测的是「scripts 与 physics **一致**」,**不测**「physics 取值对不对」:
+ * 后者由 `checkFrozen()` 的推导链 + 「`SLOW_DT` = 0.5 秒」那条外部语义守着。
+ */
+
+/** 扫描命中的一条**写死 tick 口径**。 */
+export interface TickLitHit {
+  /** 仓库相对路径(`/` 分隔)。 */
+  rel: string;
+  /** 1 起的行号。 */
+  line: number;
+  /** 命中规则(报告里点名用)。 */
+  rule: string;
+  /** 该行原文(截断到 160 字符)。 */
+  text: string;
+  /** 写死的值。 */
+  got: number;
+  /** 由 `physics.ts` 派生的应有值(文字描述,含算式)。 */
+  want: string;
+}
+
+/** 白名单条目:**关键片段**,不用行号。 */
+export interface TickLitExemption {
+  /** 仓库相对路径(`/` 分隔)。 */
+  rel: string;
+  /** 该行必须包含的片段。 */
+  snippet: string;
+  /** 为什么它可以不跟 `TICK_HZ` 走(必填:空理由在下面会被点名)。 */
+  why: string;
+}
+
+/**
+ * 允许清单(逐条理由见 `why`)。
+ * ⚠️ 这里**不做**"自动放过":注释里的旧口径默认在射程内,要豁免就得来这张表登记。
+ * ⚠️ **片段里不要写旧口径的数**:片段本身也要过这几条规则 ——
+ * 写**含旧口径数字**的片段,表自己那一行就会被扫成"写死的旧频率"
+ * (实测过一次,靠"自我豁免"才通过 —— 那是**噪音**,不是设计)。
+ * ⇒ 片段一律取**不含数字**的特征串。
+ */
+export const TICK_LIT_EXEMPTIONS: readonly TickLitExemption[] = [
+  {
+    rel: 'scripts/verify.ts',
+    snippet: '网络协议',
+    why: 'README 表行的**引用样本**(那张 `WS-07` 的表)—— 那一行的口径在 README 侧,'
+      + '这里只是引用原文,不是本仓的第二份声明',
+  },
+  {
+    rel: 'scripts/data-conformance.ts',
+    snippet: 'Fast Tick =',
+    why: '手册原文的**转写**(比对对象):手册是仓外文件,那里写的频率是**手册自己的值**,'
+      + '不是本仓口径 ⇒ 它要是跟着 `TICK_HZ` 走,这条对账就变成同义反复',
+  },
+  {
+    rel: 'scripts/soak.ts',
+    snippet: '比服务端 32Hz 慢几档',
+    why: '假客户端的**上行节拍**:独立频率(本仓刻意让它与服务端 tick 解耦),不是快帧口径',
+  },
+  {
+    rel: 'scripts/soak.ts',
+    snippet: '本机实测',
+    why: '**实测读数**行(墙钟节拍、以及由它折算的墙钟秒)—— 机器相关,不是口径',
+  },
+  {
+    rel: 'scripts/play.ts',
+    snippet: '本机实测',
+    why: '同上:实测读数(墙钟节拍),不是口径',
+  },
+];
+
+/**
+ * 规则 1 的表:**这些标识符被赋一个字面量时,那个字面量必须等于 `want`**。
+ *
+ * ⚠️ 只在「**整条右值就是这个数**」时命中(见 `scanTickLiterals` 里的终结符检查):
+ * `frameMs: DT * 1000`(派生写法)**不**命中,`frameMs: 20` 命中。
+ * 这张表是**枚举**而不是"任何含 tick 字样的名字":名字越宽越容易误报,
+ * 而误报几次之后门禁就会被忽略(比漏报更贵)。
+ */
+const TICK_LIT_ID_SPEC: Record<string, { want: number; how: string }> = {
+  TICK_HZ: { want: TICK_HZ, how: 'TICK_HZ(physics.ts)' },
+  FAST_TICK_HZ: { want: TICK_HZ, how: 'TICK_HZ' },
+  SERVER_TICK_HZ: { want: TICK_HZ, how: 'TICK_HZ' },
+  NOMINAL_TICK_HZ: { want: TICK_HZ, how: '1000 / TICK_MS' },
+  HZ_FAST: { want: TICK_HZ, how: 'TICK_HZ' },
+  TICK_MS: { want: TICK_MS, how: '1000 / TICK_HZ' },
+  NOMINAL_TICK_MS: { want: TICK_MS, how: 'DT * 1000' },
+  frameMs: { want: TICK_MS, how: 'DT * 1000(标称帧长)' },
+  frame_ms: { want: TICK_MS, how: 'DT * 1000' },
+  tickMs: { want: TICK_MS, how: 'DT * 1000' },
+  tickIntervalMs: { want: TICK_MS, how: 'DT * 1000' },
+  DT: { want: DT, how: '1 / TICK_HZ' },
+  SIM_DT: { want: DT, how: 'DT' },
+  SIM_FAST_DT: { want: DT, how: 'DT' },
+  SLOW_DT: { want: SLOW_DT, how: 'SLOW_DT(0.5 秒)' },
+  SIM_SLOW_DT: { want: SLOW_DT, how: 'SLOW_DT' },
+  fastHz: { want: TICK_HZ, how: 'TICK_HZ' },
+  HZ_SLOW: { want: SLOW_TICK_HZ, how: 'SLOW_TICK_HZ' },
+  slowHz: { want: SLOW_TICK_HZ, how: 'SLOW_TICK_HZ' },
+};
+
+/** 规则 2/3/4 的允许值 —— **全部由 `physics.ts` 派生**,这里不写第二份数。 */
+const TICK_LIT_OK_HZ: readonly number[] = [TICK_HZ, SLOW_TICK_HZ];
+const TICK_LIT_OK_MS: readonly number[] = [TICK_MS, SLOW_DT * 1000];
+const TICK_LIT_OK_RATIO = TICK_HZ * SLOW_DT;
+
+/** 规则 1:`<标识符> = <字面量>` / `<标识符>: <字面量>`(终结符在代码里判)。 */
+const TICK_LIT_DECL_RE = /\b([A-Za-z_$][\w$]*)\s*(?::|=(?!=))\s*(\d[\d_]*(?:\.\d+)?)/g;
+/** 规则 2:任何 `NN Hz`。 */
+const TICK_LIT_HZ_RE = /(\d[\d_]*(?:\.\d+)?)\s*hz\b/gi;
+/** 规则 3:帧 / tick 语境下的 `NN ms`(语境由 `TICK_LIT_CTX_RE` 判)。 */
+const TICK_LIT_MS_RE = /(\d[\d_]*(?:\.\d+)?)\s*(?:ms|毫秒)\b/gi;
+/** 规则 4:快慢帧的 `N:1`。 */
+const TICK_LIT_RATIO_RE = /(\d[\d_]*)\s*:\s*1(?![.\d])/g;
+
+/** 规则 3 的语境词(`NN ms` 只有在讲帧 / tick 时才算口径)。 */
+const TICK_LIT_CTX_RE = /帧|frame|tick|节拍/i;
+/** 规则 4 的语境词(比值只有在讲双频时才算口径)。 */
+const TICK_LIT_RATIO_CTX_RE = /快帧|慢帧|双频/;
+
+/** 扫描结果(自证用的计数,以及两类命中分开列)。 */
+export interface TickLitScan {
+  /** 扫过的文件数(0 ⇒ 扫描口径坏了,结论无意义)。 */
+  files: number;
+  /** 命中总数(= `violations + exempted` ⇒ "0 处违规"与"规则没触发"可区分)。 */
+  hits: number;
+  /** 与 `physics.ts` 不一致的写死口径(门禁据此报红)。 */
+  violations: TickLitHit[];
+  /** 命中但已登记白名单(每次运行都打印,不静默)。 */
+  exempted: TickLitHit[];
+  /** 白名单里**一条都没命中**的条目(可以清理)。 */
+  staleExemptions: string[];
+}
+
+/** 把字面量文本转成数(`1_000` → 1000)。 */
+function litNum(text: string): number {
+  return Number(text.replace(/_/g, ''));
+}
+
+/**
+ * 扫 `scripts/**` 里写死的 tick 口径。返回**违规**与**白名单命中**两组;
+ * 不打印、不判红(打印与判红在 `checkTickConvention()` —— 这个纯函数可被测试直接调)。
+ */
+export function scanTickLiterals(root: string): TickLitScan {
+  const files = walk(join(root, 'scripts'), ['.ts']).sort();
+  const violations: TickLitHit[] = [];
+  const exempted: TickLitHit[] = [];
+  const used = new Set<string>();
+  let hits = 0;
+
+  const record = (
+    rel: string, line: number, rule: string, text: string, got: number, want: string,
+  ): void => {
+    hits += 1;
+    const hit: TickLitHit = { rel, line, rule, text: text.trim().slice(0, 160), got, want };
+    const ex = TICK_LIT_EXEMPTIONS.find((e) => e.rel === rel && text.includes(e.snippet));
+    if (ex === undefined) violations.push(hit);
+    else {
+      used.add(`${rel}\u0000${ex.snippet}`);
+      exempted.push(hit);
+    }
+  };
+
+  for (const f of files) {
+    const rel = relative(root, f).split(sep).join('/');
+    const lines = readFileSync(f, 'utf8').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const raw = lines[i] as string;
+      const lineNo = i + 1;
+
+      /* 规则 1:标识符被赋一个**整条右值**就是一个字面量。
+         ⚠️ 终结符检查是必要的:`NOMINAL_TICK_HZ = 1_000 / NOMINAL_TICK_MS` 里
+         `NOMINAL_TICK_HZ = 1_000` 只是**前缀**,右边还有算式 ⇒ 那不是"写死一个值",
+         是**派生**。少了这一步,派生写法会被误报(而误报会毁掉门禁)。 */
+      for (const m of raw.matchAll(TICK_LIT_DECL_RE)) {
+        const id = m[1] as string;
+        const spec = TICK_LIT_ID_SPEC[id];
+        if (spec === undefined) continue;
+        const after = raw.slice((m.index ?? 0) + m[0].length);
+        if (!/^\s*(?:[,;)\]}]+|$|\/\/|\/\*)/.test(after)) continue;
+        const got = litNum(m[2] as string);
+        if (Math.abs(got - spec.want) > 1e-9) record(rel, lineNo, `常量 ${id}`, raw, got, spec.how);
+      }
+
+      /* 规则 2:任何 `NN Hz`(注释也算 —— 见本节长注释)。 */
+      for (const m of raw.matchAll(TICK_LIT_HZ_RE)) {
+        const got = litNum(m[1] as string);
+        if (!TICK_LIT_OK_HZ.some((v) => Math.abs(v - got) < 1e-9)) {
+          record(rel, lineNo, '频率 NN Hz', raw, got,
+            `TICK_HZ(${TICK_HZ})或 SLOW_TICK_HZ(${SLOW_TICK_HZ})`);
+        }
+      }
+
+/* 规则 3:`NN ms` —— **只在讲帧 / tick 的行上**算口径(否则会把采样间隔、
+   握手超时这类无关时长一起卷进来,变成误报机器)。`0ms` 也不在射程内:
+   那是"没有间隔"的写法(低于时钟分辨率),不是帧长口径。 */
+      if (TICK_LIT_CTX_RE.test(raw)) {
+        for (const m of raw.matchAll(TICK_LIT_MS_RE)) {
+          const got = litNum(m[1] as string);
+          if (got === 0) continue;
+          if (!TICK_LIT_OK_MS.some((v) => Math.abs(v - got) < 1e-9)) {
+            record(rel, lineNo, '帧长 NN ms', raw, got,
+              `TICK_MS(${TICK_MS})或 SLOW_DT 秒(${SLOW_DT * 1000})`);
+          }
+        }
+      }
+
+      /* 规则 4:快慢帧的比值。 */
+      if (TICK_LIT_RATIO_CTX_RE.test(raw)) {
+        for (const m of raw.matchAll(TICK_LIT_RATIO_RE)) {
+          const got = litNum(m[1] as string);
+          if (Math.abs(got - TICK_LIT_OK_RATIO) > 1e-9) {
+            record(rel, lineNo, '快慢比值 N:1', raw, got,
+              `TICK_HZ × SLOW_DT(${TICK_LIT_OK_RATIO})`);
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    files: files.length,
+    hits,
+    violations,
+    exempted,
+    staleExemptions: TICK_LIT_EXEMPTIONS
+      .filter((e) => !used.has(`${e.rel}\u0000${e.snippet}`))
+      .map((e) => `${e.rel}: "${e.snippet}"`),
+  };
+}
+
+/**
+ * 门禁项:tick 口径硬化(见本节长注释)。
+ *
+ * 「跳过必须出声」:白名单命中与"白名单条目没命中过任何东西"都打印出来,
+ * 后者是**可清理**的信号(表烂成墓碑时,下一个人会以为那些豁免仍然必要)。
+ */
+function checkTickConvention(): void {
+  console.log('\n[tick 口径硬化]');
+  const r = scanTickLiterals(ROOT);
+  if (r.files === 0) {
+    fail('scripts/** 下 0 个 .ts —— 扫描口径坏了(不许把"扫不到"当成"没问题")');
+    return;
+  }
+  const fmtHit = (h: TickLitHit): string =>
+    `      · ${h.rel}:${h.line} [${h.rule}] 写死 ${h.got} ⇒ 应为 ${h.want}` + `\n        ${h.text}`;
+  if (r.violations.length > 0) {
+    fail(
+      `scripts/** 有 ${r.violations.length} 处写死的 tick 率/帧长与 `
+        + `shared/types/physics.ts 不一致(TICK_HZ=${TICK_HZ} ⇒ 帧长 ${TICK_MS}ms、`
+        + `慢帧 ${SLOW_DT} 秒、比值 ${TICK_LIT_OK_RATIO}):\n`
+        + r.violations.slice(0, 8).map(fmtHit).join('\n')
+        + (r.violations.length > 8 ? `\n      · …还有 ${r.violations.length - 8} 处(见上)` : '')
+        + '\n      ⇒ 改成从 `TICK_HZ` / `SLOW_DT` 派生(例:`secondsToTicks(n)` / `TICK_MS`);'
+        + '\n        若它是外部事实的转写 / 实测读数 / 独立频率,'
+        + '加进 `TICK_LIT_EXEMPTIONS` 并写明理由。',
+    );
+  } else {
+    pass(
+      `scripts/** 写死的 tick 口径与 physics.ts 一致(扫 ${r.files} 个文件 / 命中 ${r.hits} 处:`
+        + `tick 率 ${TICK_HZ}Hz、帧长 ${TICK_MS}ms、慢帧 ${SLOW_DT}s、比值 ${TICK_LIT_OK_RATIO})`,
+    );
+  }
+  /* 白名单命中**照常打印,并带上理由** —— 静默豁免与静默跳过是一回事;
+     而"为什么它可以不跟 `TICK_HZ` 走"必须和命中一起出现,否则下一个人
+     只能看到"这里放过了",看不到判据。 */
+  for (const e of r.exempted) {
+    const entry = TICK_LIT_EXEMPTIONS.find((x) => x.rel === e.rel && e.text.includes(x.snippet));
+    console.log(`  i 白名单豁免 ${e.rel}:${e.line} [${e.rule}]「${e.text}」`);
+    if (entry !== undefined) console.log(`      ← ${entry.why}`);
+  }
+  if (r.staleExemptions.length > 0) {
+    console.log(
+      `  i 白名单 ${r.staleExemptions.length} 条没命中任何写死口径(可清理):`
+        + r.staleExemptions.join(' / '),
+    );
+  }
+}
+
 /* ───────────────────── 3. 文档结构检查 ───────────────────── */
 
 function checkDocs(): void {
@@ -6145,7 +6499,8 @@ function checkDocs(): void {
  *
  * 这一节把「世界能跑」变成门禁的一部分:
  *   1. 编排层可实例化 —— 全部子系统能同时构造,不因参数不匹配而抛;
- *   2. 双频节奏正确 —— 慢帧数恰为快帧数的 1/10;
+ *   2. 双频节奏正确 —— 快帧 : 慢帧 = `TICK_HZ × SLOW_DT`(32Hz / 2Hz ⇒ 16:1),
+ *      且慢帧计数与之一致(**不写死 1/10 这种比值**:它是派生的);
  *   3. 各子系统真的在动 —— 刚体数、流体总量、通电格数、活跃生物数都非空;
  *   4. 确定性 —— 同种子两次运行终态逐字节一致;
  *   5. 跨 WS 接线存在 —— 编排层至少 import 3 个不同 WS 的模块。
@@ -6210,45 +6565,70 @@ async function checkIntegration(): Promise<void> {
     return;
   }
 
-  /* 2. 双频节奏:20Hz 与 2Hz 的比值必须是 **10**。
-     注意这里把 10 写死而**不能**用 `FAST_PER_SLOW` 去算期望值 —— 
-     那样两边同源,改常量会让断言与实现一起变,永远相等(同义反复,
-     曾经真的这样写过,注入 `FAST_PER_SLOW *= 2` 都测不出来)。
-     10 来自手册 §2.1 的 20Hz / 2Hz,是外部事实,应当硬编码。 */
-  const TOTAL = 200;
+  /* 2. 双频节奏:快帧 : 慢帧 = **TICK_HZ × SLOW_DT**(32Hz / 2Hz ⇒ **16**:1)。
+
+     ⚠️ 期望值必须从**单一事实源** `shared/types/physics.ts` 派生,而**不能**用
+     `FAST_PER_SLOW` 去算 —— 那样两边同源,改常量会让断言与实现一起变,永远相等
+     (同义反复,曾经真的这样写过,注入 `FAST_PER_SLOW *= 2` 都测不出来)。
+     这里比的是**另一个模块**的实现常量:`physics.ts` 的口径 vs `world_sim.ts` 的
+     `FAST_PER_SLOW` ⇒ 两处不同源 ⇒ 能失败。
+
+     ★ 2026-11-25(tick 口径硬化):本节此前把**快帧频率**与**窗口帧数**写死
+     (`HZ_FAST` / `TOTAL`)—— 那是**第二份 tick 口径**;现在一律从
+     `TICK_HZ` / `SLOW_DT` 派生,残留的写死值由 `checkTickConvention()` 扫出来。 */
+  const HZ_FAST = TICK_HZ;
+  const HZ_SLOW = SLOW_TICK_HZ;
+  /** 快帧 : 慢帧 的比值。由**秒**派生(`SLOW_DT` 秒里有多少个 `DT`)⇒ 与 Hz 写法无关。 */
+  const FAST_PER_SLOW_EXPECTED = TICK_HZ * SLOW_DT;
+  /* 驱动窗口**按慢帧数**给(20 个慢帧 = 10 世界秒),快帧数是派生的 ——
+     这样改 tick 率时窗口仍是「同一段世界时间」,而不是「同一串帧号」。
+     (旧形态是 `TOTAL = 200`,在 32Hz 下只有 6.25 世界秒。) */
+  const DRIVE_SLOW_FRAMES = 20;
+  const TOTAL = Math.round(DRIVE_SLOW_FRAMES * FAST_PER_SLOW_EXPECTED);
   const { frames, slowFrames } = s.run(TOTAL);
-  const HZ_FAST = 20;
-  const HZ_SLOW = 2;
-  const expectSlow = (TOTAL / (HZ_FAST / HZ_SLOW)) | 0;
-  if (FAST_PER_SLOW !== HZ_FAST / HZ_SLOW) {
-    fail(`快慢比例常数 ${FAST_PER_SLOW} ≠ 手册规定的 ${HZ_FAST}/${HZ_SLOW} = ${HZ_FAST / HZ_SLOW}`);
-  } else if (slowFrames !== expectSlow) {
-    fail(`慢帧数 ${slowFrames} ≠ 期望 ${expectSlow}(${TOTAL} 帧 @ 20Hz 应对应 ${expectSlow} 个 2Hz 慢帧)`);
+  if (FAST_PER_SLOW !== FAST_PER_SLOW_EXPECTED) {
+    fail(`快慢比例常量 ${FAST_PER_SLOW} ≠ TICK_HZ × SLOW_DT = `
+      + `${TICK_HZ} × ${SLOW_DT} = ${FAST_PER_SLOW_EXPECTED}(${HZ_FAST}Hz / ${HZ_SLOW}Hz)`);
+  } else if (slowFrames !== DRIVE_SLOW_FRAMES) {
+    fail(`慢帧数 ${slowFrames} ≠ 期望 ${DRIVE_SLOW_FRAMES}`
+      + `(${TOTAL} 快帧 @ ${HZ_FAST}Hz = ${ticksToSeconds(TOTAL).toFixed(1)} 世界秒,`
+      + `应对应 ${DRIVE_SLOW_FRAMES} 个 ${HZ_SLOW}Hz 慢帧)`);
   } else {
-    pass(`双频节奏正确:${frames} 快帧 / ${slowFrames} 慢帧 = ${FAST_PER_SLOW}:1`);
+    pass(`双频节奏正确:${frames} 快帧 / ${slowFrames} 慢帧 = ${FAST_PER_SLOW}:1`
+      + `(${HZ_FAST}Hz × ${SLOW_DT}s = ${FAST_PER_SLOW_EXPECTED})`);
   }
   if (s.frame !== TOTAL) fail(`帧序 ${s.frame} ≠ ${TOTAL}`);
-  else pass(`帧序单调推进至 ${s.frame}`);
+  else pass(`帧序单调推进至 ${s.frame}(${TOTAL} 快帧 = ${ticksToSeconds(TOTAL).toFixed(1)} 世界秒)`);
 
   /* 2b. 模拟时间必须按快帧单位换算。
-     帧序永远是快帧计数,所以任意一帧的 `simSeconds` 恒为 `frame / 20` —— 
-     即使这一帧同时是慢帧。曾经写成 `isSlow ? frame / SLOW_TICK_HZ : frame / TICK_HZ`,
-     慢帧那一支除以 2 而不是 20,时间**快了 10 倍**(第 10 帧报 5.00s,真值 0.5s)。
-     单独验一条,避免这类「相位分支污染时间基」的错误再次溜过。 */
+
+     帧序永远是快帧计数,所以任意一帧的 `simSeconds` 恒为 `ticksToSeconds(frame)`
+     (= `frame / TICK_HZ`)—— 即使这一帧同时是慢帧。曾经写成
+     `isSlow ? frame / SLOW_TICK_HZ : frame / TICK_HZ`,慢帧那一支除以 2 而不是
+     `TICK_HZ`,时间**快了 `TICK_HZ / SLOW_TICK_HZ` = 16 倍**(旧口径下的表现:
+     第 10 帧报 5.00s,真值 0.5s)。单独验一条,避免这类「相位分支污染时间基」
+     的错误再次溜过。
+
+     ⚠️ 窗口取 **1 世界秒**(`secondsToTicks(1)`)而不是写死帧数:它必须至少覆盖
+     **一个慢帧**,否则慢帧那一支永远不被走到,这条断言就没了目标 ——
+     1 秒 ≥ `SLOW_DT` ⇒ 必然含至少一个慢帧。 */
   const tsim = build();
   let timeOk = true;
   let timeDetail = '';
-  for (let i = 0; i < 25; i += 1) {
+  const timeCheckTicks = secondsToTicks(1);
+  for (let i = 0; i < timeCheckTicks; i += 1) {
     const r = tsim.tick();
-    const want = r.frame / HZ_FAST;
+    const want = ticksToSeconds(r.frame);
     if (Math.abs(r.simSeconds - want) > 1e-12) {
       timeOk = false;
       timeDetail = `第 ${r.frame} 帧(${r.phase})报 ${r.simSeconds},应为 ${want}`;
       break;
     }
   }
-  if (timeOk) pass(`模拟时间基正确:任意帧 simSeconds = frame / ${HZ_FAST}(慢帧也不例外)`);
-  else fail(`模拟时间基错误:${timeDetail}`);
+  if (timeOk) {
+    pass(`模拟时间基正确:任意帧 simSeconds = frame / ${HZ_FAST}`
+      + `(慢帧也不例外;窗口 ${timeCheckTicks} 帧 = 1 世界秒,含慢帧)`);
+  } else fail(`模拟时间基错误:${timeDetail}`);
 
   /* 3. 各子系统真的在动 —— 空跑不报错是最容易蒙混过关的假绿。
      注意区分**注册数**与**活跃数**:`snapshot().mobs` 是已注册生物数,
@@ -6348,15 +6728,20 @@ async function checkIntegration(): Promise<void> {
      
      这一条守的是本项目最隐蔽的一类缺口:代码完整、单测全绿、
      但**生产路径从未执行**。实测证据:25 个 AI 的 tick 实现、
-     MobFsm 的完整实现,在生产里调用次数为 0。 */
+     MobFsm 的完整实现,在生产里调用次数为 0。
+
+     ★ 驱动窗口按**世界秒**给(此前写死 100 帧 = 旧口径的 5 秒;
+     32Hz 下 100 帧只有 3.1 秒)。判据仍是「计数 > 0」,窗口长度不参与判据。 */
+  const aiTicks = secondsToTicks(5);
   const mhost = new WorldSim({ sizeCells: 48 });
   mhost.addPlayer('p1', 24, 24);
   mhost.addMob('mob_pangolin', 'MEADOW', 24, 25);
-  for (let i = 0; i < 100; i += 1) mhost.tick();
+  for (let i = 0; i < aiTicks; i += 1) mhost.tick();
   if (mhost.mobHost.totals.ticks <= 0) {
-    fail('生物 AI 生产不可达:100 帧内宿主推进 0 次(编排层可能退回了空回调)');
+    fail(`生物 AI 生产不可达:${aiTicks} 帧内宿主推进 0 次(编排层可能退回了空回调)`);
   } else {
-    pass(`生物 AI 生产可达:100 帧推进 ${mhost.mobHost.totals.ticks} 次`);
+    pass(`生物 AI 生产可达:${aiTicks} 帧(${ticksToSeconds(aiTicks).toFixed(0)} 世界秒)`
+      + `推进 ${mhost.mobHost.totals.ticks} 次`);
   }
   if (mhost.mobErrors !== 0) {
     fail(`生物 AI 抛错 ${mhost.mobErrors} 次(宿主可能缺少 AI 需要的字段)`);
@@ -6414,7 +6799,8 @@ async function checkIntegration(): Promise<void> {
   } else {
     pass('AI 可见玩家且不含生物');
   }
-  for (let i = 0; i < 60; i += 1) pvis.tick();
+  /* 窗口 = 3 世界秒(此前写死 60 帧 = 旧口径的 3 秒):够 AI 至少判一次「附近有玩家」。 */
+  for (let i = 0; i < secondsToTicks(3); i += 1) pvis.tick();
   const boarRt = pvis.mobHost.runtimeOf('mob_boar');
   const boarMem = boarRt ? Object.keys(boarRt.mem) : [];
   if (boarMem.length === 0) {
@@ -6422,28 +6808,31 @@ async function checkIntegration(): Promise<void> {
   } else {
     pass(`AI 响应玩家:野猪进入状态机(${boarMem.slice(0, 4).join(', ')}…)`);
   }
-
   /* 11. 伤害闭环:生物的攻击真的能打到玩家
      
      这一条守的是「AI 产出预警几何 → 有人结算」这段。缺它的表现是
-     `WarnGeom` 被造出来又扔掉:生物围着你打、血条不动、不报错。 */
+     `WarnGeom` 被造出来又扔掉:生物围着你打、血条不动、不报错。
+
+     ★ 窗口按**世界秒**给(`hitWindowTicks`),此前写死 400 帧 ——
+     那是旧口径的 20 秒,在 32Hz 下只有 12.5 秒(即"窗口变短",判据强度随之漂移)。 */
+  const hitWindowTicks = secondsToTicks(20);
   const dmg = new WorldSim({ sizeCells: 48 });
   dmg.addPlayer('p1', 24, 24);
   dmg.addMob('mob_lava_elem', 'MEADOW', 24, 26);
-  for (let i = 0; i < 400; i += 1) dmg.tick();
+  for (let i = 0; i < hitWindowTicks; i += 1) dmg.tick();
   const dv = dmg.vitals.get('p1');
   if (!dv) {
     fail('玩家未被登记到 vitals —— 生物攻击将永远不掉血');
   } else if (dmg.hitCount === 0) {
-    fail('生物在旁 400 帧零命中:预警几何未被结算(见 combat/vitals.ts)');
+    fail(`生物在旁 ${hitWindowTicks} 帧零命中:预警几何未被结算(见 combat/vitals.ts)`);
   } else {
     pass(`伤害闭环可达:岩元素命中 ${dmg.hitCount} 次,掉血 ${dv.totalTaken}`);
   }
 
-  /* 12. 对照:没有生物时玩家不掉血 */
+  /* 12. 对照:没有生物时玩家不掉血(窗口与上面**同一个**,配对才可比) */
   const calm = new WorldSim({ sizeCells: 48 });
   calm.addPlayer('p1', 24, 24);
-  for (let i = 0; i < 400; i += 1) calm.tick();
+  for (let i = 0; i < hitWindowTicks; i += 1) calm.tick();
   const cv = calm.vitals.get('p1');
   if (!cv || calm.hitCount !== 0 || cv.hp !== cv.maxHp) {
     fail(`无生物却掉血(hp=${cv?.hp},命中=${calm.hitCount})—— 伤害结算误伤了空世界`);
@@ -6471,7 +6860,10 @@ async function checkIntegration(): Promise<void> {
     const r = mover.mobHost.runtimeOf(id)!;
     startPos.set(id, { x: r.x, y: r.y });
   }
-  for (let i = 0; i < 300; i += 1) mover.tick();
+  /* 窗口 = 15 世界秒(此前写死 300 帧 = 旧口径的 15 秒 —— 「1.8 格/60 秒」那类实测
+     读数都是**世界秒**口径,窗口跟着世界秒走才可比)。 */
+  const wanderTicks = secondsToTicks(15);
+  for (let i = 0; i < wanderTicks; i += 1) mover.tick();
   let movedCount = 0;
   for (const [id, p0] of startPos) {
     const r = mover.mobHost.runtimeOf(id)!;
@@ -6479,10 +6871,11 @@ async function checkIntegration(): Promise<void> {
   }
   if (movedCount === 0) {
     fail(
-      `5 只生物 300 帧全部原地不动 —— 游荡逻辑未生效(方案 D 的 FSM 基础移动可能又断了)`,
+      `5 只生物 ${wanderTicks} 帧(${ticksToSeconds(wanderTicks).toFixed(0)} 世界秒)`
+      + `全部原地不动 —— 游荡逻辑未生效(方案 D 的 FSM 基础移动可能又断了)`,
     );
   } else {
-    pass(`生物会动:300 帧内 ${movedCount}/5 只产生位移(游荡或追猎)`);
+    pass(`生物会动:${wanderTicks} 帧内 ${movedCount}/5 只产生位移(游荡或追猎)`);
   }
 
   /* 11c. 举投**经编排层可达**(而不是只在单测里可用)
@@ -6532,7 +6925,9 @@ async function checkIntegration(): Promise<void> {
   } else {
     /* 手册 §2.2 的投掷初速度:水平 8.5 格/秒、垂直 +6.0 格/秒 */
     const okSpeed = Math.abs(thrown.vx - 8.5) < 1e-6 && Math.abs(thrown.vz - 6.0) < 1e-6;
-    for (let i = 0; i < 40; i += 1) cs2.tick();
+    /* 窗口 = 2 世界秒(与下面那条「冷却 2 秒后仍未解冻」同一口径;
+       此前写死 40 帧 —— 那是旧口径的 2 秒,在 32Hz 下只有 1.25 秒)。 */
+    for (let i = 0; i < secondsToTicks(2); i += 1) cs2.tick();
     if (!okSpeed) {
       fail(`投掷初速度不符手册 §2.2:vx=${thrown.vx} vz=${thrown.vz}(应 8.5 / 6.0)`);
     } else if (cs2.carry.isOnCooldown('a')) {
@@ -6573,13 +6968,17 @@ async function checkIntegration(): Promise<void> {
   watchSub('physics', 'step');
   watchSub('bus', 'drain');
   watchSub('spawner', 'canSpawn');
-  /* ⚠️ 400 帧(= 40 个慢帧)而不是 40 帧(2026-11-14):刷怪改成
-     「按配表速率累加预算」之后,`canSpawn` 不再每慢帧都被调用 ——
+  /* ⚠️ 窗口**按慢帧数**给(40 个慢帧),快帧数是派生的:
+     刷怪改成「按配表速率累加预算」之后,`canSpawn` 不再每慢帧都被调用 ——
      4 个慢帧的预算只有 `spawnsPerCheck('MEADOW') × 4` = 0.15 只,
-     于是它**一次都没被调用**,本条当场红(并连带让「跨 WS 集成」从 38 掉到 37)。
+     于是它**一次都没被调用**,本条当场红(并连带让「跨 WS 集成」掉一格)。
      40 个慢帧的预算 = 1.5 ⇒ 至少一次 `trySpawnOne` ⇒ 计数 > 0。
-     这不是放宽判据:「调用计数 > 0」这条命题没变,变的只是驱动窗口的长度。 */
-  for (let i = 0; i < 400; i += 1) drv.tick();
+     这不是放宽判据:「调用计数 > 0」这条命题没变,变的只是驱动窗口的长度。
+     ★ 2026-11-25:tick 率改成 32Hz 时,这里原来写死的 400 帧从
+     「40 个慢帧」变成了「25 个慢帧」⇒ 预算掉到 0.94 ⇒ **假红**(实测过)。
+     现在写 `40 × TICK_HZ × SLOW_DT`,改 tick 率时它自己跟着走。 */
+  const spawnDriveTicks = Math.round(40 * TICK_HZ * SLOW_DT);
+  for (let i = 0; i < spawnDriveTicks; i += 1) drv.tick();
   const dead = [...counts.entries()].filter(([, n]) => n === 0).map(([k]) => k);
   if (dead.length > 0) {
     fail(
@@ -6626,7 +7025,9 @@ async function checkIntegration(): Promise<void> {
   let crossed = -1;
   let wx = wr.x;
   let wy = wr.y;
-  for (let i = 1; i <= 400 && crossed < 0; i += 1) {
+  /* 窗口 = 20 世界秒(此前写死 400 帧 = 旧口径的 20 秒)。 */
+  const wallTicks = secondsToTicks(20);
+  for (let i = 1; i <= wallTicks && crossed < 0; i += 1) {
     wall.tick();
     /* 线段级细分:两帧之间才是可能穿越的地方 */
     const dist = Math.hypot(wr.x - wx, wr.y - wy);
@@ -6646,7 +7047,8 @@ async function checkIntegration(): Promise<void> {
   if (crossed > 0) {
     fail(`穿山甲在第 ${crossed} 帧进入了墙格 [24,25)×[28,29)—— 扫掠夹取失效`);
   } else {
-    pass(`防穿墙生效:1 格厚的墙 400 帧无穿越(终点 x=${wr.x.toFixed(2)},绕行而非穿透)`);
+    pass(`防穿墙生效:1 格厚的墙 ${wallTicks} 帧(${ticksToSeconds(wallTicks).toFixed(0)} 世界秒)`
+      + `无穿越(终点 x=${wr.x.toFixed(2)},绕行而非穿透)`);
   }
 
   /* 14. 流体扩散不随世界面积变慢
@@ -6755,7 +7157,10 @@ async function checkIntegration(): Promise<void> {
     evoSeen.add(k);
     return evoOrig(k, p);
   };
-  for (let i = 0; i < 120; i += 1) evo.tick();
+  /* 窗口 = 6 世界秒(此前写死 120 帧 = 旧口径的 6 秒);两段窗口**同一个**,
+     配对对照才可比(下面 A/B 两条路径跑同样的驱动量)。 */
+  const evoTicks = secondsToTicks(6);
+  for (let i = 0; i < evoTicks; i += 1) evo.tick();
   const beforeInteract = evoSeen.size;
   /* 经编排层交互 + 受击 */
   const evoItems = [ITEM.INFLATE_HAMMER, ITEM.BERRY, ITEM.PEACH, ITEM.WATER_GUN, ITEM.HOOK,
@@ -6772,7 +7177,7 @@ async function checkIntegration(): Promise<void> {
      下一次 `tick()` 就会把它清空。第一版把它放在两次 tick 之后读,
      结果永远是空数组(门禁因此恒绿)。 */
   const attrSnap = [...evo.mobHost.frameEmits];
-  for (let i = 0; i < 120; i += 1) evo.tick();
+  for (let i = 0; i < evoTicks; i += 1) evo.tick();
   /* ⚠️ 判据不能是「事件种类比之前多」——**光 tick 也会自然产生新事件**
      (蝎子钻出、姜饼小人逃逸都有计时器),所以「增长」不是交互生效的证据。
      实测:把 interactMob 注入成永远返回 false,种类仍从 4 涨到 5,
@@ -8554,6 +8959,14 @@ checkClientTrust();
 checkWhitelistCross();
 /* ★ PERF U3:三条 `not-in-manual` 的**标签**降级(纯文本核对,不跑基准)。 */
 checkPerfTagDemotions();
+/* ★ 2026-11-25(tick 口径硬化):**扫** `scripts/**` 里写死的 tick 率/帧长。
+   为什么无条件跑(连 `--only` / `--docs` / `--frozen` 也跑):
+     它只读文件,不依赖测试结果,也不依赖任何 producer ——
+     「口径是否一致」是**局部也成立**的命题(`--only WS-01` 期间那句
+     `TICK_HZ = 20` 一样是错的)。放行条件越多,漏改的地方就越晚被发现。
+   为什么排在这里:与 `checkPerfTagDemotions()` / `checkDynamicImportBoundary()`
+     同一族(纯文本判据),紧挨着读更容易对照。 */
+checkTickConvention();
 /* ★ 动态 `import()` 不跟踪 —— **显式接受**的边界(每次输出都说明它仍然成立)。 */
 checkDynamicImportBoundary();
 /* ★ 客户端构建 —— 补「boot.ts 零测试覆盖」这个结构性缺口。

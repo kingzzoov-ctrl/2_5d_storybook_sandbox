@@ -8,7 +8,7 @@ import { test, ok, eq, near, includes, inRange, report } from '../shared/testing
 import { mulberry32 } from '../shared/testing/harness.ts';
 import { MOB_LIST, MOB_BY_ID, hostileMobs, tameableMobs } from '../shared/constants/mobs.ts';
 import { Biome, MobBehavior } from '../shared/types/entities.ts';
-import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ, secondsToTicks } from '../shared/types/physics.ts';
 
 import {
   AoiManager, AOI_WAKE_DISTANCE, isInsideAoi, chunkKeyOf, estimateAoiScanCost,
@@ -30,7 +30,7 @@ import {
   BAT_FALL_SEC, CHOCO_MELT_FLOOR,
   GINGER_ESCAPE_SEC, KNIGHT_PARALYZE_SEC, SAMURAI_FRONT_ARC_DEG,
   TANUKI_REVEAL_DISTANCE, ITEM, DamageKind, THUNDER_HELM_STACK_MAX,
-  HARPY_GUST_FORCE,
+  HARPY_GUST_FORCE, HARPY_ENSEMBLE_SEC, SCORPION_BURROW_SEC,
   createMobAi, isHostile,
   type MobRuntime, type MobWorld, type WorldPlayer, type GroundItem,
 } from '../server/src/mobs/behaviors.ts';
@@ -314,13 +314,18 @@ test('W4-13 FSM 三态:IDLE → ALERT → TELEGRAPH → 结算 → 回 ALERT', (
   }
   eq(resolved, 1, `单次预警在 ${frames} 帧内只结算一次`);
   eq(fsm.state, MobFsmState.ALERT_FLEE_OR_CHASE, '结算后回 ALERT');
-  /* 攻击后摇保证不会同帧连发:再推进 20 帧(1.0s),后摇 1.2s 未结束 → 不再结算 */
+  /* 攻击后摇 1.2s:推进 1.0 秒(秒数写死的是**时长**,帧数由 secondsToTicks 派生)
+     → 后摇未结束,不再结算 */
   let after = 0;
-  for (let i = 0; i < 20; i += 1) if (fsm.tick({ x: fsm.x, y: fsm.y }, noWall)) after += 1;
+  for (let i = 0; i < secondsToTicks(1.0); i += 1) {
+    if (fsm.tick({ x: fsm.x, y: fsm.y }, noWall)) after += 1;
+  }
   eq(after, 0, '后摇期间(1.0s < 1.2s)不重复结算');
-  /* 越过 1.2s 后摇,才允许下一轮起手 */
+  /* 越过 1.2s 后摇 + 一轮 0.8s 预警 = 2.0s,才允许下一轮起手并结算 */
   let next = 0;
-  for (let i = 0; i < 40; i += 1) if (fsm.tick({ x: fsm.x, y: fsm.y }, noWall)) next += 1;
+  for (let i = 0; i < secondsToTicks(2.0); i += 1) {
+    if (fsm.tick({ x: fsm.x, y: fsm.y }, noWall)) next += 1;
+  }
   eq(next, 1, '后摇结束后恰好起手并结算第二轮一次');
 });
 
@@ -441,9 +446,11 @@ test('W4-23 野猪:蓄力 1s → 直线冲锋 6 格 → 撞墙自晕 3s', () => 
    * note 原文见 `shared/constants/mobs.ts:32`「原地刨蹄蓄力 1 秒」. */
   eq(rt.mem.windup, 1.0, '蓄力 = 1.0s(手册 §5)');
   const x0 = rt.x;
-  for (let i = 0; i < 19; i += 1) ai.tick(rt, world, DT);
+  /* 转冲锋发生在第 `BOAR_WINDUP_SEC / DT + 1` 帧(phase 1 每帧扣 dt,第 1 帧只建计时);
+     帧数由秒派生(1.0s → 20Hz = 21 帧,32Hz = 33 帧),不再写死 19/20。 */
+  const windupTicks = secondsToTicks(rt.mem.windup) + 1;
+  for (let i = 0; i < windupTicks - 2; i += 1) ai.tick(rt, world, DT);
   near(rt.x, x0, 1e-9, '蓄力期间原地不动');
-  /* 第 20 帧正好 1.0s → 转冲锋 */
   ai.tick(rt, world, DT);
   eq(rt.mem.phase, 2, '切换为冲锋');
 
@@ -606,13 +613,15 @@ test('W4-29 姜饼小人:10 秒逃逸计时 + 飞索钩回', () => {
 /* task-86:10.0 来自手册 §5「`GINGER_ESCAPE_SEC` | 10.0 | 秒 | 同上「10 秒逃逸」」. */
   eq(rt.mem.escapeTimer + DT, 10.0, '起始严格为 10.00s,未多扣(手册 §5)');
 
-  /* 逃逸必须发生在恰好第 200 个 20Hz tick(= 10.00s)。 */
+  /* 逃逸必须发生在恰好 `GINGER_ESCAPE_SEC`(秒)后 —— 帧数由 secondsToTicks 派生
+     (20Hz = 200 帧,32Hz = 320 帧),不再写死 200。 */
+  const escapeTicks = secondsToTicks(GINGER_ESCAPE_SEC);
   let escapeTick = -1;
-  for (let i = 1; i < 400; i += 1) {
+  for (let i = 1; i < escapeTicks * 2; i += 1) {
     ai.tick(rt, world, DT);
     if (rt.mem.escaped) { escapeTick = i + 1; break; }
   }
-  eq(escapeTick, 200, '逃逸计时精确落在第 200 tick');
+  eq(escapeTick, escapeTicks, `${GINGER_ESCAPE_SEC}s 逃逸精确落在第 ${escapeTicks} tick`);
   eq(rt.alive, false, '消失');
   ok(world.events.includes('ginger_escaped'), '触发逃逸事件');
   ok(world.spawned.filter((s) => s.id === 128).length >= 9, '边跑边掉糖果(≥9 份)');
@@ -622,7 +631,7 @@ test('W4-29 姜饼小人:10 秒逃逸计时 + 飞索钩回', () => {
   const rt2 = makeRuntime('mob_ginger_imp');
   const ai2 = createMobAi(rt2.def);
   ai2.tick(rt2, world2, DT);
-  for (let i = 0; i < 60; i += 1) ai2.tick(rt2, world2, DT); /* 跑到 3 秒 */
+  for (let i = 0; i < secondsToTicks(3); i += 1) ai2.tick(rt2, world2, DT); /* 跑到 3 秒 */
   const t3 = rt2.mem.escapeTimer;
   eq(ai2.onInteract(rt2, world2, ITEM.HOOK, makePlayer()), true, '钩爪生效');
   eq(rt2.mem.hooked, 1, '被钩中');
@@ -679,9 +688,9 @@ test('W4-31 竖琴风精鸟:合奏送星辰碎片', () => {
     true, '恰好在 35° 边界线上命中');
   eq(insideWarn(gusts[0], 0, 3), false, '90° 方向在扇形外');
   eq(insideWarn(gusts[0], 7, 0), false, '超出 6 格长度');
-  /* 合奏 5 秒(20Hz × 5s = 100 帧) */
+  /* 合奏满 `HARPY_ENSEMBLE_SEC`(秒)→ 帧数由 secondsToTicks 派生(32Hz = 160 帧) */
   let got = false;
-  for (let i = 0; i < 100; i += 1) {
+  for (let i = 0; i < secondsToTicks(HARPY_ENSEMBLE_SEC); i += 1) {
     if (ai.ensemble(rt, world, DT, 253)) { got = true; break; }
   }
   eq(got, true, '合奏满 5 秒触发馈赠');
@@ -695,8 +704,8 @@ test('W4-32 火灵:遇水固化黑曜石、走过草地变焦炭', () => {
   const world = makeWorld();
   const rt = makeRuntime('mob_lava_elem', { x: 3, y: 3 });
   const ai = createMobAi(rt.def);
-  /* 走动 1 秒 → 焦炭地形 */
-  for (let i = 0; i < 20; i += 1) ai.tick(rt, world, DT);
+  /* 走动 1 秒 → 焦炭地形(帧数由秒派生) */
+  for (let i = 0; i < secondsToTicks(1); i += 1) ai.tick(rt, world, DT);
   ok(world.floors.size >= 9, `地形被改写为焦炭(实际 ${world.floors.size} 格)`);
   ok([...world.floors.values()].includes(320), '写入炙热烫脚火炭砖');
 
@@ -826,8 +835,9 @@ test('W4-37 毒尾蝎:潜伏沙下 + 引水逼现形 + 毒液球几何', () => {
   ai.tick(rt, world, DT);
   eq(rt.mem.buried, 1, '潜伏沙下');
   eq(rt.mem.visible, 0, '不可见');
-  /* 5 秒后钻出 */
-  for (let i = 0; i < 100; i += 1) ai.tick(rt, world, DT);
+  /* 潜伏时长 `SCORPION_BURROW_SEC` = 5 秒(behaviors.ts `buriedAt += dt`)⇒
+     帧数由 secondsToTicks 派生(32Hz = 160 帧);旧写法 100 帧只在 20Hz 下是 5 秒。 */
+  for (let i = 0; i < secondsToTicks(SCORPION_BURROW_SEC); i += 1) ai.tick(rt, world, DT);
   eq(rt.mem.ambush, 1, '钻出突袭一次');
   /* 引水 → 强制现形 */
   const rt2 = makeRuntime('mob_scorpion');
@@ -922,7 +932,10 @@ test('W4-41 其余生物分支:绵羊/果冻怪/花栗鼠/河蟹/萤火蛙/云�
   const aiq = createMobAi(rq.def);
   aiq.tick(rq, makeWorld(), DT);
   ok(rq.mem.hopZ > 0, '跳跃抛物线离地');
-  for (let i = 0; i < 30; i += 1) aiq.tick(rq, makeWorld(), DT);
+  /* 藏松果发生在跳跃周期结束时(behaviors.ts `SquirrelAi`:`dt / 1.2` ⇒ 周期 1.2 秒);
+     帧数按 DT 派生(1.2s / DT → 32Hz = 39 帧),不再写死 30。 */
+  const hopTicks = Math.ceil(1.2 / DT);
+  for (let i = 0; i < hopTicks; i += 1) aiq.tick(rq, makeWorld(), DT);
   eq(rq.mem.stored, 1, '藏 1 颗松果到树洞');
 
   /* 铁钳河蟹:横移偏向 */

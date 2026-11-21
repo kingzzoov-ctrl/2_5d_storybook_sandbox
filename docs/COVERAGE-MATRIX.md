@@ -38,12 +38,12 @@ node scripts/coverage-matrix.ts --write    # 重写 §1/§2/§3 三块(保留人
 三档判据的**定义**在 `scripts/coverage-matrix.ts` 文件头(含优先级与边界),这里只抄结果:
 
 <!-- GEN:STATS:BEGIN -->
-total = 2495
-behavior = 1312
+total = 2508
+behavior = 1331
 symbol-only = 15
-none = 1168
+none = 1162
 none-prodref-positive = 289
-none-prodref-zero = 879
+none-prodref-zero = 873
 src-files = 101
 <!-- GEN:STATS:END -->
 
@@ -477,8 +477,8 @@ server/src/combat/revive.ts | v | behavior | BUBBLE_GUN_SHOTS BUBBLE_STACK_WINDO
 server/src/combat/revive.ts | v | none | GHOST_BUBBLE_MIN_SEC GHOST_DRIFT_SPEED GHOST_MOVE_MUL MANUAL_REVIVE_INVULN
 server/src/combat/revive.ts | t | behavior | DownedState EquipmentSnapshot
 server/src/combat/revive.ts | t | none | GhostBubbleTick RangedReviveInput ReviveResult TouchReviveInput TouchReviveOutcome
-server/src/combat/vitals.ts | v | behavior | CONTENT_MAX_MOB_LEVEL MOB_HIT_MAX_DAMAGE PLAYER_BASE_HP VitalsSystem mobHitDamage resolveStrikes
-server/src/combat/vitals.ts | v | none | BLIND_VIEW_MUL ELEMENT_RESIST_NEUTRAL EVENT_BLIND_RULES EVENT_STRIKE_RULES MAX_ELEMENT_RESIST_MUL MOB_HIT_BASE MOB_HIT_PER_LEVEL MOB_HIT_RADIUS_SLACK PLAYER_IFRAME_SEC PLAYER_REGEN_DELAY_SEC PLAYER_REGEN_PER_SEC collectEventBlinds collectEventStrikes eventStrikeRule explainMiss warnHitsPlayer
+server/src/combat/vitals.ts | v | behavior | CONTENT_MAX_MOB_LEVEL MOB_HIT_MAX_DAMAGE PLAYER_BASE_HP PLAYER_IFRAME_SEC PLAYER_REGEN_DELAY_SEC VitalsSystem mobHitDamage resolveStrikes
+server/src/combat/vitals.ts | v | none | BLIND_VIEW_MUL ELEMENT_RESIST_NEUTRAL EVENT_BLIND_RULES EVENT_STRIKE_RULES MAX_ELEMENT_RESIST_MUL MOB_HIT_BASE MOB_HIT_PER_LEVEL MOB_HIT_RADIUS_SLACK PLAYER_REGEN_PER_SEC collectEventBlinds collectEventStrikes eventStrikeRule explainMiss warnHitsPlayer
 server/src/combat/vitals.ts | t | none | MobHitResult PendingStrike PlayerVitals VitalsFrameStats
 server/src/combat/weapons.ts | v | behavior | ARMORS ARMOR_BY_ID BASE_CRIT_DMG BREACH_PICK COMBAT_CONSUMABLES COMBAT_ITEM_INDEX COMBAT_ITEM_RANGE DEAD_ELEMENTS ELEMENTS ELEMENT_COUNTER ELEMENT_COUNTER_MUL ELEMENT_MATRIX_VALUES ELEMENT_REVERSE_MUL Element MAX_COMBO_MUL MAX_CRIT_DMG MAX_DODGE_RATE PRANK_HAMMER_KNOCKBACK SET_BONUSES SkillShape WEAPONS WEAPON_BY_ID activeSets applyForgeTierBonus combatantStats elementMul equipSummary forgeTierBonusOf levelDamageMul skillOf weaponById
 server/src/combat/weapons.ts | v | none | ARMOR_SLOTS ArmorSlot BASE_CRIT_RATE CONSUMABLE_BY_ID CombatItemKind ConsumableKind DamageType ELEMENT_LABEL ELEMENT_NEUTRAL_MUL ELEMENT_SELF_MUL FORGE_TIER_STAT_BONUS KAIROS_CRIT_BONUS MAX_CRIT_RATE TAUNT_RADIUS WEAPON_ITEM_BASE_ATK WeaponKind emptySummary forgeTierIndexOf sanitizeComboMul sanitizeMul
@@ -523,9 +523,9 @@ server/src/mobs/aoi.ts | v | behavior | AOI_WAKE_DISTANCE AoiManager chunkKeyOf 
 server/src/mobs/aoi.ts | v | none | AOI_EPS AOI_WAKE_DISTANCE_SQ DORMANT_TICK_HZ
 server/src/mobs/aoi.ts | t | behavior | AoiPlayer
 server/src/mobs/aoi.ts | t | none | AoiMobRecord AoiStats
-server/src/mobs/behaviors.ts | v | behavior | BEETLE_FRONT_DR BOAR_CHARGE_TILES BOAR_SELF_STUN_SEC BOAR_WINDUP_SEC CHOCOBO_TAME_WHEAT CHOCO_MELT_FLOOR DamageKind GINGER_ESCAPE_SEC ITEM SAMURAI_FRONT_ARC_DEG TANUKI_REVEAL_DISTANCE createMobAi isHostile
+server/src/mobs/behaviors.ts | v | behavior | BEETLE_FRONT_DR BOAR_CHARGE_TILES BOAR_SELF_STUN_SEC BOAR_WINDUP_SEC CHOCOBO_TAME_WHEAT CHOCO_MELT_FLOOR DamageKind GINGER_ESCAPE_SEC HARPY_ENSEMBLE_SEC ITEM SAMURAI_FRONT_ARC_DEG SCORPION_BURROW_SEC TANUKI_REVEAL_DISTANCE createMobAi isHostile
 server/src/mobs/behaviors.ts | v | symbol-only | TAMEABLE_AI_IDS
-server/src/mobs/behaviors.ts | v | none | BAT_FALL_SEC BAT_RING_RADIUS BAT_RING_WIDTH BEAVER_DAM_MAX BEAVER_STEAL_TILES BEETLE_FLIP_SEC BEETLE_FRONT_ARC_DEG BOAR_CHARGE_SPEED BaseMobAi BatAi BeaverAi BeetleAi BoarAi CAPYBARA_HEAL_AURA_RADIUS CAPYBARA_HEAL_MUL CAPYBARA_REFLECT_HEARTS CHOCOBO_HONEY_SLOW CHOCOBO_MOUNT_SPEED_MUL CHOCO_ARMOR CapybaraAi ChocoGolemAi ChocoboAi ClockKnightAi CrabRiverAi DefaultMobAi FIRE_PEPPER_ARROW FROG_LIGHT_RADIUS FROG_TONGUE_RANGE GINGER_CANDY GingerImpAi GlowFrogAi HARPY_CLIFF_MARGIN HARPY_ENSEMBLE_SEC HARPY_GUST_FORCE HarpyAi INSTRUMENT_IDS INSTRUMENT_MAX INSTRUMENT_MIN KNIGHT_FRONT_DR KNIGHT_KEY_ARC_DEG KNIGHT_PARALYZE_SEC LAVA_BURN_RADIUS LAVA_SHIELD_HP LavaElemAi MANTA_BACK_RADIUS MANTA_GLIDE_SPEED MIMIC_BITE_RANGE MIMIC_EXPOSE_SEC MOB_AI_FACTORY MimicCogAi NOCTURNAL_MOBS PANGOLIN_ROLL_SPEED PANGOLIN_STUN_SEC PUDDING_CARAMEL_RADIUS PUDDING_CARAMEL_SEC PUDDING_HEAL_AMOUNT PUDDING_HEAL_RADIUS PangolinAi PuddingMageAi SAMURAI_BURN_SEC SCORPION_BURROW_SEC SCORPION_POISON_RADIUS SamuraiAi ScorpionAi SheepAi SkyMantaAi SlimeAi SquirrelAi TANUKI_MIST_FRUIT THUNDER_HELM_ATK_SPEED_STACK THUNDER_HELM_STACK_MAX THUNDER_LINK_RADIUS THUNDER_LINK_TARGETS TanukiAi ThunderSpriteAi isInstrument noDamage
+server/src/mobs/behaviors.ts | v | none | BAT_FALL_SEC BAT_RING_RADIUS BAT_RING_WIDTH BEAVER_DAM_MAX BEAVER_STEAL_TILES BEETLE_FLIP_SEC BEETLE_FRONT_ARC_DEG BOAR_CHARGE_SPEED BaseMobAi BatAi BeaverAi BeetleAi BoarAi CAPYBARA_HEAL_AURA_RADIUS CAPYBARA_HEAL_MUL CAPYBARA_REFLECT_HEARTS CHOCOBO_HONEY_SLOW CHOCOBO_MOUNT_SPEED_MUL CHOCO_ARMOR CapybaraAi ChocoGolemAi ChocoboAi ClockKnightAi CrabRiverAi DefaultMobAi FIRE_PEPPER_ARROW FROG_LIGHT_RADIUS FROG_TONGUE_RANGE GINGER_CANDY GingerImpAi GlowFrogAi HARPY_CLIFF_MARGIN HARPY_GUST_FORCE HarpyAi INSTRUMENT_IDS INSTRUMENT_MAX INSTRUMENT_MIN KNIGHT_FRONT_DR KNIGHT_KEY_ARC_DEG KNIGHT_PARALYZE_SEC LAVA_BURN_RADIUS LAVA_SHIELD_HP LavaElemAi MANTA_BACK_RADIUS MANTA_GLIDE_SPEED MIMIC_BITE_RANGE MIMIC_EXPOSE_SEC MOB_AI_FACTORY MimicCogAi NOCTURNAL_MOBS PANGOLIN_ROLL_SPEED PANGOLIN_STUN_SEC PUDDING_CARAMEL_RADIUS PUDDING_CARAMEL_SEC PUDDING_HEAL_AMOUNT PUDDING_HEAL_RADIUS PangolinAi PuddingMageAi SAMURAI_BURN_SEC SCORPION_POISON_RADIUS SamuraiAi ScorpionAi SheepAi SkyMantaAi SlimeAi SquirrelAi TANUKI_MIST_FRUIT THUNDER_HELM_ATK_SPEED_STACK THUNDER_HELM_STACK_MAX THUNDER_LINK_RADIUS THUNDER_LINK_TARGETS TanukiAi ThunderSpriteAi isInstrument noDamage
 server/src/mobs/behaviors.ts | t | behavior | GroundItem
 server/src/mobs/behaviors.ts | t | symbol-only | DamageResult WorldPlayer
 server/src/mobs/behaviors.ts | t | none | MobAiFactory MobMem MobRuntime MobWorld
@@ -538,7 +538,7 @@ server/src/mobs/fsm.ts | t | none | FsmConfig SteerResult TelegraphState
 server/src/mobs/geometry.ts | v | behavior | WARN_SHAPES circleWarn insideWarn insideWarn3D insideWarnZ pointerAngleDeg pointerWarn rectWarn ringWarn sectorWarn
 server/src/mobs/geometry.ts | v | none | DEG GEOM_EPS WarnShape angleDiffDeg angleToDeg makeWarn rayWarn rejectByBounds unit warnBoundsRadius wrapDeg
 server/src/mobs/geometry.ts | t | none | WarnGeom
-server/src/mobs/host.ts | v | behavior | MOB_CORPSE_FRAMES MobHost
+server/src/mobs/host.ts | v | behavior | BOSS_AI_DT_SEC BOSS_AI_RATE_HZ FAST_FRAME_HZ MOB_AI_DT_SEC MOB_AI_RATE_HZ MOB_CORPSE_FRAMES MOB_CORPSE_SEC MobHost frameSecondsAtRate frameStrideAtRate tickDueAtRate ticksInWindow
 server/src/mobs/host.ts | t | none | MobHostFrameStats MobHostOptions MobHostWorld MobTickResult
 server/src/mobs/spawner.ts | v | behavior | BIOME_SPAWN GLOBAL_MOB_CAP MobSpawner NIGHT_BRICK_ID NOCTURNAL STREET_LAMP_ID STREET_LAMP_RADIUS SpawnReject TOWN_SAFE_RADIUS applySafeZoneShield biomeCoverage decideSpawn inSafeZone isInsideSafeRadius isNocturnal lightSuppressed mobInstanceId nightGateAllows safeZoneShield setTownRadiusProvider spawnableMobs townSafeRadiusFor
 server/src/mobs/spawner.ts | v | none | MOB_INSTANCE_SEP NIGHT_BRICK_RADIUS SAFE_SHIELD_MULT SPAWNER_MOB_TOTAL mobDefOf mobSpeciesId spawnsPerCheck
@@ -595,8 +595,8 @@ server/src/net/actions/use_own_chest.ts | v | behavior | useOwnChest
 server/src/net/actions/wire_edit.ts | v | behavior | wireAt wiresOfRoom
 server/src/net/actions/wire_edit.ts | v | none | wireEdit
 server/src/net/actions/wire_edit.ts | t | none | RoomWires WireEdge
-server/src/net/anticheat.ts | v | behavior | AntiCheatRoom BASE_ATTACK_INTERVAL_S DEFAULT_LIMITS InventoryReject ItemSourcePurpose MAX_ATTACK_SPEED_BONUS MAX_ITEM_DELTA_PER_TICK MAX_MOVE_CATCHUP_TICKS MAX_SPEED_BONUS_MUL SPEED_WINDOW_TICKS SPEED_WINDOW_TOLERANCE VIOLATION_KEEP_PER_PLAYER VIOLATION_LOG_CAPACITY VIOLATION_SCORE_DECAY_PER_TICK VIOLATION_SCORE_KICK VIOLATION_WEIGHT ViolationKind advanceServerClock checkAttack checkInventory checkMove commitAttack createAcState decayScore fixedClock maxDisplacementPerTick mergeLimits parseItemSourceToken previewAttack restoreMoveWindow snapshotMoveWindow
-server/src/net/anticheat.ts | v | none | DEFAULT_FRAME_DT_SECONDS TELEPORT_SLACK looksLikeItemSourceToken mintItemSourceToken
+server/src/net/anticheat.ts | v | behavior | AntiCheatRoom BASE_ATTACK_INTERVAL_S DEFAULT_FRAME_DT_SECONDS DEFAULT_LIMITS FRAME_SECONDS InventoryReject ItemSourcePurpose MAX_ATTACK_SPEED_BONUS MAX_ITEM_DELTA_PER_TICK MAX_MOVE_CATCHUP_TICKS MAX_SPEED_BONUS_MUL SPEED_WINDOW_SECONDS SPEED_WINDOW_TICKS SPEED_WINDOW_TOLERANCE TELEPORT_SLACK VIOLATION_KEEP_PER_PLAYER VIOLATION_LOG_CAPACITY VIOLATION_SCORE_DECAY_PER_TICK VIOLATION_SCORE_KICK VIOLATION_WEIGHT ViolationKind advanceServerClock checkAttack checkInventory checkMove commitAttack createAcState decayScore fixedClock maxDisplacementPerTick mergeLimits parseItemSourceToken previewAttack restoreMoveWindow snapshotMoveWindow
+server/src/net/anticheat.ts | v | none | looksLikeItemSourceToken mintItemSourceToken
 server/src/net/anticheat.ts | t | behavior | FixedClock
 server/src/net/anticheat.ts | t | symbol-only | MoveIntent
 server/src/net/anticheat.ts | t | none | AntiCheatLimits Clock InventoryCheckInput InventoryCheckResult InventoryOp ItemSourceGrant MoveWindowSnapshot PlayerAntiCheatState Verdict Violation
@@ -698,7 +698,7 @@ server/src/world/archive.ts | t | none | ArchiveChunk ArchiveFluidField ArchiveF
 server/src/world/chunk.ts | v | behavior | BARE_GROUND_MU Chunk DIRTY_BYTES DIRTY_WORDS EMPTY_TILE FLOOR_BURN_BY_SLOT FLOOR_DEFAULT_MU FLOOR_META FLOOR_MU_BY_SLOT FLOOR_PALETTE FLOOR_SLOT_MASK FLOOR_SPEED_MUL_BY_SLOT ROOF_BITS ROOF_CAPABLE ROOF_ID_MAX ROOF_META SPEED_MUL_DEFAULT VERTICAL_STACK assertRoofId chunkKey decodeRoofRle encodeRoofRle floorIdOfSlot floorMeta floorMu floorSlotOfId idx inChunkBounds isRoofId muOfSlot popcount32 roofAlphaOf roofSpanOf speedMulOfSlot worldToChunk
 server/src/world/chunk.ts | v | none | BUILDING_MAX BUILDING_MIN CHUNK_MASK CHUNK_SHIFT CHUNK_W DEFAULT_MU FLOOR_BASE_COUNT FLOOR_ID_MAX FLOOR_ID_MIN FLOOR_UGC_FIRST FLOOR_UGC_ID FLOOR_UGC_LAST LAYER_FIELD PACKED_LAYERS SurfaceKind VerticalLayer floorBurn toBytes
 server/src/world/chunk.ts | t | none | FloorMeta LayerSpec RoofMeta TileView WorldToChunk
-server/src/world/fluid.ts | v | behavior | CAP FLUID_CELL_BUDGET FLUID_FRAME_SECONDS FluidField FluidKind OBSIDIAN_ID PHASE_MIN_AMOUNT PUMICE_ID VISCOSITY_FLOW baseOfFluidKind fluidKindOfBase makeSealedPool packFluidAmounts readFluidAmounts
+server/src/world/fluid.ts | v | behavior | CAP FLUID_CELL_BUDGET FLUID_FRAME_SECONDS FLUID_RATE_HZ FluidField FluidKind OBSIDIAN_ID PHASE_MIN_AMOUNT PUMICE_ID VISCOSITY_FLOW baseOfFluidKind fluidKindOfBase makeSealedPool packFluidAmounts readFluidAmounts
 server/src/world/fluid.ts | v | none | FLUID_AMOUNT_HEADER_BYTES FLUID_AMOUNT_MAGIC applyFluidAmounts
 server/src/world/fluid.ts | t | none | FluidAmountsBlob FluidCellInit FluidStepReport
 server/src/world/grid.ts | v | behavior | CanalResult DIR_NAMES DIR_VECTORS WorldGrid digToDeep findCanalIntakes isCanalIntake

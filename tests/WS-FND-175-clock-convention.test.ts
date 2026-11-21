@@ -168,6 +168,22 @@ function checkClockRows(text: string, rel: (p: string) => string[]): string[] {
 /** 读仓库里的一个相对路径(给 `checkClockRows` 用)。 */
 const readLines = (rel: string): string[] => fileLines(rel);
 
+/**
+ * 把**某个字段**那一行的「口径」列改成 `to`(负对照用)。
+ *
+ * ⚠️ 按**字段名**(子串)定位,**不写死 `文件:行`**:表里的行号会随被指向的文件漂
+ * (实测:`world_sim.ts` 一动,写死行号的负对照就恒红 —— 那不是判据,是噪音)。
+ * 字段名对不上 ⇒ 原样返回(调用方的前置断言会红,不会静默放过)。
+ */
+function flipClockOf(text: string, field: string, to: '墙钟' | '游戏秒'): string {
+  const row = parseClockRows(text).find((r) => r.field.includes(field));
+  if (row === undefined) return text;
+  return text.replace(
+    `| ${row.clock} | \`${row.file}:${row.line}\` |`,
+    `| ${to} | \`${row.file}:${row.line}\` |`,
+  );
+}
+
 /* ═══════════════ 3. 声明句 ═══════════════ */
 
 test('FND175-1 ★ 五条声明句**逐字**存在(DECISIONS D-26 + README 口径段)', () => {
@@ -204,7 +220,10 @@ test('FND175-2 ★ 启动打印含倍率:探针真采间隔,打印走共享实�
   ok(printed.includes(String(clockRatio(15.93))), '打印行里的倍率 = 同一份算法算出的值');
   ok(printed.includes(`均值 ${rate.meanMs}ms`) === false, '这是构造出来的读数,与真实样本不是同一份');
   probe.restore();
-  ok(printed.includes('倍率 1.2555'), '打印行里的倍率就是 D-26 那个数(给定 62.77ms ⇒ 可复算)');
+  /* 打印行里的倍率走 `observedFps`(先四舍五入到 2 位)再 `clockRatio` ⇒ 复算也必须走同一口径。 */
+  const ratioFromInterval = Math.round((NOMINAL_TICK_HZ / observedFps(62.77)) * 10_000) / 10_000;
+  ok(printed.includes(`倍率 ${ratioFromInterval}`),
+    `打印行里的倍率 = 标称帧率 ÷ observedFps(62.77)= ${ratioFromInterval}(可由 62.77ms 复算)`);
 });
 
 /* ═══════════════ 5. 清单 ↔ 代码现状 ═══════════════ */
@@ -246,20 +265,24 @@ test('FND175-6 两钟交界处「选一个」:存档稳态走墙钟、世界钟�
 
 test('FND175-4 ★ 倍率可复算(给定间隔 ⇒ 倍率),标称与 DT 同源', () => {
   near(NOMINAL_TICK_MS, DT * 1000, 1e-9, '标称帧间隔必须 = DT × 1000(不造第二份量纲)');
-  eq(NOMINAL_TICK_HZ, 20, '标称帧率 = 20Hz');
+  near(NOMINAL_TICK_HZ, 1 / DT, 1e-9, '标称帧率 = 1 / DT(旧写法写死 20 ⇒ 改 tick 率即红)');
 
+  /* 期望倍率一律**由标称帧率派生**(标称 ÷ 实测),不写字面量 1.2555(那是 20Hz 的数)。 */
+  const ratioAt = (fps: number): number => Math.round((NOMINAL_TICK_HZ / fps) * 10_000) / 10_000;
   eq(observedFps(62.77), 15.93, '1000 / 62.77 ⇒ 15.93fps');
-  eq(clockRatio(15.93), 1.2555, '20 / 15.93 ⇒ 1.2555');
-  eq(clockRatioOfMean(62.77), 1.2555, '给定实测间隔 62.77ms ⇒ 倍率 1.2555(可复算)');
-  eq(clockRatioOfMean(50), 1, '标称间隔 50ms ⇒ 倍率 1(游戏秒 = 墙钟秒)');
-  eq(clockRatioOfMean(100), 2, '间隔 100ms ⇒ 倍率 2(线性)');
+  eq(clockRatio(15.93), ratioAt(15.93), `标称 ${NOMINAL_TICK_HZ}Hz ÷ 15.93fps ⇒ 倍率`);
+  eq(clockRatioOfMean(62.77), ratioAt(observedFps(62.77)), '给定实测间隔 62.77ms ⇒ 倍率可复算');
+  eq(clockRatioOfMean(NOMINAL_TICK_MS), 1, '标称间隔 ⇒ 倍率 1(游戏秒 = 墙钟秒)');
+  eq(clockRatioOfMean(NOMINAL_TICK_MS * 2), 2, '间隔翻倍 ⇒ 倍率 2(与间隔线性)');
   eq(clockRatioOfMean(0), 0, '没有样本 ⇒ 0(不假装 1.0)');
   eq(clockRatio(0), 0, '非正 fps ⇒ 0');
 
   const line = formatTickRateLine('实测节拍', tickRateOf([62.77, 62.77, 62.77]));
   ok(line.includes('均值 62.77ms'), `均值应逐字进打印行(实际:${line})`);
-  ok(line.includes('倍率 1.2555'), `倍率应逐字进打印行(实际:${line})`);
-  ok(line.includes('1200 游戏秒 ≈ 1506.6 墙钟秒'), `1200 游戏秒的墙钟折算要印出来(实际:${line})`);
+  ok(line.includes(`倍率 ${clockRatioOfMean(62.77)}`), `倍率应逐字进打印行(实际:${line})`);
+  const wallSec = Math.round(1_200 * clockRatioOfMean(62.77) * 10) / 10;
+  ok(line.includes(`1200 游戏秒 ≈ ${wallSec} 墙钟秒`),
+    `1200 游戏秒的墙钟折算要印出来(实际:${line})`);
   const empty = formatTickRateLine('实测节拍', tickRateOf([]));
   ok(empty.includes('没采到帧间隔'), `0 样本时必须如实说(实际:${empty})`);
   ok(!empty.includes('倍率 1'), '0 样本时不许印一个假的倍率 1');
@@ -270,12 +293,15 @@ test('FND175-4 ★ 倍率可复算(给定间隔 ⇒ 倍率),标称与 DT 同源'
 test('FND175-5 ★ 文档里的实测数用同一算法复算一致', () => {
   const mean = Number(/tickMean = ([\d.]+)ms/.exec(DECISIONS)?.[1] ?? 'NaN');
   const fps = Number(/fps = ([\d.]+)/.exec(DECISIONS)?.[1] ?? 'NaN');
-  const ratioDoc = Number(/倍率 = 20 \/ ([\d.]+) = ([\d.]+)/.exec(DECISIONS)?.[2] ?? 'NaN');
+  /* ⚠️ 分子是**标称帧率**,会随 tick 率变(20 → 32)⇒ 正则不许写死 20。 */
+  const ratioDoc = Number(/倍率 = [\d.]+ \/ ([\d.]+) = ([\d.]+)/.exec(DECISIONS)?.[2] ?? 'NaN');
   ok(Number.isFinite(mean) && mean > 0, `D-26 必须写出实测均值间隔(实际读到 ${mean})`);
   ok(Number.isFinite(fps) && fps > 0, `D-26 必须写出实测 fps(实际读到 ${fps})`);
   eq(fps, observedFps(mean), '文档里的 fps = 由均值间隔算出的 fps(同一算法)');
   eq(ratioDoc, clockRatioOfMean(mean), '文档里的倍率 = 由同一算法复算出的倍率');
-  ok(DECISIONS.includes('1200 游戏秒 ≈ 1506.6 墙钟秒'), 'D-26 要给出 1200 游戏秒的墙钟折算');
+  const wallDoc = Math.round(1_200 * clockRatioOfMean(mean) * 10) / 10;
+  ok(DECISIONS.includes(`1200 游戏秒 ≈ ${wallDoc} 墙钟秒`),
+    `D-26 要给出 1200 游戏秒的墙钟折算(${wallDoc} 墙钟秒)`);
   ok(DECISIONS.includes('不读挂钟'), '声明句里的「不读挂钟」必须在');
 });
 
@@ -296,19 +322,16 @@ test('FND175-8 ★★ 负对照:删掉声明句 ⇒ 红;把「口径」改反 �
     const missing = missingDeclarations(DECISIONS.replace(d, '(口径已删)'));
     ok(missing.includes(d), `删掉「${d}」必须被报出来(实际缺 ${missing.length} 句)`);
   }
-  /* 反口径 1:墙钟行改成「游戏秒」⇒ needle 里的 nowMs 与口径矛盾。 */
-  const wallFlipped = DECISIONS.replace(
-    '| 墙钟 | `server/src/net/room.ts:163` |',
-    '| 游戏秒 | `server/src/net/room.ts:163` |',
-  );
-  ok(wallFlipped !== DECISIONS, '负对照的前提:墙钟那一行确实被改到(行号快照对不上就该先修表)');
+  /* 反口径 1:墙钟行改成「游戏秒」⇒ needle 里的 nowMs 与口径矛盾。
+     ⚠️ 两处负对照都按**字段名**锚定,不写死 `file:line`:行号会随被指向的文件漂,
+     写死一处就变成「每次改那个文件都要跟着改测试」的脆弱锚点(实测踩过)。 */
+  const wallFlipped = flipClockOf(DECISIONS, '自动存档周期', '游戏秒');
+  ok(wallFlipped !== DECISIONS, '负对照的前提:墙钟那一行确实被改到(字段名对不上就该先修表)');
   ok(checkClockRows(wallFlipped, readLines).some((p) => p.includes('自动存档周期')),
     '墙钟行被改成游戏秒 ⇒ 必须报出「自动存档周期」这一条');
   /* 反口径 2:游戏秒行改成「墙钟」⇒ needle 里没有墙钟原语。 */
-  const gameFlipped = DECISIONS.replace(
-    '| 游戏秒 | `server/src/sim/world_sim.ts:1221` |',
-    '| 墙钟 | `server/src/sim/world_sim.ts:1221` |',
-  );
+  const gameFlipped = flipClockOf(DECISIONS, '跳跃冷却帧数', '墙钟');
+  ok(gameFlipped !== DECISIONS, '负对照的前提:游戏秒那一行确实被改到(按字段名锚定 ⇒ 行号漂了也改得到)');
   ok(checkClockRows(gameFlipped, readLines).some((p) => p.includes('跳跃冷却帧数')),
     '游戏秒行被改成墙钟 ⇒ 必须报出「跳跃冷却帧数」这一条');
   /* 破坏性前提:改坏后的文本必须**确实**被解析成了另一行(否则上面的红是假的)。 */
@@ -319,15 +342,17 @@ test('FND175-8 ★★ 负对照:删掉声明句 ⇒ 红;把「口径」改反 �
 });
 
 test('FND175-9 ★★ 负对照:`文件:行` 挪一行 ⇒ 红,且点名是哪个字段', () => {
-  const drifted = DECISIONS.replace(
-    '`client/src/net/session.ts:54`',
-    '`client/src/net/session.ts:55`',
-  );
+  /* ⚠️ 锚点由**表里那一行**派生(字段名 → 文件/行/needle),不写死行号:
+     写死的话,`session.ts` 一动这条负对照就恒红(噪音),而行号本身不是判据。 */
+  const row = parseClockRows(DECISIONS).find((r) => r.field.includes('连接超时'));
+  ok(row !== undefined, '负对照的前提:D-26 表里有「连接超时」这一行');
+  const anchor = `\`${row!.file}:${row!.line}\``;
+  const drifted = DECISIONS.replace(anchor, `\`${row!.file}:${row!.line + 1}\``);
+  ok(drifted !== DECISIONS, '负对照的前提:那一行的 `文件:行` 确实被挪了一行');
   const problems = checkClockRows(drifted, readLines);
   ok(problems.length > 0, '行号漂了必须红(否则表会静默腐烂)');
   ok(problems.some((p) => p.includes('连接超时')), `报错必须点名字段(实际:${problems.join(' / ')})`);
-  const actual = fileLines('client/src/net/session.ts')
-    .findIndex((l) => l.includes('CONNECT_TIMEOUT_MS = 8000')) + 1;
+  const actual = fileLines(row!.file).findIndex((l) => l.includes(row!.needle)) + 1;
   ok(problems.some((p) => p.includes(`现在在第 ${actual} 行`)),
     `报错要给出现在正确的行号(一步可修;实际:${problems.join(' / ')})`);
 });

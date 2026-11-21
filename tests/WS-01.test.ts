@@ -561,12 +561,14 @@ test('引水渠:挖低 Z0 形成 Z-1 并判定汇水口', () => {
 
 /* ═════════════════ 9. 流体:守恒(核心验收) ═════════════════ */
 
-test('水体守恒:密封水池跑 2000 个 2Hz 帧,总量误差 <1%', () => {
+test('水体守恒:密封水池跑 2000 个流体步,总量误差 <1%', () => {
   const f = makeSealedPool(32, 32, 400);
   const before = f.total();
   const expected = before;
   ok(before > 0, '池中有水');
-  eq(FLUID_FRAME_SECONDS, 0.5, '2Hz 帧长 0.5s');
+  /* ★ owner 裁决(2026-11-21):流体已**独立提频到 8Hz**(`FLUID_RATE_HZ`,
+     不再吃慢帧)⇒ 名义帧长 0.125s。这条断言钉的就是「它不再等于慢帧的 0.5s」。 */
+  eq(FLUID_FRAME_SECONDS, 0.125, '8Hz 独立速率的帧长 0.125s(≠ 慢帧 0.5s)');
 
   /* 真的跑 2000 帧(= 1000 秒模拟时间) */
   let maxDrift = 0;

@@ -49,16 +49,40 @@
  *
  * ⇒ 第 2 条不再需要靠「入站报文限速」兜;`checkMove` 的额度与跳变判据**仍未动**。
  *
+ * ## ★ 本轮追加:节拍改 32Hz / 31.25ms ⇒ 反作弊侧全部改由 `TICK_HZ` 推导
+ *
+ * 帧长、**每帧额度**、**窗口帧数**三处原先各自钉着 20Hz 的字面量(`DT = 0.05` 的读数、
+ * 窗口 20 帧),tick 率一变就会让**每秒**语义漂移(窗口 0.625 秒、合法速被误伤)。
+ * 现在:
+ * ```text
+ * FRAME_SECONDS       = 1 / TICK_HZ           反作弊侧唯一的帧长来源(与 physics#DT 一致)
+ * SPEED_WINDOW_TICKS  = SPEED_WINDOW_SECONDS × TICK_HZ    窗口恒 1 秒(20Hz ⇒ 20,32Hz ⇒ 32)
+ * 每帧额度             = 基线 × 倍率 × FRAME_SECONDS × slack   每秒额度不变(7.2 × 倍率)
+ * ```
+ * 判据侧:不再写死 20 / 0.918 / 0.30 这类与 tick 绑定的字面量,一律改成
+ * 「基线 × 容差」「速度 × 帧长」「窗口帧数」等**由常量推导**的形式(见
+ * `SLOW_RATIO` 的两条界);总判据 = `FND172-16`(32Hz 的每帧额度与 20Hz
+ * **换算回每秒后等价** ⇒ 只是重标定,没有改变游戏性)。
+ * 两条既有锚点**必须**改口径,理由各写在各处:报文率/帧率那一族从 `15.93Hz`
+ * 改成 `SLOW_RATIO × TICK_HZ`(15.93Hz 是 20Hz 标称下的实测值,32Hz 下低于
+ * `1/slack` 会先被单帧额度拦下);`FND172-12` 的「注入后仍被抓」改成
+ * 「判不判**恰好**等于读数 > 上限」(原式在 32Hz 下已不成立:每帧吃满额度的
+ * 作弊者在更慢的实测节拍下**本来就**没超速)。
+ *
  * 运行:`node tests/WS-FND-172-anticheat-clock.test.ts`
  */
 import { eq, near, ok, report, test, mulberry32 } from '../shared/testing/harness.ts';
-import { BASE_MOVE_SPEED, DT } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
 import {
   AntiCheatRoom,
+  DEFAULT_FRAME_DT_SECONDS,
+  FRAME_SECONDS,
   MAX_MOVE_CATCHUP_TICKS,
   MAX_SPEED_BONUS_MUL,
+  SPEED_WINDOW_SECONDS,
   SPEED_WINDOW_TICKS,
   SPEED_WINDOW_TOLERANCE,
+  TELEPORT_SLACK,
   VIOLATION_SCORE_KICK,
   ViolationKind,
   fixedClock,
@@ -69,13 +93,28 @@ import {
 import { AC_FRAME_GAP_MAX_MS } from '../server/src/net/room.ts';
 import { assemble } from '../server/src/index.ts';
 
-/** 窗口上限(格/秒)。 */
+/** 窗口上限(格/秒)= 基线 × 声明倍率 × 容差。 */
 const capOf = (mul: number): number => BASE_MOVE_SPEED * mul * SPEED_WINDOW_TOLERANCE;
 /** 单帧额度(格/帧)= maxDisplacementPerTick。 */
 const quotaOf = (mul: number): number => maxDisplacementPerTick(mul);
+/** 每帧额度(格/帧)的**独立算式**(不经过实现,按给定 tick 率算 = 基线 × 倍率 × 帧长 × slack)。 */
+const quotaAt = (hz: number, mul: number): number => BASE_MOVE_SPEED * mul * (1 / hz) * TELEPORT_SLACK;
 /** 满加成合法玩家的单帧位移。 */
-const LEGIT_STEP = BASE_MOVE_SPEED * DT;                       // mul=1: 0.225
-const QUOTA_MAX = quotaOf(MAX_SPEED_BONUS_MUL);                // 0.918
+const LEGIT_STEP = BASE_MOVE_SPEED * FRAME_SECONDS;            // mul=1
+const QUOTA_MAX = quotaOf(MAX_SPEED_BONUS_MUL);
+
+/**
+ * ★ 「比标称慢一档」的节拍/报文率,取 `TICK_HZ` 的比例(**不写字面量** 15.93Hz ——
+ * 那个数是 20Hz 标称下的实测值,与 tick 率绑定:32Hz 下它同时踩坏两条判据)。
+ *
+ * 0.7 是这个区间的中点,两侧各有一条**由常量推导**的界:
+ *   · 下界 `1 / TELEPORT_SLACK = 0.625` —— 更低则**单包额度**盖不住一包/一帧的位移
+ *     (位移 > 1 帧额度 ⇒ 合法玩家先被判 TELEPORT,测到的就不是窗口了);
+ *   · 上界 `1 / SPEED_WINDOW_TOLERANCE = 0.8` —— 更高则窗口放大倍数 ≤ 容差 ⇒
+ *     `FND172-3` 的「登记」不再成立(那条钉的是**未修**的耦合)。
+ * 两个界都由常量算出,下面 `FND172-16` 显式断言 `SLOW_RATIO` 落在开区间内。
+ */
+const SLOW_RATIO = 0.7;
 
 /** 收集 SPEED 违规的实测均速(解析 detail,便于断言「5.65 还是 4.5」)。 */
 function speedObserved(ac: AntiCheatRoom): number[] {
@@ -107,18 +146,28 @@ test('FND172-1 窗口的时间戳 = 服务端帧号(`s.lastTick`),不是报文�
      它会是「第几条报文」)。 */
   eq(s.window[s.window.length - 1]?.tick, 3 * SPEED_WINDOW_TICKS,
     '窗口末条 tick 必须等于当时的 `s.lastTick`');
-  /* 窗口**最早**一条 = `lastTick - SPEED_WINDOW_TICKS` ⇒ spanTicks 恰好 20(= 名义 1 秒) */
-  eq(s.lastTick - s.window[0].tick, 20,
-    'spanTicks 由**帧号差**给出,应恰为 20 帧(= SPEED_WINDOW_TICKS,期望侧写字面量:常量在 actual 侧同源会是同义反复)');
+  /* 窗口**最早**一条 = `lastTick - speedWindowTicks` ⇒ spanTicks 恰好一个窗口。
+     ★ 判据按**秒**写:窗口恒为 `SPEED_WINDOW_SECONDS` 秒,帧数由 `TICK_HZ` 推导
+     ⇒ 这里同时断言「帧数 = `SPEED_WINDOW_TICKS`」与「换算回秒 = 1」;
+     改 tick 率时第一条随之重标定、第二条**不变** —— 不再钉死字面量 20。 */
+  eq(s.lastTick - s.window[0].tick, SPEED_WINDOW_TICKS,
+    'spanTicks 由**帧号差**给出,应恰为一个窗口(帧数 = SPEED_WINDOW_TICKS)');
+  near((s.lastTick - s.window[0].tick) / TICK_HZ, 1.0, 1e-9,
+    '窗口跨度换算回秒必须恒为 1.0 秒(= `SPEED_WINDOW_SECONDS` 的字面量,与 TICK_HZ 无关)');
   eq(speedObserved(ac).length, 0, `满速合法玩家不得产生 SPEED,实际 ${JSON.stringify(speedObserved(ac))}`);
 });
 
 /* ═══════════ 2. 【关键】报文集低于标称 ⇒ 满速合法玩家不越线 ═══════════ */
 
-test('FND172-2 【关键】报文率 15.93Hz < 标称 20Hz:满速合法玩家不越线', () => {
-  const PACKET_HZ = 15.93;
-  const REAL_DT = 1 / PACKET_HZ;                        // 62.8ms
-  const stepPerPacket = BASE_MOVE_SPEED * REAL_DT;      // 0.2825 格 ⇒ 真实 4.5 格/秒
+test('FND172-2 【关键】报文率低于标称(= SLOW_RATIO × TICK_HZ):满速合法玩家不越线', () => {
+  /* ★ 报文率按 `TICK_HZ` 推导(**不写死 15.93Hz** —— 那是 20Hz 标称下的实测值,
+     32Hz 下 15.93Hz 会低于 `1/TELEPORT_SLACK` 而先被单包额度拦下,测到的就不是窗口。
+     理由与两侧的界见 `SLOW_RATIO` 的注释)。 */
+  const PACKET_HZ = SLOW_RATIO * TICK_HZ;
+  const REAL_DT = 1 / PACKET_HZ;
+  const stepPerPacket = BASE_MOVE_SPEED * REAL_DT;      // 一包一帧的真实位移(⇒ 真实 4.5 格/秒)
+  ok(stepPerPacket <= quotaOf(1),
+    `前提:一包位移 ${stepPerPacket.toFixed(4)} 必须在单帧额度 ${quotaOf(1).toFixed(4)} 内`);
   const ac = new AntiCheatRoom();
   ac.join('p', 0, 0, 0, 0);
   const clock: FixedClock = fixedClock(0);              // 假时钟驱动两条节拍
@@ -140,25 +189,28 @@ test('FND172-2 【关键】报文率 15.93Hz < 标称 20Hz:满速合法玩家不
   eq(ac.get('p')?.kicked, false, '更不得因此累计到踢出');
 
   /* 负对照:旧口径(时间轴 = 报文条数)在**同一条轨迹**上必然越线 ——
-     窗口保留 20 **条报文**(spanTicks = 20),分母却按 1 tick = 50ms 记:
-       observed = (20 × 0.2825) / (20 × 0.05) = 5.65 > 上限 5.625 */
-  const oldAxisObserved = (stepPerPacket * SPEED_WINDOW_TICKS) / (SPEED_WINDOW_TICKS * DT);
+     窗口保留一个窗口那么多**条报文**,分母却按标称帧长记:
+       observed = stepPerPacket / 帧长 = (4.5 / PACKET_HZ) × TICK_HZ = 4.5 × TICK_HZ/PACKET_HZ */
+  const oldAxisObserved = stepPerPacket / DT;
   ok(oldAxisObserved > capOf(1),
     `负对照:旧口径 observed=${oldAxisObserved.toFixed(3)} 应 > 上限 ${capOf(1)}`);
-  near(oldAxisObserved, 5.65, 0.01,
-    '旧口径 observed 应 ≈ 5.65(= W2 算式 S × 20/min(f_c,f_s),与实测旧代码一致)');
+  near(oldAxisObserved, BASE_MOVE_SPEED * TICK_HZ / PACKET_HZ, 1e-9,
+    '旧口径 observed 应恰为 S × TICK_HZ/PACKET_HZ(= S / SLOW_RATIO,与实测旧代码同式)');
 });
 
 /* ═══════════ 3. 登记:服务端真帧率低于标称时的那处耦合 ═══════════ */
 
-test('FND172-3 【登记·未修】服务端真实帧率 15.93Hz ⇒ 满速合法玩家仍被误判 SPEED', () => {
+test('FND172-3 【登记·未修】服务端帧率低于标称(0.7 × TICK_HZ)⇒ 满速合法玩家仍被误判 SPEED', () => {
   /* ⚠️ 这条**不是**「修好了」,而是把本修点**没覆盖**的那处耦合钉住:
-     窗口分母仍是 `spanTicks × DT`,`DT = 50ms` 是**标称**帧间隔。
-     服务端真跑到 15.93Hz 时,窗口跨的 20 帧 = 1.256 秒真实时间,分母却记 1.0 秒
-     ⇒ 合法速度被放大 20/15.93 = 1.256 倍。 */
-  const SRV_HZ = 15.93;
+     窗口分母仍是 `spanTicks × 帧长`,而 `帧长` 是**标称**值(`FRAME_SECONDS`)。
+     服务端真跑得比标称慢时,整窗跨的是**多于 1 秒**的真实时间,分母却只记 1 秒
+     ⇒ 合法速度被放大 `TICK_HZ / SRV_HZ`(= 1 / `SLOW_RATIO`)倍。
+     ★ 帧率按 `SLOW_RATIO × TICK_HZ` 推导(不写死 15.93Hz,理由见 `SLOW_RATIO`)。 */
+  const SRV_HZ = SLOW_RATIO * TICK_HZ;
   const REAL_DT = 1 / SRV_HZ;
-  const stepPerFrame = BASE_MOVE_SPEED * REAL_DT;       // 0.2825 格/帧 ⇒ 真实 4.5 格/秒
+  const stepPerFrame = BASE_MOVE_SPEED * REAL_DT;       // 一帧真实位移 ⇒ 真实 4.5 格/秒
+  ok(stepPerFrame <= quotaOf(1),
+    `前提:一帧位移 ${stepPerFrame.toFixed(4)} 必须在单帧额度 ${quotaOf(1).toFixed(4)} 内`);
   const ac = new AntiCheatRoom();
   ac.join('p', 0, 0, 0, 0);
   /* 先走一格:避免**首包与 join 同 tick** 给窗口多塞一条零位移段(那会把观测值
@@ -179,16 +231,16 @@ test('FND172-3 【登记·未修】服务端真实帧率 15.93Hz ⇒ 满速合�
   ok(observed.length > 0,
     '登记的前提必须成立:服务端帧率低于标称时,窗口**仍会**误判 4.5 格/秒的合法玩家');
   ok(observed[0] > capOf(1),
-    `登记:实测均速 ${observed[0]} 应 > 上限 ${capOf(1)}(即满足 S × 20/f_s 的放大)`);
-  /* 放大倍数应是**恰好** 20/15.93 = 1.2555(观测值 = 4.5 × 20/15.93 = 5.6497;
+    `登记:实测均速 ${observed[0]} 应 > 上限 ${capOf(1)}(即满足 S × TICK_HZ/SRV_HZ 的放大)`);
+  /* 放大倍数应是**恰好** `TICK_HZ / SRV_HZ` = 1 / `SLOW_RATIO`(观测值 = S / SLOW_RATIO;
      ⚠️ `detail` 只带 2 位小数 ⇒ 容差取 0.005)。 */
-  near(observed[0], BASE_MOVE_SPEED * (20 / SRV_HZ), 0.005,
-    `观测均速应恰为 S × 20/f_s = ${(BASE_MOVE_SPEED * (20 / SRV_HZ)).toFixed(4)}`);
-  near(observed[0] / BASE_MOVE_SPEED, 20 / SRV_HZ, 0.002,
-    `放大倍数应恰为 20/15.93 = ${(20 / SRV_HZ).toFixed(4)}`);
-  /* 对照:FND172-2 已证明**报文率**那一侧的放大被本修点消掉了 ⇒ 剩下的确是 f_s 这一项。 */
-  ok((20 / SRV_HZ) > SPEED_WINDOW_TOLERANCE,
-    `根因确认:放大 ${(20 / SRV_HZ).toFixed(3)} > 容差 ${SPEED_WINDOW_TOLERANCE} ⇒ 必越线`);
+  near(observed[0], BASE_MOVE_SPEED * (TICK_HZ / SRV_HZ), 0.005,
+    `观测均速应恰为 S × TICK_HZ/SRV_HZ = ${(BASE_MOVE_SPEED * (TICK_HZ / SRV_HZ)).toFixed(4)}`);
+  near(observed[0] / BASE_MOVE_SPEED, TICK_HZ / SRV_HZ, 0.002,
+    `放大倍数应恰为 TICK_HZ/SRV_HZ = ${(TICK_HZ / SRV_HZ).toFixed(4)}`);
+  /* 对照:FND172-2 已证明**报文率**那一侧的放大被本修点消掉了 ⇒ 剩下的确是帧率这一项。 */
+  ok((TICK_HZ / SRV_HZ) > SPEED_WINDOW_TOLERANCE,
+    `根因确认:放大 ${(TICK_HZ / SRV_HZ).toFixed(3)} > 容差 ${SPEED_WINDOW_TOLERANCE} ⇒ 必越线`);
 });
 
 /* ═══════════ 4. 零跨度(`spanTicks = 0`):同帧连发不再失明 ═══════════ */
@@ -280,14 +332,16 @@ test('FND172-6 真作弊:单帧 2× 位移(mul=1)⇒ 仍判 TELEPORT', () => {
 });
 
 test('FND172-7 真作弊:持续 1.33× 均速(单帧在额度内)⇒ 窗口仍判 SPEED', () => {
-  /* 每帧 0.30 格 = 6 格/秒:单帧额度 0.36 内(所以单帧检查放行),
-     但 20 帧窗口均速 6.0 > 上限 5.625 ⇒ 必须在第 20 帧被窗口抓住。
+  /* 持续 **1.33 × 基线**(= 5.985 格/秒):单帧额度内(所以单帧检查放行),
+     但整窗均速 5.985 > 上限 5.625 ⇒ 必须在窗口填满那一帧被抓住。
+     ★ 步长按**速度 × 帧长**推导(不写死 0.30 = 20Hz 口径下的每帧位移)。
      ⚠️ 这条**只在一帧一报**时成立 —— 同帧连发的结算见 FND172-10 / FND172-13。 */
   const ac = new AntiCheatRoom();
   ac.join('fast', 0, 0, 0, 0);
-  const SPEED_STEP = 0.30;
-  ok(SPEED_STEP < quotaOf(1), `前提:0.30 必须在单帧额度 ${quotaOf(1)} 内`);
-  ok(SPEED_STEP / DT > capOf(1), `前提:6.0 格/秒必须超窗口上限 ${capOf(1)}`);
+  const SPEED_PER_SEC = BASE_MOVE_SPEED * 1.33;
+  const SPEED_STEP = SPEED_PER_SEC * FRAME_SECONDS;
+  ok(SPEED_STEP < quotaOf(1), `前提:每帧 ${SPEED_STEP.toFixed(4)} 必须在单帧额度 ${quotaOf(1)} 内`);
+  ok(SPEED_PER_SEC > capOf(1), `前提:${SPEED_PER_SEC} 格/秒必须超窗口上限 ${capOf(1)}`);
   let x = 0;
   for (let f = 1; f <= SPEED_WINDOW_TICKS; f += 1) {
     ac.tick(f);
@@ -296,29 +350,32 @@ test('FND172-7 真作弊:持续 1.33× 均速(单帧在额度内)⇒ 窗口仍�
   }
   const observed = speedObserved(ac);
   ok(observed.length > 0, `累计超速必须被判 SPEED,实际 ${JSON.stringify([...kindsOf(ac)])}`);
-  near(observed[0], 6.0, 0.01, '实测窗口均速应为 6.00 格/秒');
+  near(observed[0], SPEED_PER_SEC, 0.01, `实测窗口均速应为 ${SPEED_PER_SEC} 格/秒`);
   eq(ac.get('fast')?.kicked, false, '单次命中(3 分)< 阈值 12,尚未到踢出');
 });
 
 /* ═══════════ 8. 误伤面不扩大 ═══════════ */
 
-test('FND172-8 对照:标称 20Hz 下满速合法玩家(mul=1 / mul=2.55)60 秒 0 违规', () => {
+test('FND172-8 对照:标称节拍下满速合法玩家(mul=1 / mul=2.55)60 秒 0 违规', () => {
+  /* ★ 时长按**秒**给,帧数由 `TICK_HZ` 推导(不写死 1200 帧 = 20Hz 口径)。 */
+  const SECONDS = 60;
+  const FRAMES = Math.round(SECONDS * TICK_HZ);
   for (const mul of [1, MAX_SPEED_BONUS_MUL]) {
     const ac = new AntiCheatRoom();
     ac.join('legit', 0, 0, 0, 0);
-    const step = BASE_MOVE_SPEED * mul * DT;
+    const step = BASE_MOVE_SPEED * mul * FRAME_SECONDS;
     let x = 0;
-    for (let f = 1; f <= 1200; f += 1) {           // 60 秒 @ 20Hz
+    for (let f = 1; f <= FRAMES; f += 1) {
       ac.tick(f);
       x += step;
       const v = ac.move({ playerId: 'legit', tick: f, x, y: 0, z: 0, speedMul: mul });
       eq(v.allowed, true, `mul=${mul} 第 ${f} 帧必须放行`);
     }
     const s = ac.get('legit');
-    eq(ac.violations().length, 0, `mul=${mul}:60 秒合法移动不得留任何违规流水`);
+    eq(ac.violations().length, 0, `mul=${mul}:${SECONDS} 秒合法移动不得留任何违规流水`);
     eq(s?.score, 0, `mul=${mul}:违规分应为 0`);
     eq(s?.kicked, false, `mul=${mul}:不得被踢出`);
-    near(x, BASE_MOVE_SPEED * mul * 60, 1e-6, `mul=${mul}:60 秒总位移 = 速度 × 60`);
+    near(x, BASE_MOVE_SPEED * mul * SECONDS, 1e-6, `mul=${mul}:${SECONDS} 秒总位移 = 速度 × 秒数`);
   }
 });
 
@@ -469,14 +526,14 @@ test('FND172-13 【关键】同帧内的合法连发不许被误判(水位新鲜
 
 /* ═══════════ 11. ★ 分母注入实测帧间隔:62.77ms/帧下满速 4.5 格/秒不越线 ═══════════ */
 
-test('FND172-11 ★ 注入实测帧间隔 62.77ms ⇒ 满速合法玩家 4.5 格/秒不再被判 SPEED', () => {
-  /* 口径与 D-26 一致:本机 20Hz 循环实测 62.77ms/帧 ⇒ 15.93Hz。
-     玩家仍以**真实** 4.5 格/秒走 ⇒ 每帧 0.2825 格(单帧额度 0.36 内)。 */
-  const SRV_HZ = 15.93;
-  const FRAME_MS = 1000 / SRV_HZ;                          // 62.77ms
-  const stepPerFrame = BASE_MOVE_SPEED / SRV_HZ;           // 0.2825 格/帧
-  ok(stepPerFrame < quotaOf(1),
-    `前提:${stepPerFrame.toFixed(4)} 必须在单帧额度 ${quotaOf(1)} 内(否则先被 TELEPORT 拦,测不到窗口)`);
+test('FND172-11 ★ 注入实测帧间隔(比标称慢一档)⇒ 满速合法玩家 4.5 格/秒不再被判 SPEED', () => {
+  /* 口径与 D-26 一致(宿主定时器粒度 > 标称帧长 ⇒ 真帧率更低),但**帧率按 `TICK_HZ`
+     的比例推导**:15.93Hz 是 20Hz 标称下的实测值,与 tick 率绑定 —— 32Hz 下它低于
+     `1/TELEPORT_SLACK`,先行被单帧额度拦下(那就测不到窗口了)。理由与两侧的界见 `SLOW_RATIO`。
+     玩家仍以**真实** 4.5 格/秒走 ⇒ 每帧 `4.5 / SRV_HZ` 格。 */
+  const SRV_HZ = SLOW_RATIO * TICK_HZ;
+  const FRAME_MS = 1000 / SRV_HZ;
+  const stepPerFrame = BASE_MOVE_SPEED / SRV_HZ;
 
   const run = (inject: boolean): AntiCheatRoom => {
     const ac = new AntiCheatRoom();
@@ -493,24 +550,27 @@ test('FND172-11 ★ 注入实测帧间隔 62.77ms ⇒ 满速合法玩家 4.5 格
 
   const fixed = run(true);
   near(fixed.dtSeconds, FRAME_MS / 1000, 1e-12,
-    '注入后分母应 = 62.77ms(而不是标称 50ms)');
+    '注入后分母应 = 实测帧间隔(而不是标称帧长)');
   eq(speedObserved(fixed).length, 0,
     `★ 分母取实测节拍后,真实 4.5 格/秒的合法玩家不得被误判 SPEED,实际 ${JSON.stringify(speedObserved(fixed))}`);
   eq(fixed.get('p')?.kicked, false, '更不得因此累计到踢出');
 
-  /* 负对照 = `FND172-3` 的形状:同一条轨迹**不注入** ⇒ 缺省 `DT` ⇒ 读数被放大 20/15.93 */
+  /* 负对照 = `FND172-3` 的形状:同一条轨迹**不注入** ⇒ 缺省标称帧长 ⇒
+     读数被放大 `TICK_HZ / SRV_HZ`(= 1 / `SLOW_RATIO`)倍。 */
   const nominal = run(false);
-  eq(nominal.dtSeconds, DT, '未注入 ⇒ 分母仍是标称 DT(既有房的行为逐位不变)');
-  near(speedObserved(nominal)[0] ?? Number.NaN, BASE_MOVE_SPEED * (20 / SRV_HZ), 0.02,
-    '未注入时读数仍是被放大的 ≈ 5.65(即 FND172-3 登记的那次误判)');
+  eq(nominal.dtSeconds, DT, '未注入 ⇒ 分母仍是标称帧长(既有房的行为逐位不变)');
+  near(speedObserved(nominal)[0] ?? Number.NaN, BASE_MOVE_SPEED * (TICK_HZ / SRV_HZ), 0.02,
+    '未注入时读数仍是被放大的(即 FND172-3 登记的那次误判)');
 });
 
-/* ═══════════ 12. 缺省 50ms ⇒ 5.63 锚点不变;注入只改读数不改判据 ═══════════ */
+/* ═══════════ 12. 缺省分母 = 标称帧长 ⇒ 上限锚点由常量推导;注入只改读数不改判据 ═══════════ */
 
-test('FND172-12 帧间隔 50ms 时 5.63 锚点逐位不变;注入实测值只改**读数**、不放水', () => {
-  /* 锚点 = WS-07 `M49` 的步长口径(裸装 mul=1,上限 4.5 × 1.25 = 5.625 ≈ 5.63):
-     0.25 格/帧 = 5.00 格/秒 < 5.63 合法;0.30 格/帧 = 6.00 格/秒 在第 20 帧被拒。 */
-  const walk = (step: number, frameMs?: number): AntiCheatRoom => {
+test('FND172-12 缺省分母 = 标称帧长:上限锚点(基线 × 容差)逐位不变;注入只改**读数**、不放水', () => {
+  /* 锚点 = WS-07 `M49` 的步长口径(裸装 mul=1,上限 = `BASE_MOVE_SPEED × SPEED_WINDOW_TOLERANCE`
+     = 5.625):5.0 格/秒 < 上限合法;6.0 格/秒 > 上限在窗口填满那一帧被拒。
+     ★ 步长按**速度 × 帧长**给,不写死 0.25 / 0.30(= 20Hz 口径下的每帧位移)。 */
+  const walk = (speedPerSec: number, frameMs?: number): AntiCheatRoom => {
+    const step = speedPerSec * FRAME_SECONDS;              // 一帧一报:每帧一份位移
     const ac = new AntiCheatRoom();
     ac.join('p', 0, 0, 0, 0);
     let x = 0;
@@ -521,32 +581,39 @@ test('FND172-12 帧间隔 50ms 时 5.63 锚点逐位不变;注入实测值只改
     }
     return ac;
   };
-  const slow = walk(0.25);
-  eq(slow.dtSeconds, DT, '缺省分母 = DT');
-  eq(slow.violations().length, 0, '5.00 格/秒(< 5.63)必须 0 违规 —— 锚点不变');
-  const fast = walk(0.30);
-  near(speedObserved(fast)[0] ?? Number.NaN, 6.0, 0.01,
-    '6.00 格/秒的读数仍是 6.00(分母 = 缺省 DT,读数一格没变)');
-  ok(speedObserved(fast).length > 0, '6.00 格/秒仍被窗口抓住(判据未动)');
+  const LEGAL_SPEED = 5.0;
+  const CHEAT_SPEED = 6.0;
+  ok(LEGAL_SPEED < capOf(1) && CHEAT_SPEED > capOf(1),
+    `前提:${LEGAL_SPEED} < 上限 ${capOf(1)} < ${CHEAT_SPEED}`);
+  const slow = walk(LEGAL_SPEED);
+  eq(slow.dtSeconds, DT, '缺省分母 = 标称帧长');
+  eq(slow.violations().length, 0, `${LEGAL_SPEED} 格/秒(< 上限)必须 0 违规 —— 锚点不变`);
+  const fast = walk(CHEAT_SPEED);
+  near(speedObserved(fast)[0] ?? Number.NaN, CHEAT_SPEED, 0.01,
+    `${CHEAT_SPEED} 格/秒的读数仍是 ${CHEAT_SPEED}(分母 = 缺省帧长,读数一格没变)`);
+  ok(speedObserved(fast).length > 0, `${CHEAT_SPEED} 格/秒仍被窗口抓住(判据未动)`);
 
-  /* 注入 62.77ms:同一个 0.36 格/帧(单帧额度上界,恰好放行)的作弊者,
-     读数从**膨胀的 7.20** 修正为**真实 5.735 格/秒** —— 仍 > 同一个上限 5.625
-     ⇒ 照样被拒。即:容差没动,只是秒表准了(真作弊者身上没有同步放水)。 */
-  const quotaStep = quotaOf(1);                            // 0.36,恰好 = 单帧上界
-  const inflated = walk(quotaStep);
-  near(speedObserved(inflated)[0] ?? Number.NaN, quotaStep / DT, 0.01,
-    '缺省分母把 0.36 格/帧读成 7.20 格/秒(标称 20Hz 口径)');
-  const real = walk(quotaStep, 1000 / 15.93);
-  const realObserved = speedObserved(real);
-  near(realObserved[0] ?? Number.NaN, quotaStep / (1000 / 15.93 / 1000), 0.01,
-    '注入 62.77ms 后读数 = **真实** 5.735 格/秒(分母修的是秒表,不是容差)');
-  ok(realObserved.length > 0 && realObserved[0] > capOf(1),
-    `依然越线被抓:真实 ${realObserved[0]} > 上限 ${capOf(1)}(放水会放行它)`);
+  /* ── 注入只改「秒表」,不放水(tick 率无关的等价形式)──
+     作弊者每帧吃满**单帧额度**(= 基线 × slack = 7.2 格/秒的额度);注入实测帧间隔后
+     读数恒为 `每帧额度 ÷ 注入间隔`,而**判不判恰好等于「读数 > 上限」**:
+     没有额外宽容,也没有因为分母被注入而改变判据本身。 */
+  const QUOTA_SPEED = quotaOf(1) / FRAME_SECONDS;         // 7.2
+  /* ⚠️ 少 1e-9:额度与位移是同一算式的两种结合顺序,取等可能差 1 ulp 而先被判 TELEPORT。 */
+  const inflated = walk(QUOTA_SPEED * (1 - 1e-9));
+  near(speedObserved(inflated)[0] ?? Number.NaN, QUOTA_SPEED, 0.01,
+    `缺省分母把每帧额度读成 ${QUOTA_SPEED} 格/秒(= 基线 × slack,与 tick 率无关)`);
+  ok(speedObserved(inflated).length > 0, '每帧吃满额度 ⇒ 必被抓(判据未动)');
+  const injectedMs = FRAME_SECONDS * 1000 * SLOW_RATIO;   // 实测帧间隔(短于标称)
+  const injected = speedObserved(walk(QUOTA_SPEED * (1 - 1e-9), injectedMs));
+  near(injected[0] ?? Number.NaN, QUOTA_SPEED / SLOW_RATIO, 0.01,
+    '注入后读数 = 每帧额度 ÷ 注入间隔(秒表准了,容差没动)');
+  eq(injected.length > 0, QUOTA_SPEED / SLOW_RATIO > capOf(1),
+    '判不判**恰好**等于「读数 > 上限」—— 不因分母而多放行一条');
 
   /* 注入门:非法值**保持**当前值(写成 NaN 会让 `observed > NaN` 恒 false ⇒ 窗口失明)。 */
   const guard = new AntiCheatRoom();
-  eq(guard.dtSeconds, DT, '缺省 = 标称 DT');
-  eq(guard.setFrameIntervalMs(Number.NaN), DT, 'NaN 注入被忽略 ⇒ 保持 DT(分母不得变 NaN)');
+  eq(guard.dtSeconds, DT, '缺省 = 标称帧长');
+  eq(guard.setFrameIntervalMs(Number.NaN), DT, 'NaN 注入被忽略 ⇒ 保持缺省(分母不得变 NaN)');
   eq(guard.setFrameIntervalMs(0), DT, '0 注入被忽略');
   eq(guard.setFrameIntervalMs(-5), DT, '负数注入被忽略');
   near(guard.setFrameIntervalMs(62.77), 0.06277, 1e-12, '合法注入生效');
@@ -586,24 +653,25 @@ function runRoom(fields: { tag: string; beatMs: number; hz: number }): ReturnTyp
 
 /* ═══════════ 14. 端到端:分母真的来自房间的实测节拍 ═══════════ */
 
-test('FND172-14 ★ 端到端:真房 `step()` 每帧把**实测**节拍喂进窗口(62.77ms ⇒ 满速 4.5 不越线)', () => {
-  const SRV_HZ = 15.93;
-  const FRAME_MS = 1000 / SRV_HZ;                       // 62.77ms
+test('FND172-14 ★ 端到端:真房 `step()` 每帧把**实测**节拍喂进窗口(慢一档 ⇒ 满速 4.5 不越线)', () => {
+  /* ★ 节拍按 `TICK_HZ` 的比例推导(不写死 15.93Hz,理由见 `SLOW_RATIO`)。 */
+  const SRV_HZ = SLOW_RATIO * TICK_HZ;
+  const FRAME_MS = 1000 / SRV_HZ;
   const real = runRoom({ tag: 'e2e_real', beatMs: FRAME_MS, hz: SRV_HZ });
   /* 1) 分母 = **房间自己量到**的差值。`FND172-11` 只证明注入入口能用,这条证明房间真在注入
-        (标称 DT = 50ms 与本值分得开 ⇒ 断言有牙)。 */
+       (标称帧长与本值分得开 ⇒ 断言有牙)。 */
   near(real.ac.dtSeconds, FRAME_MS / 1000, 1e-6,
     `★ 分母应 = 房间实测的 ${FRAME_MS.toFixed(2)}ms(缺省标称是 ${DT * 1000}ms)`);
   eq(real.acFrameGapDiscarded, 0, '节拍正常 ⇒ 一次都没被丢弃');
-  /* 2) 满速合法玩家不越线(接线之前=无注入的形态见 `FND172-3`:5.65 > 5.625 误判)。 */
+  /* 2) 满速合法玩家不越线(接线之前的形态见 `FND172-3`:读数被放大 ⇒ 误判)。 */
   eq(speedObserved(real.ac).length, 0,
     `★ 实测节拍注入后满速合法玩家不得被判 SPEED,实际 ${JSON.stringify(speedObserved(real.ac))}`);
   eq(real.ac.get('p')?.kicked, false, '更不得因此累计到踢出');
 
-  /* 负对照:**同一条每帧轨迹**换成标称 20Hz 节拍 ⇒ 分母 50ms ⇒ 读数被放大 20/15.93 ⇒ 误判。
-     ⇒ 判据分得开「房间按实测节拍注入」与「分母恒为标称 DT」。 */
+  /* 负对照:**同一条每帧轨迹**换成标称节拍 ⇒ 分母 = 标称帧长 ⇒ 读数被放大 1/SLOW_RATIO ⇒ 误判。
+     ⇒ 判据分得开「房间按实测节拍注入」与「分母恒为标称帧长」。 */
   const nom = runRoom({ tag: 'e2e_nom', beatMs: DT * 1000, hz: SRV_HZ });
-  near(nom.ac.dtSeconds, DT, 1e-9, '标称 20Hz 节拍 ⇒ 分母 = 50ms');
+  near(nom.ac.dtSeconds, DT, 1e-9, '标称节拍 ⇒ 分母 = 标称帧长');
   ok(speedObserved(nom.ac).length > 0,
     '负对照:同一条每帧轨迹在标称节拍下仍被误判(⇒ 判据钉的是「喂了实测值」,不是「改了判据」)');
 });
@@ -611,7 +679,7 @@ test('FND172-14 ★ 端到端:真房 `step()` 每帧把**实测**节拍喂进窗
 /* ═══════════ 15. ★ 休眠唤醒后的首个差值必须被丢弃(不稀释)═══════════ */
 
 test('FND172-15 ★ 端到端:休眠唤醒后的首个极大差值被**丢弃** —— 分母不被稀释', () => {
-  const FRAME_MS = 1000 / 15.93;                         // 62.77ms
+  const FRAME_MS = 1000 / (SLOW_RATIO * TICK_HZ);         // 比标称慢一档的实测帧间隔
   let wall = 1_700_000_000_000;
   const a = assemble({
     roomId: 'r_fnd172_e2e_sleep',
@@ -650,13 +718,83 @@ test('FND172-15 ★ 端到端:休眠唤醒后的首个极大差值被**丢弃** 
   near(rt.ac.dtSeconds, FRAME_MS / 1000, 1e-6, '下一帧差值正常 ⇒ 注入恢复');
   eq(rt.acFrameGapDiscarded, 1, '正常帧不再计丢弃');
 
-  /* 负对照(照抄「把差值直接喂进去」的改法):分母 = 60s ⇒ 窗口读数被稀释 ~1200 倍。 */
+  /* 负对照(照抄「把差值直接喂进去」的改法):分母 = 60s ⇒ 窗口读数被稀释。
+     ★ 稀释倍率 = 注入秒表 ÷ 标称帧长(tick 率无关的形式),不写死 0.00375。 */
   const naiveDt = 60_000 / 1000;
-  const dilutedObserved = LEGIT_STEP / naiveDt;          // 每帧 0.225 格 ÷ 60 秒/帧
-  near(dilutedObserved, 0.00375, 1e-6,
-    '锚:无上限时合法 4.5 格/秒被读成 0.0038 格/秒(反作弊失明)');
+  const dilutedObserved = LEGIT_STEP / naiveDt;          // 一帧合法位移 ÷ 60 秒/帧
+  near(BASE_MOVE_SPEED / dilutedObserved, naiveDt / FRAME_SECONDS, 1e-6,
+    `锚:稀释倍率 = 注入的 ${naiveDt}s ÷ 标称帧长 ${FRAME_SECONDS}s(无上限时反作弊失明)`);
   ok(BASE_MOVE_SPEED / dilutedObserved > 1000,
     '★ 稀释倍率 > 1000 ⇒ 这正是 `AC_FRAME_GAP_MAX_MS` 要挡的那件事(比不接线更糟)');
 });
 
+/* ═══════════ 16. ★ 全部由 `TICK_HZ` 推导:秒级语义不变(32Hz ↔ 20Hz 换算后等价)═══════════ */
+
+test('FND172-16 ★ 改节拍只重标定:每帧额度按秒换算后与 20Hz 等价;窗口恒 1 秒', () => {
+  /* 这是 owner 裁定「tick 改 32Hz / 31.25ms」在**反作弊侧**的唯一总判据:
+     帧长、每帧额度、窗口帧数都改成由 `TICK_HZ` 推导 ⇒ 变的只是「一帧是多少秒」;
+     速度读数(格/秒)、窗口秒数、单帧容差、窗口容差**逐位不变**(重标定,不是改游戏性)。 */
+
+  /* 1) 单一事实源一致:反作弊自己的帧长推导 == `physics.ts` 的 `DT`,缺省分母取同一个值。 */
+  near(FRAME_SECONDS, DT, 1e-12, '反作弊的帧长推导必须 = `physics.ts#DT`(不许两处漂移)');
+  near(FRAME_SECONDS, 1 / TICK_HZ, 1e-12, '帧长 = 1 / TICK_HZ(不写字面量)');
+  eq(DEFAULT_FRAME_DT_SECONDS, FRAME_SECONDS, '窗口分母缺省值同源(与每帧额度同一个帧长)');
+
+  /* 2) 窗口恒 1 秒:tick 率怎么变,秒数不变。 */
+  eq(SPEED_WINDOW_SECONDS, 1, '常量锚点:窗口恒 1 秒(期望侧改字面量 ⇒ 去掉同义反复)');
+  near(SPEED_WINDOW_TICKS / TICK_HZ, 1.0, 1e-12,
+    '窗口帧数换算回秒 = 1.0 秒(= `SPEED_WINDOW_SECONDS` 的字面量,与 TICK_HZ 无关)');
+
+  /* 3) ★ 显式等价(默认配置、未注入):把每帧额度换算成**每秒额度**,
+        32Hz 口径与 20Hz 口径必须相等 —— 只是重标定,没有改变游戏性。 */
+  for (const mul of [1, MAX_SPEED_BONUS_MUL]) {
+    near(maxDisplacementPerTick(mul) * TICK_HZ, quotaAt(20, mul) * 20, 1e-12,
+      `mul=${mul}:32Hz 的每帧额度 × ${TICK_HZ} 必须 = 20Hz 口径的每帧额度 × 20(每秒额度守恒)`);
+    near(maxDisplacementPerTick(mul) * TICK_HZ, BASE_MOVE_SPEED * mul * TELEPORT_SLACK, 1e-12,
+      `mul=${mul}:每秒额度 = 基线速度 × 倍率 × slack(与 tick 率无关)`);
+    near(quotaAt(TICK_HZ, mul), maxDisplacementPerTick(mul), 1e-12,
+      `mul=${mul}:每帧额度 = 基线 × 倍率 × 帧长 × slack`);
+    near(capOf(mul), BASE_MOVE_SPEED * mul * SPEED_WINDOW_TOLERANCE, 1e-12,
+      `mul=${mul}:窗口上限只由基线、倍率、容差决定`);
+  }
+
+  /* 4) 满速 4.5 格/秒:整窗走高仍读 4.5、仍不越线(帧长变了,读数不变)。 */
+  const legit = new AntiCheatRoom();
+  legit.join('legit', 0, 0, 0, 0);
+  let x = 0;
+  for (let f = 1; f <= SPEED_WINDOW_TICKS + 2; f += 1) {
+    legit.tick(f);
+    x += BASE_MOVE_SPEED * FRAME_SECONDS;                // 每帧 = 4.5 × 帧长 格
+    eq(legit.move({ playerId: 'legit', tick: f, x, y: 0, z: 0, speedMul: 1 }).allowed, true,
+      `第 ${f} 帧满速合法移动必须放行`);
+  }
+  eq(legit.violations().length, 0,
+    `★ 满速 4.5 格/秒在 ${TICK_HZ}Hz(帧长 ${FRAME_SECONDS}s)下仍不越线,实际 ${JSON.stringify(speedObserved(legit))}`);
+
+  /* 5) 读数仍是**格/秒**:1.30 × 基线的作弊者被读成 5.85 格/秒,而不是被 tick 率缩放。 */
+  const cheatSpeed = BASE_MOVE_SPEED * 1.3;
+  const cheat = new AntiCheatRoom();
+  cheat.join('cheat', 0, 0, 0, 0);
+  let cx = 0;
+  for (let f = 1; f <= SPEED_WINDOW_TICKS + 2; f += 1) {
+    cheat.tick(f);
+    cx += cheatSpeed * FRAME_SECONDS;
+    cheat.move({ playerId: 'cheat', tick: f, x: cx, y: 0, z: 0, speedMul: 1 });
+  }
+  near(speedObserved(cheat)[0] ?? Number.NaN, cheatSpeed, 0.01,
+    `★ 读数必须是**真实格/秒**(1.30 × 基线 = ${cheatSpeed}),与 tick 率无关`);
+
+  /* 6) `SLOW_RATIO` 的界由常量算出(见其注释):两条都成立,FND172-2/3/11/14 才有意义。 */
+  ok(SLOW_RATIO >= 1 / TELEPORT_SLACK,
+    `SLOW_RATIO ${SLOW_RATIO} 必须 ≥ 1/TELEPORT_SLACK(${1 / TELEPORT_SLACK}):否则一包位移超出单帧额度`);
+  ok(SLOW_RATIO < 1 / SPEED_WINDOW_TOLERANCE,
+    `SLOW_RATIO ${SLOW_RATIO} 必须 < 1/SPEED_WINDOW_TOLERANCE(${1 / SPEED_WINDOW_TOLERANCE}):否则放大 ≤ 容差,FND172-3 不成立`);
+
+  /* 7) 休眠上限(`room.ts`)仍高于任一合法帧长、且远低于「以秒计」的停摆 ——
+        取值理由见 `AC_FRAME_GAP_MAX_MS`(刻意**不**随 `TICK_HZ` 推导)。 */
+  ok(AC_FRAME_GAP_MAX_MS >= 4 * (1000 / TICK_HZ),
+    `${AC_FRAME_GAP_MAX_MS}ms 必须 ≥ 4 帧(${4 * (1000 / TICK_HZ)}ms)⇒ 正常抖动不会被误丢`);
+  ok(AC_FRAME_GAP_MAX_MS < 1000,
+    `${AC_FRAME_GAP_MAX_MS}ms 必须仍远低于「以秒计」的休眠停摆 ⇒ 两类差值分得开`);
+});
 report('WS-FND-172');

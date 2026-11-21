@@ -71,6 +71,7 @@ import { NetPersistRoom, RoomSchema, gameServerConfig } from '../server/src/net/
 import { RoomRuntime } from '../server/src/net/room.ts';
 import type { ActionPayload } from '../server/src/net/room.ts';
 import { townSafeRadiusFor } from '../server/src/mobs/spawner.ts';
+import { FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 import { beginSleep, clearSleepRegistry } from '../server/src/net/actions/sleep.ts';
 
 /* ═══════════════════ 0. 夹具 ═══════════════════ */
@@ -347,9 +348,10 @@ async function main(): Promise<void> {
 
     clearSleepRegistry();
     beginSleep(ROOM_ID, OWNER);
-    /* 慢帧 2Hz、快帧 20Hz ⇒ 10 帧必跨过至少一个慢帧(`lastRoomEffects` 只在慢帧刷新);
-       取 12 帧留余量,不用 while 重试(重试包裹会把「一根都没扫到」洗成绿)。 */
-    for (let i = 0; i < 12; i += 1) room.stepTick();
+    /* 慢帧每 `FAST_PER_SLOW` 个快帧一次(`lastRoomEffects` 只在慢帧刷新);
+       跨过一个慢帧所需的帧数由 `FAST_PER_SLOW` 派生(不写死 —— 写死的数只在旧 tick 率下成立),
+       再加 2 帧余量,不用 while 重试(重试包裹会把「一根都没扫到」洗成绿)。 */
+    for (let i = 0; i < FAST_PER_SLOW + 2; i += 1) room.stepTick();
     const rec = reads.lastRoomEffects.find((r) => r.playerId === OWNER);
     eq(rec?.sleeping, 1, '★★ 本房号的登记被世界侧读到(sleeping=1)—— 只有注入生效才会发生');
 
@@ -357,7 +359,7 @@ async function main(): Promise<void> {
        或干脆是个全局开关)。 */
     clearSleepRegistry();
     beginSleep('room_other', OWNER);
-    for (let i = 0; i < 12; i += 1) room.stepTick();
+    for (let i = 0; i < FAST_PER_SLOW + 2; i += 1) room.stepTick();
     eq(reads.lastRoomEffects.find((r) => r.playerId === OWNER)?.sleeping, 0,
       '★ 别的房号的登记**不算**(读口的口径是本房号,不是全局)');
   });

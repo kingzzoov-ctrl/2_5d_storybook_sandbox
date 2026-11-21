@@ -5,7 +5,7 @@
 
 import { test, ok, eq, near, inRange, mulberry32, report } from '../shared/testing/harness.ts';
 import {
-  DT, TICK_HZ, GRAVITY, THROW_SPEED_XY, THROW_SPEED_Z,
+  DT, TICK_HZ, TICK_MS, msToTicks, secondsToTicks, GRAVITY, THROW_SPEED_XY, THROW_SPEED_Z,
   CARRY_Z_STEP, CARRY_MAX_DEPTH, CARRY_SLOWDOWN,
   CATCH_RADIUS, CATCH_Z_MIN, CATCH_Z_MAX,
   RADIUS_PLAYER, RADIUS_WILD, RADIUS_BOSS,
@@ -78,8 +78,11 @@ function mkActors(defs: [string, number, number, Partial<{ mass: number; shield:
 /* ═══════════════ 1. 常数与冻结层一致性 ═══════════════ */
 
 test('冻结层物理常数与手册一致', () => {
-  eq(TICK_HZ, 20, '20Hz');
-  near(DT, 0.05, 1e-12, 'dt = 0.05s');
+  /* tick 率/帧长的唯一事实源是 shared/types/physics.ts;此处只校验**派生关系**,
+     不写死 20/0.05 —— 否则下次改 tick 率会静默改所有「帧数计」的时长(见 WS-FND-177)。 */
+  eq(secondsToTicks(1), TICK_HZ, '1 秒派生出的快帧数 = TICK_HZ');
+  near(DT, 1 / TICK_HZ, 1e-12, 'DT = 1/TICK_HZ');
+  eq(msToTicks(TICK_MS), 1, '标称帧间隔 TICK_MS 恰好 = 1 帧');
   near(GRAVITY, -18.0, 1e-12, '重力 -18 格/秒²');
   near(THROW_SPEED_XY, 8.5, 1e-12, '投掷水平速度');
   near(THROW_SPEED_Z, 6.0, 1e-12, '投掷垂直速度');
@@ -164,8 +167,15 @@ test('冰砖打滑:4.5 格/秒冲上 315,滑行距离远超其它地砖', () => 
   const iceDist = slideDistance(0.98, BASE_MOVE_SPEED);
   const bareDist = slideDistance(0.72, BASE_MOVE_SPEED);
   const honeyDist = slideDistance(0.35, BASE_MOVE_SPEED);
-  near(iceDist, (4.5 * 0.05) / (1 - 0.98), 1e-9, '冰砖解析射程 = 0.225/0.02');
-  near(iceDist, 11.25, 1e-9, '冰砖 11.25 格');
+  /* 解析式:s∞ = v0·dt/(1-μ);dt 取冻结层 DT(**不写死 0.05**)。
+     20Hz(dt=0.05)时该值为 11.25 格(手册原文引用的数),32Hz 时为 7.03125 格 —— 位移与帧长成正比。 */
+  near(iceDist, (BASE_MOVE_SPEED * DT) / (1 - 0.98), 1e-9, '冰砖解析射程 = v0·DT/0.02');
+  /* 第二断言钉「射程由帧长派生」:帧长减半 ⇒ 射程减半(不写死任何帧数/秒数); */
+  near(slideDistance(0.98, BASE_MOVE_SPEED, DT / 2), iceDist / 2, 1e-12,
+    '射程与帧长成正比(帧长减半 ⇒ 射程减半)');
+  /* 逐帧积分与解析式同量级(离散和含 μ 因子,故用 3% 容差而非硬等) */
+  near(glide(0.98, BASE_MOVE_SPEED, 1, 0, 400).distance, iceDist, iceDist * 0.03,
+    '逐帧积分 400 帧 ≈ 解析射程');
   ok(iceDist > bareDist * 10, '冰砖滑行距离是裸地的 10 倍以上');
   ok(honeyDist < 1, `蜂蜜毯几乎立刻停住,实际 ${honeyDist.toFixed(3)} 格`);
   ok(slideFrames(0.98, 4.5) > slideFrames(0.35, 4.5), '冰砖需要更多帧才停住');
@@ -642,13 +652,14 @@ test('落穴草席 319:踩上 0.4 秒后碎裂', () => {
   rect(map, 0, 0, 20, 20, SLOT_TRAP);
   const pw = new PhysicsWorld({ terrain: terrainWith(map) });
   pw.spawn('victim', { x: 5.5, y: 5.5, z: 0 });
-  /* 0.4s / 0.05s = 8 帧 */
-  const framesNeeded = Math.ceil(TRAP_DELAY / DT);
-  eq(framesNeeded, 8, '0.4s = 8 帧');
+  /* 0.4 秒 → 帧数由 secondsToTicks 派生(20Hz=8 帧,32Hz=13 帧);帧数写死会在改 tick 率时静默改时长 */
+  const framesNeeded = secondsToTicks(TRAP_DELAY);
+  eq(framesNeeded, secondsToTicks(0.4), '0.4s 派生的帧数 = secondsToTicks(0.4)');
+  ok(framesNeeded >= 1, `延迟必须至少 1 帧,实际 ${framesNeeded}`);
   for (let i = 0; i < framesNeeded - 1; i += 1) pw.step();
-  eq(pw.totalTraps, 0, '第 8 帧之前不碎裂');
+  eq(pw.totalTraps, 0, `第 ${framesNeeded} 帧之前不碎裂`);
   pw.step();
-  eq(pw.totalTraps, 1, '第 8 帧碎裂');
+  eq(pw.totalTraps, 1, `第 ${framesNeeded} 帧碎裂`);
   ok(pw.fx.some((f) => f.kind === 'TRAP_OPENED'), '产生 TRAP_OPENED 特效');
 });
 

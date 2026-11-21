@@ -140,8 +140,9 @@ test('FND140-3 ★★ 注入:一条「不经过任何登记」的死亡也被计
   eq(sim.corpseCount, 2, '★★ 未登记的死亡也被计入(修前恒 1:只读 deadMobs)');
   eq(sim.mobHost.deadIds().length, 2, '宿主能说出两只都是尸体');
 
-  /* 负对照(窗口):第 1 帧一具都不收。 */
-  sim.advance(1);
+  /* 负对照(窗口):窗口 = `MOB_CORPSE_FRAMES` 帧(由 `MOB_CORPSE_SEC` = 0.1 秒派生;
+     20Hz = 2,32Hz = 3)。旧写法写死「1 帧不收 / 第 2 帧收」= 20Hz 的窗口。 */
+  if (MOB_CORPSE_FRAMES > 1) sim.advance(MOB_CORPSE_FRAMES - 1);
   eq(sim.corpseCount, 2, `负对照:${MOB_CORPSE_FRAMES} 帧窗口未满 ⇒ 都不收`);
   eq(sim.mobsReaped, 0, '负对照:一次都没收');
 
@@ -149,7 +150,6 @@ test('FND140-3 ★★ 注入:一条「不经过任何登记」的死亡也被计
   sim.advance(1);
   eq(sim.mobsReaped, 1, '★ 先到点的那具被收');
   eq(sim.corpseCount, 1, '★ 另一具仍在待收账(不是一起被扫掉)');
-
   sim.advance(1);
   eq(sim.mobsReaped, 2, '★★ 注入的死亡最终也被收掉');
   eq(tables(sim).host, 0, '宿主空');

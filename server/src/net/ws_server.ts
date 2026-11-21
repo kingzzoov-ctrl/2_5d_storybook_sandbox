@@ -106,6 +106,16 @@ import {
   isValidAckedSeq,
   type DecodedPacket,
 } from '../../../shared/net/delta.ts';
+/* ★ 第十二轮:**默认帧长从单一事实源派生**(`TICK_MS = 1000 / TICK_HZ`,
+ * 唯一声明处 = `shared/types/physics.ts`)。
+ *
+ * 理由:`startWsServer` 的 `frameMs` 缺省值曾是写死的 50ms(20Hz)。tick 改 32Hz
+ * 之后那一行没跟着走 ⇒ **不传 `frameMs` 的调用方会被以 20Hz 驱动**广播循环,
+ * 而 `room.step()` 的一拍在语义上是 32Hz ⇒ 世界推进与世界广播不同频,
+ * 且不报错、判据不红(本仓反复点名的「改一处必须改两处」形态)。
+ * ⚠️ 只改缺省分支:显式传 `frameMs` 的调用方(play.ts / soak.ts / 各判据)行为不变。
+ */
+import { TICK_MS } from '../../../shared/types/physics.ts';
 
 /* ═══════════════════════════ 1. 帧编解码 ═══════════════════════════ */
 
@@ -572,7 +582,7 @@ export type WsServerOptions = {
   port?: number;
   /** 世界源:提供需要的方法(结构化,不 import 具体类)。 */
   room: WsRoomLike;
-  /** 每帧间隔 ms(默认 50 = 20Hz,与 room.step 外部驱动对齐)。 */
+  /** 每帧间隔 ms(默认 `TICK_MS` = 1000 / `TICK_HZ`,与 room.step 外部驱动对齐)。 */
   frameMs?: number;
   onLog?: (msg: string) => void;
 
@@ -1033,7 +1043,7 @@ export function defaultWsLog(line: string): void {
 }
 export async function startWsServer(opts: WsServerOptions): Promise<WsServerHandle> {
   const port = opts.port ?? 0;
-  const frameMs = opts.frameMs ?? 50;
+  const frameMs = opts.frameMs ?? TICK_MS;
   /* ═══════════ ★ WS-FND-134(P1-2):日志**出口**与计数 ═══════════
    * ## 修前(第九轮实测)
    * ```ts

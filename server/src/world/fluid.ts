@@ -1,5 +1,5 @@
 /**
- * WS-01 · 水体 / 熔岩 / 粘液 元胞自动机(2Hz)+ 相变。
+ * WS-01 · 水体 / 熔岩 / 粘液 元胞自动机(**独立速率 8Hz**,见 §7 `FLUID_RATE_HZ`)+ 相变。
  *
  * 设计要点(守恒优先):
  *  1. 水量用**整数**「毫格」(1 满格 = 1000 毫格)存 Int32Array。所有输运都是
@@ -21,7 +21,6 @@
  */
 
 import { BaseFluid, Elevation } from '../../../shared/types/tile.ts';
-import { SLOW_DT } from '../../../shared/types/physics.ts';
 
 /* ═══════════════════════ 1. 常量与配表 ═══════════════════════ */
 
@@ -190,7 +189,7 @@ export class FluidField {
    * 通量暂存缓冲,**跨帧复用**。
    *
    * 早先每帧 `new Int32Array(n)`:1024×1024 世界是 **4MB/帧**,
-   * 2Hz 下每秒 8MB 垃圾 —— 而其中 99% 的位置恒为 0。
+   * 2Hz 下每秒 8MB 垃圾(独立速率 8Hz 下 32MB)—— 而其中 99% 的位置恒为 0。
    * 复用后靠「落账时把用过的位置清零」保持正确,不依赖 GC。
    */
   private readonly deltaBuf: Int32Array;
@@ -390,7 +389,7 @@ export class FluidField {
   /* ═══════════════ 4. 单帧推进 ═══════════════ */
 
   /**
-   * 2Hz 推进一帧。`budget` 为本次最多服务多少格(默认 FLUID_CELL_BUDGET)。
+   * 独立速率推进一帧(8Hz,见 §7 的 `FLUID_RATE_HZ`)。`budget` 为本次最多服务多少格(默认 FLUID_CELL_BUDGET)。
    * 返回统计;守恒关系恒为
    *   total_after + Σconsumed = total_before
    *
@@ -827,7 +826,7 @@ export class FluidField {
   /* ═══════════════ 7. 批量推进与快照 ═══════════════ */
 
   /**
-   * 跑 frames 个 2Hz 帧,返回最后一帧报告与全程「总账」轨迹。
+   * 跑 frames 个流体步(速率见 §7 的 `FLUID_RATE_HZ`,与慢帧无关),返回最后一帧报告与全程「总账」轨迹。
    * 总账 = total() + 相变销毁的水 + 相变销毁的熔岩,应当逐帧等于初始总量。
    */
   run(frames: number, budget: number = FLUID_CELL_BUDGET): { last: FluidStepReport; trace: number[] } {
@@ -892,7 +891,7 @@ export class FluidField {
     return c;
   }
 
-  /** 每帧模拟耗时(毫秒,2Hz 预算参考),用于文档里的实测数字。 */
+  /** 单步模拟耗时(毫秒,按 `FLUID_RATE_HZ` 折算每秒成本),用于文档里的实测数字。 */
   static perStepMillis(field: FluidField, frames: number): number {
     const t0 = performance.now();
     for (let i = 0; i < frames; i += 1) field.step();
@@ -930,8 +929,58 @@ export function makeSealedPool(width: number, height: number, fill: number): Flu
   return f;
 }
 
-/** 2Hz 帧时长(秒),文档与超时判定共用。 */
-export const FLUID_FRAME_SECONDS = SLOW_DT;
+/* ═══════════════ ★ 独立速率常量(单一事实源;单位:Hz = 次/秒)═══════════════
+ *
+ * owner 裁决(2026-11-21):整体提到 32Hz 之外,**流体单独提频**,不再吃慢帧。
+ *
+ * ## 为什么流体要单独提频
+ * 慢帧是 2Hz(每 0.5 秒才推进一步)⇒ 水/熔岩在观感上是「一跳一帧」,而流体
+ * 恰恰是**最可能糊**的地方。提到 8Hz 后每 0.125 秒一步(32Hz 快帧下每 4 帧一步),
+ * 按秒计的扩散速度 ×4,视觉上连续。
+ *
+ * ## 与慢帧解耦(本常量存在的全部意义)
+ * 本模块**不读** `isSlow` / `FAST_PER_SLOW` / `SLOW_TICK_HZ` / `SIM_SLOW_DT`;
+ * 调度端按「快帧序号 % 步长」取模,量化器**只有一份**
+ * (`mobs/host.ts#frameStrideAtRate` / `tickDueAtRate` / `ticksInWindow`)。
+ * ⇒ 改快慢比(`FAST_PER_SLOW`)对本速率**没有任何影响**;要改速率只改本常量。
+ *
+ * ## 为什么是 8Hz(而不是 4Hz)
+ * 单步成本实测 ≈ **333μs**(128×128 稳态,`docs/PERF-BOUNDS.md` C3;单步受
+ * `FLUID_CELL_BUDGET = 1024` 封顶,与世界面积无关)⇒ 8Hz = **2.66ms/秒**
+ * (32Hz 一帧 31.25ms 的 0.27% 摊薄 / 1.07% 单帧),余量三个数量级 ⇒ 取 8Hz。
+ * 只有在 `FLUID_CELL_BUDGET` 抬到 2048 以上、或活跃水格长期 ≫ 预算时才降到 4Hz。
+ *
+ * ## 上限保护(超预算 ⇒ 降级,不崩)
+ * 单步额度**不随速率变**:额度打满只记 `deferredCells`(R18:这一帧延后,
+ * 水位一格不丢),不抛异常、不丢状态 ⇒ 提频的坏表现是「水比预期慢」,不是崩。
+ * **每秒格数上界 = FLUID_CELL_BUDGET × FLUID_RATE_HZ**(今天 = 1024 × 8 = 8192
+ * 格/秒):要抬预算就按同一比例降速率(2048 ⇒ 4Hz、4096 ⇒ 2Hz),别让乘积变大。
+ *
+ * ## 判据(RATE-1/2/3/5/6;实现在 `tests/WS-FND-05` §11)
+ * RATE-1 本常量 = 8、`FLUID_FRAME_SECONDS` = 0.125 = 1/8(不再是慢帧的 0.5);
+ * RATE-2 跑 N 快帧 ⇒ 推进 `ticksInWindow(N, 8)` 次(32Hz、N=64 ⇒ 16 次):
+ *        逐帧谓词与整除计数两条路径必须同值;
+ * RATE-3 解耦:本文件与 `mobs/host.ts` 的**代码**里不许出现 `FAST_PER_SLOW` /
+ *        `SLOW_TICK_HZ` / `isSlow`(扫描器掩注释);把 `FAST_PER_SLOW` 改成任意值,
+ *        上面那个次数逐位不变;
+ * RATE-5 量化取上整 ⇒ **实际频率 ≤ 名义频率**(20Hz 帧率下 8Hz ⇒ 步长 3 = 6.67Hz,
+ *        绝不超支);非正/非有限的速率入参 ⇒ 步长 1,不抛异常;
+ * RATE-6 提频只放大「每秒额度」:单步仍受预算截断、水位守恒(降级 = 延后),
+ *        且 `FLUID_CELL_BUDGET × FLUID_RATE_HZ ≤ 8192`。
+ * 负对照:RATE-3/RATE-7 —— 把旧写法(`= SLOW_DT`、用 `isSlow` 门控)注回源码 ⇒ 扫描器必须红。
+ */
+
+/** 流体推进速率(Hz = 次/秒)。**与慢帧无关**;理由与判据见上方「独立速率常量」。 */
+export const FLUID_RATE_HZ = 8;
+
+/**
+ * 一次流体推进的**名义**时长(秒)= `1 / FLUID_RATE_HZ` = 0.125s。
+ *
+ * ⚠️ 名义值:调度端用 `frameStrideAtRate()` 量化到整数快帧(取上整),真实步长
+ * = 步长/快帧频率 **≥** 本值(帧率不是速率的整数倍时略慢,永不超支)。
+ * 拿它做超时判定时按上界理解(0.125 ≤ 实际 ≤ 0.25)。
+ */
+export const FLUID_FRAME_SECONDS = 1 / FLUID_RATE_HZ;
 
 /* ═══════════ 8. 水位表存档格式(★ WS-FND-164:chunk 脏页存档的流体那一半)═══════════
  *

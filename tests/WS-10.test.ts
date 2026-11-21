@@ -55,7 +55,7 @@ import {
 import { ITEM_BY_ID } from '../shared/constants/items.ts';
 import { BOSS_LIST } from '../shared/constants/bosses.ts';
 import { MOB_BY_ID } from '../shared/constants/mobs.ts';
-import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ, SLOW_DT, secondsToTicks } from '../shared/types/physics.ts';
 import { maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
 import { WorldSim, FAST_PER_SLOW, SIM_FAST_DT, SIM_SLOW_DT } from '../server/src/sim/world_sim.ts';
 /* task-70:`VitalsSystem` 直接 import —— §9 验收 3 必须用**裸实例**,
@@ -2069,6 +2069,25 @@ function partyWorld(
   return s;
 }
 
+/**
+ * ★ 把救援者 p2 贴到**倒地者 p1 的当前坐标**旁 `dist` 格处。
+ *
+ * ## 为什么不能写死绝对坐标(本条实测)
+ * `task44-6/7` 旧写法把 p2 放在出生点旁的 `(24.3, 24)`,假设倒地者还在 (24,24)。
+ * 实测(32Hz):倒地者的刚体在**残余击退窗口**里每慢帧被推进 1 格
+ * (`tickKnockback` 每个慢帧消费一步),于是「0.3 格」实测成 1.044 格
+ * (> `TOUCH_RADIUS` 0.9)⇒ 救援永不开始,而断言无法分辨「距离判定坏了」
+ * 与「夹具锚错了点」。判据要的变量只有「距离」⇒ 每慢帧重新贴住。
+ *
+ * ⚠️ 只在**慢帧**贴:救援判据只在慢帧跑;每帧贴会靠重叠刚体的分离把倒地者顶走
+ * (实测每帧贴会让倒地者连人带泡泡一路平移)。
+ */
+function pinRescuerOnSlow(sim: WorldSim, dist: number): void {
+  if ((sim.frame + 1) % FAST_PER_SLOW !== 0) return;
+  const a = sim.playerPosition('p1')!;
+  sim.setPlayerPos('p2', a.x + dist, a.y);
+}
+
 test('task44-1:击杀生物 → 队伍经验真的入账(接线前 WorldSim 无任何经验账本)', () => {
   const s = partyWorld([{ id: 'p1', x: 24, y: 24, wearing: [712] }], 'mob_sheep');
 
@@ -2174,11 +2193,18 @@ test('task44-5:HP 归零 → 进幽灵泡泡(vitals.downed 是唯一判据)', ()
   eq(s.downedOf('p1'), undefined, '对照:一开始没有泡泡状态');
 
   let downedAt = -1;
-  for (let i = 0; i < 600; i += 1) {
+  /* 击倒窗口 30 秒(帧数由秒派生;旧写法 600 帧 = 30s 只在 20Hz 成立) */
+  const deathWindow = secondsToTicks(30);
+  for (let i = 0; i < deathWindow; i += 1) {
     s.tick();
     if (s.vitals.get('p1')!.downed) { downedAt = i; break; }
   }
-  ok(downedAt >= 0, `前置:确实在 600 帧内被打到 HP 归零(第 ${downedAt} 帧)`);
+  ok(downedAt >= 0, `前置:确实在 ${deathWindow} 帧内被打到 HP 归零(第 ${downedAt} 帧)`);
+
+  /* ★ `DownedState`(泡泡)由**慢帧**创建 ⇒ 死亡后再推满**一个慢帧 stride**
+     (`FAST_PER_SLOW`,由 `SLOW_DT` 派生)才会出现。旧写法靠「死亡恰好紧跟慢帧」的
+     相位运气 —— 32Hz 下相位不同即假红(实测:此处 `downedOf` 仍是 undefined)。 */
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) s.tick();
 
   const d = s.downedOf('p1')!;
   ok(d !== undefined, '倒地后有了幽灵泡泡状态(接线前 downed=true 但没有任何后续)');
@@ -2351,13 +2377,13 @@ test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对
       { id: 'p1', x: 24, y: 24 },
       { id: 'p2', x: 24 + 40, y: 24 },   /* 先放远处 */
     ], 'mob_lava_elem', [24, 26]);
-    for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+    for (let i = 0; i < secondsToTicks(30) && !s.vitals.get('p1')!.downed; i += 1) s.tick();
     /* 前置:此时确实倒地了。 */
     if (!s.vitals.get('p1')!.downed) return { revived: false, hp: -1 };
     /* ★ 移走伤害源(D-09):否则救援者会被击退推出 0.9 格,这条就变成在测击退 */
     s.mobHost.removeMob('mob_lava_elem');
-    s.setPlayerPos('p2', 24 + dist, 24);   /* 移到指定距离 */
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < secondsToTicks(3); i += 1) {
+      pinRescuerOnSlow(s, dist);          /* 移到指定距离 */
       s.tick();
       if (s.lastRevive !== null) break;
     }
@@ -2401,18 +2427,22 @@ test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对
       { id: 'p1', x: 24, y: 24 },
       { id: 'p2', x: 64, y: 24 },
     ], 'mob_lava_elem', [24, 26]);
-    for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
-    /* 贴身 1 个慢帧(0.5s < REVIVE_TIME 1.0s ⇒ 不会复活)。 */
-    s.setPlayerPos('p2', 24.3, 24);
-    for (let i = 0; i < 10; i += 1) s.tick();
+    for (let i = 0; i < secondsToTicks(30) && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+    /* ★ 移走伤害源(与上面 `attempt()` 同一手法,理由同 D-09):熔岩怪的残余击退
+       每慢帧还把倒地者推进 1 格 ⇒ 慢帧里「贴 0.3 格」实测变成 ~1.0 格(> TOUCH_RADIUS)
+       ⇒ 救援永不开始、进度恒 0。本块测的是「松手后进度归零」,**不是**击退。
+       ⚠️ 实测(2026-11-25):不移走时这条随倒地帧号漂(修 `vitals.stepTimers` 的 dt 后即红)。 */
+    s.mobHost.removeMob('mob_lava_elem');
+    /* 贴身 1 个慢帧(0.5s < REVIVE_TIME 1.0s ⇒ 不会复活)。
+       ⚠️ 距离必须每慢帧重新贴到**倒地者当前位置**(旧写法写死 (24.3, 24))。 */
+    for (let i = 0; i < secondsToTicks(SLOW_DT); i += 1) { pinRescuerOnSlow(s, 0.3); s.tick(); }
     const built = s.downedOf('p1')?.reviveProgress ?? -1;
     /* 走远(> TOUCH_RADIUS)。 */
     s.setPlayerPos('p2', 30, 24);
-    for (let i = 0; i < 10; i += 1) s.tick();
+    for (let i = 0; i < secondsToTicks(SLOW_DT); i += 1) s.tick();
     const afterRelease = s.downedOf('p1')?.reviveProgress ?? -1;
     /* 再回来 1 个慢帧 —— 若进度被继承会直接满,若从零则回到 0.5。 */
-    s.setPlayerPos('p2', 24.3, 24);
-    for (let i = 0; i < 10; i += 1) s.tick();
+    for (let i = 0; i < secondsToTicks(SLOW_DT); i += 1) { pinRescuerOnSlow(s, 0.3); s.tick(); }
     return { carriedOver: built > 0 && afterRelease > 0, afterReturn: s.downedOf('p1')?.reviveProgress ?? -1 };
   })();
   eq(release.carriedOver, false, '走远后救援进度归零(「中途松手进度归零」契约生效)');
@@ -2437,8 +2467,9 @@ test('task44-6:队友触摸复活 —— 含「隔一格救不到」的反向对
     const gv2 = g.vitals.get('p2')!;
     gv2.downed = true;
     gv2.hp = 0;
-    g.setPlayerPos('p2', 24.3, 24);
-    for (let i = 0; i < 40; i += 1) {
+    /* 确保真的贴身(锚在倒地者当前位置,见 pinRescuerOnSlow 的说明)。 */
+    for (let i = 0; i < secondsToTicks(2); i += 1) {
+      pinRescuerOnSlow(g, 0.3);
       g.tick();
       if (g.lastRevive !== null) break;
       /* 每帧重置:避免被其它路径改动而干扰本断言。 */
@@ -2457,14 +2488,16 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
     { id: 'p1', x: 24, y: 24 },
     { id: 'p2', x: 64, y: 24 },
   ], 'mob_lava_elem', [24, 26]);
-  for (let i = 0; i < 600 && !s.vitals.get('p1')!.downed; i += 1) s.tick();
+  for (let i = 0; i < secondsToTicks(30) && !s.vitals.get('p1')!.downed; i += 1) s.tick();
   eq(s.vitals.get('p1')!.downed, true, '前置:先倒地');
   /* ★ D-09:先把伤害源移走 —— 否则救援者会在读条期间被击退推出 `TOUCH_RADIUS`,
      这条判据就测不到"复活后泡泡清除 / downed 归位"(它会先红在"复活没发生")。
      挨打会推开救援,是裁决要的机制,由 `WS-FND-53` 单独钉。 */
   s.mobHost.removeMob('mob_lava_elem');
-  s.setPlayerPos('p2', 24.3, 24);
-  for (let i = 0; i < 60 && s.lastRevive === null; i += 1) s.tick();
+  for (let i = 0; i < secondsToTicks(3) && s.lastRevive === null; i += 1) {
+    pinRescuerOnSlow(s, 0.3);
+    s.tick();
+  }
 
   ok(s.lastRevive !== null, '复活发生了');
   eq(s.lastRevive!.method, ReviveMethod.TOUCH, '复活方式是 TOUCH');
@@ -2485,8 +2518,8 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
   s.setPlayerPos('p1', 300, 300);
   s.setPlayerPos('p2', 300, 300);
   const takenAfterRevive = s.vitals.get('p1')!.totalTaken;
-  for (let i = 0; i < 40; i += 1) s.tick();
-  eq(s.vitals.get('p1')!.downed, false, '移开伤害源后 40 帧内没有再次倒地(排除状态未清的死循环)');
+  for (let i = 0; i < secondsToTicks(2); i += 1) s.tick();
+  eq(s.vitals.get('p1')!.downed, false, '移开伤害源后 2 秒内没有再次倒地(排除状态未清的死循环)');
   eq(s.vitals.get('p1')!.totalTaken, takenAfterRevive, 'totalTaken 未再增长 —— 确实没有再挨打');
   eq(s.downedOf('p1'), undefined, '没有重新生成泡泡');
 
@@ -2529,13 +2562,15 @@ test('task44-7:复活后泡泡清除且 downed 归位(不写成死循环)', () =
     { id: 'p1', x: 24, y: 24 },
     { id: 'p2', x: 64, y: 24 },
   ], 'mob_lava_elem', [24, 26]);
-  for (let i = 0; i < 600 && !g.vitals.get('p1')!.downed; i += 1) g.tick();
+  for (let i = 0; i < secondsToTicks(30) && !g.vitals.get('p1')!.downed; i += 1) g.tick();
   ok(g.vitals.get('p1')!.downed, 'task-64 前置:先倒地');
   /* ★ D-09:同 task44-6 —— 读条期间被击退会把救援者推出 0.9 格,复活不会发生。
      本块测的是「复活宽限无敌」,故先移走伤害源(挨打会推开救援由 `WS-FND-53` 钉)。 */
   g.mobHost.removeMob('mob_lava_elem');
-  g.setPlayerPos('p2', 24.3, 24);
-  for (let i = 0; i < 60 && g.lastRevive === null; i += 1) g.tick();
+  for (let i = 0; i < secondsToTicks(3) && g.lastRevive === null; i += 1) {
+    pinRescuerOnSlow(g, 0.3);
+    g.tick();
+  }
   ok(g.lastRevive !== null, 'task-64 前置:复活发生了');
   eq(g.lastRevive!.method, ReviveMethod.TOUCH, 'task-64 前置:复活方式是 TOUCH');
 
@@ -2612,7 +2647,8 @@ test('task44-8:713 命中 → 灼烧 DoT 真的逐帧扣血(原先生产零消�
   eq(dot!.dps, 8, '任务 dps 取自武器表 713 的 dot.dps = 8');
   eq(dot!.remainSec, 3, '任务时长取自武器表 dot.sec = 3');
 
-  for (let i = 0; i < 60; i += 1) s.tick();   /* 3 秒 = 60 快帧 */
+  /* 3 秒 = 灼烧任务时长;帧数由秒派生(32Hz = 96 帧)。写死 60 等于把 tick 率写死。 */
+  for (let i = 0; i < secondsToTicks(3); i += 1) s.tick();
   const burned = afterHit - rt.hp;
   near(burned, 24, 1e-6, `3 秒灼烧总量 = ${burned}(期望 8/s × 3s = 24,接线前为 0)`);
   eq(s.dotOf('mob_tanuki'), undefined, '3 秒后灼烧任务被清账(不留孤儿任务)');
@@ -2630,19 +2666,65 @@ test('task44-8:713 命中 → 灼烧 DoT 真的逐帧扣血(原先生产零消�
   const prt = prof.mobHost.runtimeOf('mob_tanuki')!;
   prof.attackMob('p1', 'mob_tanuki', { level: 1, weaponId: 713 });
   const ph0 = prt.hp;
-  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 1s */
+  for (let i = 0; i < secondsToTicks(1); i += 1) prof.tick();        /* t = 1s */
   near(ph0 - prt.hp, 8, 1e-6, `t=1s 时已烧 8(1/3 总量)—— 若按错时钟此时已烧完 24`);
   ok(prof.dotOf('mob_tanuki') !== undefined, 't=1s 时灼烧任务**仍在**(没提前结束)');
-  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 2s */
+  for (let i = 0; i < secondsToTicks(1); i += 1) prof.tick();        /* t = 2s */
   near(ph0 - prt.hp, 16, 1e-6, 't=2s 时已烧 16(2/3 总量)');
-  for (let i = 0; i < 20; i += 1) prof.tick();        /* t = 3s */
+  for (let i = 0; i < secondsToTicks(1); i += 1) prof.tick();        /* t = 3s */
   near(ph0 - prt.hp, 24, 1e-6, 't=3s 时恰好烧完 24');
   eq(prof.dotOf('mob_tanuki'), undefined, 't=3s 时任务清除');
 
   /* 反例:再跑 60 帧不应继续掉血(时长到了就该停)。 */
   const hpAt3s = rt.hp;
-  for (let i = 0; i < 60; i += 1) s.tick();
+  for (let i = 0; i < secondsToTicks(3); i += 1) s.tick();
   near(rt.hp, hpAt3s, 1e-9, '再跑 3 秒 HP 不变(灼烧按时长结束,不是永久燃烧)');
+  /* ── ★ 补充判据(第十二轮):**DoT 总伤害只取决于秒数,与 tick 率无关** ──
+   *
+   * 上面两条只测「32Hz 这一条路上对了」—— 它红了**不能**说明「换 tick 率仍然对」。
+   * 旧写法(每帧 `r2` 余量)恰恰是**只在 32Hz 才现形**的那种缺陷:
+   * ```text
+   * 20Hz  dt = 0.05     ⇒  60 帧 / 总伤害 24.00   ← 旧写法在这一侧是对的
+   * 32Hz  dt = 0.03125  ⇒ 100 帧 / 总伤害 24.99   ← 旧写法多活 0.12s
+   * ```
+   * ⇒ 把两个 dt 摆在一起跑同一把灼烧:总伤害相同、清账时刻相同。
+   * ⚠️ 帧数**本来**就不同(60 vs 96)⇒ 下面「总量相同」不是同义反复,
+   *   而是「时长语义不随帧率漂」这条口头承诺的判据。 */
+  /* 口径锚点:713 的**武器级** dot(生产 `world_sim.applyDot` 施加的就是它,
+     不是 §技能那一条 15/s × 4s)。 */
+  const dot713 = WEAPON_BY_ID.get(713)!.dot!;
+  const dotSec = dot713.sec;
+  const burnTotal = (dt: number): { total: number; frames: number } => {
+    let task = makeDot('mburn', dot713, `lava_${String(dt)}`);
+    let total = 0;
+    let frames = 0;
+    /* 上限由秒数派生(`dotSec` 秒的帧数 + 余量):跑不完就是余量没有单调递减。 */
+    const cap = Math.ceil(dotSec / dt) + 8;
+    while (frames < cap) {
+      const step = tickDot(task, dt);
+      task = step.task;
+      total += step.damage;
+      frames += 1;
+      if (step.expired) return { total, frames };
+    }
+    throw new Error(`dt=${dt} 下 ${cap} 帧仍未清账(DoT 余量没有单调递减)`);
+  };
+  eq(dot713.dps, 8, '★ 口径锚点:713 武器级 dot = 8/s(与上面 dotOf 那条同源)');
+  eq(dotSec, 3, '★ 口径锚点:713 武器级 dot 持续 3 秒');
+  const at20 = burnTotal(0.05);   /* 20Hz —— 旧默认帧长 */
+  const at32 = burnTotal(DT);     /* 32Hz —— 当前 TICK_HZ */
+  eq(at20.frames, 60, '★ 20Hz(dt = 0.05)清账用 60 帧 = 3 / 0.05');
+  eq(at32.frames, secondsToTicks(3),
+    `★ 32Hz(dt = 1/32)清账用 ${secondsToTicks(3)} 帧(= 3 × TICK_HZ,不写死 96)`);
+  ok(at20.frames !== at32.frames,
+    `★ 两个 dt 的帧数不同(${at20.frames} vs ${at32.frames})⇒ 下面「总伤害相同」不是同义反复`);
+  near(at20.frames * 0.05, dotSec, 1e-9, `★ 20Hz 清账时刻 = ${at20.frames * 0.05}s`);
+  near(at32.frames * DT, dotSec, 1e-9, `★ 32Hz 清账时刻 = ${at32.frames * DT}s`);
+  const wantBurn = dot713.dps * dotSec;
+  near(at20.total, wantBurn, 1e-9, `★ 20Hz 3 秒灼烧总量 = ${at20.total}(= 8 × 3 = ${wantBurn})`);
+  near(at32.total, wantBurn, 1e-9, `★ 32Hz 3 秒灼烧总量 = ${at32.total}(旧写法这里是 24.99)`);
+  near(at32.total, at20.total, 1e-9,
+    `★ 总伤害只取决于秒数:32Hz ${at32.total} vs 20Hz ${at20.total}(相等 ⇒ 不随 tick 率漂)`);
 });
 
 test('task44-9:DoT 只在**命中**时点燃(挥空 / 无 dot 武器两个反向对照)', () => {
@@ -2701,7 +2783,8 @@ test('task44-11:DoT 携带命中方向(fromDeg),不因站位运气改变总量',
     const rt = s.mobHost.runtimeOf('mob_clock_knight')!;
     const r = s.attackMob('p1', 'mob_clock_knight', { level: 1, weaponId: 713, fromDeg })!;
     const afterHit = rt.hp;
-    for (let i = 0; i < 60; i += 1) { rt.facingDeg = 0; s.tick(); }
+    /* 烧满 dot.sec = 3 秒(帧数由秒派生,不写死 60) */
+    for (let i = 0; i < secondsToTicks(3); i += 1) { rt.facingDeg = 0; s.tick(); }
     return { burn: afterHit - rt.hp, events: r.events as string[] };
   };
 
@@ -3268,14 +3351,18 @@ test('T59-1 ★ `advance(n)` 就是 n 个快帧,且与 `run(n)` 等价', () => {
   eq(c.frame, 0, '两次无效调用后帧号仍为 0');
 });
 
-test('T59-2 ★ 慢帧算术:每 10 快帧恰好 1 慢帧(两侧扫)', () => {
-  /* `FAST_PER_SLOW = 10`。慢帧是**世界状态的真实推进**(2Hz),
-     算错会让 AI/流体/刷怪频率整体偏移。两侧都扫,不只测一个点。 */
-  for (const [n, expectSlow] of [[9, 0], [10, 1], [11, 1], [20, 2], [100, 10]] as [number, number][]) {
+test('T59-2 ★ 慢帧算术:每 FAST_PER_SLOW 快帧恰好 1 慢帧(两侧扫)', () => {
+  /* `FAST_PER_SLOW` = 慢帧 stride(**由 `SLOW_DT` 秒派生**,32Hz ⇒ 16;20Hz ⇒ 10)。
+     算错会让 AI/流体/刷怪频率整体偏移。两侧都扫,不只测一个点。
+     ⚠️ 表格**不能写死 9/10/11/20/100** —— 那些数字编码的是「stride = 10」。 */
+  const S = FAST_PER_SLOW;
+  for (const [n, expectSlow] of [
+    [S - 1, 0], [S, 1], [S + 1, 1], [S * 2, 2], [S * 10, 10],
+  ] as [number, number][]) {
     const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
     const r = s.run(n);
     eq(r.slowFrames, expectSlow, `${n} 快帧 ⇒ 恰好 ${expectSlow} 慢帧`);
-    eq(Math.floor(n / FAST_PER_SLOW), expectSlow, `与 floor(${n}/${FAST_PER_SLOW}) 口径一致`);
+    eq(Math.floor(n / S), expectSlow, `与 floor(${n}/stride) 口径一致`);
   }
 });
 
@@ -3290,18 +3377,21 @@ test('T59-3 ★ `SIM_FAST_DT` 与 20Hz 天然对齐 —— 不需要任何换算
      推进次数由 **T59-1 / T59-4 / WS-07 的 N1/N2** 守。
      常量断言与行为断言的**失效条件本来就不同**:前者要常量被改才红,
      后者要调用被改就红。⇒ 若某次注入只让本断言没红,先查注入改的是哪一类。 */
-  eq(SIM_FAST_DT, 1 / 20, `SIM_FAST_DT = ${SIM_FAST_DT} === 1/20`);
-  eq(TICK_HZ, 20, 'TICK_HZ = 20');
+  near(SIM_FAST_DT, 1 / TICK_HZ, 1e-12,
+    `SIM_FAST_DT = ${SIM_FAST_DT} === 1/TICK_HZ(同一份单一事实源,改 tick 率无需换算)`);
+  eq(TICK_HZ, 1 / SIM_FAST_DT, 'TICK_HZ 与快帧步长互相自洽');
   eq(FAST_PER_SLOW, Math.round(SIM_SLOW_DT / SIM_FAST_DT),
     'FAST_PER_SLOW 与两个 DT 的关系自洽(1 慢帧 = FAST_PER_SLOW 快帧)');
 
   /* 关键:**一次 tick = 一帧**,不是「一次 tick = 一个慢帧」 */
   const s = new WorldSim({ sizeCells: 64, rng: () => 0.5, combatRng: () => 0.5 });
   const phases: string[] = [];
-  for (let i = 0; i < 12; i += 1) phases.push(s.tick().phase);
+  /* stride 次 tick() 内**恰好**一个慢帧(frame % FAST_PER_SLOW === 0)——
+     用 stride 而不是写死 12,否则改 tick 率后这条会与相位相关地假红/假绿。 */
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) phases.push(s.tick().phase);
   eq(phases.filter((p) => p === 'SLOW').length, 1,
-    `12 次 tick() 里恰好 1 个慢帧(实测相位 ${phases.join(' ')})`);
-  eq(s.frame, 12, 'frame 与 tick 次数 1:1');
+    `FAST_PER_SLOW(${FAST_PER_SLOW})次 tick() 里恰好 1 个慢帧(实测相位 ${phases.join(' ')})`);
+  eq(s.frame, FAST_PER_SLOW, 'frame 与 tick 次数 1:1');
 });
 
 test('T59-4 ★ 翻倍检测:多推一次必须**可观测**(本任务最该守的错)', () => {

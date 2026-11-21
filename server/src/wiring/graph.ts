@@ -29,6 +29,29 @@ export function secondsToTicks(seconds: number): number {
   return Math.max(1, Math.ceil(seconds / FRAME_SECONDS - 1e-9));
 }
 
+/* ── ★ 帧频清单:谁**留在慢帧**、谁**独立提频**(owner 裁决 2026-11-21)──
+ *
+ * 本文件的 `FRAME_SECONDS` / `TICKS_PER_SECOND` / `secondsToTicks` **仍是 2Hz 慢帧**
+ * 口径 —— 电路件与它消费的一切都留在慢帧(不改):
+ *   1 电路泛洪 `SignalGraph.tick()` + 40 项件的求值(`wiring/components.ts`);
+ *   2 自动化物流(传送带/分拣/机械臂/钻头;`wiring/logistics.ts#LOGISTICS_HZ = SLOW_TICK_HZ`);
+ *   3 刷怪决策 + AOI 唤醒(`sim/world_sim.ts#tickSpawn` / `aoi.update()`);
+ *   4 牧场日结 `settleRanchOnce` / 作物生长 `growCrops`(按天;`advanceRoomSystems`);
+ *   5 建造接力 / 房间识别 / 房间效果(`tickRelay` / `refreshRooms` / `tickRoomEffects`);
+ *   6 派对 / 急单 / 挂机(`tickPartyStep`;秒量纲 `partyClock.advance(SIM_SLOW_DT)`);
+ *   7 举投冷却 `CarrySystem.tick` 与料理 buff / 幽灵泡泡计时(秒量纲)。
+ * 独立提频(**不看 `isSlow`**,各有一个具名 Hz 常量)只有三处:
+ *   · 流体    `world/fluid.ts#FLUID_RATE_HZ`
+ *   · 生物 AI `mobs/host.ts#MOB_AI_RATE_HZ`
+ *   · Boss    `mobs/host.ts#BOSS_AI_RATE_HZ`
+ * 调度判据与量化器**只有一份**:`mobs/host.ts` 的 `frameStrideAtRate`(Hz → 快帧步长,
+ * 取上整 ⇒ 实际 ≤ 名义)、`tickDueAtRate`、`ticksInWindow`、`frameSecondsAtRate`(dt)。
+ * ⚠️ 同名不同物:`wiring/graph.ts#secondsToTicks` 是 **2Hz 慢帧**换算(最小 1 帧),
+ * `shared/types/physics.ts#secondsToTicks` 是 **`TICK_HZ` 快帧**网格(`Math.round`);
+ * 两处语义不同,故不可互换 —— 改电路延时别顺手换成快帧那份。
+ * 判据见 `tests/WS-FND-05` §11(RATE-1..8)。
+ */
+
 export const ALL_COLORS: readonly WireColor[] = [
   WireColor.RED,
   WireColor.BLUE,

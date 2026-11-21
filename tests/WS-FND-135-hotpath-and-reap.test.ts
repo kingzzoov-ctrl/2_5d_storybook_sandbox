@@ -36,11 +36,12 @@
  *     同 id 覆盖重建 / 无效攻击后再打同一 tick …)。
  */
 import { eq, ok, report, test } from '../shared/testing/harness.ts';
+import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../shared/types/physics.ts';
 import { FAST_PER_SLOW, WorldSim } from '../server/src/sim/world_sim.ts';
 import { MOB_CORPSE_FRAMES } from '../server/src/mobs/host.ts';
 import { DamageKind } from '../server/src/mobs/behaviors.ts';
 import { MAX_ACTIONS_PER_TICK, RoomAction, RoomRuntime, type WorldSaveHost } from '../server/src/net/room.ts';
-import { ViolationKind, fixedClock } from '../server/src/net/anticheat.ts';
+import { ViolationKind, fixedClock, BASE_ATTACK_INTERVAL_S } from '../server/src/net/anticheat.ts';
 import { makeComponent } from '../server/src/wiring/components.ts';
 import { clearPartyRegistry, setPartyClock } from '../server/src/net/actions/start_party.ts';
 import { AccessMode, RoomStatus } from '../server/src/db/repo.ts';
@@ -49,7 +50,11 @@ import { AccessMode, RoomStatus } from '../server/src/db/repo.ts';
 
 const SIZE = 32;
 const SEED = 135;
-
+/** 单帧**合法**位移(格):`BASE_MOVE_SPEED × DT`(32Hz = 0.140625)——
+    小于反作弊单帧额度(`maxDisplacementPerTick` = 0.225 @32Hz)。判据里的步长
+    一律由它派生:写死 0.2/0.3 只在 20Hz 下合法(0.3 > 0.225 ⇒ 反作弊先拒,
+    「世界侧拒收」那条路径根本走不到 —— 这正是 FND135-7 在 32Hz 下变红的原因)。 */
+const LEGAL_STEP = BASE_MOVE_SPEED * DT;
 let seq = 0;
 function freshId(tag: string): string {
   seq += 1;
@@ -142,8 +147,11 @@ test('FND135-1 ★★ 击杀 ⇒ 延迟窗口内三表仍持有(负对照:不是
   eq(sim.mobHost.deadIds().length, 3, '宿主自己能说出「这 3 只是尸体」');
   eq(sim.listWildlife().length, 0, '存活投影立刻不再报它们(尸体不是「活物」)');
 
-  sim.advance(1);
-  eq(sim.corpseCount, 3, `负对照:第 1 帧还没到窗口(${MOB_CORPSE_FRAMES} 帧)⇒ 不收`);
+  /* 收尸窗口 = `MOB_CORPSE_FRAMES` 帧(由 `MOB_CORPSE_SEC` = 0.1 秒派生;
+     20Hz = 2,32Hz = 3)⇒ 先走满**窗口前一帧**(不收),再走 1 帧(到窗口 ⇒ 收)。
+     旧写法写死 1 + 1 = 2 帧,只在 20Hz 下正好等于窗口。 */
+  if (MOB_CORPSE_FRAMES > 1) sim.advance(MOB_CORPSE_FRAMES - 1);
+  eq(sim.corpseCount, 3, `负对照:窗口(${MOB_CORPSE_FRAMES} 帧)未到 ⇒ 不收`);
   eq(sim.mobsReaped, 0, '负对照:一次都没收');
 
   sim.advance(1);
@@ -360,10 +368,10 @@ test('FND135-7 ★★ 世界拒收(倒地)⇒ 反作弊窗口不推进 + 如实�
   /* ── 前置:一步合法移动(把水位 / 窗口 / 权威位置对齐) ── */
   const P = sim.playerPosition('p1')!;
   const t1 = bumpTick(rt);
-  const step1 = rt.applyMove('p1', { tick: t1, x: P.x + 0.2, y: P.y, z: 0 });
+  const step1 = rt.applyMove('p1', { tick: t1, x: P.x + LEGAL_STEP, y: P.y, z: 0 });
   eq(step1.allowed, true, '前置:合法小步放行');
   const A = sim.playerPosition('p1')!;
-  eq(A.x, P.x + 0.2, '前置:权威位置真的动了');
+  eq(A.x, P.x + LEGAL_STEP, '前置:权威位置真的动了');
   const st = rt.ac.get('p1')!;
   eq(st.lastX, A.x, '前置:反作弊水位与权威**同源**');
   const winLen = st.window.length;
@@ -373,7 +381,7 @@ test('FND135-7 ★★ 世界拒收(倒地)⇒ 反作弊窗口不推进 + 如实�
   /* ── 世界拒收:倒地 ── */
   sim.vitals.applyDamage('p1', 1e9, { ignoreIframe: true });
   eq(sim.vitals.get('p1')!.downed, true, '前置:已倒地');
-  const phantom = A.x + 0.3;
+  const phantom = A.x + LEGAL_STEP;   /* 合法步长 ⇒ 这一包过的是**世界侧**那道闸,不是反作弊 */
   const t2 = bumpTick(rt);
   const rejected = rt.applyMove('p1', { tick: t2, x: phantom, y: A.y, z: 0 });
   eq(rejected.allowed, false, '★★ 世界拒收 ⇒ 回执**如实**(修前:allowed:true —— 谎报成功)');
@@ -388,7 +396,7 @@ test('FND135-7 ★★ 世界拒收(倒地)⇒ 反作弊窗口不推进 + 如实�
 
   /* ── 复活 + **同一 tick** 的合法重发(按权威坐标)⇒ 必须放行 ── */
   sim.vitals.revive('p1');
-  const retry = rt.applyMove('p1', { tick: t2, x: A.x + 0.3, y: A.y, z: 0 });
+  const retry = rt.applyMove('p1', { tick: t2, x: A.x + LEGAL_STEP, y: A.y, z: 0 });
   eq(retry.allowed, true, '★★ 回滚之后,同 tick 的合法重发必须放行(修前按幻影坐标判跳变)');
   eq(rt.ac.violations().length, violBefore, '★ 仍零违规(TELEPORT / SPEED 都没有)');
   eq(rt.worldMoveRejects, 1, '这次世界收了 ⇒ 计数不变');
@@ -398,18 +406,19 @@ test('FND135-7 ★★ 世界拒收(倒地)⇒ 反作弊窗口不推进 + 如实�
   g.rt.join({ userId: 'p1' });
   const B = g.sim.playerPosition('p1')!;
   const t1b = bumpTick(g.rt);
-  eq(g.rt.applyMove('p1', { tick: t1b, x: B.x + 0.2, y: B.y, z: 0 }).allowed, true, '注入组前置:合法小步');
+  eq(g.rt.applyMove('p1', { tick: t1b, x: B.x + LEGAL_STEP, y: B.y, z: 0 }).allowed, true,
+    '注入组前置:合法小步');
   const C = g.sim.playerPosition('p1')!;
   const st2 = g.rt.ac.get('p1')!;
   const t2b = bumpTick(g.rt);
   /* 修前:世界拒收**照样**把窗口与水位推到申报坐标(`applyPlayerMove` 返回值被丢弃);
-     客户端带预测连发两包(`C+0.3` / `C+0.6`)⇒ 水位停在 `C+0.6`,刚体还在 `C`。 */
-  st2.window.push({ tick: t2b, x: C.x + 0.6, y: C.y });
-  st2.lastX = C.x + 0.6;
+     客户端带预测连发两包(`C+2δ` / `C+δ`,δ = 单帧合法位移)⇒ 水位停在 `C+2δ`,刚体还在 `C`。 */
+  st2.window.push({ tick: t2b, x: C.x + LEGAL_STEP * 2, y: C.y });
+  st2.lastX = C.x + LEGAL_STEP * 2;
   st2.lastY = C.y;
   st2.lastMoveTick = t2b;
   g.sim.vitals.revive('p1');
-  const falsePositive = g.rt.applyMove('p1', { tick: t2b, x: C.x + 0.3, y: C.y, z: 0 });
+  const falsePositive = g.rt.applyMove('p1', { tick: t2b, x: C.x + LEGAL_STEP, y: C.y, z: 0 });
   eq(falsePositive.allowed, false, '★★ 注入:幻影水位 ⇒ 同一条**合法**报文被判跳变(修前形态)');
   eq(falsePositive.violation?.kind, ViolationKind.TELEPORT, '★ 违规类型 = TELEPORT(合法玩家被误判)');
   eq(falsePositive.worldRejected, undefined, '负对照:这次是**反作弊侧**拒绝,不是世界侧');
@@ -589,22 +598,27 @@ test('FND135-12 ★ 负对照:无世界 / 无目标 / NO_SKILL / 目标不在册
   eq(h.rt.ac.get('p1')!.lastAttackTick, -9999, '★ 冷却没提交');
 });
 
-test('FND135-13 ★ 锚:冷却间隔常量与「8 帧」的量纲一致(判据不把量纲读错)', () => {
-  /* 本套件的所有「白占 8 帧」说法都建立在「基线间隔 = 0.4s = 8 帧(@20Hz)」上。
-     这里用**函数级**入口把它钉住:第 8 帧放行、第 7 帧被拒 ——
-     常量被改掉时这条锚先红,而不是让上面那些行为判据悄悄失去量纲。 */
+test('FND135-13 ★ 锚:冷却间隔常量与「基线帧数」的量纲一致(判据不把量纲读错)', () => {
+  /* 本套件的所有「白占 N 帧」说法都建立在「基线间隔 = `BASE_ATTACK_INTERVAL_S` 秒」上。
+     这里用**函数级**入口把它钉住:基线帧数前 1 帧被拒、基线帧放行 ——
+     常量被改掉时这条锚先红,而不是让上面那些行为判据悄悄失去量纲。
+     ⚠️ 帧数由秒 × `TICK_HZ` 派生(旧写法写死 7/8 = 20Hz 下的 0.4 秒)。 */
   const rt = new RoomRuntime({ roomId: freshId('anchor'), ownerId: 'owner', clock: fixedClock(1).clock });
   rt.join({ userId: 'p1' });
   const s = rt.ac.get('p1')!;
   rt.ac.commitAttackOf('p1', 0);
-  eq(rt.ac.attackPreview('p1', 7).allowed, false, '第 7 帧仍不够(基线 8 帧)');
-  eq(rt.ac.attackPreview('p1', 8).allowed, true, '★ 第 8 帧满足基线间隔');
+  /* 基线间隔 = `BASE_ATTACK_INTERVAL_S` 秒 ⇒ **帧数由秒派生**:
+     `ceil(0.4 × TICK_HZ)`(20Hz = 8,32Hz = 13)—— 旧写法把 8 帧写死了。 */
+  const needTicks = Math.ceil(BASE_ATTACK_INTERVAL_S * TICK_HZ);
+  eq(rt.ac.attackPreview('p1', needTicks - 1).allowed, false,
+    `第 ${needTicks - 1} 帧仍不够(基线 ${needTicks} 帧)`);
+  eq(rt.ac.attackPreview('p1', needTicks).allowed, true, `★ 第 ${needTicks} 帧满足基线间隔`);
   eq(s.lastAttackTick, 0, '★ `attackPreview` 不提交水位(判定与提交分开)');
-  eq(rt.ac.commitAttackOf('p1', 8), true, '提交成功');
-  eq(s.lastAttackTick, 8, '★ 提交后水位 = 8');
+  eq(rt.ac.commitAttackOf('p1', needTicks), true, '提交成功');
+  eq(s.lastAttackTick, needTicks, `★ 提交后水位 = ${needTicks}`);
   eq(rt.ac.commitAttackOf('p1', 3), true, '负对照:申报一个**更小**的 tick 也「提交成功」');
-  eq(s.lastAttackTick, 8, '★ 但水位单调、不会被拉回去(修前 `= tick` 可被回退攻击绕过)');
-  eq(rt.ac.attackPreview('p1', 9).allowed, false, '★ 回退申报拿不到新额度');
+  eq(s.lastAttackTick, needTicks, '★ 但水位单调、不会被拉回去(修前 `= tick` 可被回退攻击绕过)');
+  eq(rt.ac.attackPreview('p1', needTicks + 1).allowed, false, '★ 回退申报拿不到新额度');
   eq(rt.ac.commitAttackOf('ghost', 1), false, '未登记的玩家 ⇒ 不提交');
 });
 

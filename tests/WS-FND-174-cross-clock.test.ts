@@ -32,6 +32,7 @@
 import { eq, near, ok, report, test, mulberry32 } from '../shared/testing/harness.ts';
 import { assemble } from '../server/src/index.ts';
 import { FAST_PER_SLOW, WorldSim } from '../server/src/sim/world_sim.ts';
+import { TICK_MS, TICK_HZ, secondsToTicks } from '../shared/types/physics.ts';
 import { RoomAction } from '../server/src/net/room.ts';
 import { PartyMode } from '../server/src/db/repo.ts';
 import { clearPartyRegistry, partyStateOf } from '../server/src/net/actions/start_party.ts';
@@ -48,12 +49,12 @@ import {
 } from '../server/src/net/actions/sleep.ts';
 import { BED_HP_PER_SEC, createAfkPlayer, goBackground, tickAfk } from '../server/src/social/afk.ts';
 
-/* ═════════════════════════ 基础设施 ═════════════════════════ */
-
 /** 写死的时间原点(墙钟;被故意做假的那一半)。 */
 const T0 = 1_700_000_000_000;
-/** 名义节拍:20Hz。 */
-const NOMINAL_BEAT_MS = 50;
+/** 上床前的空跑帧数(`runSleep`;窗口起点取这一段的**世界钟读数**)。 */
+const PRE_SLEEP_FRAMES = 30;
+/** 名义节拍 = **标称帧间隔**(冻结层 `TICK_MS`,由 `TICK_HZ` 派生;32Hz ⇒ 31.25ms)。 */
+const NOMINAL_BEAT_MS = TICK_MS;
 /** 真实节拍(实测 ~15.93Hz):**一个世界帧真实花掉 62.8ms,而世界钟只记 50ms**。 */
 const REAL_BEAT_MS = 1000 / 15.93;
 
@@ -119,7 +120,7 @@ function runParty(opts: {
     timerAtStart: -1, totalSec: cfg!.buildSec + cfg!.raceSec, wallAtSettleSec: -1,
     noClockFrames: 0,
   };
-  const frames = opts.frames ?? 1400;
+  const frames = opts.frames ?? secondsToTicks(cfg!.buildSec + cfg!.raceSec) + 200;
   for (let k = 0; k < frames; k += 1) {
     wall += opts.beatMs;
     rt.step();
@@ -189,7 +190,7 @@ function runSleep(opts: { tag: string; beatMs: number; frames?: number }): Sleep
   rt.join({ userId: 'p1' });
   const c = buildBedroom(sim);
   sim.addPlayer('p1', c.cx + 0.5, c.cy + 0.5);
-  for (let i = 0; i < 30; i += 1) { wall += opts.beatMs; rt.step(); }
+  for (let i = 0; i < PRE_SLEEP_FRAMES; i += 1) { wall += opts.beatMs; rt.step(); }
 
   const res = rt.dispatchAction('p1', RoomAction.SLEEP);
   eq(res.ok, true, `前置:卧室里 SLEEP 成功(kind=${res.kind} reason=${res.reason ?? '-'})`);
@@ -203,7 +204,7 @@ function runSleep(opts: { tag: string; beatMs: number; frames?: number }): Sleep
     expireFrame: -1, dozeEndFrame: -1, dozeStartFrame: -1,
     wallAtExpireSec: -1, sinceMs,
   };
-  const frames = opts.frames ?? 1500;
+  const frames = opts.frames ?? secondsToTicks(SLEEP_DURATION_SEC) + 200;
   for (let k = 0; k < frames; k += 1) {
     wall += opts.beatMs;
     rt.step();
@@ -238,10 +239,10 @@ test('FND174-1 ★★ HUD 剩余归零的时刻 == 世界结算的时刻(15.93Hz
 
 test('FND174-2 ★ 墙钟在结算帧已经走了 56.5 秒 ⇒ 它不可能再驱动这个 HUD(判据有牙)', () => {
   const p = runParty({ tag: 'real2', beatMs: REAL_BEAT_MS });
-  /* 时间**形态**:世界钟按帧走 ⇒ 45 秒 = 45 × 20 = 900 帧(帧号是 **0 基**的步号:
-     第 k 步把世界推到第 k+1 帧 ⇒ 结算在步 899 = 第 900 帧)。 */
-  eq(p.settleFrame, 45 * 20 - 1,
-    '★ 结算发生在开局的第 900 帧(0 基步号 899 = 45 世界秒 × 20Hz)');
+  /* 时间**形态**:世界钟按帧走 ⇒ 总时长 = `secondsToTicks(totalSec)` 帧
+     (帧号是 **0 基**步号:第 k 步把世界推到第 k+1 帧 ⇒ 结算在步 N−1)。 */
+  eq(p.settleFrame, secondsToTicks(p.totalSec) - 1,
+    `★ 结算发生在开局的第 ${secondsToTicks(p.totalSec)} 帧(0 基步号 ${secondsToTicks(p.totalSec) - 1})`);
   /* 墙钟形态:同一个 900 帧在 15.93Hz 下是 56.5 秒。
      负对照(旧实现):墙钟第 45 秒(= 第 717 帧)就会把它算成「剩余 0」。 */
   ok(p.wallAtSettleSec > p.totalSec + 10,
@@ -284,9 +285,10 @@ test('FND174-4 ★★ 注入验证:摘掉世界钟读口 ⇒ 墙钟再也推不�
     + ' ⇒ 墙钟一次都没参与(退回墙钟的实现这里恒 0)');
   ok(p.lastNonZeroFrame >= p.settleFrame - 1,
     `★ 结算之前每一帧都是「剩余 = 总时长」⇒ 倒计时一帧都没走过(实测 ${p.lastNonZeroFrame})`);
-  /* 负对照(同一夹具、**只差读口在不在**):有世界钟时同一局照常在第 899 帧归零。 */
+  /* 负对照(同一夹具、**只差读口在不在**):有世界钟时同一局照常在窗口末帧归零。 */
   const keep = runParty({ tag: 'keep', beatMs: NOMINAL_BEAT_MS, frames: 4000 });
-  eq(keep.hudZeroFrame, 899, '负对照:读口在 ⇒ 倒计时照常在第 899 帧归零');
+  eq(keep.hudZeroFrame, secondsToTicks(keep.totalSec) - 1,
+    `负对照:读口在 ⇒ 倒计时照常在第 ${secondsToTicks(keep.totalSec) - 1} 帧归零`);
   eq(keep.noClockFrames, 0, '负对照:读口在 ⇒ 「缺读数」计数恒 0(两条降级路径分得开)');
 });
 
@@ -298,9 +300,14 @@ test('FND174-5 ★★ 打盹窗口打在**世界钟**上:60 世界秒,而不是 
   eq(real.base, 'WORLD', '★★ 窗口的时基 = 世界钟(房间推开的世界秒),不是模块时钟(墙钟)');
   eq(real.windowMs, SLEEP_DURATION_MS, '窗口长度 = SLEEP_DURATION_MS(60 世界秒)');
   eq(real.windowMs / 1000, 60, '锚:窗口秒数 = 60(= SLEEP_DURATION_SEC;期望侧写字面量以免同义反复)');
-  /* 结束时刻:世界秒 60 ⇒ 60 × 20 = 1200 帧(窗口在世界钟 1.5s 处开)。 */
-  eq(real.expireFrame, SLEEP_DURATION_SEC * 20 - 1,
-    `★ 第 1200 帧到期(0 基步号 1199 = 60 世界秒 × 20Hz),实测 ${real.expireFrame}`);
+  /* 时间**形态**:窗口起点是**量化到 0.5 秒慢帧网格**的世界钟读数
+     (`worldSecondsOf`:`floor(sec × SLOW_TICK_HZ) / SLOW_TICK_HZ`),
+     到期 = 起点 + `SLEEP_DURATION_SEC` 世界秒 ⇒ 帧数由秒 × `TICK_HZ` 派生
+     (旧写法 `SLEEP_DURATION_SEC × 20` 把 20Hz 写死);夹具见 `PRE_SLEEP_FRAMES`。 */
+  const expectExpire = Math.ceil((real.sinceMs / 1000 + SLEEP_DURATION_SEC) * TICK_HZ) - 1 - PRE_SLEEP_FRAMES;
+  eq(real.expireFrame, expectExpire,
+    `★ 到期帧 = 世界钟起点(${real.sinceMs / 1000}s,已量化)+ ${SLEEP_DURATION_SEC}s`
+    + ` ⇒ ${expectExpire} 帧,实测 ${real.expireFrame}`);
   /* 同一时刻的**墙钟**读数:15.93Hz 下已走 ~75 秒 ⇒ 两个钟不是一回事。
      负对照(旧实现):窗口按墙钟判 ⇒ 第 956 帧(墙上 60 秒)就醒。 */
   ok(real.wallAtExpireSec > SLEEP_DURATION_SEC + 10,

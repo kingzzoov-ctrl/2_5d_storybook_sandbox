@@ -40,9 +40,9 @@ import { join, relative } from 'node:path';
 
 import { eq, near, ok, report, test } from '../shared/testing/harness.ts';
 import { assemble } from '../server/src/index.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 import { DamageKind } from '../server/src/mobs/behaviors.ts';
-import { BASE_MOVE_SPEED } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, secondsToTicks } from '../shared/types/physics.ts';
 import {
   COMBO_CHAIN_MUL,
   COMBO_WINDOW_SEC,
@@ -148,14 +148,14 @@ test('FND152-3 moveMul 接**速度上限**乘区,且**不是**地面摩擦 μ(mu
               或者把 moveMul 当作 μ 写进 muMuls ⇒ 第 2 条红(D-12 的 μ 与这里不是同一件事)。 */
   const s = scene();
   s.useItem('p1', { itemId: FOOD_CHICKEN });
-  s.advance(10); /* 一个慢帧:推送点在慢帧里 */
+  s.advance(FAST_PER_SLOW); /* 一个慢帧:推送点在慢帧里(旧写法 10 编码了 20Hz) */
   near(s.physics.speedCapOf('p1') ?? -1, BASE_MOVE_SPEED * 1.10, 1e-9, '★ 4.5 × 1.10 = 4.95');
   const phys = s.physics as unknown as { muMuls: Map<string, number> };
   eq(phys.muMuls.has('p1'), false, '★ moveMul 是速度**上限**乘区,不该写进 μ 旁表(610 才走 μ)');
 
   /* 负对照:没吃料理 ⇒ 速度上限**不设记录**(中性必须是「撤掉」而不是「推 1」)。 */
   const bare = scene();
-  bare.advance(10);
+  bare.advance(FAST_PER_SLOW);
   eq(bare.physics.speedCapOf('p1'), null, '★ 没吃料理 ⇒ 旁表没有记录');
 });
 
@@ -165,14 +165,14 @@ test('FND152-4 gravityMul / jumpMul 接物理层(重力 + 起跳),没吃 ⇒ 两
      负对照:没吃料理 ⇒ gravityMulOf = 1、jumpMulOf = 1、jumpPlayer 不放大。 */
   const s = scene();
   s.useItem('p1', { itemId: FOOD_CHICKEN });
-  s.advance(10);
+  s.advance(FAST_PER_SLOW);
   near(s.physics.gravityMulOf('p1'), 0.90, 1e-9, '★ 重力 ×0.90');
   near(s.physics.jumpMulOf('p1'), 1.05, 1e-9, '★ 起跳 ×1.05');
   near(s.jumpPlayer('p1', 8) ?? -1, 8 * 1.05, 1e-9, '★ 8 × 1.05 = 8.4(乘区只结算一次)');
   eq(s.tryPlayerJump('p1').reason, 'AIRBORNE', '负对照:已经在空中 ⇒ 生产入口拒绝第二次起跳');
 
   const bare = scene();
-  bare.advance(10);
+  bare.advance(FAST_PER_SLOW);
   near(bare.physics.gravityMulOf('p1'), 1, 1e-12, '没吃 ⇒ 重力恒 1');
   near(bare.physics.jumpMulOf('p1'), 1, 1e-12, '没吃 ⇒ 起跳恒 1');
   near(bare.jumpPlayer('p1', 8) ?? -1, 8, 1e-9, '没吃 ⇒ 起跳 8 逐位不变');
@@ -181,7 +181,7 @@ test('FND152-4 gravityMul / jumpMul 接物理层(重力 + 起跳),没吃 ⇒ 两
   const c = scene();
   c.useItem('p1', { itemId: FOOD_GRAVITY });
   c.useItem('p1', { itemId: FOOD_JUMP });
-  c.advance(10);
+  c.advance(FAST_PER_SLOW);
   near(c.physics.gravityMulOf('p1'), 0.30, 1e-9, '609 的 0.30 逐字保留');
   near(c.physics.jumpMulOf('p1'), 1.50, 1e-9, '604 的 1.50 逐字保留');
 });
@@ -279,7 +279,7 @@ test('FND152-8 ★ 连击接进**伤害**:生产入口同帧三刀 ⇒ 第 3 刀
   near(r3.hit!.result.base / r1.hit!.result.base, 1.25, 0.01, '★ 第 3 刀 base = 第 1 刀 × 1.25');
 
   /* 负对照:跨过窗口(> 0.6 秒;DT = 0.05 ⇒ 20 帧 = 1.0 秒)⇒ 连击回到 1,伤害回到 1.00 档。 */
-  s.advance(20);
+  s.advance(secondsToTicks(COMBO_WINDOW_SEC * 2));   /* 跨过 0.6 秒连击窗口 */
   const r4 = s.attackMobAuthorized('p1', 'mob_boar#1', {});
   eq(s.comboOf('p1')?.count, 1, '★ 超窗后重新从第 1 段算');
   ok(r4.hit !== null, '第 4 刀仍命中(前置)');
@@ -405,7 +405,11 @@ test('FND152-12 ★ 世界侧真的按质量推:质量 20 的玩家被推 0.1 �
   hb!.mass = 20;
   eq(heavy.applyKnockback('p1', hx - 1, hb!.y, 2), true, '击退被接受');
   eq(heavy.knockbackOf('p1'), true, '搬家窗口打开(可观测)');
-  heavy.advance(20);
+  /* 击退走**慢帧分段推**(生产侧 `WorldSim.KNOCKBACK_STEPS = 2` 段,每段一个慢帧,
+     该常量是 private ⇒ 这里按同值声明并注明出处);帧数 = 段数 × 慢帧 stride。
+     旧写法 20 = 20Hz 下的 2 个慢帧。 */
+  const KNOCKBACK_STEPS = 2;   /* = `WorldSim.KNOCKBACK_STEPS`(private) */
+  heavy.advance(KNOCKBACK_STEPS * FAST_PER_SLOW);
   near(hb!.x - hx, 0.1, 1e-6, '★ 质量 20 ⇒ 2 × (1/20) = 0.1 格');
 
   const light = scene();
@@ -413,7 +417,7 @@ test('FND152-12 ★ 世界侧真的按质量推:质量 20 的玩家被推 0.1 �
   const lx = lb!.x;
   eq(lb!.mass, 1, '前提:玩家默认质量 = 1');
   light.applyKnockback('p1', lx - 1, lb!.y, 2);
-  light.advance(20);
+  light.advance(KNOCKBACK_STEPS * FAST_PER_SLOW);
   near(lb!.x - lx, 2, 1e-6, '★ 质量 1 ⇒ 逐位 2 格(D-09 原值)');
 });
 

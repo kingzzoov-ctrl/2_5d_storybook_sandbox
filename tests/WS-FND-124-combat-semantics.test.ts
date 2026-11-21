@@ -26,8 +26,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { eq, ok, near, report, test, mulberry32 } from '../shared/testing/harness.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
-import { BodyState } from '../shared/types/physics.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
+import { BodyState, secondsToTicks } from '../shared/types/physics.ts';
 import { createProgress, setLevel } from '../server/src/combat/progression.ts';
 import { createDowned, ghostControl } from '../server/src/combat/revive.ts';
 import {
@@ -95,7 +95,8 @@ test('FND124-1 ★★ P1:倒地者被打成 BUBBLED 后仍然不能攻击(修前
 
   /* 把 p1 打成 0 血 ⇒ vitals.downed 同一帧置真;慢帧建幽灵泡泡。 */
   s.vitals.applyDamage('p1', 1e9, { ignoreIframe: true });
-  for (let i = 0; i < 10; i += 1) s.tick();
+  /* 泡泡由**慢帧**创建 ⇒ 推满一个慢帧 stride(旧写法 10 编码了 20Hz)。 */
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) s.tick();
   const ghost = s.downedOf('p1');
   ok(ghost !== undefined, '前置:慢帧建出了倒地状态');
   eq(ghost!.state, BodyState.GHOST_BUBBLE, '前置:泡泡态是 GHOST_BUBBLE');
@@ -306,11 +307,11 @@ test('FND124-7 ★★ P2:716 箭雨按 tick 排程(修前 6 段同一帧)', () =
   const afterFirst = rt.hp;
   ok(hp0 - afterFirst > 0, '第 1 段当场落地');
 
-  for (let i = 0; i < 10; i += 1) s.tick();          /* 10 × 0.05 = 0.5 秒 */
+  for (let i = 0; i < secondsToTicks(0.5); i += 1) s.tick();   /* 0.5 秒(帧数由秒派生) */
   ok(rt.hp < afterFirst, '★ 0.5 秒后第 2 段才到(修前 6 段全在第一帧)');
   eq(s.pendingSkillTicks(), 4, '★ 只到期 1 段(段间隔 0.5 秒真的被遵守)');
 
-  for (let i = 0; i < 60; i += 1) s.tick();
+  for (let i = 0; i < secondsToTicks(3); i += 1) s.tick();
   eq(s.pendingSkillTicks(), 0, '★ 排队的段全部走完');
   eq(s.skillTickStats().landed, 5, '★ 5 段在后续帧分别结算');
   ok(hp0 - rt.hp > hp0 - afterFirst, '★ 后续段真的继续造成伤害');
@@ -335,11 +336,11 @@ test('FND124-8 ★★ P2:718 陨石的 1 秒前摇真的存在(前摇内零结�
   eq(hit.pendingTicks, 1, '整段排队');
   eq(rt.hp, hp0, '生物一点血没掉');
 
-  for (let i = 0; i < 10; i += 1) s.tick();          /* 0.5 秒 */
+  for (let i = 0; i < secondsToTicks(0.5); i += 1) s.tick();   /* 0.5 秒 */
   eq(rt.hp, hp0, '★ 0.5 秒时仍在预警(前摇没走完)');
   eq(s.pendingSkillTicks(), 1, '★ 段还在队列里');
 
-  for (let i = 0; i < 15; i += 1) s.tick();          /* 累计 1.25 秒 */
+  for (let i = 0; i < secondsToTicks(0.75); i += 1) s.tick();  /* 累计 1.25 秒 */
   ok(rt.hp < hp0, '★ 1 秒后陨石落地');
   eq(s.pendingSkillTicks(), 0, '★ 落地后队列清空');
 });

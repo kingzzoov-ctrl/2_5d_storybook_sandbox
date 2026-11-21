@@ -27,13 +27,21 @@
  * 且该条实测余量 5000 倍以上,不会抖红。
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { test, ok, eq, near, inRange, report } from '../shared/testing/harness.ts';
 
 import { Chunk } from '../server/src/world/chunk.ts';
-import { FluidField } from '../server/src/world/fluid.ts';
+import { FluidField, FLUID_RATE_HZ, FLUID_FRAME_SECONDS, FLUID_CELL_BUDGET } from '../server/src/world/fluid.ts';
 import { PhysicsWorld } from '../server/src/physics/world.ts';
 import { SignalGraph } from '../server/src/wiring/graph.ts';
 import { AoiManager, AOI_WAKE_DISTANCE } from '../server/src/mobs/aoi.ts';
+import {
+  FAST_FRAME_HZ, MOB_AI_RATE_HZ, BOSS_AI_RATE_HZ, MOB_AI_DT_SEC, BOSS_AI_DT_SEC,
+  frameStrideAtRate, tickDueAtRate, ticksInWindow, frameSecondsAtRate,
+} from '../server/src/mobs/host.ts';
 import { WireColor } from '../shared/types/tile.ts';
 import {
   estimateBandwidth, encodeDelta,
@@ -495,4 +503,157 @@ test('内存上界换算自洽:1KB 基础网格 + 顶层结构 = 常驻字节', 
   eq(Chunk.RESIDENT_BYTES, 1024 + 512 + 96, '常驻应为 grid + roofs + 元数据');
 });
 
+/* ═══════════ 11. 独立速率常量:流体 / AI / Boss(owner 裁决 2026-11-21)═══════════
+ *
+ * ⚠️ 本节**不是**手册原文数字:它守的是 owner 的裁决「整体提到 32Hz 之外,流体与
+ * AI **单独提频到 8Hz**,且与慢帧解耦」。期望值因此全部写**字面量**(8 / 4 / 0.125 /
+ * 16),不引用被测常量 —— 引用常量会让「改成几就绿成几」。
+ *
+ * 判据:RATE-1(流体常量)/ RATE-2(跑 N 帧 ⇒ expected 次)/ RATE-3(解耦)/
+ *       RATE-4(AI·Boss 常量与 dt)/ RATE-5(取整方向:实际 ≤ 名义)/
+ *       RATE-6(上限保护:超预算 ⇒ 降级不崩)/ RATE-7(解耦负对照)/ RATE-8(慢帧清单显式)。
+ */
+
+/** 掩掉注释与字符串(**长度与换行不变** ⇒ 行号不偏),只留代码。 */
+function rateCodeOnly(src: string): string {
+  let out = '';
+  let i = 0;
+  let st: 'code' | 'line' | 'block' | 'str' = 'code';
+  let q = '';
+  while (i < src.length) {
+    const c = src[i] as string;
+    const c2 = src[i + 1];
+    if (st === 'code') {
+      if (c === '/' && c2 === '/') { st = 'line'; out += '  '; i += 2; continue; }
+      if (c === '/' && c2 === '*') { st = 'block'; out += '  '; i += 2; continue; }
+      if (c === "'" || c === '"' || c === '`') { st = 'str'; q = c; out += c; i += 1; continue; }
+      out += c; i += 1; continue;
+    }
+    if (st === 'line') { if (c === '\n') { st = 'code'; out += c; i += 1; continue; } out += ' '; i += 1; continue; }
+    if (st === 'block') {
+      if (c === '*' && c2 === '/') { st = 'code'; out += '  '; i += 2; continue; }
+      out += c === '\n' ? '\n' : ' '; i += 1; continue;
+    }
+    if (c === '\\') { out += c + (c2 ?? ''); i += 2; continue; }
+    if (c === q) { st = 'code'; q = ''; out += c; i += 1; continue; }
+    out += c; i += 1;
+  }
+  return out;
+}
+
+/**
+ * 「速率与慢帧耦合」的形态扫描(**纯函数**,可喂合成副本 ⇒ 负对照有牙)。
+ * 命中 = 代码里出现 `FAST_PER_SLOW` / `SLOW_TICK_HZ` / `isSlow` / `SIM_SLOW_DT`。
+ */
+function rateCouplingHits(files: readonly { path: string; src: string }[]): string[] {
+  const re = /FAST_PER_SLOW|SLOW_TICK_HZ|isSlow|SIM_SLOW_DT/;
+  return files.filter((f) => re.test(rateCodeOnly(f.src))).map((f) => f.path);
+}
+
+const RATE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const rateRead = (rel: string): { path: string; src: string } =>
+  ({ path: rel, src: readFileSync(join(RATE_ROOT, rel), 'utf8') });
+/** 判据 RATE-3/RATE-7 的被测面:两个**独立提频**的模块。 */
+const RATE_FILES = [rateRead('server/src/world/fluid.ts'), rateRead('server/src/mobs/host.ts')];
+
+test('[RATE-1/2] 流体 8Hz:具名常量 + 跑 N 帧推进 expected 次', () => {
+  eq(FLUID_RATE_HZ, 8, 'RATE-1:流体速率 = 8Hz(次/秒;不再等于慢帧的 2Hz)');
+  eq(FLUID_FRAME_SECONDS, 0.125, 'RATE-1:名义帧长 = 1/8 = 0.125s');
+
+  /* RATE-2:跑 N 帧 ⇒ 该系统推进 expected 次。期望值用**逐帧谓词**独立数一遍
+     (与 `ticksInWindow` 的整除计数是两条路径),再钉两个字面量。 */
+  for (const N of [1, 3, 4, 7, 8, 16, 64, 100, 1000]) {
+    let byPredicate = 0;
+    for (let f = 1; f <= N; f += 1) if (tickDueAtRate(f, FLUID_RATE_HZ)) byPredicate += 1;
+    eq(byPredicate, ticksInWindow(N, 8), `N=${N} 帧:逐帧谓词次数必须等于 ticksInWindow`);
+  }
+  eq(ticksInWindow(64, 8), 16, '32Hz 下 64 帧 = 2 秒 ⇒ 流体推进 16 次');
+  eq(ticksInWindow(1000, 8), 250, '1000 帧(31.25 秒)⇒ 250 次');
+  eq(ticksInWindow(0, 8), 0, '0 帧 ⇒ 0 次(边界)');
+});
+
+test('[RATE-5] 量化取上整:实际频率 ≤ 名义频率(速率永不超支)', () => {
+  eq(FAST_FRAME_HZ, 32, '快帧频率 = 冻结层 TICK_HZ(owner 目标 32Hz)');
+  eq(frameStrideAtRate(8), 4, '32Hz ÷ 8Hz = 每 4 快帧一次(整数比,精确)');
+  eq(frameStrideAtRate(8, 20), 3, '20Hz ÷ 8Hz 非整数:取上整 ⇒ 3 帧');
+  ok(20 / frameStrideAtRate(8, 20) <= 8, '★ 取整方向:若改成下取(2 帧 = 10Hz)这条立刻红');
+  ok(frameStrideAtRate(8, 20) > 20 / 8, '上整必须严格大于名义商(2.5 ⇒ 3)');
+  eq(frameStrideAtRate(2, 32), 16, '慢帧 2Hz 经同一量化器 ⇒ 步长 16(= 32 ÷ 2,旧口径可复现)');
+  eq(frameStrideAtRate(0), 1, 'rate ≤ 0 ⇒ 步长 1(不抛异常)');
+  eq(frameStrideAtRate(Number.NaN), 1, '非法速率 ⇒ 步长 1(不抛异常)');
+  eq(frameStrideAtRate(1e9), 1, '速率 ≫ 帧率 ⇒ 仍是 1(每帧),不会得到 0 帧');
+});
+
+test('[RATE-3/7] 解耦:代码里不许出现慢帧耦合符号(注释不算),注入 ⇒ 红', () => {
+  eq(rateCouplingHits(RATE_FILES), [],
+    '流体与 AI 的**代码**里不许有 FAST_PER_SLOW / SLOW_TICK_HZ / isSlow / SIM_SLOW_DT');
+
+  /* 负对照(注入合成副本):旧写法必须被命中,否则本节无区分力。 */
+  eq(rateCouplingHits([{ path: 'x', src: 'const due = isSlow;\n' }]).length, 1,
+    '负对照:旧门控 `isSlow` 必须命中');
+  eq(rateCouplingHits([{ path: 'x', src: 'const dt = SIM_SLOW_DT;\n' }]).length, 1,
+    '负对照:AI 的 dt 改回 `SIM_SLOW_DT` 必须命中');
+  eq(rateCouplingHits([{ path: 'x', src: 'const n = FAST_PER_SLOW;\n' }]).length, 1,
+    '负对照:`FAST_PER_SLOW` 必须命中');
+  /* 反面对照:注释里提到这些名字是**允许**的(那是留档)⇒ 掩注释后必须为 0。 */
+  eq(rateCouplingHits([{ path: 'x', src: '/* 早先用 isSlow 门控 */\nconst a = 1;\n' }]).length, 0,
+    '注释不算命中(否则本节自己就会红,判据失去区分力)');
+
+  /* 「改 FAST_PER_SLOW 不影响它」的直接读数:次数只由 *_RATE_HZ 与 TICK_HZ 决定。 */
+  eq(ticksInWindow(64, 8, 32), 16, '32Hz 帧率下 8Hz ⇒ 每 64 帧 16 次(与慢帧比无关)');
+  eq(frameStrideAtRate(8, 32), frameStrideAtRate(8), '显式帧率与当前帧率同值 ⇒ 同一节拍');
+});
+
+test('[RATE-4] AI / Boss 各自 8Hz,dt = 0.125s(不是慢帧的 0.5s)', () => {
+  eq(MOB_AI_RATE_HZ, 8, 'RATE-4:生物 AI = 8Hz(原「慢帧约 1.6~2Hz」)');
+  eq(BOSS_AI_RATE_HZ, 8, 'RATE-4:Boss = 8Hz');
+  eq(MOB_AI_DT_SEC, 0.125, 'AI 一 tick = 4/32 = 0.125s');
+  eq(BOSS_AI_DT_SEC, 0.125, 'Boss 一 tick = 0.125s');
+  ok(MOB_AI_DT_SEC * MOB_AI_RATE_HZ === 1, '★ dt × 速率 = 1(给错 dt 会让生物 4 倍速移动而不报错)');
+  ok(BOSS_AI_DT_SEC * BOSS_AI_RATE_HZ === 1, '同上(Boss 的护盾/眩晕倒计时是秒量纲)');
+  eq(frameSecondsAtRate(2, 32), 0.5, '负对照:慢帧经同一量化器 = 0.5s(改回慢帧 dt 会让上两条红)');
+
+  let ai = 0;
+  let boss = 0;
+  for (let f = 1; f <= 64; f += 1) {
+    if (tickDueAtRate(f, MOB_AI_RATE_HZ)) ai += 1;
+    if (tickDueAtRate(f, BOSS_AI_RATE_HZ)) boss += 1;
+  }
+  eq(ai, 16, '64 帧(2 秒)= AI 推进 16 次(2Hz 慢帧下只有 4 次)');
+  eq(boss, 16, '64 帧 = Boss 推进 16 次');
+  eq(ticksInWindow(200, 2, 32), 12, '负对照:2Hz 慢帧口径 200 帧只推进 12 次(≠ 8Hz 的 50)');
+});
+
+test('[RATE-6] 上限保护:提频只放大每秒额度;超预算 ⇒ 降级(延后)不崩', () => {
+  eq(FLUID_CELL_BUDGET, 1024, '单步额度仍是 1024(不随速率变)');
+  ok(FLUID_CELL_BUDGET * FLUID_RATE_HZ <= 8192,
+    '每秒格访问上界 = 1024 × 8 = 8192;抬预算要按同一比例降速率');
+
+  /* 额度远小于活跃格 ⇒ 每帧都「延后」:不许抛异常,水位一格不丢。 */
+  const p = mkPool(96);
+  const before = p.total();
+  let deferred = 0;
+  let threw = '';
+  try {
+    for (let i = 0; i < 200; i += 1) deferred += p.step(64).deferredCells;
+  } catch (e) {
+    threw = String(e);
+  }
+  eq(threw, '', '额度打满不许抛异常(降级 = 延后)');
+  ok(deferred > 0, `额度 64 服务不了 96×96 的活跃集 ⇒ 必须报告延后(实测 ${deferred} 格·次)`);
+  eq(p.total(), before, '延后期间总毫格数精确不变(R18:延后不丢水位)');
+});
+
+test('[RATE-8] 「谁留在慢帧」是显式清单,不是默认值', () => {
+  const g = rateRead('server/src/wiring/graph.ts').src;
+  ok(g.includes('谁**留在慢帧**、谁**独立提频**'), 'RATE-8:graph.ts 必须有帧频清单节');
+  for (const kw of [
+    'SignalGraph.tick()', 'LOGISTICS_HZ', 'tickSpawn', 'settleRanchOnce', 'growCrops',
+    'tickRelay', 'refreshRooms', 'tickRoomEffects', 'tickPartyStep', 'CarrySystem.tick',
+  ]) ok(g.includes(kw), `清单必须逐条列出「留在慢帧」者:${kw}`);
+  for (const kw of ['FLUID_RATE_HZ', 'MOB_AI_RATE_HZ', 'BOSS_AI_RATE_HZ']) {
+    ok(g.includes(kw), `清单必须点名独立提频的常量:${kw}`);
+  }
+  ok(g.includes('frameStrideAtRate'), '清单必须指出量化器的唯一住处(mobs/host.ts)');
+});
 report('WS-FND-05');

@@ -38,6 +38,7 @@
  * · 0 影响行 ≠ 静默成功 ⇒ 必须断言「房间不存在 ⇒ 0」,而不是抛错或假装写成功
  * ```
  */
+import { TICK_HZ } from '../shared/types/physics.ts';
 import { eq, near, ok, report, test } from '../shared/testing/harness.ts';
 import {
   PartyMode,
@@ -425,12 +426,15 @@ test('FND144-7 previewAttack 不推进水位;commitAttack 才推进且单调;拒
   eq(s.score, VIOLATION_WEIGHT.ATTACK_RATE, '★ 违规照记(ATTACK_RATE 是事实,与结算成不成功无关)');
   eq(s.lastAttackTick, 100, '★★ 被拒后水位仍是 100(拒绝不提交)');
 
-  /* 负对照 2:边界含等号 —— 恰好 8 帧放行,少一点点就拒。 */
-  eq(BASE_ATTACK_INTERVAL_S, 0.4, '锚点:基线 0.4s = 8 帧 @20Hz');
+  /* 负对照 2:边界含等号 —— 恰好一个基线间隔放行,少一点点就拒。 */
+  eq(BASE_ATTACK_INTERVAL_S, 0.4, '锚点:基线 0.4s(帧数 = 0.4 × TICK_HZ,不写死 8)');
+  /* 阈值本身是**秒 × TICK_HZ**(32Hz ⇒ 12.8 帧),不是整数 ⇒ 边界值用它、不用 ceil 后的整数。 */
+  const minIntervalTicks = BASE_ATTACK_INTERVAL_S * TICK_HZ;
   const b = createAcState('p2', 0);
   commitAttack(b, 0);
-  eq(previewAttack(b, 8).allowed, true, '★ 恰好 8 帧 ⇒ 放行(边界是「≥」)');
-  eq(previewAttack(b, 7.999).allowed, false, '★★ 差 0.001 帧 ⇒ 拒(边界不是「>」)');
+  eq(previewAttack(b, minIntervalTicks).allowed, true,
+    `★ 恰好 ${minIntervalTicks} 帧(= 0.4 × TICK_HZ)⇒ 放行(边界是「≥」)`);
+  eq(previewAttack(b, minIntervalTicks - 0.001).allowed, false, '★★ 差 0.001 帧 ⇒ 拒(边界不是「>」)');
   eq(b.lastAttackTick, 0, '两次都只判定,水位没动');
 
   /* 负对照 3:单调 —— 申报一个更小的 tick 不许把水位往回拉。 */
@@ -448,8 +452,8 @@ test('FND144-7 previewAttack 不推进水位;commitAttack 才推进且单调;拒
   commitAttack(i, 40);
   commitAttack(i, 40);
   eq(i.lastAttackTick, 40, '★ 同 tick 重复提交不动(幂等)');
-  eq(previewAttack(i, 48).allowed, true, '满 8 帧放行');
-  eq(previewAttack(i, 47.99).allowed, false, '不足 8 帧仍拒');
+  eq(previewAttack(i, 40 + minIntervalTicks).allowed, true, `满 ${minIntervalTicks} 帧放行`);
+  eq(previewAttack(i, 40 + minIntervalTicks - 0.001).allowed, false, '差 0.001 帧 ⇒ 仍拒');
 });
 
 test('FND144-8 攻速加成:NaN / 非数值 / -Inf 必须回落「未声明」,**不许 fail-open**', () => {
@@ -458,20 +462,22 @@ test('FND144-8 攻速加成:NaN / 非数值 / -Inf 必须回落「未声明」,*
   const s = createAcState('p1', 0);
   commitAttack(s, 0);
 
-  /* 正对照:满加成 ⇒ 间隔减半到 4 帧。 */
-  eq(previewAttack(s, 4, MAX_ATTACK_SPEED_BONUS).allowed, true, '满加成 ⇒ 4 帧即可');
-  eq(previewAttack(s, 3.99, MAX_ATTACK_SPEED_BONUS).allowed, false, '负对照:3.99 帧仍不够');
-  eq(previewAttack(s, 5, 5).allowed, true, '超上限的声明被钳到 1.0(仍是 4 帧)');
+  /* 正对照:满加成 ⇒ 间隔减半(帧数 = 基线秒数 / 2 × TICK_HZ;32Hz ⇒ 6.4)。 */
+  const halfTicks = Math.ceil((BASE_ATTACK_INTERVAL_S / (1 + MAX_ATTACK_SPEED_BONUS)) * TICK_HZ);
+  eq(previewAttack(s, halfTicks, MAX_ATTACK_SPEED_BONUS).allowed, true, `满加成 ⇒ ${halfTicks} 帧即可`);
+  eq(previewAttack(s, halfTicks - 1, MAX_ATTACK_SPEED_BONUS).allowed, false,
+    `负对照:${halfTicks - 1} 帧仍不够`);
+  eq(previewAttack(s, halfTicks, 5).allowed, true, `超上限的声明被钳到 1.0(仍是 ${halfTicks} 帧)`);
 
   /* ★★ 核心负对照:非法声明不许让 `minInterval` 变 NaN。
      `since < NaN` 恒 false ⇒ 同帧 10 连发全放行(CR-14 U2-b 的原形态)。 */
-  eq(previewAttack(s, 4, Number.NaN).allowed, false,
-    '★★ NaN 加成 ⇒ 回落「未声明」= 8 帧 ⇒ 4 帧必须拒(否则整道闸静默失效)');
-  eq(previewAttack(s, 4, 'abc' as unknown as number).allowed, false,
+  eq(previewAttack(s, halfTicks - 1, Number.NaN).allowed, false,
+    `★★ NaN 加成 ⇒ 回落「未声明」= ${halfTicks * 2} 帧 ⇒ 必须拒(否则整道闸静默失效)`);
+  eq(previewAttack(s, halfTicks - 1, 'abc' as unknown as number).allowed, false,
     '★ 字符串声明 ⇒ 同样回落(TS 标注不产生运行时校验)');
-  eq(previewAttack(s, 4, Number.NEGATIVE_INFINITY).allowed, false,
+  eq(previewAttack(s, halfTicks - 1, Number.NEGATIVE_INFINITY).allowed, false,
     '★ −Inf ⇒ 回落,不夹成 0(夹 0 = allowed 0 ⇒ 每次移动都判瞬移,自我锁死)');
-  eq(previewAttack(s, 4, Number.POSITIVE_INFINITY).allowed, true,
+  eq(previewAttack(s, halfTicks, Number.POSITIVE_INFINITY).allowed, true,
     '★ +Inf ⇒ 钳到上限(「申请最大加成」是安全的,与既有行为一致)');
 
   /* 非法声明产生的拒必须**归因到 ATTACK_RATE**(不是别处),且分数照记。 */
@@ -483,9 +489,13 @@ test('FND144-8 攻速加成:NaN / 非数值 / -Inf 必须回落「未声明」,*
   const L = { ...DEFAULT_LIMITS, baseAttackIntervalS: 1.0, maxAttackSpeedBonus: 0 };
   const c = createAcState('p2', 0);
   commitAttack(c, 0);
-  eq(previewAttack(c, 19, 0, L).allowed, false, '★ 1.0s @20Hz = 20 帧:19 帧不够');
-  eq(previewAttack(c, 20, 0, L).allowed, true, '★ 20 帧放行(阈值随注入的 limits 走)');
-  eq(previewAttack(c, 20, 1.0, L).allowed, true, 'maxAttackSpeedBonus = 0 ⇒ 加成被钳成 0,不影响 20 帧判定');
+  /* ⚠️ 阈值帧数 = `baseAttackIntervalS × TICK_HZ`(旧写法写死 19/20 = 20Hz 下的 1.0s)。 */
+  const lNeed = Math.round(L.baseAttackIntervalS * TICK_HZ);
+  eq(previewAttack(c, lNeed - 1, 0, L).allowed, false,
+    `★ ${L.baseAttackIntervalS}s = ${lNeed} 帧:${lNeed - 1} 帧不够`);
+  eq(previewAttack(c, lNeed, 0, L).allowed, true, `★ ${lNeed} 帧放行(阈值随注入的 limits 走)`);
+  eq(previewAttack(c, lNeed, 1.0, L).allowed, true,
+    'maxAttackSpeedBonus = 0 ⇒ 加成被钳成 0,不影响判定');
 
   /* 合体形态 `checkAttack`:放行即提交,拒绝不提交 —— 攻击/回滚路径的对照基准。 */
   const k = createAcState('p3', 0);

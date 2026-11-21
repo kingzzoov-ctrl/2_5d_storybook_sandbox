@@ -40,6 +40,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { TICK_MS } from '../shared/types/physics.ts';
 import { test, ok, eq, report } from '../shared/testing/harness.ts';
 import {
   DEFAULT_SOAK_OPTIONS,
@@ -124,7 +125,9 @@ test('FND169-1 量纲锚:默认 60 分钟 / 8 客户端 / 5s 采样 / 50ms 帧 /
   eq(DEFAULT_SOAK_OPTIONS.minutes, 60, '默认跑 60 分钟');
   eq(DEFAULT_SOAK_OPTIONS.clients, 8, '默认 8 个并发假客户端');
   eq(DEFAULT_SOAK_OPTIONS.sampleEveryMs, 5_000, '默认 5 秒采一条');
-  eq(DEFAULT_SOAK_OPTIONS.frameMs, 50, '默认 20Hz(50ms/帧)');
+  /* 默认帧长必须 = **标称帧间隔**(冻结层 `TICK_MS`,由 `TICK_HZ` 派生)——
+     旧写法写死 50,把 20Hz 抄进了这里。 */
+  eq(DEFAULT_SOAK_OPTIONS.frameMs, TICK_MS, `默认帧长 = TICK_MS = ${TICK_MS}ms`);
   eq(DEFAULT_SOAK_OPTIONS.sizeCells, 96, '默认世界 96 格(与 scripts/play.ts 同值)');
   eq(DEFAULT_SOAK_OPTIONS.dbPath, '.data/soak.db', '默认落文件库(不是内存)');
 

@@ -38,7 +38,7 @@ import {
   auditComponentProducers,
   makeComponent,
 } from '../server/src/wiring/components.ts';
-import { WorldSim } from '../server/src/sim/world_sim.ts';
+import { WorldSim, FAST_PER_SLOW } from '../server/src/sim/world_sim.ts';
 import type { GroundItem } from '../server/src/mobs/behaviors.ts';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -224,7 +224,7 @@ test('FND114-7 ★ 425/437 读 `enemyInRange` / `hitMob`:生物在范围内/同�
   eq(trainIdle.state.crushes, 0, '负对照:另一列火车那一格没有生物 ⇒ 不碾');
 });
 
-test('FND114-8 ★ 426「每早自动洒水」:世界日头一拍触发;同一小时内过 10 帧就不再触发(负对照)', () => {
+test('FND114-8 ★ 426「每早自动洒水」:世界日头一拍触发;过了这一拍就不再触发(负对照)', () => {
   const sim = new WorldSim({ sizeCells: 24, mobs: false });
   const g = sim.wiring;
   const spr = makeComponent('spr', 426, 6, 6);
@@ -235,7 +235,9 @@ test('FND114-8 ★ 426「每早自动洒水」:世界日头一拍触发;同一�
   eq(spr.state.active, 1, '★ 早上头一拍 ⇒ 自动旋转(**没有**接蓝线)');
   eq(spr.state.wetCells, 25, '浇湿 5×5 = 25 格');
 
-  for (let i = 0; i < 10; i += 1) sim.tick();
+  /* 推**一个慢帧 stride**(= `FAST_PER_SLOW` 快帧;旧写法 10 编码了 20Hz)。
+     「早上一拍」= 日头的前 `FAST_PER_SLOW` 帧窗口 ⇒ 推满一个 stride 才走出窗口。 */
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) sim.tick();
   eq(Math.floor(sim.hourOfDay()), 6, '前提:钟点仍在这一小时内(06:0x)⇒ `hour` 取整仍是 6');
   g.run(1);
   eq(spr.state.active, 0, '负对照:过了「早上一拍」⇒ 不再洒(证明触发是 `morningTick`,不是 `hour === 6`)');

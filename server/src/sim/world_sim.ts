@@ -19,12 +19,12 @@
  *
  * `WorldSim` 持有全部子系统并**按手册 §2.1 的双频节奏推进**:
  *
- *   20Hz 快帧:物理积分(刚体、举投、碰撞、反弹)+ 生物 FSM + 电路时序件
+ *   32Hz 快帧:物理积分(刚体、举投、碰撞、反弹)+ 生物 FSM + 电路时序件
  *    2Hz 慢帧:流体元胞自动机 + 电路信号泛洪 + 刷怪决策 + AOI 唤醒
  *
- * 比例恰好 **10:1** —— 这是「快帧 20Hz、慢帧 2Hz」的直接推论,也是本文件
- * 最重要的不变量:慢帧逻辑在 60 秒里只跑 120 次,快帧跑 1200 次。
- * 把流体或电路误放进快帧会让 CPU 开销直接 ×10,这是最容易被写错的一处。
+ * 比例恰好 **16:1** —— 这是「快帧 32Hz、慢帧 2Hz」的直接推论(慢帧仍是 0.5 秒),
+ * 也是本文件最重要的不变量:慢帧逻辑在 60 秒里只跑 120 次,快帧跑 1920 次。
+ * 把流体或电路误放进快帧会让 CPU 开销直接 ×16,这是最容易被写错的一处。
  *
  * ## 设计约束
  *
@@ -35,7 +35,7 @@
  * 4. **不重复实现**:子系统已有的逻辑一律调用,本层只负责**顺序与节奏**。
  */
 
-import { SLOW_TICK_HZ, TICK_HZ, DT, BASE_MOVE_SPEED } from '../../../shared/types/physics.ts';
+import { TICK_HZ, DT, SIM_DT, SLOW_DT, BASE_MOVE_SPEED, secondsToTicks } from '../../../shared/types/physics.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
 /* ★ WS-FND-164:`encodeRoofRle` / `decodeRoofRle` 是屋顶旁路层的**唯一**编解码器
@@ -80,7 +80,7 @@ import { NEUTRAL_AFFINITY } from '../alchemy/degrade.ts';
    而解码/计划**只能有一份实现**(在 `world/archive.ts`),本文件不重写任何一条
    解码规则。方向仍是单向:`world/archive.ts` 只认识 `Chunk`,不认识 sim。 */
 import { decodeWorldArchive, planRestore, type RestorePlan } from '../world/archive.ts';
-import { FluidField, FLUID_CELL_BUDGET, packFluidAmounts, readFluidAmounts, applyFluidAmounts } from '../world/fluid.ts';
+import { FluidField, FLUID_CELL_BUDGET, FLUID_RATE_HZ, packFluidAmounts, readFluidAmounts, applyFluidAmounts } from '../world/fluid.ts';
 /* ★ WS-FND-98:`safeMass` 是「质量归一 / 非法质量拒绝」的**唯一入口**(见 `physics/world.ts` §0)。 */
 import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, JUMP_VZ, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
@@ -289,7 +289,7 @@ import '../wiring/components.ts';
    夜行怪刷新门、世界钟全用它)—— 这里只借用,不重写,也不另带一份边界数值。 */
 import { isNight as isNightAtClock } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
-import { MOB_CORPSE_FRAMES, MobHost, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
+import { MOB_CORPSE_FRAMES, MobHost, MOB_AI_RATE_HZ, BOSS_AI_RATE_HZ, MOB_AI_DT_SEC, BOSS_AI_DT_SEC, tickDueAtRate, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, warnHitsPlayer, BLIND_VIEW_MUL, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
 /* ★ D2(视线遮挡):纯函数模块(`server/src/world/vision.ts`)。
    生物 → 玩家的打击在**结算前**过一次射线遮挡 —— 修前隔着 1 格墙也能打中
@@ -519,14 +519,19 @@ import { skillWarnGeoms } from '../bosses/phases.ts';
    是 wire 的五值数字表(0..4);两侧都**不在这里重抄数字**。 */
 import { WarnShape, type WarnGeom } from '../mobs/geometry.ts';
 
-/** 快帧与慢帧的固定比例:20Hz / 2Hz = 10。 */
-export const FAST_PER_SLOW = TICK_HZ / SLOW_TICK_HZ;
+/**
+ * 快帧与慢帧的固定比例 = **一个慢帧跨越多少快帧**。
+ *
+ * ★ 由**秒**派生(`secondsToTicks(SLOW_DT)` = 0.5 秒的帧数),不写死 10/16:
+ *   改 tick 率时慢帧仍是 0.5 秒,比例自动跟着换算(32Hz ⇒ 16)。
+ */
+export const FAST_PER_SLOW = secondsToTicks(SLOW_DT);
 
-/** 一帧快帧的现实时长(秒)。 */
-export const SIM_FAST_DT = DT;
+/** 一帧快帧的现实时长(秒)= `SIM_DT`(= `1 / TICK_HZ`)。 */
+export const SIM_FAST_DT = SIM_DT;
 
-/** 一帧慢帧的现实时长(秒)。 */
-export const SIM_SLOW_DT = 1 / SLOW_TICK_HZ;
+/** 一帧慢帧的现实时长(秒)= `SLOW_DT`(0.5 秒)。 */
+export const SIM_SLOW_DT = SLOW_DT;
 /**
  * ★ WS-FND-164:水位表字节的**本仓上限**(= `repo.BLOB_MAX_BYTES` 的同一个 1 MiB)。
  *
@@ -1154,7 +1159,7 @@ export class WorldSim {
    *
    * **为什么挂慢帧**:`tickBoss` 的 `dt` 以秒计(`CAST_INTERVAL_SEC` /
    * `TIME_SHIELD_SEC` / `stunnedSec` 全是秒),与 `SIM_SLOW_DT = 0.5` 同量纲;
-   * 挂快帧会让护盾/眩晕以 10 倍速流失 —— 不报错,但行为全错。
+   * 挂快帧会让护盾/眩晕以 16 倍速流失 —— 不报错,但行为全错。
    */
   bossRaid: BossRaidRuntime;
 
@@ -1212,19 +1217,22 @@ export class WorldSim {
    * 不会出现「基线缺失 ⇒ 回拖窗口恰好落在开局」。
    */
   private readonly zSeen = new Map<string, number>();
-  /** 起跳冷却(快帧数):24 帧 = 1.2s(20Hz 快帧,不引挂钟)。
+  /** 起跳冷却(秒)。帧数由它派生,不写死(不引挂钟,D-26)。 */
+  private static readonly JUMP_COOLDOWN_SEC = 1.2;
+  /**
+   * 起跳冷却的**帧数** = `secondsToTicks(JUMP_COOLDOWN_SEC)`(1.2 秒 ⇒ 32Hz 下 38 帧)。
    *
-   * ⚠️ 必须**大于一次跳跃的滞空帧数**(`JUMP_VZ ≈ 6.0`、`GRAVITY = 18` ⇒
-   * 滞空 ≈ 0.67s ≈ 13 帧),否则「落地后仍在冷却」这一支**永远不可达** ——
+   * ⚠️ 必须**大于一次跳跃的滞空时长**(`JUMP_VZ ≈ 6.0`、`GRAVITY = 18` ⇒
+   * 滞空 ≈ 0.67s),否则「落地后仍在冷却」这一支**永远不可达** ——
    * 那会是一条写了但判不到的红线(本仓点名的「不能变红的说明」)。
    * `tests/WS-FND-122` 的 FND122-4 钉住「落地后立刻再跳 ⇒ COOLDOWN」。 */
-  private static readonly JUMP_COOLDOWN_FRAMES = 24;
+  private static readonly JUMP_COOLDOWN_FRAMES = secondsToTicks(WorldSim.JUMP_COOLDOWN_SEC);
   private players: AoiPlayer[] = [];
 
   /**
    * ★ WS-FND-137 P2:`syncPlayers()` 的**元素对象池**(按 id 复用)。
    *
-   * 为什么要池化而不是「每帧新建」:`syncPlayers()` 跑在**快帧 20Hz**
+   * 为什么要池化而不是「每帧新建」:`syncPlayers()` 跑在**快帧 32Hz**
    * (`tick()` 里紧随 `physics.step`),而 `physics.bodies` 含**生物**,数量随世界涨 ——
    * 每帧给每个刚体 + 每个玩家各造一个对象,是稳定的垃圾流(实测每帧 2×N 个对象),
    * 而这些对象的字段每帧都会被**重新覆写**。池化后稳态(名册不变)分配数 0。
@@ -1744,7 +1752,7 @@ export class WorldSim {
    * 累计的「过了多少天」的小数部分(牧场跨日结算用)。
    *
    * 为什么不直接用 `frameCount`:一整天是 `WORLD_DAY_SEC = 1200` 秒
-   * (24000 帧),用帧号算跨日要除两次;而 `advanceRoomSystems` 已经按
+   * (1200 秒 = 32Hz 下 38400 帧),用帧号算跨日要除两次;而 `advanceRoomSystems` 已经按
    * 「天的一部分」推进,同一个累加器同时服务温室(按天生长)与牧场(按天结算)。
    */
   private dayFraction = 0;
@@ -3549,7 +3557,7 @@ export class WorldSim {
   /**
    * 每**快帧**把到期的技能段结算掉 —— 技能时序的唯一执行点。
    *
-   * 放在快帧(20Hz)而不是慢帧:716 的段间隔是 0.5 秒,慢帧刚好等于 0.5 秒,
+   * 放在快帧(32Hz)而不是慢帧:716 的段间隔是 0.5 秒,慢帧刚好等于 0.5 秒,
    * 放在慢帧会让「每 0.5 秒一段」变成帧率巧合;而且与 `tickDots` 同为
    * 「按秒记账」的东西,同处快帧更不容易漂移。
    */
@@ -4041,7 +4049,7 @@ export class WorldSim {
    *
    * 与房间效果同一理由:救援读条按 `dt` 折算,总量与帧率无关,
    * 2Hz 足够(`REVIVE_TIME = 1.0s` 只需 2 个慢帧)。挂快帧只会
-   * 让同一份状态被查询 10 倍次数。
+   * 让同一份状态被查询 16 倍次数。
    */
   private tickDowned(): void {
     const dt = SIM_SLOW_DT;
@@ -4674,7 +4682,7 @@ export class WorldSim {
   /** 游戏内**一天**的秒数 —— D-07 裁决值(20 分钟)。改它需要新裁决。 */
   static readonly WORLD_DAY_SEC = 1200;
 
-  /** 世界日 = `WORLD_DAY_SEC / DT` **快帧**(20 分钟一天 ⇒ 24000 帧)。 */
+  /** 世界日 = `WORLD_DAY_SEC / DT` **快帧**(1200 游戏秒 = 20 分钟一天 ⇒ 32Hz 下 38400 帧)。 */
   private static readonly FRAMES_PER_DAY = WorldSim.WORLD_DAY_SEC / DT;
   /** 世界时间 0 帧对应的**钟点** —— D-07 裁决值(06:00 天亮)。 */
   static readonly WORLD_START_HOUR = 6;
@@ -4861,7 +4869,7 @@ export class WorldSim {
    *
    * 分母是 D-07 的一天(`WORLD_DAY_SEC`),**不另发明**「清晨窗口」的长度;窗口取
    * 一个慢帧(`FAST_PER_SLOW` 快帧)是因为 426 本身就跑在 2Hz 上 ——
-   * 一天的帧数能被慢帧周期整除(`24000 % 10 == 0`),所以这个窗口里**恰好**含
+   * 一天的帧数能被慢帧周期整除(`38400 % 16 == 0`),所以这个窗口里**恰好**含
    * 当天第一个慢帧(在世界日边界那一拍)。
    */
   private isMorningSlowFrame(): boolean {
@@ -5112,7 +5120,7 @@ export class WorldSim {
    *
    * 接线前实测(**服务器路径** 0 处调用推进):
    * ```
-   * room.colyseus.ts  setSimulationInterval(20Hz) → RoomRuntime.step()
+   * room.colyseus.ts  setSimulationInterval(32Hz) → RoomRuntime.step()
    * room.ts:1058      step() = meta.tick++ / ac.tick / 落盘 / 投影等级 → 返回
    *                   **不推进 sim**
    * index.ts          `tick`/`run` 关键词 0 命中
@@ -5129,14 +5137,14 @@ export class WorldSim {
    *
    * 两层频率**嵌套**:
    * ```
-   * 外层  setSimulationInterval 20Hz  →  RoomRuntime.step()  每秒 20 次
+   * 外层  setSimulationInterval 32Hz  →  RoomRuntime.step()  每秒 32 次
    * 内层  WorldSim 自管双频            →  tick() 内部按计数决定 FAST / SLOW
    * ```
    * 实测:`tick()` 连调 12 次的相位是 `FAST×9 SLOW FAST×2`
    * ⇒ **一次 `tick()` 就是一帧**,快慢**由内部计数决定**。
    * ⇒ `advance(1)` 对应外部一帧,**恰好 1:1**。
    *
-   * `SIM_FAST_DT = 0.05 = 1/20`(实测 `=== 1/20` 为 `true`)与外部 20Hz
+   * `SIM_FAST_DT = 0.03125 = 1/32`(实测 `=== 1/32` 为 `true`)与外部 32Hz
    * **天然对齐,无需任何换算**。⚠️ 下一个人若以为「慢帧按 2Hz,所以外面要乘
    * `FAST_PER_SLOW`」,就会**每慢帧推进两次 AI**,世界快 2 倍 ——
    * 而这类错误**不报错、测试也可能照过**(本文件下方记着同一先例)。
@@ -5775,7 +5783,7 @@ export class WorldSim {
   /**
    * 推进全部玩家的房间效果一慢帧。
    *
-   * ## 为什么挂在慢帧(2Hz)而不是快帧(20Hz)
+   * ## 为什么挂在慢帧(2Hz)而不是快帧(32Hz)
    *
    * 与流体/电路/物流同一理由:房间识别本身就是慢帧产物
    * (`refreshRooms`),本函数消费它的输出。挂在快帧只会读到同一份缓存
@@ -7558,7 +7566,7 @@ export class WorldSim {
    * 从 AOI 的当前状态重建玩家列表(位置每帧会变,必须同步)。
    *
    * ★ WS-FND-137 P2(第九轮实测):本节修的是「**每快帧重造同一批对象**」,
-   * 不是算法复杂度。修前每次调用(20Hz)都:
+   * 不是算法复杂度。修前每次调用(32Hz)都:
    * ```text
    * 1 新建 list 数组 + 每个刚体一个 AoiPlayer 对象   ← physics.bodies 含生物,数量随世界涨
    * 2 再 filter + map 出 mobPlayers(每人一个新 WorldPlayer 对象)
@@ -8197,7 +8205,11 @@ export class WorldSim {
       /* 即使没有攻击,**计时器也要推进** —— 否则无敌帧永不结束
          (表现是「被打一次之后再也不掉血」),回血也永不发生。 */
       this.vitals.beginFrame();
-      this.vitals.stepTimers(SIM_SLOW_DT);
+      /* ⚠️ 量纲必须与**调用频率**一致:`resolveMobStrikes` 跑在 8Hz 块(`aiDue`,步长 4 帧)
+         ⇒ dt = `MOB_AI_DT_SEC`(0.125s)。修前这里是 `SIM_SLOW_DT`(0.5s)—— 那是 2Hz 时代的写法,
+         把本方法从慢帧挪进 8Hz 块时漏改,于是无敌帧 / 回血延迟 / 致盲 / 眩晕
+         全部以 **4 倍**速度流失(不报错,只是时间凭空快 4 倍;实测见 `tests/WS-FND-71` FND71-11)。 */
+      this.vitals.stepTimers(MOB_AI_DT_SEC);
       this.lastHits = [];
       return;
     }
@@ -8353,7 +8365,7 @@ export class WorldSim {
       }
     }
     this.lastHits = applied;
-    this.vitals.stepTimers(SIM_SLOW_DT);
+    this.vitals.stepTimers(MOB_AI_DT_SEC); /* 同上:8Hz 块 ⇒ dt = MOB_AI_DT_SEC(不是 SIM_SLOW_DT) */
   }
 
   /**
@@ -8952,8 +8964,8 @@ export class WorldSim {
    *
    * `partyClock.advance(SIM_SLOW_DT)` 每慢帧推进一次 ⇒ 逻辑秒与**慢帧数**
    * 严格成比例。刻意**不**用 `frameCount / TICK_HZ`:后者含快帧,
-   * 两者差 `FAST_PER_SLOW`(=10)倍 —— 写成那样 `tickAfk` 的
-   * `nowSec - backgroundedAtSec` 会 10 倍速越过 `DOZE_AFTER_SEC`,
+   * 两者差 `FAST_PER_SLOW`(=16)倍 —— 写成那样 `tickAfk` 的
+   * `nowSec - backgroundedAtSec` 会 16 倍速越过 `DOZE_AFTER_SEC`,
    * 表现成「切后台不到 5 秒就进打盹」,而**不报错**。
    *
    * ## 顺序:`先 party 后 afk`,互不依赖
@@ -11054,6 +11066,11 @@ export class WorldSim {
     this.frameCount += 1;
     const frame = this.frameCount;
     const isSlow = frame % FAST_PER_SLOW === 0;
+    /* ★ 独立速率门控(owner 裁决 2026-11-21):流体 / 生物 AI / Boss 各自 8Hz,
+       与慢帧(2Hz)解耦 —— 量化器唯一住在 `mobs/host.ts#tickDueAtRate`。 */
+    const fluidDue = tickDueAtRate(frame, FLUID_RATE_HZ);
+    const aiDue = tickDueAtRate(frame, MOB_AI_RATE_HZ);
+    const bossDue = tickDueAtRate(frame, BOSS_AI_RATE_HZ);
     /* ★ D-07:世界时钟按**快帧步长**累加(与物理同一口径),不读系统时钟。 */
 
     let physics: StepReport | null = null;
@@ -11087,15 +11104,15 @@ export class WorldSim {
     this.tickSkillCasts();
 
     if (this.mobsOn) {
-      /* ── 慢帧 2Hz:AOI 唤醒 / 休眠 ──
+      /* ── 独立速率 8Hz:AOI 唤醒 / 休眠 ──
          `update()` 才是**决定谁该被推进**的那一步;`stepActive` 只遍历
          已被唤醒的集合。只调 `stepActive` 不调 `update`,集合恒为空,
          表现成「活跃生物数永远 0」「生物不动」——
          而既不报错也不抛异常,只是默默什么都不做。
          生态模拟只跑慢帧:手册 §2.4 明确「打盹玩家不提供唤醒能量」。 */
-      if (isSlow) {
+      if (aiDue) {
         this.aoi.update();
-        /* ── 慢帧 2Hz:生物 AI ──
+        /* ── 独立速率 8Hz:生物 AI ──
            这里此前是**空回调** —— `stepActive` 遍历了唤醒集合却什么都不做,
            所以 25 个 AI 的 `tick` 实现一行都没跑过。
            现在直接把 AOI 唤醒集合交给宿主推进(见 mobs/host.ts)。
@@ -11109,25 +11126,27 @@ export class WorldSim {
         /* 只推进一次,并把结果留作诊断 —— 早先写成「调两次,一次推进一次
            只为读结果」会**每慢帧推进两次 AI**,行为速度凭空翻倍。
            这类错误不报错、测试也可能照过(只是快了 2 倍),很难发现。 */
-        this.lastMobTicks = this.mobHost.tickMobs([...this.aoi.activeMobs], SIM_SLOW_DT);
+        this.lastMobTicks = this.mobHost.tickMobs([...this.aoi.activeMobs], MOB_AI_DT_SEC);
         activeMobs = this.aoi.activeMobs.size;
         this.mobErrors += this.lastMobTicks.filter((t) => t.error !== null).length;
-        /* ── 慢帧 2Hz:预警几何 → 玩家伤害结算 ──
+        /* ── 独立速率 8Hz:预警几何 → 玩家伤害结算 ──
            AI 在 `tick` 里产出的 `WarnGeom` 是「将要打哪里、多大范围、多久后生效」。
            此前没有任何地方结算它们 —— 16 只敌对/捣蛋生物的攻击打不到玩家。
            见 server/src/combat/vitals.ts 与 docs/DAMAGE-LOOP.md。 */
         this.resolveMobStrikes();
-        /* ── 慢帧 2Hz:Boss 副本推进(WS-05)──
+        /* ── 独立速率 8Hz:Boss 副本推进(WS-05)──
            阶段切换 / 时间护盾回血 / 破防眩晕倒计时全是**时间驱动**的,
            必须每帧都跑:漏掉的话「8 秒未破盾则回血」永远不会发生。
 
-           量纲必须与 `SIM_SLOW_DT` 一致(0.5 秒)。放快帧会让护盾与眩晕
-           以 10 倍速流失 —— 这类错误不抛异常,只是时间凭空快 10 倍。
+           量纲必须与 `BOSS_AI_DT_SEC` 一致(0.125 秒)—— 它由 `BOSS_AI_RATE_HZ`
+           派生(见 mobs/host.ts)。给错 dt 会让护盾/眩晕倒计时快慢失真而不报错。
 
            放在生物 AI **之后**:Boss 的破防输入(玩家投喂/摆机关)来自
            上一帧的世界状态,同帧内先让生物与世界结算完再推进 Boss,
            避免「谁先响应」取决于调用顺序。 */
-        this.lastBossTick = this.bossRaid.tickBosses(SIM_SLOW_DT);
+        if (bossDue) {
+          this.lastBossTick = this.bossRaid.tickBosses(BOSS_AI_DT_SEC);
+        }
       } else {
         activeMobs = this.aoi.activeMobs.size;
       }
@@ -11153,8 +11172,12 @@ export class WorldSim {
          2Hz 的 dt=0.5 与它同量纲;快帧调用只会让冷却以 10 倍速消掉。 */
       this.carry.tick(SIM_SLOW_DT);
 
-      /* ── 慢帧 2Hz:流体 ── */
-      if (this.fluid !== null) {
+    }
+
+    /* ── 独立速率 8Hz(FLUID_RATE_HZ):流体 —— 与慢帧彻底解耦 ──
+       每 `frameStrideAtRate(FLUID_RATE_HZ)` 快帧推进一次(32Hz ÷ 8Hz = 4);
+       改 `FAST_PER_SLOW` 不影响它。 */
+    if (fluidDue && this.fluid !== null) {
         const fr = this.fluid.step(this.fluidBudget);
         fluidProcessed = fr.processed;
         fluidActive = fr.active;
@@ -11185,7 +11208,9 @@ export class WorldSim {
           this.setCell(p.x, p.y, { obj: p.obj });
           phaseProducts += 1;
         }
-      }
+    }
+
+    if (isSlow) {
 
       /* ── 慢帧 2Hz:电路泛洪 ──
          `drive` 是**帧内**状态:每帧都要重新施加,否则第一次 tick 之后再无驱动态,

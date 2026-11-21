@@ -47,6 +47,12 @@ import {
   createRoomState, createPlayerState, createWildlifeState, createBossState,
 } from '../server/src/net/schema.ts';
 import { DEFAULT_MAX_AREA } from '../server/src/build/rooms.ts';
+/* ★ 2026-11-25(tick 口径硬化):tick 率改成 **32Hz**(`TICK_HZ` = 32,每帧
+   `TICK_MS` = 31.25ms)。本脚本原来的**口径副本**(旧快帧频率、旧帧预算、
+   旧快慢比值、带宽按旧频率计)已全部改成从 `physics.ts` 派生;
+   `scripts/**` 里任何残留都由 `verify.ts` 的 `checkTickConvention()` 扫出来。 */
+import { TICK_HZ, TICK_MS, SLOW_DT, SLOW_TICK_HZ } from '../shared/types/physics.ts';
+import { WorldSim } from '../server/src/sim/world_sim.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -96,6 +102,11 @@ function fmt(ms: number): string {
   if (ms >= 1) return `${ms.toFixed(3)} ms`;
   if (ms >= 0.001) return `${(ms * 1000).toFixed(1)} µs`;
   return `${(ms * 1e6).toFixed(1)} ns`;
+}
+
+/** 去掉浮点尾巴的数字文本(31.25 / 500 / 16)。**只用于打印**,不当判据。 */
+function numText(x: number): string {
+  return String(Number(x.toFixed(3)));
 }
 
 function machineInfo(): string {
@@ -151,18 +162,67 @@ function add(r: Row): void {
 /* ═══════════════════ 1. 手册 §2.1 / §2.4:双频与 AOI ═══════════════════ */
 
 function checkTickRates(): void {
-  /* 手册 L19/L20:快帧 20Hz(50ms)、慢帧 2Hz(500ms)。
-     判据取手册的 20Hz / 2Hz,**不**取代码里的 FAST_PER_SLOW。 */
-  const fastHz = 20;
-  const slowHz = 2;
+  /* ★ 2026-11-25(tick 口径硬化):本条的**判据来源换过一次**,值得写下来。
+   * 旧形态:判据取**手册 L19/L20** 的频率(旧口径),并特意
+   *   不取代码里的 `FAST_PER_SLOW`(防"判据与实现同源 ⇒ 永真")。
+   *   那一版在 tick 率被 owner 改成 **32Hz(每帧 31.25ms)** 之后就**过期**了:
+   *   手册写的是旧口径,此时"手册数字"不再是外部事实,而是**过期事实** ——
+   *   C1 会拿着**旧频率**去判一个 32Hz 的实现,并因为 `verdict` 写死 `holds`
+   *   而**照样打勾**(恒真:它连变红的机会都没有)。
+   * ⇒ 现在:判据取**单一事实源** `shared/types/physics.ts#TICK_HZ / #SLOW_DT`
+   *   (仓里 tick 口径的唯一定义处),仍然**不**取 `world_sim.ts` 的
+   *   `FAST_PER_SLOW`(那是被测代码自己的常量)。
+   *
+   * ## 被断言的是**语义**,不是帧数
+   *
+   * 手册 L20 明写「慢帧每 500ms」——**0.5 秒**是语义(改 tick 率也不该动),
+   * 而「一个慢帧跨 16 个快帧」是**派生量**。把 16 当判据正是"把口径再抄一份"。
+   * 所以判据写成:
+   *   · 慢帧 = `SLOW_DT` 秒 = **0.5 秒**(手册 L20 的明文语义);
+   *   · 快帧 = `1 / TICK_HZ` 秒(= `TICK_MS` 毫秒);
+   *   · 比值 = `TICK_HZ × SLOW_DT`(= 16),由**秒**推出,与 Hz 写法无关。
+   *
+   * ## 读数取**实跑**,不取公式
+   *
+   * 让 `WorldSim` 真跑 `比值 × 3` 个快帧(1.5 世界秒),看它给出
+   * 几个慢帧、世界钟走了几秒 ⇒ 判据在 physics 侧、读数在 sim 侧,**两处不同源**。 */
+  const fastHz = TICK_HZ;
+  const fastMs = TICK_MS;
+  const slowMs = SLOW_DT * 1000;
+  const ratio = TICK_HZ * SLOW_DT;
+  const sim = new WorldSim({ sizeCells: 32 });
+  const wantSlow = 3;
+  const runTicks = Math.round(ratio * wantSlow);
+  const r = sim.run(runTicks);
+  const lastReport = r.reports[r.reports.length - 1];
+  const simSec = lastReport === undefined ? NaN : lastReport.simSeconds;
+
+  const why: string[] = [];
+  if (Math.abs(slowMs - 500) > 1e-9) {
+    why.push(`慢帧 ${slowMs}ms ≠ 500ms(手册 L20 的「每 500ms」,与 tick 率无关)`);
+  }
+  if (Math.abs(fastMs - 1000 / fastHz) > 1e-9) why.push(`快帧 ${fastMs}ms ≠ 1000/${fastHz}`);
+  if (Math.abs(ratio - fastHz * SLOW_DT) > 1e-9) why.push(`比值 ${ratio} ≠ TICK_HZ × SLOW_DT`);
+  if (r.slowFrames !== wantSlow) {
+    why.push(`实跑 ${runTicks} 快帧得 ${r.slowFrames} 个慢帧,应为 ${wantSlow}`);
+  }
+  if (Math.abs(simSec - SLOW_DT * wantSlow) > 1e-9) {
+    why.push(`世界钟 ${simSec}s ≠ ${SLOW_DT * wantSlow}s(1 慢帧 = ${SLOW_DT}s)`);
+  }
   add({
     id: 'C1',
-    claim: '快帧 20Hz(每 50ms)、慢帧 2Hz(每 500ms),比例恒 10:1',
-    source: '手册 L19-L20',
-    expected: '快帧 50ms / 慢帧 500ms / 比值 10',
-    actual: `快帧 ${(1000 / fastHz).toFixed(0)}ms / 慢帧 ${(1000 / slowHz).toFixed(0)}ms / 比值 ${fastHz / slowHz}`,
-    verdict: 'holds',
-    note: '频率契约由手册规定,实现侧 FAST_PER_SLOW 与之一致(见 WS-FND-04)',
+    claim: `快帧 ${numText(fastHz)}Hz(每 ${numText(fastMs)}ms)、慢帧 ${numText(SLOW_TICK_HZ)}Hz`
+      + `(每 ${numText(slowMs)}ms),比值恒 ${numText(ratio)}:1`,
+    source: 'shared/types/physics.ts#TICK_HZ(仓内单一事实源;手册 L19 的频率是旧口径)',
+    expected: `快帧 ${numText(fastMs)}ms / 慢帧 ${numText(slowMs)}ms(= ${SLOW_DT} 秒)`
+      + ` / 比值 ${numText(ratio)}`,
+    actual: `实跑 ${runTicks} 快帧 ⇒ ${r.slowFrames} 慢帧 / 世界钟 ${simSec}s`
+      + ` ⇒ 快帧 ${numText(1000 / fastHz)}ms / 慢帧 ${numText(slowMs)}ms / 比值 ${numText(ratio)}`,
+    verdict: why.length === 0 ? 'holds' : 'fails',
+    note: why.length === 0
+      ? `判据取 physics.ts(不取被测代码的 FAST_PER_SLOW);慢帧 = 0.5 秒是**语义**,`
+        + ` ${numText(ratio)} 是**派生量**;实跑读数与判据两侧不同源`
+      : `不成立:${why.join(';')}`,
   });
 }
 
@@ -296,15 +356,21 @@ function checkPhysicsFrame(): void {
   for (let i = 0; i < 24; i += 1) world.spawn(`m${i}`, { x: 20 + (i % 12), y: 20 + Math.floor(i / 12), vx: -1, vy: 1 });
   world.spawn('boss', { x: 40, y: 40, vx: 0.5, vy: 0.5, mass: 20, radius: 1.2 });
 
+  /* 单快帧预算 = `TICK_MS`(32Hz ⇒ 31.25ms)。
+     ★ 2026-11-25:原来取的是**手册 L19 的帧预算** —— 那是**旧口径的帧长**。快帧预算
+     必须**等于帧长**才有意义(否则"占预算 X%"这个比例在换 tick 率后自动失真),
+     故与 C1 同源地从 `physics.ts` 派生。 */
+  const frameBudgetMs = TICK_MS;
   const b = world.benchmark(300, WARMUP);
   add({
     id: 'C2',
-    claim: '16 人 + 野怪 + 1 Boss 同屏,单快帧(50ms 预算)物理耗时',
-    source: '手册 L5 / L9 / L19',
-    expected: '< 50 ms(快帧预算)',
+    claim: `16 人 + 野怪 + 1 Boss 同屏,单快帧(${numText(frameBudgetMs)}ms 预算)物理耗时`,
+    source: '手册 L5 / L9 / L19(帧预算口径改取 physics.ts#TICK_MS)',
+    expected: `< ${numText(frameBudgetMs)} ms(快帧预算 = 1000 / TICK_HZ)`,
     actual: `41 刚体(16+24+1):平均 ${b.avgMs.toFixed(4)} ms、p99 ${b.p99Ms.toFixed(4)} ms、最大 ${b.maxMs.toFixed(4)} ms`,
-    verdict: b.maxMs < 50 ? 'holds' : 'fails',
-    note: `占 50ms 快帧 ${(b.avgMs / 50 * 100).toFixed(3)}%;判据取手册的快帧 50ms,非代码常量`,
+    verdict: b.maxMs < frameBudgetMs ? 'holds' : 'fails',
+    note: `占 ${numText(frameBudgetMs)}ms 快帧 ${(b.avgMs / frameBudgetMs * 100).toFixed(3)}%;`
+      + '判据取 TICK_MS(非被测代码常量)',
   });
 
   /* 放宽到「上百只」(手册 L62 原文「上百只野生怪物」)的对照 */
@@ -317,10 +383,11 @@ function checkPhysicsFrame(): void {
     id: 'C2b',
     claim: '手册 L62「上百只野生怪物」规模的单快帧物理耗时',
     source: '手册 L62',
-    expected: '< 50 ms(快帧预算)',
+    expected: `< ${numText(frameBudgetMs)} ms(快帧预算)`,
     actual: `117 刚体:平均 ${bb.avgMs.toFixed(4)} ms、p99 ${bb.p99Ms.toFixed(4)} ms、最大 ${bb.maxMs.toFixed(4)} ms`,
-    verdict: bb.maxMs < 50 ? 'holds' : 'fails',
-    note: `占 50ms 快帧 ${(bb.avgMs / 50 * 100).toFixed(3)}%;两两判定 O(N²) = ${117 * 116 / 2} 对`,
+    verdict: bb.maxMs < frameBudgetMs ? 'holds' : 'fails',
+    note: `占 ${numText(frameBudgetMs)}ms 快帧 ${(bb.avgMs / frameBudgetMs * 100).toFixed(3)}%;`
+      + `两两判定 O(N2) = ${117 * 116 / 2} 对`,
   });
 }
 
@@ -555,13 +622,15 @@ function checkBandwidth(): void {
    *   而那个坑**比原来的更难发现**(原来的错有内部矛盾,修完剩的错**看起来是对的**)。
    */
   const bytesPerFrame = moving.bytes.length;
-  const perClient = (bytesPerFrame * 20) / 1024;      /* KiB/s */
+  /* ★ 2026-11-25:每秒帧数从写死的 `20` 改成 `TICK_HZ`(带宽 = 每帧字节 × **每秒帧数**,
+     那个"每秒帧数"就是 tick 率 —— 写死 20 会让这份带宽账在 32Hz 下**低估 37.5%**)。 */
+  const perClient = (bytesPerFrame * TICK_HZ) / 1024;   /* KiB/s */
   const roomEgress = perClient * n;                    /* KiB/s */
   /* KiB → Mbps 的**显式两步**:×1024(KiB→B)× 8(B→bit)÷ 1e6(→Mb) */
   const kibsToMbps = (kibs: number): number => (kibs * 1024 * 8) / 1e6;
   const egressMbps = kibsToMbps(roomEgress);
   /* ★ 独立的第二条算法:**绕过 KiB**,直接从 B/s 算 Mbps —— 用于交叉校验 */
-  const egressMbpsDirect = (bytesPerFrame * 20 * n * 8) / 1e6;
+  const egressMbpsDirect = (bytesPerFrame * TICK_HZ * n * 8) / 1e6;
 
   add({
     id: 'C8d',
@@ -572,7 +641,8 @@ function checkBandwidth(): void {
     verdict: 'holds',
     /* ⚠️ 原为**单引号**字符串 ⇒ `${...}` 不会被插值,会字面打印出去。
        这是与量纲错**无关的第二个缺陷**,顺手修掉(改成模板串)。 */
-    note: `按实编移动稳态 ${bytesPerFrame}B × 20Hz 计;手册 L747 给出 12 房间并发目标`,
+    note: `按实编移动稳态 ${bytesPerFrame}B × ${TICK_HZ}Hz(= TICK_HZ)计;`
+      + '手册 L747 给出 12 房间并发目标',
   });
 
   /* ★ **把量纲钉成常驻判据**(task-A):

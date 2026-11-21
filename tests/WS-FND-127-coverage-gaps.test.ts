@@ -37,6 +37,7 @@ import { PartyMode } from '../server/src/db/repo.ts';
 import { PARTY_MODES } from '../shared/constants/bosses.ts';
 import { FAST_PER_SLOW, WorldSim } from '../server/src/sim/world_sim.ts';
 import { CarryReject } from '../server/src/physics/carry.ts';
+import { secondsToTicks } from '../shared/types/physics.ts';
 import { makeComponent } from '../server/src/wiring/components.ts';
 
 /* ═════════════════════════ 基础设施 ═════════════════════════ */
@@ -168,7 +169,7 @@ test('FND127-2 ★★ 喂一局 ⇒ partyTimer/scoreA/scoreB 按**权威值**出
   /* ★ WS-FND-174(**陈旧断言已翻面**):HUD 的剩余现在与世界钟同源 ⇒ 要让它递减,
      必须推进**世界钟**(`sim.advance`,一帧 = 一快帧),而不是房间墙钟。
      10.4 世界秒 ⇒ 45 − quant(10.4) = 45 − 10 = 35(与判定用的同一个数)。 */
-  r.sim.advance(10.4 * 20);
+  r.sim.advance(secondsToTicks(10.4));
   syncHud(r);
   eq(metaOf(r).partyTimer, 35, '★ 世界钟推进 10.4s ⇒ 剩余递减到 35(与判定同源)');
   /* 负对照(同一条判据的另一半):墙钟推进同样的 10.4 秒,**一分不动** ——
@@ -206,7 +207,7 @@ test('FND127-3 ★ 三个字段各自被夹到值域(不负 / 不溢出)', () =>
   eq(metaOf(r).partyTimer, 45, '★ 墙钟回拨 ⇒ 剩余照旧停在总时长 45(墙钟不参与,不是「钳住了」)');
 
   /* 3 计时:下界。**世界钟**走过总时长 ⇒ 剩余为负 ⇒ 夹到 0(不写负数)。 */
-  r.sim.advance(45 * 20 + 200);
+  r.sim.advance(secondsToTicks(45) + secondsToTicks(10));
   syncHud(r);
   const m = metaOf(r);
   eq(m.partyTimer, 0, '★ 世界钟走过 45s ⇒ 夹到 0(绝不写负数)');

@@ -327,16 +327,17 @@
 
 ## D-26 时间口径:**帧数即时间**(世界时间 = `frameCount × DT`,**不读挂钟**)
 - **状态**:已裁(owner,2026-11-25)
-- **问题**:本仓的「秒」有两个来源 —— 世界侧按**帧**推进(20Hz,`DT = 50ms`),进程/网络侧按**墙钟**推进。此前这条口径**从未写下来**,于是十三轮里反复出现同一种误读:「1200 游戏秒」被当成「1200 秒实时」,预热 / 冷却 / 长跑的时长按挂钟估。宿主定时器粒度 > 50ms 的机器上误差是实打实的(本机 20Hz 循环实测 62.77ms/帧 ⇒ **1.2555 倍**)。
+- **问题**:本仓的「秒」有两个来源 —— 世界侧按**帧**推进(名义 **32Hz**,`TICK_MS = 31.25ms`),进程/网络侧按**墙钟**推进。此前这条口径**从未写下来**,于是十三轮里反复出现同一种误读:「1200 游戏秒」被当成「1200 秒实时」,预热 / 冷却 / 长跑的时长按挂钟估。宿主定时器粒度 > 帧长的机器上误差是实打实的(旧 20Hz / 50ms 口径下,本机 20Hz 循环实测 62.77ms/帧)。
 - **裁定**:
   1 **世界时间 = `frameCount × DT`(不读挂钟)**。世界里的时长(冷却 / DoT / buff / 赛局 / 打盹 / 昼夜)一律由**帧序**派生;挂钟**不许**进模拟(否则确定性、回放与跨机对账全部失效)。
-  2 **「1200 游戏秒 ≠ 1200 墙钟秒」**。60.0 墙钟秒只是「定时器恰好 50ms」的**标称**;粒度更粗的机器上实际节拍更长 —— 本机实测 62.77ms/帧 ⇒ 1200 游戏秒 ≈ 1506.6 墙钟秒。
+  2 **「1200 游戏秒 ≠ 1200 墙钟秒」**。这是**两个钟量纲**(游戏秒 = `frameCount × DT`;墙钟秒 = 宿主定时器),不许互相顶替、不许相加减。名义 32Hz 下 1200 游戏秒 = 38400 帧 × 31.25ms = **1200 墙钟秒**(37.5 墙钟分钟)—— 但那只在「定时器恰好 31.25ms」的**标称**下成立;真实节拍以 `play` / `soak` 的打印为准(**不在此手抄**,见下方「实测」)。
   3 哪些量**必须**用**墙钟**(与人 / 进程 / 网络有关):自动存档周期、心跳与离线判定、连接与握手超时、重连宽限(退避与下次重试时刻)、会话/令牌时效、炼金缓存时效、**拍卖类限时**(本仓当前无实现 = 0 处;若实现必须用墙钟,否则玩家拖慢世界就能冻结行情)。
   4 哪些量**必须**用**游戏秒**(与世界推进有关):冷却、DoT 每段、buff 到期、赛局时长、打盹 / 露水累计、昼夜(世界钟)。
   5 **两钟交界处必须选一个并保持同源**:跨钟比较必须**显式换算并标单位**(换算只有一处:`DT`),不许把「帧数」当「秒」用。已登记的交界处 —— 自动存档的**稳态**触发是墙钟(与 `AUTOSAVE_INTERVAL_MS` 比,走 `clock.nowMs()`),唯一按帧的那一处是**冷启动垫底**(`saveCount === 0` 期间按 `AUTOSAVE_FRAME_INTERVAL` 节流),它第一次成功存档后即失效,**不许**扩成常态;存档时间戳(unix 毫秒,墙钟)与归档里的 `frame`(游戏)各留原口径、**不互相换算**;派对赛局时长(游戏秒)与重连宽限(墙钟)**不许**相加或比较;心跳踢人(墙钟)**不许**改按帧数(慢机器上会把活人踢掉)。
-- **实测(本机,2026-11-25)**:均值间隔 `tickMean = 62.77ms` · `fps = 15.93` · **倍率 = 20 / 15.93 = 1.2555**(复算:`1000 / 62.77 = 15.93`,`20 / 15.93 = 1.2555`;同机复测 300 帧读到 62.79ms / 15.93fps ⇒ 同一个倍率)。
+- **实测(2026-11-25,W2 本机;tick 口径 20Hz → 32Hz)**:名义 **32Hz** ⇒ 标称帧间隔 31.25ms(`1000 / TICK_HZ`,也是 `DT × 1000` —— **恒等式**,与平台无关),标称 **32fps**(标称下 `1200 游戏秒 ≈ 1200 墙钟秒`)。31.25 确实落在宿主定时器粒度网格上(Windows 默认粒度 15.625ms:31.25 = 2 × 15.625,**整数倍**),**但真实循环不由网格决定**:本机**真实 WS 循环**在名义 32Hz 下实测 `tickMean = 34.6ms`、`fps = 28.9` ⇒ **倍率 = 32 / 28.9 = 1.1073**,即 `1200 游戏秒 ≈ 1328.8 墙钟秒` —— **不是 1**。⇒ 「网格精确 ⇒ 两边一致」这条推理**至少在本机不成立**:另一次**异步裸探测**(请求 20ms / 50ms ⇒ 实测 31.4 / 62.6ms,两个数都精确落在 15.625ms 网格上)曾让人以为「31.25ms 恰在网格上 ⇒ 倍率 1」,而**真实循环下不是**(很可能是「每轮工作量 + 下一轮取整」的复合效应)。真实节拍一律**以 `play` / `soak` 的启动打印为准**(两者共用 `soak.ts` §8b 的同一份算法),**不在此手抄**;**Linux / 生产部署必须在目标机实测后回填**(不要假设 1:1)。
+- **顺带(决定将来要「精确 32Hz」该往哪调)**:20Hz 下同一台机实测 15.93fps(倍率 1.2555)、32Hz 下 34.6ms(倍率 1.1073)⇒ **粒度取整只解释了一部分**,另一部分是**每轮固定开销**(每轮工作量本身 + 下一轮取整的复合效应)。⇒ 要贴近标称,方向是**减小每轮开销**(或改调度方式),**不是**继续换名义值 —— 换值只会把误差挪到另一个网格倍数上。
 - **理由**:两个钟各有正确用途,**边界**才是风险点。把「谁必须用哪个 + 交界处选一个」写死后,「慢机器上世界钟与墙钟不同步」从**静默偏差**变成**可复算的一个数**(启动打印与汇总行各印一次)。
-- **影响**:`scripts/play.ts` 启动 5 秒后打印实测 tick 间隔 / 实际 fps / **世界钟×墙钟倍率**;`scripts/soak.ts` 的汇总行补同款一列(两者**共用** `soak.ts` §8b 的同一份算法,不许各算一遍)。世界侧一行未改(它本来就按帧走)。
+- **影响**:`scripts/play.ts` 启动 5 秒后打印实测 tick 间隔 / 实际 fps / **世界钟×墙钟倍率**;`scripts/soak.ts` 的汇总行补同款一列(两者**共用** `soak.ts` §8b 的同一份算法,不许各算一遍)。世界钟本身一行未改(它本来就按帧走);**时长一律以「秒」声明、帧数由 `secondsToTicks(n)` 派生** —— 判据 `tests/WS-FND-177-tick32-seconds.test.ts`(名义 tick 20 → 32Hz 后时长不变);`scripts/**` 里写死的 tick 率 / 帧长由 `scripts/verify.ts#checkTickConvention()` 对照 `shared/types/physics.ts` 扫描(**同一事实不许两处**)。⚠️ 2026-11-25 另修一处**量纲**错位:`resolveMobStrikes` 里的 `vitals.stepTimers(SIM_SLOW_DT)` 改成 `MOB_AI_DT_SEC`(该方法随 RATE 裁决挪进了 8Hz 块,而 dt 还留着 2Hz 的 0.5s ⇒ 无敌帧 / 回血延迟 / 致盲 / 眩晕一度以 **4 倍**速度流失;判据 `tests/WS-FND-71` FND71-11)。
 - **现状逐条对账**(抽样 17 个字段;**行号是 2026-11-25 的快照**,由判据逐行核对,漂了会点名给出新行号):
 
 | # | 量 | 口径 | 现状(文件:行) | 那一行里的 needle |
@@ -348,18 +349,31 @@
 | 5 | 重连宽限上限(退避封顶) | 墙钟 | `client/src/net/session.ts:58` | `RECONNECT_MAX_MS = 30000` |
 | 6 | 世界侧墙钟来源(装配) | 墙钟 | `server/src/index.ts:469` | `nowMs: () => Date.now()` |
 | 7 | 炼金缓存时效 | 墙钟 | `server/src/alchemy/cache.ts:385` | `at = Date.now()` |
-| 8 | 跳跃冷却(帧数门) | 游戏秒 | `server/src/sim/world_sim.ts:10666` | `this.frameCount < ready` |
-| 9 | 跳跃冷却帧数 | 游戏秒 | `server/src/sim/world_sim.ts:1221` | `JUMP_COOLDOWN_FRAMES = 24` |
-| 10 | DoT 每段结算 | 游戏秒 | `server/src/sim/world_sim.ts:4199` | `tickDot(task, DT)` |
-| 11 | 料理 buff 到期 | 游戏秒 | `server/src/sim/world_sim.ts:5499` | `tickFoodBuff(b, dt)` |
-| 12 | 昼夜 / 世界日长度 | 游戏秒 | `server/src/sim/world_sim.ts:4678` | `FRAMES_PER_DAY = WorldSim.WORLD_DAY_SEC / DT` |
-| 13 | 昼夜判定 | 游戏秒 | `server/src/sim/world_sim.ts:4868` | `this.frameCount % WorldSim.FRAMES_PER_DAY` |
-| 14 | 赛局时长(逻辑秒) | 游戏秒 | `server/src/sim/world_sim.ts:8966` | `this.partyClock.advance(SIM_SLOW_DT)` |
-| 15 | 打盹 / 露水累计 | 游戏秒 | `server/src/sim/world_sim.ts:9032` | `tickAfk(p, nowSec, SIM_SLOW_DT)` |
-| 16 | 世界内时间戳(接力) | 游戏秒 | `server/src/sim/world_sim.ts:2318` | `(this.frameCount / TICK_HZ) * 1000` |
+| 8 | 跳跃冷却(帧数门) | 游戏秒 | `server/src/sim/world_sim.ts:10678` | `this.frameCount < ready` |
+| 9 | 跳跃冷却帧数 | 游戏秒 | `server/src/sim/world_sim.ts:1229` | `JUMP_COOLDOWN_FRAMES = secondsToTicks(WorldSim.JUMP_COOLDOWN_SEC)` |
+| 10 | DoT 每段结算 | 游戏秒 | `server/src/sim/world_sim.ts:4207` | `tickDot(task, DT)` |
+| 11 | 料理 buff 到期 | 游戏秒 | `server/src/sim/world_sim.ts:5507` | `tickFoodBuff(b, dt)` |
+| 12 | 昼夜 / 世界日长度 | 游戏秒 | `server/src/sim/world_sim.ts:4686` | `FRAMES_PER_DAY = WorldSim.WORLD_DAY_SEC / DT` |
+| 13 | 昼夜判定 | 游戏秒 | `server/src/sim/world_sim.ts:4876` | `this.frameCount % WorldSim.FRAMES_PER_DAY` |
+| 14 | 赛局时长(逻辑秒) | 游戏秒 | `server/src/sim/world_sim.ts:8978` | `this.partyClock.advance(SIM_SLOW_DT)` |
+| 15 | 打盹 / 露水累计 | 游戏秒 | `server/src/sim/world_sim.ts:9044` | `tickAfk(p, nowSec, SIM_SLOW_DT)` |
+| 16 | 世界内时间戳(接力) | 游戏秒 | `server/src/sim/world_sim.ts:2326` | `(this.frameCount / TICK_HZ) * 1000` |
 | 17 | 打盹秒累计(纯函数) | 游戏秒 | `server/src/social/afk.ts:148` | `p.dozedSec += dt` |
 
-- **判据**:`tests/WS-FND-175-clock-convention.test.ts`(声明句逐字存在 · 启动打印含倍率 · 上表逐行 `文件:行` + needle 与「口径」列一致 · 倍率可复算 · 负对照:删掉声明句 / 把某行口径改反 ⇒ 必红)。
+- **帧数 → 秒值 → 新帧数**(换 tick 率时**只有帧数动,秒值不动**):源头一律是**秒**,帧数由 `secondsToTicks(n)`(=`round(n × TICK_HZ)`)派生;下表是 20 → 32Hz 的实测换算(旧 20Hz 那一列只作对照,生产里已不留):
+
+| 量(源头是**秒**) | 秒值 | 旧 20Hz 帧数 | 新 32Hz 帧数 | 派生式 |
+| :--- | ---: | ---: | ---: | :--- |
+| 跳跃冷却 | 1.2s | 24 | **38** | `secondsToTicks(JUMP_COOLDOWN_SEC)` |
+| 收尸窗口 | 0.1s | 2 | **3** | `secondsToTicks(MOB_CORPSE_SEC)` |
+| 一个慢帧 | 0.5s | 10 | **16** | `secondsToTicks(SLOW_DT)` = `FAST_PER_SLOW` |
+| 泡泡困人 | 5.0s | 100 | **160** | `secondsToTicks(BUBBLE_TRAP_SEC)` |
+| 连击窗口 | 0.6s | 12 | **19** | `secondsToTicks(COMBO_WINDOW_SEC)` |
+| 受击无敌 | 0.35s | 7 | **11** | `secondsToTicks(PLAYER_IFRAME_SEC)` |
+| 回血延迟 | 6.0s | 120 | **192** | `secondsToTicks(PLAYER_REGEN_DELAY_SEC)` |
+| 世界一日 | 1200s | 24000 | **38400** | `WorldSim.WORLD_DAY_SEC / DT` |
+
+- **判据**:`tests/WS-FND-175-clock-convention.test.ts`(声明句逐字存在 · 启动打印含倍率 · 上表逐行 `文件:行` + needle 与「口径」列一致 · 倍率可复算 · 负对照:删掉声明句 / 把某行口径改反 ⇒ 必红)· `tests/WS-FND-177-tick32-seconds.test.ts`(32Hz 下时长以秒派生不变)。
 
 ---
 ## 待 owner 裁决(尚未定)

@@ -56,7 +56,7 @@ import {
   type DamageResult,
 } from './behaviors.ts';
 import { MobFsmState, MobBehavior, type MobDef } from '../../../shared/types/entities.ts';
-import { BASE_MOVE_SPEED } from '../../../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, secondsToTicks, TICK_HZ } from '../../../shared/types/physics.ts';
 import type { EventBus, EventPayload } from '../events/bus.ts';
 
 /* ═══════════════════════ 1. 宿主依赖 ═══════════════════════ */
@@ -130,10 +130,98 @@ function makeDefaultRng(seed = 0x2f6e2b1): () => number {
  *
  * ## 为什么必须很小
  * 尸体只要还在,`runtimes()` 每帧就仍复制排序它、AOI 仍可能唤醒它、
- * 物理仍拿它两两配对 —— 那是纯浪费。取 2 帧 = 最多一帧余量,
+ * 物理仍拿它两两配对 —— 那是纯浪费。0.1 秒的余量(20Hz 时代的 2 帧)刚好,
  * 收尸在**下一帧末尾**发生(判据见 `tests/WS-FND-135`)。
  */
-export const MOB_CORPSE_FRAMES = 2;
+export const MOB_CORPSE_SEC = 0.1;
+/** 尸体保留的**帧数** = `secondsToTicks(MOB_CORPSE_SEC)`(0.1 秒 ⇒ 32Hz 下 3 帧)。 */
+export const MOB_CORPSE_FRAMES = secondsToTicks(MOB_CORPSE_SEC);
+
+/* ═════════ ★ 独立速率常量(流体 / AI / Boss):与慢帧解耦的**唯一**量化点 ═════════
+ *
+ * owner 裁决(2026-11-21):整体提到 32Hz 之外,**流体与 AI 单独提频**。
+ * 为什么是这两处:慢帧 2Hz 下它们每 0.5 秒才动一次(AI 走路一格一格跳、水流
+ * 「一跳一帧」),正是**最可能糊**的地方。
+ *
+ * ## 单位(三个都不同,别混)
+ *   `*_RATE_HZ`         = 次/秒(名义频率)
+ *   `frameStrideAtRate` = 几次快帧推进一次(整数;**取上整** ⇒ 实际 ≤ 名义)
+ *   `*_DT_SEC` / `frameSecondsAtRate` = 一次推进的**真实**秒数(步长 ÷ 快帧频率)
+ *
+ * ## 为什么量化器住在这个文件
+ * AI 是**唯一**必须拿到 `dt` 的那个(FSM/steering 都是「× dt」,给错 dt 会让生物
+ * 以 4 倍速移动而不报错)⇒ `dt` 与步长必须同源;流体与 Boss 共用同一个量化器
+ * (全仓只有这一份 Hz→步长 的实现),避免两处各自取整出不同的节拍。
+ * ⚠️ 与 shared 的 `secondsToTicks` **同一帧网格**(`TICK_HZ`),区别只在取整方向:
+ *   那里是时长口径(`Math.round`,可下取),这里是**速率口径**(取上整 ⇒ 不超支)。
+ *
+ * ## 上限保护(超预算 ⇒ 降级,不崩)
+ * · 流体:单步额度仍由 `FLUID_CELL_BUDGET` 封顶,打满只记 `deferredCells`
+ *   (延后、不丢水位)—— 提频的坏表现是「比预期慢」,不是崩;
+ * · AI:每 tick 推进的是 **AOI 唤醒集**(上界 = 半径内生物数),不是全世界生物;
+ * · Boss:上界 = 激活 Boss 数(`BossRaidRuntime`;实测 8 Boss 单帧 30~60μs、上界
+ *   500μs ⇒ 8Hz 也只有 0.5ms/秒);
+ * · 真要削:改 `*_RATE_HZ` 一行(4Hz / 2Hz),不必动调度代码。
+ *
+ * ## 判据(RATE-4 / RATE-7 / RATE-8;实现在 `tests/WS-FND-05` §11)
+ * RATE-4 AI 与 Boss 各自具名常量 = 8Hz:`tickDueAtRate(f, 8)` 在 N 帧里恰好为真
+ *        `ticksInWindow(N, 8)` 次(32Hz、N=64 ⇒ 16 次),`dt` 取 `*_DT_SEC`(= 0.125s)
+ *        **而不是** `SIM_SLOW_DT`;
+ * RATE-7 解耦负对照:本文件与 `world/fluid.ts` 的代码里不许出现 `FAST_PER_SLOW` /
+ *        `SLOW_TICK_HZ` / `isSlow` / `SIM_SLOW_DT`(扫描器掩注释);AI 的 dt 若改回
+ *        `SIM_SLOW_DT`,生物会以 4 倍速移动 —— 判据钉住这一条;
+ * RATE-8 「谁留在慢帧」是一份**显式清单**(见 `wiring/graph.ts` 的速率节),不是默认值。
+ */
+
+/** 快帧频率(Hz = 次/秒):转发冻结层 `TICK_HZ`(32Hz)。 */
+export const FAST_FRAME_HZ = TICK_HZ;
+
+/**
+ * Hz → 快帧步长(整数帧)。**取上整** ⇒ 实际频率 ≤ 名义频率(永不超支):
+ * 32Hz 帧率下 8Hz ⇒ 4 帧(精确);20Hz 帧率下 8Hz ⇒ 3 帧(6.67Hz,不足额而非超支)。
+ * 非正 / 非有限的 `rateHz` ⇒ 1(每帧),不抛异常。
+ *
+ * `fastHz` 形参只服务判据与「目标帧率核对」(默认 = 当前 `FAST_FRAME_HZ`),
+ * 调度端**不要**传它。
+ */
+export function frameStrideAtRate(rateHz: number, fastHz: number = FAST_FRAME_HZ): number {
+  if (!Number.isFinite(rateHz) || rateHz <= 0) return 1;
+  if (!Number.isFinite(fastHz) || fastHz <= 0) return 1;
+  return Math.max(1, Math.ceil(fastHz / rateHz - 1e-9));
+}
+
+/** 第 `frame` 个快帧(1 起)是否该推进 `rateHz` 的那个系统 —— 调度端的唯一判据。 */
+export function tickDueAtRate(frame: number, rateHz: number, fastHz: number = FAST_FRAME_HZ): boolean {
+  return frame % frameStrideAtRate(rateHz, fastHz) === 0;
+}
+
+/** 跑 `frames` 个快帧 ⇒ 该系统推进了**几次**(判据 RATE-2/RATE-4 的期望值)。 */
+export function ticksInWindow(frames: number, rateHz: number, fastHz: number = FAST_FRAME_HZ): number {
+  return Math.floor(Math.max(0, Math.floor(frames)) / frameStrideAtRate(rateHz, fastHz));
+}
+
+/** 一次推进的**真实**时长(秒)= 步长 ÷ 快帧频率。AI/Boss 的 `dt` 必须取它。 */
+export function frameSecondsAtRate(rateHz: number, fastHz: number = FAST_FRAME_HZ): number {
+  return frameStrideAtRate(rateHz, fastHz) / fastHz;
+}
+
+/**
+ * 生物 AI 的独立速率(Hz = 次/秒)。
+ *
+ * 从「慢帧(约 1.6~2Hz)」改成具名常量 8Hz:AI 的移动/转向是菜单上最显眼的「糊」源。
+ * ⚠️ **必须与它同频**的还有 AOI 唤醒(`aoi.update()`)—— 用旧唤醒集推 8Hz 的 AI
+ * 不报错,只会追着上一帧的位置跑;`resolveMobStrikes` 同理(结算与 AI 同一块)。
+ */
+export const MOB_AI_RATE_HZ = 8;
+
+/** Boss 副本的独立速率(Hz)。与 AI 同值,但**各留一个旋钮**(可能单独调)。 */
+export const BOSS_AI_RATE_HZ = 8;
+
+/** AI 一 tick 的真实秒数(32Hz ⇒ 0.125s)。**不许用 `SIM_SLOW_DT`。** */
+export const MOB_AI_DT_SEC = frameSecondsAtRate(MOB_AI_RATE_HZ);
+
+/** Boss 一 tick 的真实秒数(同上;`tickBosses` 的护盾/眩晕倒计时是秒量纲)。 */
+export const BOSS_AI_DT_SEC = frameSecondsAtRate(BOSS_AI_RATE_HZ);
 
 /** 一帧的宿主统计。 */
 export interface MobHostFrameStats {

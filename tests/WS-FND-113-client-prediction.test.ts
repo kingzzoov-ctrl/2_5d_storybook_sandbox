@@ -20,7 +20,7 @@
  * | :--- | :--- | :--- |
  * | 1 | `predictParamsOf`:四种禁步态 ⇒ frozen;NORMAL/SLIPPING/AFK_SHIELD ⇒ 不冻结(**负对照**);越界/空输入 ⇒ 不冻结 | 表里少一个状态 / 改成"总是冻结" |
  * | 2 | `mu` / `speedMul` 从权威状态派生(滑 ⇒ 0.98、背人 ⇒ 0.85、否则 1) | 把 `mu` 写死 / 不读 carryingEntityId |
- * | 3 | 参数**真的**进 `predictStep`:冻结 ⇒ 0 格;mul=2 ⇒ 0.45 格。**注入**:不传参数 ⇒ 同场景走 0.225 格 | 参数只存不用 / 传了不生效 |
+ * | 3 | 参数**真的**进 `predictStep`:冻结 ⇒ 0 格;mul=2 ⇒ 2 × 单帧位移。**注入**:不传参数 ⇒ 同场景走 1 步位移 | 参数只存不用 / 传了不生效 |
  * | 4 | 前推与重演**同一份**参数。**注入**:重演传 `{}` ⇒ 位置差一半(0.675 格) | onAuthoritative 不用 `this.params` |
  * | 5 | 渲染消费:SMOOTH 后 `pos == 权威`、`render == 权威 + 未收回偏移`;`absorbVisual` 单调收敛。**负对照**:不校正时 render == pos | 把 renderPos 接成 pos / 不发视觉偏移 |
  * | 6 | 坏值(坐标 NaN)⇒ `poseView()` 返回 `null`(调用方退回权威)。**负对照**:正常时非 null | 去掉 `Number.isFinite` 那道门 |
@@ -41,7 +41,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CARRY_SLOWDOWN, DT } from '../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, CARRY_SLOWDOWN, DT } from '../shared/types/physics.ts';
 import { STATE_FLAG_NAMES, type PlayerState } from '../shared/types/wire.ts';
 import { createPlayerState, createRoomState } from '../server/src/net/schema.ts';
 import {
@@ -80,7 +80,8 @@ const playerWith = (patch: Partial<PlayerState> = {}): PlayerState =>
   createPlayerState('p1', { name: '阿珍', x: 10, y: 10, ...patch });
 
 /** 一步的位移(格):BASE_MOVE_SPEED 4.5 × DT 0.05 = 0.225 —— **字面量锚定**。 */
-const STEP = 0.225;
+/* 单帧位移 = 移速(格/秒) × 帧长 —— **由冻结层派生**,不写死 0.225(那是 20Hz 的值)。 */
+const STEP = BASE_MOVE_SPEED * DT;
 
 /** 一条向东的命令。 */
 const cmd = (seq: number): { seq: number; moveX: number; moveY: number; jump: boolean } =>
@@ -134,16 +135,16 @@ test('FND113-3 ★★ 参数生效:冻结 ⇒ 一步不动;mul=2 ⇒ 两倍;**�
   const fast = new LocalPredictor({ x: 0, y: 0, z: 0 });
   fast.setParams({ speedMul: 2 });
   fast.step(cmd(1));
-  near(fast.pos.x, STEP * 2, 1e-12, 'mul=2 ⇒ 一步 0.45 格');
+  near(fast.pos.x, STEP * 2, 1e-12, `mul=2 ⇒ 一步 ${2 * STEP} 格(2 × 单帧位移)`);
   eq(fast.lastParams, { speedMul: 2 }, '喂进去的参数**可读回**(自检口径)');
 
   /* 3 ★ 注入(修前的行为):同一个被冻住的玩家,若**不传参数**(={}),
      客户端会照样走一步;而服务端这条移动会被整条拒收 ⇒ 分歧累积到 1.5 格后硬 SNAP。 */
   const old = new LocalPredictor({ x: 0, y: 0, z: 0 });
   old.step(cmd(1));
-  near(old.pos.x, STEP, 1e-12, '★ 注入:不传参数 ⇒ 被冻住的玩家照样走 0.225 格');
+  near(old.pos.x, STEP, 1e-12, `★ 注入:不传参数 ⇒ 被冻住的玩家照样走 ${STEP} 格`);
   ok(old.pos.x > 0.05,
-    '★ 分歧 0.225 格 > 校正死区 0.05 ⇒ 每帧都会触发校正(修前的"橡皮筋"来源)');
+    `★ 分歧 ${STEP} 格 > 校正死区 0.05 ⇒ 每帧都会触发校正(修前的"橡皮筋"来源)`);
 });
 
 test('FND113-4 ★★ 前推与**重演**用同一份参数(注入:重演传 {} ⇒ 位置差一半)', () => {
@@ -151,22 +152,22 @@ test('FND113-4 ★★ 前推与**重演**用同一份参数(注入:重演传 {} 
   const p = new LocalPredictor({ x: 0, y: 0, z: 0 });
   p.setParams({ speedMul: 2 });
   for (let i = 1; i <= 3; i += 1) p.step(cmd(i));
-  near(p.pos.x, 1.35, 1e-12, '前置:3 步 × 0.45 = 1.35');
+  near(p.pos.x, STEP * 2 * 3, 1e-12, `前置:3 步 × ${2 * STEP} = ${6 * STEP}`);
   eq(p.pendingCount, 3, '前置:3 条待确认');
 
   /* 权威说"你还在原点"⇒ 从原点重演那 3 条。参数相同 ⇒ 重演与预测**逐位相同**
      ⇒ 零误差(IGNORE),位置不动。 */
   const r = p.onAuthoritative({ x: 0, y: 0, z: 0 });
   eq(r.action, ReconcileAction.IGNORE, '同一份参数重演 ⇒ 预测与重演重合(IGNORE)');
-  near(p.pos.x, 1.35, 1e-12, '位置不动');
+  near(p.pos.x, STEP * 2 * 3, 1e-12, '位置不动');
 
   /* ★ 注入:重演用 `{}`(修前的等效形态)⇒ 重演只走 0.225×3 = 0.675 ⇒ 差 0.675 格。 */
   const q = new LocalPredictor({ x: 0, y: 0, z: 0 });
   q.setParams({ speedMul: 2 });
   for (let i = 1; i <= 3; i += 1) q.step(cmd(i));
   const wrong = q.onAuthoritative({ x: 0, y: 0, z: 0 }, {});
-  eq(wrong.action, ReconcileAction.SMOOTH, '★ 注入:重演用 {} ⇒ 误差 0.675 格(软校正)');
-  near(q.pos.x, 0.675, 1e-12, '★ 注入:重演算出来的位置只有一半 ⇒ 正是"偶发橡皮筋"');
+  eq(wrong.action, ReconcileAction.SMOOTH, `★ 注入:重演用 {} ⇒ 误差 ${3 * STEP} 格(软校正)`);
+  near(q.pos.x, STEP * 3, 1e-12, '★ 注入:重演算出来的位置只有一半 ⇒ 正是"偶发橡皮筋"');
 });
 
 /* ═══════════════ 3. 渲染消费(第 2 处)═══════════════ */
@@ -175,7 +176,7 @@ test('FND113-5 ★★ 渲染消费:SMOOTH 后 pos == 权威、render == 权威 +
   const p = new LocalPredictor({ x: 0, y: 0, z: 0 });
   p.step(cmd(1));
   p.step(cmd(2));
-  near(p.pos.x, 0.45, 1e-12, '前置:两步到 0.45');
+  near(p.pos.x, STEP * 2, 1e-12, `前置:两步到 ${2 * STEP}`);
   /* 负对照:没有权威帧时**不许**凭空产生视觉偏移(否则立牌一开始就抖)。 */
   eq(p.renderPos, p.pos, '负对照:没有校正 ⇒ render == pos(无幽灵偏移)');
   eq(p.poseView()?.visualOffset, 0, '负对照:视觉偏移 = 0');
@@ -185,12 +186,12 @@ test('FND113-5 ★★ 渲染消费:SMOOTH 后 pos == 权威、render == 权威 +
   eq(r.action, ReconcileAction.SMOOTH, '0.25 格落在软校正带内');
   eq([p.pendingCount, p.prunedTotal], [0, 2], '前置:队列剪空(否则下面混进了"重演位移")');
   near(p.pos.x, 0.2, 1e-12, '★ 逻辑位置**立即**对齐权威(权威成了唯一真值)');
-  near(p.renderPos.x, 0.45, 1e-12, '★★ 渲染位置 = 校正**之前**那里(视觉连续,不跳)');
+  near(p.renderPos.x, STEP * 2, 1e-12, '★★ 渲染位置 = 校正**之前**那里(视觉连续,不跳)');
 
   const view = p.poseView();
   ok(view !== null, 'poseView 非 null');
   eq(view?.render, p.renderPos, '★ poseView.render **就是** renderPos(渲染读的就是它)');
-  near(view?.visualOffset ?? -1, 0.25, 1e-12, '★ 视觉偏移 0.25 格(自检口径可读)');
+  near(view?.visualOffset ?? -1, 2 * STEP - 0.2, 1e-12, `★ 视觉偏移 ${2 * STEP - 0.2} 格(自检口径可读)`);
 
   /* 逐帧吸收:偏移**单调**减小,并在若干帧后归零(之后 render 恒等于 pos)。 */
   let prev = view?.visualOffset ?? 0;

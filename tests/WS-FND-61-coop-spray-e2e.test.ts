@@ -34,12 +34,15 @@
  *
  * ## ⚠️ 断言右侧一律用**字面量**
  *
- * `508` / `227` / `240` / `12` / `0.5` / `'BURNING'` / `'STATION_DOUSED'`
+ * `508` / `227` / `12`(=`OVERHEAT_SEC`)/ `0.5` / `'BURNING'` / `'STATION_DOUSED'`
  * 都写死,不拿被测模块的导出当期望值(门禁 `--strict-taut` 的口径)。
+ * ⚠️ **例外**:帧数一律**由秒派生**(`secondsToTicks` / `FAST_PER_SLOW`)—— 写死帧数
+ * 会在改 tick 率时静默改变被测时长(见 FND177 的口径)。
  *
  * 运行:`node tests/WS-FND-61-coop-spray-e2e.test.ts`
  */
-import { test, ok, eq, includes, report } from '../shared/testing/harness.ts';
+import { test, ok, eq, near, includes, report } from '../shared/testing/harness.ts';
+import { secondsToTicks, ticksToSeconds, TICK_HZ } from '../shared/types/physics.ts';
 import { WorldSim, FAST_PER_SLOW, SIM_SLOW_DT } from '../server/src/sim/world_sim.ts';
 import {
   EXTINGUISH_SEC,
@@ -61,18 +64,17 @@ const OVEN_X = 6;
 const OVEN_Y = 6;
 
 /**
- * ★ 前置实测数字(不是推算出来的「应该」):
+ * ★ 起火所需的两个数 —— **全部由秒派生**(`OVERHEAT_SEC` / `SIM_SLOW_DT` / `FAST_PER_SLOW`),
+ * 不写死帧数(写死的数只在旧 tick 率下是 12 秒)。
  *
  * 工位要连续运转 `OVERHEAT_SEC`(= 12 s)才进 BURNING;
- * `tickRushOrder` 的慢帧 dt 是 `SIM_SLOW_DT`(= 0.5 s)⇒ **24 个慢帧**;
- * 慢帧 = 每 `FAST_PER_SLOW`(= 10)个快帧一次 ⇒ **240 次 `sim.tick()`**,
- * 也就是世界时间 **12.00 秒**。
+ * `tickRushOrder` 的慢帧 dt 是 `SIM_SLOW_DT`(= 0.5 s)⇒ `BURN_SLOW_FRAMES` 个慢帧;
+ * 慢帧 = 每 `FAST_PER_SLOW` 个快帧一次 ⇒ `BURN_TICKS` 次 `sim.tick()`,也就是世界时间 12.00 秒。
  *
- * 实测边界:第 **239** 帧(= 11.5 s)仍是 `RUNNING`,第 **240** 帧(12.00 s)转 `BURNING`
- * —— 下面 FND61-1 就钉在这两个数上。
+ * 两条独立派生(`secondsToTicks` 与「慢帧数 × 每慢帧快帧数」)**必须一致** ⇒ FND61-1 钉住。
  */
-const BURN_SLOW_FRAMES = 24;
-const BURN_TICKS = BURN_SLOW_FRAMES * FAST_PER_SLOW;
+const BURN_SLOW_FRAMES = OVERHEAT_SEC / SIM_SLOW_DT;
+const BURN_TICKS = secondsToTicks(OVERHEAT_SEC);
 
 /**
  * 拿世界侧那个急单会话。`null` = 本房间没开急单。
@@ -123,32 +125,33 @@ function scene(): Scene {
   return { sim, ses };
 }
 
-/** 推够帧让工位进 BURNING(240 帧 = 12.00 秒)。 */
+/** 推够帧让工位进 BURNING(`BURN_TICKS` 帧 = `OVERHEAT_SEC` 秒,帧数由秒派生)。 */
 function burn(sim: WorldSim): void {
   for (let i = 0; i < BURN_TICKS; i += 1) sim.tick();
 }
 
 /* ══════════════════ 1 前置:起火 ══════════════════ */
 
-test('FND61-1 前置:508 成为 FURNACE 工位格 (6,6);推 240 帧(= 12.00 秒)后工位 BURNING', () => {
+test('FND61-1 前置:508 成为 FURNACE 工位格 (6,6);推 `BURN_TICKS` 帧(= OVERHEAT_SEC)后工位 BURNING', () => {
   const { sim, ses } = scene();
 
   eq(stationStateOf(ses, 'FURNACE'), 'RUNNING', '开局:高炉在运转,还没起火');
   eq(sprayableKinds(ses), [], '开局:没有工位在烧');
   /* 映射表必须来自**真器件格**:纯函数单测里的默认占位格是 (0,0),世界侧必须是 (6,6)。 */
   eq(ses.stationCells.FURNACE, { x: 6, y: 6 }, '★ 披萨炉格 (6,6) 成了高炉工位的世界格');
-  eq(BURN_TICKS, 240, '★ 起火烧起来的帧数 = 240(24 个慢帧 × 10 快帧,实测)');
+  eq(BURN_TICKS, BURN_SLOW_FRAMES * FAST_PER_SLOW,
+    '★ 起火帧数:两条独立派生必须一致(secondsToTicks(OVERHEAT_SEC) = 慢帧数 × 每慢帧快帧数)');
 
-  /* 边界负对照:第 239 帧 = 11.5 秒 < 12 秒 ⇒ 还没烧起来。
-     没有这一条,「240」这个数就只是我抄来的常量,不是被量出来的。 */
+  /* 边界负对照:第 `BURN_TICKS - 1` 帧 = 11.5 秒 < 12 秒 ⇒ 还没烧起来(11.5 = 少一个慢帧)。
+     没有这一条,`BURN_TICKS` 就只是我抄来的常量,不是被量出来的。 */
   for (let i = 0; i < BURN_TICKS - 1; i += 1) sim.tick();
-  eq(stationStateOf(ses, 'FURNACE'), 'RUNNING', '★ 第 239 帧(11.5 秒)仍在 RUNNING');
-  eq(stationRuntimeOf(ses, 'FURNACE').runningSec, 11.5, '★ 累计运转 11.5 秒');
+  eq(stationStateOf(ses, 'FURNACE'), 'RUNNING', `★ 第 ${BURN_TICKS - 1} 帧(${(BURN_SLOW_FRAMES - 1) * SIM_SLOW_DT} 秒)仍在 RUNNING`);
+  eq(stationRuntimeOf(ses, 'FURNACE').runningSec, (BURN_SLOW_FRAMES - 1) * SIM_SLOW_DT, '★ 累计运转 11.5 秒(= 少一个慢帧)');
 
   const f = sim.tick();
-  eq(f.simSeconds, 12, '★ 第 240 帧的世界时间 = 12.00 秒(= OVERHEAT_SEC)');
-  eq(stationStateOf(ses, 'FURNACE'), 'BURNING', '★★ 第 240 帧进入 BURNING');
-  eq(stationRuntimeOf(ses, 'FURNACE').runningSec, 12, '累计运转 12 秒');
+  eq(f.simSeconds, 12, '★ 第 `BURN_TICKS` 帧的世界时间 = 12.00 秒(= `OVERHEAT_SEC` 的字面值)');
+  eq(stationStateOf(ses, 'FURNACE'), 'BURNING', '★★ 该帧进入 BURNING');
+  eq(stationRuntimeOf(ses, 'FURNACE').runningSec, BURN_SLOW_FRAMES * SIM_SLOW_DT, '累计运转 12 秒(= OVERHEAT_SEC)');
   /* 另外两个工位没人照看 ⇒ 一起烧(负对照留给 FND61-3:它们不在喷射半径内)。 */
   eq(sprayableKinds(ses), ['FURNACE', 'POT', 'CUTTER'], '三个工位都在烧,顺序 = 工位表顺序');
 });
@@ -187,7 +190,7 @@ test('FND61-3 ★★ 用一次 227 浇它 ⇒ 下一个慢帧后不再是 BURNIN
   eq(use.consume, true, '前置:这一件真的被用掉');
   eq(stationStateOf(ses, 'FURNACE'), 'BURNING', '★ 用道具的**当帧**还没灭(灭火要等慢帧)');
 
-  /* 意图窗口 = 一个慢帧 = 10 个快帧;推到窗口覆盖的那个慢帧。 */
+  /* 意图窗口 = 一个慢帧 = `FAST_PER_SLOW` 个快帧;推到窗口覆盖的那个慢帧。 */
   for (let i = 0; i < FAST_PER_SLOW; i += 1) sim.tick();
 
   eq(stationStateOf(ses, 'FURNACE'), 'RUNNING', '★★ 不再是 BURNING(0.5 秒累计达成)');
@@ -210,7 +213,7 @@ test('FND61-4 ★ 意图会过期:227 用过但窗口内没浇到 ⇒ 之后站�
   eq(sim.useItem('p1', { itemId: BUBBLE_GUN, targetDeviceId: PIZZA_OVEN }).applied, true,
     '前置:227 生效 ⇒ 喷射意图已登记');
 
-  /* 窗口只覆盖 10 个快帧,而慢帧每 10 帧一次 ⇒ **必然**有一个慢帧落在窗口内。
+  /* 窗口只覆盖 `FAST_PER_SLOW` 个快帧,而慢帧每 `FAST_PER_SLOW` 帧一次 ⇒ **必然**有一个慢帧落在窗口内。
      所以「过期」这件事只能是:窗口内那一次被浪费掉(人不在半径内)。
      位置用 `setPlayerPos` 挪 —— 判据用的是**刚体坐标**(见 `playerAt`),不是入参。 */
   sim.setPlayerPos('p1', OVEN_X + 0.5, OVEN_Y + 4.5);
@@ -218,7 +221,7 @@ test('FND61-4 ★ 意图会过期:227 用过但窗口内没浇到 ⇒ 之后站�
   eq(stationStateOf(ses, 'FURNACE'), 'BURNING', '窗口内那一慢帧:人不在半径内 ⇒ 没浇到');
   eq(stationRuntimeOf(ses, 'FURNACE').dousedSec, 0, '灭火计时仍为 0');
 
-  /* 再推 2 个慢帧 ⇒ 意图窗口(本帧 + 10)过期,账被清掉 */
+  /* 再推 2 个慢帧 ⇒ 意图窗口(本帧 + `FAST_PER_SLOW`)过期,账被清掉 */
   for (let i = 0; i < 2 * FAST_PER_SLOW; i += 1) sim.tick();
 
   /* 回到工位旁:纯坐标判定此刻会命中(与 FND61-2 同形),但**没有新的意图** */
@@ -272,11 +275,12 @@ test('FND61-5 读口:未开急单(rushRun = null)/ 未知 kind ⇒ 明确返回(
 
 test('FND61-6 既有规则不动:EXTINGUISH_SEC = 0.5;意图窗口 = 一个慢帧 = 0.5 秒', () => {
   eq(EXTINGUISH_SEC, 0.5, '227 水枪累计喷射 0.5 秒 ⇒ 恢复正常运转');
-  eq(OVERHEAT_SEC, 12, '连续运转 12 秒不翻炒 ⇒ 起火(FND61-1 的 240 帧由它算出)');
+  eq(OVERHEAT_SEC, 12, '连续运转 12 秒不翻炒 ⇒ 起火(FND61-1 的 `BURN_TICKS` 由它算出)');
   eq(STATION_SPRAY_RADIUS, 3, '喷射半径 = 3 格(复用料理站灭火常量)');
-  eq(FAST_PER_SLOW, 10, '一个慢帧 = 10 个快帧');
+  eq(FAST_PER_SLOW, secondsToTicks(SIM_SLOW_DT), '一个慢帧 = secondsToTicks(SIM_SLOW_DT) 个快帧(帧数由秒派生)');
   eq(SIM_SLOW_DT, 0.5, '慢帧 dt = 0.5 秒');
-  eq(FAST_PER_SLOW / 20, 0.5, '★ 意图窗口 = 一个慢帧 = 0.5 秒 = 恰好够累计一次 EXTINGUISH_SEC');
+  near(ticksToSeconds(FAST_PER_SLOW), 0.5, 1 / TICK_HZ,
+    '★ 意图窗口 = 一个慢帧 = 0.5 秒(= `EXTINGUISH_SEC` 的字面值,恰好够累计一次灭火,刻度内)');
   eq(BURN_SLOW_FRAMES * SIM_SLOW_DT, 12, '24 个慢帧 × 0.5 秒 = 12 秒 = OVERHEAT_SEC');
 });
 

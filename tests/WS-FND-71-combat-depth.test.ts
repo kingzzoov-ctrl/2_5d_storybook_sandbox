@@ -21,6 +21,7 @@
  * 每个判据都有**负对照**(不该生效的那一侧也断言),否则「恒真」也能过。
  */
 import { test, ok, eq, near, report, mulberry32 } from '../shared/testing/harness.ts';
+import { secondsToTicks } from '../shared/types/physics.ts';
 import { assemble } from '../server/src/index.ts';
 import { RoomAction } from '../server/src/net/room.ts';
 import { WorldSim } from '../server/src/sim/world_sim.ts';
@@ -288,9 +289,11 @@ test('FND71-11 ★ D5:视野半径受致盲影响;**倒计时**递减;复活清�
   eq(sim.viewRadiusOf('p1'), 32, '基线:视野半径 32(AOI 唤醒半径,字面量)');
   sim.vitals.applyBlind('p1', 2);
   eq(sim.viewRadiusOf('p1'), 16, '★ 致盲 ⇒ 视野减半(16)');
-  /* 慢帧 0.5s / 次 ⇒ 推 1 秒应剩 1。 */
-  for (let i = 0; i < 20; i += 1) sim.tick();
-  near(sim.vitals.blindOf('p1'), 1, 1e-9, '★ 致盲按时长消耗(2 → 1)');
+  /* 致盲是**秒**口径 ⇒ 推 1 真实秒应剩 1(帧数由 `secondsToTicks` 派生,不写死 20)。
+     ⚠️ 计时器由 8Hz 块推进,dt 必须是 `MOB_AI_DT_SEC`(0.125s)—— 修前那里写的是
+     `SIM_SLOW_DT`,于是每秒流失 2 秒(33→32 那批改动把本方法从慢帧挪进 8Hz 块时漏改)。 */
+  for (let i = 0; i < secondsToTicks(1); i += 1) sim.tick();
+  near(sim.vitals.blindOf('p1'), 1, 1e-9, '★ 致盲按时长消耗(2 → 1,推进 1 秒)');
   eq(sim.viewRadiusOf('p1'), 16, '★ 仍在致盲中 ⇒ 视野仍是减半的');
   sim.vitals.applyBlind('p1', 9);
   sim.vitals.revive('p1');
@@ -355,10 +358,11 @@ test('FND71-14 ★★ D7:`damage.ts` 八步与 `components.ts` 昼夜都是**活
   ok(rep.hit!.result.base > 0, '★ 基础伤害被算出来了(不是 0 的壳)');
 
   /* `wiring/components.ts` 的 `isNight`:世界钟走到 19:00 ⇒ 真的是夜。
-     (13000 快帧 = 650 世界秒 = 13 小时,从 06:00 到 19:00 —— 实测 63 ms。) */
+     06:00 → 19:00 = 13 小时 = 13 × (`WORLD_DAY_SEC` / 24)= 650 **秒**;
+     帧数由 `secondsToTicks` 派生(写死帧数会在改 tick 率时静默改时长)。 */
   const clockSim = quietScene().sim;
   eq(clockSim.isNightNow(), false, '基线:开局 06:00 是白天');
-  clockSim.advance(13000);
+  clockSim.advance(secondsToTicks((WorldSim.WORLD_DAY_SEC / 24) * 13));
   near(clockSim.hourOfDay(), 19, 1e-6, '前置:世界钟推到 19:00');
   eq(clockSim.isNightNow(), true, '★★ 19:00 ⇒ 夜(读的是 components 的 isNight,不是本地常量)');
   eq(isNightAtHour(19), true, '对照:同一个边界在 components 里也是夜');

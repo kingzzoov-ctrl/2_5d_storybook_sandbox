@@ -865,11 +865,41 @@ export function makeDot(
   return { key, targetId, element: dot.element, dps: dot.dps, remainSec: dot.sec };
 }
 
+/* ★ 第十二轮(tick 改 32Hz 后暴露的真回归):DoT 的**余量与入账都不按帧取整**。
+ *
+ * ## 缺陷(V1 实测)
+ *
+ * 旧写法 `const remainSec = r2(task.remainSec - used);` —— 每帧把余量截到 2 位小数。
+ * 帧长是 0.01s 的整数倍时无损(20Hz `dt = 0.05`);32Hz 的 `dt = 0.03125`
+ * **不是** 0.01 的整数倍 ⇒ 每帧只记走 0.03,余量虚高 0.00125s/帧。
+ * 同一把 713(`dot = 8/s × 3s`)实测:
+ * ```text
+ * 20Hz  dt = 0.05     ⇒  60 帧 / 总伤害 24.00
+ * 32Hz  dt = 0.03125  ⇒ 100 帧 / 总伤害 24.99,任务多活 0.12s
+ * ```
+ * ⇒ **总伤害随 tick 率变**,而设计值是 `dps × 秒`(时长语义不许随帧率漂)。
+ *
+ * ## 口径
+ * ```text
+ * 余量  只减不取整(内部账本,不是给人看的读数)
+ * 入账  dps × elapsed(同样不按帧取整)
+ * ```
+ * 取整若需要,归**展示 / 回执**层 —— 把 `r2` 压在账本上等于每帧改时长。
+ * ⚠️ 收敛必须干净:余量进 `DOT_EPS` 以内一律记 0,否则
+ *   `4 - 80 × 0.05` 这类浮点尾差会让任务多跑一帧「近 0 伤害」的跳。
+ */
+const DOT_EPS = 1e-9;
+
 export function tickDot(task: DotTask, dt: number): { task: DotTask; damage: number; expired: boolean } {
-  const used = Math.min(dt, Math.max(0, task.remainSec));
-  const damage = r2(task.dps * used);
-  const remainSec = r2(task.remainSec - used);
-  return { task: { ...task, remainSec }, damage, expired: remainSec <= 0 };
+  const remainBefore = Math.max(0, task.remainSec);
+  const elapsed = Math.min(Math.max(0, dt), remainBefore);
+  const remainRaw = remainBefore - elapsed;
+  const expired = remainRaw <= DOT_EPS;
+  return {
+    task: { ...task, remainSec: expired ? 0 : remainRaw },
+    damage: task.dps * elapsed,
+    expired,
+  };
 }
 
 /* ───────────────────────────── 技能命中解析(713/716/718/723) ───────────────────────────── */

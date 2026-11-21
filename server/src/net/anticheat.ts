@@ -2,7 +2,8 @@
  * WS-07 · 服务端权威反作弊(零依赖核心)。
  *
  * 原则:客户端的一切输入都视为「**申请**」,不是「事实」。四类校验:
- *   1. 坐标跳变 —— 单帧位移不得超过 `maxSpeed(移速加成上限) × DT × 容差`。
+ *   1. 坐标跳变 —— 单帧位移不得超过 `maxSpeed(移速加成上限) × 帧步长 × 容差`,
+ *      帧步长 = `FRAME_SECONDS`(由 `TICK_HZ` 推导,见该常量)。
  *   2. 移速上限 —— 单位时间平均移速,窗口式检测(防单帧合法、累计超速)。
  *   3. 攻速上限 —— 攻击间隔不得小于武器基线间隔 × (1 - 攻速加成上限)。
  *   4. 物品栏一致性 —— 物品总量守恒(消耗必须有来源,产出必须落账)。
@@ -17,7 +18,21 @@
  */
 
 import { createHmac, randomBytes } from 'node:crypto';
-import { BASE_MOVE_SPEED, DT, TICK_HZ } from '../../../shared/types/physics.ts';
+import { BASE_MOVE_SPEED, TICK_HZ } from '../../../shared/types/physics.ts';
+
+/**
+ * ★ 单帧标称步长(秒)—— **由 `TICK_HZ` 推导**,这里不写字面量。
+ * 20Hz ⇒ 0.05;32Hz(31.25ms)⇒ 0.03125。
+ *
+ * 为什么在本文件再推一次(而不是直接用 `physics.ts` 的 `DT`):反作弊有两处量
+ * 必须随节拍一起重标定,而它们**同源**于 `TICK_HZ` 才能保证「秒级语义不变」——
+ *   1 每帧额度 `maxDisplacementPerTick`(= 基线速度 × `FRAME_SECONDS` × slack);
+ *   2 速度窗口分母的**缺省值** `DEFAULT_FRAME_DT_SECONDS`。
+ * 两者同源 ⇒ 改 tick 率只把「一帧是多少秒」重标定,速度读数(格/秒)、窗口秒数、
+ * 容差、单帧容差**逐位不变**。单一事实源仍是 `TICK_HZ`;本式与 `physics.ts`
+ * 的 `DT` 必须一致,由 `tests/WS-FND-172` 的 `FND172-16` 钉住(不许两处漂移)。
+ */
+export const FRAME_SECONDS = 1 / TICK_HZ;
 
 /* ═══════════════════════════ 1. 阈值表 ═══════════════════════════ */
 
@@ -40,7 +55,7 @@ export const MAX_SPEED_BONUS_MUL = 2.55;
  *   - `TELEPORT_SLACK`  —— **单帧**抖动补偿。语义是「某一帧突然多走一点」,
  *     分母是**一帧**,只用于 `dist > allowed` 这一处。
  *   - `SPEED_WINDOW_TOLERANCE` —— **持续**超速容忍。语义是「一整秒里平均快了
- *     一点」,分母是**20 帧窗口**,只用于窗口均速比较。
+ *     一点」,分母是**1 秒窗口**(帧数 = `SPEED_WINDOW_TICKS`),只用于窗口均速比较。
  *
  * 两者可推导出一个容易误读的结论:`1.6 > 1.25` ⇒ **持续以「单帧上界」的速度
  * 行走会被窗口抓住**。这不是矛盾,而是设计意图:
@@ -58,17 +73,26 @@ export const TELEPORT_SLACK = 1.6;
 /**
  * 窗口式移速检测:窗口长度与窗口内允许的平均超速比例。
  * ⚠️ 与 `TELEPORT_SLACK`(1.6)语义不同,见上。
+ *
+ * ★ 窗口的**语义锚是「秒」,不是「帧」**:窗口恒为 `SPEED_WINDOW_SECONDS` 秒,
+ * 帧数由 `TICK_HZ` 推导(20Hz ⇒ `SPEED_WINDOW_TICKS = 20`;32Hz ⇒ 32)。
+ * 原先写死 `20`(把「1 秒」写在注释里)⇒ 改 `TICK_HZ` 时窗口会**悄悄**变成
+ * 0.625 秒 —— 那是容差判据变紧(重标定),不是「改帧率」应有的副作用。
  */
-export const SPEED_WINDOW_TICKS = 20; // 1 秒
+export const SPEED_WINDOW_SECONDS = 1;
+/** 窗口长度(帧)= 秒数 × `TICK_HZ`(取整:窗口是整帧数)。 */
+export const SPEED_WINDOW_TICKS = Math.round(SPEED_WINDOW_SECONDS * TICK_HZ);
 export const SPEED_WINDOW_TOLERANCE = 1.25;
 
 /**
- * ★ 速度窗口**分母**用的帧间隔(秒)的缺省值 = 标称 `DT`(20Hz,50ms)。
+ * ★ 速度窗口**分母**用的帧间隔(秒)的缺省值 = 标称帧步长 `FRAME_SECONDS`(由
+ * `TICK_HZ` 推导:20Hz ⇒ 50ms;32Hz ⇒ 31.25ms)。**与每帧额度同源** ⇒
+ * 「窗口跨度 / 分母」恒等于真实秒数,与 tick 率无关。
  *
  * ## 为什么需要它
- * 窗口分母原先是写死的 `spanTicks × DT`,而宿主定时器粒度可能 > 50ms ——
+ * 窗口分母原先是写死的 `spanTicks × DT`,而宿主定时器粒度可能 > 标称帧间隔 ——
  * 本机实测 **62.77ms/帧(= 15.93Hz)**,`docs/DECISIONS.md` D-26。
- * 此时 20 帧窗口跨的是 **1.2555 秒**真实时间,分母却只记 1.0 秒
+ * 此时一个 1 秒窗口(20Hz 下 20 帧)跨的是 **1.2555 秒**真实时间,分母却只记 1.0 秒
  * ⇒ 满速裸装合法玩家 4.5 格/秒被读成 `4.5 × 20/15.93 = 5.65 > 5.625`(**误判 SPEED**)。
  *
  * ## 它与 `SPEED_WINDOW_TOLERANCE` 的分工(不要混淆)
@@ -85,7 +109,7 @@ export const SPEED_WINDOW_TOLERANCE = 1.25;
  * `this.clock.nowMs()` 可读实测节拍)。**不注入 ⇒ 本缺省值**,既有判据逐位不变
  * (含 WS-07/WS-10 的 5.63 锚点与 FND172-3 登记的 5.65 误判)。
  */
-export const DEFAULT_FRAME_DT_SECONDS = DT;
+export const DEFAULT_FRAME_DT_SECONDS = FRAME_SECONDS;
 
 /**
  * 自报 `tick` 相对**水位**允许的单包最大超前量(帧)。它是**斜率**限制,不是配额。
@@ -680,21 +704,27 @@ export function mergeLimits(limits: unknown): { limits: AntiCheatLimits; issues:
 }
 
 /**
- * 单帧允许的最大位移。
- * 位移上界 = maxSpeed(声明倍率) × DT,再乘 `teleportSlack` 补偿时钟抖动。
+ * 单帧允许的最大位移(格/帧)。
+ * 位移上界 = maxSpeed(声明倍率)× **标称帧步长 `FRAME_SECONDS`** × `teleportSlack`,
+ * 再乘 `dtTicks`(见 `checkMove`)。
+ *
+ * ★ 帧步长由 `TICK_HZ` 推导 ⇒ 改 tick 率只**重标定每帧额度**,
+ * **每秒额度不变**:`maxDisplacementPerTick / FRAME_SECONDS` 恒 = maxSpeed × slack
+ * (20Hz ⇒ 4.5 × 1.6 = 7.2 格/秒;32Hz ⇒ 同一读数)。若这里跟着旧帧长走,
+ * 32Hz 下每帧额度会**偏大 1.6 倍**(等于把 slack 悄悄放大到 2.56)。
  *
  * 声明倍率先经 `sanitizeMul` 兜底 —— 否则非法声明会让本函数返回 `NaN`,
  * 使调用方的 `dist > allowed` 恒为 false(见 `sanitizeMul` 说明)。
  */
 export function maxDisplacementPerTick(speedMul = 1, limits: AntiCheatLimits = DEFAULT_LIMITS): number {
   const mul = sanitizeMul(speedMul, 1, limits.maxSpeedBonusMul);
-  return BASE_MOVE_SPEED * mul * DT * limits.teleportSlack;
+  return BASE_MOVE_SPEED * mul * FRAME_SECONDS * limits.teleportSlack;
 }
 
 /** 校验一次移动意图。
  *
  * `dtSeconds` = §6.2 窗口**分母**用的帧间隔(秒),缺省标称 `DT`。由调用方注入**实测**
- * 节拍 —— 宿主定时器粒度 > 50ms 的机器上这是一个真差别(见 `DEFAULT_FRAME_DT_SECONDS`)。
+ * 节拍 —— 宿主定时器粒度 > 标称帧步长的机器上这是一个真差别(见 `DEFAULT_FRAME_DT_SECONDS`)。
  * 它只影响分母;`dtTicks` 额度与单帧跳变上界仍按标称 `DT` 记账(**未动**)。
  */
 export function checkMove(

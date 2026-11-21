@@ -14,7 +14,7 @@
  * 但它证明不了下面这四件事 —— 而它们只在**真墙钟 + 真 I/O + 真 GC** 下才成立:
  *
  * ```text
- * 1 真定时器抖动      20Hz 的 setInterval 在真实负载下的**实际 tick 间隔**(本文件采样)
+ * 1 真定时器抖动      32Hz 的 setInterval 在真实负载下的**实际 tick 间隔**(本文件采样)
  * 2 真文件 I/O        自动存档真的写进 SQLite 文件(库文件字节 / 行数增长)
  * 3 真 GC / 真内存    RSS 与 heapUsed 在 60 分钟里是**回落**还是**单调涨**
  * 4 真协议            假客户端走**真 WebSocket**(二进制帧 / tag 分流 / ack)
@@ -24,7 +24,7 @@
  *
  * ```text
  * assemble({ sizeCells, mobs, dbPath })  →  RoomRuntime + WorldSim(生产装配)
- * startWsServer({ room, frameMs })       →  20Hz 广播循环(room.step 在那儿被调)
+ * startWsServer({ room, frameMs })       →  32Hz 广播循环(room.step 在那儿被调)
  * 假客户端:全局 WebSocket(Node 24 内置,零依赖)连 ?userId=&token=
  * ```
  *
@@ -70,6 +70,7 @@ import { startWsServer, type WsServerHandle } from '../server/src/net/ws_server.
 import { TABLE_PRIMARY_KEYS, createUser, getUser, type DbLike } from '../server/src/db/repo.ts';
 import type { RoomRuntime } from '../server/src/net/room.ts';
 import { PROTOCOL_VERSION } from '../shared/net/delta.ts';
+import { DT } from '../shared/types/physics.ts';
 
 /* ═══════════════════════════ 1. 选项与参数 ═══════════════════════════ */
 
@@ -81,7 +82,7 @@ export type SoakOptions = {
   clients: number;
   /** 采样间隔(ms)。 */
   sampleEveryMs: number;
-  /** 服务端帧间隔(ms)。20Hz ⇒ 50。 */
+  /** 服务端帧间隔(ms)。32Hz ⇒ 31.25。 */
   frameMs: number;
   /** 每客户端每秒**动作**条数(0 = 不发动作)。 */
   actionHz: number;
@@ -127,7 +128,7 @@ export const DEFAULT_SOAK_OPTIONS: SoakOptions = {
   minutes: 60,
   clients: 8,
   sampleEveryMs: 5_000,
-  frameMs: 50,
+  frameMs: DT * 1000,
   actionHz: 1,
   moveHz: 5,
   sizeCells: 96,
@@ -148,7 +149,7 @@ export function usage(): string {
     '  --minutes <N>        跑多久(分钟;小数合法)  默认 60',
     '  --clients <N>        并发假客户端数(0 = 负对照)  默认 8',
     '  --sample-every <S>   采样间隔(秒)  默认 5',
-    '  --frame-ms <MS>      服务端帧间隔(ms)  默认 50(20Hz)',
+    '  --frame-ms <MS>      服务端帧间隔(ms)  默认 31.25(32Hz)',
     '  --action-hz <N>      每客户端每秒动作条数  默认 1',
     '  --move-hz <N>        每客户端每秒移动意图条数  默认 5',
     '  --size <N>           世界边长(格)  默认 96',
@@ -616,7 +617,7 @@ type FakeClient = {
 const WALK_STEP = 0.15;
 
 
-/** 客户端上行节拍(ms)。10Hz:比服务端 20Hz 慢一档,避免自己把上行灌满。 */
+/** 客户端上行节拍(ms)。10Hz:比服务端 32Hz 慢几档,避免自己把上行灌满。 */
 const CLIENT_TICK_MS = 100;
 
 /**
@@ -944,7 +945,7 @@ export async function createSoakFixture(options: SoakOptions): Promise<SoakFixtu
   }
   void lastWorldTick;
 
-  /* ── 6.4 真 WS 服务端(20Hz 广播循环)── */
+  /* ── 6.4 真 WS 服务端(32Hz 广播循环)── */
   const wsLogs: string[] = [];
   const srv = await startWsServer({
     port: 0,
@@ -1348,23 +1349,23 @@ export function formatSummaryLines(s: SoakSummary): string[] {
 /**
  * ★ D-26:**世界时间 = `frameCount × DT`**(不读挂钟)。
  *
- * 标称 50ms/帧(20Hz)是**物量纲**,不是墙钟承诺 —— 宿主定时器粒度 > 50ms 的机器上,
- * 20Hz 循环的真实节拍更长(本机实测 ≈ 62.77ms/帧):
+ * 标称 31.25ms/帧(32Hz)是**物量纲**,不是墙钟承诺 —— 宿主定时器粒度 > 31.25ms 的机器上,
+ * 32Hz 循环的真实节拍更长(本机实测 ≈ 62.77ms/帧):
  *
  * ```text
- * 1200 游戏秒 = 1200 帧 × 50ms = 60.0 墙钟秒(标称,只在 50ms 粒度机器上成立)
- * 本机实测    1200 帧 × 62.77ms = 75.3 墙钟秒 ⇒ 倍率 = 20 / 15.93 = 1.2555
+ * 1200 游戏秒 = 1200 帧 × 31.25ms = 37.5 墙钟秒(标称,只在 31.25ms 粒度机器上成立)
+ * 本机实测    1200 帧 × 62.77ms = 75.3 墙钟秒 ⇒ 倍率 = 32 / 15.93 = 2.0088
  * ```
  *
  * 本节四个函数是**唯一**的倍率实现:`play.ts` 的启动打印与 `soak.ts` 的汇总行
  * 都调它们,不许各自再算一遍(判据 `tests/WS-FND-175-clock-convention.test.ts`)。
  */
 
-/** 标称帧间隔(ms)。**必须**等于 `shared/types/physics.ts#DT × 1000`(50)。 */
-export const NOMINAL_TICK_MS = 50;
+/** 标称帧间隔(ms)。**必须**等于 `shared/types/physics.ts#DT × 1000`(32Hz ⇒ 31.25)。 */
+export const NOMINAL_TICK_MS = DT * 1000;
 
 /** 标称帧率(Hz)。 */
-export const NOMINAL_TICK_HZ = 1_000 / NOMINAL_TICK_MS; // 20
+export const NOMINAL_TICK_HZ = 1_000 / NOMINAL_TICK_MS; // 32
 
 /** 一段帧间隔样本的读数(与样本行里的 `tick` **同一份**)。 */
 export type TickRate = {

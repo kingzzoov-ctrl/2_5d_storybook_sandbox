@@ -28,11 +28,12 @@
  *
  * ## 为什么不在本套件里"等到 19:00"
  *
- * 一天 = 20 分钟(D-07)⇒ 06:00 → 19:00 是 650 秒 = 13000 帧。本套件用**组合**取证:
+ * 一天 = 20 分钟(D-07)⇒ 06:00 → 19:00 是 650 秒(帧数由 `secondsToTicks` 派生)。本套件用**组合**取证:
  * FND64-2 证明"挂上去的就是世界钟",FND64-3 证明"405 读的就是那一口"。
- * 两条合起来 = 感光器跟着世界钟走,而不把 13000 帧写进套件的运行时间。
+ * 两条合起来 = 感光器跟着世界钟走,而不把 650 秒的帧数写进套件的运行时间。
  */
 import { test, eq, near, report } from '../shared/testing/harness.ts';
+import { secondsToTicks } from '../shared/types/physics.ts';
 import { WireColor } from '../shared/types/tile.ts';
 import { SignalGraph, layHorizontal } from '../server/src/wiring/graph.ts';
 import { makeComponent, isNight } from '../server/src/wiring/components.ts';
@@ -43,6 +44,15 @@ const SENSOR_DAYNIGHT = 405;
 
 /** 件 id(摆放者给的名字;405 的 `spec.params` 里**没有** `hour`,所以静态表读不到它)。 */
 const SENSOR_ID = 'light';
+
+/**
+ * 本套件推的**世界时间**(秒)。12 秒 ⇒ 钟点前进 `12 × 24 / WORLD_DAY_SEC` 小时。
+ * 帧数由 `secondsToTicks` 派生 —— 写死帧数会在改 tick 率时静默改变被测时长。
+ */
+const ADVANCE_SEC = 12;
+const ADVANCE_FRAMES = secondsToTicks(ADVANCE_SEC);
+/** 推 12 秒之后的钟点:由**秒数 + 世界日长度**(D-07 的两个裁决值)算出,不取自被测模块。 */
+const ADVANCE_HOUR = WorldSim.WORLD_START_HOUR + (ADVANCE_SEC / WorldSim.WORLD_DAY_SEC) * 24;
 
 /** 在一张 10×10 的图上摆一个 405 并拉一条 8 格红线(与 `WS-08` 的 WT-08-25 同一摆法)。 */
 function sensorRig(): { g: SignalGraph; lit: () => boolean } {
@@ -111,11 +121,11 @@ test('FND64-2 ★ WorldSim 挂上的就是世界钟(hour 与 night 两个键)', 
   eq(sim.wiringEnvOf('hour'), 6, '★ 环境 hour = 世界钟读数(不是另算一遍)');
   eq(sim.wiringEnvOf('night'), 0, '06:00 不是夜');
 
-  /* 推 240 帧 = 12.00 秒世界时间 ⇒ 钟点前进 12 × (24/1200) = 0.24 小时。 */
-  for (let i = 0; i < 240; i += 1) sim.tick();
-  /* 世界钟是 `frameCount × DT` 派生的浮点 ⇒ 用 near 比对(期望值由帧数 × 24/1200 算,不取自被测模块)。 */
-  near(sim.hourOfDay(), 6.24, 1e-9, '240 帧后 = 06:14:24(世界时间 12.00 秒)');
-  near(sim.wiringEnvOf('hour'), 6.24, 1e-9, '★ 环境读数跟着钟走(每个 tick 都是新值)');
+  /* 推 `ADVANCE_FRAMES` 帧 = `ADVANCE_SEC` 秒世界时间 ⇒ 钟点前进 0.24 小时。 */
+  for (let i = 0; i < ADVANCE_FRAMES; i += 1) sim.tick();
+  /* 世界钟是 `frameCount × DT` 派生的浮点 ⇒ 用 near 比对(期望值由**秒数**算出,不取自被测模块)。 */
+  near(sim.hourOfDay(), ADVANCE_HOUR, 1e-9, `${ADVANCE_FRAMES} 帧后 = 06:14:24(世界时间 ${ADVANCE_SEC}.00 秒)`);
+  near(sim.wiringEnvOf('hour'), ADVANCE_HOUR, 1e-9, '★ 环境读数跟着钟走(每个 tick 都是新值)');
   eq(sim.wiringEnvOf('night'), 0, '06:14 仍不是夜');
 
   /* 未提供的键不许被这个口"发明"出来。 */
@@ -150,8 +160,8 @@ test('FND64-3 ★★ 真世界图里的 405:06:00 ⇒ 暗;把那一口换成 22 
 
 test('FND64-4 ★ D-06 重置后新电路图依旧挂着世界钟(忘了重挂 ⇒ 恒亮)', () => {
   const sim = new WorldSim({ sizeCells: 24, mobs: false });
-  for (let i = 0; i < 240; i += 1) sim.tick();
-  near(sim.wiringEnvOf('hour'), 6.24, 1e-9, '前置:重置前环境 = 06.24');
+  for (let i = 0; i < ADVANCE_FRAMES; i += 1) sim.tick();
+  near(sim.wiringEnvOf('hour'), ADVANCE_HOUR, 1e-9, '前置:重置前环境 = 06.24(由秒数算出)');
 
   const r = sim.resetWorld({ seed: 7 });
   eq(r.applied, true, '前置:重置成功');

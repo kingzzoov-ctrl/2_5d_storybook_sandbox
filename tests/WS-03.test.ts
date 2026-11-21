@@ -9,6 +9,7 @@ import { eq, near, ok, report, test, includes } from '../shared/testing/harness.
 import { packTile, unpackTile, setWire, WireColor, Elevation } from '../shared/types/tile.ts';
 import { ITEM_BY_ID, itemName } from '../shared/constants/items.ts';
 import { ROOM_RECIPES } from '../shared/constants/bosses.ts';
+import { SLOW_DT, secondsToTicks } from '../shared/types/physics.ts';
 
 import { TileGrid } from '../server/src/build/grid.ts';
 import {
@@ -111,10 +112,17 @@ function countObjIn(sim: WorldSim, objId: number): number {
 
 /* ══════════ task-48 房间效果消费的夹具 ══════════ */
 
-/** 把玩家送到某格中心并推进到下一个慢帧,返回推进后的 vitals。 */
-function tickInRoom(sim: WorldSim, id: string, x: number, y: number, ticks = 10): void {
+/**
+ * 把玩家送到某格中心,并推进**至少一个慢帧**(慢帧 = `SLOW_DT` = 0.5 秒的 stride)。
+ *
+ * 参数是**秒**,帧数由 `secondsToTicks` 派生 —— 慢帧 stride = 0.5 秒,写死帧数
+ * (旧的 `ticks = 10`)在 32Hz 下已不足一个慢帧,房间扫描/效果都不会被触发。
+ * 注意:任意 16(=`FAST_PER_SLOW`)个连续帧内**恰好**有一个慢帧,故 0.5 秒足够。
+ */
+function tickInRoom(sim: WorldSim, id: string, x: number, y: number, seconds = 0.5): void {
   sim.setPlayerPos(id, x + 0.5, y + 0.5);
-  for (let i = 0; i < ticks; i += 1) sim.tick();
+  const frames = Math.max(1, secondsToTicks(seconds));
+  for (let i = 0; i < frames; i += 1) sim.tick();
 }
 
 /** 盖一间带指定核心件的房间,并在房间中心放一个玩家。 */
@@ -1062,8 +1070,9 @@ test('WT-03-59 [接线] 房间识别必须在 tick 的慢帧里自动刷新(不�
   sim.setCell(6, 6, { obj: 536 });
   sim.setCell(8, 7, { obj: 537 });
 
-  /* 推到第一个慢帧(`frame % 10 === 0`)—— 房间识别与流体/电路/物流同为 2Hz。 */
-  for (let i = 0; i < 10; i += 1) sim.tick();
+  /* 推到第一个慢帧(慢帧 stride = 0.5 秒,32Hz = 16 帧)——
+     房间识别与流体/电路/物流同为 2Hz。 */
+  for (let i = 0; i < secondsToTicks(SLOW_DT); i += 1) sim.tick();
   eq(sim.rooms().some((r) => r.key === 'ALCHEMY_LAB'), false,
     '墙有缺口时不得识别(负对照)');
 
@@ -1084,7 +1093,7 @@ test('WT-03-59 [接线] 房间识别必须在 tick 的慢帧里自动刷新(不�
      (此陷阱由 `combat-progress` 用 `roomScanCount` 直接数发现,Lead 复现并补了 D 组。) */
   const before = sim.roomScanCount;
   sim.setCell(6, 3, { obj: 351 });
-  for (let i = 0; i < 10; i += 1) sim.tick();
+  for (let i = 0; i < secondsToTicks(SLOW_DT); i += 1) sim.tick();
   ok(sim.roomScanCount > before,
     `tick 的慢帧必须自己触发房间识别(计数 ${before} → ${sim.roomScanCount})—— `
     + '不能只有调用方读 rooms() 时才顺带算');
@@ -1096,7 +1105,7 @@ test('WT-03-59 [接线] 房间识别必须在 tick 的慢帧里自动刷新(不�
   /* 负对照:地形没动时不应反复重扫(脏标记必须真的生效)。
      没有这条,「每帧无条件全图扫」也能过 —— 那是 O(sizeCells²)/慢帧 的性能陷阱。 */
   const after = sim.roomScanCount;
-  for (let i = 0; i < 40; i += 1) sim.tick();
+  for (let i = 0; i < secondsToTicks(2); i += 1) sim.tick();
   eq(sim.roomScanCount, after, '地形未变时不应重扫(脏标记失效会让每帧都全图扫)');
 });
 
@@ -1118,12 +1127,14 @@ test('WT-03-60 [接线] 蓝图接力队列在生产路径上被消费并真正�
     for (let x = 0; x < 3; x += 1) elevBefore.set(`${x},${y}`, sim.grid.elevAt(x, y));
   }
 
-  /* 推进足量帧让全部任务飞完。
-     实测标定:80 帧只落 8/9(最后一个任务的飞行时长跨过了第 80 帧),
-     120 帧落满 9 格且队列自动关闭 ⇒ 用 120 留出余量。
-     飞行时长由 `flightDurationMs` 按曼哈顿距离算,接力只在**慢帧**(每 10 帧)推进,
-     所以「帧数」不是直觉上的几十而是上百。 */
-  for (let i = 0; i < 120; i += 1) sim.tick();
+  /* 推进足量**模拟时间**让全部任务飞完 —— 帧数由秒派生(改 tick 率不再影响这里)。
+     ## 推导(为什么是 6 秒)
+     接力只在**慢帧**推进(stride = 0.5s),`tickRelay` 传的时间戳是模拟时钟
+     `frameCount / TICK_HZ * 1000`(ms),`flightDurationMs = 400 + 60×曼哈顿距离`。
+     单 builder + `perBuilderParallel = 2` ⇒ 2 块并行、5 批;派发又被量化到 0.5s 慢帧网格上,
+     实测最后一块的完成时刻 ≈ 4.0s(小于理论顺序和 4.68s),故留 6s 余量。
+     旧写法「120 帧」只在 20Hz(= 6s)成立;32Hz 下 120 帧 = 3.75s ⇒ 只落 7/9。 */
+  for (let i = 0; i < secondsToTicks(6); i += 1) sim.tick();
 
   eq(countObjIn(sim, 351), 9, '接力跑完后 9 格墙必须真的落进世界(不是只改队列状态)');
   eq(sim.relayPlacedCount, 9, '落位计数应等于蓝图格数');
@@ -1281,11 +1292,11 @@ test('WT-03-63 [房间效果] 森系茶歇卧室:站在房里应按手册恢复 
   ok(sim.rooms().some((r) => r.key === 'COZY_BEDROOM'),
     '前置条件:应识别出 COZY_BEDROOM(实测应为真)');
 
-  tickInRoom(sim, 'p1', cx, cy, 20);
+  tickInRoom(sim, 'p1', cx, cy, 1);
   const hp = sim.vitals.get('p1')!.hp;
 
   /* 手册原文:「躺上去每秒快速恢复 15 HP」。
-     跑 20 帧 = 1 秒(快帧 20Hz),即便按慢帧 2Hz 算也过了 2 秒。 */
+     推进 1 秒(帧数由 secondsToTicks 派生,32Hz = 32 帧),覆盖 ≥ 2 个慢帧。 */
   ok(hp > 50, `站在卧室里 HP 应上升(手册:每秒 15 HP);实测 50 → ${hp}`);
 
   /* 负对照:拆掉核心件后增益必须停止 —— 这是「增益真挂在房间识别上」的判据。
@@ -1300,7 +1311,7 @@ test('WT-03-63 [房间效果] 森系茶歇卧室:站在房里应按手册恢复 
   sim2.setCell(5, 5, { obj: 0 });
   eq(sim2.rooms().some((r) => r.key === 'COZY_BEDROOM'), false,
     '拆掉 517 后不应再识别为卧室');
-  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 20);
+  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 1);
   const hp2 = sim2.vitals.get('p1')!.hp;
   eq(hp2, 50, '拆掉核心件 517 后不得再回血(增益必须挂在房间识别上)');
 });
@@ -1312,7 +1323,7 @@ test('WT-03-64 [房间效果] 露天温泉馆:泡澡获生命上限提升,且随
   ok(sim.rooms().some((r) => r.key === 'SAKURA_ONSEN'), '前置条件:应识别出 SAKURA_ONSEN');
 
   const base = sim.effectiveMaxHp('p1');
-  tickInRoom(sim, 'p1', cx, cy, 20);
+  tickInRoom(sim, 'p1', cx, cy, 1);
   const boosted = sim.effectiveMaxHp('p1');
   /* 手册原文:「战前泡澡获 20 分钟生命上限 +30%」 */
   ok(boosted > base, `泡温泉应提升生命上限(手册:+30%);实测 ${base} → ${boosted}`);
@@ -1343,7 +1354,7 @@ test('WT-03-65 [房间效果] 大师锻造房:房内解锁中高级锻造,房外
   sim.addPlayer('p1', cx + 0.5, cy + 0.5);
   ok(sim.rooms().some((r) => r.key === 'FORGE_MASTER'), '前置条件:应识别出 FORGE_MASTER');
 
-  tickInRoom(sim, 'p1', cx, cy, 10);
+  tickInRoom(sim, 'p1', cx, cy, 0.5);
   eq(sim.forgeUnlocked('p1'), true, '站在大师锻造房里应解锁中高级锻造');
 
   /* 负对照:走到房外 → 必须立刻不解锁(不是永久解锁)。 */
@@ -1355,7 +1366,7 @@ test('WT-03-65 [房间效果] 大师锻造房:房内解锁中高级锻造,房外
   const sim2 = new WorldSim({ sizeCells: 24, mobs: false, wiring: false });
   const r2 = makeRoomWith(sim2, [503]);
   sim2.addPlayer('p1', r2.cx + 0.5, r2.cy + 0.5);
-  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 10);
+  tickInRoom(sim2, 'p1', r2.cx, r2.cy, 0.5);
   eq(sim2.forgeUnlocked('p1'), false, '只有高炉没有铁砧,不构成大师锻造房');
 });
 
@@ -1369,7 +1380,7 @@ test('WT-03-66 [房间效果] 房间远离原点时增益仍生效(钉住格坐�
   far.addPlayer('p1', rf.cx + 0.5, rf.cy + 0.5);
   far.vitals.get('p1')!.hp = 50;
   ok(far.rooms().some((r) => r.key === 'COZY_BEDROOM'), '远处(30,30)置房的识别(前置)');
-  tickInRoom(far, 'p1', rf.cx, rf.cy, 20);
+  tickInRoom(far, 'p1', rf.cx, rf.cy, 1);
   ok(far.vitals.get('p1')!.hp > 50,
     `远离原点 (30,30) 的卧室同样应回血 —— 钉住「局部格坐标 + 窗口原点」的换算;`
     + `实测 50 → ${far.vitals.get('p1')!.hp}`);
