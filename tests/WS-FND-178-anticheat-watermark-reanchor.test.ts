@@ -103,7 +103,7 @@ import { eq, ok, report, test } from '../shared/testing/harness.ts';
 import { BASE_MOVE_SPEED, DT } from '../shared/types/physics.ts';
 import { FAST_PER_SLOW, WorldSim } from '../server/src/sim/world_sim.ts';
 import { RoomRuntime, type WorldSaveHost } from '../server/src/net/room.ts';
-import { ViolationKind, fixedClock, maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
+import { VIOLATION_WEIGHT, ViolationKind, fixedClock, maxDisplacementPerTick } from '../server/src/net/anticheat.ts';
 
 /* ═══════════════════════════ 夹具 ═══════════════════════════ */
 
@@ -619,4 +619,88 @@ test('FND178-9 ★★ 席位 resume 后计数器重置 ⇒ 基准必须重算:�
   /* ── 反证(有牙怎么验):把 `normalizeClientTick` 里的 `|| reset` 去掉
      (即基准只在首包定一次)⇒ 本用例的第一条判据必须红。 ── */
 });
+/* ═══ 10. ★ 残余归因(第四修点):世界**自己**挪了刚体 ⇒ 归 `stale`,不计违规 ═══ */
+
+/**
+ * ## 这一条守什么
+ *
+ * 前三个修点关掉的是「水位与权威**永久**偏离」那类风暴。剩下的是最后一类:
+ * **世界在 `checkMove` 之外自己把刚体挪了一下** —— 真击退(`applyKnockback` 的慢帧
+ * 两段推)、互相挤出的碰撞分离(`resolvePairs`)、落地沉降 —— 而客户端那一包是
+ * **按它读到投影那一刻**起算的,它**不可能知道**。
+ *
+ * 入口重锚把 `lastX/lastY` 钉到**此刻**的权威刚体 ⇒ `dist = |step − W|`(`W` = 上面那些
+ * 服务端位移)。三角形不等式 `|step − W| ≤ |step| + |W|` 说明:**只要 `dist ≤ 额度 + W`**,
+ * 客户端的步长就仍在额度内,多出来的部分全是**服务端自己的动作**。
+ *
+ * 修前它一律记 TELEPORT(60 分钟实测:8 客户端堆叠 + 真击退,63 条假阳性,`acViolations`
+ * 就是这个数)。修法是把这一支**归类**成 `stale`:照样拒绝(陈旧申报不许覆盖权威刚体,
+ * 否则一次击退会被客户端的迟到包抹掉),但**不计违规、不加分、不进流水**。
+ *
+ * 判据**一个数都没动**:同一份 `W` **只吃一包**(下一次入口重锚的 drift 已是 0),
+ * 且 `dist` 超过 `额度 + drift` 时仍是 TELEPORT **且计分** —— 正/反两面各钉一次。
+ */
+test('FND178-10 ★★ 世界自位移 W 内的拒绝归 `stale` 不计违规;超过 `额度 + W` 仍是 TELEPORT 且计分', () => {
+  const clock = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: freshId('stale'), ownerId: 'owner', clock: clock.clock });
+  const sim = new WorldSim({ sizeCells: SIZE, mobs: false, wiring: false, seed: SEED });
+  rt.worldSaveHost = sim as unknown as WorldSaveHost;
+
+  const j = rt.join({ userId: 'p1' });
+  ok(j.ok, '前置:玩家进场');
+  for (let x = 0; x <= 12; x += 1) for (let y = 0; y <= 12; y += 1) sim.setCell(x, y, { obj: 0 });
+  for (let i = 0; i < 4; i += 1) rt.step();
+
+  /* ★ 客户端**读到**的那一份投影 —— 它按这个起算下一包。
+     ⚠️ 必须**拷成数字**:`playerState()` 返回的是投影对象**本体**(活引用),后续房间帧
+     会把它刷新 ⇒ 直接抓引用等于读「事后」的值,判据自己失真(实测 W 恒读成 0)。 */
+  const proj = rt.playerState('p1');
+  ok(proj !== undefined, '前置:投影里有这个玩家');
+  const readX = proj!.x;
+  const readY = proj!.y;
+  const readZ = proj!.z;
+  const before = rt.ac.get('p1');
+  ok(before !== undefined, '前置:反作弊里有这个玩家');
+  eq(before!.lastX, readX, '前置:这一包之前水位 x == 投影 x(水位只在三条路径重锚)');
+  eq(before!.lastY, readY, '前置:水位 y 同理');
+
+  /* ★ 服务端**自己**把刚体挪走:真击退(慢帧两段推,总位移上界 2 格)。
+     客户端此刻还没收到新位置 ⇒ 它的下一包只能按 `readX/readY` 起算。 */
+  ok(sim.applyKnockback('p1', readX - 2, readY, 2.0),
+    '前置:击退被世界接受(施力点取 −x 侧 ⇒ 朝 +x 推:出生点在角落,反向会被地图边界挡下一半)');
+  for (let i = 0; i < FAST_PER_SLOW * 2; i += 1) rt.step();
+
+  const body = sim.playerPosition('p1');
+  ok(body !== null, '前置:权威刚体读得到');
+  const W = Math.hypot(body!.x - readX, body!.y - readY);
+  const budget = maxDisplacementPerTick(1);
+  ok(W > budget - LEGAL_STEP,
+    `前置:世界自位移 W = ${W.toFixed(3)} 格 > 每包余量 ${(budget - LEGAL_STEP).toFixed(4)}`
+    + ' ⇒ 这一包本来**一定**会被判 TELEPORT(修前的形态)');
+
+  /* ── 正面:客户端的步长仍在额度内 ⇒ 归 `stale` ── */
+  const r = rt.applyMove('p1', { tick: 1, x: readX + LEGAL_STEP, y: readY, z: readZ });
+  eq(r.allowed, false, '★ 仍然**拒绝**(陈旧申报不许覆盖权威刚体:否则一次击退会被迟到包抹掉)');
+  eq(r.stale, true, '★★ 但归入 `stale`:dist ≤ 额度 + W ⇒ 步长在额度内,超出的是**服务端自己**的位移');
+  eq(r.violation, undefined, '★★ 不得留下违规记录');
+  eq(rt.ac.violations().length, 0, '★★ 流水零条(修前这里是 1 条 TELEPORT;60 分钟实测 63 条假阳性)');
+  eq(rt.ac.get('p1')!.score, 0, '★★ 不加分(修前一次 +4)');
+  eq(rt.ac.staleRejections, 1, '★ `stale` 单独计数 ⇒ 假阳性在汇总里**可归因**,不再与真瞬移混淆');
+  eq(rt.ac.get('p1')!.lastX, body!.x, '★ 水位仍钉在权威刚体(拒绝不改参考点)');
+
+  /* ── 反面:同一份 W **只吃一包** —— 这次入口重锚的 drift 已经是 0 ── */
+  const cheat = rt.applyMove('p1', { tick: 2, x: readX + LEGAL_STEP + 1.5, y: readY, z: readZ });
+  eq(cheat.allowed, false, '反例:瞬移照样被拒');
+  eq(cheat.stale, undefined, '★★ 反例:不得被归类成 `stale`(宽限只吃一包,不是常态)');
+  ok(cheat.violation !== undefined, '★★ 反例:必须留下**真**违规');
+  eq(cheat.violation!.kind, ViolationKind.TELEPORT, '反例:判据种类仍是 TELEPORT');
+  eq(rt.ac.violations().length, 1, '反例:流水里恰好一条');
+  eq(rt.ac.get('p1')!.score, VIOLATION_WEIGHT.TELEPORT, '反例:分数照常加 ⇒ 分类**不是**放水');
+
+  /* ── 反证(有牙怎么验):把 `room.ts#applyMove` 入口喂给 `ac.noteAuthorityDrift` 的那个读数
+     按死成 `0`(或删掉 `checkMove` §6.1 里那段 `stale` 分类)⇒ `authorityDrift` 恒 0
+     ⇒ 走 TELEPORT 分支 ⇒ 本用例「★★ 但归入 `stale`」「★★ 流水零条」「★★ 不加分」
+     三条必须红(实测:10/10 → 9/10)。 ── */
+});
+
 report('WS-FND-178');

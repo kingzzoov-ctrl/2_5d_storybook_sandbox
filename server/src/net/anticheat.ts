@@ -347,6 +347,12 @@ export interface Verdict {
    * 幻影坐标**上 —— 下一包按幻影坐标判跳变,合法玩家被误判 TELEPORT / SPEED。
    */
   worldRejected?: boolean;
+  /**
+   * ★ 这次拒绝**不是**违规:客户端的步长仍在额度内,多出来的距离来自**服务端自己**
+   * 在上两包之间挪动刚体(击退 / 碰撞分离 / 落地沉降),客户端那一包发出时还不知道。
+   * ⇒ 照样拒绝(陈旧申报不许覆盖权威刚体),但**不计违规、不加分**(见 `checkMove` §6.1)。
+   */
+  stale?: boolean;
 }
 
 export interface AntiCheatLimits {
@@ -462,6 +468,20 @@ export interface PlayerAntiCheatState {
    * `null` = 还没收到过任何一包。与 `clientTickBase` 一样**不进快照、不回滚**。
    */
   lastRawClientTick: number | null;
+  /**
+   * ★ **上一次入口重锚把水位挪了多远**(= 权威刚体自上一包以来**自己**走的距离)。
+   *
+   * 只在 `room.ts#applyMove` **顶部**那次重锚写入(见 `syncWatermark` 的 `entry` 参数);
+   * 出路径的两次重锚**不写**它 —— 否则读数会被压成「一帧」,而客户端错过的是「一包间隔」。
+   *
+   * 唯一用途:`checkMove` §6.1 把「世界自己挪了刚体」造成的那一包**归类**成 `stale`
+   * (客户端的步长仍在额度内,多出来的是**服务端**位移)⇒ 不计违规、不加分。
+   * 判据用三角形不等式:`|step − W| ≤ |step| + |W| ≤ 额度 + W` —— 与 `W` 无关地成立,
+   * 所以它**不放宽任何上界**;真作弊者申报远处坐标照样按真实位移判。
+   */
+  authorityDrift: number;
+  /** ★ 被归类成 `stale`(服务端自位移所致的假阳性)的拒绝次数。 */
+  staleRejections: number;
   /** 环形窗口:最近 N 帧的位置与时间,用于窗口式移速检测。 */
   window: { tick: number; x: number; y: number }[];
   /** 上次成功攻击的 tick。 */
@@ -496,6 +516,8 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
     /* 基准由**首包**定(见 `normalizeClientTick`);抵达此刻还没有任何一包。 */
     clientTickBase: null,
     lastRawClientTick: null,
+    authorityDrift: 0,
+    staleRejections: 0,
     window: [{ tick, x, y }],
     lastAttackTick: -9999,
     score: 0,
@@ -847,6 +869,32 @@ export function checkMove(
 
   /* ── 6.1 坐标跳变 ── */
   if (dist > allowed + 1e-9) {
+    /* ★ **分类**(不是放宽):世界会在 `checkMove` **之外**自己挪刚体 ——
+       击退(`vitals` 的 `knockbackPerSec`)、互相挤出的碰撞分离(`resolvePairs`)、
+       落地沉降、台阶抬升。而客户端那一包是**按它读到投影那一刻**起算的,入口重锚却把
+       `lastX/lastY` 钉到**此刻**的权威刚体 ⇒ `dist = |step − W|`(`W` = 上面那些服务端位移)。
+       三角形不等式:`|step − W| ≤ |step| + |W|`,所以「这一包超限」**并不**
+       说明客户端多走了 —— 只要 `dist ≤ 额度 + W`,客户端的步长就仍在额度内,
+       多出来的部分全是**服务端自己的动作**。
+
+       ⇒ 归入 `stale`:照样拒绝(陈旧申报不许覆盖权威刚体,否则一次击退会被客户端的
+       迟到包抹掉),但**不计违规、不加分、不进流水**。修前它一律记 TELEPORT ⇒
+       诚实玩家被记成作弊者(60 分钟实测:8 客户端堆叠时每 60 分钟 63 条假阳性)。
+
+       ⚠️ 取舍(如实登记):`W` 是**服务端侧可触发**的事件 ⇒ 作弊者能靠「挨一下击退」
+       在**那一个包**上多拿 `W` 的余量,而 `W` 由物理给出(击退上界 2 格 / 碰撞分离
+       每帧 ≈0.02 格),不是攻击者能自由放大的量。单帧上界、窗口均速、Z 值域三道判据
+       一字未动。判据:`tests/WS-FND-178` 的 `FND178-10`(正例认得出 `stale`;反例:
+       `dist` 超过 `额度 + W` 时仍是 TELEPORT **且计分**)。 */
+    const drift = Number.isFinite(s.authorityDrift) && s.authorityDrift > 0 ? s.authorityDrift : 0;
+    if (drift > 0 && dist <= allowed + drift + 1e-9) {
+      s.staleRejections += 1;
+      return {
+        allowed: false,
+        corrected: { x: s.lastX, y: s.lastY, z: s.lastZ },
+        stale: true,
+      };
+    }
     const v: Violation = {
       kind: ViolationKind.TELEPORT,
       tick: claimedTick,
@@ -1517,6 +1565,15 @@ export class AntiCheatRoom {
   /** 写入序号(单调;`violations()` 据此恢复时间顺序)。 */
   private logSeq = 0;
 
+  /**
+   * ★ 被归类成 `stale` 的拒绝**累计条数**(与服务端自位移有关,**不是**违规)。
+   *
+   * 为什么要有它:修前这一类和真瞬移在读数上不可分(都只让 `acViolations` 涨),
+   * 于是「残余几十条」既可能是作弊也可能是诚实玩家被服务端自己挪动 —— 无法归因。
+   * 有它之后「假阳性」是汇总里**可分辨的一列**,而不是被静默吃掉。
+   */
+  staleRejections = 0;
+
   constructor(limits: AntiCheatLimits | unknown = DEFAULT_LIMITS) {
     /* ★ CR-27 修复点:此前是 `this.limits = limits`(不做任何检查)
        ⇒ 部分对象/非对象会让 `maxMoveCatchupTicks` 变 `undefined`
@@ -1577,6 +1634,8 @@ export class AntiCheatRoom {
     if (!s) return { allowed: false };
     const v = checkMove(s, intent, this.limits, maxZ, this.dtSeconds);
     if (v.violation) this.pushViolation(v.violation);
+    /* ★ `stale`(服务端自位移所致的假阳性)单独计数:修前它与真瞬移在读数上**不可分**。 */
+    if (v.stale) this.staleRejections += 1;
     return v;
   }
 
@@ -1665,6 +1724,31 @@ export class AntiCheatRoom {
     s.lastX = x;
     s.lastY = y;
     s.lastZ = z;
+  }
+
+  /**
+   * ★ 记下「**世界自己**自上一包以来自行挪了多远」(`authorityDrift`)。
+   *
+   * ## 信息来源必须与 `syncWatermark` **分开**
+   *
+   * ⚠️ 这个量**不是**从水位推出来的 —— 水位是**判据的参考点**,它可以因回滚 / 注入而
+   * 与权威不一致(WS-FND-135 的注入负对照就是手工把它改成幻影)。若拿 `|新水位 − 旧水位|`
+   * 当「世界自位移」,那么「水位被改坏」也会换来宽限 ⇒ 一条合法报文会被**静默放过**,
+   * 而那正是那条判据守的东西。
+   *
+   * 所以调用方必须是**房间**,且必须用房间**自己**的权威读数算:
+   * `room.ts#applyMove` 顶部拿「上一包时的权威刚体」与「此刻的权威刚体」之差喂进来
+   * (`hostPositionOf` 两帧读数)。⇒ 水位怎么变都不影响这个量。
+   *
+   * ## 它换来的只是**分类**,不是额度
+   *
+   * 读数只被 `checkMove` §6.1 用来把「世界自己挪了刚体」造成的那一包归入 `stale`
+   * (客户的步长仍在额度内,三角形不等式保证)。单帧上界 / 窗口均速 / Z 值域一字未动。
+   */
+  noteAuthorityDrift(playerId: string, drift: number): void {
+    const s = this.states.get(playerId);
+    if (s === undefined) return;
+    s.authorityDrift = Number.isFinite(drift) && drift > 0 ? drift : 0;
   }
 
   /**

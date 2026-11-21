@@ -318,6 +318,15 @@ export type SoakSample = {
      * 需要时按点路径读。
      */
     acDroppedViolations: number;
+    /**
+     * ★ 被归类成 `stale` 的拒绝**累计条数**(`AntiCheatRoom.staleRejections`)。
+     *
+     * 这类拒绝**不是违规**:客户端的步长仍在额度内,多出来的距离来自**服务端自己**
+     * 在两包之间挪动刚体(击退 / 碰撞分离 / 落地沉降),客户端那一包发出时还不知道
+     * (判据见 `checkMove` §6.1 的三角形不等式分类)。⇒ 它与 `acViolations` 分开读,
+     * 才能把「有人在作弊」与「服务端在推玩家」分开。
+     */
+    acStaleRejections: number;
     ledgerPrunes: number;
   };
   autosave: {
@@ -1257,6 +1266,10 @@ function buildSample(input: SampleInput): SoakSample {
       throttledActions: rt.throttledActions.length,
       acViolations: rt.ac.violations().length,
       acDroppedViolations: rt.ac.droppedViolations,
+      /* ★ 被归类成 `stale` 的拒绝(服务端自己挪刚体所致的假阳性)—— **不是**违规。
+         与 `acViolations` 分开读,才能把「有人在作弊」与「服务端在推玩家」区分开:
+         `acViolations = 0` 而这一列在涨 ⇒ 现场是后者。 */
+      acStaleRejections: rt.ac.staleRejections,
       ledgerPrunes: rt.ledgerPrunes,
     },
     autosave: {

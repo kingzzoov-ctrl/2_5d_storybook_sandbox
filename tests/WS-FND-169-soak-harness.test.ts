@@ -187,8 +187,12 @@ test('FND169-2 采样行结构:`[soak] {json}` 可读回,每个跟踪序列都�
   ok(shortLast.db.totalBytes >= shortLast.db.mainBytes, '库字节总量 ≥ 主文件字节(含 WAL 侧)');
   /* ★ WS-FND-178:台账加了一项 `acDroppedViolations`(环形流水**丢弃**条数 ——
      `acViolations` 会饱和到 512,饱和与「一直在违规」在日志里长得一样)。
+     ★ 第四修点再 **+1**:`acStaleRejections`(被归入 `stale` 的拒绝 —— 服务端自己挪
+     刚体造成的假阳性)。它与 `acViolations` **分开读**才能归因:一条涨、另一条恒 0
+     ⇒ 现场是「服务端在推玩家」,不是「有人在作弊」。
      计数跟着 +1:这条断言守的是「一项不少」,不是「恰好八项」。 */
-  eq(Object.keys(shortLast.ledgers).length, 9, '台账 9 项一个不少(WS-FND-178 起含丢弃计数)');
+  eq(Object.keys(shortLast.ledgers).length, 10,
+    '台账 10 项一个不少(WS-FND-178 起含丢弃计数;第四修点起含 `stale` 计数)');
   eq(Object.keys(shortLast.autosave).length, 6, '自动存档 6 项一个不少');
   eq(Object.keys(shortLast.tick).length, 6, '帧率 6 项一个不少');
 });

@@ -2860,6 +2860,15 @@ export class RoomRuntime {
         body?.z ?? 0,
       );
 
+      /* ★ 第四修点的基准(见 `lastMoveAuthority` 的 docblock):**加入那一刻**的权威刚体。
+         玩家进房到第一包之间世界可能自己挪了刚体(落体 / 被怪推 / 碰撞分离),那一段同样
+         「客户端不可能知道」⇒ 从入场就起算,不留空档。取值与上面 `ac.join` 的播种**同源**
+         (恢复后的实际权威坐标,不是存档 blob 里的坐标)。 */
+      this.lastMoveAuthority.set(input.userId, {
+        x: restoredPose?.x ?? body?.x ?? 0,
+        y: restoredPose?.y ?? body?.y ?? 0,
+      });
+
       /* ★★ 恢复后**立刻投影一次**(task-70 实测抓到的一环)。
        *
        * ## 为什么不能等到下一帧的 `step()`
@@ -3377,6 +3386,8 @@ export class RoomRuntime {
        `ac.leave()` ⇒ 这张旁表跨世代残留(同 id 重进时留着上一代的帧号)。
        它与 `ac.leave` 同属「这个 id 的必清痕迹」,故**并排清**,不散到别处。 */
     this.lastTargetlessAttackTick.delete(userId);
+    /* ★ 第四修点:房间自己那份「上一包时的权威刚体」同属这个 id 的必清痕迹。 */
+    this.lastMoveAuthority.delete(userId);
     /* ★ P2(2026-11-21):两张按玩家的背包表也要收 —— 只收**空账**,见下面的理由。 */
     this.prunePlayerLedger(userId);
     this.state.players = this.state.players.filter((p) => p.id !== userId);
@@ -4144,6 +4155,14 @@ export class RoomRuntime {
        **判据与上界一个数都没动**。 */
     const bodyNow = this.hostPositionOf(userId);
     if (bodyNow !== null && typeof bodyNow.z === 'number' && Number.isFinite(bodyNow.z)) {
+      /* ★ 「世界自己挪了刚体」的位移由**房间自己的读数**给出,不读 AC 水位 ——
+         水位是判据的参考点,回滚/注入会让它与权威不一致,拿它推位移等于「水位被改坏
+         就换来宽限」(WS-FND-135 的注入负对照守这条)。见 `ac.noteAuthorityDrift`。 */
+      const prevAuth = this.lastMoveAuthority.get(userId);
+      this.ac.noteAuthorityDrift(
+        userId,
+        prevAuth === undefined ? 0 : Math.hypot(bodyNow.x - prevAuth.x, bodyNow.y - prevAuth.y),
+      );
       this.ac.syncWatermark(userId, bodyNow.x, bodyNow.y, bodyNow.z);
     }
     const snap = this.ac.snapshotMove(userId);
@@ -4155,6 +4174,9 @@ export class RoomRuntime {
     );
     if (!v.allowed) {
       if (v.violation) this.pendingViolations.push(v.violation);
+      /* ★ 基准点 C(反作弊拒绝):世界**没有被写**,权威没动 ⇒ 客户端能读到的仍是 `bodyNow`。
+         不更新它,下一包就会把「本包之后的世界位移」叠在旧基准上 —— 宽限单调变大。 */
+      if (bodyNow !== null) this.lastMoveAuthority.set(userId, { x: bodyNow.x, y: bodyNow.y });
       return v;
     }
 
@@ -4264,6 +4286,9 @@ export class RoomRuntime {
       );
       this.touch(this.clock.nowMs());
       /* 如实回执:静默回退到**权威**坐标,并标记这不是反作弊拒绝。 */
+      /* ★ 基准点 B(世界拒收):客户端能读到的权威 = **调用之后**的刚体(`authAfter`)。
+         用调用前的 `authBefore` 会让下一包少算这一段位移。 */
+      this.lastMoveAuthority.set(userId, { x: authAfter.x, y: authAfter.y });
       return {
         allowed: false,
         corrected: {
@@ -4302,6 +4327,11 @@ export class RoomRuntime {
        水位若继续停在申报值,判据的参考点就与权威刚体不一致(下一包按权威起算 ⇒ 误判)。
        投影与水位取自**同一次读数**:两处各读一次就等于又造了一份基准。 */
     const auth = this.hostPositionOf(userId);
+      /* ★ 基准点 A(正常放行):客户端**能读到的**那一份 = 本包处理**完**之后的权威刚体。
+         下一包的 `authorityDrift` 从它起算 ⇒ 玩家自己这一步**不会**被算成「世界自位移」。
+         (拿「进入本包**之前**的权威」当基准,会把玩家的每一步都记成世界位移 ⇒
+         真作弊包被误归 `stale`,`FND178-5` 当场红 —— 第一版就是这么错的。) */
+      this.lastMoveAuthority.set(userId, { x: auth?.x ?? intent.x, y: auth?.y ?? intent.y });
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {
       p.x = auth?.x ?? intent.x;
@@ -4335,6 +4365,21 @@ export class RoomRuntime {
    * 「回滚过了」)。`null` = 从未发生世界侧拒收。
    */
   lastMoveWorldReject: boolean | null = null;
+
+  /**
+   * ★ 每个玩家**上一次移动包到达时**的权威刚体(x/y)。
+   *
+   * 用途只有一个:`applyMove` 顶部用它算出「**世界自己**自上一包以来把刚体挪了多远」,
+   * 喂给 `ac.noteAuthorityDrift` —— 那正是客户端那一包发出时**不可能知道**的位移,
+   * `checkMove` §6.1 据此把这一包归入 `stale`(照样拒绝,但不计违规、不加分)。
+   *
+   * ⚠️ 为什么**不**在 AC 里用水位之差推:`水位`(`lastX/lastY/lastZ`)是**判据的参考点**,
+   * 回滚 / 测试注入都会让它与权威不一致 ⇒ 拿它推位移等于「水位被改坏就换来宽限」,
+   * 而那正是 `WS-FND-135` 注入负对照守的东西。这里是**房间自己**的权威读数,与水位解耦。
+   *
+   * 与席位同生命周期:离场走 `clearSeatTraces`(否则每个进过房的 id 都留一条)。
+   */
+  private lastMoveAuthority = new Map<string, { x: number; y: number }>();
 
   /**
    * ★ WS-FND-122:把一条**起跳意图**交给世界侧,并把它回的形态**原样**记下。
@@ -5468,8 +5513,8 @@ export class RoomRuntime {
        不跑 ⇒ **生物 AI 看不见玩家移动**。
 
        ## 为什么是 `advance(1)` 且**只能**写 1
-       `WorldSim` 内部自管双频(`FAST_PER_SLOW=10`),一次 `tick()` 就是一帧
-       (实测相位 `FAST×9 SLOW FAST×2`);`SIM_FAST_DT = 0.03125 = 1/32` 与外部
+       `WorldSim` 内部自管双频(`FAST_PER_SLOW = secondsToTicks(SLOW_DT)` = 16),一次 `tick()` 就是一帧
+       (相位由 `frame % FAST_PER_SLOW` 决定);`SIM_FAST_DT = 0.03125 = 1/32` 与外部
        32Hz **天然对齐**。⇒ 外部一帧 = 内部一快帧,**恰好 1:1**。
 
        ⚠️ **绝不可**写成 `advance(FAST_PER_SLOW)` 或在本方法里再调一次 ——
