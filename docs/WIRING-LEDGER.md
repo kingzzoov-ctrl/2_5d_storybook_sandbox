@@ -127,7 +127,7 @@ Get-ChildItem tests -Filter *.test.ts |
 
 | ID | 符号 | 位置(符号锚) | 现状 | 理由 | 判据 |
 |---|---|---|---|---|---|
-| R6-TAME | `mobs/taming.ts` 全模块(27 export / `PetRecord` / `feedPet` / `deployPet` / `tickRanch` / `carrySpeedMul`) | `server/src/mobs/taming.ts`(文件级;`#feedPet` / `#deployPet` / `#tickRanch`) | **已登记**(文件级):`verify.ts#UNREACHABLE_EXEMPT` 的可达性项 + 交叉表 · `orphan-audit.ts` 的白名单项 | 生产 `import` 实测 **0**(第七轮复算,见 §0.1),且是**显式回避**(`world_sim.ts` / `systems/wiring.ts` 都写着「不 import taming,它是白名单成员」);缺的是**宿主**:22 个动作里没有 TAME / FEED / DEPLOY。⚠️ `feedPet`(`taming.ts#feedPet`)的调用点仍是 0 | WS-04 · FND-29 · FND-41 · FND-46 |
+| R6-TAME | `mobs/taming.ts` 全模块(27 export / `PetRecord` / `feedPet` / `deployPet` / `tickRanch` / `carrySpeedMul`) | `server/src/mobs/taming.ts`(文件级;`#feedPet` / `#deployPet` / `#tickRanch`) | **已接** | 链:`server/src/index.ts → net/room.ts → net/actions/action_table.ts → net/actions/breed_tame.ts → mobs/taming.ts`(`BREED_TAME` 四个子操作:FEED → `createPetRecord` + `feedPet`;TAME → `commandPet`;RANCH → `sendToRanch`;`forgetRoom` → `forgetRoomPets`)。★ 本行修前写「**已登记**(文件级):`verify.ts#UNREACHABLE_EXEMPT` 的可达性项」「生产 `import` 实测 **0**」「`feedPet` 的调用点仍是 0」—— 那是**第七轮复算**的读数;`verify.ts#UNREACHABLE_EXEMPT` 的摘除注释(2026-11-19)已写明本文件进了可达闭包、`feedPet` 现在是**真调用点**,本行没跟着复检。⚠️ 本轮只复核了这条链,27 个 export 的逐符号读者身份**未**重算 | WS-04 · FND-29 · FND-41 · FND-46 |
 
 ### 2.4 party 的五个 settle(`server/src/party/modes.ts`)
 
@@ -155,7 +155,7 @@ Get-ChildItem tests -Filter *.test.ts |
 | ID | 符号 | 位置(符号锚) | 现状 | 理由(调用点) | 判据 |
 |---|---|---|---|---|---|
 | R6-PRANK-1 | `PRANK_TOYS` / `toyOf` | `prank/toys.ts#PRANK_TOYS` · `#toyOf` | **已接**(表被真消费;**35 件里只有 3 件走到生产**) | 链:`world_sim.ts`(掉冠判定 `gateCrownKnock`)→ `party/actions.ts`(值导入 `prank/actions.ts`)→ `prank/actions.ts`(`toyOf` 三处调用,`PRANK_ACTION_LEDGER` 由 `PRANK_TOYS` 逐条生成)→ `toys.ts`。★ 台账 `WIRED_PRANK_PATHS` 只登记 **222 / 224 / 225**(走 `crown_knock`),其余 32 件是 `NONE`(出路 = `net/actions/use_item` 的 221..255 分支)。`verify.ts` 的 `UNREACHABLE_EXEMPT` 已把 `prank/toys.ts` / `immunity.ts` 从「等施加整蛊的宿主」白名单里**摘除**(宿主已在) | WS-11 · FND-120 |
-| R6-PRANK-2 | 缺的那一半:`applyPrank`(施加端) | 全仓不存在(`grep` 0 命中) | **未接**(无实现) | 表、免疫、结算与掉冠判定都在,但「玩家对玩家用玩具」没有任何模块承担;`PARTY_ACTION_LEDGER` 的 `PRANK` 行仍是 `NONE:net/actions/use_item 的 221..255 分支` | WS-11 |
+| R6-PRANK-2 | 施加端 `applyPrankToTarget`(修前按旧符号名 `applyPrank` 记) | `net/room.ts#applyPrankToTarget`(宿主成员;实现在 `sim/world_sim.ts#applyPrankToTarget`) | **已接**(含「半」:只对玩家生效,怪物侧落点仍 `NONE`) | 链:`net/actions/use_item.ts` 的 221..255 分支 → `party/actions.ts#gatePrank`(→ `prank/actions.ts#resolvePrankAction`)→ `host.applyPrankToTarget` → `vitals.applyStun` / `physics.applyImpulse`;宿主没这个成员时退回道具并写 `NOT_IMPLEMENTED`(不静默)。★ 本行修前写「全仓不存在(`grep` 0 命中)/**未接**(无实现)」—— 那是按**旧符号名** grep 得到的**假阴性**:WS-FND-122 接线时符号定为 `applyPrankToTarget` 且 `prank/actions.ts` 加了 `PRANK_PLAYER_VERB` 标记,本行没跟着复检 | WS-11 · FND-122 |
 
 ### 2.7 social 四段(`server/src/social/afk.ts`;手册 §6.4)
 
@@ -245,11 +245,11 @@ Get-ChildItem tests -Filter *.test.ts |
 
 | 现状 | 条数 | 其中仍含「未接」的一半 | 说明 |
 |---|--:|--:|---|
-| 已接 | 20 | 4 | SIM-1/2/3 · PARTY-S1..S5(5) · PARTY-A1..A3(3) · CBT-1/3/4/5 · CL-1/3/4/5 · PRANK-1;含「半」的 4 条 = **SIM-2**(`stock` 无来源)· **CBT-4**(`ghostDamageMul` 按设计不接)· **CBT-5**(`PRANK_PRIORITY` 只本模块内读)· **PRANK-1**(35 件玩具里 32 件 `NONE`) |
-| 已登记 | 5 | 0 | R6-TAME · R6-SH-1/4/5/6(4 条) |
+| 已接 | 22 | 5 | SIM-1/2/3 · PARTY-S1..S5(5) · PARTY-A1..A3(3) · CBT-1/3/4/5 · CL-1/3/4/5 · PRANK-1/2 · TAME;含「半」的 5 条 = **SIM-2**(`stock` 无来源)· **CBT-4**(`ghostDamageMul` 按设计不接)· **CBT-5**(`PRANK_PRIORITY` 只本模块内读)· **PRANK-1**(35 件玩具里 32 件 `NONE`)· **PRANK-2**(施加端只对玩家生效,怪物侧落点仍 `NONE`) |
+| 已登记 | 4 | 0 | R6-SH-1/4/5/6(4 条) |
 | 部分接 | 2 | 2 | R6-CBT-2(天赋)· R6-CL-2(`stage_assembly` 9/14) |
-| 未接(符号级,门禁看不见) | 9 | 9 | CBT-6 · SH-2/3/7 · PRANK-2 · SOC-1..4 |
-| **合计** | **36** | **15** | 15 = 9 全未接 + 2 部分接 + 4 已接里仍含未接的一半 |
+| 未接(符号级,门禁看不见) | 8 | 8 | CBT-6 · SH-2/3/7 · SOC-1..4 |
+| **合计** | **36** | **15** | 15 = 8 全未接 + 2 部分接 + 5 已接里仍含未接的一半 |
 
 ★ 这 15 条**不进任何现有分母**:`生产可达性` 是**文件级**,这些符号所在的文件大多**可达**。
 

@@ -78,7 +78,7 @@ WS 文档结构     14/14 ✅(每份 10 节、≥2000 字符)
      分类说的是**卡在哪**,不是「要不要修」。接一个少一个;
      `verify.ts` 与本节双向校验,数字不能静默漂。
 >     ★ **2026-11-19 第六轮**:上面这个数字是**文件级**的 —— 它查不到「文件可达、符号没人调」。
->     后一类的逐符号台账在 `docs/WIRING-LEDGER.md`(36 行:**9 全未接 / 2 部分接 / 20 已接 / 5 已登记**)。
+>     后一类的逐符号台账在 `docs/WIRING-LEDGER.md`(36 行:**8 全未接 / 2 部分接 / 22 已接 / 4 已登记**)。
 >     结论见 `docs/AUDIT-W34.md §13`:多个系统**有实现、有判据、全绿,但没接进生产路径**
 >     ⇒ 「全绿」不足以支撑任何一句「可用」,只有「已实现」是它买得起的措辞。
      ⚠ **2026-11-14 task-84 接线:WS-11 缺口 A(对局运行时)⇒ 可达 84→88,白名单 14→10**
@@ -119,12 +119,16 @@ WS 文档结构     14/14 ✅(每份 10 节、≥2000 字符)
      · `prank/toys.ts` —— 1 引用(immunity)。
      ⚠️ **2026-11-14 task-84 接线后本清单从 4 条降为 2 条**:
      `coop/rush_order.ts` 与 `party/scoring.ts` 已**移出**(它们从「引用了不可达模块」
-     变成「被可达模块引用」)。**非欠账总数**,现在 7 = gate-only 4 + 差集 3
-     (★ 口径来源:`verify --all` 的两处打印 ——「欠账构成」行给**非欠账总数 7**,
-      「生产零引用清单自洽」行给**差集 3**(计算式 `isDiffSet()`)⇒ gate-only = 7 − 3 = 4;
-      ⚠️ 旧文写的是「gate-only 5 + 差集 2」—— 总数 7 没错、**拆分写反了**。
-      ⚠️ 后一行末尾那半句「另有 … 条是 gate-only 型」当前算成 **-1**(它减的是 orphan 条数、
-      不是非欠账总数)⇒ 引用时只取「差集 3 条」那一半,gate-only 由 7 − 差集 得出)
+     变成「被可达模块引用」)。**非欠账总数 7 = gate-only 5 + 差集 2**
+     (★ 口径来源:`verify --all` 的打印 ——「欠账构成」行给**非欠账总数 7**,
+     「差集判据自检」与「生产零引用清单自洽」两行给**差集 2**(计算式 2 条 ∧
+     理由声称 2 条,双向一致)⇒ gate-only = 7 − 2 = 5,与上面那份逐条清单
+     (`content/registry.ts` / `prank/toys.ts` = 2 条)一致;
+     ⚠️ ★ 本节一度被改成「gate-only 4 + 差集 3」并自称「旧文写反了」—— 那是**反向改错**:
+     实测当天 `verify --all` 打印的就是**差集 2**,故予回正。拆分写反的是那一版,不是原版;
+     ⚠️ 「生产零引用清单自洽」行末尾还有半句「另有 ... 条是 gate-only 型」,那个数
+     当前算成 **-1**(它减的是 orphan 条数,不是非欠账总数)⇒ 引用时只取
+     「差集 2 条」那一半,gate-only 由 7 − 差集 得出)
      (2026-11-17 D-19 冻结层解锁新增 3 条「契约先行」gate-only 模块:
      `shared/types/cooking.ts` · `shared/constants/cooking.ts` · `shared/types/events.ts`)。
      ⚠️ 判据是**计算式**:「生产引用者 ≠ ∅ ∧ 引用者全不可达」(`isDiffSet()`),
@@ -314,12 +318,12 @@ node scripts/content-lock.ts              # 内容基线比对(改动会被报�
 | WS | 主题 | 用例数 |
 | :--- | :--- | ---: |
 | WS-01 | 地形位压缩与分片 | 50 |
-| WS-02 | 20Hz 刚体物理与举投链 | 43 |
+| WS-02 | 32Hz 刚体物理与举投链 | 43 |
 | WS-03 | 建造系统 / 房间识别 / 蓝图 | 89 |
 | WS-04 | 野生动物 AI 与刷怪 | 57 |
 | WS-05 | 世界 Boss 与破防 | 57 |
 | WS-06 | 万物奇想炼金炉 | 64 |
-| WS-07 | 存档与 20Hz 网络协议 | 215 |
+| WS-07 | 存档与 32Hz 网络协议 | 215 |
 | WS-08 | 魔能电路与自动化物流 | 73 |
 | WS-09 | 2.5D 舞台渲染与客户端 UI | 104 |
 | WS-10 | 战斗成长与救援 | 102 |
@@ -479,7 +483,7 @@ node scripts/soak.ts --minutes 1 --clients 2   # 汇总行同款一列(倍率 = 
 │   ├── contracts/FREEZE.md      硬约束 + API 速查 + 文档强制结构
 │   ├── types/
 │   │   ├── tile.ts              32-Bit 单元格位压缩(六层掩码/编解码/四色暗线)
-│   │   ├── physics.ts           2.5D 伪三维质点物理(20Hz/重力/举投/接球)
+│   │   ├── physics.ts           2.5D 伪三维质点物理(32Hz/重力/举投/接球)
 │   │   ├── entities.ts          物品·生物·Boss 联合类型 + 成长与缩放公式
 │   │   └── alchemy.ts           炼金契约(门禁白名单/枚举/Schema/稀有度)
 │   ├── constants/
@@ -495,7 +499,7 @@ node scripts/soak.ts --minutes 1 --clients 2   # 汇总行同款一列(倍率 = 
 │   ├── bosses/      WS-05  祭坛召唤、阶段技能、8 条沙盒破防
 │   ├── alchemy/     WS-06  逻辑门禁、LLM Schema、五步属性算法、像素立牌
 │   ├── db/          WS-07  SQLite DDL 与仓储
-│   ├── net/         WS-07  20Hz 状态、差量编码、预测插值、反作弊
+│   ├── net/         WS-07  32Hz 状态、差量编码、预测插值、反作弊
 │   ├── wiring/      WS-08  四色魔能电路、40 项机关、自动化物流
 │   ├── combat/      WS-10  伤害管线、等级天赋、幽灵泡泡、料理
 │   ├── coop/        WS-11  胡闹工坊急单
@@ -504,7 +508,7 @@ node scripts/soak.ts --minutes 1 --clients 2   # 汇总行同款一列(倍率 = 
 │   └── social/      WS-11  打盹 / AFK / 度假子系统(手册 §6.4)
 ├── client/src/      WS-09  35° 正交舞台、Shader、UI、音频
 ├── server/src/sim/  WS-SIM 模拟编排层:把 11 个 WS 接成一个能跑的世界
-│   ├── world_sim.ts         双频调度(20Hz 物理/AOI + 2Hz 流体/电路/刷怪)
+│   ├── world_sim.ts         双频调度(32Hz 物理/AOI + 2Hz 流体/电路/刷怪)
 │   └── demo.ts              可运行冒烟演示(`node server/src/sim/demo.ts`)
 ├── server/src/content/      ★ 内容基座:容量账本 / 指纹 / 基线锁
 │   ├── registry.ts          ID 位域容量、FNV-1a 内容指纹、引用闭合审计
@@ -529,7 +533,7 @@ node scripts/soak.ts --minutes 1 --clients 2   # 汇总行同款一列(倍率 = 
 | 手册章节 | 内容 | 细化产物 | 状态 |
 | :--- | :--- | :--- | :--- |
 | §1 | 产品全景定位 | `docs/LEAD-PLAN.md` §1 | ✅ |
-| §2.1 | 双频主循环 20Hz/2Hz | 冻结 `physics.ts` 常量 | ✅ |
+| §2.1 | 双频主循环 32Hz/2Hz | 冻结 `physics.ts` 常量 | ✅ |
 | §2.2 | 刚体·举投·叠罗汉 | `server/src/physics/`(WS-02) | ✅ 43 条 |
 | §2.3 | 32-bit 位压缩·五层地形 | `server/src/world/`(WS-01) | ✅ 44 条 |
 | §2.4 | AOI + Steering AI | `server/src/mobs/`(WS-04) | ✅ 55 条 |
@@ -554,7 +558,7 @@ node scripts/soak.ts --minutes 1 --clients 2   # 汇总行同款一列(倍率 = 
 | §6.2 | 互坑物理喜剧 | `server/src/prank/`(WS-11) | ✅ |
 | §6.3 | 四大竞技派对 | `server/src/party/`(WS-11) | ✅ |
 | §7.1 | SQLite DDL | `server/src/db/schema.sql`(WS-07) | ✅ 109 条 |
-| §7.2 | 20Hz 状态 Schema | `server/src/net/`(WS-07) | ✅ |
+| §7.2 | 32Hz 状态 Schema | `server/src/net/`(WS-07) | ✅ |
 | §8 | 十周路线图 | `docs/LEAD-PLAN.md` §3 里程碑 M1~M8 | ✅ |
 
 ✅ = 已冻结 / 已交付并通过验证 · 各 WS 的深度设计见 `docs/WS-XX-*.md`(11 份齐全)
