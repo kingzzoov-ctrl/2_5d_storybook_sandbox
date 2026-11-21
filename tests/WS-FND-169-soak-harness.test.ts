@@ -185,7 +185,10 @@ test('FND169-2 采样行结构:`[soak] {json}` 可读回,每个跟踪序列都�
   ok(shortFirst.seq >= 1 && shortLast.phase === 'final', '首条 seq ≥ 1,末条是 final 阶段');
   ok(shortLast.atMs >= 0 && shortLast.atMs <= 60_000, `atMs 在跑动窗口内(实际 ${shortLast.atMs})`);
   ok(shortLast.db.totalBytes >= shortLast.db.mainBytes, '库字节总量 ≥ 主文件字节(含 WAL 侧)');
-  eq(Object.keys(shortLast.ledgers).length, 8, '台账 8 项一个不少');
+  /* ★ WS-FND-178:台账加了一项 `acDroppedViolations`(环形流水**丢弃**条数 ——
+     `acViolations` 会饱和到 512,饱和与「一直在违规」在日志里长得一样)。
+     计数跟着 +1:这条断言守的是「一项不少」,不是「恰好八项」。 */
+  eq(Object.keys(shortLast.ledgers).length, 9, '台账 9 项一个不少(WS-FND-178 起含丢弃计数)');
   eq(Object.keys(shortLast.autosave).length, 6, '自动存档 6 项一个不少');
   eq(Object.keys(shortLast.tick).length, 6, '帧率 6 项一个不少');
 });

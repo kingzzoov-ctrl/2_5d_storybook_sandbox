@@ -4126,6 +4126,22 @@ export class RoomRuntime {
       return v;
     }
 
+    /* ⚠️ ★ WS-FND-178 **残留**(如实记录:本轮的修点**没有**覆盖这一支)。
+
+       这里提前返回 ⇒ 既不重锚水位、也不重投影 `state.players`。**多数情况下这是对的**:
+       「反作弊拒绝」意味着**世界没有被写过**,刚体与投影都留在原处,三者仍然一致。
+       但若世界**同时**在自己挪刚体(例如刚落位就被 `resolvePairs` 推挤,而世界侧这次
+       没报拒收),水位就会落后于刚体一格 ⇒ 与 WS-FND-178 修掉的那个形态同类。
+
+       **为什么不在这一支补一个 `syncWatermark`**:单独重锚会造出一个**更糟**的形态 ——
+       水位锚到了新刚体,而 `state.players` 仍是旧投影(这里不投影是**有意**的:反作弊拒绝
+       要走 `v.corrected`,让客户端按**判据的权威**回退,而不是按世界投影)。客户端随后按
+       快照(旧投影)起算的下一包,位移 = |旧投影 − 新刚体| ⇒ 又变成假阳性,只是换了个来源。
+       ⇒ 要真正补上必须**同时**重锚 **且**把权威刚体投进 `state.players`,那会改掉反作弊
+       拒绝的既有回执语义(牵动 WS-FND-135 / WS-FND-172 登记的口径),**超出本轮范围**。
+       触发条件比已修那条窄得多(需要「世界自行位移」与「反作弊正在拒包」同帧重叠),
+       故如实登记而不在本轮动它。 */
+
     /* 1 先写进世界(权威)。没有世界则跳过 —— 不报错,不假装。
 
        ★ WS-FND-135(P1):返回值**必须收下**(修前是 `host.applyPlayerMove(...)` 一行,
@@ -4148,24 +4164,43 @@ export class RoomRuntime {
     }
     if (!worldAccepted && authBefore !== null) {
       /* 回滚窗口与水位(不是「保留一部分」):幻影坐标不许成为下一包的基准。
-         违规流水与分数**不动** —— 那是判定的事实,不是位置事实。 */
+         违规流水与分数**不动** —— 那是判定的事实,不是位置事实。
+         ★ WS-FND-178(P1):权威值必须**重读一次**(修前这里用的是 `applyPlayerMove`
+         **之前**读到的 `authBefore`)—— 世界在同一次调用里可能已经把刚体改了
+         (击退搬家 / 撞墙滑行 / 落地沉降 / 台阶),那样 `state.players` 与 `corrected`
+         写出去的都是**陈旧值**,而水位连陈旧值都拿不到(只有 `rollbackMove` 那一份
+         「移动之前的申报坐标」)。重读之后两条读数一起锚到调用之后的权威刚体。
+         新值取不到(世界这次没给出权威 / 旧世界源)⇒ 退回 `authBefore`,行为逐字不变。 */
+      const authAfter = this.hostPositionOf(userId) ?? authBefore;
       const rolled = this.ac.rollbackMove(userId, snap);
       this.worldMoveRejects += 1;
       this.lastMoveWorldReject = rolled;
       const p = this.state.players.find((x) => x.id === userId);
       if (p) {
-        p.x = authBefore.x;
-        p.y = authBefore.y;
-        if (typeof authBefore.z === 'number') p.z = authBefore.z;
+        p.x = authAfter.x;
+        p.y = authAfter.y;
+        if (typeof authAfter.z === 'number') p.z = authAfter.z;
       }
+      /* 水位重锚到**权威刚体**:`rollbackMove` 只把水位拉回「这次移动之前」,
+         而世界这段时间是自己在动的 ⇒ 不回锚就是「权威与水位永久偏离,
+         每个移动包都被判瞬移、永不收敛」(WS-FND-178 的根因)。
+         z 的取舍与上面两处逐点同源:`authAfter` 没给高度(旧世界源只回 x/y)⇒
+         保持**移动之前**的水位(`snap.lastZ`,此刻已被 `rollbackMove` 写回),
+         **不**把这次没落地的申报高度写进水位。 */
+      this.ac.syncWatermark(
+        userId,
+        authAfter.x,
+        authAfter.y,
+        typeof authAfter.z === 'number' ? authAfter.z : (snap?.lastZ ?? intent.z),
+      );
       this.touch(this.clock.nowMs());
       /* 如实回执:静默回退到**权威**坐标,并标记这不是反作弊拒绝。 */
       return {
         allowed: false,
         corrected: {
-          x: authBefore.x,
-          y: authBefore.y,
-          z: typeof authBefore.z === 'number' ? authBefore.z : intent.z,
+          x: authAfter.x,
+          y: authAfter.y,
+          z: typeof authAfter.z === 'number' ? authAfter.z : intent.z,
         },
         worldRejected: true,
       };
@@ -4190,14 +4225,28 @@ export class RoomRuntime {
        (裁决见 `WorldSim.lastZAuthority`)。⇒ 客户端声明的 z **只是建议值**:
        `room.ts` 只搬运它、**不判**它,也不把它当最终值(与 x/y 同一口径 ——
        判定只在世界侧一处,理由见 `applyPlayerMove` 的「不制造第二份等效实现」)。
-       `host.playerPosition` 的 `z` 是**可选**的(老世界源只回 x/y)⇒ 回退到声明值。 */
+       `host.playerPosition` 的 `z` 是**可选**的(老世界源只回 x/y)⇒ 回退到声明值。
+
+       ★ WS-FND-178(P1):权威值**无条件**先读一次(修前只在 `p` 存在时读,且读完
+       只用来投影)。读回的值同时是**水位重锚**的输入 —— 世界可能采纳了这组坐标却把
+       刚体放到别处(空中 / 落地 / 台阶的 z 由服务端裁决,见 `WorldSim.lastZAuthority`),
+       水位若继续停在申报值,判据的参考点就与权威刚体不一致(下一包按权威起算 ⇒ 误判)。
+       投影与水位取自**同一次读数**:两处各读一次就等于又造了一份基准。 */
+    const auth = this.hostPositionOf(userId);
     const p = this.state.players.find((x) => x.id === userId);
     if (p) {
-      const auth = this.hostPositionOf(userId);
       p.x = auth?.x ?? intent.x;
       p.y = auth?.y ?? intent.y;
       p.z = auth?.z ?? intent.z;
     }
+    /* 没有世界 / 旧世界源(拿不到权威)⇒ 三个值退回声明值:那正是 `checkMove`
+       放行时已经写进水位的东西 ⇒ 该分支逐位不变(不制造第二种基准)。 */
+    this.ac.syncWatermark(
+      userId,
+      auth?.x ?? intent.x,
+      auth?.y ?? intent.y,
+      auth?.z ?? intent.z,
+    );
     this.touch(this.clock.nowMs());
     return v;
   }

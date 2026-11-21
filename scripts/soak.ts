@@ -304,6 +304,20 @@ export type SoakSample = {
     playerSnapshotErrors: number;
     throttledActions: number;
     acViolations: number;
+    /**
+     * ★ WS-FND-178(P1):反作弊流水**因环形缓冲满而丢掉**的条数
+     * (`AntiCheatRoom.droppedViolations`)。
+     *
+     * 为什么必须有它:`acViolations` 是**环里还剩多少条**(容量 512),它**饱和**——
+     * 长期跑的时候读数是 512 还是 512,「一直在违规」与「511 条是三个月前的」
+     * 在日志里长得**一模一样**。丢掉的那一半事实此前没有任何读口 ⇒ 现场只剩
+     * 一句「512 条全是一个人的 TELEPORT」。口径:`≥ 512` 就是饱和的证据。
+     *
+     * ⚠️ **不**进 `SOAK_SERIES`(那是「只该涨」的序列台账,加一条会改序列条数,
+     * 牵动 `FND169-11` 的 `reports.length` 与文档里登记的数字);它挂在样本对象上,
+     * 需要时按点路径读。
+     */
+    acDroppedViolations: number;
     ledgerPrunes: number;
   };
   autosave: {
@@ -606,13 +620,30 @@ type FakeClient = {
 /**
  * 一帧移动的**步长**(每轴,格)。
  *
- * ## 为什么是 0.15 而不是 0.2(实测定的)
- * 假客户端每 100ms 发一条 `move`,斜向走时一步 = `√2 × 步长`。反作弊的窗口均速
- * 判据按**帧**折算(实测 2026-11-25:步长 0.2 ⇒ 读数 `窗口均速 5.66 格/秒 > 上限 5.63`,
- * `weight: 3`,`SPEED` 记录在 30 秒内把 512 格流水灌满)。
- * ⇒ 夹具的走法必须**留余量**,否则长跑里长出来的不是「负载」而是「作弊证据」:
- *   0.15 每轴 ⇒ 折算约 4.24 格/秒,离 5.63 有 25% 余量(判据:FND169-10 的
- *   `acViolations === 0`)。
+ * ## 真正的天花板是 §6.1 的**单帧上界**(实测定的),不是 §6.2 的窗口均速
+ *
+ * 假客户端按 `moveHz` 的节拍发包(除数由 `moveEveryTicks` 派生,见 `CLIENT_TICK_MS`),
+ * 报文里的 `tick`
+ * 取服务器的 `state.meta.tick`;而 `checkMove` 的额度是
+ * `maxDisplacementPerTick(1) × dtTicks`,且 `claimedTick` 被
+ * `min(…, lastMoveTick + MAX_MOVE_CATCHUP_TICKS(1), …)` 夹住 ⇒ **每包只兑现 1 帧**,
+ * 额度 = `BASE_MOVE_SPEED × DT × TELEPORT_SLACK` = 4.5 × 0.03125 × 1.6 = **0.225 格**。
+ * 斜向走的单包位移 = `√2 × 步长` = `√2 × 0.15` = **0.2121 格** ⇒ 对 0.225 只剩
+ * **≈5.7%** 余量。这就是「步长只能这么小」的全部理由:0.2 会得到 0.283 > 0.225
+ * ⇒ 每一包都被判 `TELEPORT`(`weight: 4`)。
+ *
+ * ⚠️ 修前这段写的是「折算约 4.24 格/秒,离 5.63 有 25% 余量」——**两处口径都错**:
+ * ```text
+ * (a) 4.24 = 0.2121 × 20 —— 把**报文率**当成服务端帧率,**不是实测值**;
+ *     60 分钟 soak 实测的窗口均速读数是 **0.5~1.3 格/秒**(窗口分母走真实跨度
+ *     `spanTicks × 帧间隔`,而报文节拍远低于服务端帧率)⇒ 窗口那道闸一直有几十倍余量,
+ *     它**从来不是**约束;
+ * (b) 真正的约束是上面那条 0.225 的单帧上界 —— 它只有 ≈5.7% 余量,而且是
+ *     **硬闸**(超一点即判违规),不是「均速超一点才算」。
+ * ```
+ * 长跑里「长出假阳性」的真实来源也印证了这一点:见 WS-FND-178 —— 假阳性不是
+ * 夹具走快了,而是**世界自己挪了刚体**(击退 / 落地 / 撞墙)之后反作弊水位不跟着走。
+ * 判据:FND169-10 的 `acViolations === 0`。
  */
 const WALK_STEP = 0.15;
 
@@ -1203,6 +1234,7 @@ function buildSample(input: SampleInput): SoakSample {
       playerSnapshotErrors: rt.playerSnapshotErrors.length,
       throttledActions: rt.throttledActions.length,
       acViolations: rt.ac.violations().length,
+      acDroppedViolations: rt.ac.droppedViolations,
       ledgerPrunes: rt.ledgerPrunes,
     },
     autosave: {
