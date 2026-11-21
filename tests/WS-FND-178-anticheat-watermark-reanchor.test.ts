@@ -540,7 +540,7 @@ test('FND178-8 ★★ 客户端计数器折算:房间先跑 60 帧**之后**才�
   ok(first.worldRejected !== true, '★ 也不是靠世界拒收(世界侧接受)');
 
   /* ── 连发三拍(每拍之间推一个真房间帧,与真实客户端 32Hz 发包同形)── */
-  let allowed = 1;
+  let allowed = first.allowed ? 1 : 0;
   for (let i = 0; i < 3; i += 1) {
     rt.step();
     clientTick += 1;
@@ -557,4 +557,66 @@ test('FND178-8 ★★ 客户端计数器折算:房间先跑 60 帧**之后**才�
      实测:`allowed = false`,`detail = 单帧位移 0.141 格 > 上界 0.000`。 ── */
 });
 
+/* ═══ 9. ★ 同一条缺陷的**另一条入口**:席位 resume(重连)后计数器重置 ═══ */
+
+/**
+ * ## 这一条守什么
+ *
+ * 客户端计数器是 **JS 上下文**的(`client/src/main.ts` 的 `localTick`,每页从 0 起)。
+ * 而反作弊状态在 **`disconnect()` → 宽限期内 `resume`** 这条路上是**整份保留**的:
+ * `ac.leave()` 只在**主动退房 / 宽限超期**时才调(`room.ts#purgeSeat → clearSeatTraces`)。
+ *
+ * ⇒ 若基准 `clientTickBase` 只在「首包」定一次(不识别重置),重连回来的新页面发
+ * `tick = 1` 会被折算成 `1 + 旧基准 ≈ 旧房间帧号 ≤ lastMoveTick`
+ * ⇒ `dtTicks` 恒 0 ⇒ **重连回来的玩家一步也走不动**,而且每包留一条假 TELEPORT,
+ * 症状与 `FND178-8` 逐字相同 —— 只是入口不同(那个是「房间先跑再进人」,这个是「重连」)。
+ *
+ * 修法:`normalizeClientTick()` 发现**申报值跳回**(`clientTick < 上一包原始值`)就重算基准。
+ * 重算不放松上界:返回值照样被 `checkMove` 的同一对夹取封顶。
+ */
+test('FND178-9 ★★ 席位 resume 后计数器重置 ⇒ 基准必须重算:重连回来的玩家仍必须能走', () => {
+  const clock = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: freshId('resume'), ownerId: 'owner', clock: clock.clock });
+  const sim = new WorldSim({ sizeCells: SIZE, mobs: false, wiring: false, seed: SEED });
+  rt.worldSaveHost = sim as unknown as WorldSaveHost;
+
+  const j1 = rt.join({ userId: 'p1' });
+  ok(j1.ok, '前置:首次进场');
+  for (let x = 0; x <= 8; x += 1) for (let y = 0; y <= 8; y += 1) sim.setCell(x, y, { obj: 0 });
+
+  /* ── 在房里正常玩一阵:客户端计数器与房间时钟一起涨,水位也涨 ── */
+  let clientTick = 0;
+  for (let i = 0; i < 20; i += 1) {
+    rt.step();
+    clientTick += 1;
+    const p = rt.playerState('p1');
+    if (p !== undefined) rt.applyMove('p1', { tick: clientTick, x: p.x + LEGAL_STEP, y: p.y, z: p.z });
+  }
+  const before = rt.ac.get('p1');
+  ok(before !== undefined, '前置:反作弊里有这个玩家');
+  ok(before!.lastMoveTick >= 20, `前置:申报水位已经涨到 ≥20(实际 ${before!.lastMoveTick})`);
+
+  /* ── 掉线:席位保留、AC 状态**整份保留**(这是 resume 与 leave 的区别) ── */
+  ok(rt.disconnect('p1'), '前置:掉线成功');
+  ok(rt.ac.get('p1') !== undefined, '前置:掉线**不**清 AC 状态(清它的是 `ac.leave`)');
+
+  /* ── 宽限期内重连 ⇒ 走 resumed 分支(内部**不**调 `ac.join`) ── */
+  const j2 = rt.join({ userId: 'p1' });
+  ok(j2.ok, '前置:重连成功');
+  eq(j2.resumed, true, '前置:走的是**席位 resume** 那条分支(不是全新 join)');
+
+  for (let i = 0; i < 2; i += 1) rt.step();
+
+  /* ★ 新页面的计数器从 0 重来 ⇒ 重连后的第一包是 tick = 1。 */
+  const p = rt.playerState('p1');
+  ok(p !== undefined, '前置:投影里有这个玩家');
+  const r = rt.applyMove('p1', { tick: 1, x: p!.x + LEGAL_STEP, y: p!.y, z: p!.z });
+  eq(r.allowed, true,
+    '★★ 重连后计数器重置,申报仍必须放行(不重算基准 ⇒ 折算值 ≤ lastMoveTick ⇒ dtTicks 恒 0 ⇒ 冻住)');
+  eq(r.violation, undefined, '★ 不得留下违规');
+  eq(rt.ac.violations().length, 0, '★ 零违规');
+
+  /* ── 反证(有牙怎么验):把 `normalizeClientTick` 里的 `|| reset` 去掉
+     (即基准只在首包定一次)⇒ 本用例的第一条判据必须红。 ── */
+});
 report('WS-FND-178');

@@ -8,7 +8,7 @@
  *   onCreate  → new RoomRuntime(...)  + RoomSchema + **registerHandlers()**
  *   onJoin    → runtime.join()        → 回发全量/断线快照
  *   onLeave   → runtime.disconnect() / runtime.leave()
- *   setSimulationInterval(50ms) → runtime.step() → schema.syncFrom()
+ *   setSimulationInterval(31.25ms) → runtime.step() → schema.syncFrom()
  *
  * ✅ 本文件自 2026-11-14(task-95)起**可被 Node 直接加载**
  *   (装饰器 → `defineTypes`、CJS 命名导入 → 默认导出/`import type`),

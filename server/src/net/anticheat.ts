@@ -449,6 +449,19 @@ export interface PlayerAntiCheatState {
    * ⚠️ **不进快照、不回滚** —— 它是「两套时钟之间的换算」,不是位置事实。
    */
   clientTickBase: number | null;
+
+  /**
+   * ★ **上一包原始的客户端计数器**(只用于识别「计数器被重置」)。
+   *
+   * 客户端计数器是**JS 上下文的**:页面重载 / 崩溃恢复 / 席位 `resumed` 之后都从 0 重来,
+   * 而 AC 状态在 `disconnect()` / resume 那条路上是**整份保留**的(`ac.leave()` 只在
+   * 主动退房或宽限超期时才调)⇒ 基准 `clientTickBase` 会一直停在旧值。
+   * 不识别重置 ⇒ `t' = 0 + 旧基准 ≈ 旧房间帧号 ≤ lastMoveTick` ⇒ `dtTicks` 恒 0
+   * ⇒ **重连回来的玩家一步也走不动**(判据 `FND178-9`,与 `FND178-8` 是同一条缺陷的两个入口)。
+   *
+   * `null` = 还没收到过任何一包。与 `clientTickBase` 一样**不进快照、不回滚**。
+   */
+  lastRawClientTick: number | null;
   /** 环形窗口:最近 N 帧的位置与时间,用于窗口式移速检测。 */
   window: { tick: number; x: number; y: number }[];
   /** 上次成功攻击的 tick。 */
@@ -482,6 +495,7 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
     lastMoveTick: tick,
     /* 基准由**首包**定(见 `normalizeClientTick`);抵达此刻还没有任何一包。 */
     clientTickBase: null,
+    lastRawClientTick: null,
     window: [{ tick, x, y }],
     lastAttackTick: -9999,
     score: 0,
@@ -504,7 +518,7 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
  * (`PlayerAntiCheatState` 的一部分,测试直接 `.length` / `.some(...)`),
  * 改成环形结构会改掉它的形状。这里的量级是「违规次数」(抖动级,通常个位数),
  * 而 `shift()` 只在**到顶之后**才发生 ⇒ 摊还成本可忽略。
- * 房间级那条 20Hz 热路径用的是真环形(`AntiCheatRoom.pushViolation`)。
+ * 房间级那条 32Hz 热路径用的是真环形(`AntiCheatRoom.pushViolation`)。
  */
 function record(s: PlayerAntiCheatState, v: Violation): void {
   if (s.violations.length >= VIOLATION_KEEP_PER_PLAYER) s.violations.shift();
@@ -1512,7 +1526,7 @@ export class AntiCheatRoom {
     this.limits = merged.limits;
     this.limitsIssues = merged.issues;
     if (merged.issues.length > 0) {
-      /* 打到 stderr:配置错误属**开发者可见**的一类,不该被 20Hz 的日志淹掉。
+      /* 打到 stderr:配置错误属**开发者可见**的一类,不该被 32Hz 的日志淹掉。
          (与 WS-13 的 `LOAD_FAIL::` 同一取舍:失败要让门禁能看见。) */
       console.error(
         `[anticheat] 限值非法,已逐字段回退默认值(${merged.issues.length} 项):\n`
@@ -1554,7 +1568,7 @@ export class AntiCheatRoom {
    * 移动检查 + 违规入流水。
    *
    * ★ WS-FND-137 P2:修前本方法尾部有一行 `this.log = this.log.slice(-512)` ——
-   * 每次移动(20Hz × 玩家数)都**整数组重建一遍**,只为丢掉最多 1 条过期记录。
+   * 每次移动(32Hz × 玩家数)都**整数组重建一遍**,只为丢掉最多 1 条过期记录。
    * 现在走 `pushViolation`(环形缓冲,满了才绕回)⇒ 本方法**恒定成本**,
    * 与流水长度无关。
    */
@@ -1623,11 +1637,15 @@ export class AntiCheatRoom {
    * `x/y/z` 必须来自 `WorldSaveHost.playerPosition`(或等价的权威读口)。
    * 客户端申报值走 `checkMove` 那条既定路径。
    *
-   * ⚠️ **两处出路径的兜底是有意的例外,不是新入口**:`room.ts#applyMove` 在
-   * 「没有世界 / 旧世界源只回 x/y」时退回 `intent.x` / `intent.y` / `intent.z`
-   * (`auth?.x ?? intent.x`)。它只在**拿不到任何权威**时进入,而那种情况下
-   * `checkMove` 放行本来就把申报值写进水位(逐位等价的既有行为)。
-   * 将来若所有世界源都能回 z,这条兜底应收紧成「拿不到就不重锚」。
+   * ⚠️ **入口与出路径的兜底是有意的例外,不是新入口** —— 但**两处兜底的对象不同**(逐个核过):
+   * - **入口**(`room.ts#applyMove` 顶部):`hostPositionOf()` 为空、或 `z` 不是有限数
+   *   ⇒ **整次跳过**(根本不重锚),**不是**退回申报值;
+   * - **正常放行路径**:`auth?.x ?? intent.x` 三处逐个兜底到申报值 —— 那里 `checkMove`
+   *   刚把申报值写进水位,故与既有行为**逐位等价**;
+   * - **世界拒收路径**:x/y 兜底到**调用前**的 `authBefore`(**不是**申报值),z 优先取
+   *   `snap.lastZ`(`ac.move` 已放行 ⇒ `snap` 必非空 ⇒ `intent.z` 实际到不了)。
+   *   这条比「逐位等价」**更严**,不是放宽。
+   * 将来若所有世界源都能回 z,正常放行路径那条兜底应收紧成「拿不到就不重锚」。
    *
    * ## 契约(fail-closed)
    *
@@ -1680,8 +1698,22 @@ export class AntiCheatRoom {
     /* 基准**钳到 ≥ 0**:只有房间时钟**领先**客户端计数器时才折算。逆差不折算 ——
        那时两套时钟本来就是同起点(短跑夹具直接发房间帧号;单测里没推过房间帧,
        `lastTick === 0` 而 tick 从 1 数起)。折出一个负基准会把申报压到 0 以下,
-       `dtTicks` 变 0,反而把**合法**的包判成违规(WS-07 F24/G01/G04/task-38 实测)。 */
-    if (s.clientTickBase === null) s.clientTickBase = Math.max(0, s.lastTick - clientTick);
+       `dtTicks` 变 0,反而把**合法**的包判成违规(WS-07 F24/G01/G04/task-38 实测)。
+
+       ★ 另外:**计数器被重置时必须重算基准**。客户端计数器是 JS 上下文的
+       (页面重载 / 崩溃恢复 / 席位 `resumed` 都从 0 重来),而 AC 状态在
+       `disconnect()` → resume 这条路上**整份保留**(`ac.leave()` 只在主动退房或
+       宽限超期时才调)⇒ 基准会一直停在旧值,`t' = 0 + 旧基准 ≤ lastMoveTick`
+       ⇒ `dtTicks` 恒 0 ⇒ **重连回来的玩家一步也走不动**(判据 `FND178-9`)。
+
+       重算**不放松任何上界**:返回值照样被 `checkMove` 的同一对夹取
+       (`lastMoveTick + MAX` / `lastTick + MAX`)封顶 —— 一次重算只换来
+       「与诚实客户端逐位同形」的那 1 帧额度,拿不到更多(对抗审查逐案验过)。 */
+    const reset = s.lastRawClientTick !== null && clientTick < s.lastRawClientTick;
+    if (s.clientTickBase === null || reset) {
+      s.clientTickBase = Math.max(0, s.lastTick - clientTick);
+    }
+    s.lastRawClientTick = clientTick;
     return clientTick + s.clientTickBase;
   }
 
@@ -1823,7 +1855,7 @@ export class AntiCheatRoom {
    *
    * ★ WS-FND-137 P2:底层改成**环形缓冲**(容量 `VIOLATION_LOG_CAPACITY`)。
    * 修前是 `this.log = this.log.slice(-512)`,而那一行在 `move()` 里 ——
-   * `move` 是 20Hz × 玩家数的热路径 ⇒ 每次移动都**整数组重建一遍**,
+   * `move` 是 32Hz × 玩家数的热路径 ⇒ 每次移动都**整数组重建一遍**,
    * 只为丢掉最多 1 条过期记录。环形只写一个槽(且满了才绕回)。
    *
    * ⚠️ 返回值定义**未变**:仍然是「最近 512 条、按时间顺序(最早在前)」的一串。

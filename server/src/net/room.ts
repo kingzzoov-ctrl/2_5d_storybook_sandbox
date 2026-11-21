@@ -147,10 +147,10 @@ export const MAX_ACTIONS_PER_TICK = 64;
  *
  * ## 两条触发轨,取**先到者**
  * ```
- * 帧节流  AUTOSAVE_FRAME_INTERVAL = 20 帧(20Hz ⇒ 1 秒)  ← 既有口径(WS-FND-02 C25 钉着)
+ * 帧节流  AUTOSAVE_FRAME_INTERVAL = 20 帧(32Hz ⇒ 0.625 秒)  ← 既有口径(WS-FND-02 C25 钉着)
  * 墙钟轨  AUTOSAVE_INTERVAL_MS    = 30 秒                ← 本常量
  * ```
- * 保留帧节流不是遗留:它是「20Hz 下不许每帧写库」的**下界**(去掉就退化成 20Hz
+ * 保留帧节流不是遗留:它是「32Hz 下不许每帧写库」的**下界**(去掉就退化成 32Hz
  * 写库,C25 当场红);墙钟轨补的是帧节流**保证不了**的那一半 —— 房间被低频驱动
  * (`step()` 一秒才来一次、或长时间没人推进)时,「至少每 30 秒落一次盘」才是
  * 可兑现的承诺。
@@ -162,7 +162,7 @@ export const MAX_ACTIONS_PER_TICK = 64;
  */
 export const AUTOSAVE_INTERVAL_MS = 30_000;
 
-/** 帧节流:每 20 帧一次低频落盘(20Hz ⇒ 1 秒;`tests/WS-FND-02` C25 钉着这个数)。 */
+/** 帧节流:每 20 帧一次低频落盘(32Hz ⇒ 0.625 秒;`tests/WS-FND-02` C25 钉着这个数)。 */
 export const AUTOSAVE_FRAME_INTERVAL = 20;
 
 /**
@@ -1297,10 +1297,10 @@ export interface WorldSaveHost {
    *
    * ## 为什么是「快帧数」而不是秒
    *
-   * `WorldSim` 自管**内部双频**(`FAST_PER_SLOW = 10`),而 `tick()` 一次
+   * `WorldSim` 自管**内部双频**(`FAST_PER_SLOW = 16`),而 `tick()` 一次
    * 就是一帧(实测相位 `FAST×9 SLOW FAST×2`)。
    * ⇒ `advance(1)` 对应外部一帧,**恰好 1:1**,不需要换算。
-   * `SIM_FAST_DT = 0.05 = 1/20` 与 20Hz 天然对齐。
+   * `SIM_FAST_DT = 0.03125 = 1/32` 与 32Hz 天然对齐。
    *
    * ## ⚠️ 调用方**绝不可**再乘 `FAST_PER_SLOW`
    *
@@ -3482,7 +3482,7 @@ export class RoomRuntime {
    * 调用点:`step()` 的**最顶部**(早于 status 早退)⇒ 休眠房里也会推进;
    * 队列为空时是 O(1) 早退。
    *
-   * ★ P1(2026-11-21):每条都要先核**世代**。调用点与重进点在同一个 20Hz 循环里
+   * ★ P1(2026-11-21):每条都要先核**世代**。调用点与重进点在同一个 32Hz 循环里
    * 竞争(消息处理 → 下一帧 step),修前 `Set<string>` 只有 userId ⇒ 无法区分
    * 「这条待删说的是哪一代」,于是重试会把**刚重进的刚体**删掉。
    */
@@ -3690,7 +3690,7 @@ export class RoomRuntime {
   *   退回墙钟(退回墙钟就是本缺陷本身)。
    *
    * ## 幂等与代价
-   * 只写**值有变化**的字段(与 `syncLevelProjections` 同一取舍):20Hz 每帧写一遍值
+   * 只写**值有变化**的字段(与 `syncLevelProjections` 同一取舍):32Hz 每帧写一遍值
    * 本身不贵,但逐帧把同一个值写回快照会让差量编码器看见「每帧都变」——
    * 那是真的多余。故三个字段各自比较后赋值。
    */
@@ -5386,7 +5386,7 @@ export class RoomRuntime {
   /* ── 4.4 每帧推进 ── */
 
   /**
-   * 20Hz 推进。返回本帧的编码报文(差量)。
+   * 32Hz 推进。返回本帧的编码报文(差量)。
    * `prev` 由调用方持有(通常是「上一帧已发给该客户端的快照」)。
    */
   step(prevSnapshot: RoomState | null = null): Uint8Array {
@@ -5469,8 +5469,8 @@ export class RoomRuntime {
 
        ## 为什么是 `advance(1)` 且**只能**写 1
        `WorldSim` 内部自管双频(`FAST_PER_SLOW=10`),一次 `tick()` 就是一帧
-       (实测相位 `FAST×9 SLOW FAST×2`);`SIM_FAST_DT = 0.05 = 1/20` 与外部
-       20Hz **天然对齐**。⇒ 外部一帧 = 内部一快帧,**恰好 1:1**。
+       (实测相位 `FAST×9 SLOW FAST×2`);`SIM_FAST_DT = 0.03125 = 1/32` 与外部
+       32Hz **天然对齐**。⇒ 外部一帧 = 内部一快帧,**恰好 1:1**。
 
        ⚠️ **绝不可**写成 `advance(FAST_PER_SLOW)` 或在本方法里再调一次 ——
        那会每慢帧推进两次 AI,世界快 2 倍,而**不报错、测试也可能照过**
@@ -5485,7 +5485,7 @@ export class RoomRuntime {
 
        ## ⚠️ 三个时钟**互不联动**,不要试图让它们相等
        ```
-       room.state.meta.tick  本方法 +1(房间 20Hz)
+       room.state.meta.tick  本方法 +1(房间 32Hz)
        WorldSim.frame        advance 推进(世界帧)
        ac.s.lastTick         服务端时钟水位(反作弊自己的)
        ```
@@ -5521,7 +5521,7 @@ export class RoomRuntime {
      * 落盘动作本身**只有一个实现**(`saveWorldNow()`):这里只决定「何时」。
      */
     if (this.db) {
-      /* 世界帧号低频落盘(每 20 帧 = 1 秒),避免 20Hz 写库。 */
+      /* 世界帧号低频落盘(每 20 帧 = 0.625 秒),避免 32Hz 写库。 */
       if (this.state.meta.tick % AUTOSAVE_FRAME_INTERVAL === 0) {
         this.db.update('rooms', { id: this.id }, {
           world_tick: this.state.meta.tick,
@@ -5919,7 +5919,7 @@ export class RoomRuntime {
    * | 7 | `weaponId` | 装备权威 | 直传(`undefined` = 不投) |
    * | 8 | `inventory` | `users.inventory_json`(明细) | ⚠️ **只投总量**,走变更时路径 |
    *
-   * ⚠️ 第 8 项**不在这里逐帧投** —— 它是标量,20Hz × N 人无意义(带宽裁定),
+   * ⚠️ 第 8 项**不在这里逐帧投** —— 它是标量,32Hz × N 人无意义(带宽裁定),
    *    由 `projectInventoryTotalFor` 在 `applyInventory` 变更时调一次。
    *
    * ## ⚠️ 顺序:先 `syncMaxHp` 再 `projectPlayer`(不可换)
