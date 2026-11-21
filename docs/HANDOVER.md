@@ -682,3 +682,129 @@ AC20 冻结层未被动                  ✓ --frozen 17 项全绿;shared/** 与
 > 但**这张表本身不参与比对** ⇒ 它同样会腐烂。
 > 读它时以 `node scripts/verify.ts --all` 的当场输出为准;若要把它也接进门禁,
 > 照 §三 的做法加 `verifyHandoverNumbers` 的同类行即可(`makeNumberCheck` 已经是通用的)。
+
+---
+
+## 十三、★ 本轮(w59–w61):反作弊水位风暴 —— 定因 / 修复 / **未闭环清单** / 自测指南
+
+### 13.1 一句话
+
+`applyMove` 里的反作弊水位(`PlayerAntiCheatState.lastX/Y/Z`)**只在「包被接受」与「世界拒收」
+两条路径的末尾重锚**,而权威刚体在 `applyMove` **之外**也会动(物理沉降 / 击退 / `syncPlayers()`
+把刚体投影回 `state.players`)⇒ 投影与水位越走越开 ⇒ 客户端按**投影**起算的下一包被判 TELEPORT
+⇒ 走那条**早退分支**(它不重锚)⇒ 漂移只增不减。**修法:把水位锚到「此刻的权威刚体」**
+(`room.ts#applyMove` 入口、`snapshotMove` 之前),于是 `dist` 变成「申报位置离它**真实所在**有多远」。
+
+### 13.2 三个提交
+
+| commit | 内容 |
+| :--- | :--- |
+| `799d2ef` | w59:两条路径**末**重锚(`AntiCheatRoom.syncWatermark`)+ D-26 目标机实测回填。**实测不足** —— 见 13.7 |
+| `0654d72` | w60:文档口径订正。32Hz 残留 11 处(PLAY.md 4 / README.md 7)· `WIRING-LEDGER` 两行陈账回正 · README「差集」块**反向改错**回正 · §九 sha256 重钉 |
+| `1f39349` | w61:**入口重锚** · `WS-FND-178` 4/6 → **7/7**(新增 `FND178-7` 专守入口重锚;注释掉修点 ⇒ 4/7 有牙)· 夹具 `WALK_STEP` 改成**派生**(`BASE_MOVE_SPEED * DT / √2`) |
+
+### 13.3 判据(可复跑)
+
+| 量 | 修前 | 修后 | 怎么量 |
+| :--- | :--- | :--- | :--- |
+| `acViolations`(2.5 分钟 / 8 客户端) | 512(环饱和) | **0~1** | 探针(见 13.6) |
+| `acDroppedViolations` | 69 | **0** | 同上 |
+| `gapBefore` = \|投影 − 水位\| 峰值 | 2.66 | **0.30** | 同上 |
+| 被拒的包 | 全 `worldRejected:false`(AC 误判) | 全 `worldRejected:true`(世界拒收) | 同上 |
+| `WS-FND-178` | 6/6(只覆盖两条末路径) | **7/7** | `node tests/WS-FND-178-anticheat-watermark-reanchor.test.ts` |
+
+**判据常量一个都没动**:单帧上界 `0.225`、`SPEED_WINDOW_TOLERANCE` 1.25、`TELEPORT_SLACK` 1.6、
+`maxDisplacementPerTick(1)` —— 全字未改。**改的只有「判据的参考点」与夹具的步长**(后者是保真度)。
+
+### 13.4 ★★ 未闭环清单(接手者先看这张)
+
+| # | 事项 | 状态 | 证据 / 判据 | 下一步 |
+| :--- | :--- | :--- | :--- | :--- |
+| O-1 | **一帧内的真击退**把刚体挪 0.088~0.300 格,而快照只能**事后**告知 ⇒ 诚实客户端那一包的申报位置必然偏出单帧上界 | **未闭环** | 22 条残余里 **6 条(27%)**;实测速率 ≈ **0.037 条/秒** | 两个候选(**都不改上界**):(1) 世界位移后给**一包**宽限;(2) AC 拒绝也下发 `corrected`。取舍**待拍**,本轮不动 |
+| O-2 | 60 分钟长跑的 `acViolations` **不是 0** | **未闭环** | 预期落在 **~20**(环形容量 512,**没饱和** ⇒ 读数可信) | 由 O-1 决定。`acDroppedViolations === 0` 是本轮拿到的强信号 |
+| O-3 | `WIRING-LEDGER` 其余 **34 行**的逐符号状态**没有**复核 | **未闭环** | 本轮只回正 2 行(`R6-PRANK-2` / `R6-TAME`);改 TAME 时明确写了「27 个 export 的逐符号读者身份**未**重算」 | 这张表**没有门禁按符号复检**(只有「表体合计 == §2.10 汇总」的**内部一致性**)⇒ 陈账不会被任何东西发现。要么补判据,要么按符号重跑一遍 |
+| O-4 | `server/src/**` 的**代码注释**里仍有 20Hz 残留(约 15 处) | **未闭环** | 例:`world_sim.ts` 的 `/* ── 快帧 20Hz:物理 ── */`;`room.ts` 的「帧节流 `AUTOSAVE_FRAME_INTERVAL = 20 帧(20Hz ⇒ 1 秒)`」在 32Hz 下其实 **0.625 秒**(数值被 `WS-FND-02` C25 钉住,是**注释**陈) | 独立一件:改注释前要逐个确认没有判据在按注释文本断言(本仓有「剥注释后断言」的约定) |
+| O-5 | `sync-docs --write` 在**并发负载**下不可靠 | **未闭环** | 本机两次报「测量源不可信:… 没有可解析的『用例汇总』行」—— `verify --all` 的子进程被抢占 | 本轮是**手工**补数字与 sha256 绕过的(口径已复算逐字一致)。工具侧未修:子进程被 kill 时应**重跑**而不是把整次测量判死 |
+| O-6 | Windows 本机那份 60 分钟长跑**没有 summary** | **未闭环** | 后台任务在 **28.8 分钟**被回收(18:28:57 停写) | D-26 里 Windows 的两个数(`34.6ms` / `1.1073`)来自**独立测量**,不是长跑 ⇒ 「Windows 上的真实长跑」目前**无完整证据** |
+| O-7 | 反作弊**丢弃计数**是否进生产可观测面 | **未核** | `acDroppedViolations` 本轮接进了 **soak 台账**;生产侧本轮**没查过** | 若要运维可观测,另开一件 |
+
+### 13.5 已核实**不是**问题的(免得下一个人重查)
+
+- `R6-CBT-2`「部分接:`isTalentUnlocked` 1 处」**准确**(`world_sim.ts:363` 是 import、`:3856` 是唯一调用点)。
+  它与历史 commit message「天赋…全接」措辞不一致,但**账是保守的一方**。
+- README 类型检查区的 `205+26+15+10+3 = 259` 是**带日期的历史分布快照**,紧邻一行明写
+  「现值…本文件**不手抄**」⇒ 不是漂移。
+- `HANDOVER §三` 的「第六轮 121 / 第七轮 127 / 第八轮号段 132」是**带日期的轮次叙述**(不是当前值);
+  该行「值」列的数字由 `verify.ts::verifyHandoverNumbers()` 逐行核过。
+- 同义反复注记的 `2026-11-25` 在 README / HANDOVER 两处一致。
+
+### 13.6 自测指南
+
+```bash
+# ── 1 门禁(约 6 分钟)────────────────────────────────────────
+node scripts/verify.ts --all
+#   期望:exit 0 · 行首 ✗ 0 项 · 用例汇总 3127 条 / 187 套件 · 自检 30/30
+node scripts/typecheck.ts
+#   期望:exit 2 / 257 条 —— 这是**在案形态**(基线锁在 --all 里核),别当红
+node scripts/sync-docs.ts --check
+#   期望:无变化(它内部会**现跑一次** verify --all,所以也要 6 分钟)
+
+# ── 2 单套件(秒级)──────────────────────────────────────────
+node tests/WS-FND-178-anticheat-watermark-reanchor.test.ts   # 期望 7/7
+node tests/WS-FND-169-soak-harness.test.ts                   # 期望 11/11
+
+# ── 3 真长跑(60 分钟;本机与服务器同一份夹具)──────────────
+node scripts/soak.ts --minutes 60 --clients 8 \
+  --db ./soak.db --log ./soak.log --fresh --quiet
+#   采样在同名的 .log 里(--log 那一路);`.out` 只有启动那几行。
+#   读 `soak:summary` 那一行:ledgers.acViolations / ledgers.acDroppedViolations / tick
+#   ⚠️ `acViolations` 是**环形流水长度**(容量 512)⇒ **饱和即丢信息**;
+#      `acDroppedViolations` 才是「丢了多少条」。判据:后者 === 0。
+
+# ── 4 只想快速看反作弊(2.5 分钟,不必等 60 分钟)───────────
+#   核心是**包一层 applyMove**,看「投影 vs 水位」的偏离有没有在累积:
+```
+
+```ts
+// probe.ts —— 逐次 move 记「投影 vs 水位」的偏离,并判早退分支
+const soak = await import('file:///<repo>/scripts/soak.ts');
+const fx = await soak.createSoakFixture({
+  ...soak.DEFAULT_SOAK_OPTIONS,
+  minutes: 2.5, clients: 8, dbPath: 'p.db', logPath: 'p.db.log', fresh: true, quiet: true,
+});
+const rt = fx.runtime, orig = rt.applyMove.bind(rt);
+const gapOf = (id: string): number => {
+  const s = rt.ac.get(id), p = rt.playerState(id);
+  return s && p ? Math.hypot(p.x - s.lastX, p.y - s.lastY) : Number.NaN;
+};
+rt.applyMove = (id: string, intent: unknown) => {
+  const before = gapOf(id);
+  const r = orig(id, intent);
+  const after = gapOf(id);
+  // ★ 判据:非世界拒收却被拒,且偏离**没有变小** ⇒ 走的是反作弊早退分支(它不重锚)
+  if (!r.allowed && r.worldRejected !== true) console.log('AC-REJECT', { id, before, after });
+  return r;
+};
+const t0 = Date.now();
+while (Date.now() - t0 < 150_000) await new Promise((r) => setTimeout(r, 200));
+await fx.close();
+const vs = rt.ac.violations();
+const kinds: Record<string, number> = {};
+for (const v of vs) kinds[v.kind] = (kinds[v.kind] ?? 0) + 1;
+console.log('acViolations', vs.length, 'dropped', rt.ac.droppedViolations, 'kinds', kinds);
+```
+
+```bash
+# ── 5 服务器(本仓当前那台:阿里深圳 · Debian 12 · node v24.13.0)
+#   通道:`decodo-recon/rsh.py`(需 RSH_USER / RSH_PASS)
+#   ⚠️ 含引号/管道/分号的远端命令一律**写成 .sh 上传再 bash 执行** —— 内联必被三层引号吃掉;
+#      长任务用 `setsid nohup node scripts/soak.ts ... < /dev/null &` 起,
+#      且**别让 sleep 混在被杀的会话里**。取采样读 **.log**,不读 .out。
+```
+
+### 13.7 一次自我更正(记一次)
+
+w59 交付后我写了「已修」—— 随后被**自己的 60 分钟长跑**推翻(`acViolations` 仍 512 饱和、
+`acDroppedViolations` 65835/29min ≈ 38/s)。教训:**反作弊这类「判据的参考点」缺陷,2 秒的短跑门禁
+与一次探针都可能看不出来** —— 它的 onset ≈ **92 秒**,且只在**长跑**里才累积成风暴。
+⇒ 定这类缺陷的**唯一**可信判据是「**长跑台账 + 逐次 `applyMove` 的偏离量**」两件一起看。
