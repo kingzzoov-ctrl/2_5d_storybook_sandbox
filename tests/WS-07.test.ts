@@ -1915,14 +1915,20 @@ test('E17e 【如实钉住残留】静默后同帧连发仍可有界获益(未�
   /* 但它**有界**:放行条数 ≤ 积压量,不随报文数无界增长 */
   ok(allowed <= IDLE + MAX_MOVE_CATCHUP_TICKS,
     `有界确认:放行 ${allowed} 条应 ≤ 积压量 ${IDLE + MAX_MOVE_CATCHUP_TICKS}`);
-  /* 且修复前是**零代价无界**(20 包全放行 / 0 分),现在至少留下违规流水。
-     ⚠️ 实测拒因是 **SPEED** 而非 TELEPORT —— 爆发打满后是**窗口检查**在拦尾部,
-     说明窗口对「同帧累积超速」并非完全失明(与我在别处的推断不同,以实测为准)。 */
+  /* 且修复前是**零代价无界**(20 包全放行 / 0 分),现在至少留下违规流水。 */
   ok(rejected > 0, `较修复前已改善:现在至少拒 ${rejected} 条并记分,修复前为 0 拒 0 分`);
   const kinds = new Set(ac.violations().map((v) => v.kind));
   ok(kinds.size > 0, `越界包应留下违规流水,实际 [${[...kinds].join(',')}]`);
-  eq(kinds.has(ViolationKind.SPEED), true,
-    `实测拒因应为 SPEED(窗口检查在拦尾部),实际 [${[...kinds].join(',')}]`);
+  /* ★ WS-FND-172 口径变更(本条自述「根治时应更新」,现按新口径改):
+     窗口的**时间轴**由自报 `claimedTick` 改为**服务端时钟** `s.lastTick`
+     (见 `anticheat.ts` §6.2)。同一帧内连发的报文因此全落进**同一个 `lastTick`**
+     ⇒ `spanTicks = 0` ⇒ 窗口检查**不触发**;这批越界包改由**单帧跳变(TELEPORT)**
+     拦下。残留本身未被根治(放行条数仍 = 积压量,见上),变的只是拦它的那道检查:
+     TELEPORT 权重 4 > 旧 SPEED 的 3 ⇒ 达到踢出阈值的速度**更快**,不是更慢。 */
+  eq(kinds.has(ViolationKind.TELEPORT), true,
+    `实测拒因应为 TELEPORT(单帧跳变在拦尾部),实际 [${[...kinds].join(',')}]`);
+  eq(kinds.has(ViolationKind.SPEED), false,
+    `窗口检查不得再在同帧连发上报 SPEED(时间轴锚服务端时钟 ⇒ spanTicks=0),实际 [${[...kinds].join(',')}]`);
 
   /* ★ 关键定性:这是**一次性位置可达优势**,不是**可持续移速优势**。
      必须钉住,否则会被误读成「能一直超速」——而实测恰恰相反。 */

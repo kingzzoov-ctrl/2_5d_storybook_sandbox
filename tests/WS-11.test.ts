@@ -158,6 +158,20 @@ import { fileURLToPath } from 'node:url';
 /** 仓库根(本文件在 <root>/tests/ 下)。 */
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+/* 判据用文本:读生产源码后**先剥注释**,再判定「有没有这处调用/引用」。
+ *
+ * 为什么必须有它:本文件里多条断言的主语是「生产源码里有没有这处**调用/引用**」
+ * (`tickPartyMode` / `resolveShield` / `tickAfk` / 露水)。注释里出现同一个词
+ * 只是**在解释**这件事 ⇒ 对全文做 `includes`/正则会被自己的文档字符串打红
+ * (判据被它声称的本体的**说明文字**证伪)。禁的是调用/引用,不是解释它为什么重要。
+ *
+ * ⚠️ 反向禁令同样成立:**不许为了过判据去删注释** —— 那些注释记的是缺陷修复的理由。
+ *
+ * 剥法:`deadcode-audit.ts:stripCommentsOnly` 的老口径 —— 先抹块注释,再抹行注释,
+ * 且避开 `://`(URL / 路径里的双斜杠不是注释起点)。 */
+const stripComments = (src: string): string =>
+  src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
 /* ════════════════════════════════════════════════════════════════════
  * A. 急单:订单生成可复现 + 3 分钟状态机 + 交付评分
  * ════════════════════════════════════════════════════════════════════ */
@@ -1627,10 +1641,13 @@ test('J10 四大模式各自的结算互不串扰', () => {
 
 test('task-38:四个模块的宿主在生产里都不存在(故「接线」是伪命题)', () => {
   /* ⚠️ 断言必须读**生产源码文本**,不能用「文件里有没有这个词」的宽匹配 ——
-   * 注释与类型声明都会命中,会造成恒真。下面统一用 import 语句/成员访问形态。 */
+   * 注释与类型声明都会命中,会造成恒真。下面统一用 import 语句/成员访问形态。
+   * ★ 文本判据一律先**剥注释**(本文件顶部 `stripComments`):本批给 room.ts 补的注释里
+   *   出现了 `tickPartyMode`,而那是在**解释**「net 层不驱动它」,不是在驱动它 ⇒
+   *   对全文 `includes` 会被自己的文档字符串打红。⚠️ 反向禁令:**不许为了过判据删注释**。 */
 
   /* modes.ts:生产只有 party **枚举存储**,没有对局运行时。 */
-  const room = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  const room = stripComments(readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8'));
   ok(/partyMode/.test(room), 'room.ts 有 partyMode 字段(仅是枚举存储)');
   for (const absent of ['tickPartyMode', 'RoomMode', 'MatchState', 'createPartyMode']) {
     ok(!room.includes(absent),
@@ -1677,8 +1694,10 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
   /* (i) 驱动点**唯一**。比原来的「某个文件没有它」更强:禁的是任何第二处。
          两处驱动会让时钟双倍前进,而**不报错**。 */
   {
+    /* ★ 剥注释后再数驱动点:room.ts 里有多处注释在**讨论** `tickAfk`(说明文字),
+       它们不是第二处驱动 —— 本判据禁的是**调用**,不是解释。 */
     const drivers = ['server/src/sim/world_sim.ts', 'server/src/net/room.ts']
-      .filter((p) => readFileSync(join(ROOT, p), 'utf8').includes('tickAfk'));
+      .filter((p) => stripComments(readFileSync(join(ROOT, p), 'utf8')).includes('tickAfk'));
     eq(drivers.length, 1,
       `tickAfk 的驱动点必须恰好 1 处(实测:${drivers.join(', ') || '无'})——`
       + `两处会让逻辑时钟双倍前进且不报错`);
@@ -1816,10 +1835,8 @@ test('task-38:四个模块的宿主在生产里都不存在(故「接线」是�
    *   修前这里直接对**全文**做 `includes`,而 `world_sim.ts` 里有一行注释在解释
    *   「`resolveShield` 永远收到没开盾」(那是缺陷修复的说明文字)⇒ 判据被自己的
    *   文档字符串打红。禁的是**调用/引用**,不是解释它为什么重要。
-   *   剥法是 `deadcode-audit.ts:stripCommentsOnly` 的老口径:先抹块注释,再抹行注释
-   *   且避开 `://`(URL / 路径里的双斜杠不是注释起点)。 */
-  const stripComments = (src: string): string =>
-    src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+   *   剥法用本文件顶部的 `stripComments`(与 `deadcode-audit.ts:stripCommentsOnly` 同口径:
+   *   先抹块注释,再抹行注释且避开 `://` —— URL / 路径里的双斜杠不是注释起点)。 */
   ok(!stripComments(wildSim).includes('resolveShield'), 'world_sim 不调 resolveShield(剥注释后)');
   ok(!stripComments(room).includes('resolveShield'), 'room.ts 也不调 resolveShield(剥注释后)');
 
@@ -1872,7 +1889,7 @@ test('task-38:两处「AFK」是不同概念,不应互相顶替', () => {
    * social/afk.ts 的 `AFK` = 挂机攒露水玩法(DOZE_AFTER_SEC / 露水)。
    * 同名会让后来者以为「room 已经有 AFK 了,afk.ts 不用接」—— 正是误报掩盖。
    * 判据:room.ts 里**没有**露水/打盹产出概念。 */
-  const room = readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8');
+  const room = stripComments(readFileSync(join(ROOT, 'server', 'src', 'net', 'room.ts'), 'utf8'));
   ok(/AFK_TIMEOUT_MS/.test(room), 'room.ts 有 AFK 概念(在场状态)');
   ok(!/露水|dew/i.test(room), '但 room.ts **不含**露水/dew ⇒ 与 afk.ts 不是同一件事');
 

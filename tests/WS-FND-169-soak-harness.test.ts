@@ -15,7 +15,7 @@
  * FND169-3  快跑真能跑通:短跑产出**恰好** ceil(时长/间隔)+1 条样本,日志**追加**且逐行可读回
  * FND169-4  内存 / 库增长**读得出来**:RSS/heap 非零、库字节增长、users/room_players 有行
  * FND169-5  ★ 客户端动作**真的改了世界**:move/action/attack 三条上行都到过服务端且被执行,
- *           玩家坐标相对出生点发生了位移,世界侧物质层被调用过
+ *           玩家坐标相对出生点发生了位移,**地形**被真的写过(`terrainWrites > 0`)
  * FND169-6  ★★ 负对照:0 客户端 ⇒ `NO_LOAD`(而不是假装有负载);同一个判据在 2 客户端上必须 `LOAD`
  * FND169-7  ★ 单调增长的集合可判:世界帧号/上行计数/采样条数**单调涨**,内存类在下降集合里;
  *           判据的负对照 = 手写样本里那条序列降一格 ⇒ 必须从「单调涨」里掉出去
@@ -255,7 +255,12 @@ test('FND169-5 ★ 客户端动作真的改了世界:三条上行都到达并被
   ok(load.movesApplied > 0, `服务端**真应用**了移动(实际 ${load.movesApplied})`);
   ok(load.actionsApplied > 0, `动作到达了房间执行层(实际 ${load.actionsApplied})`);
   ok(load.actionOk >= 1, `至少一条动作真的成功(实际 OK ${load.actionOk} 条:${JSON.stringify(shortRun.summary.actionKinds)})`);
-  ok(load.worldWrites > 0, `世界侧物质层被真的调用过(实际 ${load.worldWrites} 次)`);
+  /* ★ WS-FND-173 修正:修前这里断的是 `load.worldWrites > 0` —— 而那颗计数器
+     数的是「物质层五方法被调了几次」,**地面掉落**就能满足它(实测 2 秒短跑里
+     `worldWrites=4` 全部来自地面掉落与被拒的拆块,`room_chunks` 一行都没有)。
+     ⇒ 改成地形写(`placeBlock` / `breakBlock` 成功),它才真的对应「地形被改」。 */
+  ok(load.terrainWrites > 0,
+    `地形被真的写过(实际 ${load.terrainWrites} 次;地面写 ${load.groundWrites}、被拒 ${load.rejectedWrites})`);
 
   /* ★★ 世界**真的变了**:坐标相对出生点挪开了(不是「调了方法就算数」)。 */
   ok(load.displacement > 0.5,
@@ -276,7 +281,9 @@ test('FND169-6 ★★ 负对照:0 客户端 ⇒ 报告 NO_LOAD(不假装有负�
     '一条上行都没发');
   eq(negLast.load.movesApplied + negLast.load.actionsApplied + negLast.load.attacksApplied, 0,
     '一条动作都没被执行');
-  eq(negLast.load.worldWrites, 0, '世界侧零写入(没有人去改世界)');
+  eq(negLast.load.terrainWrites, 0, '地形零写入(没有人去改地形)');
+  eq(negLast.load.groundWrites, 0, '地面账零写入');
+  eq(negLast.load.rejectedWrites, 0, '连被拒的地形写都没有');
   eq(negLast.load.displacement, 0, '零位移');
 
   /* 世界**仍在跑**:「无负载」不等于「没在跑」。 */
@@ -403,12 +410,14 @@ test('FND169-11 汇总与序列对账:首末/峰值与序列同一份事实', ()
 /** 空计数(只为 `summarizeSoak` 的形参;**不**参与任何负载断言)。 */
 function emptyCounters(): {
   movesApplied: number; movesWorldRejected: number; actionsApplied: number; actionOk: number;
-  actionKinds: Record<string, number>; attacksApplied: number; worldWrites: number;
+  actionKinds: Record<string, number>; attacksApplied: number;
+  terrainWrites: number; groundWrites: number; rejectedWrites: number;
   framesReceived: number;
 } {
   return {
     movesApplied: 0, movesWorldRejected: 0, actionsApplied: 0, actionOk: 0,
-    actionKinds: {}, attacksApplied: 0, worldWrites: 0, framesReceived: 0,
+    actionKinds: {}, attacksApplied: 0,
+    terrainWrites: 0, groundWrites: 0, rejectedWrites: 0, framesReceived: 0,
   };
 }
 

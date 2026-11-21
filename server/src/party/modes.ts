@@ -204,23 +204,23 @@ export function settlePartyRun(m: PartyModeRuntime): PartySettlement | null {
 }
 
 /**
- * 全模式统一推进入口:处理 BUILD→RACE→SETTLED 的相位与总时长。
+ * 全模式统一推进入口:处理 BUILD→RACE→SETTLED(→IDLE,见 §6)的相位与总时长。
  * 注意 CROWN_BR 由 `tickCrown` 自行判定提前结束,此函数只兜底超时。
  *
  * ★ WS-FND-120:相位走到 `SETTLED` 时**顺便结算**(`settlePartyRun`),不再依赖
  * 上层「记得调 settle*」—— 修前五个 `settle*` 在生产里零调用,`settlement`
  * 恒 `null`、`rewards` 一份不发。现在有两条进入结算的路径,都只走钩子:
  *   · 本函数把相位推到 `SETTLED` 的那一帧(超时);
- *   · 子运行自己提前结束(如 `tickCrown` 的 60 秒持冠)⇒ 下一次 tick 走
- *     「已 SETTLED 但还没结算」那一支。
+ *   · 子运行自己提前结束(如 `tickCrown` 的 60 秒持冠)⇒ 走「已 SETTLED 但还没结算」那一支。
  */
 export function tickPartyMode(m: PartyModeRuntime): string[] {
   const ev: string[] = [];
   if (m.phase === PARTY_PHASE.IDLE) return ev;
   const t = modeElapsedSec(m);
 
-  /* 已结束但尚未结算(子运行提前宣胜 / 上一帧只置了相位)⇒ 本帧补结算。 */
+  /* 已结束:未结算 ⇒ 本帧补结算;结算已定格 ⇒ **自动回 IDLE**(§6,D-23)。 */
   if (m.phase === PARTY_PHASE.SETTLED) {
+    if (m.settlement !== null) return autoIdleAfterSettle(m, ev);
     const done = settlePartyRun(m);
     if (done !== null && m.settlement === done) ev.push('PARTY_SETTLED');
     return ev;
@@ -990,3 +990,66 @@ export function assertAllModesPresent(): void {
 }
 
 assertAllModesPresent();
+
+/* ═══════════ ★ WS-FND-176 §6:结算之后**自动回 `IDLE`**(owner 裁定 D-23)═══════════
+ *
+ * ⚠️ 本段放在**文件末**是刻意的:`party/modes.ts` 的上半段有按**行号**钉住的判据锚
+ * (`tests/WS-FND-136-constants-single-source.test.ts` 的 257/258/329/479/595-598/
+ * 614/695/706),在中间插行会让那些锚整段漂移 ⇒ 追加在这里,它们一行都不动。
+ */
+
+/**
+ * **结算定格之后把相位送回 `IDLE`** —— D-23「派对结算自动回 `IDLE`」的实现点。
+ * 唯一调用点:`tickPartyMode` 的 `SETTLED` 支(`if (m.settlement !== null)`)。
+ *
+ * ## 修前是什么样(与 D-23 **直接冲突**的缺陷)
+ *
+ * ```text
+ * `phase` 一旦变成 SETTLED 就再也出不去 —— 全仓只有 436 哨台按 -1 的
+ * `WorldSim.clearPartyRun()` 清掉赛局容器 ⇒ `partyPhase()` 才回 'IDLE'。
+ * 自然超时结算的局没有任何人按 -1:
+ *   ⇒ `partyPhase()` 永远停在 'SETTLED'
+ *   ⇒ 房间侧 `syncPartyRecord` 的收束支(**判据是 `'IDLE'`**)永不触发
+ *   ⇒ 记分账 `PartyRecord` 永远 `RUNNING`,`addScore` 继续累计
+ *     (名次早在结算那一刻定格,分却还在涨 —— 谁最后报分谁赢)
+ * ```
+ *
+ * ⇒ 本函数补上那一步:结算**已经定格**之后的下一慢帧,相位回 `IDLE`。
+ * `WorldSim.partyPhase()` 的 `'IDLE'`(定义 = 「没有赛局容器」)与这里给出的
+ * `'IDLE'` 是**同一个可读值** ⇒ 房间侧那条既有收束路径(D-23 影响 §1:
+ * 世界回 `IDLE` + 账本仍 `RUNNING` ⇒ `endParty`)对**自然超时**也真的成立。
+ *
+ * ## 两条边界(刻意的)
+ *
+ * ```text
+ * 1 结算那一帧仍报 `SETTLED`,**不**提前回 IDLE:
+ *   · `settleBridgeRun` 的安慰分只在 `SETTLED` 折算 ⇒ 相位必须先到位再结算;
+ *   · 「结算帧可见」被既有冻结判据钉着(WS-FND-120 FND120-5 / WS-FND-142
+ *     FND142-11 / WS-11 H1·H3 都在结算帧读 `SETTLED`);
+ *   · 那一帧房间的账**还没关**(账本仍 `RUNNING`)⇒ 结算前一刻的分照样算得进去。
+ * 2 回 `IDLE` **不**清任何东西:
+ *   · `m.settlement` 留在运行时上(名次 / 终端文案 / 回执仍可读 —— 与
+ *     `clearPartyRun` 的「清空容器」是两件事);
+ *   · `phaseSwitches` 不加:那一格记的是 BUILD→RACE→SETTLED 这类**模式节拍**,
+ *     回 IDLE 不是节拍切换(WS-11 H1 钉着切换次数)。
+ * ```
+ *
+ * ## 五个 `settle*` 走的是**同一条**相位轨 ⇒ 一处修好,五处受益
+ *
+ * `settleBridgeRun` / `settleJellyBall` / `settleCrown` / `settlePaintWar` /
+ * `settleRace` 都只经 `tickPartyMode` 推相位(超时那一条,或 `tickCrown` 提前宣胜后
+ * 「已 SETTLED 但还没结算」那一条)⇒ 不存在「某个模式要单独再修一次」。
+ * ⚠️ `settleJellyBall` / `settleCrown` / `settlePaintWar` / `settleRace` 自己**不查**
+ * 幂等(每次调用都重算一遍并覆盖 `m.settlement`);它们共同的护栏是
+ * `settlePartyRun` 的「`m.settlement` 非空 ⇒ 原样返回」。本函数只把相位送回 `IDLE`,
+ * **不会**触发任何结算:第二次进 `SETTLED` 支时 `m.settlement` 已非空 ⇒ 直接回 `IDLE`。
+ *
+ * @param m  本局的模式运行时(唯一被改的字段是 `phase`)
+ * @param ev 本慢帧的事件列表(原地 push `PHASE:IDLE`,与 `PHASE:SETTLED` 同一词表)
+ * @returns `ev`(同引用;`tickPartyMode` 直接把它交出去)
+ */
+function autoIdleAfterSettle(m: PartyModeRuntime, ev: string[]): string[] {
+  m.phase = PARTY_PHASE.IDLE;
+  ev.push('PHASE:IDLE');
+  return ev;
+}

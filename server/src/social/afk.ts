@@ -141,6 +141,19 @@ export function goForeground(p: AfkPlayer): void {
 /**
  * 单步推进打盹:推荐 dt = 0.5s(低频帧)。
  * 返回本步获得的整滴露水数量。
+ *
+ * ## 时基:世界钟(游戏秒)—— 不是墙钟(★ WS-FND-174)
+ *
+ * `nowSec` / `dt` 都由世界侧喂(`world_sim.ts#tickPartyStep` 里的
+ * `partyClock.advance(SIM_SLOW_DT)`),单位是**世界秒**:`p.dozedSec += dt`、
+ * `p.healedHp += BED_HP_PER_SEC * dt`、`p.dewAcc += 速率 × dt` 三处都在这个钟上。
+ *
+ * ⇒ 「一次打盹的**结束**」也必须在同一个钟上:上游那条窗口
+ * (`actions/sleep.ts` 的 `SLEEP_DURATION_SEC = 60`,按世界钟开、按世界钟判到期)
+ * 与这里的累加是**同一段时间** —— 睡满 60 世界秒 ⇔ 回血攒了
+ * `60 × BED_HP_PER_SEC`。任一边退回墙钟,帧率低于名义 20Hz(实测 ~16Hz)时两边
+ * 差约 20%(墙上 60 秒 ≈ 世界 47.8 秒),表现是「睡够了却还在回血 / 没睡够就
+ * 停了」,而**不报错**。
  */
 export function tickAfk(p: AfkPlayer, nowSec: number, dt: number): number {
   if (dt <= 0) return 0;

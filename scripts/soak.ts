@@ -35,7 +35,8 @@
  *
  * ```text
  * 1 客户端**真发动作**(move / action / attack 三条上行),不是只连上挂着;
- *   ⇒ `load.movesApplied` / `load.actionsApplied` / `load.worldWrites` 会涨
+ *   ⇒ `load.movesApplied` / `load.actionsApplied` / `load.terrainWrites` 会涨;
+ *     轮转里含 `PLACE_BLOCK` / `BREAK_BLOCK`,目标格**随玩家移动而变**(不是只打脚下)
  * 2 采样**结构化**一行一条(`[soak] {json}`),可被 `parseSampleLine` 读回、逐字段断言
  * 3 采样**追加**到日志(不覆盖):`--minutes 1` 也留下可对账的样本序列
  * 4 `--clients 0` 必须报告 `NO_LOAD`,**不许**假装有负载(负对照组)
@@ -52,7 +53,8 @@
  * 自动存档  count / failCount / lastReason / lastError / inFlight / backoffFrames
  * 帧率      tick.worldTick / observed / meanMs / minMs / maxMs / fps(实际间隔,非标称)
  * 负载      clients / connected / movesApplied / actionsApplied / actionOk /
- *           attacksApplied / worldWrites / sends / framesReceived
+ *           attacksApplied / terrainWrites / groundWrites / rejectedWrites /
+ *           sends / framesReceived
  * ```
  *
  * ⚠️ 读数**只读**:本文件不触发存档、不改房间状态。唯一「动」的东西是
@@ -101,6 +103,23 @@ export type SoakOptions = {
   quiet: boolean;
   /** 每条样本的回调(测试用)。 */
   onSample: ((s: SoakSample) => void) | null;
+  /**
+   * 放置 / 拆块 / 采集的**挑格策略**(WS-FND-173)。
+   *
+   * ```text
+   * 'varying'   默认:在玩家周围半径 2 内挑「空格」(放)/「有物件的格」(拆),
+   *             扫描起点按轮次旋转 ⇒ 目标格随玩家移动**与轮次**都变(不是只打脚下)
+   * 'offworld'  负对照:目标恒取**世界外**那一格 ⇒ `placeBlock` / `breakBlock`
+   *             一律被世界拒(理由「坐标 … 在世界外」),零副作用、
+   *             **一个 chunk 都不改** ⇒ 判据 flags 里 `rejectedWrites > 0`
+   *             而 `room_chunks` 与 `terrainWrites` 都不动
+   * ```
+   *
+   * ⚠️ 负对照为什么不用「自己脚下那一格」:实测玩家会走过**生成的地形物件**
+   *   (树/矿脉),那时脚下的 `GATHER` / `BREAK_BLOCK` **会成功** ⇒ 负对照自己
+   *   造出地形写,判据转假又转真,没有牙。世界外那一格是确定性的零副作用目标。
+   */
+  placeTarget: 'varying' | 'offworld';
 };
 
 /** 夹具的**默认值**(量纲都写在这里,不散在代码里)。 */
@@ -119,6 +138,7 @@ export const DEFAULT_SOAK_OPTIONS: SoakOptions = {
   fresh: false,
   quiet: false,
   onSample: null,
+  placeTarget: 'varying',
 };
 
 /** 用法(打印在 `--help` / 参数错时)。 */
@@ -137,7 +157,8 @@ export function usage(): string {
     '  --log <PATH>         采样日志(追加)  默认 .data/soak-<minutes>m.log',
     '  --room-id <ID>       房间 id  默认 soak',
     '  --fresh              开跑前删掉旧库与旧日志',
-    '  --quiet              不往 stdout 打样本行',
+  '  --quiet              不往 stdout 打样本行',
+  '  --place-offworld     放置/拆块/采集恒打世界外那格(负对照:必被拒、不改地形)',
   ].join('\n');
 }
 
@@ -197,7 +218,8 @@ export function parseSoakArgs(argv: readonly string[]): SoakOptions {
     throw new Error(`--warmup 必须是非负整数(实际 ${warmupFrames})`);
   }
   if (dbPath === '') throw new Error('--db 不能为空(本夹具只跑文件库版本)');
-
+  /* `--place-offworld` = 负对照开关(布尔 ⇒ 没有「非法值」这种可能):见 `placeTarget`。 */
+  const placeOffworld = argv.includes('--place-offworld');
   return {
     minutes,
     clients,
@@ -213,6 +235,7 @@ export function parseSoakArgs(argv: readonly string[]): SoakOptions {
     fresh: argv.includes('--fresh'),
     quiet: argv.includes('--quiet'),
     onSample: null,
+    placeTarget: placeOffworld ? 'offworld' : 'varying',
   };
 }
 
@@ -240,7 +263,17 @@ export type SoakLoad = {
   actionsApplied: number;
   actionOk: number;
   attacksApplied: number;
-  worldWrites: number;
+  /**
+   * ★ WS-FND-173:世界侧三类写法**分开计数**(修前只有一颗 `worldWrites`,
+   * 定义见 `applyMaterialWrite`)。判据要的是「地形真的被写」这一维:
+   * `terrainWrites > 0 ⇔ room_chunks > 0`。
+   */
+  /** 真改了 chunk 的地形写次数(`placeBlock` / `breakBlock` 返回 `ok:true`)。 */
+  terrainWrites: number;
+  /** 地面物品账的写入次数(**一个字都不改 chunk**;`dropItem` / 拾取 / 消耗)。 */
+  groundWrites: number;
+  /** 地形写口**被世界拒**的次数(`placeBlock` / `breakBlock` 返回 `ok:false`)。 */
+  rejectedWrites: number;
   /** Σ|Δx| + |Δy|(假客户端相对各自出生点的位移)——「世界真的被挪了」。 */
   displacement: number;
   sends: { move: number; action: number; attack: number };
@@ -323,7 +356,8 @@ export const SOAK_SERIES: readonly string[] = [
   'autosave.count', 'autosave.failCount',
   'tick.worldTick', 'tick.observed',
   'load.movesApplied', 'load.movesWorldRejected', 'load.actionsApplied',
-  'load.actionOk', 'load.attacksApplied', 'load.worldWrites', 'load.displacement',
+  'load.actionOk', 'load.attacksApplied', 'load.terrainWrites',
+  'load.groundWrites', 'load.rejectedWrites', 'load.displacement',
   'load.sends.move', 'load.sends.action', 'load.sends.attack',
 ];
 
@@ -428,7 +462,10 @@ export type LoadCounters = {
   actionOk: number;
   actionKinds: Record<string, number>;
   attacksApplied: number;
-  worldWrites: number;
+  /** ★ WS-FND-173:地形写 / 地面写 / 被拒的三颗**互斥**计数器(定义见 `applyMaterialWrite`)。 */
+  terrainWrites: number;
+  groundWrites: number;
+  rejectedWrites: number;
   framesReceived: number;
 };
 
@@ -441,7 +478,9 @@ export function emptyLoadCounters(): LoadCounters {
     actionOk: 0,
     actionKinds: {},
     attacksApplied: 0,
-    worldWrites: 0,
+    terrainWrites: 0,
+    groundWrites: 0,
+    rejectedWrites: 0,
     framesReceived: 0,
   };
 }
@@ -473,10 +512,64 @@ export function wrapMethods(
   }
 }
 
-/** 世界侧「真的改了世界」的方法(物质层五件 + 攻击结算)。 */
-export const WORLD_WRITE_METHODS: readonly string[] = [
+/** 物质层的全部写口(放置 / 破坏 / 地面掉落三件)。 */
+export const MATERIAL_WRITE_METHODS: readonly string[] = [
   'dropItem', 'takeGroundItemNear', 'consumeGroundItem', 'placeBlock', 'breakBlock',
 ];
+
+/**
+ * ★ WS-FND-173:把一次**物质层写法**的返回值分进三个**互斥**计数桶。
+ *
+ * ## 为什么要拆(修前那颗 `worldWrites` 为什么不够)
+ *
+ * 修前只有一颗计数器,数的是「物质层五方法被调用了几次」。它把三类写法
+ * **混在一个数**里:
+ *
+ * ```text
+ * 真改了地形的        placeBlock / breakBlock 成功
+ * 只动地面物品账的    dropItem / 拾取 / 消耗(一个字都不改 chunk)
+ * 被世界拒的          placeBlock / breakBlock 失败(「这一格没有物件」…)
+ * ```
+ *
+ * 后果:`load.worldWrites > 0` 被**地面掉落**就能满足 ⇒ 「真客户端动作 →
+ * 地形被写 → chunk 落库」这条链**没有任何判据覆盖**(实测:60 分钟长跑里
+ * `room_chunks` 恒 0,而 `worldWrites` 一直涨 —— 见 `tests/WS-FND-173` 的文件头)。
+ *
+ * ## 三个桶的定义(判据用的就是这三条)
+ *
+ * ```text
+ * terrainWrites   真改了 chunk 的:placeBlock / breakBlock 返回 ok:true
+ *                 (GATHER 也走 breakBlock ⇒ 自然计入)
+ * groundWrites    地面物品账的写入:dropItem 总是写;takeGroundItemNear /
+ *                 consumeGroundItem 只在**真的扣到东西**时才算
+ * rejectedWrites  地形写口被世界**拒**的次数(placeBlock / breakBlock 返回 ok:false)
+ * ```
+ *
+ * ⚠️ 不变量:`terrainWrites + rejectedWrites` = 地形写的尝试次数;
+ *   `terrainWrites` 与 `groundWrites` **互斥**(前者必改 chunk,后者一个字都不改)。
+ */
+export function applyMaterialWrite(counters: LoadCounters, name: string, result: unknown): void {
+  switch (name) {
+    case 'placeBlock':
+    case 'breakBlock': {
+      const ok = (result as { ok?: unknown } | null | undefined)?.ok === true;
+      if (ok) counters.terrainWrites += 1;
+      else counters.rejectedWrites += 1;
+      return;
+    }
+    case 'dropItem':
+      counters.groundWrites += 1;
+      return;
+    case 'takeGroundItemNear':
+      if (result === true) counters.groundWrites += 1;
+      return;
+    case 'consumeGroundItem':
+      if (typeof result === 'number' && result > 0) counters.groundWrites += 1;
+      return;
+    default:
+      return;
+  }
+}
 
 /* ═══════════════════════════ 5. 假客户端(真 WebSocket)═══════════════════════════ */
 
@@ -567,35 +660,146 @@ function intentOf(
   return { t: 'move', tick: rt.state.meta.tick, x, y, z: pos.z, seq: c.seq };
 }
 
+/** 一格(**整格**坐标,不是玩家那种半格浮点位置)。 */
+type Cell = { x: number; y: number };
+
+/**
+ * 环形扫描的**偏移序列**(由内向外:r=1 的 8 格 → r=2 的 16 格)。
+ *
+ * 顺序是**确定性**的(不随机、不排序)⇒ 判据里「挑哪一格」可复现;
+ * 起点由调用方按轮次旋转 ⇒ 同一次跑动里目标格不会钉死在同一处。
+ */
+function ringOffsets(radius: number): Cell[] {
+  const out: Cell[] = [];
+  for (let r = 1; r <= radius; r += 1) {
+    for (let dy = -r; dy <= r; dy += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        out.push({ x: dx, y: dy });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 放置/拆块的候选偏移(半径 2)。
+ *
+ * 半径取 2 的理由:1 格内常常是**玩家自己脚下**或紧贴的墙,`placeBlock` 会因实体
+ * 占位被拒;3 格以上开始像「隔空造墙」。2 格既是对「站在旁边动手」的直觉,
+ * 又让目标格**不止一格**(坐标真的在变)。
+ */
+const CELL_OFFSETS: readonly Cell[] = ringOffsets(2);
+
+/** 玩家脚下那一格(整格坐标)。 */
+function cellOf(pos: { x: number; y: number }): Cell {
+  return { x: Math.floor(pos.x), y: Math.floor(pos.y) };
+}
+
+/** 世界侧的**读口**子集(夹具只用它挑格;宿主缺席 ⇒ null)。 */
+type MaterialsRead = { blockAt(x: number, y: number): number };
+
+/** 取世界侧物质层的读口;没有世界源 ⇒ `null`(调用方退回脚下那一格)。 */
+function materialsOf(rt: RoomRuntime): MaterialsRead | null {
+  const host = rt.worldSaveHost;
+  if (host === null || host === undefined || typeof host.materials !== 'function') return null;
+  return host.materials();
+}
+
+/**
+ * 在 `at` 周围挑一格满足 `want` 的格子;一圈都挑不到 ⇒ `null`。
+ *
+ * `spin` 旋转扫描起点(传**轮次**)⇒ 目标格随玩家**移动**与**轮次**都变,
+ * 这正是「不要只打脚下」这条要求落到代码上的形态。
+ */
+function pickCell(
+  mat: MaterialsRead, at: Cell, sizeCells: number, spin: number, want: 'empty' | 'occupied',
+): Cell | null {
+  const n = CELL_OFFSETS.length;
+  for (let i = 0; i < n; i += 1) {
+    const o = CELL_OFFSETS[(i + spin) % n] as Cell;
+    const x = at.x + o.x;
+    const y = at.y + o.y;
+    if (x < 0 || y < 0 || x >= sizeCells || y >= sizeCells) continue;
+    const obj = mat.blockAt(x, y);
+    if (want === 'empty' ? obj === 0 : obj !== 0) return { x, y };
+  }
+  return null;
+}
+
 /**
  * 造一条**动作/攻击**上行(轮转)。返回值是完整的上行报文。
  *
- * 轮转表刻意覆盖三条不同的执行层:`material`(丢/拾/拆)、`sleep`、
+ * 轮转表刻意覆盖三条不同的执行层:`material`(丢 / 拾 / 拆 / **放**)、`sleep`、
  * `use_item`、以及战斗那条**独立**的 `attack` 通道 —— 长跑要压的是它们的总和,
  * 不是某一个。
+ *
+ * ## 为什么必须含 `PLACE_BLOCK` 与「对有物件的格 `BREAK_BLOCK`」(WS-FND-173)
+ *
+ * 修前的轮转里**一个地形写都没有**:
+ *
+ * ```text
+ * BREAK_BLOCK / GATHER  打的是**自己脚下那一格**(那里是空格)
+ *                       ⇒ 世界回「这一格没有物件」⇒ 被拒,chunk 一个字节都不改
+ * PLACE_BLOCK           根本不在轮转表里
+ * ⇒ 60 分钟长跑里 room_chunks 恒 0 行,而 worldWrites 一直涨
+ *   (它数的是地面掉落 + 被拒的拆块)⇒「真客户端动作 → 地形被写 → chunk 落库」
+ *   这条链没有任何判据覆盖(见 tests/WS-FND-173 的文件头)
+ * ```
+ *
+ * 现在:
+ * ```text
+ * PLACE_BLOCK   在玩家周围挑**空**格(obj = 0)放下背包里第一件 ⇒ 真改 chunk
+ * BREAK_BLOCK   在玩家周围挑**有物件**的格拆 ⇒ 真改 chunk
+ *               (周围一圈都没有物件时退回脚下 ⇒ 如实记一次 rejectedWrites)
+ * GATHER        同一条挑格规则(采集的扣减也走 breakBlock)
+ * ```
  */
 function actionIntentOf(
-  rt: RoomRuntime, c: FakeClient, round: number,
+  rt: RoomRuntime, c: FakeClient, round: number, options: SoakOptions,
 ): Record<string, unknown> | null {
   const pos = rt.playerState(c.userId);
   const inv = rt.authoritativeItemIds(c.userId);
   const itemId = inv.length > 0 ? (inv[0] as number) : null;
   const wildlife = rt.state.wildlife;
-  switch (round % 7) {
+  const mat = materialsOf(rt);
+  const self = pos === undefined ? null : cellOf(pos);
+  /**
+   * 目标格。负对照(`placeTarget === 'offworld'`)恒取**世界外**那一格:
+   * `placeBlock` / `breakBlock` 必被世界拒(零副作用、一个 chunk 都不改)
+   * ⇒ 那是「被拒的地形写」那条判据的负对照。
+   */
+  const targetOf = (want: 'empty' | 'occupied'): Cell => {
+    if (options.placeTarget === 'offworld') {
+      return { x: options.sizeCells + 4, y: options.sizeCells + 4 };
+    }
+    if (self === null || mat === null) return self ?? { x: 0, y: 0 };
+    return pickCell(mat, self, options.sizeCells, round, want) ?? self;
+  };
+  switch (round % 8) {
     case 0:
       return itemId === null ? null
         : { t: 'action', action: 'DROP_ITEM', x: pos?.x ?? 0, y: pos?.y ?? 0, itemId, count: 1 };
     case 1:
       return itemId === null ? null
         : { t: 'action', action: 'PICKUP_ITEM', x: pos?.x ?? 0, y: pos?.y ?? 0, itemId };
-    case 2:
-      return { t: 'action', action: 'GATHER', x: pos?.x ?? 0, y: pos?.y ?? 0 };
+    case 2: {
+      const at = targetOf('occupied');
+      return { t: 'action', action: 'GATHER', x: at.x, y: at.y };
+    }
     case 3:
       return { t: 'action', action: 'SLEEP' };
     case 4:
       return itemId === null ? null : { t: 'action', action: 'USE_ITEM', itemId };
-    case 5:
-      return { t: 'action', action: 'BREAK_BLOCK', x: pos?.x ?? 0, y: pos?.y ?? 0 };
+    case 5: {
+      const at = targetOf('occupied');
+      return { t: 'action', action: 'BREAK_BLOCK', x: at.x, y: at.y };
+    }
+    case 6: {
+      const at = targetOf('empty');
+      return itemId === null ? null
+        : { t: 'action', action: 'PLACE_BLOCK', x: at.x, y: at.y, itemId };
+    }
     default: {
       const mob = wildlife.length > 0 ? (wildlife[0] as { mobId?: string }) : null;
       const mobId = mob?.mobId;
@@ -734,7 +938,9 @@ export async function createSoakFixture(options: SoakOptions): Promise<SoakFixtu
   wrapMethods(runtime, ['applyAttack'], () => { counters.attacksApplied += 1; });
   const host = runtime.worldSaveHost;
   if (host !== null) {
-    wrapMethods(host, WORLD_WRITE_METHODS, () => { counters.worldWrites += 1; });
+    wrapMethods(host, MATERIAL_WRITE_METHODS, (name, _args, result) => {
+      applyMaterialWrite(counters, name, result);
+    });
   }
   void lastWorldTick;
 
@@ -890,7 +1096,7 @@ function startFakeClients(
         }
       }
       if (actionEveryTicks > 0 && tick % actionEveryTicks === 0) {
-        const msg = actionIntentOf(runtime, c, Math.floor(tick / actionEveryTicks) + c.index);
+        const msg = actionIntentOf(runtime, c, Math.floor(tick / actionEveryTicks) + c.index, options);
         if (msg !== null) {
           socket.send(JSON.stringify(msg));
           if (msg['t'] === 'attack') sent.attack += 1;
@@ -948,21 +1154,8 @@ function buildSample(input: SampleInput): SoakSample {
   const walBytes = fileBytes(`${input.dbPath}-wal`) + fileBytes(`${input.dbPath}-shm`);
   const rt = input.runtime;
 
-  const intervals = input.tickIntervals;
-  let tickMean = 0;
-  let tickMin = 0;
-  let tickMax = 0;
-  if (intervals.length > 0) {
-    let sum = 0;
-    tickMin = intervals[0] as number;
-    tickMax = intervals[0] as number;
-    for (const v of intervals) {
-      sum += v;
-      if (v < tickMin) tickMin = v;
-      if (v > tickMax) tickMax = v;
-    }
-    tickMean = sum / intervals.length;
-  }
+  /* ★ D-26:节拍读数走 8b 的**同一份**实现(`tickRateOf`),这里不再自己算一遍。 */
+  const rate = tickRateOf(input.tickIntervals);
 
   const c = input.counters;
   const load: SoakLoad = {
@@ -974,7 +1167,9 @@ function buildSample(input: SampleInput): SoakSample {
     actionsApplied: c.actionsApplied,
     actionOk: c.actionOk,
     attacksApplied: c.attacksApplied,
-    worldWrites: c.worldWrites,
+    terrainWrites: c.terrainWrites,
+    groundWrites: c.groundWrites,
+    rejectedWrites: c.rejectedWrites,
     displacement: input.clients.displacement(),
     sends: {
       move: input.clients.sent.move,
@@ -1019,11 +1214,11 @@ function buildSample(input: SampleInput): SoakSample {
     },
     tick: {
       worldTick: rt.state.meta.tick,
-      observed: intervals.length,
-      meanMs: Math.round(tickMean * 100) / 100,
-      minMs: tickMin,
-      maxMs: tickMax,
-      fps: tickMean > 0 ? Math.round((1_000 / tickMean) * 100) / 100 : 0,
+      observed: rate.observed,
+      meanMs: rate.meanMs,
+      minMs: rate.minMs,
+      maxMs: rate.maxMs,
+      fps: rate.fps,
     },
     load,
     verdict: anyUplink || anyApplied ? 'LOAD' : 'NO_LOAD',
@@ -1138,13 +1333,110 @@ export function formatSummaryLines(s: SoakSummary): string[] {
     `  [soak] 库    首 ${s.disk.first}B → 末 ${s.disk.last}B(+${s.disk.delta}B)`,
     `  [soak] 事件  ${s.events.first} → ${s.events.last}(+${s.events.delta}) · room_players ${s.tables['room_players']?.last ?? 0} · users ${s.tables['users']?.last ?? 0}`,
     `  [soak] 存档  成功 ${s.autosave.count} 次 · 失败 ${s.autosave.failCount} 次 · 最近原因 ${s.autosave.lastReason ?? '(无)'}`,
-    `  [soak] tick  ${s.tick.observed} 帧间隔 · 均值 ${s.tick.meanMs}ms · 最大 ${s.tick.maxMs}ms · ${s.tick.fps}fps`,
-    `  [soak] 负载  move ${s.load.movesApplied} · action ${s.load.actionsApplied}(OK ${s.load.actionOk}) · attack ${s.load.attacksApplied} · 世界写 ${s.load.worldWrites}`,
+    `  [soak] tick  ${s.tick.observed} 帧间隔 · 均值 ${s.tick.meanMs}ms · 最大 ${s.tick.maxMs}ms · ${s.tick.fps}fps`
+      + ` · 世界钟×墙钟倍率 ${clockRatio(s.tick.fps)}(1200 游戏秒 ≈ ${Math.round(1_200 * clockRatio(s.tick.fps) * 10) / 10} 墙钟秒;`
+      + ' 详见 D-26)',
+    `  [soak] 负载  move ${s.load.movesApplied} · action ${s.load.actionsApplied}(OK ${s.load.actionOk}) · attack ${s.load.attacksApplied}`
+      + ` · 地形写 ${s.load.terrainWrites} · 地面写 ${s.load.groundWrites} · 被拒 ${s.load.rejectedWrites}`,
     `  [soak] 单调增长 ${s.monotonicGrowers.length === 0 ? '(无)' : s.monotonicGrowers.join(', ')}`,
     `  [soak] 中途下降 ${s.decreased.length === 0 ? '(无)' : s.decreased.join(', ')}`,
   ];
 }
 
+/* ═══════════════ 8b. 时间口径:帧数即时间(★ D-26)═══════════════ */
+
+/**
+ * ★ D-26:**世界时间 = `frameCount × DT`**(不读挂钟)。
+ *
+ * 标称 50ms/帧(20Hz)是**物量纲**,不是墙钟承诺 —— 宿主定时器粒度 > 50ms 的机器上,
+ * 20Hz 循环的真实节拍更长(本机实测 ≈ 62.77ms/帧):
+ *
+ * ```text
+ * 1200 游戏秒 = 1200 帧 × 50ms = 60.0 墙钟秒(标称,只在 50ms 粒度机器上成立)
+ * 本机实测    1200 帧 × 62.77ms = 75.3 墙钟秒 ⇒ 倍率 = 20 / 15.93 = 1.2555
+ * ```
+ *
+ * 本节四个函数是**唯一**的倍率实现:`play.ts` 的启动打印与 `soak.ts` 的汇总行
+ * 都调它们,不许各自再算一遍(判据 `tests/WS-FND-175-clock-convention.test.ts`)。
+ */
+
+/** 标称帧间隔(ms)。**必须**等于 `shared/types/physics.ts#DT × 1000`(50)。 */
+export const NOMINAL_TICK_MS = 50;
+
+/** 标称帧率(Hz)。 */
+export const NOMINAL_TICK_HZ = 1_000 / NOMINAL_TICK_MS; // 20
+
+/** 一段帧间隔样本的读数(与样本行里的 `tick` **同一份**)。 */
+export type TickRate = {
+  observed: number;
+  meanMs: number;
+  minMs: number;
+  maxMs: number;
+  fps: number;
+};
+
+/** 实测帧率(2 位小数);`meanMs <= 0` ⇒ 0(**不编数**)。 */
+export function observedFps(meanMs: number): number {
+  return meanMs > 0 ? Math.round((1_000 / meanMs) * 100) / 100 : 0;
+}
+
+/**
+ * 世界钟相对墙钟的**倍率**(4 位小数)= 标称帧率 ÷ 实测帧率。
+ *
+ * ```text
+ * 倍率 1.0    实测节拍 = 标称 ⇒ 游戏秒 与 墙钟秒 同时走
+ * 倍率 1.2555 实测 15.93fps ⇒ 1200 游戏秒要走 1506.6 墙钟秒(本机)
+ * ```
+ *
+ * 非正数一律返回 0(由调用方判「不适用」,不在这里假装 1.0)。
+ */
+export function clockRatio(fps: number, nominalMs: number = NOMINAL_TICK_MS): number {
+  if (!(fps > 0) || !(nominalMs > 0)) return 0;
+  return Math.round(((1_000 / nominalMs) / fps) * 10_000) / 10_000;
+}
+
+/** 由实测**均值间隔**算倍率(先 `observedFps` 再 `clockRatio`,两步各只有一份实现)。 */
+export function clockRatioOfMean(meanMs: number, nominalMs: number = NOMINAL_TICK_MS): number {
+  return clockRatio(observedFps(meanMs), nominalMs);
+}
+
+/** 由一段帧间隔算节拍读数(采样本体与本节的打印**共用**它,不各算一遍)。 */
+export function tickRateOf(intervals: readonly number[]): TickRate {
+  if (intervals.length === 0) return { observed: 0, meanMs: 0, minMs: 0, maxMs: 0, fps: 0 };
+  const first = intervals[0] as number;
+  let sum = 0;
+  let min = first;
+  let max = first;
+  for (const v of intervals) {
+    sum += v;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const mean = sum / intervals.length;
+  return {
+    observed: intervals.length,
+    meanMs: Math.round(mean * 100) / 100,
+    minMs: min,
+    maxMs: max,
+    fps: observedFps(mean),
+  };
+}
+
+/**
+ * 「实测节拍」的**一行**(启动打印与汇总行同款同一份实现):
+ * 均值/最小/最大间隔 · 实际 fps · **世界钟 × 墙钟倍率** · 1200 游戏秒折算的墙钟秒。
+ */
+export function formatTickRateLine(
+  label: string, r: TickRate, nominalMs: number = NOMINAL_TICK_MS,
+): string {
+  if (r.observed <= 0) return `${label}: 没采到帧间隔(样本 0 条)⇒ 倍率不适用`;
+  if (r.meanMs <= 0) return `${label}: ${r.observed} 个帧间隔但均值 0ms(低于时钟分辨率)⇒ 倍率不适用`;
+  const ratio = clockRatio(r.fps, nominalMs);
+  const wallSec = Math.round(1_200 * ratio * 10) / 10;
+  return `${label}: ${r.observed} 个帧间隔 · 均值 ${r.meanMs}ms · 最小 ${r.minMs}ms · 最大 ${r.maxMs}ms`
+    + ` · 实际 ${r.fps}fps(标称 ${nominalMs}ms ⇒ ${NOMINAL_TICK_HZ}fps)`
+    + ` · 世界钟×墙钟倍率 ${ratio}(1200 游戏秒 ≈ ${wallSec} 墙钟秒)`;
+}
 /* ═══════════════════════════ 9. 跑一次 ═══════════════════════════ */
 
 /** 一次长跑的全部产物。 */

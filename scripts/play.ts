@@ -15,6 +15,9 @@
  *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来。实测:
  *   预热 1200 帧(60 秒)⇒ 3 只;默认取 2400 帧(120 秒)⇒ 更多。
  *   **已经有生物**:生物是按配表密度逐只刷的,第一只约 13 秒才来
+ *   └ ★ **D-26(时间口径)**:启动 5 秒后打印**实测节拍**(tick 间隔 / 实际 fps /
+ *     世界钟×墙钟倍率)。世界时间 = `帧数 × DT`,**不读挂钟** ⇒
+ *     **「1200 游戏秒」不等于「1200 墙钟秒」**(本机实测 62.77ms/帧 ⇒ 倍率 1.2555)。
  * ```
  *
  * ## 为什么必须用 `assemble()` 而不是 `ws_demo.ts`
@@ -57,6 +60,10 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_DB_PATH, assemble } from '../server/src/index.ts';
 import { startWsServer } from '../server/src/net/ws_server.ts';
 
+import { DT } from '../shared/types/physics.ts';
+
+import { formatTickRateLine, tickRateOf, type TickRate } from './soak.ts';
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const argv = process.argv.slice(2);
@@ -82,6 +89,42 @@ const DB_PATH = DB_FLAG_AT >= 0 ? (argv[DB_FLAG_AT + 1] ?? '') : '';
 const DB_TARGET: string | null = MEMORY_MODE ? null : (DB_PATH !== '' ? DB_PATH : DEFAULT_DB_PATH);
 
 const log = (m: string): void => { console.log(`  [play] ${m}`); };
+
+/**
+ * 实测节拍探针(★ D-26):**只读** `step` 的调用间隔 —— 不改参数、不改返回值、
+ * 不吞异常。返回的 `rate()` 与 `formatTickRateLine()` 一起给出
+ * 「实测 tick 间隔 / 实际 fps / 世界钟×墙钟倍率」。
+ *
+ * 导出是为了**可判**(`tests/WS-FND-175-clock-convention.test.ts` 拿一个假 `step`
+ * 直接验它);同款包法见 `scripts/soak.ts#createSoakFixture`。
+ */
+export type TickProbe = {
+  /** 已采到的间隔(ms);第一个调用没有前驱 ⇒ 不计。 */
+  intervals: number[];
+  /** 现算的节拍读数(均值 / 极值 / fps)。 */
+  rate: () => TickRate;
+  /** 还原原方法(测试用)。 */
+  restore: () => void;
+};
+
+/** 装探针(幂等性不管:同一对象只许装一次,与 `soak.ts` 同款)。 */
+export function installTickProbe(room: object): TickProbe {
+  const target = room as unknown as Record<string, unknown>;
+  const base = (target['step'] as (...args: unknown[]) => unknown).bind(room);
+  const intervals: number[] = [];
+  let lastAtMs = 0;
+  target['step'] = (...args: unknown[]): unknown => {
+    const now = Date.now();
+    if (lastAtMs !== 0) intervals.push(now - lastAtMs);
+    lastAtMs = now;
+    return base(...args);
+  };
+  return {
+    intervals,
+    rate: () => tickRateOf(intervals),
+    restore: (): void => { target['step'] = base; },
+  };
+}
 
 async function main(): Promise<void> {
   /* ── 1 真实世界 + 房间 ── */
@@ -114,7 +157,11 @@ async function main(): Promise<void> {
   const warmT0 = Date.now();
   for (let i = 0; i < warmup; i += 1) assembled.runtime.step(null);
   const mobs = assembled.host.listWildlife();
-  log(`预热 ${warmup} 帧(${(warmup / 20).toFixed(0)} 秒世界时间,耗时 ${Date.now() - warmT0}ms)`
+  /* ★ D-26:世界时间是 `帧数 × DT`(**不读挂钟**)⇒ 这里的「秒」是**世界秒**;
+     而那个 `耗时 Xms` 是**同步跑帧的 CPU 成本**,不是节拍 ——
+     真实节拍(墙钟)见下面「实测节拍」那一行。 */
+  log(`预热 ${warmup} 帧(${(warmup * DT).toFixed(0)} 秒世界时间 = ${warmup} 帧 × DT;`
+    + `同步跑帧的 CPU 耗时 ${Date.now() - warmT0}ms,不是节拍)`
     + ` ⇒ 世界里有 ${mobs.length} 只生物`
     + (mobs.length === 0 ? '  ⚠️ 一只都没有(若 --size 小到整图都在安全区里,就会是 0)' : ''));
   if (mobs.length > 0) {
@@ -122,6 +169,17 @@ async function main(): Promise<void> {
       + (mobs.length > 8 ? ` … 共 ${mobs.length} 只` : ''));
   }
   log(`房间 ${assembled.runtime.id} 就绪;host=${assembled.host === null ? 'null(异常)' : '已装配'}`);
+
+  /* ── 1c 实测节拍探针(★ D-26:帧数即时间)──
+     世界时间 = `frameCount × DT`(不读挂钟)⇒「20Hz / 50ms」是**物量纲的标称**,
+     不是墙钟承诺:宿主定时器粒度 > 50ms 的机器上,同一段世界时间要更长的墙钟。
+     探针只**读** `step` 的调用间隔(不改参数 / 不改返回值),由下面的启动打印给出
+     「实测 tick 间隔 / 实际 fps / 世界钟×墙钟倍率」。
+     ⚠️ 必须在 `startWsServer` **之前**装:那个 20Hz 循环每次现取 `room.step`。
+     ⚠️ 本脚本的循环 `frameMs = 20` ⇒ 每次广播推**一**世界帧(50ms 世界时间)
+     ⇒ 标称下世界钟比墙钟**快** 2.5 倍(倍率 = 每世界帧墙钟 ms ÷ DT,< 1)。
+     启动打印里的倍率把它如实算出来 —— 别按「1 世界帧 = 1 墙钟帧」读。 */
+  const tickProbe = installTickProbe(assembled.runtime);
 
   /* ── 2 WS 服务端(20Hz;room.step 推进世界) ── */
   const srv = await startWsServer({
@@ -131,6 +189,14 @@ async function main(): Promise<void> {
     onLog: (m) => { if (process.env['PLAY_VERBOSE'] === '1') log(`[ws] ${m}`); },
   });
   log(`WS 服务端:ws://127.0.0.1:${srv.port}/ws`);
+
+  /* ── 2a 实测节拍(★ D-26)──
+     5 秒后打一行:此时循环已跑过几十帧,读数才有意义。**只打印**,不改世界一步。
+     `unref`:它不该让进程活着(退出由 ws / 浏览器那侧决定)。 */
+  const tickWatch = setTimeout(() => {
+    log(formatTickRateLine('实测节拍(WS 循环 step:每次广播 = 1 世界帧)', tickProbe.rate()));
+  }, 5_000);
+  if (typeof tickWatch.unref === 'function') tickWatch.unref();
 
   /* ── 2b 自动存档的**日志观测点**(owner 裁定要求「失败不能静默」)──
      每 10 秒对比一次房间的存档计数:变了就报「存了几次 / 最近何时」,
@@ -197,6 +263,7 @@ async function main(): Promise<void> {
       + ` · 最近 ${rt.lastSaveAt === null ? '从未' : new Date(rt.lastSaveAt).toLocaleTimeString()}`
       + (rt.lastSaveError === null ? '' : ` · 最近错因:${rt.lastSaveError}`));
     clearInterval(saveWatch);
+    clearTimeout(tickWatch);
     try { web?.kill(); } catch { /* 已退出 */ }
     void srv.close();
     setTimeout(() => process.exit(0), 50);
@@ -205,7 +272,12 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((e: unknown) => {
-  console.error(`  [play] 启动失败:${(e as Error).stack ?? String(e)}`);
-  process.exit(1);
-});
+/* ★ 入口守卫(与 `scripts/soak.ts` 同款):被 import 时**不**启动服务 ——
+   判据(`tests/WS-FND-175-clock-convention.test.ts`)要直接验本文件的探针与打印。 */
+const entry = process.argv[1]?.replace(/\\/g, '/');
+if (entry !== undefined && entry.endsWith('play.ts')) {
+  main().catch((e: unknown) => {
+    console.error(`  [play] 启动失败:${(e as Error).stack ?? String(e)}`);
+    process.exit(1);
+  });
+}

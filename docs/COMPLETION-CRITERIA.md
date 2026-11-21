@@ -54,8 +54,11 @@
 | 28 | 剩余状态落库(装备 / 房间运行时 / 牧场 / 温室 / 百货库存 / 生物位置朝向 / 电路件) | 达成(边界:证据 = **文件库往返**(写句柄关掉再新句柄读回**逐段一致**)+ 坏档如实标 `corrupt`(**不猜**),不是小时级真跑) | `tests/WS-FND-168-state-persistence.test.ts`(15/15)+ 实现/真值源 `server/src/db/schema_room_runtime.sql` · `server/src/db/repo.ts`(`saveRoomRuntimeState` / `loadRoomRuntimeState` · `PLAYER_EQUIPMENT_*` · `ROOM_RUNTIME_*`)· `server/src/sim/world_sim.ts`(`saveToDb` 生产入口) | 2026-11-21 |
 | 29 | 真长跑夹具(`scripts/soak.ts`)自身有判据 | 达成(边界:夹具在**真墙钟 / 真文件 I/O / 真 socket / 真协议**下短跑即产数、可断言;小时级真跑仍等 owner 环境) | `tests/WS-FND-169-soak-harness.test.ts`(11/11:量纲钳制 / 采样行 `[soak] {json}` 可读回 / 内存与库增长读得出 / 多客户端真改世界 / 0 客户端 `NO_LOAD` 负对照 / 单调序列 / 自动存档次数字账)/ `node scripts/soak.ts` | 2026-11-21 |
 | 30 | canvas 可读性与浏览器基线 | 达成(边界:真浏览器不可测 —— 基线句靠**源码逐字比对**(README ↔ `BROWSER_BASELINE_TEXT`)、降级靠桩 DOM 触发) | `tests/WS-FND-170-canvas-a11y.test.ts`(11/11:画布字号/描边与 DOM 基线同源 · `vite.config.ts#BUILD_TARGET='es2022'` · `structuredClone` 缺 API 时 JSON 往返降级 + `role=\"alert\"` 横幅)/ `client/src/ui/a11y.ts#browserBaselineReport` · README「浏览器兼容性基线」 | 2026-11-21 |
+| 31 | 时间口径「帧数即时间」显式声明且有判据 | 达成(边界:倍率是**本机实测**(62.77ms/帧 ⇒ 1.2555),换一台机器就是另一个数 —— **口径**与机器无关,**数字**有关) | `tests/WS-FND-175-clock-convention.test.ts`(声明句逐字 · 启动打印含倍率 · D-26 表逐行 `文件:行` + needle 与「口径」列一致 · 倍率可复算 · 负对照:删声明句 / 口径改反 ⇒ 红)+ 真值源 `scripts/play.ts#installTickProbe` · `scripts/soak.ts#clockRatio` · `docs/DECISIONS.md` D-26 · README「时间口径:帧数即时间」 | 2026-11-25 |
+| 32 | 跨钟缺陷修复:派对 HUD 剩余与打盹窗口改用**世界钟**(与相位判定同源) | 达成 | `tests/WS-FND-174-cross-clock.test.ts`(9/9:HUD 归零帧 == 世界结算帧 · 归零前**一帧都不许**显示 0 · 20Hz ↔ 15.93Hz 同帧归零 · 打盹窗口按世界秒,负对照/注入见各条)、修点 `server/src/net/room.ts#syncPartyHud` · `server/src/net/actions/sleep.ts`、读口 `WorldSaveHost.simSeconds` | 2026-11-25 |
+| 33 | 派对自然结算后回 `IDLE`(与 **D-23** 对齐) | 达成 | `tests/WS-FND-176-party-settle-idle.test.ts`(9/9:自然结算后相位回 `IDLE` · 账本被 `endParty` 收束 · 结算后 `addScore` 被拒 · `SETTLED` 恰好停一慢帧 · 哨台 `-1` 收局幂等)、修点 `server/src/party/modes.ts#tickPartyMode`、房间侧 `server/src/net/room.ts#syncPartyRecord` | 2026-11-25 |
 
-⇒ **判据:本表 30 项全部「达成」或「达成(边界)」才算完成。今天:27 项达成(其中 16 项带边界)/ 3 项未达成(#13 #14 #15)。**
+⇒ **判据:本表 33 项全部「达成」或「达成(边界)」才算完成。今天:30 项达成(其中 17 项带边界)/ 3 项未达成(#13 #14 #15)。**
 
 ### 复算(三条命令,别抄数)
 

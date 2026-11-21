@@ -63,6 +63,31 @@ export const SPEED_WINDOW_TICKS = 20; // 1 秒
 export const SPEED_WINDOW_TOLERANCE = 1.25;
 
 /**
+ * ★ 速度窗口**分母**用的帧间隔(秒)的缺省值 = 标称 `DT`(20Hz,50ms)。
+ *
+ * ## 为什么需要它
+ * 窗口分母原先是写死的 `spanTicks × DT`,而宿主定时器粒度可能 > 50ms ——
+ * 本机实测 **62.77ms/帧(= 15.93Hz)**,`docs/DECISIONS.md` D-26。
+ * 此时 20 帧窗口跨的是 **1.2555 秒**真实时间,分母却只记 1.0 秒
+ * ⇒ 满速裸装合法玩家 4.5 格/秒被读成 `4.5 × 20/15.93 = 5.65 > 5.625`(**误判 SPEED**)。
+ *
+ * ## 它与 `SPEED_WINDOW_TOLERANCE` 的分工(不要混淆)
+ * ```
+ * SPEED_WINDOW_TOLERANCE —— 判据:容忍多少超速。放大它在**真作弊者**身上同步放水
+ *                           (6.0 格/秒会变成合法,且会红掉以 5.63 为锚的
+ *                            WS-07 `M49` / WS-10:`5.63 限住总量` 那两条)。
+ * 本常量                —— 秒表:一帧是多少秒。修正它只把读数**还原成真实格/秒**,
+ *                           判据一字不动(真作弊者 6.0 格/秒在实测节拍下照样 > 5.625)。
+ * ```
+ *
+ * ## 怎么注入
+ * `AntiCheatRoom.setFrameIntervalMs(ms)` 或 `tick(t, frameMs)`(`room.ts` 有
+ * `this.clock.nowMs()` 可读实测节拍)。**不注入 ⇒ 本缺省值**,既有判据逐位不变
+ * (含 WS-07/WS-10 的 5.63 锚点与 FND172-3 登记的 5.65 误判)。
+ */
+export const DEFAULT_FRAME_DT_SECONDS = DT;
+
+/**
  * 自报 `tick` 相对**水位**允许的单包最大超前量(帧)。它是**斜率**限制,不是配额。
  *
  * ## 两个水位,两种含义(原名 `s.lastTick` 被两侧共写,是失明的病根)
@@ -73,6 +98,12 @@ export const SPEED_WINDOW_TOLERANCE = 1.25;
  * `claimedTick = min(intent.tick, lastMoveTick + MAX, lastTick + MAX)`。
  * 夹取点仍在 `checkMove` 入口**一处**(下游一律用 `claimedTick`),
  * 调用方不再重复夹取(J13 形态)。
+ *
+ * ⚠️ **唯一例外:窗口的时间轴**。★ WS-FND-172 起 §6.2 的 `window.push` /
+ * `cutoff` / `spanTicks` 读的是 `s.lastTick`(**服务端时钟**),不是 `claimedTick` ——
+ * 因为 `claimedTick` 被 `lastMoveTick + MAX` 项夹住,推进速率 = `min(报文率, 帧率)`,
+ * 拿它当秒表就会把「报文条数」当成「时间」。额度(`dtTicks`)与跳变判据仍全走
+ * `claimedTick`,**未动**。
  *
  * ## 为什么单靠 `MAX` 不够:同一帧可重复兑现额度
  *
@@ -119,27 +150,42 @@ export const SPEED_WINDOW_TOLERANCE = 1.25;
  *
  * ## ⚠️ 残留(如实记录,本修复**没有**根治这一条)
  *
- * 上面的「跨不过墙」是**单包**性质。本修复把额度锚在服务端时钟上,
- * 但时钟是**按帧**推进的,于是攻击者只要**静默若干帧**换取积压,
- * 再在**同一帧内**连发,就能把积压一次兑现:
+ * 上面的「跨不过墙」是**单包**性质。额度锚在服务端时钟上,而时钟是**按帧**推进的,
+ * 于是攻击者只要**静默若干帧**换取积压,再在**同一帧内**连发,就能把积压一次兑现:
  *
  *   静默 T 帧 ⇒ 可用额度 B = T + 1(帧);同帧内连发 K 包时
  *   超出 B 的包被拒 ⇒ 分数 = 4×拒(TELEPORT)或 3×拒(SPEED)。
  *
- * 实测(静默 19 帧 + 同帧连发 22 包):**放行 19 包 / 拒 3 条(全为 SPEED,权重 3)/
- * 违规分 9.0 < 12 ⇒ 未被踢出**,单帧位移 **17.442 格** ⇒ 可越过 10 格墙。
+ * ★ WS-FND-172(2026-11-21)把**窗口时间轴**改锚 `s.lastTick`(见 §6.2)后重测:
+ *   · 静默 19 帧 + 同帧连发 22 包 ⇒ **放行 20 / 拒 2(全 TELEPORT,权重 4)/
+ *     违分 8.0 < 12 ⇒ 未被踢**,单帧位移 **18.36 格**;
+ *     (改前口径:19 放行 / 3 拒 SPEED / 9 分 / 17.442 格 —— 拒因 SPEED→TELEPORT,
+ *      权重 3→4 ⇒ 记分更快。)
+ *   · **立刻重复**该循环 ⇒ 第 2 轮 22 条**全判 SPEED**,累计分 73.58 ⇒ 被踢(实测)。
  *
- * 但它是**一次性的位置可达优势,不是移速优势** —— 这一点必须说清,否则会
- * 把它误报成「可以一直超速」:
- *   · **立刻重复**该循环 ⇒ **第 2 轮即被踢出**(累计分 74.6,实测);
- *   · **等分数衰减归零再爆**(0.02/帧 ⇒ 9 分需 450 帧)⇒ 稳态
- *     **0.712 格/秒 = 合法裸装 4.5 的 0.16 倍**,比合法玩法**更慢**。
+ * ⚠️ ⚠️ 同一改动曾打开另一条更大的口子 —— **本轮已修**(见 §6.2b 零跨度分支 / `FND172-10`);
+ *   **修前**实测如下(如实保留作对照):同帧连发的报文在时间轴上**全落进同一个 `lastTick`**
+ *   ⇒ 窗口检查对「同帧突发」完全失明;而额度 = T + 1 ⇒ 只要把静默间隔拉到
+ *   ≥ `SPEED_WINDOW_TICKS`(20 帧),上一轮的位置也已被 `cutoff` 剪掉,
+ *   突发就**一条都不被拒**:
  *
- * 与修复前的定性差别(这是本任务的实质交付):
+ *   实测(间隔 22 帧、每轮 22 包 × 0.918 格、跑 20 轮):
+ *     · 本改动后:**403.92 格 / 460 帧 ≈ 17.56 格/秒,0 违规、0 踢**;
+ *     · 改前(窗口轴 = `claimedTick`)同一输入:**17.442 格 / 460 帧 ≈ 0.76 格/秒,
+ *       且第 1 轮即被判 SPEED 踢出**。
+ *   ⇒ 定性从「**一次性**位置可达优势」变成「**可持续**移速优势」(
+ *     裸装合法 4.5 的 3.9 倍、满加成合法 11.48 的 1.53 倍)。
+ *   ⚠️ 还有一处**旧耦合未被本改动覆盖**(非本改动引入):窗口**分母**仍是
+ *     标称 `spanTicks × DT`,而 `DT = 50ms` 是标称帧间隔。服务端真实帧率低于
+ *     标称时(如 15.93Hz),窗口跨的 20 帧是 **1.256 秒**真实时间,分母却记
+ *      1.0 秒 ⇒ **满速裸装合法玩家 4.5 → 5.65 格/秒 > 上限 5.625,仍被误判 SPEED**。
+ *     (本改动消掉的是 `min(f_c, f_s)` 里的**报文率** `f_c` 那一项;`f_s` 那一项还在。)
+ *
+ * 与修复前的定性差别(task-55 的实质交付):
  *   · 修复前:同一形状 **20 包全放行 / 18.36 格 / 违规分恒 0** ⇒
  *     零代价、无界、可无限重复;
- *   · 修复后:单帧位移**有界**(≤ B × 0.918)、超出部分**必留违规流水并记分**、
- *     重复即踢。残留收窄为「一次穿墙」,不再是「零代价无限瞬移」。
+ *   · task-55 修复后:**单包**位移有界(≤ B × 0.918)、超出部分**必留违规流水并记分**。
+ *     ⚠️ 「残留收窄为一次穿墙」这个定性**已被 WS-FND-172 推翻**(见上)。
  *
  * 根治需要两件事之一(均**不在本文件职责内**):
  *   1. **入站报文限速**(会话/传输层):同一帧内进站报文数有上限,
@@ -448,7 +494,7 @@ export function advanceServerClock(s: PlayerAntiCheatState, tick: number): void 
  *
  * `checkMove` 在**放行**时会把三件事一起推进:
  * ```
- * s.window.push(申报坐标)        窗口式移速的时间轴
+ * s.window.push(申报坐标)        窗口式移速的时间轴(时间戳 = `s.lastTick`,见 §6.2)
  * s.lastX / lastY / lastZ        下一包「跳变」比较的基准
  * s.lastMoveTick                 下一包「额度」的基准(单调)
  * ```
@@ -645,12 +691,18 @@ export function maxDisplacementPerTick(speedMul = 1, limits: AntiCheatLimits = D
   return BASE_MOVE_SPEED * mul * DT * limits.teleportSlack;
 }
 
-/** 校验一次移动意图。 */
+/** 校验一次移动意图。
+ *
+ * `dtSeconds` = §6.2 窗口**分母**用的帧间隔(秒),缺省标称 `DT`。由调用方注入**实测**
+ * 节拍 —— 宿主定时器粒度 > 50ms 的机器上这是一个真差别(见 `DEFAULT_FRAME_DT_SECONDS`)。
+ * 它只影响分母;`dtTicks` 额度与单帧跳变上界仍按标称 `DT` 记账(**未动**)。
+ */
 export function checkMove(
   s: PlayerAntiCheatState,
   intent: MoveIntent,
   limits: AntiCheatLimits = DEFAULT_LIMITS,
   maxZ = 3,
+  dtSeconds = DEFAULT_FRAME_DT_SECONDS,
 ): Verdict {
   /* ── 6.0 值域门:非有限值一律拒绝 ──
    *
@@ -759,16 +811,48 @@ export function checkMove(
   }
   void dz;
 
-  /* ── 6.2 窗口式移速 ── */
-  s.window.push({ tick: claimedTick, x: intent.x, y: intent.y });
-  const cutoff = claimedTick - limits.speedWindowTicks;
+  /* ── 6.2 窗口式移速 ──
+   * ★ WS-FND-172(P1):窗口的**时间轴 = 服务端时钟 `s.lastTick`**,不是自报 `claimedTick`。
+   *
+   * 病理:额度按**帧**发(`dtTicks × maxDisplacementPerTick`),而窗口时间轴此前走
+   * `claimedTick` —— 后者被 `lastMoveTick + MAX` 夹住,同一帧内每发一条最多只推进
+   * `MAX = 1` ⇒ `spanTicks ≈ 报文条数`,而分母 `spanS = spanTicks × DT` 却按
+   * 「1 tick = 50ms」记账。于是合法速度被读成 `S_obs = S × 20/min(f_c, f_s)`
+   * (`f_c` = 报文率,`f_s` = 服务端帧率):**报文率低于标称**时(客户端 15.93Hz、
+   * 服务端 20Hz),4.5 格/秒的满速合法玩家被算成 5.65 > 上限 5.625。实测旧轴判
+   * 1 次 SPEED、新轴 0 次(WS-FND-172 `FND172-2`)。
+   * 锚到 `s.lastTick` 后,窗口的时间轴与额度**同一个时钟**,`min` 里的 `f_c` 那一项消失;
+   * 抬高自报 `tick` 也不再能推动时间轴(判据 `FND172-5`)。
+   *
+   * ★ 分母不再写死标称 `DT`(★ 本轮修点):新增**可注入的帧间隔**,
+   * 注入点 `AntiCheatRoom.setFrameIntervalMs()` / `tick(t, frameMs)`
+   * (见 `DEFAULT_FRAME_DT_SECONDS` 的口径与残留)。调用方每帧传**实测**间隔后:
+   * 服务端真跑到 15.93Hz(62.77ms/帧)时,窗口跨的 20 帧 = 1.2555 秒真实时间,
+   * 分母随之 = 1.2555 秒 ⇒ 满速裸装合法玩家读出 **4.5**(不再被误判 SPEED)。
+   * ⚠️ **不注入 = 缺省 `DT`** ⇒ 逐位保持既有判据 —— `FND172-3` 登记的误判
+   * (5.65 > 5.625)在未接线的房里照旧成立,不是「已消失」。
+   *
+   * ⚠️ 同一帧内的多条报文落进**同一个 `lastTick`** ⇒ `spanTicks = 0` ⇒ 上面的窗口
+   * 检查看不到时间流逝。**这一支已修**(★ 本轮**只动这一支**):见下面 §6.2b 的零跨度
+   * 分支 —— 按「最小可判跨度 = 1 帧」结算同帧累计路径,判据 `FND172-10` / `FND172-13`。
+   * 额度/跳变逻辑(上面的 `claimedTick` / `dtTicks` / `allowed`)**仍是一字未动**。 */
+  s.window.push({ tick: s.lastTick, x: intent.x, y: intent.y });
+  const cutoff = s.lastTick - limits.speedWindowTicks;
   while (s.window.length > 2 && s.window[0].tick < cutoff) s.window.shift();
 
   const first = s.window[0];
-  const spanTicks = claimedTick - first.tick;
+  const spanTicks = s.lastTick - first.tick;
   if (spanTicks >= limits.speedWindowTicks) {
     const path = pathLength(s.window);
-    const spanS = spanTicks * DT;
+    /* ★ 分母 = `spanTicks × 帧间隔`。帧间隔取**调用方实测/注入**的值
+       (见 `DEFAULT_FRAME_DT_SECONDS`),缺省才是标称 `DT`。
+       非法注入(非有限 / ≤ 0)一律回退缺省:分母偏小 ⇒ 观测均速偏大 ⇒
+       **fail-closed**(宁可多判,不可失明) —— 与 `sanitizeMul` 同取向。
+       仅**分母**走这个值;`dtTicks` 额度与单帧跳变上界仍按标称 `DT` 记账(**未动**)。 */
+    const frameDt = Number.isFinite(dtSeconds) && dtSeconds > 0
+      ? dtSeconds
+      : DEFAULT_FRAME_DT_SECONDS;
+    const spanS = spanTicks * frameDt;
     const observed = path / spanS;
     const cap = BASE_MOVE_SPEED * sanitizeMul(intent.speedMul ?? 1, 1, limits.maxSpeedBonusMul)
       * limits.speedWindowTolerance;
@@ -778,6 +862,56 @@ export function checkMove(
         tick: claimedTick,
         playerId: s.id,
         detail: `窗口均速 ${observed.toFixed(2)} 格/秒 > 上限 ${cap.toFixed(2)}`,
+        weight: VIOLATION_WEIGHT.SPEED,
+      };
+      record(s, v);
+      return { allowed: false, corrected: { x: s.lastX, y: s.lastY, z: s.lastZ }, violation: v };
+    }
+  }
+
+  /* ── 6.2b ★ 零跨度:同一帧内的多条报文 ⇒ 按**最小可判跨度**结算 ──
+   *
+   * 病理(本分支要堵的口子):窗口的时间轴是**服务端帧号**,同一帧内连发的报文全落
+   * **同一个 `lastTick`** ⇒ `spanTicks = 0` ⇒ 上面的窗口检查看不到「时间流逝」;
+   * 而额度是按帧发的(静默 T 帧就攒 T+1 帧)⇒ 攻击者只要「静默 ≥ 一整个窗口 +
+   * 同帧连发」,积压就能一次兑现,且窗口与跳变两道检查**都放行**:
+   *   实测(间隔 22 帧 / 每轮 22 包 × 0.918 格 / 20 轮)⇒ **17.56 格/秒、0 违规、0 踢**
+   *   (旧口径下同一输入 0.76 格/秒,且第 1 轮即被判 SPEED)。
+   * ⇒ `spanTicks === 0` **不能**读成「无法判断 ⇒ 放行」,那就是失明。
+   *
+   * ## 判据一:突发必须被抓 —— 结算跨度 = **最小可判跨度 1 帧**
+   *
+   * 帧号时钟能分辨的最小跨度就是 **1 帧**,所以同帧内的累计路径一律按「在一帧内走完」
+   * 结算,与窗口上限(含 `speedWindowTolerance`)比 —— **不是**按被 `cutoff` 剪掉的
+   * 静默段去稀释(稀释正是失明的原形态)。
+   * 突发第 2 包即命中:`0.918 / 0.05 = 18.36 > 14.34`(满加成上限)。
+   *
+   * ## 判据二(**不同**的量):触发条件 = 申报水位**落后整整一个窗口**
+   *
+   * `s.lastTick - s.lastMoveTick >= speedWindowTicks` 才是「静默后突发」的指纹:
+   * 诚实客户端每帧一报,申报水位与时钟只差 0~1 帧 ⇒ 本分支不参与;
+   * 零位移的重复/心跳包累计路径 = 0 ⇒ 永不命中;连续流里的同帧双发
+   * (`spanTicks > 0`)走上一条正常分支。三种合法形状各由**不同**的量区分,
+   * 不是同一条判据的松紧 —— 判据见 `FND172-10`(静默后突发必须违规)/ `FND172-13`(同帧合法连发不违规)。
+   *
+   * 为什么不塞进 TELEPORT:那条的 detail 是「单帧位移 X > 上界 Y」,而突发里**每一包**
+   * 都在自己的额度内(X ≤ Y)⇒ 逐包判会把一条**虚假的**越界写进流水,归因失真。
+   * 真正被违反的是**均速**,归因应是 SPEED。
+   * 跨度口径与 §6.2 分母**同一个注入量**(实测帧间隔,缺省标称 `DT`)。
+   */
+  if (spanTicks === 0 && s.lastTick - s.lastMoveTick >= limits.speedWindowTicks) {
+    const minSpanS = Number.isFinite(dtSeconds) && dtSeconds > 0 ? dtSeconds : DEFAULT_FRAME_DT_SECONDS;
+    const burstPath = pathLength(s.window);
+    const burstObserved = burstPath / minSpanS;
+    const burstCap = BASE_MOVE_SPEED * sanitizeMul(intent.speedMul ?? 1, 1, limits.maxSpeedBonusMul)
+      * limits.speedWindowTolerance;
+    if (burstObserved > burstCap + 1e-9) {
+      const v: Violation = {
+        kind: ViolationKind.SPEED,
+        tick: claimedTick,
+        playerId: s.id,
+        detail: `窗口均速 ${burstObserved.toFixed(2)} 格/秒 > 上限 ${burstCap.toFixed(2)}`
+          + `(同帧突发:跨度按最小 1 帧结算;申报水位落后 ${s.lastTick - s.lastMoveTick} 帧)`,
         weight: VIOLATION_WEIGHT.SPEED,
       };
       record(s, v);
@@ -1271,6 +1405,33 @@ export class AntiCheatRoom {
    * 那就必须**让降级可观测** —— 否则它只是又一处静默降级。
    */
   readonly limitsIssues: readonly string[];
+  /**
+   * 速度窗口**分母**用的帧间隔(秒)—— 可注入,缺省标称 `DT`(见 `DEFAULT_FRAME_DT_SECONDS`)。
+   *
+   * ★ 为什么是**分母**而不是 `SPEED_WINDOW_TOLERANCE`:容差是**判据**(放大它在真作弊者
+   * 身上同步放水),分母是**秒表**(修正它只把读数还原成真实格/秒)。
+   *
+   * ⚠️ 唯一写入口是 `setFrameIntervalMs`(`tick(t, frameMs)` 只是转发):只接受
+   * **有限正数**,非法值**保持当前值**。写成 `NaN` 会让 `spanS = spanTicks × NaN`
+   * ⇒ `observed > NaN + 1e-9` 恒 `false` ⇒ 窗口检查**静默失明**(与 `sanitizeMul` 同族)。
+   *
+   * ⚠️ 残留(如实登记):注入值是**调用方说**的间隔,反作弊不独立测量 ⇒ 传进来的值
+   * 偏大时窗口读数偏低(稀释)。故调用方必须传**逐帧实测差**;局内休眠 / 暂停造成的长间隔
+   * (房间 `status !== OPEN` 时 `tick` 根本不被调用,唤醒后首个差值会很大)应丢弃或夹住。
+   */
+  dtSeconds = DEFAULT_FRAME_DT_SECONDS;
+
+  /**
+   * 注入**实测帧间隔**(毫秒),返回生效后的 `dtSeconds`。
+   *
+   * 非法(非有限 / ≤ 0)⇒ **忽略**(保持当前值,缺省 `DT`):不抛错(每帧热路径上抛错
+   * 会把「一个读数为 0」升级成房间整帧崩掉,与 `mergeLimits` 的 fail-closed 同取向),
+   * 也不改成 `NaN`(见 `dtSeconds` 的失明风险)。
+   */
+  setFrameIntervalMs(frameMs: number): number {
+    if (Number.isFinite(frameMs) && frameMs > 0) this.dtSeconds = frameMs / 1000;
+    return this.dtSeconds;
+  }
   private states = new Map<string, PlayerAntiCheatState>();
   /**
    * 违规流水(**环形缓冲**,容量 `VIOLATION_LOG_CAPACITY`)。
@@ -1325,8 +1486,15 @@ export class AntiCheatRoom {
     return this.states.get(id);
   }
 
-  /** 每帧推进:分数衰减 + **服务端时钟水位** + 淘汰被踢的玩家状态。 */
-  tick(t: number): void {
+  /**
+   * 每帧推进:分数衰减 + **服务端时钟水位** + 淘汰被踢的玩家状态。
+   *
+   * `frameMs`(可选)= 本帧与上一帧的**实测墙钟差**(毫秒),转发给
+   * `setFrameIntervalMs`;不传 ⇒ 窗口分母保持当前值(缺省 `DT`)。
+   * 这是房间侧的唯一接线点(`room.ts` 手上有 `this.clock.nowMs()`,读得到实测节拍)。
+   */
+  tick(t: number, frameMs?: number): void {
+    if (frameMs !== undefined) this.setFrameIntervalMs(frameMs);
     for (const s of this.states.values()) {
       decayScore(s);
       advanceServerClock(s, t);
@@ -1344,7 +1512,7 @@ export class AntiCheatRoom {
   move(intent: MoveIntent & { playerId: string }, maxZ = 3): Verdict {
     const s = this.states.get(intent.playerId);
     if (!s) return { allowed: false };
-    const v = checkMove(s, intent, this.limits, maxZ);
+    const v = checkMove(s, intent, this.limits, maxZ, this.dtSeconds);
     if (v.violation) this.pushViolation(v.violation);
     return v;
   }
@@ -1540,6 +1708,25 @@ export class AntiCheatRoom {
     return n;
   }
 
+
+  /**
+   * ★ WS-FND-172(P1 顺带登记):**标记为「应踢出」的玩家 id**。
+   *
+   * ⚠️ ⚠️ **生产侧目前没有任何消费者** —— 全仓 grep `kickedPlayers` / `.kicked`,
+   * `server/src/**` 里只命中本文件的定义处(`record` 置位 + 本方法),调用者
+   * **只有测试**(WS-07 `E11` / `E17d` / `E17e`、WS-FND-144 等)。
+   *
+   * 后果必须说清,否则会把它读成「已经会踢人」:
+   *   · 越过 `VIOLATION_SCORE_KICK` 只把状态里的 `kicked` 置 `true`,
+   *     **不**断开连接、**不**拒绝其后续 `move`/`attack`(`checkMove` 不看这个位)、
+   *     **不**写库(写进 `room_events` 的是 `violations()`,与 `kicked` 无关);
+   *   · 故一次**长跑**里长出来的是「**作弊证据**」(违规流水),**不是**「踢人」。
+   *     WS-FND-172 实测的持续突发玩家(`17.56 格/秒`)即使被标记,也照常移动。
+   *
+   * 要真正落地「踢」,需要房间层(`room.ts` / `room.colyseus.ts`,**不在本文件职责内**)
+   * 在每帧末读一次本方法并 `disconnect()`。在那之前,这里是**悬空的闸门**,
+   * 由本注释与 WS-FND-172 的判据共同登记(不许当它已经生效)。
+   */
   kickedPlayers(): string[] {
     return [...this.states.values()].filter((s) => s.kicked).map((s) => s.id);
   }

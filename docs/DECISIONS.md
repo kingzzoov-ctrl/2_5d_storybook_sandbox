@@ -38,6 +38,7 @@
 | D-23 | 派对结算:自动回 `IDLE`(不需要玩家确认) |
 | D-24 | 急行(急单):世界侧自动触发,不加手动开工入口 |
 | D-25 | 浏览器基线:不纳入旧 WebView(Chrome 98+ / Safari 15.4+) |
+| D-26 | 时间口径:帧数即时间(世界时间 = `frameCount × DT`,不读挂钟) |
 
 ## D-01 投影方式:以手册为准(35° 正交等轴测)
 
@@ -294,7 +295,7 @@
   ① 现状路径(无需改动):`tickPartyMode` 把相位推到 `SETTLED` 并同帧结算(`server/src/party/modes.ts`);世界侧 `clearPartyRun()` 清空容器 ⇒ `partyPhase()` 的 `IDLE` 定义 = "没有赛局容器"(`server/src/sim/world_sim.ts`);房间侧 `syncPartyRecord` 见"世界回 `IDLE` + 账本仍 `RUNNING`"即自动 `endParty` 收束(`server/src/net/room.ts`)。
   ② 不新增确认 UI / 不新增动作报文。
   ③ 哨台 STOP(`stepRefereeDesk` 的 `-1` 档)是**收起一局**的入口、不是结算确认,不受本裁定影响。
-- **判据**:`tests/WS-FND-120-party-coop-wired.test.ts`(相位到 `SETTLED` 同帧结算)· `tests/WS-FND-123-boss-party-projection.test.ts`(世界 → 房间的投影)· `tests/WS-11.test.ts`(对局运行时)。
+- **判据**:`tests/WS-FND-120-party-coop-wired.test.ts`(相位到 `SETTLED` 同帧结算)· `tests/WS-FND-123-boss-party-projection.test.ts`(世界 → 房间的投影)· `tests/WS-11.test.ts`(对局运行时)· `tests/WS-FND-176-party-settle-idle.test.ts`(自然结算后回 `IDLE` 并收束记分账 —— 本裁定的直接判据;原「结算后停在 `SETTLED`」缺陷已修)。
 
 ---
 
@@ -321,6 +322,44 @@
   ② "缺关键 API ⇒ 可读提示"这一半**由 T3 的能力探测落地**(探测代码不在本裁定内);可依的同类先例是 `WS-FND-167` 的启动看门狗 + `client/index.html` 的非 module 兜底脚本(`reportFatal` 那条路已把"主模块加载失败"从纯白屏变成可读提示)。
   ③ 本裁定只定**口径**(哪算目标环境 + 失败时给人看的话),不承诺旧 WebView 上的行为。
 - **判据**:基线口径由 `vite.config.ts` 的 `build.target` 与本文记录共同承载;"不可见失败最小化"的判据是 `tests/WS-FND-167-resilience.test.ts`(连接 / 握手具名超时 + 兜底致命出口);**能力探测的判据由 T3 那条线补**,不属本裁定,也不因此重开本项。
+
+---
+
+## D-26 时间口径:**帧数即时间**(世界时间 = `frameCount × DT`,**不读挂钟**)
+- **状态**:已裁(owner,2026-11-25)
+- **问题**:本仓的「秒」有两个来源 —— 世界侧按**帧**推进(20Hz,`DT = 50ms`),进程/网络侧按**墙钟**推进。此前这条口径**从未写下来**,于是十三轮里反复出现同一种误读:「1200 游戏秒」被当成「1200 秒实时」,预热 / 冷却 / 长跑的时长按挂钟估。宿主定时器粒度 > 50ms 的机器上误差是实打实的(本机 20Hz 循环实测 62.77ms/帧 ⇒ **1.2555 倍**)。
+- **裁定**:
+  1 **世界时间 = `frameCount × DT`(不读挂钟)**。世界里的时长(冷却 / DoT / buff / 赛局 / 打盹 / 昼夜)一律由**帧序**派生;挂钟**不许**进模拟(否则确定性、回放与跨机对账全部失效)。
+  2 **「1200 游戏秒 ≠ 1200 墙钟秒」**。60.0 墙钟秒只是「定时器恰好 50ms」的**标称**;粒度更粗的机器上实际节拍更长 —— 本机实测 62.77ms/帧 ⇒ 1200 游戏秒 ≈ 1506.6 墙钟秒。
+  3 哪些量**必须**用**墙钟**(与人 / 进程 / 网络有关):自动存档周期、心跳与离线判定、连接与握手超时、重连宽限(退避与下次重试时刻)、会话/令牌时效、炼金缓存时效、**拍卖类限时**(本仓当前无实现 = 0 处;若实现必须用墙钟,否则玩家拖慢世界就能冻结行情)。
+  4 哪些量**必须**用**游戏秒**(与世界推进有关):冷却、DoT 每段、buff 到期、赛局时长、打盹 / 露水累计、昼夜(世界钟)。
+  5 **两钟交界处必须选一个并保持同源**:跨钟比较必须**显式换算并标单位**(换算只有一处:`DT`),不许把「帧数」当「秒」用。已登记的交界处 —— 自动存档的**稳态**触发是墙钟(与 `AUTOSAVE_INTERVAL_MS` 比,走 `clock.nowMs()`),唯一按帧的那一处是**冷启动垫底**(`saveCount === 0` 期间按 `AUTOSAVE_FRAME_INTERVAL` 节流),它第一次成功存档后即失效,**不许**扩成常态;存档时间戳(unix 毫秒,墙钟)与归档里的 `frame`(游戏)各留原口径、**不互相换算**;派对赛局时长(游戏秒)与重连宽限(墙钟)**不许**相加或比较;心跳踢人(墙钟)**不许**改按帧数(慢机器上会把活人踢掉)。
+- **实测(本机,2026-11-25)**:均值间隔 `tickMean = 62.77ms` · `fps = 15.93` · **倍率 = 20 / 15.93 = 1.2555**(复算:`1000 / 62.77 = 15.93`,`20 / 15.93 = 1.2555`;同机复测 300 帧读到 62.79ms / 15.93fps ⇒ 同一个倍率)。
+- **理由**:两个钟各有正确用途,**边界**才是风险点。把「谁必须用哪个 + 交界处选一个」写死后,「慢机器上世界钟与墙钟不同步」从**静默偏差**变成**可复算的一个数**(启动打印与汇总行各印一次)。
+- **影响**:`scripts/play.ts` 启动 5 秒后打印实测 tick 间隔 / 实际 fps / **世界钟×墙钟倍率**;`scripts/soak.ts` 的汇总行补同款一列(两者**共用** `soak.ts` §8b 的同一份算法,不许各算一遍)。世界侧一行未改(它本来就按帧走)。
+- **现状逐条对账**(抽样 17 个字段;**行号是 2026-11-25 的快照**,由判据逐行核对,漂了会点名给出新行号):
+
+| # | 量 | 口径 | 现状(文件:行) | 那一行里的 needle |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | 自动存档周期(30 秒,墙钟轨) | 墙钟 | `server/src/net/room.ts:163` | `AUTOSAVE_INTERVAL_MS = 30_000` |
+| 2 | 心跳 / 离线超时 | 墙钟 | `server/src/net/room.ts:136` | `HEARTBEAT_TIMEOUT_MS = 5_000` |
+| 3 | 连接超时 | 墙钟 | `client/src/net/session.ts:54` | `CONNECT_TIMEOUT_MS = 8000` |
+| 4 | 握手超时 | 墙钟 | `client/src/net/session.ts:56` | `HANDSHAKE_TIMEOUT_MS = 8000` |
+| 5 | 重连宽限上限(退避封顶) | 墙钟 | `client/src/net/session.ts:58` | `RECONNECT_MAX_MS = 30000` |
+| 6 | 世界侧墙钟来源(装配) | 墙钟 | `server/src/index.ts:469` | `nowMs: () => Date.now()` |
+| 7 | 炼金缓存时效 | 墙钟 | `server/src/alchemy/cache.ts:385` | `at = Date.now()` |
+| 8 | 跳跃冷却(帧数门) | 游戏秒 | `server/src/sim/world_sim.ts:10666` | `this.frameCount < ready` |
+| 9 | 跳跃冷却帧数 | 游戏秒 | `server/src/sim/world_sim.ts:1221` | `JUMP_COOLDOWN_FRAMES = 24` |
+| 10 | DoT 每段结算 | 游戏秒 | `server/src/sim/world_sim.ts:4199` | `tickDot(task, DT)` |
+| 11 | 料理 buff 到期 | 游戏秒 | `server/src/sim/world_sim.ts:5499` | `tickFoodBuff(b, dt)` |
+| 12 | 昼夜 / 世界日长度 | 游戏秒 | `server/src/sim/world_sim.ts:4678` | `FRAMES_PER_DAY = WorldSim.WORLD_DAY_SEC / DT` |
+| 13 | 昼夜判定 | 游戏秒 | `server/src/sim/world_sim.ts:4868` | `this.frameCount % WorldSim.FRAMES_PER_DAY` |
+| 14 | 赛局时长(逻辑秒) | 游戏秒 | `server/src/sim/world_sim.ts:8966` | `this.partyClock.advance(SIM_SLOW_DT)` |
+| 15 | 打盹 / 露水累计 | 游戏秒 | `server/src/sim/world_sim.ts:9032` | `tickAfk(p, nowSec, SIM_SLOW_DT)` |
+| 16 | 世界内时间戳(接力) | 游戏秒 | `server/src/sim/world_sim.ts:2318` | `(this.frameCount / TICK_HZ) * 1000` |
+| 17 | 打盹秒累计(纯函数) | 游戏秒 | `server/src/social/afk.ts:148` | `p.dozedSec += dt` |
+
+- **判据**:`tests/WS-FND-175-clock-convention.test.ts`(声明句逐字存在 · 启动打印含倍率 · 上表逐行 `文件:行` + needle 与「口径」列一致 · 倍率可复算 · 负对照:删掉声明句 / 把某行口径改反 ⇒ 必红)。
 
 ---
 ## 待 owner 裁决(尚未定)

@@ -23,6 +23,9 @@ import {
   PROTOCOL_VERSION,
 } from '../../../shared/net/delta.ts';
 import { EntityKind, TelegraphShape, type BossState } from '../../../shared/types/wire.ts';
+/* ★ WS-FND-174:世界钟(秒)的慢帧网格(共享冻结层 SLOW_TICK_HZ = 2,即 0.5s = 世界慢帧 dt)。
+   worldSecondsOf() 用它把世界的 frameCount / TICK_HZ 读数换算成世界侧逻辑真正比较的那个数。 */
+import { SLOW_TICK_HZ } from '../../../shared/types/physics.ts';
 /* ★ WS-FND-123:Boss 投影的两个容器写口。修前 `upsertBoss` 是全仓**唯一**定义且
    **零调用**(`room.ts` 没有 `projectBosses`,`bossSnapshots()` 只有测试调)⇒
    `state.bosses` 恒空,客户端血条与地面预警只能走 demo 兜底。 */
@@ -113,7 +116,7 @@ import { notImplemented } from './actions/not-implemented.ts';
 /* ★ WS-FND-131:世界换代时**顺带**给玩家睡眠登记换代(唯一的换代点在
    `dispatchAction` 的 RESET_WORLD 成功那一刻,见那里的注释)。
    ⚠️ 不引入运行时环:`actions/sleep.ts` 只 `import type` 本文件的类型(擦除)。 */
-import { bumpSleepGeneration } from './actions/sleep.ts';
+import { bumpSleepGeneration, forgetSleepWorldClock, noteSleepWorldSeconds } from './actions/sleep.ts';
 import type { ActionContext } from './actions/types.ts';
 /* 物质层的模块级常量(`PICKUP_RADIUS` / `ITEM_ID_SET`)与 `numField` 随那 4 个动作
    一起搬去了 `net/actions/material.ts` —— 它们只为那 4 个 case 存在,留在这里就是死代码。 */
@@ -208,6 +211,27 @@ export const PLAYER_SNAPSHOT_INTERVAL_MS = 10_000;
  * 而那两个数之间没有任何必须相等的关系。
  */
 export const EVENT_TRIM_INTERVAL_MS = 30_000;
+
+/**
+ * ★ WS-FND-172(接线):允许喂给 `AntiCheatRoom` 的**帧间隔上限**(毫秒)。
+ *
+ * ## 为什么需要这条上限(`ac.tick(t, frameMs)` 的分母语义)
+ * `frameMs` 是速度窗口的**分母** ⇒ 分母越大、窗口读数越低(**稀释**)。
+ * 而本文件里那行 `ac.tick` 在 `status !== OPEN` **早退之后**
+ * ⇒ 房间休眠(无人活动 `IDLE_SLEEP_MS` / 暂停)期间一帧都不调它
+ * ⇒ **唤醒后首个差值是整段休眠时长**(以秒计)。照传 ⇒ 读数被稀释到几乎为 0
+ * ⇒ 反作弊当场失明 —— **比不接线更糟**。
+ *
+ * ## 250ms 这条线怎么划的
+ * 真帧率实测 ~15.93Hz(62.77ms/帧);正常调度抖动远低于 250ms(≈ 标称 20Hz 的 5 帧),
+ * 而休眠/暂停/长时间停摆的差值以秒计 ⇒ 两类差值在这条线上分得干干净净。
+ * 超上限或**不正**(时钟回拨)的差值一律**丢弃**(`tick(t)` 不传 ⇒ 分母保持上一次
+ * 的实测值),并计一次 `RoomRuntime.acFrameGapDiscarded`(丢弃必须可观测,不许静默)。
+ *
+ * ## 为什么导出
+ * 它是判据的**锚**:测试要按它构造「正常抖动 / 休眠唤醒」两组差值。
+ */
+export const AC_FRAME_GAP_MAX_MS = 250;
 
 /**
  * 存档失败日志的环形上限(诊断够用即可,不随房间寿命增长)。
@@ -1281,6 +1305,31 @@ export interface WorldSaveHost {
   advance?(frames: number): number;
 
   /**
+   * ★ WS-FND-174:**世界钟(秒)** —— `frameCount / TICK_HZ`(世界自己按帧序派生,
+   * 不读系统时钟,D-07)。
+   *
+   * ## 为什么房间要读它
+   *
+   * 派对 HUD 的剩余时间必须与**判定**同源:模式相位(`party/modes.ts` 的
+   * `modeElapsedSec`)与打盹回血(`social/afk.ts` 的 `tickAfk` 收到的 `nowSec`)
+   * 用的都是世界侧的 `partyClock`(`0.5s × 慢帧数`)—— 即世界钟。房间此前用
+   * `clock.nowMs()`(墙钟)算 HUD 的 elapsed ⇒ HUD 比世界早 20% 走到 0
+   * (180 秒的赛:墙上 180 秒时世界还剩 ~37 秒)。
+   *
+   * ## 为什么写成属性而不是方法
+   *
+   * `WorldSim` 上的实现是 `get simSeconds()`(`sim/world_sim.ts`)—— 结构化类型下
+   * getter 就是只读属性,写成 `simSeconds?(): number` 会和它**编译期对不上**
+   * (而「对不上就红」正是本接口存在的意义)。
+   *
+   * ## 缺它时的语义(可选成员)
+   *
+   * 手写 host 假件 / 老世界源没有这个读数 ⇒ **不猜**:HUD 停在「本局总时长」并
+   * 计数(`partyHudNoClockFrames`),**不**退回墙钟(墙钟正是本缺陷的来源)。
+   */
+  readonly simSeconds?: number;
+
+  /**
    * **读档恢复的权威入口**(task-70 / 契约 §2.1)。
    *
    * 把一份**已解码的**玩家档案按固定顺序写进权威层(`progresses` / `vitals`)。
@@ -1655,6 +1704,33 @@ export interface WorldSaveHost {
    * `playerId` / `roomKey`)。`roomKey === null` = 不在任何具名房间。
    */
   lastRoomEffects?: readonly { readonly playerId: string; readonly roomKey: string | null }[];
+}
+
+/**
+ * ★ WS-FND-174:**世界钟(秒)读数** —— 判定(HUD / 打盹 / 回血)唯一认可的时基。
+ *
+ * ## 它回答的是什么
+ *
+ * `host.simSeconds` = `frameCount / TICK_HZ`(世界钟的原始读数),再**量化到慢帧网格**
+ * (`SLOW_TICK_HZ`)。量化不是修饰:世界侧真正比较的那个数(`partyClock.now()`,
+ * 即 `tickPartyMode` 的 elapsed 与 `tickAfk` 的 `nowSec`)恒等于
+ * `0.5 × 慢帧数` = `quant(frameCount / 20)` —— 多一个慢帧才多 0.5 秒。
+ * ⇒ 这里读到的数与世界**逐帧相等**,于是「HUD 的剩余秒数」就是「判定的剩余秒数」
+ * (差一个慢帧都会让「HUD 归零」与「结算」错帧)。
+ *
+ * ## 为什么不是墙钟
+ *
+ * 墙钟只在名义 20Hz 节拍下与它对得上;真实部署的帧率低于名义值(实测 ~16Hz)时,
+ * 两者差约 20% ⇒ 用墙钟算剩余,180 秒的赛在墙上 180 秒就显示「剩余 0」,
+ * 而世界还剩 37 秒(HUD 与判定打架,且**不报错**)。
+ *
+ * @returns 世界钟秒;没有读数(host 为 null / 老世界源 / 非有限数)⇒ `null`,
+ *          调用方**如实降级**(HUD 停在总时长;睡眠登记退回模块时钟)。
+ */
+function worldSecondsOf(host: WorldSaveHost | null): number | null {
+  const sec = host?.simSeconds;
+  if (typeof sec !== 'number' || !Number.isFinite(sec) || sec < 0) return null;
+  return Math.floor(sec * SLOW_TICK_HZ) / SLOW_TICK_HZ;
 }
 
 /** 投影输出的 7 个状态字段(第 8 项 `inventory` 不落在 `PlayerState` 上,见下)。 */
@@ -2055,6 +2131,22 @@ export class RoomRuntime {
     return table[this.state.meta.partyMode] ?? PartyMode.NONE;
   }
   readonly ac: AntiCheatRoom;
+  /**
+   * ★ WS-FND-172(接线):上一次 `ac.tick` 时读到的**实测墙钟**(`clock.nowMs()`)。
+   * `null` = 还没走过一帧(首帧没有差值可算)。
+   *
+   * 只在 `status === OPEN` 的那一支里推进 ⇒ 休眠期间它**冻结**,
+   * 唤醒后首个差值就是整段休眠时长(由 `AC_FRAME_GAP_MAX_MS` 拦下)。
+   */
+  private lastAcFrameMs: number | null = null;
+  /**
+   * ★ WS-FND-172(接线):被**丢弃**的帧间隔差值次数(首帧不计)。
+   *
+   * 丢弃 = 「区间不合法(超 `AC_FRAME_GAP_MAX_MS` / ≤ 0)⇒ 不喂给窗口分母」。
+   * 它必须可读:否则「休眠唤醒后分母被稀释」这件事会表现成「什么都没发生」——
+   * 而稀释正是接线要防的那件事(见 `AC_FRAME_GAP_MAX_MS` 的注释)。
+   */
+  acFrameGapDiscarded = 0;
   readonly members = new Map<string, MemberSession>();
   /** 上次「有人活动」的时刻。 */
   lastActivityMs: number;
@@ -2287,6 +2379,24 @@ export class RoomRuntime {
   partyRecordSkips = 0;
   /** `endParty` 被真调用(赛局收束)的次数。 */
   partyRecordEndCount = 0;
+
+  /**
+   * HUD 倒计时的**锚点**:本局开局那一刻的世界钟秒 + 本局的身份(开局时刻,
+   * 只当**身份标签**用,不当时间用)。
+   *
+   * 为什么需要一个锚点:模式相位只认「世界钟距开局过了多久」,而世界侧的开局
+   * 时刻(`startedAtSec`)不出读口 ⇒ 房间在**第一次看见 `RUNNING`** 的帧上记下
+   * 那一刻的世界钟。世界开局与房间建账在同一帧(`dispatchAction` 的
+   * `startWorldPartyRun` 钩子 / `syncPartyRecord` 的补建路径),故锚点与
+   * `startedAtSec` 同帧。
+   */
+  private partyHudAnchor: { tag: number; sec: number } | null = null;
+  /**
+   * 没有世界钟读数的帧数(`worldSecondsOf` 返回 `null`)。**可断言**,不静默:
+   * 有世界源却没读到世界钟,是接线漏了;没有世界源(手写 host 假件)时它照涨,
+   * 但那种房本来就没有赛局在跑。
+   */
+  partyHudNoClockFrames = 0;
 
   /** 世界开局 → 记账的锁:同一局只补建一次(键 = 模式键 + 裁判;世界回 IDLE 即释放)。 */
   private partyRecordLatch: string | null = null;
@@ -3188,6 +3298,11 @@ export class RoomRuntime {
       this.worldBusOff = null;
     }
     this.worldBusAttached = false;
+    /* ★ WS-FND-174:房间实例消失 ⇒ 连同它那条**世界钟读数**一起摘掉。
+       不摘就是一处按 roomId 增长的泄漏(`sleep.ts` 的 `WORLD_SEC` 只有
+       本方法能回收);摘下之后该房的睡眠查询退回模块时钟 —— 房间都没了,
+       也不会再有查询。 */
+    forgetSleepWorldClock(this.id);
     if (this.db) setRoomStatus(this.db, this.id, RoomStatus.CLOSED, this.clock.nowMs());
     return true;
   }
@@ -3540,20 +3655,32 @@ export class RoomRuntime {
    * 实测它们只出现在 `schema.ts` / `schema.colyseus.ts` 的默认值里。
    * ⇒ 表现是「派对在跑,客户端恒显示 剩余 0s / 红 0 : 0 蓝」,而这**不报错**。
    *
-   * ## 两个数字各自的**已有**权威(不新造第三份状态)
-   * ```
-   * 计时:`actions/start_party.ts` 的房间赛局记录 `startedAtMs` + 模式总时长
-   *       (时长取 `shared/constants/bosses.ts::PARTY_MODES` —— `party/modes.ts`
-   *        建运行时用的也是这张表,故两边同源)
-   * 比分:同一份记录的 `scores`(按玩家 id),队伍归属问世界 `partyTeamOf`
-   * ```
-   * ⚠️ 房间**不**自己跑一份对局时钟:那是第二份真值,两份迟早不同步。
-   *
-   * ## 四个分支都**如实写 0**(不是缺失静默)
-   * 1 房间没有赛局记录(`START_PARTY` 从没开过)⇒ 三个字段全 0;
-   * 2 赛局已 `SETTLED` ⇒ 剩余秒数归 0(比分保留:名次已定格,清掉会让 HUD 闪成 0:0);
-   * 3 世界没有 `partyTeamOf`(老宿主)⇒ 分不出红/蓝 ⇒ 比分 0,不按加入顺序编;
-   * 4 模式不在 `PARTY_MODES`(契约外取值)⇒ 总时长 0 ⇒ 剩余 0。
+  * ## 两个数字各自的**已有**权威(不新造第三份状态)
+  * ```
+  * 计时:**世界钟**(`host.simSeconds`,判定用的同一个数)+ 本房在「第一次看见
+  *       RUNNING」那一帧记下的世界钟锚点(`partyHudAnchor`);总时长取
+  *       `shared/constants/bosses.ts::PARTY_MODES`(`party/modes.ts` 建运行时
+  *        用的也是这张表,故两边同源)
+  * 比分:同一份记录的 `scores`(按玩家 id),队伍归属问世界 `partyTeamOf`
+  * ```
+  * ★ WS-FND-174(**时基**):倒计时必须与**判定**同源 —— 模式相位走世界钟
+  * (`party/modes.ts` 的 `modeElapsedSec`)、打盹回血也走世界钟(`social/afk.ts`
+  * 的 `tickAfk` 收到的 `nowSec`)。修前这里用 `clock.nowMs()`(墙钟)算 elapsed:
+  * 名义 20Hz 下两者恰好对上,而真实帧率低于名义值(实测 ~16Hz)时墙钟快约 20%
+  * ⇒ 180 秒的赛在墙上 180 秒就显示「剩余 0」,世界却还剩 37 秒
+  * (「HUD 归零」比「结算」早 37 秒,而**不报错**)。现在 HUD 的剩余秒数逐帧
+  * 等于判定的剩余秒数(`worldSecondsOf` 读出的是世界钟的慢帧网格值)。
+  * ⚠️ 房间仍然**不**自己跑一份对局时钟:锚点只是「第一次看见 RUNNING 那一刻的
+  * 世界钟读数」,判断与推进都在世界侧(那是唯一真值)。
+  *
+  * ## 五个分支都**如实**写值(不是缺失静默)
+  * 1 房间没有赛局记录(`START_PARTY` 从没开过)⇒ 三个字段全 0;
+  * 2 赛局已 `SETTLED` ⇒ 剩余秒数归 0(比分保留:名次已定格,清掉会让 HUD 闪成 0:0);
+  * 3 世界没有 `partyTeamOf`(老宿主)⇒ 分不出红/蓝 ⇒ 比分 0,不按加入顺序编;
+  * 4 模式不在 `PARTY_MODES`(契约外取值)⇒ 总时长 0 ⇒ 剩余 0;
+  * 5 **没有世界钟读数**(`worldSecondsOf` ⇒ `null`:手写 host 假件 / 老宿主)
+  *   ⇒ 剩余停在**本局总时长**并计数(`partyHudNoClockFrames`)—— 不猜,也**不**
+  *   退回墙钟(退回墙钟就是本缺陷本身)。
    *
    * ## 幂等与代价
    * 只写**值有变化**的字段(与 `syncLevelProjections` 同一取舍):20Hz 每帧写一遍值
@@ -3566,14 +3693,34 @@ export class RoomRuntime {
     let scoreA = 0;
     let scoreB = 0;
     if (snap !== null) {
+      /* 世界源只取一次:倒计时(世界钟)与比分(队伍归属)读的是同一个宿主。 */
+      const host = this.worldSaveHost;
       const cfg = PARTY_MODES.find((m) => m.key === snap.mode);
       const totalSec = cfg === undefined ? 0 : cfg.buildSec + cfg.raceSec;
       if (snap.state === PartyPhase.RUNNING) {
-        const elapsedSec = Math.max(0, (this.clock.nowMs() - snap.startedAtMs) / 1000);
-        remainSec = Math.max(0, Math.round(totalSec - elapsedSec));
+        /* ★ WS-FND-174:剩余 = 总时长 − **世界钟**流逝(判定用的那一个数)。
+           `startedAtMs` 只当本局的**身份标签**(换局时重取锚点),不当时间用。 */
+        const nowSec = worldSecondsOf(host);
+        if (nowSec === null) {
+          /* 没有世界钟 ⇒ 不猜、也不退回墙钟:停在总时长 + 计数(分支 5)。 */
+          this.partyHudAnchor = null;
+          this.partyHudNoClockFrames += 1;
+          remainSec = totalSec;
+        } else {
+          if (this.partyHudAnchor === null || this.partyHudAnchor.tag !== snap.startedAtMs) {
+            this.partyHudAnchor = { tag: snap.startedAtMs, sec: nowSec };
+          }
+          const elapsedSec = Math.max(0, nowSec - this.partyHudAnchor.sec);
+          /* `ceil` 而不是 `round`:`round` 会让「还剩 0.05 秒」显示成 0
+             ⇒ HUD 比判定**早一帧**归零。再夹到 `[0, totalSec]`:世界钟回退
+             (如 `RESET_WORLD` 换代后帧号归零)时剩余不会超过本局总时长。 */
+          remainSec = Math.min(totalSec, Math.max(0, Math.ceil(totalSec - elapsedSec)));
+        }
+      } else {
+        /* 本局不在跑(已结算 / 没开局)⇒ 锚点作废,下一局重新取。 */
+        this.partyHudAnchor = null;
       }
       /* 队伍的权威在世界侧(435 旗)。没有这个读口 ⇒ 比分 0,不猜。 */
-      const host = this.worldSaveHost;
       const teamOf = host === null ? undefined : host.partyTeamOf;
       if (teamOf !== undefined) {
         for (const [userId, score] of snap.scores) {
@@ -3582,9 +3729,13 @@ export class RoomRuntime {
           else if (team === 'BLUE') scoreB += score;
         }
       }
+    } else {
+      /* 没有赛局记录 ⇒ 锚点作废(否则下一局会拿上一局的锚点算剩余)。 */
+      this.partyHudAnchor = null;
     }
     /* `partyTimer` 是 POS(i32×1024)载秒数、`scoreA/B` 是 U16 ⇒ 逐字段夹到值域内:
-       负剩余(时钟回拨)与溢出都会让编码器写出垃圾,而那是静默的。 */
+       负剩余与溢出都会让编码器写出垃圾,而那是静默的(剩余那一路已在上面夹过
+       一轮,这里的 `MAX_PARTY_TIMER_SEC` 是字段值域的最后一道)。 */
     const timer = Math.min(MAX_PARTY_TIMER_SEC, Math.max(0, remainSec));
     if (this.state.meta.partyTimer !== timer) this.state.meta.partyTimer = timer;
     const a = Math.min(65535, Math.max(0, Math.round(scoreA)));
@@ -5147,7 +5298,40 @@ export class RoomRuntime {
        放在这里而不是 `worldSaveHost.advance()` 里,是因为它读的两份事实
        (房间赛局记录 / 世界队伍)在**任何**宿主下都存在,而 `advance` 是可选成员。 */
     this.syncPartyHud();
-    this.ac.tick(this.state.meta.tick);
+    /* ★ WS-FND-172(接线):把这**一帧的实测墙钟差**喂给反作弊速度窗口的**分母**。
+
+       ## 为什么必须接线
+       `anticheat.ts` 把窗口分母参数化(`setFrameIntervalMs` / `tick(t, frameMs)`)
+       正是为「服务端真帧率 ≠ 标称 20Hz」那一半;不接线则分母恒为标称 `DT = 50ms`
+       ⇒ 实测 15.93Hz(62.77ms/帧)下合法 4.5 格/秒被读成
+       `4.5 × 20 / 15.93 = 5.65 > 上限 5.625`(FND172-3 登记的那次误判)。
+       而**本行**是房间侧唯一读得到实测节拍的地方(`this.clock.nowMs()`)。
+
+       ## ⚠️ 为什么必须有上限(`AC_FRAME_GAP_MAX_MS`)
+       本行在 `status !== OPEN` 早退**之后** ⇒ 休眠期间一帧都不调 ⇒
+       **唤醒后首个差值 = 整段休眠时长**(以秒计)。若照传:分母被放大几个数量级、
+       窗口读数趋近 0 ⇒ 反作弊失明 —— **比不接线更糟**(稀释)。
+       ⇒ 首帧(无差值)与「差值 > `AC_FRAME_GAP_MAX_MS` / ≤ 0(时钟回拨)」
+       一律**丢弃**:不给分母,并计一次 `acFrameGapDiscarded`(丢弃可观测,不静默)。
+       丢弃时走 `tick(t)`(不传 `frameMs`)⇒ 分母保持上一次的**实测**值
+       (从未注入过时即缺省标称 `DT`)。
+
+       ⚠️ 与 `sim.frame` **无关**:喂进去的是**墙钟差**,不是帧号
+       (见下面那段「三个时钟互不联动」)。 */
+    const acNowMs = this.clock.nowMs();
+    if (this.lastAcFrameMs === null) {
+      /* 首帧:没有前一帧的读数 ⇒ 无差值可算(分母保持当前值)。 */
+      this.ac.tick(this.state.meta.tick);
+    } else {
+      const acFrameMs = acNowMs - this.lastAcFrameMs;
+      if (acFrameMs > 0 && acFrameMs <= AC_FRAME_GAP_MAX_MS) {
+        this.ac.tick(this.state.meta.tick, acFrameMs);
+      } else {
+        this.acFrameGapDiscarded += 1;
+        this.ac.tick(this.state.meta.tick);
+      }
+    }
+    this.lastAcFrameMs = acNowMs;
 
     /* ── 推进世界(task-59:驱动缺失)──
        接线前**服务器路径**对 `tick`/`run` 的调用是 **0 处**
@@ -5186,6 +5370,13 @@ export class RoomRuntime {
     if (host !== null && typeof host.advance === 'function') {
       host.advance(1);
     }
+    /* ★ WS-FND-174:把**世界钟读数**推给睡眠登记(`actions/sleep.ts`)。
+       为什么必须由房间推:打盹窗口的两端必须与世界侧的回血/露水
+       (`tickAfk` 收到的 `nowSec`)同一个时基,而房间是**唯一**驱动世界的人 ——
+       世界钟只有它读得到。时机 = 推完世界的下一行(读数即本帧世界钟),
+       于是「窗口到期」与「回血停止」落在**同一个慢帧**。 */
+    noteSleepWorldSeconds(this.id, worldSecondsOf(host));
+
     /* ★ WS-FND-123:两套开局**打通**的落点(见 `syncPartyRecord`)。
        必须在 `advance(1)` **之后**:世界的 `partyPhase()/partyModeKey()` 是本帧
        推进后的事实(哨台入口在 `tickPartyStep` 里跑),早一帧读会差一整局。 */
@@ -5406,6 +5597,25 @@ export class RoomRuntime {
    *   世界有局 + 账本没有/已结算          ⇒ 补建账本(走真正的 START_PARTY 动作)
    *   世界回 IDLE + 账本仍 RUNNING       ⇒ endParty 收束(名次定格,addScore 停止计分)
    * ```
+   *
+   * ## ★ WS-FND-176:第三支(D-23 的「自动回 IDLE」)**修前永不触发**
+   *
+   * ```text
+   * 派对**自然超时**结算之后,世界的 `partyPhase()` 停在 'SETTLED' 再也不动
+   *   (修前只有 436 哨台按 -1 的 `WorldSim.clearPartyRun()` 会清掉赛局容器)
+   *   ⇒ 本方法第三支(判据 = `'IDLE'`)永不触发
+   *   ⇒ 账本永远 RUNNING ⇒ `addScore` 继续累计(名次早已定格,分却还在涨)
+   * ```
+   *
+   * ⇒ 修点在**世界侧**、且只有一处:`party/modes.ts` 的 `tickPartyMode` ——
+   * 结算定格之后的下一慢帧把相位送回 `IDLE`(§6 有完整口径)。本方法**一个字都没改**:
+   * 它等的那个 `'IDLE'` 现在真的会来,于是「世界回 IDLE + 账本仍 RUNNING ⇒ endParty」
+   * 这条既有路径对自然超时也成立。
+   *
+   * ⚠️ **不**把这一支放宽成「`'SETTLED'` 也算收束」:`SETTLED` 是**结算那一帧**的可见形态,
+   * 而那一帧的账**必须还开着**(结算前一刻的分仍算得进去)。提前关账会把终场分吞掉,
+   * 而那种吞法不报错、只让名次少一档 —— 判据分列在 `tests/WS-FND-176`
+   * (FND176-2/3/4:结算帧账本仍 RUNNING、跨过慢帧边界才收束)。
    *
    * ## 为什么必须走 `dispatchAction(START_PARTY)` 而不是自己写 Map
    * 账本的单例 `PARTIES` 只有 `actions/start_party.ts` 能写(`addScore`/`endParty`

@@ -32,10 +32,28 @@
  *   2 显式查询函数可被未来的世界侧/慢帧调用,不需要把 `RoomRuntime` 或
  *     `WorldSim` 交进动作层。
  *
- * ## 时钟
+ * ## 时钟:世界钟(游戏秒)—— 与回血/露水**同一时基**
  *
- * 默认 `Date.now()`,但**可注入**(`setSleepClock`):判据要能推进时间而不
- * `sleep` 真秒。注入点是模块级的,因为 `ActionContext` 没有 `clock`。
+ * ★ WS-FND-174:窗口打在**世界钟**上(`sim/world_sim.ts` 的 `partyClock`:
+ * `0.5s × 慢帧数`),由房间每帧推进世界后经 `noteSleepWorldSeconds()` 推来。
+ * 为什么必须这样:床上的回血与露水由 `social/afk.ts#tickAfk` 按**游戏秒**累加,
+ * 而打盹的**结束**由本模块的窗口决定(`sleepSource` → 世界侧 `stepDozingEntry`)
+ * —— 两边任一边退回墙钟,表现就是「睡够了却还在回血 / 没睡够就停了」,且**不报错**
+ * (真实帧率低于名义 20Hz 时,墙钟比世界钟快约 20%:墙上 60 秒 ≈ 世界 47.8 秒)。
+ *
+ * 三级取钟(逐级显式,不猜):
+ * ```text
+ *   1 显式 nowMs 入参   ⇒ 用它(调用方自带基准;查询侧也要一起给)
+ *   2 本房有世界钟读数   ⇒ 用世界钟(生产路径:房间每帧推)
+ *   3 两者都没有        ⇒ 注入的模块时钟(setSleepClock;缺省 Date.now())
+ * ```
+ * 第 3 级是**如实**的降级,不是静默兜底:没有世界源就没有回血/露水那条链,也就
+ * 没有能与窗口错配的第二条时间线;而「这条记录用了哪个钟」由 `SleepRecord.base`
+ * 记着(`sleepClockBaseOf` 可读)。
+ *
+ * ⚠️ 已知边界(不是两个钟的错配):窗口到期由**世界的慢帧回调**判定,而房间每帧
+ * 只能推一次读数 ⇒ 到期生效时刻最多晚**一个慢帧**(0.5 世界秒)。它是世界钟上的
+ * 采样延迟,回血那一侧同样按慢帧走 ⇒ 两端仍然同源。
  *
  * ## 卧室判定从哪来
  *
@@ -47,27 +65,57 @@ import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
 /**
- * 一次睡眠的时长(毫秒)。
+ * 一次睡眠的时长:**60 世界秒(游戏秒)**。★ WS-FND-174 起这是一个**时基声明**,
+ * 不是「随便挑的 60 秒」—— 它量的是世界钟上的一次打盹,与床上的回血/露水
+ * (`social/afk.ts#tickAfk` 按 `dt` 游戏秒累加)同源。
  *
  * 取值理由(对着本仓已有常量算,不拍脑袋):
- *   · 卧室回血 `BEDROOM_HEAL_PER_SEC = 15`(`rooms/effects.ts`);
+ *   · 床上回血 `BED_HP_PER_SEC = 15`(`social/afk.ts`)/ 卧室回血
+ *     `BEDROOM_HEAL_PER_SEC = 15`(`rooms/effects.ts`);
  *   · 满级生命上限 `statsAtLevel(MAX_LEVEL = 30).maxHp = 100 + 15×(30−1) = 535`
  *     (`shared/types/entities.ts`);
- *   ⇒ 60 秒 = 900 HP > 535,一次完整睡眠足以把濒死玩家拉回满血;
+ *   ⇒ 60 **游戏**秒 = 900 HP > 535,一次完整睡眠足以把濒死玩家拉回满血;
  *     再长只是把「睡着」变成挂机占位。
  *
- * ⚠️ 它与 `RoomRuntime` 的**房间休眠**、以及 `AFK_TIMEOUT_MS`(30 分钟)
+ * ⚠️ 同一个 60 在墙钟上不是同一段时间:真实帧率低于名义 20Hz 时(实测 ~16Hz)
+ *   60 世界秒 ≈ 75 墙钟秒。修前本模块的窗口按**墙钟**判到期,于是「墙上睡满
+ *   60 秒」只换来 47.8 世界秒的回血(≈ 717 HP 而不是 900),而**不报错**。
+ *
+ * ⚠️ 它与 `RoomRuntime` 的**房间休眠**、以及 `AFK_TIMEOUT_MS`(30 分钟,**墙钟**)
  *   是三条互不相干的线:这里量的是「一次上床睡多久」。
  */
-export const SLEEP_DURATION_MS = 60_000;
+export const SLEEP_DURATION_SEC = 60;
+/** 同上,毫秒形态(窗口内部一律用 ms 记,免得两处各转一次)。 */
+export const SLEEP_DURATION_MS = SLEEP_DURATION_SEC * 1000;
 
 /** 一条睡眠记录(纯数据,便于回执与断言)。 */
 export interface SleepRecord {
-  /** 入睡时刻(ms)。 */
+  /** 入睡时刻(ms;**在 `base` 那个钟上**)。 */
   readonly sinceMs: number;
-  /** 到这一刻就算睡醒(ms)。 */
+  /** 到这一刻就算睡醒(ms;同样在 `base` 那个钟上)。 */
   readonly untilMs: number;
+  /**
+   * 这条窗口用的是哪个钟(见 `SLEEP_CLOCK`)。★ WS-FND-174:它让「开窗」与
+   * 「判到期」两次独立调用**不靠调用方记得**就落在同一时基上(见 `sleepStateOf`)。
+   */
+  readonly base: SleepClockBase;
 }
+
+/**
+ * 窗口的**时基**(★ WS-FND-174)。
+ *
+ * 为什么记录里要存它:`beginSleep` 与 `sleepStateOf` 是**两次独立调用**
+ * (前者在动作层、后者在世界慢帧里),两次之间房间可能刚推上一个世界钟读数。
+ * 不带这维的话,「世界钟开的窗口 + 模块时钟判到期」会把 60 游戏秒读成几百万
+ * 毫秒 ⇒ 永不醒;而那种错**不报错**。
+ */
+export const SLEEP_CLOCK = {
+  /** 世界钟(游戏秒,`0.5s × 慢帧数`)—— 生产路径。 */
+  WORLD: 'WORLD',
+  /** 注入的模块时钟(`setSleepClock`;缺省 `Date.now()`)= 墙钟。 */
+  MODULE: 'MODULE',
+} as const;
+export type SleepClockBase = (typeof SLEEP_CLOCK)[keyof typeof SLEEP_CLOCK];
 
 /** 睡眠状态查询结果。 */
 export interface SleepState {
@@ -105,10 +153,19 @@ interface SleepBucket {
  */
 const SLEEPERS = new Map<string, SleepBucket>();
 
-/** 可注入时钟(毫秒)。默认墙钟;测试注入假时钟并推进它。 */
+/**
+ * 注入时钟(毫秒)。默认墙钟;测试注入假时钟并推进它。
+ *
+ * ★ WS-FND-174:它现在只是**第三级**兜底 —— 本房有世界钟读数时(生产路径:房间
+ * 每帧推)开窗与查询都走世界钟。理由见文件头「时钟」:床上的回血/露水按游戏秒
+ * 累加,窗口却按墙钟判到期的话,两边会差 20%,而且**不报错**。
+ */
 let clockMs: () => number = () => Date.now();
 
-/** 注入时钟。**唯一**的时间来源:动作与查询都走它,不各自读 `Date.now`。 */
+/**
+ * 注入时钟(**没有世界钟读数时**的时间来源):动作与查询都走它,不各自读 `Date.now`。
+ * 生产里由第 2 级(房间推来的世界钟读数)接管;本口留给判据与「没有世界源」的宿主。
+ */
 export function setSleepClock(clock: () => number): void {
   clockMs = clock;
 }
@@ -117,6 +174,46 @@ export function setSleepClock(clock: () => number): void {
 export function resetSleepClock(): void {
   clockMs = () => Date.now();
 }
+
+/* ═══════════ 世界钟读数(由房间推入;★ WS-FND-174)═══════════ */
+
+/**
+ * 房间 → **世界钟秒**。由 `RoomRuntime.step()` 每帧推进世界之后推入
+ * (`noteSleepWorldSeconds`)。本模块是唯一读者;写口只有下面两个导出函数。
+ *
+ * 为什么由房间推、而不是本模块自己读:`sim/world_sim.ts` 不 import `net/actions/**`
+ * (`sim` 不依赖 `net`),而房间是**唯一**驱动世界的人 —— 世界钟只有它读得到。
+ */
+const WORLD_SEC = new Map<string, number>();
+
+/**
+ * 推入本房的世界钟读数(秒)。`null` / 非有限数 = 本房**没有**世界钟(没有世界源 /
+ * 老宿主 / 世界换代后帧号回退)⇒ 摘掉读数,后续开窗与查询如实退回模块时钟。
+ * 幂等,每帧可调。
+ */
+export function noteSleepWorldSeconds(roomId: string, sec: number | null): void {
+  if (sec === null || !Number.isFinite(sec) || sec < 0) {
+    WORLD_SEC.delete(roomId);
+    return;
+  }
+  WORLD_SEC.set(roomId, sec);
+}
+
+/**
+ * 摘掉本房的世界钟读数(**房间实例消失**时调:`RoomRuntime.close()`)。
+ * 不摘就是一处按 `roomId` 增长的泄漏 —— 这张表只有房间能回收。
+ */
+export function forgetSleepWorldClock(roomId: string): void {
+  WORLD_SEC.delete(roomId);
+}
+
+/** 本房当前的时间基准(ms)+ 它来自哪个钟;没有世界钟读数 ⇒ 模块时钟(第 3 级)。 */
+function nowFor(roomId: string): { ms: number; base: SleepClockBase } {
+  const sec = WORLD_SEC.get(roomId);
+  if (sec === undefined) return { ms: clockMs(), base: SLEEP_CLOCK.MODULE };
+  return { ms: Math.trunc(sec * 1000), base: SLEEP_CLOCK.WORLD };
+}
+
 
 /** 取(必要时创建)某房间的睡眠登记桶。 */
 function bucketOf(roomId: string): SleepBucket {
@@ -171,22 +268,39 @@ export function endSleep(roomId: string, userId: string): boolean {
 
 /**
  * 登记一次睡眠。**幂等**:已在睡且未到期 ⇒ 原样返回旧记录,**不叠加计时**。
- *
  * 到期后再次入睡会得到**新的**窗口(旧的过期记录在此被覆盖)。
+ *
+ * ## 窗口的时基(★ WS-FND-174)
+ *
+ * `nowMs` 不给 ⇒ 按**本房的时间基准**取(有世界钟读数就用世界钟,否则用注入的
+ * 模块时钟,见 `nowFor`);给了 ⇒ 就用给的那个,并把这条记录标成 `MODULE`
+ * (调用方自带基准 —— 查询侧必须也一起给 `nowMs`,否则两边不同源)。
+ *
+ * 返回值里的 `nowMs` 是**这一次用掉的读数**:调用方算 `remainingMs` 时复用它,
+ * 不要在下一行再读一次钟(两次读数之间可能跨过一个慢帧)。
  */
 export function beginSleep(
   roomId: string,
   userId: string,
-  nowMs: number = clockMs(),
-): { record: SleepRecord; alreadySleeping: boolean } {
+  nowMs?: number,
+): { record: SleepRecord; alreadySleeping: boolean; nowMs: number } {
+  const resolved = nowMs === undefined
+    ? nowFor(roomId)
+    : { ms: nowMs, base: SLEEP_CLOCK.MODULE as SleepClockBase };
+  const now = resolved.ms;
   const bucket = bucketOf(roomId);
   const cur = bucket.players.get(userId);
-  if (cur !== undefined && cur.untilMs > nowMs) {
-    return { record: cur, alreadySleeping: true };
+  if (cur !== undefined && cur.untilMs > now) {
+    /* 已在睡 ⇒ 连**它自己的时基**一起原样返回(不把新读数塞进旧窗口)。 */
+    return { record: cur, alreadySleeping: true, nowMs: now };
   }
-  const record: SleepRecord = { sinceMs: nowMs, untilMs: nowMs + SLEEP_DURATION_MS };
+  const record: SleepRecord = {
+    sinceMs: now,
+    untilMs: now + SLEEP_DURATION_MS,
+    base: resolved.base,
+  };
   bucket.players.set(userId, record);
-  return { record, alreadySleeping: false };
+  return { record, alreadySleeping: false, nowMs: now };
 }
 
 /**
@@ -194,17 +308,22 @@ export function beginSleep(
  *
  * 「时间到」在**这里**落地:过期记录被顺手清掉并返回 `sleeping: false`。
  * 这样「睡到什么时候」只有一份事实,不需要每个调用方各自比一次时间。
+ *
+ * ★ WS-FND-174:时基**跟着记录走** —— 没给 `nowMs` 时按这条记录当初用的那个钟读
+ * (`base`),不是无条件读模块时钟。否则「世界钟开窗 + 墙钟判到期」会把一条
+ * 60 游戏秒的窗口判成「还差几百万毫秒」(= 永不醒),而**不报错**。
  */
 export function sleepStateOf(
   roomId: string,
   userId: string,
-  nowMs: number = clockMs(),
+  nowMs?: number,
 ): SleepState {
   const rec = SLEEPERS.get(roomId)?.players.get(userId);
   if (rec === undefined) {
     return { sleeping: false, sinceMs: null, untilMs: null, remainingMs: 0 };
   }
-  if (rec.untilMs <= nowMs) {
+  const now = nowMs ?? (rec.base === SLEEP_CLOCK.WORLD ? nowFor(roomId).ms : clockMs());
+  if (rec.untilMs <= now) {
     endSleep(roomId, userId);
     return { sleeping: false, sinceMs: null, untilMs: null, remainingMs: 0 };
   }
@@ -212,7 +331,7 @@ export function sleepStateOf(
     sleeping: true,
     sinceMs: rec.sinceMs,
     untilMs: rec.untilMs,
-    remainingMs: rec.untilMs - nowMs,
+    remainingMs: rec.untilMs - now,
   };
 }
 
@@ -221,10 +340,29 @@ export function sleepingCount(roomId: string): number {
   return SLEEPERS.get(roomId)?.players.size ?? 0;
 }
 
-/** 清空全部登记(测试隔离用;生产不需要)。 */
+/**
+ * 清空全部登记(测试隔离用;生产不需要)。
+ *
+ * ★ WS-FND-174:各房的**世界钟读数**一起清 —— 它也是模块级按房状态,留着会让
+ * 下一个用例的第一次查询直接命中上一轮的世界钟(生产里由 `RoomRuntime.close()`
+ * 逐房摘掉,见 `forgetSleepWorldClock`)。
+ */
 export function clearSleepRegistry(): void {
   /* 连**世代号**一起清(清掉房间桶 ⇒ gen 归零)⇒ 测试之间不带着上一轮的 gen 起跑。 */
   SLEEPERS.clear();
+  WORLD_SEC.clear();
+}
+
+/**
+ * 某房某玩家当前窗口用的是**哪个钟**(`WORLD` = 世界钟 / `MODULE` = 注入的模块
+ * 时钟);未登记返回 `null`。
+ *
+ * 为什么要有这个读口:窗口的**时基**是本模块唯一的时间契约,而它取决于「房间推过
+ * 世界钟读数没有」—— 只看 `untilMs` 分不出「世界钟 60 秒」与「墙钟 60 秒」
+ * (两个数的字面值可以一模一样)。与 `sleepGenerationOf` 同一取舍:不为断言省读口。
+ */
+export function sleepClockBaseOf(roomId: string, userId: string): SleepClockBase | null {
+  return SLEEPERS.get(roomId)?.players.get(userId)?.base ?? null;
 }
 
 /**
@@ -279,8 +417,15 @@ export const sleep: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     };
   }
 
-  const now = clockMs();
-  const { record, alreadySleeping } = beginSleep(roomId, ctx.actorId, now);
+  /* ★ WS-FND-174:窗口的两端都打在**本房的时间基准**上(生产 = 世界钟;
+     见 `nowFor`)。`beginSleep` 把「用过的那一次读数」一并回给我们 —— 不在这里
+     再读一次钟:两次读数之间可能跨过一个慢帧,那样 `remainingMs` 与
+     `untilMs` 就错半秒。
+
+     ⚠️ 回血本体**不在**本动作(`rooms/effects.ts` 的卧室回血 + `social/afk.ts`
+     的 `tickAfk`),本动作只登记窗口。故窗口的时基必须与那两处一致 —— 那是本
+     文件唯一的时间契约(见文件头「时钟」)。 */
+  const { record, alreadySleeping, nowMs: now } = beginSleep(roomId, ctx.actorId);
   const remainingMs = record.untilMs - now;
   return {
     ok: true,
@@ -292,6 +437,7 @@ export const sleep: ActionHandler = (ctx: ActionContext): ActionOutcome => {
           sinceMs: record.sinceMs,
           untilMs: record.untilMs,
           remainingMs,
+          clockBase: record.base,
           note: '已在睡觉 ⇒ 幂等回执,不叠加计时',
         }
       : {
@@ -300,8 +446,10 @@ export const sleep: ActionHandler = (ctx: ActionContext): ActionOutcome => {
           sinceMs: record.sinceMs,
           untilMs: record.untilMs,
           durationMs: SLEEP_DURATION_MS,
+          durationSec: SLEEP_DURATION_SEC,
           remainingMs,
-          note: '已上床睡觉;睡眠期间的回血由卧室效果(BEDROOM_HEAL_PER_SEC)负责,本动作只登记状态',
+          clockBase: record.base,
+          note: '已上床睡觉;时长按**世界钟**(游戏秒)计,与床上回血/露水同源;回血本体由卧室效果负责,本动作只登记状态',
         },
   };
 };

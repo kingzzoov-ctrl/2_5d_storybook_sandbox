@@ -46,7 +46,8 @@ function tickSlow(sim: WorldSim, n = 1): void {
   for (let i = 0; i < n * FAST_PER_SLOW; i += 1) sim.tick();
 }
 
-/** 写死的时间原点:房间时钟与赛局时钟**共用**它(两者不同源 ⇒ 差值就是漂移)。 */
+/** 写死的时间原点(墙钟)。★ WS-FND-174 起 HUD 的剩余读**世界钟** ⇒ 墙钟只用于
+    「墙钟不再参与」那两条负对照。 */
 const T0 = 1_700_000_000_000;
 /** 435 复活旗(队伍归属的唯一来源)。 */
 const BANNER_ITEM = 435;
@@ -57,7 +58,7 @@ interface HudRoom {
   rt: ReturnType<typeof assemble>['runtime'];
   sim: WorldSim;
   roomId: string;
-  /** 把**房间时钟与赛局时钟同时**推到 `ms`。 */
+  /** 推**房间墙钟**(★ WS-FND-174 起它不再参与 HUD 的倒计时;负对照用)。 */
   setNow: (ms: number) => void;
 }
 
@@ -163,10 +164,18 @@ test('FND127-2 ★★ 喂一局 ⇒ partyTimer/scoreA/scoreB 按**权威值**出
   eq(m.scoreA, 4, '★ 红队比分 4 = p1 的分数(按旗的队伍归属,不按加入顺序)');
   eq(m.scoreB, 6, '★ 蓝队比分 6 = p2 的分数');
 
-  /* 推进 10.4s ⇒ 45 − 10.4 = 34.6 ⇒ round 35(房间不自跑第二个时钟) */
+
+  /* ★ WS-FND-174(**陈旧断言已翻面**):HUD 的剩余现在与世界钟同源 ⇒ 要让它递减,
+     必须推进**世界钟**(`sim.advance`,一帧 = 一快帧),而不是房间墙钟。
+     10.4 世界秒 ⇒ 45 − quant(10.4) = 45 − 10 = 35(与判定用的同一个数)。 */
+  r.sim.advance(10.4 * 20);
+  syncHud(r);
+  eq(metaOf(r).partyTimer, 35, '★ 世界钟推进 10.4s ⇒ 剩余递减到 35(与判定同源)');
+  /* 负对照(同一条判据的另一半):墙钟推进同样的 10.4 秒,**一分不动** ——
+     修前的漂移(HUD 比世界早 20% 归零)正是从这一行来的。 */
   r.setNow(T0 + 10_400);
   syncHud(r);
-  eq(metaOf(r).partyTimer, 35, '★ 时间推进 ⇒ 剩余递减到 35(读的是权威 startedAtMs)');
+  eq(metaOf(r).partyTimer, 35, '★ 墙钟推进不改变剩余(墙钟不再参与 HUD)');
 
   /* 分支 2:结算后剩余归 0,但**比分保留**(名次已定格,清掉会让 HUD 闪成 0:0) */
   ok(endParty(r.roomId) !== null, '前置:结算成功');
@@ -186,19 +195,21 @@ test('FND127-3 ★ 三个字段各自被夹到值域(不负 / 不溢出)', () =>
   syncHud(r);
   eq(metaOf(r).scoreA, 65535, '★ 比分夹到 U16 上界 65535(否则编码器写垃圾且不报错)');
 
-  /* 2 计时:上界。⚠️ 如实记一层:`elapsed` 已被 `Math.max(0, ...)` 钳过(`room.ts:2157`),
-     所以时钟回拨时剩余停在**总时长**而不是 90045;`MAX_PARTY_TIMER_SEC` 那层 `Math.min`
-     今天**不可达**(PARTY_MODES 最长 180s < 86400)⇒ 断言实际值 45,不假设是哪层钳住的。 */
+  /* 2 计时:上界(★ WS-FND-174 起时基是**世界钟**)。世界钟只会前进 ⇒ 剩余不会超过
+     总时长(`Math.min(totalSec, ...)` 那一层)。这里用**墙钟回拨**做负对照:
+     墙钟已经不再参与 HUD ⇒ 回拨 24 小时对它毫无影响(修前它会靠在
+     `Math.max(0, ...)` 上停在 45)。`MAX_PARTY_TIMER_SEC` 那层今天仍**不可达**
+     (PARTY_MODES 最长 180s < 86400)⇒ 断言实际值 45,不假设是哪层钳住的。 */
   eq(MAX_PARTY_TIMER_SEC, 86400, '锚:计时上限 24h = 86400s');
   r.setNow(T0 - 90_000_000);
   syncHud(r);
-  eq(metaOf(r).partyTimer, 45, '★ 时钟回拨 ⇒ 剩余停在总时长 45(不出现 90045 / 负数)');
+  eq(metaOf(r).partyTimer, 45, '★ 墙钟回拨 ⇒ 剩余照旧停在总时长 45(墙钟不参与,不是「钳住了」)');
 
-  /* 3 计时:下界。时钟远超总时长 ⇒ 剩余为负 ⇒ 夹到 0(不写负数)。 */
-  r.setNow(T0 + 1_000_000);
+  /* 3 计时:下界。**世界钟**走过总时长 ⇒ 剩余为负 ⇒ 夹到 0(不写负数)。 */
+  r.sim.advance(45 * 20 + 200);
   syncHud(r);
   const m = metaOf(r);
-  eq(m.partyTimer, 0, '★ elapsed > 总时长 ⇒ 夹到 0(绝不写负数)');
+  eq(m.partyTimer, 0, '★ 世界钟走过 45s ⇒ 夹到 0(绝不写负数)');
   ok(m.partyTimer >= 0 && m.partyTimer <= MAX_PARTY_TIMER_SEC,
     `值域:[0, ${MAX_PARTY_TIMER_SEC}](实测 ${m.partyTimer})`);
   resetPartyClock();
