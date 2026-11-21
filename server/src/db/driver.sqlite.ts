@@ -476,7 +476,7 @@ export function openNodeSqlite(file = ':memory:'): SqliteDb {
  * 这个决定交给了引擎默认值:换引擎/换版本就悄悄变了,而它正是长跑里
  * 「-wal 文件涨到几百 MB」的那个开关。
  *
- * 512 页(默认页 4 KiB ⇒ 约 2 MiB 上限)是本仓「20 Hz 写入 + 小库」的折中:
+ * 512 页(默认页 4 KiB ⇒ 约 2 MiB 上限)是本仓「32Hz 写入 + 小库」的折中:
  * 比默认更早回收,又不至于每个事务都检查点一次。
  * ⚠️ 单位是**页**不是字节;`better-sqlite3` 与 `node:sqlite` 接受同一语法。
  */

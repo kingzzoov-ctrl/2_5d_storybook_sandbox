@@ -32,7 +32,7 @@ import { ITEM_BY_ID } from '../../../shared/constants/items.ts';
 /* D-13:工位喷射半径复用料理站灭火半径(`EXTINGUISH_RADIUS` = 3 格),见 2b 节。 */
 import { EXTINGUISH_RADIUS } from '../combat/cooking.ts';
 
-/** 浮点容差:20Hz 逐帧累加后用于比较阈值。 */
+/** 浮点容差:32Hz 逐帧累加后用于比较阈值。 */
 export const EPS = 1e-9;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -985,7 +985,7 @@ export function pollChainTimeout(c: RelayChain, nowSec: number): RelayStageResul
  * 顶层的伸手抓取高度(格)。
  *
  * 只影响「够不够得着」,不影响承载坐标——坐标仍完全由冻结层 `stackOffset` 决定。
- * 与 `Z2_REACH_TARGET` 配对使用,两侧都留裕度,避免 20Hz 浮点累加与坐标同步抖动误判。
+ * 与 `Z2_REACH_TARGET` 配对使用,两侧都留裕度,避免 32Hz 浮点累加与坐标同步抖动误判。
  */
 export const STACK_REACH_Z = 0.30;
 

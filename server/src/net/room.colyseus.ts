@@ -15,7 +15,7 @@
  *   并由 `tests/WS-FND-12-wiring-paths.test.ts` 的 FND12-8 实测 import + 断言
  *   4 条 handler 在 `onCreate` 里真的被注册。此前它**谁也没法 import**。
  *
- * 关键:**20Hz 差量由我们自己的 delta.ts 负责**,Colyseus 的自动 patch 只当
+ * 关键:**32Hz 差量由我们自己的 delta.ts 负责**,Colyseus 的自动 patch 只当
  * 兜底(通过 `schema.syncFrom` 写值,由 Colyseus 决定是否下发)。
  * 之所以要两套并存:我们的 delta.ts 支持零依赖单测与精确字节预算,
  * 而 Colyseus 的 patch 支持其 WebSocket 层的可靠有序通道。
@@ -330,7 +330,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
 
   /* ── ★ WS-FND-134(P2):留证字段 → 日志出口(见 noteRuntimeEvidence) ──
      三个字段记的是「**最近一次**」错因 ⇒ 必须记住「上一次已经报过的那一条」,
-     否则 20Hz 的 stepTick 会把同一行刷 20 次(噪声会让人关掉日志 —— 那等于又回到静默)。 */
+    否则 32Hz 的 stepTick 会把同一行刷 32 次(噪声会让人关掉日志 —— 那等于又回到静默)。 */
   private loggedRestoreError: string | null = null;
   private loggedRemoveError: string | null = null;
   private loggedJoinAudit: RoomRuntime['lastJoinAudit'] = null;
@@ -476,7 +476,7 @@ export class NetPersistRoom extends Room<RoomSchema> {
      *    而「不可加载」掩盖了这件事 —— 文件加载不了,讨论 handler 注册无从谈起。 */
     this.registerHandlers();
 
-    /* 20Hz 权威帧。 */
+    /* 32Hz 权威帧。 */
     this.setSimulationInterval(() => this.stepTick(), DT * 1000);
   }
 

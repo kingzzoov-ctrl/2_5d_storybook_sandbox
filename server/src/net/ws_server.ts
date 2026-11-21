@@ -221,7 +221,7 @@ export const HELLO_TIMEOUT_MS = 10_000;
  *   断开之前**不阻塞**(绝不 await 写)、也**不偷偷丢**(`writeBackpressure`
  *   就是"发不出去"这件事的读数)。
  * ```
- * 10 帧 ≈ 20Hz 下 500ms 的持续积压:足够排除一次 TCP 抖动,
+ * 10 帧 ≈ 312.5ms(32Hz)的持续积压:足够排除一次 TCP 抖动,
  * 又远小于玩家能察觉的"卡住"。
  */
 export const BACKPRESSURE_DISCONNECT_STRIKES = 10;
@@ -1165,7 +1165,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
        2 连续到阈值 ⇒ **断开**(1011)+ `backpressureDrops`,理由与取舍写在
          `BACKPRESSURE_DISCONNECT_STRIKES` 上(丢帧会打断差量链,比断连更坏)。
        ⚠️ 这里**不阻塞**:`socket.write` 本来就是非阻塞的,而"等它排空再写"
-         会让 20Hz 循环的帧率由**最慢的那个客户端**决定 —— 那是把一个人的
+         会让 32Hz 循环的帧率由**最慢的那个客户端**决定 —— 那是把一个人的
          卡顿摊给全房。 */
     writeBackpressure += 1;
     c.writeStalls += 1;
@@ -1858,7 +1858,7 @@ function onMove(c: WsConn, msg: {
   }
 }
 
-  /* ── 20Hz 广播循环 ──
+  /* ── 32Hz 广播循环 ──
    * ★ WS-FND-161(P2)「广播顺序 / 有界」在这一段里的三条依据:
    * ```text
    * 1 **成员**:先 `syncSubscriptions()` 与房间席位表核对 ⇒ 广播集里

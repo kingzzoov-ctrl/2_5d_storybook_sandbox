@@ -1087,9 +1087,9 @@ export class HarpyAi extends BaseMobAi {
 
   /** 与玩家乐器合奏 → 害羞地送星辰碎片。
    *
-   * `ticks` 为累计秒数增量(由调用方按 20Hz 传 DT),**累加不重置**;
+   * `ticks` 为累计秒数增量(由调用方按 32Hz 传 DT),**累加不重置**;
    * 乐器门禁为 `INSTRUMENT_IDS` 集合;阈值 `HARPY_ENSEMBLE_SEC` 用 `>= -1e-9`
-   * 吸收 20Hz 积分下的浮点误差,保证恰好 5.00s 触发。
+   * 吸收 32Hz 积分下的浮点误差,保证恰好 5.00s 触发。
    */
   ensemble(rt: MobRuntime, world: MobWorld, ticks: number, heldItem = INSTRUMENT_IDS[0]): boolean {
     if (rt.mem.friendly) return false;             /* 已友好,不重复馈赠 */

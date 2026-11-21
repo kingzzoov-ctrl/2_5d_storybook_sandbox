@@ -11085,11 +11085,11 @@ export class WorldSim {
     let componentsEvaluated = 0;
     let spawned = 0;
 
-    /* ── 快帧 20Hz:物理 ── */
+    /* ── 快帧 32Hz:物理 ── */
     physics = this.physics.step(SIM_FAST_DT);
     this.syncPlayers();
 
-    /* ── 快帧 20Hz:灼烧 DoT(task-44)──
+    /* ── 快帧 32Hz:灼烧 DoT(task-44)──
      * ⚠ **必须在快帧、且用 `SIM_FAST_DT`**。
      *
      * 我第一版把它放进了下面的 `isSlow` 块(2Hz)却仍按 `DT = 0.05s` 折算,

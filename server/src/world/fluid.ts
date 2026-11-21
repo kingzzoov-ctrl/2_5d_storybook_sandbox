@@ -963,7 +963,7 @@ export function makeSealedPool(width: number, height: number, fill: number): Flu
  * RATE-3 解耦:本文件与 `mobs/host.ts` 的**代码**里不许出现 `FAST_PER_SLOW` /
  *        `SLOW_TICK_HZ` / `isSlow`(扫描器掩注释);把 `FAST_PER_SLOW` 改成任意值,
  *        上面那个次数逐位不变;
- * RATE-5 量化取上整 ⇒ **实际频率 ≤ 名义频率**(20Hz 帧率下 8Hz ⇒ 步长 3 = 6.67Hz,
+ * RATE-5 量化取上整 ⇒ **实际频率 ≤ 名义频率**(32Hz 帧率下 5Hz ⇒ 步长 7 = 4.57Hz,
  *        绝不超支);非正/非有限的速率入参 ⇒ 步长 1,不抛异常;
  * RATE-6 提频只放大「每秒额度」:单步仍受预算截断、水位守恒(降级 = 延后),
  *        且 `FLUID_CELL_BUDGET × FLUID_RATE_HZ ≤ 8192`。

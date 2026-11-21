@@ -389,7 +389,7 @@ function main(): void {
   }
 
   /* WASD → InputCmd → 本地预测 → 上行(2026-11-14,task-83 选乙)。
-     固定 20Hz:`predictStep` 的位移是 `v_max * DT`,而 DT 是服务端权威常数 ——
+     固定 32Hz:`predictStep` 的位移是 `v_max * DT`,而 DT 是服务端权威常数 ——
      跟着渲染帧走会让 60Hz 与 30Hz 的机器角色速度不同,且不报错。
 
      ★ WS-FND-23 更新:WASD 现在**只**驱角色。相机跟随**权威位置**

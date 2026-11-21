@@ -234,7 +234,7 @@ export interface BootHandle {
    * ★ WS-FND-113 第 2 处:接上**预测姿态源** —— 每帧拉一次,`null` = 没有预测。
    *
    * ## 为什么是函数(每帧拉)而不是一个值
-   * 渲染 60Hz、预测 20Hz。存一个值进来,渲染就会画"上次 push 进来的那个"位置,
+   * 渲染 60Hz、预测 32Hz。存一个值进来,渲染就会画"上次 push 进来的那个"位置,
    * 最多滞后一帧 —— 与"滞后一个 RTT"只是程度不同,而两者的**症状看起来一样**。
    *
    * ## 为什么 `null` 必须退回权威
@@ -1903,7 +1903,7 @@ export function boot(container: HTMLElement): BootHandle {
     const center = telegraphCenterOf(authority.state, authority.localPlayerId);
     /* ── ★ WS-FND-113 第 2 处:每帧拉一次**预测**姿态 ──
      *
-     * 为什么是"拉"而不是"被 push":预测 20Hz、渲染 60Hz。存在一个变量里会让渲染画
+     * 为什么是"拉"而不是"被 push":预测 32Hz、渲染 60Hz。存在一个变量里会让渲染画
      * "上一次推进时的位置",最多滞后一帧(16ms)—— 与"滞后一个 RTT"只是程度不同,
      * 而两者的症状看起来一样。`null` = 没有预测(未联机 / 权威还没到 / 坐标坏了)。
      */
@@ -1934,7 +1934,7 @@ export function boot(container: HTMLElement): BootHandle {
      */
     playerGz = localPlayerZOf(authority.state, authority.localPlayerId);
 
-    /* ── task-83 + ★ WS-FND-48:把玩家画出来,并让它跟着 20Hz 快照动 ──
+    /* ── task-83 + ★ WS-FND-48:把玩家画出来,并让它跟着 32Hz 快照动 ──
      *
      * 这一块就是「快照 ⇒ 屏幕」的**唯一接口**. 位置**不重新算** ——
      * `center` 已由权威状态给出(上面那几行),这里只做「翻译成摆放参数」.

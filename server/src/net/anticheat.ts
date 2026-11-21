@@ -435,6 +435,20 @@ export interface PlayerAntiCheatState {
    * 这正是「同一 tick 可重复兑现」的闸门。
    */
   lastMoveTick: number;
+
+  /**
+   * ★ **客户端帧计数器的基准偏移**(首包定,之后不变;`null` = 还没收到过包)。
+   *
+   * 客户端发的是**它自己的**计数器(`client/src/main.ts` 的 `localTick`,从 0 起),
+   * 而 `lastMoveTick` 播种的是**房间帧号**(`room.ts#join` 传 `state.meta.tick`)。
+   * 两者相差「加入时房间已经跑了多少帧」——**任何第二个玩家、任何重载**都会差几百帧。
+   * 不折算 ⇒ `claimedTick = min(intent.tick, …)` 被压到客户端那个小计数上
+   * ⇒ `dtTicks = 0` ⇒ `allowed = 0` ⇒ **每一包带位移的移动都被判 TELEPORT**,
+   * 玩家一步也走不动,且每包留一条假阳性(判据 `FND178-8`)。
+   *
+   * ⚠️ **不进快照、不回滚** —— 它是「两套时钟之间的换算」,不是位置事实。
+   */
+  clientTickBase: number | null;
   /** 环形窗口:最近 N 帧的位置与时间,用于窗口式移速检测。 */
   window: { tick: number; x: number; y: number }[];
   /** 上次成功攻击的 tick。 */
@@ -458,11 +472,16 @@ export function createAcState(id: string, tick = 0, x = 0, y = 0, z = 0): Player
   return {
     id,
     lastX: x, lastY: y, lastZ: z,
-    /* 两个水位都对齐到进入时刻(tick 由 `join` 传入 `state.meta.tick`)。
-       若只对齐时钟而让申报水位留在 0,玩家可在同一帧内连发 N 包
-       「追平」这段积压 ⇒ 开局即兑现 N 帧额度。两边同起点则无积压。 */
+    /* 两个水位都**以房间时钟为基准**:`lastTick` 是服务端时钟;`lastMoveTick` 是
+       客户端申报水位,也播种成房间帧号 —— 若留 0,玩家可在同一帧内连发 N 包
+       「追平」这段积压 ⇒ 开局即兑现 N 帧额度。
+       ⚠️ 但客户端发的是**它自己的**计数器 ⇒ 必须经 `normalizeClientTick()` 折算到
+       房间时钟(见 `clientTickBase`),否则申报水位永远追不上、`dtTicks` 恒 0
+       ⇒ 玩家一步也走不动(这正是 `FND178-8` 守的那条)。 */
     lastTick: tick,
     lastMoveTick: tick,
+    /* 基准由**首包**定(见 `normalizeClientTick`);抵达此刻还没有任何一包。 */
+    clientTickBase: null,
     window: [{ tick, x, y }],
     lastAttackTick: -9999,
     score: 0,
@@ -1602,8 +1621,13 @@ export class AntiCheatRoom {
    * ## 只有房间侧可以用**权威值**调它
    *
    * `x/y/z` 必须来自 `WorldSaveHost.playerPosition`(或等价的权威读口)。
-   * 客户端申报值走 `checkMove` 那条既定路径,**不许**经这里进入水位 ——
-   * 否则就成了「谁都能重设判据参考点」,那才是真的放水。
+   * 客户端申报值走 `checkMove` 那条既定路径。
+   *
+   * ⚠️ **两处出路径的兜底是有意的例外,不是新入口**:`room.ts#applyMove` 在
+   * 「没有世界 / 旧世界源只回 x/y」时退回 `intent.x` / `intent.y` / `intent.z`
+   * (`auth?.x ?? intent.x`)。它只在**拿不到任何权威**时进入,而那种情况下
+   * `checkMove` 放行本来就把申报值写进水位(逐位等价的既有行为)。
+   * 将来若所有世界源都能回 z,这条兜底应收紧成「拿不到就不重锚」。
    *
    * ## 契约(fail-closed)
    *
@@ -1623,6 +1647,42 @@ export class AntiCheatRoom {
     s.lastX = x;
     s.lastY = y;
     s.lastZ = z;
+  }
+
+  /**
+   * ★ 把**客户端自报的帧计数器**折算到**房间时钟**上(首包定基准,之后不变)。
+   *
+   * ## 为什么必须有这一层
+   *
+   * 两套时钟**不同源**:
+   * - 房间/反作弊:`s.lastTick` = 房间帧号(`state.meta.tick`),`join` 用它播种
+   *   `lastMoveTick`(`room.ts#join`);
+   * - 客户端:`client/src/main.ts` 的 `localTick` —— **从 0 起的自有计数器**,
+   *   每输入拍 +1,`sendMove` 发它(`main.ts:852`);服务端 `parseMoveIntent`
+   *   **原样透传**(`ws_server.ts:669`)。
+   *
+   * 房间只要在玩家加入**之前**跑过帧(⇒ **任何第二个玩家、任何页面重载**),
+   * 两者就差几百帧。此时 `claimedTick = min(intent.tick, lastMoveTick + MAX, …)`
+   * 被压到客户端那个小计数上 ⇒ `dtTicks = 0` ⇒ `allowed = 0` ⇒
+   * **每一包带位移的移动都被判 TELEPORT、写不进世界**:玩家一步也走不动,
+   * 且每包留一条假阳性(判据 `tests/WS-FND-178` 的 `FND178-8`)。
+   *
+   * ## 为什么它不打洞
+   *
+   * 返回值仍要过 `checkMove` 的**同一对夹取**(`lastMoveTick + MAX` 与
+   * `lastTick + MAX`)⇒ 折算只是把「客户端计数器」翻译成「房间帧号」,
+   * **拿不到任何额外额度**;报一个巨大的首包 tick 也没用(基准只定一次,
+   * 且随后照样被夹取封顶)。基准不进快照、不回滚 —— 它是换算,不是位置事实。
+   */
+  normalizeClientTick(playerId: string, clientTick: number): number {
+    const s = this.states.get(playerId);
+    if (s === undefined || !Number.isFinite(clientTick)) return clientTick;
+    /* 基准**钳到 ≥ 0**:只有房间时钟**领先**客户端计数器时才折算。逆差不折算 ——
+       那时两套时钟本来就是同起点(短跑夹具直接发房间帧号;单测里没推过房间帧,
+       `lastTick === 0` 而 tick 从 1 数起)。折出一个负基准会把申报压到 0 以下,
+       `dtTicks` 变 0,反而把**合法**的包判成违规(WS-07 F24/G01/G04/task-38 实测)。 */
+    if (s.clientTickBase === null) s.clientTickBase = Math.max(0, s.lastTick - clientTick);
+    return clientTick + s.clientTickBase;
   }
 
   /**

@@ -100,13 +100,13 @@ if (sim.unknownMobs.length > 0) {
 }
 
 console.log(`尺寸          ${sim.sizeCells} × ${sim.sizeCells} 格`);
-console.log(`快帧 / 慢帧   ${SIM_FAST_DT}s (20Hz) / ${SIM_SLOW_DT}s (2Hz),比例 1:${FAST_PER_SLOW}`);
+console.log(`快帧 / 慢帧   ${SIM_FAST_DT}s (32Hz) / ${SIM_SLOW_DT}s (2Hz),比例 1:${FAST_PER_SLOW}`);
 console.log(`初始快照      ${JSON.stringify(sim.snapshot())}`);
 console.log('');
 console.log('帧序  相位    模拟秒   刚体  流体处理  通电格  泛洪增量  活跃生物');
 console.log('────────────────────────────────────────────────────────────────────');
 
-const total = Math.round(SECONDS * 20);
+const total = (SECONDS / SIM_SLOW_DT) * FAST_PER_SLOW;
 const t0 = performance.now();
 /* 保留完整 reports:自检需要逐帧读 `componentsEvaluated`
    (证明电路**件**真的被求值,而不只是「线通」)。 */
@@ -136,7 +136,7 @@ if (printed === 0) console.log('(运行时长不足一个慢帧)');
 console.log('────────────────────────────────────────────────────────────────────');
 console.log('');
 console.log('══════ 结果 ══════');
-console.log(`推帧总数      ${frames} 帧(${SECONDS}s × 20Hz)`);
+console.log(`推帧总数      ${frames} 帧(${SECONDS}s × 32Hz)`);
 console.log(`其中慢帧      ${slowFrames} 帧`);
 console.log(`快慢比        ${(frames / Math.max(1, slowFrames)).toFixed(2)} : 1`);
 console.log(`终态快照      ${JSON.stringify(sim.snapshot())}`);
@@ -257,7 +257,7 @@ if (problems.length > 0) {
   process.exit(1);
 }
 console.log('自检通过:');
-console.log('  ✓ 世界按 20Hz/2Hz 双频推进,慢帧比例精确 1:10');
+console.log('  ✓ 世界按 32Hz/2Hz 双频推进,慢帧比例精确 1:16');
 console.log('  ✓ 全部子系统可同时实例化并协同运行(地形/物理/流体/电路/AOI/刷怪)');
 console.log('  ✓ 电路**件**真的被求值:' + `${evaluatedTotal} 次(线通电 ${snap.wireCells} 格)`);
 console.log(

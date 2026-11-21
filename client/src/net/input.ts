@@ -86,7 +86,7 @@ export class InputSource {
   private readonly down = new Set<string>();
   private seq = 0;
   /**
-   * 空格锁存:**恰好一条**命令带 `jump: true`(按住空格在 20Hz 下会每秒发 20 次)。
+   * 空格锁存:**恰好一条**命令带 `jump: true`(按住空格在 32Hz 下会每秒发 32 次)。
    *
    * ★ WS-FND-113:此前它**没有出口** —— `MoveIntent`(`session.ts`)没有 `jump` 字段、
    * 服务端 `applyMove` 也只接 x/y/z ⇒ 锁存下来的那个跳跃永远发不出去;

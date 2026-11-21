@@ -1,5 +1,5 @@
 /**
- * WS-02 · 2.5D 伪三维刚体物理世界(20Hz)。
+ * WS-02 · 2.5D 伪三维刚体物理世界(32Hz)。
  *
  * 全部积分由冻结层 `shared/types/physics.ts` 承担:
  *   - `integrateHorizontal(vx, vy, mu, ax, ay, fx, fy, beltX, beltY, mass, dt)`
@@ -212,7 +212,7 @@ export function apexHeight(vz0: number, dt: number = DT): number {
   return peak;
 }
 
-/** 二分反解:使 20Hz 采样峰值 ≈ targetZ 的垂直初速。 */
+/** 二分反解:使 DT(1/32)采样峰值 ≈ targetZ 的垂直初速。 */
 export function launchSpeedForApex(targetZ: number, dt: number = DT): number {
   let lo = 0;
   let hi = 64;
@@ -277,7 +277,7 @@ export const SWEEP_REFINE_STEPS = 12;
  * 落点校验的**回退搜索半径**(格,切比雪夫环数)。
  *
  * 8 环 = 最多 17×17 格:足够跨过本仓最厚的实心墙(地图边缘 + 1~2 格厚墙),
- * 又不至于让一次失败的落点校验变成全图扫描(20Hz 下每次被挡都要跑一遍)。
+ * 又不至于让一次失败的落点校验变成全图扫描(32Hz 下每次被挡都要跑一遍)。
  */
 export const CLAMP_RING_MAX = 8;
 
@@ -965,7 +965,7 @@ export class PhysicsWorld {
   /* ── 主循环 ── */
 
   /**
-   * 20Hz 推进一帧。
+   * 按 dt(= DT = 1/32)推进一帧。
    * 顺序:机关外力 → 拆分子步 → 水平积分 → 垂直积分 → 地形碰撞 →
    *       两两碰撞 → **墙体反卡** → 边界钳制 → 有限性兜底。
    */

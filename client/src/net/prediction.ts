@@ -359,11 +359,11 @@ export function simulateInterpolation(
 
   const out: { tick: number; truthX: number; truthY: number; gotX: number; gotY: number; got: boolean }[] = [];
 
-  /* 服务端 20Hz 发包。 */
+  /* 服务端 32Hz 发包。 */
   for (let t = 0; t <= opts.ticks; t += 1) {
     const p = truthAt(t);
     ch.send(t, p.x, p.y, p.z);
-    /* 客户端在这 50ms 内按 clientDt 步进渲染。 */
+    /* 客户端在这 1000 / TICK_HZ 秒(= 31.25ms,32Hz)内按 clientDt 步进渲染。 */
     for (let ms = 0; ms < 1000 / TICK_HZ; ms += clientDt) {
       const now = t * (1000 / TICK_HZ) + ms;
       for (const pkt of ch.advanceTo(now)) interp.push({ tick: pkt.tick, x: pkt.x, y: pkt.y, z: pkt.z });

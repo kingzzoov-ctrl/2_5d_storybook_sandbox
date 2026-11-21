@@ -440,7 +440,7 @@ test('FND178-6 ★ syncWatermark 契约:未登记 ⇒ 空操作不新建;非有�
   eq(st.lastTick, clockTick, '★★ 服务端时钟水位不动');
   eq(st.score, score, '★★ 分数不动(重锚是位置事实,不是「撤销一次违规」)');
   eq(rt.ac.violations().length, viol, '★★ 违规流水不动');
-  eq(rt.ac.droppedViolations >= 0, true, '★ 丢弃计数可读(soak 台账新读口的口径)');
+  eq(rt.ac.droppedViolations, 0, '★ 没有任何违规被环形覆盖掉(容量 512 未被灌满 ⇒ 读数是真实条数,不是饱和值)');
 });
 
 /* ═════ 7. ★ 第二修点:刚体在 `applyMove` **之外**被搬走 ⇒ 入口重锚 ═════ */
@@ -484,6 +484,77 @@ test('FND178-7 ★★ 入口重锚:刚体在 `applyMove` 之外被世界搬走 �
      (本轮实测:注释掉 `room.ts` 入口那三行 ⇒ 本用例在
       「★★ 诚实包不判 TELEPORT」与 「★★ 零违规」两条上失败,
       `detail` = 单帧位移 ≈ 位移量 > 上界 0.225 —— 见套件头部「有牙怎么验」。) */
+});
+
+/* ═══ 8. ★ 第三修点:客户端发的是**它自己的**帧计数器 ⇒ 必须折算到房间时钟 ═══ */
+
+/**
+ * ## 这一条守什么
+ *
+ * 两套时钟**不同源**:
+ * - 反作弊:`lastMoveTick` 在 `join` 时被播种成**房间帧号**(`room.ts#join` 传
+ *   `state.meta.tick`);
+ * - 客户端:`client/src/main.ts` 的 `localTick` —— **从 0 起的自有计数器**,每输入拍 +1,
+ *   `sendMove` 发它;服务端 `parseMoveIntent` **原样透传**(`ws_server.ts`)。
+ *
+ * ⇒ 只要房间在玩家加入**之前**跑过帧(**任何第二个玩家、任何页面重载**),两者就差几百帧:
+ * `claimedTick = min(intent.tick, lastMoveTick + 1, …)` 被压到客户端那个小计数上
+ * ⇒ `dtTicks = 0` ⇒ `allowed = 0` ⇒ **每一包带位移的移动都被判 TELEPORT、写不进世界**,
+ * 玩家一步也走不动(而每包还留一条假阳性)。
+ *
+ * 修法:第一包记下 `(房间帧号, 客户端计数器)` 的**偏移**,之后把申报 tick 折算到房间时钟。
+ * 折算结果仍要过 `checkMove` 的**同一对夹取** ⇒ **拿不到任何额外额度**。
+ */
+test('FND178-8 ★★ 客户端计数器折算:房间先跑 60 帧**之后**才进人 ⇒ 从 0 起算的申报仍必须放行', () => {
+  const clock = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: freshId('tickbase'), ownerId: 'owner', clock: clock.clock });
+  const sim = new WorldSim({ sizeCells: SIZE, mobs: false, wiring: false, seed: SEED });
+  rt.worldSaveHost = sim as unknown as WorldSaveHost;
+
+  /* ── 先把房间推 60 个真帧:模拟「房间已经在跑,玩家这时才进来」── */
+  for (let i = 0; i < 60; i += 1) rt.step();
+  const joinedAt = rt.state.meta.tick;
+  ok(joinedAt >= 60, `前置:房间先跑了 ≥60 帧(实际 ${joinedAt})`);
+
+  const j = rt.join({ userId: 'p1' });
+  ok(j.ok, '前置:玩家进场(晚进)');
+  for (let x = 0; x <= 8; x += 1) for (let y = 0; y <= 8; y += 1) sim.setCell(x, y, { obj: 0 });
+  for (let i = 0; i < 2; i += 1) rt.step();
+
+  const s0 = rt.ac.get('p1');
+  ok(s0 !== undefined, '前置:反作弊里有这个玩家');
+  eq(s0!.lastMoveTick, joinedAt, '前置:`lastMoveTick` 被播种成**加入那一刻的房间帧号**');
+  ok(rt.state.meta.tick > s0!.lastMoveTick,
+    `前置:此后房间又走了帧(now ${rt.state.meta.tick} > ${s0!.lastMoveTick})⇒ 额度窗口非零`);
+
+  /* ★ 客户端发的是**它自己的**计数器(从 0 起)⇒ 第一包 tick = 1。 */
+  let clientTick = 1;
+  const first = (() => {
+    const p = rt.playerState('p1');
+    ok(p !== undefined, '前置:投影里有这个玩家');
+    return rt.applyMove('p1', { tick: clientTick, x: p!.x + LEGAL_STEP, y: p!.y, z: p!.z });
+  })();
+  eq(first.allowed, true,
+    '★★ 客户端计数器 tick=1、房间已跑 60+ 帧 ⇒ 这一包**必须放行**');
+  eq(first.violation, undefined, '★★ 不得留下任何违规记录');
+  ok(first.worldRejected !== true, '★ 也不是靠世界拒收(世界侧接受)');
+
+  /* ── 连发三拍(每拍之间推一个真房间帧,与真实客户端 32Hz 发包同形)── */
+  let allowed = 1;
+  for (let i = 0; i < 3; i += 1) {
+    rt.step();
+    clientTick += 1;
+    const p = rt.playerState('p1');
+    ok(p !== undefined, '前置:投影里有这个玩家');
+    const r = rt.applyMove('p1', { tick: clientTick, x: p!.x + LEGAL_STEP, y: p!.y, z: p!.z });
+    if (r.allowed) allowed += 1;
+  }
+  eq(allowed, 4, '★★ 连续四拍全部放行(客户端计数器与房间时钟同速增长)');
+  eq(rt.ac.violations().length, 0, '★★ 全程零违规');
+
+  /* ── 反证(有牙怎么验):把 `room.ts#applyMove` 里那次 `normalizeClientTick(…)`
+     折算去掉(改回直接传 `intent.tick`)⇒ 本用例第一条判据必须红。
+     实测:`allowed = false`,`detail = 单帧位移 0.141 格 > 上界 0.000`。 ── */
 });
 
 report('WS-FND-178');

@@ -337,7 +337,7 @@ export function headingDeg(m: MobFsm): number {
  *  - 数组读:3 × 8ns = 24ns
  *  - 三角:`sin/cos` 各 1 次,~20ns
  *  - 积分与写回:~15ns
- *  → 单怪单帧 ≈ 60~80ns;30 只 ≈ 2.1µs;20Hz 下占单帧预算(50ms)的 0.0042%。
+ *  → 单怪单帧 ≈ 60~80ns;30 只 ≈ 2.1μs;32Hz 下占单帧预算(31.25ms)的 0.0067%。
  */
 export function estimateFsmCostUs(activeMobs: number): number {
   return activeMobs * 0.07;

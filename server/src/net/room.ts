@@ -4147,7 +4147,12 @@ export class RoomRuntime {
       this.ac.syncWatermark(userId, bodyNow.x, bodyNow.y, bodyNow.z);
     }
     const snap = this.ac.snapshotMove(userId);
-    const v = this.ac.move({ ...intent, playerId: userId }, 3);
+    /* ★ 客户端发的是**它自己的**帧计数器(`main.ts` 的 `localTick`),必须折算到
+       房间时钟,否则 `dtTicks` 恒 0 ⇒ 每包带位移的移动都被判 TELEPORT、玩家动不了
+       (判据 `FND178-8`)。折算不改额度语义:`checkMove` 里那对夹取照旧封顶。 */
+    const v = this.ac.move(
+      { ...intent, tick: this.ac.normalizeClientTick(userId, intent.tick), playerId: userId }, 3,
+    );
     if (!v.allowed) {
       if (v.violation) this.pendingViolations.push(v.violation);
       return v;

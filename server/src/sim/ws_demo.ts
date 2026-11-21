@@ -49,8 +49,8 @@
  *
  * ## ★★ 双频纪律(本仓世界层有内部双频,错了会让世界快 2 倍)
  * ```
- * WorldSim:TICK_HZ=20 / SLOW_TICK_HZ=2 / FAST_PER_SLOW=10
- * 而 `setSimulationInterval` 也是 20Hz ⇒ **两者嵌套**
+ * WorldSim:TICK_HZ=32 / SLOW_TICK_HZ=2 / FAST_PER_SLOW=16
+ * 而 `setSimulationInterval` 也是 32Hz(DT * 1000 = 31.25ms)⇒ **两者嵌套**
  * ⇒ `advance(1)` 对应外部一帧,**恰好 1:1**,不要再乘 FAST_PER_SLOW。
  * 若以为"慢帧 2Hz 所以要乘 10" ⇒ 每慢帧推进两次 AI ⇒ 世界快 2 倍,
  *   而**不报错、测试也可能照过**(world_sim.ts 自己记着这个先例)。
