@@ -703,4 +703,180 @@ test('FND178-10 ★★ 世界自位移 W 内的拒绝归 `stale` 不计违规;�
      三条必须红(实测:10/10 → 9/10)。 ── */
 });
 
+/* ═══ 11. ★ 钉住 O-8 的结论:满速 + 窗口内一次真击退 ⇒ 0 条 SPEED ═══ */
+
+/**
+ * ## 这一条守什么
+ *
+ * `docs/HANDOVER.md` §13.4 的 **O-8** 曾主张:§6.2 的速度窗口没跟着水位重锚 ⇒
+ * 满速玩家 1 秒走 4.5 格,窗口内再吃一次击退(上界 2 格)⇒ 读数 **6.5 > 上限 5.625**
+ * ⇒ **诚实玩家被判 SPEED**。
+ *
+ * **实测否证**(2026-11-22):击退期间世界**拒收**移动(`applyPlayerMove` 的搬家窗口),
+ * 那些申报被 `applyMove` 的世界拒收路径用 `rollbackMove` **从窗口里回滚掉**
+ * ⇒ 击退位移**进不了** `pathLength`;而击退位移本身又被慢帧摊进那 1 秒 ⇒ **两项互相抵消**。
+ * 本用例把这条结论**钉成回归**:以后谁改了窗口或拒收回滚,这里当场红。
+ */
+test('FND178-11 ★★ O-8 否证:满速 32Hz + 窗口内一次真击退 ⇒ 窗口读数不越界、0 条 SPEED', () => {
+  const clock = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: freshId('o8'), ownerId: 'owner', clock: clock.clock });
+  const sim = new WorldSim({ sizeCells: SIZE, mobs: false, wiring: false, seed: SEED });
+  rt.worldSaveHost = sim as unknown as WorldSaveHost;
+  const j = rt.join({ userId: 'p1' });
+  ok(j.ok, '前置:玩家进场');
+  for (let x = 0; x <= 28; x += 1) for (let y = 0; y <= 28; y += 1) sim.setCell(x, y, { obj: 0 });
+  for (let i = 0; i < 4; i += 1) rt.step();
+
+  const L = rt.ac.limits;
+  /* 上限 = 标称移速 × 容差(申报 `speedMul` 缺省 1 ⇒ 无加成)。
+     ⚠️ 与实现**同式**:`checkMove` §6.2 的 `cap = BASE_MOVE_SPEED × speedMul × tolerance`,
+     分母 `spanTicks × frameDt`;`room.ts` 从不给 AC 注入 `dtSeconds` ⇒ `frameDt = DT`。 */
+  const cap = BASE_MOVE_SPEED * L.speedWindowTolerance;
+  let clientTick = 0;
+  /** 满速走 N 帧:每帧一包,步长 = **标称单帧合法位移**(32Hz ⇒ 4.5 格/秒)。 */
+  const walk = (frames: number): void => {
+    for (let i = 0; i < frames; i += 1) {
+      rt.step();
+      clientTick += 1;
+      const p = rt.playerState('p1');
+      ok(p !== undefined, '前置:投影里有这个玩家');
+      rt.applyMove('p1', { tick: clientTick, x: p!.x + LEGAL_STEP, y: p!.y, z: p!.z });
+    }
+  };
+  const speeds = (): number =>
+    (rt.ac.get('p1')?.violations ?? []).filter((v) => v.kind === ViolationKind.SPEED).length;
+  /** 窗口读数(与实现同式:相邻申报点距离之和 ÷ (跨度帧 × DT))。 */
+  const observed = (): number => {
+    const w = rt.ac.get('p1')!.window;
+    let path = 0;
+    for (let i = 1; i < w.length; i += 1) {
+      path += Math.hypot(w[i]!.x - w[i - 1]!.x, w[i]!.y - w[i - 1]!.y);
+    }
+    const span = rt.ac.get('p1')!.lastTick - w[0]!.tick;
+    return span > 0 ? path / (span * DT) : 0;
+  };
+
+  walk(48);
+  const span = rt.ac.get('p1')!.lastTick - rt.ac.get('p1')!.window[0]!.tick;
+  ok(span >= L.speedWindowTicks, `前置:窗口已跨满一整窗(${span} ≥ ${L.speedWindowTicks} 帧)`);
+  eq(speeds(), 0, '前置:A 段(只走路)0 条 SPEED');
+  ok(observed() <= cap + 1e-9, `前置:A 段读数 ${observed().toFixed(3)} ≤ 上限 ${cap.toFixed(3)}`);
+
+  /* B 段:窗口内一次真击退(上界 2 格),期间照常满速发包 */
+  const rejectsBefore = rt.worldMoveRejects;
+  ok(sim.applyKnockback('p1', sim.playerPosition('p1')!.x - 3, sim.playerPosition('p1')!.y, 2.0),
+    '前置:击退被世界接受');
+  walk(48);
+
+  ok(observed() <= cap + 1e-9,
+    `★★ 击退之后读数仍是 ${observed().toFixed(3)} ≤ 上限 ${cap.toFixed(3)}(O-8 主张它会到 6.5)`);
+  eq(speeds(), 0, '★★ 击退期间与之后**一条 SPEED 都没有**(这就是 O-8 的否证)');
+  ok(rt.worldMoveRejects > rejectsBefore,
+    `前置:击退期间世界**拒收**了 ${rt.worldMoveRejects - rejectsBefore} 次移动`
+    + '(那些申报本来就是**幻影**,不配进窗口)');
+
+  /* ── 机理复核(直接驱动 AC 的公开 API,不绕房间):**放行**的一包确实进窗口,
+        而配对的 `rollbackMove`(房间在世界**拒收**时调的就是它)把这一包**原样抹掉**。
+        ⚠️ 这一段才是本用例的**牙**:摘掉 `anticheat.ts#rollbackMove` 里的
+        `restoreMoveWindow` ⇒ 下面「抹掉」那一条当场红(实测 12/12 → 11/12)。
+        (旧版这里只断言 `worldMoveRejects` 变大 —— 那个计数与回滚**无关**,
+         摘掉回滚照样绿 ⇒ 是**虚**断言,已被本次实测换掉。) ── */
+  const winPath = (): number => {
+    const w = rt.ac.get('p1')!.window;
+    let sum = 0;
+    for (let i = 1; i < w.length; i += 1) {
+      sum += Math.hypot(w[i]!.x - w[i - 1]!.x, w[i]!.y - w[i - 1]!.y);
+    }
+    return sum;
+  };
+  const snap = rt.ac.snapshotMove('p1');
+  ok(snap !== null, '前置:窗口快照拿得到(玩家已登记)');
+  const pathBefore = winPath();
+  const q = rt.playerState('p1')!;
+  clientTick += 1;
+  const mv = rt.ac.move({ playerId: 'p1', tick: clientTick, x: q.x + LEGAL_STEP, y: q.y, z: q.z });
+  eq(mv.allowed, true, '前置:这一包合法 ⇒ 放行 ⇒ 进窗口');
+  ok(winPath() > pathBefore,
+    `前置:窗口路径长度确实增大(${pathBefore.toFixed(3)} → ${winPath().toFixed(3)})`);
+  rt.ac.rollbackMove('p1', snap);
+  ok(Math.abs(winPath() - pathBefore) < 1e-12,
+    '★★ 回滚把这一包**从窗口里抹掉**(世界拒收时房间走的就是这条路 ⇒ 幻影申报不参与均速)');
+  eq(rt.ac.violations().length, 0, '★★ 全程零违规:满速 + 被击退都是合法的');
+});
+
+/* ═══ 12. ★ 钉住 O-9 的**安全性**(不钉它走哪一支) ═══ */
+
+/**
+ * ## 这一条守什么
+ *
+ * **O-9 的机制**(已定因、裁定不修):反作弊的 `authorityDrift` 用的是**两包之间的净位移**,
+ * 而世界位移**非单调**时(推过去 → 客户端读到 → 再推回来)净额 ≈ 0 ⇒ 低估瞬时偏移
+ * ⇒ 那一包仍会被判 TELEPORT(实测 60 分钟 2 条,0.0014%)。
+ *
+ * ⚠️ 本用例**刻意不钉**它走哪一支(`stale` 还是真 TELEPORT)—— 那是 O-9 的取舍;
+ * 将来真要修(把净位移换成**路径长度累加**)**不该**让本用例变红。它钉的是**安全性质**:
+ *
+ * 1. 这一包**不许放行**(客户端读到的是中间态);
+ * 2. 世界与投影**一个字都不许被写**;
+ * 3. 分类与计分必须**自洽**:归 `stale` ⇒ 不流水;不归 `stale` ⇒ 必须留下真违规。
+ *
+ * 三条合起来把「O-9 的残余只是**分类噪声**」钉死:它**不可能**变成位置面的可乘之机。
+ */
+test('FND178-12 ★★ O-9 基线:世界位移非单调时那一包不得写世界,且分类与计分自洽', () => {
+  const clock = fixedClock(1_700_000_000_000);
+  const rt = new RoomRuntime({ roomId: freshId('o9'), ownerId: 'owner', clock: clock.clock });
+  const sim = new WorldSim({ sizeCells: SIZE, mobs: false, wiring: false, seed: SEED });
+  rt.worldSaveHost = sim as unknown as WorldSaveHost;
+  const j = rt.join({ userId: 'p1' });
+  ok(j.ok, '前置:玩家进场');
+  for (let x = 0; x <= 20; x += 1) for (let y = 0; y <= 20; y += 1) sim.setCell(x, y, { obj: 0 });
+  for (let i = 0; i < 4; i += 1) rt.step();
+
+  /* 包 1:合法小步(把水位 / 基准对齐 —— 与真实客户端「先走一步」同形) */
+  let clientTick = 1;
+  const p0 = rt.playerState('p1');
+  ok(p0 !== undefined, '前置:投影里有这个玩家');
+  eq(rt.applyMove('p1', { tick: clientTick, x: p0!.x + LEGAL_STEP, y: p0!.y, z: p0!.z }).allowed, true,
+    '前置:合法小步放行');
+
+  /* 世界把刚体**推过去** */
+  ok(sim.applyKnockback('p1', sim.playerPosition('p1')!.x - 2, sim.playerPosition('p1')!.y, 1.0),
+    '前置:第一次击退被接受');
+  for (let i = 0; i < FAST_PER_SLOW; i += 1) rt.step();
+
+  /* 客户端**此刻读到**的位置(它按这个起算下一包;⚠️ 必须**拷成数字**,投影是活引用) */
+  const readX = rt.playerState('p1')!.x;
+  const readY = rt.playerState('p1')!.y;
+  const readZ = rt.playerState('p1')!.z;
+
+  /* 世界再把它**推回来**(净位移 ≈ 0 ⇒ 净位移式 drift 低估瞬时偏移) */
+  ok(sim.applyKnockback('p1', sim.playerPosition('p1')!.x + 2, sim.playerPosition('p1')!.y, 1.0),
+    '前置:反向击退被接受');
+  for (let i = 0; i < FAST_PER_SLOW * 2; i += 1) rt.step();
+
+  const body = sim.playerPosition('p1');
+  ok(body !== null, '前置:权威刚体读得到');
+  const violBefore = rt.ac.violations().length;
+  const scoreBefore = rt.ac.get('p1')!.score;
+
+  /* 诚实包:按**读到的**位置 + 一个合法步长 */
+  clientTick += 1;
+  const r = rt.applyMove('p1', { tick: clientTick, x: readX + LEGAL_STEP, y: readY, z: readZ });
+
+  eq(r.allowed, false, '★★ 这一包**不许放行**(客户端读到的是中间态)');
+  eq(sim.playerPosition('p1')!.x, body!.x, '★★ 世界 x **没被写**');
+  eq(sim.playerPosition('p1')!.y, body!.y, '★★ 世界 y **没被写**');
+  eq(rt.playerState('p1')!.x, body!.x, '★★ 投影也没被写');
+  const scored = rt.ac.violations().length > violBefore;
+  eq(scored, r.stale !== true,
+    '★★ 分类与计分自洽:归 `stale` ⇒ 不流水;不归 `stale` ⇒ 必须留下真违规(可追溯)');
+  eq(rt.ac.get('p1')!.score,
+    r.stale === true ? scoreBefore : scoreBefore + VIOLATION_WEIGHT.TELEPORT,
+    '★★ 分数同样自洽(把「分类噪声」与「真违规」分开记账)');
+
+  /* ── 反证(有牙怎么验):把 `room.ts#applyMove` 里反作弊拒绝的**早退分支**去掉
+     (让被拒的包也走世界写入)⇒ 本用例「世界没被写」两条必须红;反过来,把 `FND178-10` 的
+     `stale` 分类去掉 ⇒ 本用例**仍然绿**(它不钉分支)。 ── */
+});
+
 report('WS-FND-178');

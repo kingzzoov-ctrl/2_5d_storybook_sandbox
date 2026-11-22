@@ -536,23 +536,25 @@ const CASES: Case[] = [
   /* ═══ N1:--integration 不得假红 ═══
      断言的是「那条具体消息不再出现」,而不是「整体绿」——
      因为队友在飞的 README 项本来就会让它红,那与 N1 无关。 */
+  /**
+   * ★ 2026-11-22(w79):**两条并一条** —— 它们跑的是**同一条命令、同一处(没有)变异**,
+   * 只是一条断言「某消息不得出现」、另一条断言「另一消息必须出现」。
+   * `runCase` 本来就**同时**支持 `wantMsg` + `notMsg`(见 1501-1515)⇒ 一次运行
+   * 就能给出两个结论,**断言一条不少**。
+   *
+   * 为什么必须并:2 核机上这两条各 **296 s**(独占)且**不能并发**(并发成 ~600 s ⇒ 各自撞穿
+   * `verify.ts#VERIFY_TIMEOUT_MS`),所以长作业专线 = 两条串行 **927 s**(实测 532.9 + 394.3),
+   * 已超外层 `SELFCHECK_TIMEOUT_MS`(900 s)。并成一条后专线只跑一次 ⇒ 总墙钟回到预算内。
+   * ⚠️ 这不是「少测一条」:删掉的只是**重复执行**,不是任何一条断言。
+   */
   {
     group: 'N1',
-    name: '--integration 不得报「冻结层不变量…实测 0」',
+    name: '--integration:不得报「冻结层不变量...实测 0」,且必须打印「本模式未运行 checkFrozen」',
     file: 'README.md',
     from: '',
     to: '',
     expect: 'any',            /* 只断言消息,不约束整体红绿 */
     notMsg: /冻结层不变量.*实测 0/,
-    args: ['--integration'],
-  },
-  {
-    group: 'N1',
-    name: '--integration 应打印「本模式未运行 checkFrozen」',
-    file: 'README.md',
-    from: '',
-    to: '',
-    expect: 'any',
     wantMsg: /本模式未运行 checkFrozen/,
     args: ['--integration'],
   },
@@ -1171,8 +1173,19 @@ async function runVerify(args: string[]): Promise<RunResult> {
 }
 
 /**
- * 并发路数:`--jobs N`;不传则 `min(8, CPU−1)`。
- * 上限 16 —— 再高只是让 8 个 `verify` 互相抢 CPU,而每个 `verify` 自己已经是串行。
+ * 并发路数:`--jobs N`;不传则 `min(8, max(2, CPU−1))`。上限 16 —— 再高只是让 8 个
+ * `verify` 互相抢 CPU,而每个 `verify` 自己已经是串行。
+ *
+ * ★ 2026-11-22(**2 核**机器实测):本函数只回答「几路」,**它自己不是** 2 核超时的修点。
+ * 两个恒定(都是**别人的**预算,不许为了迁就机器改):
+ *   · `verify.ts#VERIFY_TIMEOUT_MS = 600_000` —— 自检内**每条用例**子进程的预算;
+ *   · `verify.ts#SELFCHECK_TIMEOUT_MS = 900_000` —— 外层 `verify --all` 给**整个自检**的预算。
+ * 2 核上两条 `--integration`(各 **296 s**)并发 ⇒ 互相争用 ⇒ 各自 ~600 s ⇒ 撞穿前者
+ * (自检里报 `spawn error … ETIMEDOUT`,N1 的两条消息断言拿不到结论);
+ * 而把路数压成 **1** 之后,自检总时长 ~1380 s ⇒ 反过来撞穿后者。
+ * ⇒ 修法是**调度的形状**,不是路数:本函数维持 `max(2, CPU−1)`,
+ *   **长作业在核数 < 3 时走专线串行**(见 `[并发]` 段的分道逻辑)。
+ *   判据 / 期望值 / 超时常量一律未动。
  */
 function resolveJobs(): number {
   const auto = Math.min(8, Math.max(2, cpus().length - 1));
@@ -1544,7 +1557,7 @@ function caseCost(c: Case): number {
   if (a.includes('--only')) return 4;      /* 单套件(D4) */
   if (a.includes('--content')) return 4;   /* 内容锁(D5) */
   if (a.includes('--docs')) return 3;      /* 文档(T38) */
-  if (a.includes('--integration')) return 3;
+  if (a.includes('--integration')) return 6; /* ★ 实测单条 **296 s** —— 原值 3 把它排在默认全量 runTests(:5)后面,与「长作业优先」正好相反 */
   return 1;                                /* --frozen(大多数) */
 }
 
@@ -1552,30 +1565,64 @@ const jobs = resolveJobs();
 /* 发车顺序(元素是 `active` 的下标);明细仍按 `active` 原顺序打印。 */
 const order: number[] = [...active.keys()]
   .sort((x, y) => caseCost(active[y] as Case) - caseCost(active[x] as Case));
-console.log(`\n[并发] ${active.length} 个用例 / ${jobs} 路(每用例一份独立副本;长作业优先)`);
+
+/* ★ 2026-11-22(2 核实测):**长作业在核数不足时必须走专线串行**。
+   `--integration` 单条 **296 s**,它会把整机吃掉;两条并发 ⇒ 各自 ~600 s ⇒ 各自撞穿
+   `verify.ts#VERIFY_TIMEOUT_MS`(600 s)⇒ 自检整体 `spawnSync … ETIMEDOUT`。
+   ⚠️ 把**并发数**压成 1 是**错的**修法:自检总时长会 ~1380 s ⇒ 反过来撞穿
+   `verify.ts#SELFCHECK_TIMEOUT_MS`(900 s)。两个常量都不许为迁就机器改。
+   ⇒ 形状改成「1 条长作业专线(串行)+ 其余 `jobs−1` 路跑短作业」;
+      **核数 ≥ 3 时**两条长作业各占不满一核 ⇒ 维持原样的单队列,行为一字不变。 */
+const isLongCase = (i: number): boolean =>
+  ((active[i] as Case).args ?? []).join(' ').includes('--integration');
+const serialLong = cpus().length < 3;
+const longQueue: number[] = serialLong ? order.filter(isLongCase) : [];
+const shortQueue: number[] = serialLong ? order.filter((i) => !isLongCase(i)) : order;
+const shortLanes = serialLong ? Math.max(0, jobs - 1) : jobs;
+console.log(`\n[并发] ${active.length} 个用例 / ${jobs} 路(每用例一份独立副本;长作业优先)`
+  + (serialLong
+    ? ` · ${longQueue.length} 条长作业走**专线串行**(核数 ${cpus().length} < 3)`
+    : ''));
 const outcomes: CaseOutcome[] = new Array(active.length);
 const spent: number[] = new Array(active.length).fill(0);
 const startedAt = Date.now();
-let cursor = 0;
-const worker = async (): Promise<void> => {
+let seq = 0;
+/** 跑一条用例并打印进度行。串行 `await` 是**有意**的:一路 worker 一次只占一份副本。 */
+const runOne = async (i: number): Promise<void> => {
+  const c = active[i] as Case;
+  const at = Date.now();
+  const oc = await runCase(c, base.fails);
+  outcomes[i] = oc;
+  spent[i] = Date.now() - at;
+  seq += 1;
+  console.log(`  · [${String(seq).padStart(2, ' ')}/${order.length}] `
+    + `${oc.failed ? '✗' : '✓'} ${((spent[i] as number) / 1000).toFixed(1)}s ${c.group} — ${c.name}`);
+};
+/** 抽干一条队列。★ 游标**按队列共享**(多条车道跑同一队列时不能各跑全量)。 */
+const cursors = new Map<number[], { n: number }>();
+const drain = async (queue: number[]): Promise<void> => {
+  let cur = cursors.get(queue);
+  if (cur === undefined) {
+    cur = { n: 0 };
+    cursors.set(queue, cur);
+  }
   for (;;) {
-    const k = cursor;
-    cursor += 1;
-    if (k >= order.length) return;
-    const i = order[k] as number;
-    const c = active[i] as Case;
-    const at = Date.now();
-    /* 串行 await 是**有意**的:一路 worker 一次只占用一份副本。 */
-    const oc = await runCase(c, base.fails);
-    outcomes[i] = oc;
-    spent[i] = Date.now() - at;
-    console.log(`  · [${String(k + 1).padStart(2, ' ')}/${order.length}] `
-      + `${oc.failed ? '✗' : '✓'} ${((spent[i] as number) / 1000).toFixed(1)}s ${c.group} — ${c.name}`);
+    const k = cur.n;
+    cur.n += 1;
+    if (k >= queue.length) return;
+    await runOne(queue[k] as number);
   }
 };
-await Promise.all(
-  Array.from({ length: Math.min(jobs, Math.max(1, order.length)) }, () => worker()),
-);
+const lanes: Array<Promise<void>> = [];
+if (serialLong) {
+  lanes.push((async () => {
+    await drain(longQueue);
+    /* `--jobs 1`(或单核)时短作业也归这条专线 ⇒ 全局并发仍是 1。 */
+    if (shortLanes === 0) await drain(shortQueue);
+  })());
+}
+for (let i = 0; i < shortLanes; i += 1) lanes.push(drain(shortQueue));
+await Promise.all(lanes);
 console.log(`  并发总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 
 /* 明细按**用例表顺序**打印 —— 并发只改墙钟,不改结论的确定性。 */
