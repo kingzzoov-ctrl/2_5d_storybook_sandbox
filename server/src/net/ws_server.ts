@@ -226,6 +226,50 @@ export const HELLO_TIMEOUT_MS = 10_000;
  */
 export const BACKPRESSURE_DISCONNECT_STRIKES = 10;
 
+/* ═══════════ ★ WS-FND-182:地形下行的两条**节流**门 ═══════════
+ *
+ * ## 为什么必须节流(而不是「块变了就发」)
+ * 块字节是 1032 字节/块,一份 192×192 的世界 = 144 块 = **148 KB**。
+ * ```text
+ * 不做时间门:32Hz 循环里每次都问一遍 ⇒ 一次搬砖/流体的连续写入
+ *             会在 1 秒内被问 32 次(每次都要读一遍世界块清单)
+ * 不做批量门:进场那一刻 148 KB **一次性**写进 socket ⇒ Node 的发送队列瞬间满,
+ *             socket.write 连续返回 false ⇒ 刚握手的人被
+ *             BACKPRESSURE_DISCONNECT_STRIKES 判成"慢客户端"**踢掉**
+ * ```
+ * ⇒ 两条门各管一件事:
+ * ```text
+ * TERRAIN_RESEND_MIN_INTERVAL_MS  多久**问一次**(问一次才读世界、才算 diff)
+ * TERRAIN_FRAMES_PER_WINDOW       一轮最多**发几帧**(帧内自带 ≤ 8 块,见 terrain.ts)
+ * ```
+ * ⚠️ 两条门都只影响**何时发**,不影响**发什么**:没发出去的帧进连接的待发队列
+ * (`WsConn.terrainPending`),下一轮继续 —— 不丢帧、也不重编一遍。
+ */
+/**
+ * 地形重新计算(diff + 编码)的最小间隔(毫秒)。
+ *
+ * 200ms = 5Hz:远比 32Hz 广播循环稀疏(节流的目的),又远快于玩家能察觉的
+ * 「盖了墙没反应」的阈值。它与 `frameMs` **无比例关系**:改 tick 率不该改变
+ * 这条门(它管的是地形这条低频通道,不是帧率)。
+ */
+export const TERRAIN_RESEND_MIN_INTERVAL_MS = 200;
+/**
+ * 一条连接在**一轮**里最多发几帧地形。
+ *
+ * 2 帧 × 8 块 × 1032 字节 ≈ 16.5 KB/轮 ⇒ 5Hz 下约 82 KB/s 的**上限**,
+ * 而稳态下(没有块变)是 0 字节。这个数刻意小:地形是"低频大块"通道,
+ * 慢一点只影响新盖的墙几毫秒后出现,而突发会把连接打挂(见上面那段)。
+ */
+export const TERRAIN_FRAMES_PER_WINDOW = 2;
+/**
+ * 握手成功时**立刻**发几帧(其余进待发队列,按轮次继续)。
+ *
+ * 为什么不在 join 时就一次发完:`snapshotFor` 之后紧跟 148 KB 的突发
+ * 与"慢客户端"在传输层**同形**(都是 `socket.write` 返回 false)——
+ * 而处置是断开。4 帧 ≈ 33 KB 是"立刻有地形可画"与"不打满队列"的折中。
+ */
+export const TERRAIN_JOIN_BURST_FRAMES = 4;
+
 /**
  * 帧超界**专用**错误类 —— 运输层据此回 **1009**(message too big),
  * 而不是把超界与协议错一律回 1002。
@@ -538,6 +582,25 @@ export type WsConn = {
    * ⇒ 断开(理由见那个常量:「丢帧比断连更坏」)。
    */
   writeStalls: number;
+  /**
+   * ★ WS-FND-182:**本连接已知的块版本基线**(key = `"cx,cy"`,值 = 块版本号)。
+   *
+   * ## 为什么在连接上(而不是房间级再存一份)
+   * 每条连接进场的时刻不同 ⇒ 基线也不同。房间那侧只回答"世界上现在是什么版本",
+   * 差集必须在**每连接**这一层算(`terrainDeltaFor(known)`)。
+   * 握手时清空(`{}`)= 全量重发,那正是重连该有的语义。
+   */
+  terrainKnown: Record<string, number>;
+  /**
+   * ★ WS-FND-182:**待发的地形帧队列**(本轮没发完的)。
+   *
+   * 为什么要有队列:一轮最多发 `TERRAIN_FRAMES_PER_WINDOW` 帧(见那条常量),
+   * 而进场时可能有 18 帧待发。⇒ 队列保证"发得慢"不会变成"发丢了":
+   * 基线在**编码时**就已经推进(帧已确定),队列只是把它们按轮次排出去。
+   * ⚠️ 队列**不需要**上界:它最多等于「世界块数 / 每帧块数」,而那个数由
+   *   世界尺寸决定(192×192 ⇒ 18 帧)。世界再大也只是多排几轮。
+   */
+  terrainPending: Uint8Array[];
 };
 
 /**
@@ -709,6 +772,29 @@ export type WsRoomLike = {
   step(prevSnapshot: unknown): Uint8Array;
   snapshotFor(userId: string): Uint8Array;
   /**
+   * ★ WS-FND-182:**一步地形下行**(可选)—— 见 `RoomRuntime.terrainDeltaFor`。
+   *
+   * ```text
+   * 入参 known    调用方的**已知块版本表**(key = "cx,cy";空表 = 全量)
+   * 返回 frames   要发的帧(已按 TERRAIN_CHUNKS_PER_FRAME 切好;空 = 没有块变)
+   * 返回 versions 这一轮之后的当前版本表 ⇒ 调用方据此推进**自己的**基线
+   * ```
+   *
+   * ## 为什么声明在运输层的接口上(而不是让运输层去问世界)
+   * 「谁该收到哪些块」是**每连接**的事(基线是每连接的),而"世界上有哪些块"
+   * 是**房间**的事 ⇒ 运输层只持基线,房间只做 diff + 编码。
+   * 运输层**不 import** `world_sim.ts`(它不知道块是什么样子,只搬字节)。
+   *
+   * ⚠️ 刻意**可选**:`WsRoomLike` 是本文件的**结构化最小接口** ——
+   *    单机演示房 / 部分测试桩没有世界可变,逼它们实现一个空方法
+   *    就等于把「什么都没做」写成契约(与 `applyMove` / `isSeated` 同一取舍)。
+   *    没实现 ⇒ 地形通道**整段不发**(既不发也不报错),差量快照通道逐字不变。
+   */
+  terrainDeltaFor?(known: Record<string, number>): {
+    frames: Uint8Array[];
+    versions: Record<string, number>;
+  };
+  /**
    * 加入房间。**凭证必传**(`token`),房间负责验签 —— 运输层不自己造一份校验实现
    * ("不造第二份口径"):密钥在房间里,运输层没有它也**不该**有。
    *
@@ -808,6 +894,23 @@ export type WsServerHandle = {
   framesSent(): number;
   /** 最近一次广播的字节长度(0 = 未发过)。 */
   lastFrameBytes(): number;
+  /**
+   * ★ WS-FND-182:已写出的**地形帧**数(单调;与 `framesSent` 分开计)。
+   *
+   * 为什么要有它:地形是**另一条通道** —— 「快照在发」不能推出「块在发」。
+   * 只断言 `framesSent > 0` 时,"服务端从不下发地形"这个缺陷**完全不可见**
+   * (那正是修前的形态:线上根本没有 chunk 下行,而所有指标都正常)。
+   */
+  terrainFramesSent(): number;
+  /** ★ WS-FND-182:最近一帧地形的字节数(`0` = 还没发过);与 `lastFrameBytes` 分开。 */
+  lastTerrainBytes(): number;
+  /**
+   * ★ WS-FND-182:`terrainDeltaFor` **抛错**的次数。
+   *
+   * 为什么单独计:地形这一条抛错时**不关连接**(与 `step` 抛错同一取舍),
+   * ⇒ 没有这个数,「地形通道一直抛错」在外部与"没有块变化"**完全同形**。
+   */
+  terrainErrors(): number;
   /** 最近收到的上行载荷(**已剥 tag**)—— 供断言证明剥对了。 */
   lastUplink(): Uint8Array | null;
   /**
@@ -1010,7 +1113,12 @@ export interface HelloFrame {
 /** 日志**类别**(唯一的分类来源;`log(cat, msg)` 的第一个参数)。 */
 export type WsLogCategory =
   | 'boot' | 'conn' | 'close' | 'frame' | 'uplink'
-  | 'hello' | 'move' | 'attack' | 'action' | 'step' | 'write' | 'misc';
+  | 'hello' | 'move' | 'attack' | 'action' | 'step' | 'write'
+  /* ★ WS-FND-182:地形下行是**独立的一条通道**(与快照通道分开计、分开排障)⇒
+     它必须有自己的类别。混进 'step' 或 'write' 会让「快照没发」与
+     「块没发」在日志里同形(判据只能靠子串猜,那正是这个类型在治的病)。 */
+  | 'terrain'
+  | 'misc';
 
 /** 每行日志末尾附的**计数快照**(叶子是单调累加量,不是"最近一次")。 */
 export interface WsLogCounts {
@@ -1083,6 +1191,20 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let writeBackpressure = 0;
   let backpressureDrops = 0;
   let seatsRevoked = 0;
+  /* ═══════ ★ WS-FND-182:地形下行的三个计数(与快照通道的计数**分开计**) ═══════
+   * ```text
+   * terrainFramesSent    真的写进 socket 的地形**帧**数(一帧 ≤ 8 块)
+   * lastTerrainBytes     最近一帧的字节数(0 = 还没发过)
+   * terrainErrors        terrainDeltaFor 抛错的次数(如对方没实现那个读口)
+   * ```
+   * ⚠️ 与 `framesSent` / `lastFrameBytes` **不合并**:那两个数的语义是
+   *   「差量快照通道」,判据(WS-07 / WS-13)盯在它们上面。地形帧混进去会让
+   *   「快照没发」与「地形没发」再也分不出来。 */
+  let terrainFramesSent = 0;
+  let lastTerrainBytes = 0;
+  let terrainErrors = 0;
+  /** 下一轮地形下发的**最早时刻**(墙钟;见 `TERRAIN_RESEND_MIN_INTERVAL_MS`)。 */
+  let nextTerrainAtMs = 0;
   /** 待握手连接数上限(默认 `MAX_PENDING_HELLO_CONNS`)。 */
   const maxPendingHello = opts.maxPendingHello ?? MAX_PENDING_HELLO_CONNS;
   /** 握手超时 ms(默认 `HELLO_TIMEOUT_MS`)。 */
@@ -1301,6 +1423,63 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     return write(c, encodeFrame(OP_TEXT, b));
   };
 
+  /* ══════════ ★ WS-FND-182:地形下发的**唯一**出口 ══════════
+   *
+   * ## 一次调用做两件事(顺序不可换)
+   * ```text
+   * 1 队列为空 ⇒ 问房间要一步 delta(known = 本连接的基线)
+   *    - 没有变化 ⇒ frames 为空 ⇒ 直接返回(这一轮一个字节都不发)
+   *    - 有变化   ⇒ 帧入队,**基线此刻推进**(帧已确定,不会"重编一份更新的")
+   * 2 从队列头最多取 maxFrames 帧发出去
+   * ```
+   * ## 为什么基线必须在**入队**时推进(而不是发完之后)
+   * ```text
+   * 若等发完再推进:队列里还有 16 帧时,下一轮又会问一次 delta
+   *   ⇒ 那 16 帧对应的是**旧版本**,而 known 还是旧的 ⇒ 会算出一模一样的变更集
+   *   ⇒ 队列无限增长("每轮把同样的块再编一遍")
+   * 入队即推进 ⇒ 队列里的帧**恰好**覆盖 known 与 versions 之间的差 ⇒ 幂等
+   * ```
+   * @param maxFrames 本轮最多发几帧(0 = 只入队不发 —— 目前没有调用方这么用)
+   * @returns 实际写出去的帧数
+   */
+  const pushTerrain = (c: WsConn, maxFrames: number): number => {
+    const delta = opts.room.terrainDeltaFor;
+    /* 房间没实现(单机演示房 / 测试桩)⇒ 整段跳过:不发、不报错、不计数。
+       这是**刻意**的"没有这件事",不是静默失败 —— `WsRoomLike` 的那个成员
+       本来就是可选的(理由见它的 docblock)。 */
+    if (typeof delta !== 'function') return 0;
+
+    if (c.terrainPending.length === 0) {
+      let out: { frames: Uint8Array[]; versions: Record<string, number> };
+      try {
+        out = delta.call(opts.room, c.terrainKnown);
+      } catch (e) {
+        /* 与 `step` 抛错同一取舍:地形这一条**断了**不该拖垮快照通道 ⇒
+           计数 + 日志 + 本轮不发(不关连接)。 */
+        terrainErrors += 1;
+        log('terrain', `terrainDeltaFor 抛错(本轮不下发地形):${(e as Error).message}`);
+        return 0;
+      }
+      if (out.frames.length === 0) return 0;
+      c.terrainPending = out.frames.slice();
+      /* ★ 基线推进(理由见上面那段"为什么在入队时")。 */
+      c.terrainKnown = out.versions;
+    }
+
+    let sent = 0;
+    while (sent < maxFrames && c.terrainPending.length > 0) {
+      const frame = c.terrainPending.shift();
+      if (frame === undefined) break;
+      /* ⚠️ `sendBinary` 返回 false **不回队**:那是"已交给 socket,但对端读得慢"
+         (见 `write` 的注释),不是丢帧 ⇒ 回队会让同一帧在下一轮重发一遍。 */
+      sendBinary(c, frame);
+      sent += 1;
+      terrainFramesSent += 1;
+      lastTerrainBytes = frame.byteLength;
+    }
+    return sent;
+  };
+
   /* ── HTTP upgrade 握手 ── */
   const server: Server = createServer((_req, res) => {
     res.writeHead(426, { 'content-type': 'text/plain; charset=utf-8' });
@@ -1348,7 +1527,9 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       urlToken: readTokenFromUrl(req.url),
       ackedSeq: -1,
       /* ★ WS-FND-161:握手成功才进广播集(`onHello` 置 true);背压计数从 0 起。 */
-      inRoom: false, writeStalls: 0,
+      /* ★ WS-FND-161:握手成功才进广播集(`onHello` 置 true);背压计数从 0 起。
+         ★ WS-FND-182:地形基线与待发队列也从空起 ⇒ 握手后是**全量**地形。 */
+      inRoom: false, writeStalls: 0, terrainKnown: {}, terrainPending: [],
     };
     conns.add(conn);
     log('conn', `upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
@@ -1682,6 +1863,12 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1)。
        包头那 4 字节 ack 也按**本连接**填(此刻通常 = 0 ⇒ 「还没有 ack」)。 */
     sendBinary(c, withAckedSeq(opts.room.snapshotFor(claimed), c.ackedSeq));
+    /* ★ WS-FND-182:地形**紧跟首帧快照**下发(此刻基线为空 ⇒ 这一轮算出的是**全量**)。
+       ⚠️ 不在这里一次发完:一场 192×192 的世界是 148 KB,一次写进 socket 会让
+          `socket.write` 连续返回 false ⇒ 刚握手的人被背压判据踢掉。
+          这里只发 `TERRAIN_JOIN_BURST_FRAMES` 帧,其余按轮次从队列里排出去
+          (见广播循环里的 `pushTerrain`)。 */
+    pushTerrain(c, TERRAIN_JOIN_BURST_FRAMES);
   }
 
 /**
@@ -1894,6 +2081,33 @@ function onMove(c: WsConn, msg: {
       framesSent += 1;
       lastFrameBytes = payload.byteLength;
     }
+    /* ══════ ★ WS-FND-182:地形下行(与快照**分开的一条通道**、**分段节流**) ══════
+     *
+     * ## 为什么在 `payload.byteLength > 0` **之外**
+     * 差量快照"本帧没变"与"地形有块变了"是两件独立的事:一次搬砖可能只改地形
+     * (实体一个没动 ⇒ `step` 返回空 ⇒ 快照那一段整段跳过),而块必须发出去。
+     * 反过来也成立(玩家在跑但没人动地形 ⇒ 这里 `nextTerrainAtMs` 门一挡就跳过)。
+     *
+     * ## 门的顺序(先时间、后连接)
+     * ```text
+     * 1 时间门:nowMs >= nextTerrainAtMs 才继续 —— 否则连"问世界要 delta"都不做
+     *           ⇒ 32Hz 的循环最多 5Hz 碰一次地形(见 TERRAIN_RESEND_MIN_INTERVAL_MS)
+     * 2 成员门:只给广播集里的人(isBroadcastTarget)—— 被踢者不再收块
+     * 3 每人每轮最多 TERRAIN_FRAMES_PER_WINDOW 帧(其余留在连接自己的队列里)
+     * ```
+     * ## 为什么用 `Date.now()` 而不是别的时钟
+     * 这条门只回答"距上次碰地形过了多久",它**不参与**任何世界推进
+     * (`room.state.meta.tick` / `WorldSim.frame` / 反作弊的 `s.lastTick` 三个时钟
+     * 互不联动,见 `step()` 里的长注释)。把一个世界钟塞进来会让"节流"与
+     * "世界帧"耦合 —— 那是三个时钟混写那一类缺陷的入口。 */
+    const nowTerrainMs = Date.now();
+    if (nowTerrainMs >= nextTerrainAtMs) {
+      nextTerrainAtMs = nowTerrainMs + TERRAIN_RESEND_MIN_INTERVAL_MS;
+      for (const c of conns) {
+        if (!isBroadcastTarget(c)) continue;
+        pushTerrain(c, TERRAIN_FRAMES_PER_WINDOW);
+      }
+    }
     /* ★★★ 基准快照**无条件**更新 —— 这一行是引导期的关键。
      *
      * ## 我第一版写错的地方(实测复盘)
@@ -1935,6 +2149,10 @@ function onMove(c: WsConn, msg: {
     connCount: (): number => [...conns].filter((c) => c.helloDone && !c.closed).length,
     framesSent: (): number => framesSent,
     lastFrameBytes: (): number => lastFrameBytes,
+    /* ★ WS-FND-182:地形通道的三个读数(与 `framesSent` / `lastFrameBytes` 并列,不混用)。 */
+    terrainFramesSent: (): number => terrainFramesSent,
+    lastTerrainBytes: (): number => lastTerrainBytes,
+    terrainErrors: (): number => terrainErrors,
     lastUplink: (): Uint8Array | null => lastUplink,
     /* ★ 2026-11-14(分片 2)上行解析的累计计数 + 最近结果。
        两个计数**分开** ⇒ 可分别断言"该接的接住了 / 该拦的拦住了"。 */

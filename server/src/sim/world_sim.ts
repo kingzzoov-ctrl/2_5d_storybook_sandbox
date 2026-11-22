@@ -2078,6 +2078,40 @@ export class WorldSim {
     return this;
   }
 
+  /* ═══════════ ★ WS-FND-182:地形下行读口 ═══════════ */
+
+  /**
+   * 世界上**当前存在**的全部块(坐标 + 版本 + 打包格)。
+   *
+   * ## 它补的是一条**断了的**链路
+   * 修前 `shared/net/delta.ts` 的 `chunkWireBytes` / `diffChunkVersions` /
+   * `makeChunkVersionKey` 三个原语**只有单测在用** —— 线上不存在 chunk 下行
+   * ⇒ 客户端只能自己算一张图,玩家盖的墙在屏幕上永远不出现,而**没有东西会红**。
+   *
+   * ## 口径(与网络层约定的三条)
+   * ```text
+   * 1 tiles 就是 `Chunk.cells` 本体(**不拷贝**)—— 调用方必须在**同一个同步段**内用完
+   *   (网络侧拿到就立刻编成字节,中间不 await / 不让出事件循环)。
+   *   拷贝一次是 1024 字节 × 块数 = 每帧上百 KB 的无谓分配。
+   * 2 version 就是 `Chunk.version`:任何真实写入都 +1(见 chunk.ts 的
+   *   `markDirtyIndex`)⇒ 它就是"这一块要不要重发"的**唯一**判据。
+   * 3 坐标原样给 `cx/cy`(不是字符串键):键的口径(`"cx,cy"`)由网络层
+   *   `terrainChunkKey()` 统一,模拟层不持有第二份键格式。
+   * ```
+   *
+   * ⚠️ `WorldGrid` 是**稀疏**的:没被碰过的区域根本没有 `Chunk`
+   * (`grid.ts` 的 `chunks: Map`)。所以这里返回的是"已创建的块",
+   * 而不是"整个世界应有的块" —— 空块**不发**(客户端那边也就没有它,
+   * 建面按空气处理,与修前一致)。
+   */
+  terrainChunks(): { cx: number; cy: number; version: number; tiles: Uint32Array }[] {
+    const out: { cx: number; cy: number; version: number; tiles: Uint32Array }[] = [];
+    for (const c of this.grid.chunks.values()) {
+      out.push({ cx: c.cx, cy: c.cy, version: c.version, tiles: c.cells });
+    }
+    return out;
+  }
+
   /**
    * 写一格地形(编排层的唯一地形入口,自动建 Chunk 并标脏)。
    *

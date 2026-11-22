@@ -33,7 +33,11 @@
 import {
   PROTOCOL_VERSION,
 } from '../../../shared/net/delta.ts';
+/* ★ WS-FND-182:地形帧的判据(**不**走 `decodePacket` —— 它是另一条通道)。 */
+import { isTerrainFrame } from '../../../shared/net/terrain.ts';
 import { ClientStateStore, type ApplyResult } from './state_store.ts';
+/* ★ WS-FND-182:块存储 —— 与 `state_store.ts` 同一纪律(纯数据,不 import three)。 */
+import { ClientChunkStore } from './chunk_store.ts';
 
 /* ═══ ★ WS-FND-167:连接 / 握手**具名超时** + 重连**指数退避**(纯常量 + 纯函数) ═══
  *
@@ -152,9 +156,40 @@ type DownlinkText = WelcomeFrame | ActionResultFrame | RejectFrame;
 
 export type SessionState = 'idle' | 'connecting' | 'live' | 'closed' | 'failed';
 
+/**
+ * ★ WS-FND-182:一帧地形落地后的事件载荷。
+ *
+ * 为什么带 `store` 而不是把块数组塞进来:块已经写进 `ClientChunkStore` 了,
+ * 再拷一份出来会让「渲染读到的那份」与「store 里那份」有机会不一致
+ * (本仓反复记的形态:两处都对、合起来不对)⇒ 只给**同一个** store 的引用,
+ * 外加一个「这次变了哪些 key」。
+ */
+export interface TerrainFrameEvent {
+  /**
+   * 本帧真正落地的块 key(按 (cy,cx) 升序,同 key 只出现一次)。
+   * ⇒ 渲染层据此**只重建这些块**,不必每帧全图重建。
+   */
+  changed: string[];
+  /** 与 `SessionHandle.chunks` 是**同一个对象**(不是副本)。 */
+  store: ClientChunkStore;
+}
+
 export interface SessionEvents {
   /** 状态流:每收到一帧**有效**字节调一次。 */
   onFrame: (r: ApplyResult, store: ClientStateStore) => void;
+  /**
+   * ★ WS-FND-182:**地形块到了**(块字节已经写进 `ClientChunkStore`)。
+   *
+   * ## 为什么必须有这个回调(而不是让调用方轮询 `chunks()`)
+   * 修前客户端的地形是**本地算**出来的(`design_world.ts` 的 `buildDesignChunks`),
+   * 于是「玩家盖的墙」在屏幕上永远不会出现 —— 而**没有任何东西会红**:
+   * 连接是 live、快照照常到、画面也在动,只有地形是另一张图。
+   * ⇒ 与 `onActionResult` / `onReject` 同一理由:把「服务端发了什么」变成
+   *   调用方**可观测**的一件事。
+   * ## 落地顺序
+   * 块**先**写进 store,**再**调本回调 ⇒ 回调里 `store.chunks()` 已经能看到新块。
+   */
+  onTerrain?: (e: TerrainFrameEvent) => void;
   /** 状态机变化(供 UI / 自检)。 */
   onState?: (s: SessionState, detail?: string) => void;
   /** 握手的 welcome 到了。 */
@@ -221,6 +256,16 @@ function describePayload(raw: unknown): string {
 /** 会话句柄。 `close()` 幂等。 */
 export interface SessionHandle {
   readonly store: ClientStateStore;
+  /**
+   * ★ WS-FND-182:**地形块存储**(与 `store` 同一纪律:必须由调用方持有)。
+   *
+   * 为什么也必须由调用方传:`boot.ts` 的渲染循环读的是**它自己那个**块存储
+   * (拿 `chunks()` 建面、拿 `dirty()` 只重建变了的块)。若本模块内部自建一个,
+   * 结果与 `store` 那个坑**逐字相同**:「字节写进了 A,渲染读的是 B」——
+   * 两块各自都"正常工作",只有屏幕上是旧地形。
+   * 省略时退化为自建(只有单测 / 冒烟才该这样用)。
+   */
+  readonly chunks: ClientChunkStore;
   readonly state: SessionState;
   /** 服务端指纹(握手收到后可用;核心是**只读记账**,见文件头)。 */
   readonly serverContentClaim: string | null;
@@ -242,6 +287,24 @@ export interface SessionHandle {
   readonly droppedFrames: number;
   /** 最近一次丢弃的原因(便于自检脚本一眼看出是"形态"问题,不是"网络"问题)。 */
   readonly lastDropReason: string | null;
+  /**
+   * ★ WS-FND-182:已落地的**地形帧**数(单调)。
+   *
+   * 为什么是一个独立的读数:地形帧与快照帧**互不使用对方的计数**
+   * (`framesSent` / `droppedFrames` 都属于快照通道)⇒ 「服务端说它发了地形」
+   * 与「客户端真的收到了地形」在这里是两个可分别断言的量。
+   * `0` 在首连后几帧内是正常的(块是**分批**下发的,见 `TERRAIN_CHUNKS_PER_FRAME`),
+   * 但**一直**是 0 就说明这条通道断了 —— 而屏幕上只会是"地形不动"。
+   */
+  readonly terrainFrames: number;
+  /**
+   * ★ WS-FND-182:最近一次**地形帧解码失败**的原因(`null` = 没失败过)。
+   *
+   * 与 `lastDropReason` 分开:`lastDropReason` 的语义是「载荷**形态**不对」
+   * (Blob / 非字节),把它混进来会让「binaryType 没设对」这一类判据失去分辨力
+   * (见 `droppedFrames` 的注释)。地形解码失败是**协议内容**问题。
+   */
+  readonly lastTerrainError: string | null;
   /**
    * ★ WS-FND-134(P1):最近一次**服务端拒绝报文**(`null` = 本次连接没被拒过)。
    *
@@ -535,6 +598,13 @@ export interface SessionOptions {
    * (省略时退化为自建 —— 只有单测/冒烟才该这样用。)
    */
   store?: ClientStateStore;
+  /**
+   * ★ WS-FND-182:**复用的块存储**。
+   *
+   * 与 `store` 同一纪律(理由逐字相同:渲染循环读的是**它自己那个**)⇒
+   * 生产路径必须由调用方传入;省略时退化为自建,只有单测 / 冒烟才该这样用。
+   */
+  chunks?: ClientChunkStore;
   /** 供测试替换(默认 `globalThis.WebSocket`)。 */
   makeSocket?: (url: string) => WebSocketLike;
   /**
@@ -572,6 +642,8 @@ export interface WebSocketLike {
 /** 建一个会话:**不同步等握手** —— 连接与握手都在事件回调里推进。 */
 export function createSession(opts: SessionOptions): SessionHandle {
   const store = opts.store ?? new ClientStateStore();
+  /* ★ WS-FND-182:块存储(与 `store` 同一纪律 —— 由调用方持有;见 `SessionOptions.chunks`)。 */
+  const chunkStore = opts.chunks ?? new ClientChunkStore();
   let state: SessionState = 'idle';
   let serverClaim: string | null = null;
   let socket: WebSocketLike | null = null;
@@ -599,6 +671,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
   let nextRetryAtMs: number | null = null;
   /** 最近一次超时的具名原因(见 `SessionHandle.lastTimeout`)。 */
   let lastTimeout: { kind: 'connect' | 'handshake'; ms: number; text: string } | null = null;
+  /* ★ WS-FND-182:地形通道的两个读数(见 `SessionHandle.terrainFrames` / `lastTerrainError`)。 */
+  /** 已落地的地形帧数(单调)。 */
+  let terrainFrames = 0;
+  /** 最近一次地形帧解码失败的原因(`null` = 没失败过)。 */
+  let lastTerrainError: string | null = null;
 
   const setState = (s: SessionState, detail?: string): void => {
     state = s;
@@ -607,6 +684,33 @@ export function createSession(opts: SessionOptions): SessionHandle {
 
   const make = opts.makeSocket
     ?? ((u: string) => new WebSocket(u) as unknown as WebSocketLike);
+
+  /**
+   * ★ WS-FND-182:落一帧地形。
+   *
+   * ## 三处都留痕(与 `onDrop` / `onReject` 同纪律)
+   * ```text
+   * 1 块字节写进 chunkStore          ← 唯一的事实(渲染读它)
+   * 2 terrainFrames += 1             ← "收到过几帧"(单调,不会被一次调用伪造)
+   * 3 events.onTerrain({changed})    ← 推送:调用方据此**只重建变了的块**
+   * ```
+   * ## 解不开时**出声**,但不算 `droppedFrames`
+   * `droppedFrames` 的语义是「载荷**形态**不对」(Blob / 非字节),把「地形帧
+   * 内容坏了」混进去会让 `binaryType` 那一类判据失去分辨力(见它的长注释)。
+   * ⇒ 走专用计数 `lastTerrainError` + 同一条 `onDrop` 出口。
+   */
+  const applyTerrainFrame = (payload: Uint8Array): void => {
+    let changed: string[];
+    try {
+      changed = chunkStore.applyWire(payload).changed;
+    } catch (e) {
+      lastTerrainError = (e as Error).message;
+      opts.events.onDrop?.(`地形帧解码失败:${lastTerrainError}`);
+      return;
+    }
+    terrainFrames += 1;
+    opts.events.onTerrain?.({ changed, store: chunkStore });
+  };
 
   /** 取消待重连(重连已经建立 / 调用方收尾时都要调,否则定时器会再拨一次)。 */
   const clearRetry = (): void => {
@@ -873,6 +977,19 @@ export function createSession(opts: SessionOptions): SessionHandle {
         }
         return;
       }
+      /* ── ★ WS-FND-182:地形帧**先分流** ──
+         它也是二进制帧(WS opcode 0x2),但不是差量包:
+         ```text
+         差量包:首字节 = PROTOCOL_VERSION(3)→ decodePacket
+         地形帧:首字节 = TERRAIN_FRAME_TAG(0x54)→ decodeTerrainFrame
+         ```
+         ⚠️ 判据必须在这里 —— 交给 `store.apply` 的话,一条**形态完好**的地形帧
+         会以「协议版本不匹配:84」的形态报出来,而那个原因指向的是**编码器**,
+         不是它真的错在哪(本仓反复记的「症状名 ≠ 成因名」)。 */
+      if (isTerrainFrame(cls.payload)) {
+        applyTerrainFrame(cls.payload);
+        return;
+      }
       /* 二进制:store 内部处理「0 字节」与「坏包」两件事,本层不再判断。 */
       const r = store.apply(cls.payload);
       opts.events.onFrame(r, store);
@@ -919,6 +1036,10 @@ export function createSession(opts: SessionOptions): SessionHandle {
 
   return {
     get store() { return store; },
+    /* ★ WS-FND-182:地形通道的三个读数(与 `store` / `droppedFrames` 并列,不混用)。 */
+    get chunks() { return chunkStore; },
+    get terrainFrames() { return terrainFrames; },
+    get lastTerrainError() { return lastTerrainError; },
     get state() { return state; },
     get serverContentClaim() { return serverClaim; },
     /* ★ WS-FND-167:超时与退避的四个读数 —— 界面 / 自检脚本都读它们,不靠看日志。 */

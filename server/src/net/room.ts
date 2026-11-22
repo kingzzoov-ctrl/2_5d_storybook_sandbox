@@ -21,7 +21,15 @@ import {
   encodeFull,
   decodePacket,
   PROTOCOL_VERSION,
+  /* ★ WS-FND-182:地形下行的差量判据(块版本比较)。 */
+  diffChunkVersions,
 } from '../../../shared/net/delta.ts';
+/* ★ WS-FND-182:地形帧的编码口(单块 1032 字节 = 1024 格 + 8 字节块头)。 */
+import {
+  encodeTerrainFrames,
+  terrainChunkKey,
+  type TerrainChunkInput,
+} from '../../../shared/net/terrain.ts';
 import { EntityKind, TelegraphShape, type BossState } from '../../../shared/types/wire.ts';
 /* ★ WS-FND-174:世界钟(秒)的慢帧网格(共享冻结层 SLOW_TICK_HZ = 2,即 0.5s = 世界慢帧 dt)。
    worldSecondsOf() 用它把世界的 frameCount / TICK_HZ 读数换算成世界侧逻辑真正比较的那个数。 */
@@ -1345,6 +1353,34 @@ export interface WorldSaveHost {
   readonly simSeconds?: number;
 
   /**
+   * ★ WS-FND-182:**地形下行的读口** —— 世界上当前存在的块
+   * (坐标 + 版本 + 1024 字节的打包格)。
+   *
+   * ## 为什么必须在这里声明(而不是房间直接读 `WorldSim` 的内部 Map)
+   * `createHost()` 的返回类型标注是 `WorldSaveHost` ⟹ `WorldSim` **有**而本接口
+   * **没声明**的成员会被**结构化裁掉**,房间侧 `typeof host.terrainChunks` 在
+   * **编译期**恒假(task-70 实测过同一个形态)。⇒ 要用它就必须在这里写出来。
+   *
+   * ## 形状(与 `WorldSim.terrainChunks` 逐字段一致)
+   * ```text
+   * cx / cy    块坐标(i16 可表示;键的口径由 `terrainChunkKey()` 统一)
+   * version    块版本号 —— 任何真实写入 +1,是"要不要重发"的唯一判据
+   * tiles      `Chunk.cells` 本体(**不拷贝**)⇒ 调用方必须在同一同步段内编完
+   * ```
+   *
+   * 可选(与 `levelOf` / `saveToDb` 同一 null 契约):老的世界源不实现它,
+   * 房间侧 `terrainDeltaFor` 就返回**空结果**(一帧都不发),不报错也不假装发过
+   * —— 空结果与"世界里真的一块都没有"在线上同形,那是本接口的既有取舍
+   * (单机演示房本来就没有块)。
+   */
+  terrainChunks?(): readonly {
+    cx: number;
+    cy: number;
+    version: number;
+    tiles: Uint32Array;
+  }[];
+
+  /**
    * **读档恢复的权威入口**(task-70 / 契约 §2.1)。
    *
    * 把一份**已解码的**玩家档案按固定顺序写进权威层(`progresses` / `vitals`)。
@@ -2102,6 +2138,23 @@ export interface StartingInventoryReport {
   readonly capacity: number;
   readonly reason: string;
   readonly rolledBack: boolean;
+}
+
+/**
+ * ★ WS-FND-182:一步地形下行的结果。
+ *
+ * 两个字段各有单一职责(别合并成一个 `Uint8Array`):
+ * ```text
+ * frames   要发的帧(已经是按 TERRAIN_CHUNKS_PER_FRAME 切好的自包含帧)
+ *          空数组 = "没有任何块变了" ⇒ 调用方一个字节都别发(节流的第一层)
+ * versions 这一轮结束后的**当前**块版本表(key = "cx,cy")⇒ 调用方据此推进
+ *          自己的基线。它**不等于**"刚发了哪些块",而是"发完之后世界上是什么版本"
+ *          —— 两者混用会让"新块在编码之后又被改了一次"永久漏发。
+ * ```
+ */
+export interface TerrainDelta {
+  frames: Uint8Array[];
+  versions: Record<string, number>;
 }
 
 /**
@@ -6428,6 +6481,70 @@ export class RoomRuntime {
         那算带宽问题,不算判据问题;要治它得先有一条明确的滞后常量。 */
     if (!this.members.has(userId)) return new Uint8Array(0);
     return encodeFull(this.visibleStateFor(userId), this.state.meta.tick).bytes;
+  }
+
+  /* ── 4.6 ★ WS-FND-182:地形下行 ── */
+
+  /**
+   * **一步地形下行**:拿调用方**已知的**块版本表,给出「该发的块帧」与
+   * 「这一轮之后的当前版本表」。
+   *
+   * ## 为什么需要它(修前的形态)
+   * ```text
+   * 客户端:client/src/stage/design_world.ts 在**本地**重算同一张设计图
+   * 服务端:WorldGrid 里跑着另一份世界
+   * 中间:  shared/net/delta.ts 的三个 chunk 原语**只有单测在用**(线上零下行)
+   * ⇒ 玩家盖的墙 / 拆的块在屏幕上永远不出现,而**没有任何东西会红**
+   * ```
+   * 本方法就是那条缺失通道的服务端半边,它**只做三件事**:
+   * ```text
+   * 1 读世界侧的块清单(host.terrainChunks,可选成员,缺它 ⇒ 空结果)
+   * 2 用 diffChunkVersions(known, current) 算出**只有哪些块变了**
+   * 3 只把那些块编成帧(encodeTerrainFrames)⇒ 没有变化时一个字都不编
+   * ```
+   *
+   * ## 节流在哪一层(必须说清,否则下一个人会在这里再加一层)
+   * ```text
+   * 判据层(本方法):「没有块变」⇒ frames 为空 ⇒ 一个字节都不发
+   * 速率层(ws_server):「距上次下发不足 TERRAIN_RESEND_MIN_INTERVAL_MS」⇒ 根本不调;
+   *                     「一条连接一轮最多发 TERRAIN_FRAMES_PER_WINDOW 帧」⇒ 队列化
+   * ```
+   * ⇒ 本方法**不做**任何时间判断(它没有时钟,也不该有:那会长出第二个节流口径)。
+   *
+   * ## ⚠️ 基线(known)由**调用方**持有,而且是**每连接**一份
+   * 断线重连 ⇒ 新连接从 `{}` 起 ⇒ 全量重发一遍(那正是想要的:块没到就是没到)。
+   */
+  terrainDeltaFor(known: Record<string, number>): TerrainDelta {
+    const host = this.worldSaveHost;
+    /* 没有世界源 / 老世界源没实现这个读口 ⇒ 空结果(与 `levelOf` 同一 null 契约:
+       不报错、也不假装发过)。 */
+    if (host === null || typeof host.terrainChunks !== 'function') {
+      return { frames: [], versions: {} };
+    }
+
+    /* ⚠️ 这一段**必须同步**:`tiles` 是 `Chunk.cells` 本体(不拷贝,见
+       `WorldSim.terrainChunks` 的口径 1)⇒ 从读到编完之间不许 await / 让出。 */
+    const chunks = host.terrainChunks();
+    const versions: Record<string, number> = {};
+    const byKey = new Map<string, TerrainChunkInput>();
+    for (const c of chunks) {
+      const k = terrainChunkKey(c.cx, c.cy);
+      versions[k] = c.version;
+      byKey.set(k, c);
+    }
+
+    const changed = diffChunkVersions(known, versions);
+    if (changed.length === 0) return { frames: [], versions };
+
+    const want: TerrainChunkInput[] = [];
+    for (const d of changed) {
+      const c = byKey.get(terrainChunkKey(d.cx, d.cy));
+      /* 理论上一定命中(两段读的是同一份 `chunks`)⇒ 万一没有,宁可少发一块
+         也不发一块身份不明的字节。这一条不抛错:它是"读口在两段之间变了"
+         那类竞态(真发生时 `versions` 也已经是新的,下一轮会补上)。 */
+      if (c !== undefined) want.push(c);
+    }
+    return { frames: encodeTerrainFrames(want), versions };
   }
 
   /**
