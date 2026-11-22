@@ -4,6 +4,7 @@
  * ```
  * npm run play          # 想换端口:node scripts/play.ts --port 9001
  * npm run play -- --host 0.0.0.0   # 让**别的机器**的浏览器能连(在服务器上玩用这个)
+ * npm run play -- --host 0.0.0.0 --dist   # **跨公网玩**:用构建产物(dev 模式首屏 6.7 MiB,会撞 8s 看门狗)
  * ```
  *
  * ## 它做了什么
@@ -253,13 +254,31 @@ async function main(): Promise<void> {
       + ` · lastSaveError=${String(assembled.runtime.lastSaveError)}`);
   }
 
-  /* ── 3 客户端 dev server ── */
+  /* ── 3 客户端 ── */
   /* ★ `--host` 决定**打印**的地址(vite 也绑同一个地址):缺省 `127.0.0.1` 与改前逐字一致;
-     `--host 0.0.0.0` 时用 `<本机IP/公网IP>` 占位 —— 因为 `0.0.0.0` 不是可点开的地址。 */
+     `0.0.0.0` 时用 `<本机IP/公网IP>` 占位 —— 因为 `0.0.0.0` 不是可点开的地址。 */
   const webUrl = `http://${URL_HOST}:${WEB_PORT}/`;
   const playUrl = `${webUrl}?server=${encodeURIComponent(`ws://${URL_HOST}:${srv.port}/ws`)}`;
   let web: ReturnType<typeof spawn> | null = null;
-  if (existsSync(join(ROOT, 'node_modules', 'vite'))) {
+  /* ★ 2026-11-22(w80):`--dist` = 用**构建产物**,而不是 vite dev。
+     跨公网玩**必须**用它 —— dev 模式的模块图实测 = **60 个请求 / 6.67 MiB / 109 s**
+     (vite 逐个模块现编译,`three` 预打包 3.93 MiB),必然撞穿 `client/index.html` 的
+     **8 s 启动看门狗** ⇒ 白屏,报「src/main.ts 没有跑起来」(而它其实 200)。
+     构建产物 = **3 个请求 / 262 KB(gzip) / 0.86 s**。 */
+  const distMode = argv.includes('--dist');
+  if (distMode) {
+    const distIndex = join(ROOT, 'dist', 'client', 'index.html');
+    if (!existsSync(distIndex)) {
+      /* fail-closed:宁可把原因说清楚,也不要起一个必然白屏的客户端 */
+      log(`⚠️ --dist 找不到构建产物:${distIndex}`);
+      log('   ⇒ 先跑 `npm run build:client`(本机实测约 1 秒);WS 与存档照常,只是没有可开玩的页面。');
+    } else {
+      web = spawn('npm', ['run', 'preview:client', '--', '--port', String(WEB_PORT), '--host', HOST], {
+        cwd: ROOT, shell: true, stdio: 'inherit',
+      });
+      log(`客户端(构建产物 dist/client,经 vite preview):${webUrl}`);
+    }
+  } else if (existsSync(join(ROOT, 'node_modules', 'vite'))) {
     web = spawn('npm', ['run', 'dev:client', '--', '--port', String(WEB_PORT), '--host', HOST], {
       cwd: ROOT, shell: true, stdio: 'inherit',
     });

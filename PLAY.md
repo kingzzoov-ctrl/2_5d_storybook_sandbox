@@ -45,6 +45,7 @@ node scripts/play.ts --memory                     # 显式内存模式:退出即
 | `--port <n>` | `8791` | WS 服务端端口 |
 | `--web-port <n>` | `5173` | 客户端 dev server 端口 |
 | `--host <addr>` | `127.0.0.1` | 监听地址。`0.0.0.0` = 让**别的机器**连(见下节) |
+| `--dist` | 关 | 用 `dist/client` 的**构建产物**(经 `vite preview`)而不是 vite dev —— **跨公网玩必须开**(见下节) |
 | `--size <格>` | `96` | 世界边长(格)。**再大会拖慢首帧建面** |
 | `--warmup <帧>` | `1200` | 连上之前先跑多少帧(**32 帧 = 1 秒世界时间**) |
 | `--db <path>` | `.data/world.db` | 存档文件库路径(`DEFAULT_DB_PATH`) |
@@ -62,6 +63,25 @@ node scripts/play.ts --host 0.0.0.0
   (`client/src/main.ts` 的默认值)⇒ 从 `http://<服务器IP>:5173/` 打开就自动连到**同一台机器**的 8791。
 - 缺省仍是 `127.0.0.1`(只本机玩)—— 与引入 `--host` 之前**逐字相同**。
 - 云主机还要在**安全组**放行 `5173`(页面)与 `8791`(WebSocket)两个 TCP 端口。
+### 跨公网玩要加 `--dist`(**不是**可选项)
+
+```bash
+npm run build:client                            # 先构建一次(本机实测约 1 秒;产物进 dist/,已 gitignore)
+node scripts/play.ts --host 0.0.0.0 --dist      # 服务端起;浏览器开 http://<服务器IP>:5173/
+```
+
+**为什么必须**:`client/index.html` 有一个 **8 秒启动看门狗**(`__bootWatchdog`,
+在 `main.ts` 跑起来那一刻被 `clearTimeout` 清掉),而 **vite dev 模式**的首屏是
+**逐模块现编译**:实测 **60 个请求 / 6.67 MiB / 109 s**(其中 `three` 的预打包就 3.93 MiB / 32 s)
+⇒ 必然开火,页面白屏并报「启动超时:8000ms 内 src/main.ts 没有跑起来」——
+⚠️ **而 `main.ts` 本身是 200,不是 404**(这正是那句提示会带偏的地方)。
+
+`--dist` 改用**构建产物**(`dist/client`,经 `vite preview`,带 gzip):
+**3 个请求 / 262 KB(gzip) / 0.86 s**。
+
+⇒ 一句话:**本机玩用默认(dev,秒级热更,不构建);跨公网玩加 `--dist`。**
+⚠️ `--dist` 找不到 `dist/client/index.html` 时**不会**起一个必然白屏的客户端,
+而是打印「先跑 `npm run build:client`」并让 WS/存档照常 —— 失败要**明说**,不要沉默白屏。
 ---
 
 `npm run play` 一次做了五件事:**装配**真实世界(`assemble()` → `WorldSim`)、开**存档**、

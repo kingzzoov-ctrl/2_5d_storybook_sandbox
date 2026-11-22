@@ -1195,3 +1195,39 @@ node scripts/play.ts --host 0.0.0.0        # 服务器上起;浏览器开 http:/
   ⇒ 从 `http://<服务器IP>:5173/` 打开即连**同一台机器**的 8791。
 - 缺省仍是 `127.0.0.1`(只本机玩),与引入 `--host` 之前**逐字相同** ⇒ 不影响任何既有判据/门禁。
 - 云主机需在安全组放行 **5173**(页面)与 **8791**(WebSocket)两个 TCP 端口。
+
+#### ★★ 白屏的定因(2026-11-22 当晚实况):**8 秒看门狗 vs dev 模式的模块图**
+
+报错原文(应用自己的看门狗,`client/index.html` 的 `__bootWatchdog`,由 `main.ts` 起来时清掉):
+
+```text
+启动超时:8000ms 内 src/main.ts 没有跑起来。
+最常见的原因是它 404(路径/文件名不对)或模块解析失败 ⇒ 页面停在白屏。
+```
+
+**那句话把排查方向带偏了**:实测 `main.ts` 是 **200**,模块也解析得到 ——
+真因是**首屏总量**。按浏览器的方式把整图跑一遍(从另一台机器,12 路并发):
+
+| 口径 | 模块数 / 总字节 | 总墙钟 | 备注 |
+|:--|:--|:--|:--|
+| **vite dev** | 60 个 / **6.67 MiB** | **109 s** | 逐模块现编译;`three` 预打包 **3.93 MiB / 32 s**;`party_hud.ts`、`stage_assembly.ts` 单请求 >30 s |
+| **构建产物 + `vite preview`** | **3 个 / 262 KB(gzip)** | **0.86 s** | `/` 46ms · 入口 89 KB/72ms · `three` chunk 170 KB/744ms |
+
+⇒ 8 s 预算下,**dev 模式必然白屏**;`--dist` 才是能玩的形态。
+
+修法:`scripts/play.ts` 增 **`--dist`**:改用 `npm run preview:client`(`vite preview`)serve
+`dist/client`,并在**找不到产物时不启动客户端**而是明说「先跑 `npm run build:client`」
+(fail-closed —— 不要起一个必然白屏的页面然后让用户自己猜)。缺省仍是 dev(本机玩要热更),
+与改前逐字相同。
+
+```bash
+npm run build:client                            # 服务器实测 950ms
+node scripts/play.ts --host 0.0.0.0 --dist      # 跨公网玩
+```
+
+两条**踩坑记录**:
+1. `vite preview --outDir dist/client` 会 **404** —— `vite.config.ts` 的 `root: 'client'`,
+   CLI 的 `--outDir` 是相对 **root** 解析的 ⇒ 变成 `client/dist/client`。
+   **不要传 `--outDir`**,让它用配置里的 `build.outDir: '../dist/client'`。
+2. 图集 `atlas_sprites.png` **2.17 MB 且不压缩**,实测单请求 **34 s**(那条链路当时也不稳)。
+   它**不挡启动**(JS 起来就世界可见),但贴图会晚到 —— 这是带宽问题,不是缺陷。
