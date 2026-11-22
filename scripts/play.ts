@@ -3,6 +3,7 @@
  *
  * ```
  * npm run play          # 想换端口:node scripts/play.ts --port 9001
+ * npm run play -- --host 0.0.0.0   # 让**别的机器**的浏览器能连(在服务器上玩用这个)
  * ```
  *
  * ## 它做了什么
@@ -76,9 +77,27 @@ const numArg = (name: string, fallback: number): number => {
   const v = i >= 0 ? Number(argv[i + 1]) : Number.NaN;
   return Number.isFinite(v) ? v : fallback;
 };
+const strArg = (name: string, fallback: string): string => {
+  const i = argv.indexOf(`--${name}`);
+  const v = i >= 0 ? argv[i + 1] : undefined;
+  return v === undefined || v === '' ? fallback : v;
+};
 
 const WS_PORT = numArg('port', 8791);
 const WEB_PORT = numArg('web-port', 5173);
+/**
+ * ★ 2026-11-22(w79):**监听地址**。缺省 `127.0.0.1`(只本机玩,与改前**逐字不变**)。
+ *
+ * `--host 0.0.0.0` = 让**别的机器**上的浏览器能连(在服务器上玩必须用这个)。
+ * ⚠️ 真正需要放开的其实**只有 vite**:WS 服务端本来就是 `server.listen(port)`
+ * (不传 host ⇒ 绑全部网卡),此前的 "127.0.0.1" 只是**打印文案**。
+ * ⚠️ 浏览器**不需要** `?server=`:客户端默认连 `ws://<当前主机名>:8791/ws`
+ * (见 `client/src/main.ts` 的默认值)⇒ 从 `http://<IP>:5173/` 打开就连到同一台机器。
+ */
+const HOST = strArg('host', '127.0.0.1');
+/** `0.0.0.0` / `::` 不是可点开的地址 ⇒ 打印时用占位符代替。 */
+const BIND_ALL = HOST === '0.0.0.0' || HOST === '::';
+const URL_HOST = BIND_ALL ? '<本机IP/公网IP>' : HOST;
 /** 世界边长(格)。96 足够走一圈看到地形、怪与屋顶;**再大会拖慢首帧建面**。 */
 const WORLD_CELLS = numArg('size', 96);
 
@@ -196,7 +215,8 @@ async function main(): Promise<void> {
     frameMs: NOMINAL_TICK_MS,
     onLog: (m) => { if (process.env['PLAY_VERBOSE'] === '1') log(`[ws] ${m}`); },
   });
-  log(`WS 服务端:ws://127.0.0.1:${srv.port}/ws`);
+  log(`WS 服务端:ws://${URL_HOST}:${srv.port}/ws`
+    + (BIND_ALL ? '(监听 0.0.0.0 = 全部网卡;浏览器请用 <本机IP>)' : ''));
 
   /* ── 2a 实测节拍(★ D-26)──
      5 秒后打一行:此时循环已跑过几十帧,读数才有意义。**只打印**,不改世界一步。
@@ -234,11 +254,13 @@ async function main(): Promise<void> {
   }
 
   /* ── 3 客户端 dev server ── */
-  const webUrl = `http://localhost:${WEB_PORT}/`;
-  const playUrl = `${webUrl}?server=${encodeURIComponent(`ws://127.0.0.1:${srv.port}/ws`)}`;
+  /* ★ `--host` 决定**打印**的地址(vite 也绑同一个地址):缺省 `127.0.0.1` 与改前逐字一致;
+     `--host 0.0.0.0` 时用 `<本机IP/公网IP>` 占位 —— 因为 `0.0.0.0` 不是可点开的地址。 */
+  const webUrl = `http://${URL_HOST}:${WEB_PORT}/`;
+  const playUrl = `${webUrl}?server=${encodeURIComponent(`ws://${URL_HOST}:${srv.port}/ws`)}`;
   let web: ReturnType<typeof spawn> | null = null;
   if (existsSync(join(ROOT, 'node_modules', 'vite'))) {
-    web = spawn('npm', ['run', 'dev:client', '--', '--port', String(WEB_PORT)], {
+    web = spawn('npm', ['run', 'dev:client', '--', '--port', String(WEB_PORT), '--host', HOST], {
       cwd: ROOT, shell: true, stdio: 'inherit',
     });
   } else {
@@ -250,7 +272,7 @@ async function main(): Promise<void> {
   console.log('   开始玩 —— 浏览器打开:');
   console.log(`     ${playUrl}`);
   console.log('');
-  console.log(`   (客户端已默认连 ws://<当前主机>:${srv.port}/ws,直接开 ${webUrl} 也行)`);
+  console.log(`   (客户端已默认连 ws://<当前主机>:${srv.port}/ws;直接开 ${webUrl} 也行)`);
   console.log(`   操作:WASD/方向键 移动 · 鼠标左键 或 空格 攻击最近的怪`);
   console.log('  ══════════════════════════════════════════════');
   console.log('');
