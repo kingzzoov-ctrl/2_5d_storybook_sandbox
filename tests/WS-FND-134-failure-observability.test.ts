@@ -978,6 +978,60 @@ async function main(): Promise<void> {
     }
   });
 
+
+  await atest('FND134-17 ★★ 反作弊的两个计数接到出口:`droppedViolations` / `staleRejections`(O-7)', async () => {
+    /* ## 这一条守什么
+     *
+     * `AntiCheatRoom.droppedViolations`(环形流水**因满而丢**的条数)与
+     * `staleRejections`(被归类成 `stale` 的拒绝)在**生产侧零读点** —— `git grep` 在
+     * `server/` 只剩定义,只有 tests / soak 读它们。而它们恰好是两类事实的唯一出口:
+     *   · 证据**正在丢失**(掉了就不可恢复,且「饱和」与「一直在违规」在读数上同形);
+     *   · 服务端在**自己推玩家**(所以有拒绝,但不是违规)。
+     * ⇒ 与上面三个留证字段同一纪律:搬进取证的唯一日志出口,**变了才报**。 */
+    const f = makeColyseusRoom();
+    const step = (): void => { (f.room['stepTick'] as () => void).call(f.room); };
+    const countOf = (p: string): number => f.lines.filter((l) => l.startsWith(p)).length;
+
+    step();
+    eq(countOf('[room:ac-dropped]'), 0, '前置:流水没满 ⇒ 无丢弃行');
+    eq(countOf('[room:ac-stale]'), 0, '前置:没有 stale 拒绝 ⇒ 无行');
+
+    /* ── ① 真的把环形流水挤爆(容量 512):证据丢失必须是**可见事件** ── */
+    const ac = f.runtime.ac;
+    ac.join('u_drop', 0, 0, 0);
+    for (let i = 1; i <= 520; i += 1) {
+      /* 每条都是 1000 格开外的瞬移 ⇒ 必判 TELEPORT ⇒ 入流水。 */
+      ac.move({ tick: i, x: 1000 + i, y: 0, z: 0, playerId: 'u_drop' });
+    }
+    ok(ac.droppedViolations > 0,
+      `前置:环形流水真的溢出了(dropped=${ac.droppedViolations},容量 512)`);
+
+    step();
+    eq(countOf('[room:ac-dropped]'), 1, '★★ `droppedViolations` 被搬到出口(修前生产侧 0 读点)');
+    ok(f.lines.some((l) => l.startsWith('[room:ac-dropped]') && l.includes(`累计 ${ac.droppedViolations}`)),
+      '★ 行里是**真读数**(累计值),不是一句通用文案');
+
+    /* ── ② stale 计数:报**增量** ── */
+    f.runtime.ac.staleRejections = ac.staleRejections + 3;
+    step();
+    eq(countOf('[room:ac-stale]'), 1, '★★ `staleRejections` 被搬到出口');
+    ok(f.lines.some((l) => l.startsWith('[room:ac-stale]') && l.includes('+3')),
+      '★ 行里是**增量**(+3),不是只报总数');
+
+    /* ── ③ 去重:本方法每帧都跑,不许把同一件事刷成一堵墙 ── */
+    step(); step();
+    eq(countOf('[room:ac-dropped]'), 1, '★★ 去重:没有再丢就不许重复报');
+    eq(countOf('[room:ac-stale]'), 1, '★★ 去重:没有再涨就不许重复报');
+
+    /* ── ④ 负对照:计数**回退**(房间复用 / AC 被换掉)⇒ 只更新基准,不报负增量 ── */
+    f.runtime.ac.staleRejections = 0;
+    step();
+    eq(countOf('[room:ac-stale]'), 1, '负对照:回退不新增行(否则会报一个假的负增量)');
+    f.runtime.ac.staleRejections = 1;
+    step();
+    eq(countOf('[room:ac-stale]'), 2, '回退之后再涨 ⇒ 从**新基准**起算,照常报一行');
+  });
+
   report('WS-FND-134');
 }
 

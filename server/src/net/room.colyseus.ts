@@ -334,6 +334,9 @@ export class NetPersistRoom extends Room<RoomSchema> {
   private loggedRestoreError: string | null = null;
   private loggedRemoveError: string | null = null;
   private loggedJoinAudit: RoomRuntime['lastJoinAudit'] = null;
+  /* ★ O-7:反作弊两个计数的「上一次已报过」基准(同上,去重靠「变了才报」)。 */
+  private loggedDroppedViolations = 0;
+  private loggedStaleRejections = 0;
 
   /**
    * ★ WS-FND-134(P1-2):装配层(B 路)的**日志出口**。
@@ -386,6 +389,37 @@ export class NetPersistRoom extends Room<RoomSchema> {
       const a = rt.lastJoinAudit;
       this.logLine('join-audit',
         `user=${a.userId} members=${a.members} state=${a.state} world=${a.world}`);
+    }
+
+    /* ★ O-7:反作弊的**两个计数**在生产侧原本**零读点** —— 只有 tests / soak 读它们
+       (`git grep droppedViolations` 在 `server/` 只剩定义)。它们恰好是「**证据正在丢失**」
+       与「诚实玩家被服务端自己推走」两类事实的唯一出口,不能只对测试可见。
+
+       · `droppedViolations` = 环形流水**因满而丢**的条数 ⇒ 掉一条就少一段证据,
+         且**不可恢复**(`violations()` 里只剩最后 512 条,而「饱和」与「一直在违规」
+         在读数上长得一模一样 —— 这正是 WS-FND-178 加它的理由)。
+       · `staleRejections` = 被归类成 `stale` 的拒绝(服务端自位移所致,**不是**违规)
+         ⇒ 它涨而 `acViolations` 不涨,是「服务端在推玩家」的健康读数。
+
+       两者都走「**变了才报**」(与上面三个字段同一纪律):计数器只增,`delta > 0` 时
+       报一行增量 + 累计;计数**变小**(房间复用 / AC 被换掉)只更新基准,不报。 */
+    const droppedNow = rt.ac.droppedViolations;
+    if (droppedNow !== this.loggedDroppedViolations) {
+      const delta = droppedNow - this.loggedDroppedViolations;
+      this.loggedDroppedViolations = droppedNow;
+      if (delta > 0) {
+        this.logLine('ac-dropped',
+          `反作弊流水因环满丢弃 +${delta}(累计 ${droppedNow}):被挤掉的证据不可恢复`);
+      }
+    }
+    const staleNow = rt.ac.staleRejections;
+    if (staleNow !== this.loggedStaleRejections) {
+      const delta = staleNow - this.loggedStaleRejections;
+      this.loggedStaleRejections = staleNow;
+      if (delta > 0) {
+        this.logLine('ac-stale',
+          `世界自位移导致的拒绝 +${delta}(累计 ${staleNow}):不算违规、不计分`);
+      }
     }
   }
 
