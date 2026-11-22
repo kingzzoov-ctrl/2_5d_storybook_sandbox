@@ -1047,7 +1047,7 @@ score 0 -> 4    流水 0 -> 1                    ← 照旧计分
 ⚠️ 这会**同时**影响 `stale` 的宽窄与 `acStaleRejections` 的读数 —— 要落就得连同
 `FND178-10` 的期望一起重钉,并重跑一轮 60 分钟 soak 作对照。
 
-### 13.15 ★ 把服务器当**唯一运行环境**:踩到的六件事(2026-11-22 owner 裁定「不要在本机上跑,只要服务器跑」)
+### 13.15 ★ 把服务器当**唯一运行环境**:踩到的八件事(2026-11-22 owner 裁定「不要在本机上跑,只要服务器跑」)
 
 | # | 症状 | 根因 | 处置 |
 |:--|:--|:--|:--|
@@ -1057,7 +1057,17 @@ score 0 -> 4    流水 0 -> 1                    ← 照旧计分
 | 4 | `WS-FND-112` 的 `FND112-11` 红(「手册在场时也必须打『跳过 0 项』」) | 它断言的手册是**仓外文件** `~/Downloads/2_5d_cartoon_sandbox_plan.md`(`scripts/data-conformance.ts#locatePlan` 的候选之一)。本机有(105 KB),服务器没有 ⇒ `WS-FND-06` 走跳过分支,报「跳过 1 项」 | 把手册放到服务器的 `$HOME/Downloads/`(或设 `PLAN_MD`) |
 | 5 | 类型错误 **+1**:`driver.sqlite.ts TS7016 Could not find a declaration file for module 'better-sqlite3'` | 本机**没装** `better-sqlite3`(它不是 `package.json` 的依赖)⇒ TS 走仓内的 ambient 声明;**服务器 `npm install` 把它装上了**却没有类型声明 ⇒ 反而多一条 | 对齐参考环境:`rm -rf node_modules/better-sqlite3` |
 | 6 | `§三 PROGRESS 陷阱` 字节数:文档 **463346** / 服务器 **455146** | `docs/PROGRESS.md` 在**本机 worktree 里是 CRLF**(`git ls-files --eol` = `i/lf w/crlf`;**8200 行 ⇒ 恰好差 8200 字节**),提交内容(LF)的真值是 455146 | 已把本机那份归一为 LF,并把文档值订正为 **455146**。⚠️ 教训同 §13.9:**所有「字节数」类判据都会被 worktree 行尾污染**,读数前先看 `git ls-files --eol` |
+| 7 | `bom-guard` 报「本轮新增 BOM:4 个」**即使 `.baseline/` 已在位** | `scripts/bom-guard.ts` 用 **`git cat-file blob HEAD:<rel>`** 与 HEAD 比对;服务器**没有 `.git`** ⇒ 比对失败 ⇒ HEAD 里本来就有的 BOM 全算「新增」 | 在服务器建一个与工作区**一致**的 `.git`(`git init` + 一次 commit)。实测:`✓ 本轮新增 BOM:0 个` |
+| 8 | `WS-FND-06` 仍报「跳过 1 项」**即使手册已在 `$HOME/Downloads/`** | `tests/WS-FND-06.test.ts` 自己的 `locatePlan()` 候选是 `join(process.env.USERPROFILE ?? '', 'Downloads', …)` —— 服务器 `USERPROFILE` **未设** ⇒ 它退化成**相对路径** `<仓根>/Downloads/…` | 手册放到**仓根的 `Downloads/`**(别放 `docs/`,那样 `FND112-11` 的负对照会红)。实测:`[WS-FND-06] 跳过 0 项`、`FND112-11` **14/14** |
 
-★ 这六条的共同形状:**「本机能跑绿」依赖了**三样不在 git 里的东西** —— 本机的
-`core.autocrlf=true`、未跟踪的 `.baseline/`、仓外手册。⇒ 换成「服务器为唯一运行环境」时,
-这三样必须一起搬过去,否则门禁的**数字**会静默漂移(而漂移看起来像「代码坏了」)。
+★ 这八条的共同形状:**「本机能跑绿」依赖了四样不在 git 里的东西** —— 本机的
+`core.autocrlf=true`、未跟踪的 `.baseline/`、仓外手册、以及一个**与工作区一致的 `.git`**
+(第 7 条)。⇒ 换成「服务器为唯一运行环境」时,这四样必须一起搬过去,
+否则门禁的**数字**会静默漂移(而漂移看起来像「代码坏了」)。
+
+★ 服务器侧还剩 **1 项**(**硬件限制,不是产品缺陷**):门禁自检
+`scripts/gate-selfcheck.ts` 的 `VERIFY_TIMEOUT_MS = 600_000` 在这台 **2 核**机上被
+`--integration` 顶穿 —— 自检里报 `spawnSync … ETIMEDOUT`,而**单独跑 `--integration`
+只要 309 s 且「全部通过」** ⇒ 那是自检**并发**时的争用。
+**不改这个常量**:为迁就机器去放宽门禁的超时 = 放水。换 4 核以上即绿;
+其余 **27/28 项全绿**,`用例汇总 3131 条 / 187 套件 / 基座 2117 / 173`。
