@@ -846,8 +846,18 @@ export function createSession(opts: SessionOptions): SessionHandle {
                (状态会被 close 覆盖、回调可能没人注册、字段要有人去读)。 */
             lastReject = w;
             rejectedFrames += 1;
-            setState('failed', describeReject(w));
             opts.events.onReject?.(w);
+            /* ★★ 2026-11-22(w82):**只有连接级拒绝才落到 `failed`**。
+               服务端对「世界侧拒收本次移动」也发 `{t:'reject', kind:'MOVE',
+               code:'WORLD_REJECTED'}`,而且**不关连接**(见 `ws_server.ts` 的
+               `onMove`:那是**每一条报文**的结果 —— 撞墙 / 被击退 / 格子冷却,
+               全是**常态**)。修前这里无条件 `setState('failed', …)` ⇒
+               玩家**撞一下墙**,HUD 就变成「连接 failed / 未连接 / 不重试」,
+               而 socket 其实还活着 ⇒ 游戏直接玩不下去(实测复现:摇杆顶着墙走十几秒)。
+               ⇒ 判据:`kind === 'MOVE'` 只**留痕**(`lastReject` / `rejectedFrames` /
+               `onReject`),**不改状态**;`kind` 缺省仍按连接级处理
+               (握手 / 入场被拒,服务端随后会 close —— WS-FND-134 的契约不变)。 */
+            if (w.kind !== 'MOVE') setState('failed', describeReject(w));
           } else {
             /* ★ WS-FND-134(P1):未知文本报文**也要留痕** —— 修前它落在那个
                "其余直接 return"的静默口上:服务端将来加一种报文时,客户端会

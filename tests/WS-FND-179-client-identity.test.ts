@@ -47,6 +47,9 @@ import {
   withUserId,
   type IdentityStore,
 } from '../client/src/net/identity.ts';
+import { createSession } from '../client/src/net/session.ts';
+import { ClientStateStore } from '../client/src/net/state_store.ts';
+import { PROTOCOL_VERSION } from '../shared/net/delta.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -209,4 +212,72 @@ test('FND179-9 设计守位:客户端 hello **仍不带** userId(id 只走地址
   ok(!/userId/.test(iface![1]!), '★ 客户端 HelloFrame 也不得声称有 userId(否则 WS13-5b-1 会红)');
 });
 
+/* ═══ 10. 行为:`kind:"MOVE"` 的 reject **不得**杀死会话(2026-11-22 实测:撞墙即"断线")═══ */
+
+/** 假 socket:与 WS-12 同形的建模(`binaryType` 那条教训见 WS-12 的注释)。 */
+function fakeSocket(): { sock: never; fire: (t: string, ev: unknown) => void } {
+  const handlers = new Map<string, ((ev: unknown) => void)[]>();
+  const sock = {
+    binaryType: 'arraybuffer',
+    readyState: 1,
+    send(): void { /* 本用例不看上行 */ },
+    close(): void { sock.readyState = 3; },
+    addEventListener(t: string, fn: (ev: never) => void): void {
+      if (!handlers.has(t)) handlers.set(t, []);
+      handlers.get(t)!.push(fn as (ev: unknown) => void);
+    },
+  };
+  return {
+    sock: sock as never,
+    fire: (t, ev) => { for (const h of handlers.get(t) ?? []) h(ev); },
+  };
+}
+
+/** 服务端下行**文本**帧 = 1 字节 tag `0x01` + JSON(与 WS-12 的 `textFrame` 同形)。 */
+function textFrame(obj: unknown): ArrayBuffer {
+  const body = new TextEncoder().encode(JSON.stringify(obj));
+  const f = new Uint8Array(body.length + 1);
+  f[0] = 0x01;
+  f.set(body, 1);
+  return f.buffer as ArrayBuffer;
+}
+
+test('FND179-10 ★★ `kind:"MOVE"` 的 reject **不得**把会话打成 failed(撞墙/被击退是常态)', () => {
+  const { sock, fire } = fakeSocket();
+  const states: string[] = [];
+  const s = createSession({
+    url: 'ws://x/', makeSocket: () => sock, store: new ClientStateStore(),
+    events: { onFrame: () => {}, onState: (st: string) => states.push(st) },
+  });
+  fire('open', {});
+  fire('message', {
+    data: textFrame({
+      t: 'welcome', playerId: 'p1', roomId: 'r',
+      protocolVersion: PROTOCOL_VERSION, contentClaim: 'v1-a',
+    }),
+  });
+  eq(s.state, 'live', '前置:welcome 之后是 live');
+
+  /* ① 世界侧拒收**这一条**移动(服务端**不**关连接) */
+  fire('message', {
+    data: textFrame({ t: 'reject', kind: 'MOVE', code: 'WORLD_REJECTED', reason: '世界侧拒收本次移动' }),
+  });
+  eq(s.state, 'live', '★★ 会话仍是 live(修前是 failed ⇒ 撞一下墙就被当成断线、且不再重试)');
+  eq(s.rejectedFrames, 1, '★ 但必须留痕:计数 +1');
+  eq(s.lastReject?.code, 'WORLD_REJECTED', '★ 最近拒因可读(排障要看得出是世界拒收)');
+  ok(!states.includes('failed'), '★★ 状态历史里**不得**出现 failed');
+
+  /* ② 连接级拒绝(握手 / 入场)—— 仍必须 failed(WS-FND-134 的契约不变) */
+  fire('message', { data: textFrame({ t: 'reject', code: 'NO_IDENTITY', reason: '缺少 userId' }) });
+  eq(s.state, 'failed', '★ 没有 kind 的 reject 仍按连接级处理');
+  ok(states.includes('failed'), '状态历史里必须出现 failed');
+});
+
+test('FND179-11 守位:`session.ts` 的 reject 分支必须**按 kind 判**,不得退回无条件 failed', () => {
+  const S = stripComments(read('client/src/net/session.ts'));
+  const branch = /w\.t === 'reject'\)\s*\{([\s\S]*?)\n\s*\}/.exec(S);
+  ok(branch !== null, '应能定位 reject 分支');
+  ok(/w\.kind !== 'MOVE'/.test(branch![1]!),
+    "★ 分支里必须是 `if (w.kind !== 'MOVE') setState('failed', …)`(修前是无条件 failed)");
+});
 report('WS-FND-179');
