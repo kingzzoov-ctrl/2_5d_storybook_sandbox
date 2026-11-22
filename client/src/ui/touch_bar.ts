@@ -255,6 +255,11 @@ export class TouchBar {
     this.layer = layer;
     this.view?.addEventListener('resize', this.onResize);
     this.relayout();
+    /* ★ 首帧后再摆一次:mount 时机可能早于容器定尺(实测拿到 0 宽)⇒ 只靠 resize 不会恢复。 */
+    const raf = this.view?.requestAnimationFrame;
+    if (typeof raf === 'function') raf(() => { this.relayout(); });
+    /* 手机旋转 / 地址栏收缩:两者都**不一定**触发 `resize`(iOS 上尤其)。 */
+    this.view?.addEventListener('orientationchange', this.onResize);
   }
 
   /** 命中查询(与 `hitTouchBar` 同一份布局) */
@@ -263,12 +268,17 @@ export class TouchBar {
     return L === null ? null : hitTouchBar(L, px, py);
   }
 
-  /** 高亮"当前打开的面板"(玩家一眼能看出按哪个会关掉) */
+  /** 高亮"当前打开的面板"(玩家一眼能看出按哪个会关掉) —— ⚠️ 只改颜色,见下面的注释 */
   setActivePanel(panel: UiPanel): void {
     this.activePanel = panel;
     for (const { id, el } of this.els) {
       const on = id === `panel:${panel}`;
-      el.style.cssText = on ? S_BUTTON_BASE + S_BUTTON_ACTIVE : S_BUTTON_BASE;
+      /* ★★ 2026-11-22(w84):**不许**写 `el.style.cssText = …` —— 那会把 `relayout()`
+         刚写进去的 `width/height/left/top` **一起抹掉**。实测后果:`main.ts` 开局调一次
+         本方法,7 个按钮立刻全缩成 15×15、叠在左上角(手机上按不到,而且 `hitAt()`
+         用的是纯函数矩形,与 DOM 已经对不上 ⇒ 点了也没反应)。⇒ 只改**颜色**这两条属性。 */
+      el.style.background = on ? 'rgba(168, 240, 200, 0.24)' : 'rgba(18, 24, 38, 0.82)';
+      el.style.borderColor = on ? 'rgba(168, 240, 200, 0.75)' : 'rgba(120, 150, 210, 0.34)';
     }
   }
 
@@ -279,7 +289,15 @@ export class TouchBar {
   /** 视口变化 ⇒ 重新摆按钮(与面板同一条 `fitPanelRect` 口径) */
   relayout(): void {
     if (this.layer === null) return;
-    const L = layoutTouchBar(this.view?.innerWidth ?? 0, this.view?.innerHeight ?? 0, this.buttons);
+    const vw = this.view?.innerWidth ?? 0;
+    const vh = this.view?.innerHeight ?? 0;
+    /* ★★ 2026-11-22(w84):**视口没就绪就别写样式**。
+       `relayout()` 是唯一把几何写进 DOM 的地方,而它只有 `resize` 一个重摆触发源;
+       若首帧拿到 0 宽的视口,写下去就是 15×15 叠在左上角的**退化布局**,且**不会自己恢复**
+       (实测:7 个按钮 rect 全 `[0,0,15,15]`,手机上等于一个都按不到)。
+       ⇒ 0 / 非有限一律跳过,等有效视口再摆(`mount()` 里补了一帧 rAF 与 orientationchange)。 */
+    if (!Number.isFinite(vw) || !Number.isFinite(vh) || vw <= 0 || vh <= 0) return;
+    const L = layoutTouchBar(vw, vh, this.buttons);
     for (let i = 0; i < this.els.length; i += 1) {
       const r = L.buttons[i]?.rect;
       const el = this.els[i]!.el;

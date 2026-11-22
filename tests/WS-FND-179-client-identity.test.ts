@@ -50,6 +50,7 @@ import {
 import { createSession } from '../client/src/net/session.ts';
 import { ClientStateStore } from '../client/src/net/state_store.ts';
 import { PROTOCOL_VERSION } from '../shared/net/delta.ts';
+import { layoutTouchBar } from '../client/src/ui/touch_bar.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -279,5 +280,38 @@ test('FND179-11 守位:`session.ts` 的 reject 分支必须**按 kind 判**,不�
   ok(branch !== null, '应能定位 reject 分支');
   ok(/w\.kind !== 'MOVE'/.test(branch![1]!),
     "★ 分支里必须是 `if (w.kind !== 'MOVE') setState('failed', …)`(修前是无条件 failed)");
+});
+/* ═══ 12-13. 手机按钮条:重绘不得抹几何 + 布局必须真的铺开 ═══ */
+
+test('FND179-12 守位:触摸条重绘**不得**重置 `cssText`,relayout 必须挡住 0 视口', () => {
+  const S = stripComments(read('client/src/ui/touch_bar.ts'));
+  /* 实测缺陷:setActivePanel 里 `el.style.cssText = …` 会把 relayout 写的
+     width/height/left/top 一并抹掉 ⇒ 7 个按钮缩成 15×15 全叠在左上角。 */
+  ok(!/style\.cssText\s*=\s*[^;\n]*S_BUTTON_ACTIVE/.test(S),
+    '★ 不得把 S_BUTTON_ACTIVE 拼进 cssText(会抹掉 relayout 的几何)');
+  ok(/el\.style\.background\s*=/.test(S), '高亮必须走**属性级**写入(background / borderColor)');
+  ok(/Number\.isFinite\(vw\)/.test(S) && /vw <= 0/.test(S),
+    '★ relayout 必须有视口守卫:0 / 非有限一律不写样式');
+});
+
+test('FND179-13 手机布局:383×717 上 7 个按钮**互不重叠**、≥ 32 宽、都在视口内', () => {
+  const L = layoutTouchBar(383, 717);
+  eq(L.buttons.length, 7, '按钮数应为 7(attack + 5 面板 + close)');
+  ok(L.buttonW >= 32, `按钮宽应 ≥ 32(拇指可点),实得 ${L.buttonW}`);
+  eq(L.comfortable, true, 'comfortable 应为 true(≥ TOUCH_BUTTON_MIN_W_PX)');
+  for (const b of L.buttons) {
+    ok(b.rect.x >= 0 && b.rect.y >= 0
+      && b.rect.x + b.rect.w <= 383 && b.rect.y + b.rect.h <= 717,
+      `${b.id} 必须整个在视口内,实得 ${JSON.stringify(b.rect)}`);
+  }
+  /* ★ 这条正是修前那 7 个 [0,0,15,15] 的反面:两两不得重叠 */
+  for (let i = 0; i < L.buttons.length; i += 1) {
+    for (let j = i + 1; j < L.buttons.length; j += 1) {
+      const a = L.buttons[i]!.rect;
+      const c = L.buttons[j]!.rect;
+      const hit = a.x < c.x + c.w && c.x < a.x + a.w && a.y < c.y + c.h && c.y < a.y + a.h;
+      ok(!hit, `${L.buttons[i]!.id} 与 ${L.buttons[j]!.id} 不得重叠(重叠 = 手机上按不准)`);
+    }
+  }
 });
 report('WS-FND-179');
