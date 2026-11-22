@@ -982,3 +982,30 @@ O-7 原本是「**未核**」。核完的答案是**没有**:`git grep 'droppedV
 判据:`tests/WS-FND-134` 新增 **`FND134-17`**(真的把环形流水灌爆 520 条 ⇒ 断言出口出现
 一行且带**真累计值**;`stale` 报**增量**;去重;回退不报负增量)。
 有牙实证:把 `droppedViolations` 那一路的判据改成 `false && ...` ⇒ **20/20 → 19/20**。
+
+### 13.13 审查回答:`stale` 能不能被作弊者利用?—— **实测否证**
+
+问法:既然 `dist ≤ 额度 + drift` 就归类成 `stale`(不计分),那作弊者能不能把 `drift` 顶大,
+**一边瞬移一边不被计分**?更狠一点:能不能借着 `stale` 真的**动过去**?
+
+**实测(注入式,`_stale_exploit_probe.ts`)**:
+
+```text
+注入 rt.ac.noteAuthorityDrift('p1', 3.0)     ← 手工把宽限顶到 3 格
+作弊包(申报 5 格开外)   allowed=false  stale=false  violation=TELEPORT
+刚体 x: 0.6406 -> 0.6406   位移=0.0000        ← 世界**没被写**
+投影 x=0.6406                                  ← 投影也没被写
+score 0 -> 4    流水 0 -> 1                    ← 照旧计分
+第二包(同一份注入)     allowed=false  stale=false  violation=TELEPORT  score=8
+```
+
+**三条结论**:
+
+1. **注入无效**:`room.ts#applyMove` 顶部**每一包都重算** `authorityDrift`
+   (`|此刻权威 − 上一包处理完之后的权威|`)⇒ 手工塞进去的值在**下一次入口**就被覆盖。
+   宽限**不可能被申报方放大** —— 它只反映**房间自己**观测到的权威位移。
+2. **`stale` 不动世界**:它仍然 `allowed:false` ⇒ `applyMove` 走早退分支,**不写刚体、不写投影、
+   不推进申报水位** ⇒ 即便宽限真的成立,作弊者也**拿不到位置**,只换来「这一包不计分」。
+   而拿到宽限的前提是**服务端自己把他推了** —— 那是物理给的事件,不是他能自由放大的量。
+3. **坏输入 fail-closed**:`noteAuthorityDrift` 收到 `Infinity` / `-5` / `NaN` ⇒ `drift = 0`
+   (实测)。
