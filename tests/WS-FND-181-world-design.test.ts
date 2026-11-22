@@ -47,6 +47,7 @@ import {
   floorSlotOfId as chunkSlotOfId, floorIdOfSlot as chunkIdOfSlot,
 } from '../server/src/world/chunk.ts';
 import { CHUNK_SIZE, FACE_BUDGET, buildChunkQuads } from '../client/src/stage/tile_mesh.ts';
+import { RoomRuntime } from '../server/src/net/room.ts';
 import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../client/src/stage/design_world.ts';
 import { packTile, unpackTile, BaseFluid, Elevation } from '../shared/types/tile.ts';
 import { eq, ok, report, test } from '../shared/testing/harness.ts';
@@ -316,4 +317,47 @@ test('FND181-13 海岸线有三个谐波(不是圆)', () => {
   ok(rep.beachCells > 500, `沙滩环 > 500 格,实际 ${rep.beachCells}`);
 });
 
+/* ─────────── 14 出生点:设计图必须把玩家送进广场,而不是海里 ─────────── */
+
+test('FND181-14 出生点跟着设计图走(缺省与改前逐字一致)', () => {
+  /* 为什么这条**必须有行为断言**:改前 `room.spawnPoint()` 恒为 `0.5 + n*1.5`,
+     即地图原点。而设计图的原点是**海**(海岸线最小半径 68)⇒ 玩家出生在水里,
+     广场在 96 格外。实测过一次(浏览器 HUD 坐标 `0.5, 0.5`、世界里全是水),
+     而当时**没有一条判据会红** —— 源码接线断言也拦不住「偏移量算错」。 */
+  const mk = (spawnOrigin?: { x: number; y: number }) => new RoomRuntime({
+    roomId: 'fnd181-spawn',
+    ownerId: 'u_host',
+    clock: { nowMs: () => 0 },
+    ...(spawnOrigin === undefined ? {} : { spawnOrigin }),
+  }, null);
+
+  /* 负对照:不给 spawnOrigin ⇒ 必须还是 (0.5, 0.5)(与改前逐字不变)。 */
+  const plain = mk();
+  plain.join({ userId: 'u_plain' });
+  const p0 = plain.state.players[0]!;
+  eq(p0.x, 0.5, '缺省出生点 x(与改前逐字一致)');
+  eq(p0.y, 0.5, '缺省出生点 y(与改前逐字一致)');
+
+  /* 设计图:出生点 = 广场中心 (96.5, 96.5),且那一格必须是**大理石**、不是水。 */
+  const designed = mk({ x: DESIGN_CENTER, y: DESIGN_CENTER });
+  designed.join({ userId: 'u_designed' });
+  const p1 = designed.state.players[0]!;
+  eq(p1.x, DESIGN_CENTER + 0.5, '设计图出生点 x');
+  eq(p1.y, DESIGN_CENTER + 0.5, '设计图出生点 y');
+  const cell = at(Math.floor(p1.x), Math.floor(p1.y));
+  eq(cell.floor, sharedSlotOfId(306), '出生点那一格是广场中心大理石');
+  ok(cell.elev !== Elevation.DEEP, '出生点**不在水里**(elev 不是 DEEP)');
+});
+
+test('FND181-15 装配层把设计图的出生原点接到房间上', () => {
+  const idx = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
+  ok(idx.includes('spawnOrigin: deps.design === true ? { x: DESIGN_CENTER, y: DESIGN_CENTER } : undefined'),
+    '`assemble()` 必须按 `deps.design` 把出生原点传进 rtOpts');
+  const room = readFileSync(new URL('../server/src/net/room.ts', import.meta.url), 'utf8');
+  ok(room.includes('const o = this.spawnOrigin;'), '`spawnPoint()` 必须读 `spawnOrigin`');
+  ok(room.includes('spawnOrigin?: { x: number; y: number };'), '`RoomRuntimeOptions` 必须有这个键');
+  /* 键集两侧一致(FND9-9 守的就是这条;这里反向钉一次,免得只改一侧)。 */
+  const colyseus = readFileSync(new URL('../server/src/net/room.colyseus.ts', import.meta.url), 'utf8');
+  ok(colyseus.includes('spawnOrigin: undefined,'), 'B 路 rtOpts 必须显式列出同一个键');
+});
 report('WS-FND-181');

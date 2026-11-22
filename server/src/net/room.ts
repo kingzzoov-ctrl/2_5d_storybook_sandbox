@@ -803,6 +803,14 @@ export interface RoomRuntimeOptions {
   requireJoinToken?: boolean;
   worldSeed?: number;
   /**
+   * ★ 2026-11-26(w85):**出生原点**(格坐标)。
+   *
+   * 设计过的世界里出生点**不是地图原点** —— 设计图的 (0,0) 是海,营地在地图中心
+   * (实测没这个偏移时:玩家落在 `0.5,0.5` 的水里,而广场在 96 格外)。
+   * 由装配层按 `deps.design` 传进来;缺省 `{0,0}` ⇒ 与改前**逐字不变**。
+   */
+  spawnOrigin?: { x: number; y: number };
+  /**
    * 世界存档源(可选;**US2 起从构造参数注入**,理由见下)。
    *
    * ## 为什么改成构造参,而不是继续用「建完再赋值」
@@ -2166,6 +2174,13 @@ export class RoomRuntime {
    * `lastSaveReport` 暴露出来,而不是让调用方以为「已经存过了」。
    */
   worldSaveHost: WorldSaveHost | null = null;
+  /**
+   * ★ 2026-11-26(w85):**出生原点**(格)。由装配层按 `deps.design` 传进来。
+   *
+   * 缺省 `{0,0}` ⇒ `spawnPoint()` 的结果与改前**逐字相同**
+   * (`0.5 + n*1.5`)。设计过的世界里营地在 (96,96),不偏移就会出生在海里。
+   */
+  spawnOrigin: { x: number; y: number } = { x: 0, y: 0 };
   /** 上一次落盘的实际计数;null = 从未落盘。供测试与诊断断言。 */
   lastSaveReport: {
     tick: number;
@@ -2463,6 +2478,7 @@ export class RoomRuntime {
        缺省仍为 null,但**装配层现在有地方可传** —— 此前只能事后赋值,
        而生产里那个赋值一处都不存在。 */
     this.worldSaveHost = opts.host ?? null;
+    this.spawnOrigin = opts.spawnOrigin ?? { x: 0, y: 0 };
     /* ══════════ ★ 房间落库必须是**幂等**的(task-70 实测抓到)══════════
      *
      * ## 为什么原来的 `createRoom` 无条件调用是错的
@@ -6659,9 +6675,12 @@ export class RoomRuntime {
   }
 
   private spawnPoint(): { x: number; y: number } {
-    /* 出生点铺开:第 n 个玩家沿 X 轴排开 1.5 格,避免叠罗汉误触。 */
+    /* 出生点铺开:第 n 个玩家沿 X 轴排开 1.5 格,避免叠罗汉误触。
+       ★ w85:`spawnOrigin` 偏移 —— 设计过的世界里出生点不是地图原点
+       (设计图的原点是海,营地在地图中心)。缺省 `{0,0}` ⇒ 与改前逐字不变。 */
+    const o = this.spawnOrigin;
     const n = this.state.players.length;
-    return { x: 0.5 + (n % 8) * 1.5, y: 0.5 + Math.floor(n / 8) * 1.5 };
+    return { x: o.x + 0.5 + (n % 8) * 1.5, y: o.y + 0.5 + Math.floor(n / 8) * 1.5 };
   }
 }
 

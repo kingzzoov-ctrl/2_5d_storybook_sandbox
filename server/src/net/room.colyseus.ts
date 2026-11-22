@@ -477,6 +477,9 @@ export class NetPersistRoom extends Room<RoomSchema> {
       passwordHash: options.passwordHash ?? null,
       maxPlayers: this.maxClients,
       worldSeed: options.worldSeed,
+      /* ★ w85:键集必须与 `index.ts` 的 rtOpts 一致(FND9-9 守两侧)。
+         B 路(Colyseus 房间)不盖设计图 ⇒ 恒 `undefined`(与改前同行为)。 */
+      spawnOrigin: undefined,
       /* US2 装配位:世界源经构造参传入。
          ★ 2026-11-14:`?? null` 已换成 `resolveRoomHost(this.deps)` ——
          B 路**不再是「恒为 null」**。三态语义见那个函数的注释:

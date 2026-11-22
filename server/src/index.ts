@@ -108,7 +108,7 @@ import type { WorldArchiveRequest, WorldArchiveReceipt, WorldArchiveSink } from 
    盖图与读档的**顺序**是语义的一部分,分开写迟早漂移)。
    ⚠️ 文件在 `shared/**` 而不是 `server/**`:客户端要画**同一张图**
    (`client/src/stage/design_world.ts`),而客户端不许 import server。 */
-import { applyWorldDesign } from '../../shared/world/design.ts';
+import { applyWorldDesign, DESIGN_CENTER } from '../../shared/world/design.ts';
 import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
@@ -493,6 +493,10 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
     passwordHash: deps.passwordHash ?? null,
     maxPlayers: deps.maxPlayers,
     worldSeed: deps.worldSeed,
+    /* ★ w85:设计过的世界出生点在地图中心(原点是海)。缺省 `undefined`
+       ⇒ `spawnPoint()` 与改前逐字相同。⚠️ 这个键**必须**与
+       `room.colyseus.ts` 的 rtOpts 键集一致(FND9-9 守两侧)。 */
+    spawnOrigin: deps.design === true ? { x: DESIGN_CENTER, y: DESIGN_CENTER } : undefined,
     /* ★ 本行就是第 9 例的修复点:host **在此被真正赋给**运行时契约字段。
        此前全仓 `server/src/**` 里没有任何地方做这件事。
        房间侧对应行是 `host: resolveRoomHost(this.deps)` —— 同一个 seam,
