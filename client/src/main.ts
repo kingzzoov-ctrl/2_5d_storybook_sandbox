@@ -51,6 +51,9 @@ import {
    本文件只剩三根线:落指 → `show`、拖动 → `moveTo`、抬手/取消 → `hide`。
    —— 只画不接 = 玩家仍然看不见手柄,而那**不会**让任何断言变红。 */
 import { createJoystickUI } from './ui/joystick_ui.ts';
+/* ★ 2026-11-22:进房间要**自带** userId(url query 里没有就 `NO_IDENTITY` 拒连接),
+   取法与理由全在模块里 —— 本文件只把结果拼进地址(`serverUrlFromLocation`)。 */
+import { resolveUserId, withUserId } from './net/identity.ts';
 /* ═══ ★ WS-FND-166:触屏入口(手机没有键盘,而 `PANEL_KEYS` 全是字母键)═══
    判定全在**纯模块**里(可单测),本文件只接线:
    ```
@@ -126,13 +129,15 @@ function reportFatal(msg: string): void {
  * ⇒ 这是本仓反复出现的形态:两处都对,合起来不对。
  *   ∴ 把「谁持有 store」变成**参数**,而不是运行期约定。
  */
-function serverUrlFromLocation(): string | null {
+function serverUrlFromLocation(userId: string): string | null {
   const q = new URLSearchParams(window.location.search).get('server');
-  if (q !== null && q !== '') return q === 'off' ? null : q;
+  if (q !== null && q !== '') return q === 'off' ? null : withUserId(q, userId);
   /* ★ 2026-11-14(`npm run play`):没给 `?server=` 时**默认连本机的 play 服务端** ——
      「打开页面就能玩」就是这一行的目的。端口与 `scripts/play.ts` 的默认值(8791)一致。
-     ⚠️ 显式 `?server=off` 关闭联机:离线/截图自检时不能让重连噪音淹没真正的错误。 */
-  return `ws://${window.location.hostname || '127.0.0.1'}:8791/ws`;
+     ⚠️ 显式 `?server=off` 关闭联机:离线/截图自检时不能让重连噪音淹没真正的错误。
+     ★ 2026-11-22:`userId` **两条路径都要带** —— 服务端没有它就直接 `NO_IDENTITY`
+     拒连接(`net/identity.ts` 的头注释写了为什么走地址而不是 hello)。 */
+  return withUserId(`ws://${window.location.hostname || '127.0.0.1'}:8791/ws`, userId);
 }
 
 function main(): void {
@@ -157,7 +162,15 @@ function main(): void {
   /* 自己的 playerId —— 只在 `welcome` 里拿得到。预测器要用它去 store 里
      取**权威**位置(`telegraphCenterOf` 的第二个参数)。 */
   let playerId: string | null = null;
-  const url = serverUrlFromLocation();
+  /* ★ 2026-11-22:服务端要「**声明**的 userId」(url query 或 hello),两边都没有就
+     `NO_IDENTITY` 拒连接 ⇒ 现象是「画面有、逻辑没有」。取法与优先级在 net/identity.ts。 */
+  const identityStore = ((): Storage | null => {
+    try { return window.localStorage; } catch { return null; }   /* 手机私密模式会抛 */
+  })();
+  const identity = resolveUserId(window.location.search, identityStore);
+  /* 身份必须**说得出话**:排障第一个问题就是「我是谁 / 为什么我是新号」。 */
+  console.info(`[identity] userId=${identity.userId}(来源:${identity.source})`);
+  const url = serverUrlFromLocation(identity.userId);
   /* 动作状态**先于** `createSession` 与键处理声明:两处都要用它们
      (声明在后面会 TDZ —— 回执回调是异步的,但键处理不是)。 */
   /* ★ 第十轮:开局那句话把**两张键位表**都报出来 —— 修前只报字母表那六个,

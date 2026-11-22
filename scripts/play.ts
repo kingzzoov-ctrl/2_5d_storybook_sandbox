@@ -214,10 +214,20 @@ async function main(): Promise<void> {
     port: WS_PORT,
     room: assembled.runtime as never,
     frameMs: NOMINAL_TICK_MS,
+    /* ★★ 2026-11-22(w82):**play 模式不强制加入凭证**。
+       `WsServerOptions.requireToken` 的注释写明:`true` 是「这条路径来自网络」的表态,
+       而 `play.ts` 是**本地/局域网玩**的入口 —— 它的房间是 `assemble()` 现造的一次性世界,
+       没有房主侧发放凭证的渠道(`ws_server.ts:913` 明说**没有**给浏览器用的 token 接口)
+       ⇒ 若保持 `true`,**任何浏览器都进不去**(现象:NO_IDENTITY + 画面有、逻辑没有)。
+       ⚠️ 这条**只**影响 play:生产网络路径走的是 `server/src/net/ws_demo.ts` 与
+       `scripts/soak.ts` 各自的调用,它们**不传**这个选项 ⇒ 仍是默认 `true`,一字未动。
+       身份仍要**声明**(url 的 `?userId=`)—— 只是不强制它由服务端签发的凭证背书。 */
+    requireToken: false,
     onLog: (m) => { if (process.env['PLAY_VERBOSE'] === '1') log(`[ws] ${m}`); },
   });
   log(`WS 服务端:ws://${URL_HOST}:${srv.port}/ws`
     + (BIND_ALL ? '(监听 0.0.0.0 = 全部网卡;浏览器请用 <本机IP>)' : ''));
+  log('加入凭证:**不强制**(play 模式:身份由客户端声明的 ?userId= 承担)');
 
   /* ── 2a 实测节拍(★ D-26)──
      5 秒后打一行:此时循环已跑过几十帧,读数才有意义。**只打印**,不改世界一步。

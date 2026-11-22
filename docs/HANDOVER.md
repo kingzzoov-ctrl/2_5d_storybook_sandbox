@@ -1231,3 +1231,35 @@ node scripts/play.ts --host 0.0.0.0 --dist      # 跨公网玩
    **不要传 `--outDir`**,让它用配置里的 `build.outDir: '../dist/client'`。
 2. 图集 `atlas_sprites.png` **2.17 MB 且不压缩**,实测单请求 **34 s**(那条链路当时也不稳)。
    它**不挡启动**(JS 起来就世界可见),但贴图会晚到 —— 这是带宽问题,不是缺陷。
+
+#### ★★ 「画面有、逻辑没有」的定因:客户端**没带身份**(`NO_IDENTITY`)
+
+白屏修完后 owner 再报「逻辑没有」。**真浏览器**实测(用 work-panel browser 真加载,不是猜):
+
+```text
+修前:连接 closed:第 1 次重连已排程 · 服务端拒绝 NO_IDENTITY:缺少 userId(身份无从校验)
+修后:连接 live · 连接阶段 已握手(收到 welcome) · 拒绝(无) · 最近 mob_slime_green hp 90/90 (8.9格)
+```
+
+- 判据在服务端 `ws_server.ts#onHello`:**声明的 userId 必须有**(`hello.userId` 或 `?userId=`);
+  而客户端**两头都不带**(默认地址 `ws://<host>:8791/ws`;hello 只有
+  `{t, protocolVersion, contentClaim}`)⇒ **任何浏览器都进不去**:
+  单机渲染照常(地形/UI/HUD 都在),世界里没有你、怪也不同步。
+- 修法(**两处,且不动 hello**):
+  1. **新** `client/src/net/identity.ts`:`?user=` > `localStorage['sandbox.userId']` > 现造
+     (纯函数 + 注入 storage,零 DOM);`main.ts` 把 id 拼进 WS 地址 —— **两条路径都拼**
+     (默认地址与 `?server=`)。
+  2. `scripts/play.ts`:`startWsServer({ requireToken: false })`。play 是本地/局域网玩,
+     而 `ws_server.ts:913` 明说**没有**给浏览器用的 token 接口(凭证由房主侧发放)⇒
+     保持默认 `true` 等于把浏览器全挡在门外。
+     ⚠️ 生产/长跑路径(`server/src/sim/ws_demo.ts`、`scripts/soak.ts`)**不传**该选项 ⇒ 仍默认 `true`。
+- **为什么不改 hello**:服务端 `HelloFrame` 镜像**刻意不声明** `userId`(`ws_server.ts:969-975`
+  「一个谁都不发的字段,只会让下一个人以为已经有这条路了」),`WS13-5b-1` 守两侧逐字段一致、
+  `WS13-6-6` 守「id 只从握手 URL 来」。⇒ 身份走**地址**,hello 一字不动。
+- 判据 `tests/WS-FND-179`(**9 条**):形状 / 造号 / 优先级 / 存储抛异常 / 拼地址(5 条纯函数)
+  + 「`main.ts` 真把 id 拼进地址」+ 「`play.ts` 显式 `requireToken:false`」
+  + 「**生产路径不得关凭证**」+ 「客户端 hello **仍不带** userId」。
+  **有牙实证**:把 `play.ts` 的 `false` 改回 `true` ⇒ **9/9 → 8/9**,只红 `FND179-7`(已还原)。
+- **手机**实测(合成触摸打真处理链:`pointerdown` + 8×`pointermove`):
+  摇杆 4 个节点、**显示 1 个**;坐标从 `0.5, 0.5` 走到 **`5.7, 0.0`**;
+  `#touch_bar` 的 7 个按钮(`attack` / 5 个面板 / `close`)在位 ⇒ 触屏是**真的能用**,不是"代码里有"。

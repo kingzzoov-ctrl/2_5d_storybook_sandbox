@@ -82,6 +82,20 @@ node scripts/play.ts --host 0.0.0.0 --dist      # 服务端起;浏览器开 http
 ⇒ 一句话:**本机玩用默认(dev,秒级热更,不构建);跨公网玩加 `--dist`。**
 ⚠️ `--dist` 找不到 `dist/client/index.html` 时**不会**起一个必然白屏的客户端,
 而是打印「先跑 `npm run build:client`」并让 WS/存档照常 —— 失败要**明说**,不要沉默白屏。
+### 手机上玩(触屏)
+
+服务器按上一节起好后,**手机浏览器**打开 `http://<服务器IP>:5173/` 就能玩:
+
+- 界面本来就是按手机做的:左下**虚拟摇杆**(单指拖动走路;死区 `0.19`)+ 右下**按钮条**
+  (`attack` / 背包 / 配方树 / 像素画布 / 音高编辑器 / 派对 / 关)。判定与布局分别在
+  `client/src/net/joystick.ts`、`client/src/ui/touch_bar.ts`(零 DOM / 纯布局,**都可单测**)。
+- 首次打开会**自动生成身份**(`localStorage['sandbox.userId']`,形如 `u_xxxxxxxxxxxx`)并拼进
+  WS 地址的 `?userId=`。⚠️ 服务端**没有**这个声明会直接 `NO_IDENTITY` 拒连接 ——
+  现象是「**画面有**(单机渲染照常)、**逻辑没有**(世界里没有你、怪也不同步)」。
+- 换身份 / 双开:地址后加 `?user=<id>`(合法字符 `[A-Za-z0-9_-]`,≤ 40 位)。
+  控制台会打印 `[identity] userId=…(来源:query|storage|minted)`,排障先看这一行。
+- ⚠️ 明文 `ws://` 在手机浏览器上:混合内容限制只针对 https 页面里的 `ws://`;
+  用 `http://` 打开本页一般放行。若某个浏览器拦了,把它加进「允许不安全内容」。
 ---
 
 `npm run play` 一次做了五件事:**装配**真实世界(`assemble()` → `WorldSim`)、开**存档**、
