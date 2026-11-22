@@ -31,6 +31,8 @@ import { makeDemoWorld, WORLD_CELLS, WORLD_CHUNKS } from '../stage/demo_world.ts
 /* ★ w85:画**设计过的世界** —— 与服务器同一张图(`shared/world/design.ts`)。 */
 import { CHUNK_SIZE, ELEV_TO_Z, type ChunkInput } from '../stage/tile_mesh.ts';
 import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../stage/design_world.ts';
+/* ★ w90:`obj` 层与植被的立牌计划(纯函数)。改前 `obj` 层**完全不渲染** —— 见挂载点的长注释。 */
+import { planObjSprites, planVegetationSprites, type ObjSpriteInput } from '../stage/obj_sprites.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
 import {
   SPRITE_CELL_WORLD, SPRITE_CENTER_X, SPRITE_CENTER_Y,
@@ -372,6 +374,80 @@ export function boot(container: HTMLElement): BootHandle {
     scene.add(mesh);
     meshes.push(mesh);
   }
+  /* ══════════ ★ w90:世界里的**东西**(obj 立牌 + 植被)══════════
+   *
+   * ## 改前是什么样
+   *
+   * `obj` 层**完全不渲染** —— `chunk_geometry` 只把"这格有 obj"当成"非空"来建面,
+   * 从不产出任何 sprite。于是设计图里写的路灯(522)、广场四角承重墙(352)、
+   * 储物箱(513)、工作台一条街(502~506)、纯金纪念碑(750)**一个都看不见**,
+   * 玩家看到的只有地面 ⇒ 「这不是游戏,是一堆色块」。
+   *
+   * ## 判定与绘制分开
+   *
+   * "哪一格该出立牌、出图集哪一格、多高"全在纯函数 `stage/obj_sprites.ts`
+   * (16 条判据,含"每格都产出必红"的有牙实证)。这里只做三件事:
+   *   ① 把计划换成 `THREE.Sprite`(与既有 `atlas_sample` 立牌**同一套数学**);
+   *   ② **按图集格缓存材质** —— 一个 Sprite 一个 draw call,每格 new 一个纹理是自杀;
+   *   ③ 给总数封顶(`SPRITE_BUDGET`),超了就不再摆。下一步应换成 InstancedMesh
+   *      (现在 6% 密度的植被在 192×192 上会到四位数,靠封顶先控住)。
+   */
+  const propSprites: THREE.Sprite[] = [];
+  /** 立牌总数上限。超过就**按遍历顺序截断**(确定性),不随机丢。 */
+  const SPRITE_BUDGET = 600;
+  /**
+   * 植被用哪几个物品当"树/草"。
+   *
+   * ⚠️ 这是**临时**选择:图集格号只按号段映射(`cellIndexFromId`),不带语义,
+   * 所以"哪一格画的是树"没法从代码推出来 —— 这里挑的是语义上最像植被的四项
+   * (柔韧风草 118 / 露水甜莓 121 / 弹簧跳跳菇 124 / 翠玉青竹 103)。
+   * 正确的做法是补一张 `102~130` 的**图集语义备注**,或让美术给树木单独出一段号。
+   */
+  const VEGETATION_IDS: readonly number[] = [118, 121, 124, 103];
+  /** 植被立牌的世界高度(格)。树木要能"盖住人",不然看不出来是树。 */
+  const VEG_HEIGHT_WORLD = 2.6;
+  void loadAtlasImage().then((img) => {
+    if (img === null) return;
+    const mats = new Map<number, THREE.SpriteMaterial>();
+    const materialOf = (cell: number): THREE.SpriteMaterial | null => {
+      /* ⚠️ `atlasCell < 0` = 不在图集内(未知 id)⇒ **必须跳过**,
+         否则会去采样 `frameRectOfCell(-1)`,取到错位的图。 */
+      if (cell < 0) return null;
+      const hit = mats.get(cell);
+      if (hit !== undefined) return hit;
+      const { offsetU, offsetV, repeatU, repeatV } = offsetRepeatOfCell(cell);
+      const tex = new THREE.Texture(img);
+      tex.magFilter = THREE.NearestFilter;
+      tex.minFilter = THREE.NearestFilter;
+      tex.generateMipmaps = false;
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.offset.set(offsetU, offsetV);
+      tex.repeat.set(repeatU, repeatV);
+      tex.needsUpdate = true;
+      const made = new THREE.SpriteMaterial({ map: tex, transparent: true });
+      mats.set(cell, made);
+      return made;
+    };
+    const add = (it: ObjSpriteInput): void => {
+      if (propSprites.length >= SPRITE_BUDGET) return;
+      const material = materialOf(it.atlasCell);
+      if (material === null) return;
+      const sp = new THREE.Sprite(material);
+      /* 格心 = 格索引 + 0.5;z 取自**地形那一格的高程** ⇒ 脚踩在面上,不悬空 */
+      sp.position.set(it.x + 0.5, it.y + 0.5, it.z);
+      const h = it.kind === 'vegetation'
+        ? VEG_HEIGHT_WORLD
+        : (it.heightPx / ATLAS_PX_PER_CELL) * SPRITE_CELL_WORLD;
+      sp.scale.set(h * 0.92, h, 1);
+      sp.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
+      sp.name = `${it.kind}_${it.id}_${it.x}_${it.y}`;
+      scene.add(sp);
+      propSprites.push(sp);
+    };
+    /* 先物件、后植被:预算吃紧时**保住**玩家能交互的东西(墙/灯/箱/台)。 */
+    for (const chunk of chunks) for (const it of planObjSprites(chunk)) add(it);
+    for (const chunk of chunks) for (const it of planVegetationSprites(chunk, VEGETATION_IDS, 0x5eed)) add(it);
+  });
   const buildMs = performance.now() - t0;
 
   /* ── 图集立牌(决策 A:保持 TILE_PX=16,装配层缩放 64px 图集)──
@@ -2239,6 +2315,10 @@ export function boot(container: HTMLElement): BootHandle {
       atlasOk,
       atlasErr,
       spriteCount: sprites.length,
+      /* ★ w90:世界里的**东西**摆了几个(obj 立牌 + 植被)。
+         没有这个读数,「网页上一棵树都没有」与「摆了 600 个但全被预算截断」
+         在外部读数上**完全一样** —— 而后者正是最该被发现的那种静默。 */
+      propSpriteCount: propSprites.length,
       spriteIds: sprites.map((s) => s.name),
       /* 锚点实测值:必须是 0.15(不是 0.85),差 0.70 会让立牌陷进地里 */
       spriteCenterY: sprites[0]?.center.y ?? null,
