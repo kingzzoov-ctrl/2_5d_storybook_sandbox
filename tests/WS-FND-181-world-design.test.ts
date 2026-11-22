@@ -316,6 +316,15 @@ test('FND181-13 海岸线有三个谐波(不是圆)', () => {
   ok(rep.landCells > 10000 && rep.seaCells > 10000, '陆地与海都要有相当面积');
   ok(rep.beachCells > 500, `沙滩环 > 500 格,实际 ${rep.beachCells}`);
 });
+test('FND181-16 HUD 的地形规模读真实块列表,不是 demo 常量', () => {
+  const src = readFileSync(new URL('../client/src/three/boot.ts', import.meta.url), 'utf8');
+  ok(src.includes('makeHud(container, { cells: worldCells, chunks: chunks.length })'),
+    'HUD 必须收到真实的世界规模');
+  ok(src.includes('const worldCells = chunks.length === 0'),
+    '世界边长必须由 chunk 列表算出来');
+  ok(!/地形 \$\{WORLD_CELLS\}/.test(src),
+    '不许再用 `WORLD_CELLS` 拼地形标签(改前实测:世界 192×192,UI 报「64×64 格 / 16 chunk」)');
+});
 
 /* ─────────── 14 出生点:设计图必须把玩家送进广场,而不是海里 ─────────── */
 

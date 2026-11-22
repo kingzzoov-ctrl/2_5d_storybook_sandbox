@@ -341,6 +341,10 @@ export function boot(container: HTMLElement): BootHandle {
       return makeDemoWorld();
     }
   })();
+  /* 地形规模(供 HUD 显示):**读真实的块列表**,不是常量。 */
+  const worldCells = chunks.length === 0
+    ? 0
+    : Math.max(...chunks.map((c) => (c.cx + 1) * CHUNK_SIZE));
   const meshes: THREE.Mesh[] = [];
   let totalVerts = 0;
   let totalFaces = 0;
@@ -762,7 +766,8 @@ export function boot(container: HTMLElement): BootHandle {
   (window as unknown as { __camDebug?: unknown }).__camDebug = camera;
 
   /* ── HUD ── */
-  const hud = makeHud(container);
+  const hud = makeHud(container, { cells: worldCells, chunks: chunks.length });
+
   /**
    * `#hint`(页面底部那行提示)的**读点**。
    *
@@ -2527,7 +2532,7 @@ interface Hud {
   update: (info: THREE.WebGLInfo, verts: number, faces: number, buildMs: number, fps: number) => void;
 }
 
-function makeHud(container: HTMLElement): Hud {
+function makeHud(container: HTMLElement, world?: { cells: number; chunks: number }): Hud {
   const wrap = document.createElement('div');
   /* 给个 id:自检脚本要临时藏掉它再做像素差分。
      HUD 里的 FPS 每帧都在变,不藏掉整块 HUD 都会被算成「差异像素」,
@@ -2546,7 +2551,15 @@ function makeHud(container: HTMLElement): Hud {
   return {
     update: (info, verts, faces, buildMs, fps) => {
       fpsEl.textContent = `FPS ${fps.toFixed(0)}`;
-      statsEl.textContent = `地形 ${WORLD_CELLS}×${WORLD_CELLS} 格 / ${WORLD_CHUNKS ** 2} chunk\n`
+      /* ★ w85:地形规模必须**读真实 chunk 列表**,不许拿 `demo_world` 的常量拼。
+         改前这里写的是 `WORLD_CELLS` / `WORLD_CHUNKS ** 2`(= 64×64 / 16),
+         而实际画的是设计图的 12×12=144 块 ⇒ **屏幕上那行数字是假的**
+         (实测:世界已经是 192×192,UI 仍报「地形 64×64 格 / 16 chunk」)。
+         这种「标签与实际不符」不会报错,只会让人以为地图还是小的。
+         缺省仍回落到旧常量:`makeHud` 的独立自检调用点不传 `world`。 */
+      const cells = world?.cells ?? WORLD_CELLS;
+      const chunkCount = world?.chunks ?? WORLD_CHUNKS ** 2;
+      statsEl.textContent = `地形 ${cells}×${cells} 格 / ${chunkCount} chunk\n`
         + `顶点 ${verts.toLocaleString()} / 面 ${Math.round(faces).toLocaleString()}\n`
         + `draw call ${info.render.calls} / 三角形 ${info.render.triangles.toLocaleString()}\n`
         + `建面 ${buildMs.toFixed(1)} ms`;
