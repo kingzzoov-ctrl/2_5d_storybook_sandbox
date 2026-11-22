@@ -117,7 +117,7 @@ node scripts/verify.ts --all                     # 旧 --strict-* 已并入默�
 | 同义反复候选 | **0 条**(白名单 0) | ★ 2026-11-25 新增 2 条候选**已当场归零**(`WS-FND-172-anticheat-clock::SPEED_WINDOW_TICKS` 期望侧改字面量 20 / `WS-FND-174-cross-clock::SLEEP_DURATION_SEC` 期望侧改字面量 60,共两处;常量全部留在 actual 侧);历史:34 → 9 → 5 → **0**(2026-11-17 最后两条期望值改字面量 + 常量锚点) |
 | 类型检查基线 | **257 条 / 指纹 126** | 2026-11-14:267/132 → 265/131 → 261/129(`TS2304` 归零后继续下降);2026-11-18 第四轮实测 **260**(`scripts/data-conformance.ts` 的 1 条 `TS2367` 已修);2026-11-19 第五轮实测 **259**(`tests/WS-FND-10-restore.test.ts` 的 1 条 `TS2339` 已修);2026-11-19 第六轮实测 **257 / 126** ⇒ 比锁 261 **好 4 条**。★ 2026-11-19 第七轮**已按实测重钉**(`node scripts/typecheck-baseline-audit.ts --update`)⇒ 锁文件 = 257 条 / 126 指纹。⚠️ 重钉理由(不是「抬水位」):本锁指纹**含归一化消息文本**(不含行号/绝对路径),而 tsc 打印**字面量联合的成员顺序**按字面量类型 id 排 ⇒ 新增文件即让同一处错误的文本漂移：实测 `tests/WS-FND-08.test.ts` 的 1 条 `TS2339` 从 `GATE`|`LLM`|`ROLL`|`INVENTORY`漂成 `INVENTORY`|`GATE`|`LLM`|`ROLL`,而总错误数**下降**(261→257)⇒ 那条「新增」是文本漂移、不是回归。根治要让 `normalizeMsg` 对联合成员排序(不在本轮写域)。 |
 | 未决台账 | **133 条**(0 未关闭 / **0 阻塞** / 133 已关闭) | 2026-11-17 关闭判据收紧(关闭 = 标记 ∧ 可查证据)⇒ 37 条仅标记无据的退回;2026-11-18 全部补齐证据 ⇒ 133/133 有据关闭 |
-| PROGRESS 陷阱 | **51 节 / 94..144** | 严格递增 ✓ / 无缺号 ✓ / 无 BOM ✓ / 463346 字节 |
+| PROGRESS 陷阱 | **51 节 / 94..144** | 严格递增 ✓ / 无缺号 ✓ / 无 BOM ✓ / 455146 字节 |
 
 
 > ✅ **这张表的 9 行数字已全部接入门禁**(2026-11-14,`verify.ts::verifyHandoverNumbers()`)——
@@ -1046,3 +1046,18 @@ score 0 -> 4    流水 0 -> 1                    ← 照旧计分
 
 ⚠️ 这会**同时**影响 `stale` 的宽窄与 `acStaleRejections` 的读数 —— 要落就得连同
 `FND178-10` 的期望一起重钉,并重跑一轮 60 分钟 soak 作对照。
+
+### 13.15 ★ 把服务器当**唯一运行环境**:踩到的六件事(2026-11-22 owner 裁定「不要在本机上跑,只要服务器跑」)
+
+| # | 症状 | 根因 | 处置 |
+|:--|:--|:--|:--|
+| 1 | 服务器上 `backlog.ts` 只数到 **8** 条(本机 133);`sync-docs` 报「未决台账 133 ⇒ 应写 8」 | **`git archive` 被 `core.autocrlf=true` 转成了 CRLF**(仓里是 LF:`git ls-files --eol` = `i/lf w/lf`)⇒ 服务器那棵树的文档全是 CRLF,而 `backlog.ts` 的解析**对行尾敏感** | 导出必须写死 **`git -c core.autocrlf=false archive …`**。验证:`tr -cd '\r' < docs/HANDOVER.md \| wc -c` = **0** |
+| 2 | `WS-07` 在服务器上 `ERR_MODULE_NOT_FOUND`(只 211/215);`WS-FND-134` 直接抛 | 服务器是**早期的全量快照 + 只对改动文件打补丁**的**残缺树**,且**没有 `node_modules`** | 改成**整棵同步**(`git archive HEAD` 覆盖 `server client shared scripts tests docs assets`)+ 服务器上 `npm install`。同步后 `WS-07` **215/215**、`WS-FND-134` **20/20** |
+| 3 | 门禁报「**本轮新增的 BOM:4 个**」(`docs/WS-05-boss-raid.md` / `server/src/mobs/aoi.ts` / `geometry.ts` / `taming.ts`) | 那 4 个 BOM **仓里本来就有**;这条判据拿**未跟踪的 `.baseline/`**(上一轮 verify 输出)当基准 —— 服务器没有它 ⇒ 全都算「新增」 | 把 `.baseline/verify.txt` / `.baseline/orphan.txt` 一并同步。⚠️ **登记为隐患:门禁基线不在 git 里**(换机器就漂) |
+| 4 | `WS-FND-112` 的 `FND112-11` 红(「手册在场时也必须打『跳过 0 项』」) | 它断言的手册是**仓外文件** `~/Downloads/2_5d_cartoon_sandbox_plan.md`(`scripts/data-conformance.ts#locatePlan` 的候选之一)。本机有(105 KB),服务器没有 ⇒ `WS-FND-06` 走跳过分支,报「跳过 1 项」 | 把手册放到服务器的 `$HOME/Downloads/`(或设 `PLAN_MD`) |
+| 5 | 类型错误 **+1**:`driver.sqlite.ts TS7016 Could not find a declaration file for module 'better-sqlite3'` | 本机**没装** `better-sqlite3`(它不是 `package.json` 的依赖)⇒ TS 走仓内的 ambient 声明;**服务器 `npm install` 把它装上了**却没有类型声明 ⇒ 反而多一条 | 对齐参考环境:`rm -rf node_modules/better-sqlite3` |
+| 6 | `§三 PROGRESS 陷阱` 字节数:文档 **463346** / 服务器 **455146** | `docs/PROGRESS.md` 在**本机 worktree 里是 CRLF**(`git ls-files --eol` = `i/lf w/crlf`;**8200 行 ⇒ 恰好差 8200 字节**),提交内容(LF)的真值是 455146 | 已把本机那份归一为 LF,并把文档值订正为 **455146**。⚠️ 教训同 §13.9:**所有「字节数」类判据都会被 worktree 行尾污染**,读数前先看 `git ls-files --eol` |
+
+★ 这六条的共同形状:**「本机能跑绿」依赖了**三样不在 git 里的东西** —— 本机的
+`core.autocrlf=true`、未跟踪的 `.baseline/`、仓外手册。⇒ 换成「服务器为唯一运行环境」时,
+这三样必须一起搬过去,否则门禁的**数字**会静默漂移(而漂移看起来像「代码坏了」)。
