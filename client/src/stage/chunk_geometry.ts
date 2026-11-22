@@ -18,6 +18,10 @@
  * - **与计数共享真相源**:顶点写出与 `buildChunkQuads` 都走
  *   `dominantZGrid` + `neighborZs`,因此「计数」与「实际顶点数」必然一致。
  *   若两者各写一遍取邻逻辑,只要有人改一处就会脱节,而测试只断言计数 ⇒ 漂移不可见。
+ * - **顶点色的材质口径**(WS-FND-180):顶面按格子的 `base` + `floor` 着色
+ *   (`terrain_vcolor.topColorOf`:铺装 > 地表 > 海拔层兜底),侧面按海拔层(`faceColor`)。
+ *   材质只取合并块的**主导格**(`dominantMaterialGrid`),与块 z 的挑格口径逐字相同;
+ *   LOD0 时主导格 = 该格自己,逐格精确。
  *
  * ## 坐标约定(与 `iso_camera.ts` 的 35° 正交投影对齐)
  *
@@ -44,6 +48,8 @@
  * 侧面:从块的四邻低处起建,朝向该方向;UV 的 v 轴对应高度,便于贴侧壁纹理。
  */
 
+import { unpackTile } from '../../../shared/types/tile.ts';
+
 import {
   CHUNK_SIZE,
   ELEV_TO_Z,
@@ -55,11 +61,13 @@ import {
   type QuadBatch,
   dominantZGrid,
   neighborZs,
+  tileZ,
 } from './tile_mesh.ts';
 import {
   TERRAIN_COLOR_COMPONENTS,
   elevLayerOfZ,
   faceColor,
+  topColorOf,
   validateVertexColors,
   writeVertexColor,
 } from './terrain_vcolor.ts';
@@ -83,6 +91,9 @@ export interface ChunkGeometry {
    *
    * ★ WS-09 U2:渲染走**顶点色**,不挂纹理图集。长度恒等于 `顶点数 × 3`,
    *   由 `terrain_vcolor.validateVertexColors` 与 `validateChunkGeometry` 双重把守。
+   * ★ WS-FND-180 的语义:**顶面** = `topColorOf(层, 主导格 base, 主导格 floor)`
+   *   (每个格子的材质不同,因此颜色不同);**侧面** = `faceColor(层, false)`(只按海拔层)。
+   *   ⇒ 「顶面全按海拔层着色」这种缺陷**查长度/值域是查不出来的**,必须查取值本身。
    */
   colors: Float32Array;
   /** 与顶点写出同源的计数(供一致性断言) */
@@ -154,19 +165,71 @@ const SIDE_NORMALS: Record<'north' | 'south' | 'west' | 'east', readonly [number
 const SIDE_DIRS = ['north', 'south', 'west', 'east'] as const;
 
 /**
- * 统计一个 Chunk 在该 LOD 下需要多少顶点/索引。
+ * 一个 Chunk 在该 LOD 下的**建面单元**(合并块)列表。
  *
- * 与 `buildChunkQuads` 的唯一区别:这里**同时**返回 cell 列表,
+ * 与 `buildChunkQuads` 的唯一区别:这里**同时**返回 cell 列表(含顶面材质),
  * 供 `emitChunkGeometry` 复用,避免再扫一遍。
  */
 interface Cell {
   bx: number;
   by: number;
   z: number;
+  /**
+   * 该合并块**主导格**(块内最高非空 z 那一格)的地表材质 —— `base` = `BaseFluid`,
+   * `floor` = 铺装槽位。顶面颜色由它们决定(WS-FND-180:`topColorOf`)。
+   *
+   * 口径与 `dominantZGrid` 的块 z **同一格**(见 `dominantMaterialGrid`);
+   * 空块(VOID)记 0 —— 那种块不会进 cells,0 只是防御性默认值。
+   */
+  base: number;
+  floor: number;
   /** 该块需要生成侧面的方向 */
   sides: ('north' | 'south' | 'west' | 'east')[];
   /** 四邻海拔(与 `buildChunkQuads` 同源,一次算好,不在写出循环里重算) */
   neighbors: NeighborZs;
+}
+
+/**
+ * 每个合并块的**主导格材质**(`base` / `floor`)。
+ *
+ * ## 为什么需要它
+ *
+ * 顶面颜色由格子的材质决定(WS-FND-180),而 `dominantZGrid` 只回 z、不回材质。
+ * 挑格口径必须与它**逐字相同**,否则「块 z 说的是 A 格、颜色却来自 B 格」:
+ *   - 同一扫描顺序:**y 外、x 内**(与 `dominantZGrid` 一样);
+ *   - 同一比较:**严格 `>`**(并列时**先出现**的那一格胜出);
+ *   - 同一非空判定:`tileZ(tile) !== -Infinity`(空格不参与,否则一块里混进一个
+ *     空气单元就会被当成「最高格」)。
+ *
+ * 实现上只扫一遍:第一个满足 `z === grid[i]` 的非空格**就是**主导格 ——
+ * 若更早出现过非空格,它的 z 必然 < grid[i](否则它才是最高格)。
+ *
+ * ⚠️ 这是 LOD>0 时的**近似**:一个合并块里可能混着多种材质,只取主导格那一种
+ * (与「块 z 只取最高格」同一条近似口径)。LOD0(merge = 1)时主导格就是这一格,逐格精确。
+ */
+function dominantMaterialGrid(
+  chunk: ChunkInput,
+  grid: Float64Array,
+  size: number,
+  merge: number,
+): { base: Int32Array; floor: Int32Array } {
+  const base = new Int32Array(size * size);
+  const floor = new Int32Array(size * size);
+  const picked = new Uint8Array(size * size);
+  for (let y = 0; y < CHUNK_SIZE; y += 1) {
+    for (let x = 0; x < CHUNK_SIZE; x += 1) {
+      const tile = chunk.tiles[y * CHUNK_SIZE + x] ?? 0;
+      const z = tileZ(tile);
+      if (z === Number.NEGATIVE_INFINITY) continue;
+      const i = Math.floor(y / merge) * size + Math.floor(x / merge);
+      if (picked[i] === 1 || z !== grid[i]) continue;
+      picked[i] = 1;
+      const u = unpackTile(tile);
+      base[i] = u.base;
+      floor[i] = u.floor;
+    }
+  }
+  return { base, floor };
 }
 
 function collectCells(
@@ -175,6 +238,8 @@ function collectCells(
   ctx?: EdgeContext,
 ): { size: number; merge: number; cells: Cell[] } {
   const { grid, size, merge } = dominantZGrid(chunk, lod);
+  /* 主导格材质与块 z 同源(同一扫描顺序 + 同一严格 >),一次算好给下面每个块取用 */
+  const material = dominantMaterialGrid(chunk, grid, size, merge);
   const cells: Cell[] = [];
   for (let by = 0; by < size; by += 1) {
     for (let bx = 0; bx < size; bx += 1) {
@@ -187,7 +252,8 @@ function collectCells(
       if (neighbors.south < z) sides.push('south');
       if (neighbors.west < z) sides.push('west');
       if (neighbors.east < z) sides.push('east');
-      cells.push({ bx, by, z, sides, neighbors });
+      const mi = by * size + bx;
+      cells.push({ bx, by, z, base: material.base[mi]!, floor: material.floor[mi]!, sides, neighbors });
     }
   }
   return { size, merge, cells };
@@ -265,9 +331,17 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     const v0 = (c.by * merge) / CHUNK_SIZE;
     const du = merge / CHUNK_SIZE;
 
-    /* 颜色:该块所处的海拔层。顶面用受光档,侧面用背光档 */
-    const topColor = faceColor(elevLayerOfZ(z), true);
-    const sideColor = faceColor(elevLayerOfZ(z), false);
+    /*
+     * 颜色(WS-FND-180):
+     *   顶面 —— 由**格子材质**决定:`topColorOf(层, base, floor)`
+     *           (铺装 > 地表 `base` > 海拔层兜底)。同一个海拔层上草地/金沙/熔岩
+     *           因此是不同色,世界不再是 4 色色块。材质取该合并块的**主导格**
+     *           (见 `collectCells`);LOD0 时主导格就是这一格自己,逐格精确。
+     *   侧面 —— 仍按**海拔层**取背光档:侧面是地层剖面与块间高差,与「表面铺了什么」无关。
+     */
+    const elev = elevLayerOfZ(z);
+    const topColor = topColorOf(elev, c.base, c.floor);
+    const sideColor = faceColor(elev, false);
 
     /* ── 顶面(法线 +Z)── */
     for (const [dx, dy] of TOP_CORNERS) {

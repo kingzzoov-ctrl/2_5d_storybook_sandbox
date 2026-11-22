@@ -103,6 +103,12 @@ import { WorldSim } from './sim/world_sim.ts';
    `WorldArchiveSummary` 由下面 `makeArchiveSink` 的**字段搬运**对齐
    (对接错误 = 编译期红,而不是运行期一个空 id)。 */
 import type { WorldArchiveRequest, WorldArchiveReceipt, WorldArchiveSink } from './sim/world_sim.ts';
+/* ★ w85:设计过的世界。放在这里而不是 `net/room.ts`:装配层是**唯一**知道
+   「本房间的世界该长什么样」的地方(与 `restoreWorldFromDb` 同处一地 ——
+   盖图与读档的**顺序**是语义的一部分,分开写迟早漂移)。
+   ⚠️ 文件在 `shared/**` 而不是 `server/**`:客户端要画**同一张图**
+   (`client/src/stage/design_world.ts`),而客户端不许 import server。 */
+import { applyWorldDesign } from '../../shared/world/design.ts';
 import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
@@ -212,6 +218,18 @@ export interface AssembleDeps {
    * 世界群系(刷怪配表 `BIOME_SPAWN` 的键)。不传 = `WorldSim` 自己的默认 `MEADOW`。
    * 本仓没有每格群系,见 `WorldSim.biomeName` 的注释。
    */
+  /**
+   * ★ 2026-11-26(w85):**盖上设计过的世界**(`server/src/world/design.ts`)。
+   *
+   * 不传 / `false` ⇒ **一格都不铺**,与改前逐字不变(世界是空的)。
+   * 传 `true`    ⇒ 在 `restoreWorldFromDb` **之前**盖 192×192 的设计图
+   * (11 个区 / 环形主干道 + 四条主路 / 跨海栈桥 / 地标)。
+   *
+   * ⚠️ 为什么必须**在读档之前**:读档的语义是「库里有的块覆盖、缺的块按新世界
+   * 默认格」⇒ 先盖设计图,存档里玩家改过的地形才盖得住它。反过来就变成
+   * 「每次开服都把玩家动过的地图推平」—— 那种缺陷只在**重启之后**才看得见。
+   */
+  design?: boolean;
   biome?: string;
   /** 房间名与准入方式,与 `NetPersistRoom.onCreate` 的同名字段一一对应。 */
   name?: string;
@@ -425,6 +443,9 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
    * 物理 / 生物),而 `wireHost` 挂的是与世代无关的接线(归档口 / 计分 sink /
    * 睡眠读口 / 城镇半径 provider)。先读档再接线 ⇒ 不存在"接线挂在已被换掉的对象上"。
    * `archiveDb` 是「本房间正在用的那个库」(名字来自 D-06,值 = `db ?? deps.db`)。 */
+  /* ★ 2026-11-26(w85):设计图 —— **必须**在 `restoreWorldFromDb` 之前盖。
+     理由见 `AssembleDeps.design` 的注释(读档只覆盖库里有的块)。 */
+  if (deps.design === true) applyWorldDesign(sim, { size: sim.sizeCells });
   sim.restoreWorldFromDb(archiveDb, roomId);
   wireHost(sim, roomId);
   return sim;

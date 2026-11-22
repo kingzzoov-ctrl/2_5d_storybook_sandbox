@@ -60,6 +60,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DEFAULT_DB_PATH, assemble } from '../server/src/index.ts';
+import { DESIGN_SIZE } from '../shared/world/design.ts';
 import { startWsServer } from '../server/src/net/ws_server.ts';
 
 import { DT } from '../shared/types/physics.ts';
@@ -99,8 +100,20 @@ const HOST = strArg('host', '127.0.0.1');
 /** `0.0.0.0` / `::` 不是可点开的地址 ⇒ 打印时用占位符代替。 */
 const BIND_ALL = HOST === '0.0.0.0' || HOST === '::';
 const URL_HOST = BIND_ALL ? '<本机IP/公网IP>' : HOST;
-/** 世界边长(格)。96 足够走一圈看到地形、怪与屋顶;**再大会拖慢首帧建面**。 */
-const WORLD_CELLS = numArg('size', 96);
+/**
+ * ★ 2026-11-26(w85):**世界来源**。
+ *
+ *   `--world plain`(缺省)= 与改前逐字不变:一格都不铺,世界是空的。
+ *   `--world design`     = 盖上 `server/src/world/design.ts` 的设计图
+ *                          (11 个区 / 环形主干道 + 四条主路 / 跨海栈桥 / 地标)。
+ *
+ * ⚠️ `design` 模式边长缺省变成 `DESIGN_SIZE`(192):设计图的区是按 192 的尺度
+ * **手放坐标**的,拿 96 去盖会把区挤在一起、甚至叠到海里 —— 那种图看着就是坏的,
+ * 但它不会报错。显式传 `--size` 可以覆盖(那就是「换边框」)。
+ */
+const WORLD_KEY = strArg('world', 'plain');
+/** 世界边长(格)。96 只够「走两步」;**设计图需要 192**。 */
+const WORLD_CELLS = numArg('size', WORLD_KEY === 'design' ? DESIGN_SIZE : 96);
 
 /* ── 存档目标(★ 2026-11-20 owner 裁定:自动保存)──
    `--memory` = 显式内存模式:`--db` 与默认路径都不生效,进程退出即丢。
@@ -158,6 +171,7 @@ async function main(): Promise<void> {
     ownerId: 'u_host',
     sizeCells: WORLD_CELLS,
     mobs: true,
+    design: WORLD_KEY === 'design',
     /* ★ 两种模式**互斥且显式**:内存模式给 `memory: true`,否则给文件路径。
        不给路径又不给 `--memory` ⇒ 走 `DEFAULT_DB_PATH`(而不是悄悄不落盘)。 */
     ...(DB_TARGET === null ? { memory: true } : { dbPath: DB_TARGET }),
@@ -192,6 +206,7 @@ async function main(): Promise<void> {
     log('  ' + mobs.slice(0, 8).map((m) => `${m.mobId}(${m.hp}/${m.maxHp})`).join(' · ')
       + (mobs.length > 8 ? ` … 共 ${mobs.length} 只` : ''));
   }
+  log(`世界来源:${WORLD_KEY === 'design' ? `设计图(${DESIGN_SIZE}×${DESIGN_SIZE} 手放区域)` : '空世界(--world plain,与改前一致)'}`);
   log(`房间 ${assembled.runtime.id} 就绪;host=${assembled.host === null ? 'null(异常)' : '已装配'}`);
 
   /* ── 1c 实测节拍探针(★ D-26:帧数即时间)──

@@ -107,7 +107,16 @@ export interface FrustumCullResult {
 
 /* ───────────────────────────── 建面算法 ───────────────────────────── */
 
-function tileZ(tile: number): number {
+/**
+ * 一个 32 位单元的**世界 z**;空格(`obj` / `floor` / `base` 全 0)⇒ `-Infinity`
+ * (= 空气,不建面)。
+ *
+ * ★ 导出给 `chunk_geometry.collectCells`:**顶面材质**(WS-FND-180)要按**同一条口径**
+ *   挑出「块内最高非空 z 的那一格」的 `base`/`floor`。同一条规则写两遍的下场本文件
+ *   已经吃过一次(见 `neighborZs` 的注释:计数与顶点写出曾各写一遍取邻逻辑 ⇒ 漂移不可见)——
+ *   所以「非空判定 + 海拔映射」只有这一处,别处一律 import。
+ */
+export function tileZ(tile: number): number {
   const u = unpackTile(tile);
   if (u.obj === 0 && u.floor === 0 && u.base === 0) return Number.NEGATIVE_INFINITY;
   const z = ELEV_TO_Z[u.elev & 0x3];

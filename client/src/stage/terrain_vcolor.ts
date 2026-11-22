@@ -14,6 +14,26 @@
  *   - 与 `chunk_geometry` 的顶点写出**同源**:颜色在 `pushVertex` 处一起写,
  *     不存在「几何更新了、颜色忘更新」的错位。
  *
+ * ## 为什么顶面按**材质**着色(WS-FND-180)
+ *
+ * 早先顶面的颜色只有一个来源:`faceColor(elevLayerOfZ(z), true)` —— 顶点色是**海拔层**
+ * 的函数,而海拔层只有 4 个值。于是 1024×1024 的世界在屏幕上只有 **4 色**:草地、
+ * 金沙滩、浅水、熔岩、冰砖、榻榻米……全是同一块绿/灰/蓝 —— 「这块地表面是什么」
+ * 在画面上不存在,而判据仍然全绿(长度、值域、没有采样器都查不出语义丢失)。
+ *
+ * 材质本来就带在格子里(`shared/types/tile.ts` 的 `unpackTile`):
+ *   - `base`(**BaseFluid**)     = 地表本身是什么(草/土/金沙/岩/浅水/温泉/黏液/熔岩/巧克力);
+ *   - `floor`(6 位**槽位号**)  = 表面铺了什么铺装(槽位 1..30 ↔ 地砖物品 301..330,
+ *                                槽位 31..63 = UGC 像素地毯变体;语义见
+ *                                `server/src/world/chunk.ts` 的 `FLOOR_PALETTE` /
+ *                                `floorSlotOfId`。客户端不 import server,故本文件独立持表)。
+ * ⇒ 顶面改成 `topColorOf(层, base, floor)`:**铺装优先,其次地表,最后才回落海拔层**
+ *   (表与取值顺序见下方 `BASE_TOP_RGB` / `FLOOR_TOP_RGB` / `topColorOf`)。
+ *
+ * 侧面**不变**:侧面朝水平方向,看到的是地层剖面(土/岩)与块间高差,与「表面铺了什么」
+ * 无关,仍走 `faceColor(层, false)`。也就是说,**海拔层色并没有被废掉**,它从「顶面唯一
+ * 来源」退成「侧面的颜色 + 顶面的兜底」。
+ *
  * ## 判据口径(写在这里,因为判据就是本文件的产品规格)
  *
  *   1. `colors.length === vertexCount × TERRAIN_COLOR_COMPONENTS`(=3);
@@ -53,6 +73,123 @@ export const ELEV_BASE_RGB: readonly FaceColor[] = [
   { r: 0.56, g: 0.52, b: 0.54 }, /* CLIFF    石崖 */
 ];
 
+/*
+ * ─────────────── WS-FND-180:顶面材质色(两张表)───────────────
+ *
+ * ## 为什么顶面不能再只按海拔层着色(现状 = 一堆 4 色色块)
+ *
+ * `faceColor(层, true)` 的取值只有 **4** 个(DEEP/GROUND/PLATFORM/CLIFF),于是顶面
+ * 只有 4 种颜色:草地、金沙滩、熔岩、冰砖、榻榻米……在画面上全都同色 ——
+ * 「这块地表面铺了什么」这件事在渲染里**根本不存在**,而所有判据仍然全绿
+ * (顶点色长度对、值域对、没有采样器)。这是「判据查形状、不查语义」的典型漏面。
+ *
+ * 格子本来就把材质带在单元里(`shared/types/tile.ts` 的 `unpackTile`):
+ *   - `base`(BaseFluid)   = 地表本身是什么  ⇒ `BASE_TOP_RGB`,10 个取值;
+ *   - `floor`(6 位**槽位**) = 表面铺了什么铺装 ⇒ `FLOOR_TOP_RGB`,64 个槽位。
+ * 两者都是**每格**的数据,LOD0(近处)逐格精确,LOD>0 时取合并块的主导格(近似,见
+ * `chunk_geometry.collectCells`)。
+ *
+ * ## 三张表的分工(别把「海拔层色」当成「地表材质色」用)
+ *
+ *   `ELEV_BASE_RGB`   海拔层 × 4     —— **侧面**仍用它(`faceColor`)
+ *   `BASE_TOP_RGB`    地表材质 × 10  —— 顶面第二优先
+ *   `FLOOR_TOP_RGB`   铺装槽位 × 64  —— 顶面第一优先(`null` = 无铺装)
+ *
+ * 顶面取值顺序由 `topColorOf` 唯一实现;侧面**不改**,因为侧面看到的是地层剖面
+ * (土/岩),不是「表面铺了什么」,而且它与块间高度差绑定,与铺装无关。
+ */
+
+/**
+ * **顶面地表基色**,下标 = `BaseFluid`(`shared/types/tile.ts`):
+ *   0 VOID / 1 GRASS / 2 DIRT / 3 GOLD_SAND / 4 ROCK
+ *   5 SHALLOW_WATER / 6 HOT_SPRING / 7 SLIME / 8 LAVA / 9 CHOCO
+ *
+ * 下标 0(VOID)刻意取 GRASS **同值**:它是兜底项 —— 一个格子里只放了物体、没写
+ * `base` 时,顶面落回草地色,而不是「第 0 号材质」的怪色。
+ * 取值全部落在中间调,理由与 `ELEV_BASE_RGB` 相同(纯黑/纯白会与「漏写」混淆)。
+ */
+export const BASE_TOP_RGB: readonly FaceColor[] = [
+  { r: 0.42, g: 0.62, b: 0.36 }, /* 0 VOID          兜底:与 GROUND 同值 */
+  { r: 0.42, g: 0.62, b: 0.36 }, /* 1 GRASS         草地 */
+  { r: 0.55, g: 0.42, b: 0.30 }, /* 2 DIRT          泥土 */
+  { r: 0.82, g: 0.74, b: 0.46 }, /* 3 GOLD_SAND     金沙滩 */
+  { r: 0.56, g: 0.52, b: 0.54 }, /* 4 ROCK          岩石 */
+  { r: 0.24, g: 0.36, b: 0.52 }, /* 5 SHALLOW_WATER 浅水 */
+  { r: 0.62, g: 0.72, b: 0.78 }, /* 6 HOT_SPRING    温泉 */
+  { r: 0.42, g: 0.70, b: 0.34 }, /* 7 SLIME         黏液 */
+  { r: 0.85, g: 0.35, b: 0.16 }, /* 8 LAVA          熔岩 */
+  { r: 0.45, g: 0.30, b: 0.22 }, /* 9 CHOCO         巧克力 */
+];
+
+/**
+ * 槽位 1..30 的顶面铺装色。下标 = **槽位号**;注释里的数字是它对应的地砖物品 ID
+ * (槽位 = 物品 ID − 300)。
+ *
+ * 语义对齐 `server/src/world/chunk.ts` 的 `FLOOR_PALETTE` / `floorSlotOfId`
+ * (0 = 无铺装;1..30 ↔ 301..330;31..63 = UGC 像素地毯变体的槽)。客户端**不** import
+ * server,所以这张表在客户端独立存在 —— **下标即槽位**,不做任何物品 ID 判断。
+ *
+ * 槽位 0 = 无铺装 ⇒ `null`(回落 `base`,而不是「某种黑色铺装」)。
+ */
+const FLOOR_TOP_SLOTS: readonly (FaceColor | null)[] = [
+  null,                          /*  0 无铺装(裸地) */
+  { r: 0.48, g: 0.36, b: 0.26 }, /*  1 301 耕地 */
+  { r: 0.60, g: 0.62, b: 0.56 }, /*  2 302 鹅卵石径 */
+  { r: 0.66, g: 0.50, b: 0.32 }, /*  3 303 木地板 */
+  { r: 0.72, g: 0.76, b: 0.50 }, /*  4 304 榻榻米 */
+  { r: 0.62, g: 0.34, b: 0.28 }, /*  5 305 红砖广场 */
+  { r: 0.86, g: 0.86, b: 0.88 }, /*  6 306 大理石 */
+  { r: 0.30, g: 0.30, b: 0.34 }, /*  7 307 棋盘砖 */
+  { r: 0.88, g: 0.62, b: 0.72 }, /*  8 308 花瓣地毯 */
+  { r: 0.36, g: 0.42, b: 0.60 }, /*  9 309 星光夜路 */
+  { r: 0.58, g: 0.44, b: 0.30 }, /* 10 310 浮木栈桥 */
+  { r: 0.76, g: 0.62, b: 0.40 }, /* 11 311 威化砖 */
+  { r: 0.34, g: 0.68, b: 0.32 }, /* 12 312 球场草皮 */
+  { r: 0.72, g: 0.28, b: 0.24 }, /* 13 313 塑胶跑道 */
+  { r: 0.62, g: 0.62, b: 0.62 }, /* 14 314 像素地毯 */
+  { r: 0.72, g: 0.86, b: 0.94 }, /* 15 315 冰砖 */
+  { r: 0.36, g: 0.30, b: 0.44 }, /* 16 316 减速沼泽 */
+  { r: 0.90, g: 0.72, b: 0.20 }, /* 17 317 加速带 */
+  { r: 0.55, g: 0.85, b: 0.75 }, /* 18 318 蹦床 */
+  { r: 0.50, g: 0.50, b: 0.42 }, /* 19 319 落穴草席 */
+  { r: 0.75, g: 0.35, b: 0.15 }, /* 20 320 火炭砖 */
+  { r: 0.60, g: 0.55, b: 0.70 }, /* 21 321 旋转盘 */
+  { r: 0.85, g: 0.65, b: 0.20 }, /* 22 322 蜂蜜毯 */
+  { r: 0.78, g: 0.70, b: 0.45 }, /* 23 323 流沙砖 */
+  { r: 0.35, g: 0.28, b: 0.30 }, /* 24 324 荆棘垫 */
+  { r: 0.75, g: 0.40, b: 0.80 }, /* 25 325 迪斯科灯砖 */
+  { r: 0.45, g: 0.65, b: 0.85 }, /* 26 326 传送砖 A */
+  { r: 0.50, g: 0.70, b: 0.90 }, /* 27 327 传送砖 B */
+  { r: 0.45, g: 0.45, b: 0.50 }, /* 28 328 直轨 */
+  { r: 0.45, g: 0.45, b: 0.50 }, /* 29 329 弯轨 */
+  { r: 0.55, g: 0.50, b: 0.45 }, /* 30 330 制动轨 */
+];
+
+/**
+ * 槽位 31..63 = 314 的 UGC 像素地毯变体,共用一个颜色
+ * (与 server 侧 `FLOOR_UGC_FIRST` / `FLOOR_UGC_LAST` 同口径)。
+ */
+const FLOOR_TOP_UGC_RGB: FaceColor = { r: 0.62, g: 0.62, b: 0.62 };
+const FLOOR_TOP_UGC_FIRST = 31;
+const FLOOR_TOP_UGC_LAST = 63;
+
+/** 槽位号位宽 = 6 位(`shared/types/tile.ts` 的 `FLOOR_WORD_BITS`)⇒ 槽位 0..63 */
+const FLOOR_SLOT_COUNT = 64;
+
+/**
+ * **顶面铺装色表**:长度恒为 `FLOOR_SLOT_COUNT`(=64),下标 = `floor` 槽位,
+ * `null` = 该槽位「无铺装色」(槽位 0 与所有未定义槽位)⇒ 回落 `base`。
+ *
+ * 长度 64 本身是判据(它必须与 6 位槽位空间一一对应;表短一格就会出现
+ * 「槽位 63 的世界里没有颜色」这种只在 UGC 地毯上可见的洞)。
+ */
+export const FLOOR_TOP_RGB: readonly (FaceColor | null)[] = (() => {
+  const arr = new Array<FaceColor | null>(FLOOR_SLOT_COUNT).fill(null);
+  for (let s = 0; s < FLOOR_TOP_SLOTS.length; s += 1) arr[s] = FLOOR_TOP_SLOTS[s] ?? null;
+  for (let s = FLOOR_TOP_UGC_FIRST; s <= FLOOR_TOP_UGC_LAST; s += 1) arr[s] = FLOOR_TOP_UGC_RGB;
+  return arr;
+})();
+
 /** 顶面亮度因子(朝上,受光最多) */
 export const TOP_FACE_SHADE = 1;
 
@@ -91,6 +228,74 @@ export function faceColor(layer: number, isTop: boolean): FaceColor {
     g: clamp01(base.g * shade),
     b: clamp01(base.b * shade),
   };
+}
+
+/*
+ * ─────────────── WS-FND-180:顶面材质色(取值函数)───────────────
+ *
+ * 顶面颜色不再只由海拔层决定(那样全世界只有 4 色,见文件顶部注释),而是:
+ *
+ *     铺装(FLOOR_TOP_RGB 槽位) > 地表(BASE_TOP_RGB / BaseFluid) > 海拔层(兜底)
+ *
+ * 侧面**不变**:它看到的是地层剖面(土/岩),不是「表面铺了什么」,仍走 faceColor。
+ */
+
+/**
+ * 一个**顶面**的颜色 —— 顶面着色的唯一算法源。
+ *
+ * 优先级(与「这块地表面是什么」这个语义一致):
+ *   1. 有铺装(`floorSlot` 是 0..63 的整数,且该槽位在 `FLOOR_TOP_RGB` 里有定义)⇒ 铺装色;
+ *   2. 否则 `base` 是 0..9 的整数 ⇒ `BASE_TOP_RGB[base]`;
+ *   3. 再否则回落 `faceColor(elevLayer, true)`(`TOP_FACE_SHADE` = 1,与旧口径逐位一致;
+ *      层号非有限时先归到 0 —— 见函数末尾的注释)。
+ *
+ * ★ `base` / `floorSlot` 非法(非整数 / 越界 / NaN / Infinity)一律走**回落**:
+ *   不抛异常、不产生 NaN。它们直接来自存档与网络,一个坏格子不该让整块地形画不出来
+ *   (与 `packTile` 的「坏 ID 归 0」同一族语义;高频路径不能因一格坏数据断帧)。
+ * ★ 每次都返回**新对象**(与 `faceColor` 同契约):调用方拿到的是值,不是共享常量本身 ——
+ *   否则谁把结果原地改一改,整张调色表就被写脏了。
+ */
+export function topColorOf(elevLayer: number, base: number, floorSlot: number): FaceColor {
+  if (Number.isInteger(floorSlot) && floorSlot >= 0 && floorSlot < FLOOR_TOP_RGB.length) {
+    const paved = FLOOR_TOP_RGB[floorSlot];
+    if (paved !== undefined && paved !== null) return { r: paved.r, g: paved.g, b: paved.b };
+  }
+  if (Number.isInteger(base) && base >= 0 && base < BASE_TOP_RGB.length) {
+    const soil = BASE_TOP_RGB[base];
+    if (soil !== undefined) return { r: soil.r, g: soil.g, b: soil.b };
+  }
+  /*
+   * 层号非有限(NaN)时 `faceColor` 里的数组下标会变成 NaN ⇒ 取到 undefined ⇒
+   * 抛 `Cannot read properties of undefined`。层号本应来自 `elevLayerOfZ`(必然 0..3),
+   * 这里把「坏层号」与「坏 base/floor」同等看待:归到 0(DEEP),不抛异常。
+   */
+  return faceColor(Number.isFinite(elevLayer) ? elevLayer : 0, true);
+}
+
+/**
+ * **顶面材质表**的成员反查:RGB → 表里的那一项;不在表里 ⇒ `null`(与 `lodPaletteOf` 同形)。
+ *
+ * 表 = `BASE_TOP_RGB`(10 项)∪ `FLOOR_TOP_RGB` 的已定义槽位(63 个:1..30 各一色、
+ * 31..63 共一色)。去重后 **38** 个不同色(VOID/GRASS 同值、直轨/弯轨同值、
+ * 像素地毯与 UGC 同值 —— 计数以去重为准)。
+ * 它是「顶面色合法吗」的判据口径(见 `lodFaceSemantics`),也是「插值/平均可判定」的依据:
+ * 平均值一般**不在**这张表里。
+ *
+ * ⚠️ 与 `lodPaletteOf`(海拔层 × 朝向的 8 色)是**两张不重叠的表** ——
+ * 逐项比对无一相同(自检在 `tests/WS-FND-180-terrain-material-palette.test.ts`),
+ * 所以「一个色落在哪条着色路径上」是可判定的,不是靠肉眼分工。
+ */
+export function topMaterialPaletteOf(rgb: FaceColor, eps = 1e-6): FaceColor | null {
+  const close = (a: number, b: number): boolean => Math.abs(a - b) <= eps;
+  for (const c of BASE_TOP_RGB) {
+    if (close(c.r, rgb.r) && close(c.g, rgb.g) && close(c.b, rgb.b)) return { r: c.r, g: c.g, b: c.b };
+  }
+  for (const c of FLOOR_TOP_RGB) {
+    if (c !== null && close(c.r, rgb.r) && close(c.g, rgb.g) && close(c.b, rgb.b)) {
+      return { r: c.r, g: c.g, b: c.b };
+    }
+  }
+  return null;
 }
 
 /** 把颜色写到顶点色数组的第 `vertexIndex` 个顶点上 */
@@ -271,8 +476,10 @@ export function terrainShaderAttributes(): string[] {
  * ```
  * 1. 合并:merge×merge 格压成一个块,块的 z = 块内**最高非空** z
  *          (空块 = −∞ ⇒ 不建面)。`aLodMerge` 就是这个 merge 边长。
- * 2. 着色:faceColor(elevLayerOfZ(块.z), isTop) —— 颜色只由**块**与**朝向**决定;
- *          块内四格各画各的颜色再平均是**另一种语义**,本仓不做。
+ * 2. 着色:侧面 `faceColor(elevLayerOfZ(块.z), false)`;顶面 `topColorOf(层, 主导格 base/floor)`
+ *          —— 侧面的色只由**块 z** 决定;顶面的色由**块内主导格(最高非空 z 那一格)**的
+ *          材质决定(WS-FND-180),两者都不看块内其余格 ⇒ 「块内逐格平均」是**另一种语义**,
+ *          本仓不做。
  * 3. 法线:只由**面朝向**决定(顶 +Z / 侧 ±X / 侧 ±Y),与 merge 大小无关
  *          ⇒ 两档 LOD 下同一朝向的法线**逐位相同**。
  * ```
@@ -281,9 +488,11 @@ export function terrainShaderAttributes(): string[] {
  * 平均等于取值),只有在「块内 z 不一致」时才分叉。也就是说 —— 顺序不定的话,
  * 门禁全绿、肉眼也看不出,直到某块台阶的边缘出现一条谁都说不出原因的色带。
  *
- * ⇒ 可判定性:`lodFaceSemantics` 要求顶点色**恰好**是 `faceColor(...)` 的输出,
- *   而「先着色再平均」得到的 RGB 一般**不在** `ELEV_BASE_RGB × shade` 这 8 个
- *   调色板色里(`lodPaletteOf` 返回 `null`)—— 于是两种顺序**可区分**,不是风格问题。
+ * ⇒ 可判定性:`lodFaceSemantics` 要求顶点色**恰好**是某张调色表的输出 —— 侧面是
+ *   `faceColor(层, false)`,顶面是 `topColorOf(层, base, floor)`(WS-FND-180)。
+ *   而「先着色再平均」得到的 RGB 一般**不在**任何一张表里
+ *   (`lodPaletteOf` 与 `topMaterialPaletteOf` 都返回 `null`)—— 于是两种顺序**可区分**,
+ *   不是风格问题。
  */
 export const LOD_MERGE_ORDER = 'MERGE_THEN_COLOR';
 
@@ -319,6 +528,9 @@ export function mergedZOfFace(vertZ: readonly number[]): number {
  * 调色板 = `ELEV_BASE_RGB` 的 4 层 × `{TOP_FACE_SHADE, SIDE_FACE_SHADE}` 两档
  * (共 8 色,由 `faceColor()` 唯一产出)。`eps` 默认 1e‑6,因为顶点色经
  * `Float32Array` 落盘再读回会带上 float32 的舍入。
+ *
+ * ★ WS-FND-180:**顶面**材质色的反查在 `topMaterialPaletteOf`(另一张表 —— 材质表)。
+ *   本函数只管「海拔层 × 朝向」这 8 色:侧面与 LOD 层模型仍用它。
  */
 export function lodPaletteOf(rgb: FaceColor, eps = 1e-6): { layer: number; isTop: boolean } | null {
   const close = (a: number, b: number): boolean => Math.abs(a - b) <= eps;
@@ -337,11 +549,28 @@ export function lodPaletteOf(rgb: FaceColor, eps = 1e-6): { layer: number; isTop
  * ```
  * 块 z = max(顶点 z)                       非法(全空)⇒ 红
  * 法线必须是单位向量且落在规范集            否则 ⇒ 红(顶 +Z / 侧 ±X±Y)
- * 顶点色必须落在调色板里                    否则 ⇒ 红(先着色再合并/插值会落在这里)
- * 着色档必须与法线一致                      顶面朝上 ↔ 亮档;侧面水平 ↔ 暗档
- * 颜色的层必须 = elevLayerOfZ(块 z)         否则 ⇒ 红(着色用了「某格」而不是「合并块」)
+ * 色必须落在某一张调色表里                  否则 ⇒ 红(先着色再合并 / 插值会落在这里)
+ * 侧面:色必须是海拔层暗档                  否则 ⇒ 红(顶面材质表的色用在了侧面上)
+ * 侧面:色所属的层必须 = elevLayerOfZ(块 z)  否则 ⇒ 红(着色用了「某格」而不是「合并块」)
+ * 顶面:色必须落在**顶面材质表**里           否则 ⇒ 红(旧口径「顶面 = 海拔层色」不再合法)
+ * 着色档必须与法线一致                      顶面朝上 ↔ 材质表;侧面水平 ↔ 海拔层暗档
  * 顶面必须平;侧面至少 2 个顶点在块 z        否则 ⇒ 红(块内混了自己的 z 去着色)
  * ```
+ *
+ * ## WS-FND-180:顶面为什么换了张表(这是**契约变更**,不是放宽判据)
+ *
+ * 顶面色现在由格子材质决定(`chunk_geometry` 取合并块内**最高非空 z 那一格**的
+ * `base`/`floor`,交给 `topColorOf` 算)。它因此**不再是** `(块 z, 朝向)` 的函数:
+ * 同一个块 z 上草地与金沙是两种色,而同一个材质在 DEEP 与 CLIFF 上是同一色。
+ * ⇒ 旧口径里「顶面色必须 = ELEV_BASE_RGB[层(块 z)]」这一条已**不成立**,
+ *   继续留着只会把正确实现判成红的(而删掉它又等于对顶面失去检查)。
+ *
+ * 换成了什么(同形,色集不同):
+ *   · 侧面那一支**一字未改**:仍在海拔层 8 色调色板里,仍要求「层 = elevLayerOfZ(块 z)」
+ *     ⇒「用块内某格的 z 着色」现在由侧面这一支守着,它仍有牙(注入用例见 WS-FND-96);
+ *   · 顶面那一支改成「必须落在 `BASE_TOP_RGB ∪ FLOOR_TOP_RGB` 里」并**去掉**层一致性检查
+ *     —— 顶面色与海拔层无关(它由材质定),那条在顶面上不可判定。
+ *     仍能抓的缺陷:平均值 / 插值 / 自造色 —— 它们一般**不在**材质表里。
  */
 export function lodFaceSemantics(sample: LodFaceSample): string | null {
   const blockZ = mergedZOfFace(sample.vertZ);
@@ -359,17 +588,32 @@ export function lodFaceSemantics(sample: LodFaceSample): string | null {
   if (!isTopByNormal && !isHorizontal) {
     return `法线不在这套规范集里(顶 +Z / 侧 ±X±Y):(${nx},${ny},${nz})`;
   }
-  const hit = lodPaletteOf(sample.color);
-  if (hit === null) {
-    return `顶点色 (${sample.color.r},${sample.color.g},${sample.color.b}) 不在调色板里 `
-      + '⇒ 着色不是 faceColor 的输出(先着色再合并 / 插值会落在这里)';
+  const hit = lodPaletteOf(sample.color);              /* 海拔层 × 朝向(8 色) */
+  const material = topMaterialPaletteOf(sample.color); /* 顶面材质表(WS-FND-180) */
+  if (hit === null && material === null) {
+    return `顶点色 (${sample.color.r},${sample.color.g},${sample.color.b}) 不在任何调色板里 `
+      + '⇒ 既不是海拔层暗档(ELEV_BASE_RGB × SIDE_FACE_SHADE),也不是顶面材质表'
+      + '(`topColorOf` 的输出)(先着色再合并 / 插值会落在这里)';
   }
-  if (hit.isTop !== isTopByNormal) {
-    return `着色档与法线冲突:法线${isTopByNormal ? '朝上' : '水平'}却用了${hit.isTop ? '亮档' : '暗档'}`;
-  }
-  const wantLayer = elevLayerOfZ(blockZ);
-  if (hit.layer !== wantLayer) {
-    return `颜色层 ${hit.layer} ≠ 合并块 z=${blockZ} 的层 ${wantLayer} ⇒ 着色用了「某格」而不是「合并块」`;
+  if (isTopByNormal) {
+    if (material === null) {
+      return '着色档与法线冲突:法线朝上(顶面)的色必须来自**顶面材质表**,'
+        + `而 (${sample.color.r},${sample.color.g},${sample.color.b}) 不是材质色`
+        + `${hit === null ? '' : `(只匹配到海拔层第 ${hit.layer} 层的亮档 = 旧口径)`}`;
+    }
+  } else {
+    if (hit === null) {
+      return '着色档与法线冲突:法线水平(侧面)却用了顶面材质表的色 '
+        + `(${sample.color.r},${sample.color.g},${sample.color.b})⇒ 侧面只按海拔层着色`;
+    }
+    if (hit.isTop) {
+      return '着色档与法线冲突:法线水平(侧面)却用了亮档色 '
+        + `(${sample.color.r},${sample.color.g},${sample.color.b})`;
+    }
+    const wantLayer = elevLayerOfZ(blockZ);
+    if (hit.layer !== wantLayer) {
+      return `颜色层 ${hit.layer} ≠ 合并块 z=${blockZ} 的层 ${wantLayer} ⇒ 着色用了「某格」而不是「合并块」`;
+    }
   }
   let atBlock = 0;
   for (const z of sample.vertZ) {
@@ -392,13 +636,15 @@ export function lodFaceSemantics(sample: LodFaceSample): string | null {
  * ```
  * 法线  —— 必须**逐位相同**(只由面朝向定,与 merge 无关)
  * 颜色  —— 块 z 相同 ⇒ 必须**逐位相同**;
- *          块 z 不同 ⇒ **允许**不同,但必须恰好是 faceColor(elevLayerOfZ(新块 z), 朝向)
- *                      (即变化只能来自「合并块的主导 z 变了」,不能来自平均/插值)
+ *          块 z 不同 ⇒ **允许**不同,但:侧面必须恰好是 faceColor(elevLayerOfZ(新块 z), 侧面);
+ *                      顶面必须是顶面材质表里的色(由主导格材质定,不比对具体值)
+ *                      (即变化只能来自「主导 z / 主导材质变了」,不能来自平均/插值)
  * ```
  *
  * ★ 负对照:把某个面的颜色换成两块颜色的平均值 ⇒ 两条都可能撞红
- *   (不在调色板里 / 不等于 faceColor 的输出),而改成「用块内某格的 z 着色」
- *   会在 `lodFaceSemantics` 的「颜色层 ≠ 块层」那条上撞红。
+ *   (不在任何一张调色表里 / 不等于 faceColor 的输出),而改成「用块内某格的 z 着色」
+ *   会在**侧面**的「颜色层 ≠ 块层」那条上撞红(WS-FND-180 后顶面不再按层着色,
+ *   这一条只在侧面上可判定 —— 见 `lodFaceSemantics` 的注释)。
  */
 export function lodTwoLevelDelta(lo: LodFaceSample, hi: LodFaceSample): string | null {
   const loErr = lodFaceSemantics(lo);
@@ -431,12 +677,23 @@ export function lodTwoLevelDelta(lo: LodFaceSample, hi: LodFaceSample): string |
     }
     return null;
   }
-  const want = faceColor(elevLayerOfZ(zHi), hiTop);
+  /*
+   * ★ WS-FND-180:块 z 变了以后,两侧的规则不同 ——
+   *   · 侧面:色只由 (块 z, 朝向) 定 ⇒ 必须**恰好**是 faceColor(层(新块 z), 侧面);
+   *   · 顶面:色由合并块**主导格**(最高非空 z 那一格)的材质 base/floor 定,
+   *     主导格换了、色当然可以换 ⇒ 这里不比对具体值,只要求它仍落在**顶面材质表**里。
+   *     那句检查在函数开头对 `hi` 跑 `lodFaceSemantics` 时已经做过 ——
+   *     也就是说「平均值 / 插值色」在这一步之前就已经撞红,这里没有被放宽成
+   *     「顶面随便什么色都行」。缺材质信息时(`LodFaceSample` 不带 base/floor)
+   *     这是唯一还成立的那条。
+   */
+  if (hiTop) return null;
+  const want = faceColor(elevLayerOfZ(zHi), false);
   if (Math.abs(want.r - hi.color.r) > 1e-6
     || Math.abs(want.g - hi.color.g) > 1e-6
     || Math.abs(want.b - hi.color.b) > 1e-6) {
-    return `块 z 从 ${zLo} 变成 ${zHi} 时,颜色必须恰好是 faceColor(层 ${elevLayerOfZ(zHi)},`
-      + `${hiTop ? '顶面' : '侧面'}) = (${want.r},${want.g},${want.b}),实际 `
+    return `块 z 从 ${zLo} 变成 ${zHi} 时,侧面颜色必须恰好是 faceColor(层 ${elevLayerOfZ(zHi)},`
+      + `侧面) = (${want.r},${want.g},${want.b}),实际 `
       + `(${hi.color.r},${hi.color.g},${hi.color.b})`;
   }
   return null;
@@ -498,6 +755,10 @@ export const LOD_MERGE_MAX_DZ = 1;
  *    调色板色里(`lodPaletteOf` 能反查);插值色一般落在调色板**之外**
  *    ⇒ 两种口径在判据上可区分,不是风格问题。
  *
+ * ★ WS-FND-180 后「8 值查表」只描述**侧面**:顶面改成查**材质表**
+ *   (`BASE_TOP_RGB ∪ FLOOR_TOP_RGB`,见文件顶部)。口径本身没变 ——
+ *   仍是「查表、不插值」,插值色照样落在两张表之外。
+ *
  * ★ 只约束**顶点色**这一层;片元里的光照(兰伯特近似)与本常量无关。
  */
 export const LOD_COLOR_INTERPOLATION = 'STEP_BY_LAYER';
@@ -553,7 +814,7 @@ export function lodMergeVerdict(blockDz: number, threshold: number = LOD_MERGE_M
 
 /** 一个合并块在该口径下的顶点色(以及它抹掉了多少细节) */
 export interface LodBlockColor {
-  /** 阶跃色 = `faceColor(层, 朝向)`;**恒**落在调色板里 */
+  /** 阶跃色 = `faceColor(层, 朝向)`;**恒**落在海拔层调色板里(WS-FND-180 后这是侧面/层模型的值) */
   color: FaceColor;
   /** `elevLayerOfZ(块 z)` —— 唯一决定颜色的那个整数 */
   layer: number;
@@ -563,9 +824,13 @@ export interface LodBlockColor {
 }
 
 /**
- * 合并块的顶点色:**按层查调色板**(阶跃),不做任何插值。
- * 算法源与 `chunk_geometry.emitChunkGeometry` 的 `faceColor(elevLayerOfZ(块z), …)` 同一个,
- * 因此「这里算出来的色」与「几何里那个色」必须逐位相等(判据拿真实几何对账)。
+ * 合并块的**层模型**顶点色:**按层查调色板**(阶跃),不做任何插值。
+ * 算法源与 `chunk_geometry` 的**侧面**着色 `faceColor(elevLayerOfZ(块z), false)` 同一个。
+ *
+ * ★ WS-FND-180:顶面已改由 `topColorOf(层, base, floor)` 着色(见文件顶部)。
+ *   因此 `isTop = true` 时本函数给的是**海拔层亮档色** —— 它是 LOD 预算的**层模型**值,
+ *   不再等于真实几何里顶面的顶点色(那个还取决于格子的 `base`/`floor`)。
+ *   侧面(`isTop = false`)与真实几何仍逐位相等。
  *
  * 空块(无非空格)⇒ `null`:不建面,也就没有颜色。
  */

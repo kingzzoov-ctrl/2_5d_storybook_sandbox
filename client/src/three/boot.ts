@@ -28,7 +28,9 @@ import {
   syncTerrainCamera,
 } from './stage_assembly.ts';
 import { makeDemoWorld, WORLD_CELLS, WORLD_CHUNKS } from '../stage/demo_world.ts';
-import { CHUNK_SIZE, ELEV_TO_Z } from '../stage/tile_mesh.ts';
+/* ★ w85:画**设计过的世界** —— 与服务器同一张图(`shared/world/design.ts`)。 */
+import { CHUNK_SIZE, ELEV_TO_Z, type ChunkInput } from '../stage/tile_mesh.ts';
+import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../stage/design_world.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
 import {
   SPRITE_CELL_WORLD, SPRITE_CENTER_X, SPRITE_CENTER_Y,
@@ -308,9 +310,11 @@ export function boot(container: HTMLElement): BootHandle {
   /* ── 相机:35° 俯角 / 45° 方位角正交 ── */
   const isoCam: IsoCamera = createCamera(window.innerWidth, window.innerHeight);
   /* createCamera 的 focus 默认 (0,0) 是世界角落,不是中心 ——
-     不显式搬过去视野会偏到边上(实测偏右下)。 */
-  isoCam.focusX = WORLD_CELLS / 2;
-  isoCam.focusY = WORLD_CELLS / 2;
+  /* createCamera 的 focus 默认 (0,0) 是世界角落,不是中心 ——
+     不显式搬过去视野会偏到边上(实测偏右下)。
+     ★ w85:世界换成**设计图**(192×192,营地在中点)⇒ 焦点必须跟世界边长走 */
+  isoCam.focusX = DESIGN_WORLD_CELLS / 2;
+  isoCam.focusY = DESIGN_WORLD_CELLS / 2;
   const camera = buildOrthographicCamera(isoCam);
 
   /* ── 光:两盏方向光 + 环境光。等轴测下方向光比点光稳定 ── */
@@ -324,7 +328,19 @@ export function boot(container: HTMLElement): BootHandle {
 
   /* ── 地形 ── */
   const t0 = performance.now();
-  const chunks = makeDemoWorld();
+  /* ★ w85:**设计过的世界**,与服务器同一张图。
+     此前这里是 `makeDemoWorld()`(64×64 正弦起伏 + 一条河 + 地板槽位循环)——
+     那正是「地图小、一堆像素块、没设计」的字面来源。
+     失败时**回落 demo 并留痕**:静默回落会让「世界又变回像素块」看起来像
+     「设计没生效」,而那种缺陷不会报错。 */
+  const chunks: ChunkInput[] = (() => {
+    try {
+      return buildDesignChunks();
+    } catch (e) {
+      console.error('[terrain] 设计世界生成失败,回落到 demo:', e);
+      return makeDemoWorld();
+    }
+  })();
   const meshes: THREE.Mesh[] = [];
   let totalVerts = 0;
   let totalFaces = 0;

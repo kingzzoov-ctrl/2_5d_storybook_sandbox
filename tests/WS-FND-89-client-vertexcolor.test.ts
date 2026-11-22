@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 import { test, eq, ok, report } from '../shared/testing/harness.ts';
 
-import { packTile, Elevation } from '../shared/types/tile.ts';
+import { BaseFluid, Elevation, packTile } from '../shared/types/tile.ts';
 import { CHUNK_SIZE, type ChunkInput } from '../client/src/stage/tile_mesh.ts';
 import { emitChunkGeometry, validateChunkGeometry } from '../client/src/stage/chunk_geometry.ts';
 import {
@@ -106,17 +106,24 @@ function flatChunk(elev: number, key = 'c_flat'): ChunkInput {
 }
 
 /**
- * 两档海拔的 Chunk:右半抬高一层。
+ * 两档海拔的 Chunk:右半抬高一层,**两半的地表材质也不同**(GRASS / GOLD_SAND)。
  *
  * 为什么要单调海拔**不够**:全平的块只有顶面,顶点色只有一种取值 ——
  * 「颜色有没有被消费」在那种几何上分辨不出来(侧面亮度档不会出现)。
+ *
+ * ★ 为什么两半的 `base` 也要不同(WS-FND-180):顶面颜色已改由格子的
+ *   `base`/`floor` 决定(`terrain_vcolor.topColorOf`),不再由海拔层决定。
+ *   若两半都写 `base: 1`,顶面只有一种颜色、侧面只有高档那一侧的暗档 ⇒ 只剩 2 种取值,
+ *   这条「顶点色带信息」的判据就会误红(它测的是「颜色有没有分辨力」,不是「是否按层」)。
  */
 function steppedChunk(): ChunkInput {
   const tiles = new Uint32Array(CHUNK_SIZE * CHUNK_SIZE);
   for (let y = 0; y < CHUNK_SIZE; y += 1) {
     for (let x = 0; x < CHUNK_SIZE; x += 1) {
-      const elev = x < CHUNK_SIZE / 2 ? Elevation.GROUND : Elevation.PLATFORM;
-      tiles[y * CHUNK_SIZE + x] = packTile({ elev, base: 1, floor: 0, wire: 0, obj: 0, meta: 0 });
+      const left = x < CHUNK_SIZE / 2;
+      const elev = left ? Elevation.GROUND : Elevation.PLATFORM;
+      const base = left ? BaseFluid.GRASS : BaseFluid.GOLD_SAND;
+      tiles[y * CHUNK_SIZE + x] = packTile({ elev, base, floor: 0, wire: 0, obj: 0, meta: 0 });
     }
   }
   return { key: 'c_step', cx: 0, cy: 0, tiles };
@@ -204,7 +211,7 @@ test('2 颜色真的被消费:几何属性 → 着色器声明 → 片元,且顶
   for (let i = 0; i + 2 < arr.length; i += 3) {
     seen.add(`${arr[i]},${arr[i + 1]},${arr[i + 2]}`);
   }
-  ok(seen.size >= 3, `顶点色至少要有 3 种取值(两层 × 顶/侧;实测 ${seen.size})`);
+  ok(seen.size >= 3, `顶点色至少要有 3 种取值(两层 × 顶/侧 × 两种地表;实测 ${seen.size})`);
 
   /* ★ 负对照:同一个统计口径喂给**单调海拔**的块必须只剩 1 种取值 ——
      证明上面那个 `>= 3` 真的在分辨「带不带信息」,而不是恒真 */

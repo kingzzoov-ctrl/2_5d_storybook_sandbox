@@ -31,7 +31,7 @@
  */
 import { test, ok, eq, near, report } from '../shared/testing/harness.ts';
 import { CHUNK_SIZE, type ChunkInput, type EdgeContext } from '../client/src/stage/tile_mesh.ts';
-import { Elevation, packTile } from '../shared/types/tile.ts';
+import { BaseFluid, Elevation, packTile } from '../shared/types/tile.ts';
 import { emitChunkGeometry, type ChunkGeometry } from '../client/src/stage/chunk_geometry.ts';
 import {
   ELEV_BASE_RGB,
@@ -50,6 +50,8 @@ import {
   lodPaletteOf,
   lodTwoLevelDelta,
   mergedZOfFace,
+  topColorOf,
+  topMaterialPaletteOf,
   type FaceColor,
   type LodBlockId,
   type LodFaceSample,
@@ -94,9 +96,18 @@ function oneStepChunk(): TestChunk {
   return withCells('c_one', [[0, 0, Elevation.PLATFORM]]);
 }
 
-/** 块内高差**大于阈值**:(0,0) 抬到 CLIFF(z = 2),LOD1 的块 (0,0) 是 {2,0,0,0}。 */
+/**
+ * 块内高差**大于阈值**:(0,0) 抬到 CLIFF(z = 2),LOD1 的块 (0,0) 是 {2,0,0,0}。
+ *
+ * ★ WS-FND-180:抬高的那一格地表改 `GOLD_SAND`(其余 GRASS)—— 顶面已按格子的材质着色,
+ *   两格材质相同的话「块 z 变了 ⇒ 顶面色也变」这条对照会退化成恒真(见 FND101-5)。
+ */
 function twoStepChunk(): TestChunk {
-  return withCells('c_two', [[0, 0, Elevation.CLIFF]]);
+  const c = withCells('c_two', [[0, 0, Elevation.CLIFF]]);
+  c.tiles[0] = packTile({
+    elev: Elevation.CLIFF, base: BaseFluid.GOLD_SAND, floor: 0, wire: 0, obj: 0, meta: 0,
+  });
+  return c;
 }
 
 /** 块内高差 3:CLIFF(2) 与 DEEP(−1) 落在同一个 LOD1 块里。 */
@@ -348,15 +359,32 @@ test('FND101-5 两档 LOD:块 z 相同 ⇒ 颜色逐位相同;块 z 变了 ⇒ �
   eq(lodTwoLevelDelta(flatTop0, flatTop1), null, '平坦地形两档:必须一致');
   eq([flatTop1.color.r, flatTop1.color.g, flatTop1.color.b],
     [flatTop0.color.r, flatTop0.color.g, flatTop0.color.b], '块 z 相同 ⇒ 顶点色逐位相同(float32 后也一样)');
-  near(flatTop1.color.r, 0.42, 1e-6, 'GROUND 亮档 r');
-  near(flatTop1.color.g, 0.62, 1e-6, 'GROUND 亮档 g');
-  near(flatTop1.color.b, 0.36, 1e-6, 'GROUND 亮档 b');
+  /*
+   * 平坦块是 GROUND + GRASS:顶面 = GRASS **材质**色,恰好与 GROUND 基色同值(0.42/0.62/0.36)。
+   *
+   * ★ WS-FND-180:下面两组断言的分工要说清 ——
+   *   · `colorOf([0,0,0,0], true)` 是**层模型**的值(`lodBlockColor` = `faceColor(层, true)`),
+   *     它代表「按层查表」那条路径,**不再**代表真实几何的顶面色;
+   *   · 真实几何的顶面色是**材质**色(`topColorOf`)⇒ 另外断言它的材质身份。
+   *   两者在这里同值纯属 GROUND 与 GRASS 撞色,不是「顶面还按层着色」。
+   */
+  near(flatTop1.color.r, 0.42, 1e-6, 'GRASS 顶面 r');
+  near(flatTop1.color.g, 0.62, 1e-6, 'GRASS 顶面 g');
+  near(flatTop1.color.b, 0.36, 1e-6, 'GRASS 顶面 b');
+  eq(topMaterialPaletteOf(flatTop1.color) !== null, true, '顶面必须是顶面材质表里的色');
   /* 与「按块 z 查表」的结果一致(几何色经 float32 落盘,故用 near 而非逐位) */
-  near(flatTop1.color.r, colorOf([0, 0, 0, 0], true).r, 1e-6, '几何色 = 阶跃查表色 r');
-  near(flatTop1.color.g, colorOf([0, 0, 0, 0], true).g, 1e-6, '几何色 = 阶跃查表色 g');
-  near(flatTop1.color.b, colorOf([0, 0, 0, 0], true).b, 1e-6, '几何色 = 阶跃查表色 b');
+  near(flatTop1.color.r, colorOf([0, 0, 0, 0], true).r, 1e-6, '顶面 r 与层模型值一致(GROUND/GRASS 撞色)');
+  near(flatTop1.color.g, colorOf([0, 0, 0, 0], true).g, 1e-6, '顶面 g 与层模型值一致(GROUND/GRASS 撞色)');
+  near(flatTop1.color.b, colorOf([0, 0, 0, 0], true).b, 1e-6, '顶面 b 与层模型值一致(GROUND/GRASS 撞色)');
 
-  /* 台阶:LOD0 的 z=0 顶面 → LOD1 覆盖它的合并块主导 z=2 ⇒ 允许变色,但必须按规则 */
+  /*
+   * 台阶:LOD0 的 z=0 顶面(GROUND + GRASS)→ LOD1 覆盖它的合并块主导 z=2、主导格 (0,0)
+   * (CLIFF + **GOLD_SAND**)⇒ 允许变色,但只能按「主导格」规则变。
+   *
+   * ★ WS-FND-180:顶面色由**主导格材质**定 ⇒ 这一对的色差来自材质(GRASS → GOLD_SAND),
+   *   不再是海拔层。断言随之换成新契约:色必须落在材质表里、且必须等于
+   *   `topColorOf(层, 主导格 base, 主导格 floor)`;平均值/插值色仍被面级自检挡住(见负对照)。
+   */
   const step0 = facesOf(emitChunkGeometry(twoStepChunk(), 0));
   const step1 = facesOf(emitChunkGeometry(twoStepChunk(), 1));
   const lowTop = step0.find((f) => isTopFace(f) && mergedZOfFace(f.vertZ) === 0);
@@ -364,12 +392,19 @@ test('FND101-5 两档 LOD:块 z 相同 ⇒ 颜色逐位相同;块 z 变了 ⇒ �
   ok(lowTop !== undefined, 'LOD0 要有 z=0 的顶面');
   ok(highTop !== undefined, 'LOD1 的合并块主导 z 应为 2(块内最高非空 z)');
   if (lowTop === undefined || highTop === undefined) return;
-  eq(lodTwoLevelDelta(lowTop, highTop), null, '块 z 变了 ⇒ 颜色按 faceColor(层(新块 z), 朝向) 变');
+  eq(lodTwoLevelDelta(lowTop, highTop), null, '块 z 变了 ⇒ 顶面色按「主导格材质」规则变');
   ok(!sameColor(lowTop.color, highTop.color), '这一对确实是「颜色变了」的样本(不是退化对照)');
-  eq(lodPaletteOf(highTop.color), { layer: 3, isTop: true });
-  near(highTop.color.r, 0.56, 1e-6, 'CLIFF 亮档 r');
-  near(highTop.color.g, 0.52, 1e-6, 'CLIFF 亮档 g');
-  near(highTop.color.b, 0.54, 1e-6, 'CLIFF 亮档 b');
+  eq(lodPaletteOf(highTop.color), null, '沙色**不是**海拔层色(顶面已按材质着色)');
+  eq(topMaterialPaletteOf(highTop.color) !== null, true, '合并块顶面必须是材质色');
+  const want = topColorOf(elevLayerOfZ(2), BaseFluid.GOLD_SAND, 0);
+  near(highTop.color.r, 0.82, 1e-6, 'GOLD_SAND 材质色 r(字面量)');
+  near(highTop.color.g, 0.74, 1e-6, 'GOLD_SAND 材质色 g(字面量)');
+  near(highTop.color.b, 0.46, 1e-6, 'GOLD_SAND 材质色 b(字面量)');
+  near(highTop.color.r, want.r, 1e-6, '几何色 = topColorOf 的 r');
+  near(highTop.color.g, want.g, 1e-6, '几何色 = topColorOf 的 g');
+  near(highTop.color.b, want.b, 1e-6, '几何色 = topColorOf 的 b');
+  ok(Math.abs(highTop.color.r - faceColor(elevLayerOfZ(2), true).r) > 1e-6,
+    '顶面不得再按海拔层着色(z=2 顶面是沙色,不是 CLIFF 亮档)');
 
   /* ★ 负对照:把 LOD1 那一面换成「块内线性平均色」⇒ 两条判据同时红 */
   const averaged: LodFaceSample = {

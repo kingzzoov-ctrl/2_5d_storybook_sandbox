@@ -70,11 +70,13 @@ import {
   lodPaletteOf,
   lodTwoLevelDelta,
   mergedZOfFace,
+  topColorOf,
+  topMaterialPaletteOf,
   type FaceColor,
   type LodFaceSample,
 } from '../client/src/stage/terrain_vcolor.ts';
 import { assembleChunkGeometry } from '../client/src/three/compat.ts';
-import { Elevation, packTile } from '../shared/types/tile.ts';
+import { BaseFluid, Elevation, packTile } from '../shared/types/tile.ts';
 
 /* ═══════════════════════ 0. 夹具 ═══════════════════════ */
 
@@ -125,14 +127,20 @@ function flatChunk(): TestChunk {
 }
 
 /**
- * 台阶地形:只有 (0,0) 一格抬到 CLIFF(z = 2),其余 GROUND(z = 0)。
+ * 台阶地形:只有 (0,0) 一格抬到 CLIFF(z = 2)且地表是 **GOLD_SAND**,其余 GROUND + GRASS。
  *
- * ⇒ LOD0 里 (1,0) 的顶面是层 1(z=0),而 LOD1 里覆盖 (0..1, 0..1) 的那个合并块
- *   主导 z = 2 ⇒ 层 3。这正是「颜色允许随 LOD 变,但只能按主导 z 规则变」的样本。
+ * ⇒ LOD0 里 (0,0) 的顶面是沙色、(1,0) 的顶面是草色;LOD1 里覆盖 (0..1, 0..1) 的那个
+ *   合并块主导 z = 2、**主导格就是 (0,0)** ⇒ 顶面也必须是沙色。
+ *   这正是「颜色允许随 LOD 变,但只能按**主导格**规则变」的样本。
+ *
+ * ★ WS-FND-180:两格的 `base` 必须不同 —— 顶面已按材质着色,若两格都是 GRASS,
+ *   两档 LOD 下顶面同色,「颜色变了」那条对照会退化成恒真(旧版靠海拔层差异凑出这个差)。
  */
 function steppedChunk(): TestChunk {
   const tiles = emptyTiles();
-  tiles[0] = packTile({ elev: Elevation.CLIFF, base: 1, floor: 0, wire: 0, obj: 0, meta: 0 });
+  tiles[0] = packTile({
+    elev: Elevation.CLIFF, base: BaseFluid.GOLD_SAND, floor: 0, wire: 0, obj: 0, meta: 0,
+  });
   return { key: 'c_step', cx: 0, cy: 0, tiles };
 }
 
@@ -429,7 +437,12 @@ test('FND96-7 真实几何 LOD0/1/3(平坦 + 台阶):每面的颜色与法线都
     }
   }
   ok(checked > 0, '一个面都没查 ⇒ 判据是恒真的');
-  /* 平坦地形:顶面颜色 = 层 1 的亮档(字面量:GROUND 基色 × TOP_FACE_SHADE) */
+  /*
+   * 平坦地形(全 GRASS + GROUND):顶面 = **GRASS 材质色**。
+   * ★ `lodPaletteOf` 在这里仍给 {layer:1,isTop:true} 纯属**两张表同值**:
+   *   GRASS 的材质色与 GROUND 的基色都是 (0.42,0.62,0.36)。所以下面**两条都要断言** ——
+   *   只查海拔层调色板的话,「顶面按层着色」的旧实现照样全绿(这正是 WS-FND-180 的由来)。
+   */
   const flatTop = facesOf(emitChunkGeometry(flatChunk(), 0)).find((f) => isTopFace(f));
   ok(flatTop !== undefined, '平坦地形必须有顶面');
   if (flatTop === undefined) return;
@@ -452,7 +465,15 @@ test('FND96-8 两档 LOD:平坦 ⇒ 颜色与法线逐位相同;台阶 ⇒ 颜�
   eq([flat1.normal.x, flat1.normal.y, flat1.normal.z], [flat0.normal.x, flat0.normal.y, flat0.normal.z],
     '法线只由朝向定 ⇒ 两档逐位相同');
 
-  /* 台阶:LOD0 的 (1,0) 是 GROUND(z=0),LOD1 覆盖它的合并块主导 z = 2 ⇒ 允许变色,但按规则 */
+  /*
+   * 台阶:LOD0 的 (0,0) 是 CLIFF + **GOLD_SAND**(z=2),其余是 GROUND + GRASS(z=0)。
+   * LOD1 覆盖 (0..1, 0..1) 的合并块主导 z = 2、主导格就是 (0,0) ⇒ 允许变色,但只能按规则。
+   *
+   * ★ WS-FND-180:顶面色由**主导格材质**定,所以这一对的色差来自「主导格从 GRASS
+   *   换成了 GOLD_SAND」,不再来自「海拔层从 GROUND 变成 CLIFF」。断言随之换成新契约:
+   *   两档对照仍必须 null,两个色都必须落在**顶面材质表**里,且合并块的色必须等于
+   *   `topColorOf(层, 主导格 base, 主导格 floor)` —— 平均值/插值色两条都过不了。
+   */
   const step0 = facesOf(emitChunkGeometry(steppedChunk(), 0));
   const step1 = facesOf(emitChunkGeometry(steppedChunk(), 1));
   const lowTop = step0.find((f) => isTopFace(f) && mergedZOfFace(f.vertZ) === 0);
@@ -460,15 +481,25 @@ test('FND96-8 两档 LOD:平坦 ⇒ 颜色与法线逐位相同;台阶 ⇒ 颜�
   ok(lowTop !== undefined, 'LOD0 要有 z=0 的顶面');
   ok(highTop !== undefined, 'LOD1 的合并块主导 z 应为 2(块内最高非空 z)');
   if (lowTop === undefined || highTop === undefined) return;
-  eq(lodTwoLevelDelta(lowTop, highTop), null, '块 z 变了 ⇒ 颜色按 faceColor(层(新块z), 朝向) 变');
+  eq(lodTwoLevelDelta(lowTop, highTop), null, '块 z 变了 ⇒ 顶面色按「主导格材质」规则变');
   ok(!sameColor(lowTop.color, highTop.color), '这一对确实是「颜色变了」的样本(不是退化对照)');
-  eq(lodPaletteOf(lowTop.color), { layer: 1, isTop: true }, 'LOD0 的 z=0 顶面是层 1 亮档');
-  eq(lodPaletteOf(highTop.color), { layer: 3, isTop: true }, 'LOD1 合并块的 z=2 顶面是层 3 亮档');
-  /* 颜色**必须**等于用合并块 z 算出来的那个值(不是两格颜色的平均) */
-  const want = faceColor(elevLayerOfZ(2), true);
+  /* LOD0 的 (1,0):GROUND + GRASS。字面量 0.42/0.62/0.36,不引用被测常量 */
+  eq(lodPaletteOf(lowTop.color), { layer: 1, isTop: true }, 'LOD0 的 z=0 顶面(GROUND + GRASS)');
+  eq(topMaterialPaletteOf(lowTop.color) !== null, true, 'LOD0 的顶面必须是材质色(GRASS)');
+  near(lowTop.color.r, 0.42, 1e-6, 'GRASS 顶面 r');
+  near(lowTop.color.g, 0.62, 1e-6, 'GRASS 顶面 g');
+  near(lowTop.color.b, 0.36, 1e-6, 'GRASS 顶面 b');
+  /* LOD1 的合并块:主导格 (0,0) 是 GOLD_SAND ⇒ 顶面必须是沙色(不是两格平均、也不是层色) */
+  eq(topMaterialPaletteOf(highTop.color) !== null, true, 'LOD1 合并块的顶面必须是材质色');
+  const want = topColorOf(elevLayerOfZ(2), BaseFluid.GOLD_SAND, 0);
+  near(want.r, 0.82, 1e-6, 'GOLD_SAND 材质色的 r 是字面量 0.82');
   near(highTop.color.r, want.r, 1e-6, '合并块色 r');
   near(highTop.color.g, want.g, 1e-6, '合并块色 g');
   near(highTop.color.b, want.b, 1e-6, '合并块色 b');
+  /* ★ 直接反证「顶面不再按海拔层着色」:层 3 的亮档是 (0.56,0.52,0.54),沙色不是它 */
+  const elevTop = faceColor(elevLayerOfZ(2), true);
+  ok(Math.abs(highTop.color.r - elevTop.r) > 1e-6,
+    '顶面不得再按海拔层着色(z=2 顶面是沙色,不是 CLIFF 亮档)');
   /* 负对照:把 LOD1 的合并色换成"两块平均" ⇒ 判据必须红 */
   const avg: FaceColor = {
     r: (lowTop.color.r + highTop.color.r) / 2,
@@ -513,10 +544,23 @@ test('FND96-9 负对照与注入:平均色不在调色板;用「某格 z」着�
   ok(errUnit !== null, '注入 D2:非单位法线必须红');
   ok((errUnit ?? '').includes('单位向量'), `注入 D2 的红要指到单位向量:${String(errUnit)}`);
 
-  /* 注入 A:用「块内另一格的 z」着色(等价于块内逐格着色)= 层号与块 z 不符 */
-  const injectedLayer: LodFaceSample = { ...topZ0, color: faceColor(elevLayerOfZ(1), true) };
+  /*
+   * 注入 A:用「块内另一格的 z」着色(= 块内逐格着色)⇒ 色所属的层与块 z 不符。
+   *
+   * ★ WS-FND-180 后这条**只能在侧面上判**:顶面色已由格子的 `base`/`floor` 决定
+   *   (`topColorOf`),与海拔层无关 ⇒「层号不符」在顶面上不再可判定
+   *   (见 `terrain_vcolor.lodFaceSemantics` 的注释)。侧面仍严格按
+   *   `elevLayerOfZ(块 z)` 着色 ⇒ 判据的牙齿没有丢,只是换了可判定的那一面。
+   */
+  const sideAtZ1: LodFaceSample = {
+    vertZ: [1, 1, 1, 1],
+    normal: { x: 0, y: 1, z: 0 },
+    color: faceColor(elevLayerOfZ(1), false),
+  };
+  eq(lodFaceSemantics(sideAtZ1), null, '正对照:z=1 块的侧面用层 2 的暗档 ⇒ 自洽');
+  const injectedLayer: LodFaceSample = { ...sideAtZ1, color: faceColor(elevLayerOfZ(0), false) };
   const errLayer = lodFaceSemantics(injectedLayer);
-  ok(errLayer !== null, '注入 A:用 z=1 的层去着 z=0 的块必须红');
+  ok(errLayer !== null, '注入 A:用 z=0 的层去着 z=1 的块必须红');
   ok((errLayer ?? '').includes('颜色层'), `注入 A 的红要指到颜色层:${String(errLayer)}`);
 
   /* 注入 B:顶面却用侧面(暗档)颜色 —— 法线朝上,着色档却是侧面 */
