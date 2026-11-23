@@ -487,6 +487,15 @@ export const CLIENT_ENTRY_LEDGER: readonly ClientEntryRow[] = [
       + '为什么不让既有 `F`(拾取)改道:同一个理由 —— 客户端**判不出**'
       + '「面前有没有可采集物」,让一个键两义就是拿一次按键去猜。',
   },
+  {
+    action: 'NPC_TALK', serverPath: 'net/actions/npc_talk.ts(★ WS-FND-188 新增)',
+    entry: 'T(靠近 NPC 时;net/action_entry.npcTalk)',
+    status: ClientEntryStatus.WIRED,
+    reason: '★ WS-FND-188 补:`T` 在**附近 2.5 格内有 NPC** 时走这一条(键位与 `USE_ITEM` '
+      + '共用 —— 距离判定在 `three/boot.ts#nearbyNpc`,HUD 那一行会说清"走开之后这个键'
+      + '仍是使用道具");报文经 `net/action_entry.npcTalk` 走**同一条**三支分流。'
+      + '台词随回执的 `effect.line` 回到 HUD(台词由服务端 `dialogue.talk` 按任务状态选)。',
+  },
   /* ── ★ WS-FND-145:剩下的 8 条**全部**裁决为「服务端已实现、客户端刻意不提供」──
      逐条的「为什么」与「解锁它的那一件事」在 `CLIENT_ENTRY_HOLDS`(同一份数据;
      别在这里再写一遍 —— 两处写同一段理由,迟早漂成两句不同的话)。 */
@@ -755,6 +764,9 @@ export const CLIENT_ENTRY_WITNESS: Readonly<Record<string, string>> = {
   /* ★ WS-FND-151:设模式(模式面板)。见证片段取**构建器里的动作名** —— 定义行
      永远存在,等于没有声明"接上了";这里要求的是"真的有一条报文叫这个名字"。 */
   SET_PARTY_MODE: "action: 'SET_PARTY_MODE'",
+  /* ★ WS-FND-188:与 NPC 说话。见证取**构建器里的动作名**(同上:定义行永远存在,
+     等于没声明"接上了")。 */
+  NPC_TALK: "action: 'NPC_TALK'",
 };
 
 /** 某动作的见证片段(`''` = 它应当仍是 `missing`:客户端代码里一次都不该出现) */

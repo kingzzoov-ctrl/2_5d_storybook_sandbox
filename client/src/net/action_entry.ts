@@ -258,6 +258,18 @@ export interface GatherInput {
 }
 
 /**
+ * `NPC_TALK` 的入参(★ WS-FND-188)。
+ *
+ * `npcId` 取**服务端下发的那张表**里的 `id`(`NpcWireDef.id`,
+ * 见 `client/src/three/boot.ts` 的 `nearbyNpc`),不是客户端自己编的编号 ——
+ * 服务端只认得 `server/src/npc/defs.ts` 里的 id,编一个只会换来一条 INVALID。
+ */
+export interface NpcTalkInput {
+  /** NPC 的稳定 id(非空字符串)。 */
+  npcId?: unknown;
+}
+
+/**
  * `SET_PARTY_MODE` 的入参(★ WS-FND-151)。
  *
  * `partyMode` 是**冻结层 `PARTY_MODES` 的 key**(`BRIDGE_CTF` 等),不是下标 ——
@@ -603,6 +615,26 @@ export function gatherRequest(input: GatherInput = {}): BuildOutcome {
 }
 
 /**
+ * `NPC_TALK` —— 与身边那个 NPC 说话(★ WS-FND-188)。
+ *
+ * ## 本层只做一件事:把 `npcId` 原样送上
+ * 「附近有没有人」「够不够近」由**两端各自**判:客户端判是为了给 HUD 那一行提示
+ * (`three/boot.ts` 的 `nearbyNpc`),服务端判是**授权**(`net/actions/npc_talk.ts`
+ * 用权威坐标重算)。⇒ 这里不预判"能不能说" —— 预判一次就是第二份距离口径,
+ * 而两份距离口径的偏差只表现为"按了没反应"。
+ */
+export function npcTalkRequest(input: NpcTalkInput = {}): BuildOutcome {
+  const id = input.npcId;
+  if (typeof id !== 'string' || id.length === 0) {
+    return {
+      ok: false,
+      reason: 'NPC_TALK 需要 npcId(非空字符串:服务端下发的那张 NPC 表里的 id)',
+    };
+  }
+  return { ok: true, request: { action: 'NPC_TALK', payload: { npcId: id } } };
+}
+
+/**
  * `SET_PARTY_MODE` —— **设模式**(改的是全房"这一局玩什么",不是开局)。
  *
  * ## 与 `START_PARTY` 的分工(别弄反)
@@ -649,6 +681,9 @@ const LABELS: Readonly<Record<string, string>> = {
   GATHER: '采集',
   /* ★ WS-FND-151:模式面板选完模式后,回执那一行读作「派对模式 → 已发」/「派对模式 ✗ ...」 */
   SET_PARTY_MODE: '派对模式',
+  /* ★ WS-FND-188:与 NPC 说话。没有这一行,被拒时状态行会显示原始动作名
+     (`NPC_TALK ✗ ...`),对玩家等于没提示。 */
+  NPC_TALK: '与 NPC 说话',
 };
 
 /** 把载荷压成一小段可读文本(对象/数组跳过 —— 一行 HUD 塞不下嵌套明细)。 */
@@ -793,6 +828,17 @@ export class ActionEntry {
    */
   gather(input: GatherInput = {}): EntryOutcome {
     return this.submit(gatherRequest(input));
+  }
+
+  /**
+   * 与 NPC 说话(★ WS-FND-188):把 `npcId` 送上去,台词随回执的 `effect.line` 回来。
+   *
+   * ⚠️ 本方法**不判**"附近有没有人":那是**输入层**的事(它才知道玩家在哪、
+   * 键位现在归谁)—— 见 `main.ts` 的 `T` 分支与 `three/boot.ts#nearbyNpc`。
+   * 这里只负责让那一条报文走**同一条**三支分流(参数不对 / 未连接 / 发)。
+   */
+  npcTalk(input: NpcTalkInput = {}): EntryOutcome {
+    return this.submit(npcTalkRequest(input));
   }
 
   /**

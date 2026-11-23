@@ -65,7 +65,9 @@ test('FND154-1 ★ ACTION_HANDLERS 的键集与 `RoomAction` **逐键一致**,�
   ok(fromRoom.includes('GATHER'), 'RoomAction 里必须有 GATHER');
   eq(lookupActionHandler(RoomAction.GATHER), gather, '★ GATHER 登记的必须是真处理器(不是占位)');
   eq(ACTION_PERMISSION.GATHER, 'baseline', '采集是基础生存动作(游客也能采)');
-  eq(Object.keys(RoomAction).length, 25, '动作总数 = 25(24 + GATHER;数字与 PLAY.md 对齐)');
+  /* ★ WS-FND-188:`NPC_TALK` 进来后是 26(25 + NPC_TALK)。数字与 `RoomAction` 同步,
+     它是"动作面又长了一条"的**显式**信号(逐键一致那条断言在 FND154-1 的第一段)。 */
+  eq(Object.keys(RoomAction).length, 26, '动作总数 = 26(25 + NPC_TALK;数字与 PLAY.md 对齐)');
   /* 负对照:每个键都能查到处理器(不存在「表里有键、值是 undefined」的形态)。 */
   for (const a of fromRoom) {
     ok(typeof lookupActionHandler(a as never) === 'function', `${a} 的处理器必须是函数`);

@@ -364,7 +364,9 @@ test('FND138-7 逐动作覆盖 `RoomAction`,并逐条与**真源码**对账(wire
      已经落地 ⇒ 这里按**实测**记 17/7,而不是继续钉 16/8。
      (钉旧数的代价不是"数字难看":它会逼着后来者把已接的入口写回 missing,
      已经落地 ⇒ 这里按**实测**记 18/7,而不是继续钉 17/7。
-  eq(wired, 18, '已接线 18 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 5 + 模式面板 1)');
+     ★ WS-FND-188:`NPC_TALK` 又接上一条(`T` 在 NPC 旁边时 + `net/action_entry.npcTalk`)
+     ⇒ 按**实测**记 19/7。) */
+  eq(wired, 19, '已接线 19 条(字母表 6 + ACTION_KEYS 4 + 专用报文 2 + 热键 5 + 模式面板 1 + NPC 说话 1)');
   eq(missing, 7, '登记"服务端有、客户端零入口"7 条(SET_PARTY_MODE 已于 WS-FND-151 接线)');
   eq(CLIENT_ENTRY_LEDGER.length, actions.length, '台账条数 = RoomAction 键数(两者派生,不写死)');
 

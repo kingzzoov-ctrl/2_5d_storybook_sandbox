@@ -795,6 +795,20 @@ export type WsRoomLike = {
     versions: Record<string, number>;
   };
   /**
+   * ★ WS-FND-188:**静态 NPC 表编成的一帧**(可选)—— `hello`/`welcome` 之后发**一次**。
+   *
+   * ## 为什么返回的是**字节**而不是 NPC 列表
+   * 与 `terrainDeltaFor` 同一条分工:编码归协议层(`shared/net/delta.ts` 的
+   * `encodeNpcFrame`),房间只回答"这份表长什么样"。运输层**不 import**
+   * `npc/defs.ts`(它不知道 NPC 是什么,只搬字节)。
+   *
+   * ## 为什么是可选成员
+   * 与 `terrainDeltaFor` 逐字同一取舍:`WsRoomLike` 是本文件的**结构化最小接口**,
+   * 单机演示房 / 部分测试桩没有静态 NPC 表 ⇒ 不实现 = 这条通道**整段不发**
+   * (既不假装发过,也不报错)。差量快照通道因此逐字不变。
+   */
+  npcFrame?(): Uint8Array;
+  /**
    * 加入房间。**凭证必传**(`token`),房间负责验签 —— 运输层不自己造一份校验实现
    * ("不造第二份口径"):密钥在房间里,运输层没有它也**不该**有。
    *
@@ -911,6 +925,22 @@ export type WsServerHandle = {
    * ⇒ 没有这个数,「地形通道一直抛错」在外部与"没有块变化"**完全同形**。
    */
   terrainErrors(): number;
+  /**
+   * ★ WS-FND-188:已写出的 **NPC 帧**数(单调;与 `terrainFramesSent` 分开计)。
+   *
+   * 为什么要有它:NPC 表是**第三条**通道 —— 「快照在发 / 地形在发」都不能推出
+   * 「NPC 表到了」。设计上每连接恰好一帧 ⇒ 这个数 ≈ 握手成功次数;
+   * 它恒 0 而 `connCount > 0` 时,缺陷正是"世界里没有人"(客户端**不会报错**)。
+   */
+  npcFramesSent(): number;
+  /**
+   * ★ WS-FND-188:`npcFrame()` **抛错**的次数。
+   *
+   * 与「房间没实现 `npcFrame`」**必须分得开**:后者是"没有这件事"(不发、不报错、
+   * 不计数,与 `terrainDeltaFor` 同取舍),前者是"实现了但坏了" ——
+   * 两者在外部若同形,排障方向会指错(本仓反复记的「症状名 ≠ 成因名」)。
+   */
+  npcFrameErrors(): number;
   /** 最近收到的上行载荷(**已剥 tag**)—— 供断言证明剥对了。 */
   lastUplink(): Uint8Array | null;
   /**
@@ -1118,6 +1148,9 @@ export type WsLogCategory =
      它必须有自己的类别。混进 'step' 或 'write' 会让「快照没发」与
      「块没发」在日志里同形(判据只能靠子串猜,那正是这个类型在治的病)。 */
   | 'terrain'
+  /* ★ WS-FND-188:NPC 表是**第三条**通道(一次性、静态)⇒ 同理给它自己的类别:
+     混进 'terrain' 会让「地形没发」与「NPC 表没发」在日志里同形。 */
+  | 'npc'
   | 'misc';
 
 /** 每行日志末尾附的**计数快照**(叶子是单调累加量,不是"最近一次")。 */
@@ -1203,6 +1236,11 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
   let terrainFramesSent = 0;
   let lastTerrainBytes = 0;
   let terrainErrors = 0;
+  /* ★ WS-FND-188:NPC 通道的两个计数(**与地形那三个并列,不合并**)。
+     `npcFramesSent` = 真的写进 socket 的 NPC 帧数(设计上每连接恰好 1 帧);
+     `npcFrameErrors` = `npcFrame()` 抛错的次数("房间实现了但坏了"与"房间没实现"必须分得开)。 */
+  let npcFramesSent = 0;
+  let npcFrameErrors = 0;
   /** 下一轮地形下发的**最早时刻**(墙钟;见 `TERRAIN_RESEND_MIN_INTERVAL_MS`)。 */
   let nextTerrainAtMs = 0;
   /** 待握手连接数上限(默认 `MAX_PENDING_HELLO_CONNS`)。 */
@@ -1478,6 +1516,40 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       lastTerrainBytes = frame.byteLength;
     }
     return sent;
+  };
+
+  /* ══════════ ★ WS-FND-188:NPC 表的**一次性**下发 ══════════
+   *
+   * ## 时机:握手成功那一刻,恰好一次
+   * 顺序 = `welcome`(JSON)→ 首帧快照(裸字节)→ 地形突发 → **NPC 帧**。
+   * ```text
+   * 为什么不放在 `welcome` 之前:客户端在 `welcome` 里才拿到 `playerId` 并进 `live`,
+   *   早于它下发的静态数据没有消费者(与"快照必须在 welcome 之后"同一条纪律)。
+   * 为什么不放在广播循环里:NPC 是**静态**的 —— 每帧重发一遍是纯浪费带宽,
+   *   而且会让"表变了"与"帧号变了"两件事混在一起(客户端无从判断内容是否更新)。
+   * ```
+   * ## 房间没实现(单机演示房 / 测试桩)⇒ 整段跳过
+   * 与 `terrainDeltaFor` 同取舍:**不发、不报错、不计数**(那是"没有这件事",
+   * 不是"静默失败")。房间实现了却抛错 ⇒ 计数 + 日志,并**不关连接**
+   * (静态表坏一帧不该把刚握手的人踢掉)。
+   *
+   * ⚠️ 与地形不同:**不排队**。一帧就是整张表(4 个 NPC ≈ 200 字节),
+   * 远在 socket 的 highWaterMark 之下 ⇒ 引队列只会多一个可以积压的状态。
+   */
+  const pushNpcFrame = (c: WsConn): boolean => {
+    const make = opts.room.npcFrame;
+    if (typeof make !== 'function') return false;
+    let frame: Uint8Array;
+    try {
+      frame = make.call(opts.room);
+    } catch (e) {
+      npcFrameErrors += 1;
+      log('npc', `npcFrame 抛错(本次不下发 NPC 表):${(e as Error).message}`);
+      return false;
+    }
+    sendBinary(c, frame);
+    npcFramesSent += 1;
+    return true;
   };
 
   /* ── HTTP upgrade 握手 ── */
@@ -1869,6 +1941,10 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
           这里只发 `TERRAIN_JOIN_BURST_FRAMES` 帧,其余按轮次从队列里排出去
           (见广播循环里的 `pushTerrain`)。 */
     pushTerrain(c, TERRAIN_JOIN_BURST_FRAMES);
+    /* ★ WS-FND-188:NPC 表**紧跟地形突发**下发(整张静态表,一帧,仅此一次)。
+       顺序上它是最后一步:在此之前客户端还没有 `playerId`(welcome)、
+       也没有世界(首帧快照)—— 静态数据早到只能等着,而顺序错时**没有任何东西会红**。 */
+    pushNpcFrame(c);
   }
 
 /**
@@ -2153,6 +2229,9 @@ function onMove(c: WsConn, msg: {
     terrainFramesSent: (): number => terrainFramesSent,
     lastTerrainBytes: (): number => lastTerrainBytes,
     terrainErrors: (): number => terrainErrors,
+    /* ★ WS-FND-188:NPC 通道的两个读数(与地形那三个并列 —— 两条通道分开计)。 */
+    npcFramesSent: (): number => npcFramesSent,
+    npcFrameErrors: (): number => npcFrameErrors,
     lastUplink: (): Uint8Array | null => lastUplink,
     /* ★ 2026-11-14(分片 2)上行解析的累计计数 + 最近结果。
        两个计数**分开** ⇒ 可分别断言"该接的接住了 / 该拦的拦住了"。 */

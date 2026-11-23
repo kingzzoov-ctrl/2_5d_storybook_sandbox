@@ -38,7 +38,7 @@
 import { TICK_HZ, DT, SIM_DT, SLOW_DT, BASE_MOVE_SPEED, secondsToTicks } from '../../../shared/types/physics.ts';
 /* ★ WS-FND-185:每格群系。**只读设计意图**(12 个区 → `REGION_BIOME` → 8 个群系键),
    不读世界本身 —— 与 `regionAt` 同一份事实源,刷怪不会自己发明第二张群系地图。 */
-import { biomeAt } from '../../../shared/world/design.ts';
+import { biomeAt, regionAt } from '../../../shared/world/design.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
 /* ★ WS-FND-164:`encodeRoofRle` / `decodeRoofRle` 是屋顶旁路层的**唯一**编解码器
@@ -292,6 +292,22 @@ import '../wiring/components.ts';
    夜行怪刷新门、世界钟全用它)—— 这里只借用,不重写,也不另带一份边界数值。 */
 import { isNight as isNightAtClock } from '../wiring/components.ts';
 import { EventBus } from '../events/bus.ts';
+/* ★ WS-FND-189:主线六步的**总线协议**(事件名 + 负载形状)由 `quests/mainline_wiring.ts`
+   一处持有 —— `sim` 在这里只当**生产者**:采集 / 建造 / 换区 / 击杀 / Boss 五个
+   成功点各发一条,合成那一条由房间侧推(`noteCraftSuccess`)。
+   「谁记、记到第几步、跳步算不算」全在 `quests/` 里,本文件**不**复述事件名与键名
+   (两处各写一份键名 ⇒ 漂移时不报错,症状是「事件发了但读不到」)。
+   ⚠️ 只 import 协议与负载构造器,不 import `attachMainline`:订阅由装配处做一次。 */
+import {
+  MAINLINE_BUS_KIND,
+  bossProgressPayload,
+  craftPayload,
+  enterRegionPayload,
+  gatherPayload,
+  killPayload,
+  placePayload,
+  type MainlineBusPayload,
+} from '../quests/mainline_wiring.ts';
 import { MOB_CORPSE_FRAMES, MobHost, MOB_AI_RATE_HZ, BOSS_AI_RATE_HZ, MOB_AI_DT_SEC, BOSS_AI_DT_SEC, tickDueAtRate, type MobHostWorld, type MobTickResult } from '../mobs/host.ts';
 import { VitalsSystem, resolveStrikes, collectEventStrikes, collectEventBlinds, warnHitsPlayer, BLIND_VIEW_MUL, type MobHitResult, type PendingStrike } from '../combat/vitals.ts';
 /* ★ D2(视线遮挡):纯函数模块(`server/src/world/vision.ts`)。
@@ -558,8 +574,19 @@ export const WORLD_SAVE_FLUID_MAX_BYTES = 1048576;
 export interface MaterialApi {
   /** 该格 obj 层 id(0 = 空)。 */
   blockAt(x: number, y: number): number;
-  /** 放一个块(玩家语义:判世界内 / 该格空 / 该格无实体)。 */
-  placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string };
+  /**
+   * 放一个块(玩家语义:判世界内 / 该格空 / 该格无实体)。
+   *
+   * `actorId` **可选**(★ WS-FND-189):给了才把「谁放下的」发到事件总线(主线第 3 步);
+   * 不传 ⇒ 形状与行为都与接线前逐位相同(旧世界源假件、`actions/material.ts` 的
+   * 三参写法都不受影响)。
+   */
+  placeBlock(
+    x: number,
+    y: number,
+    objId: number,
+    actorId?: string,
+  ): { ok: true } | { ok: false; reason: string };
   /**
    * 拆一个块,返回被拆下来的 obj id(调用方拿它当掉落)。
    *
@@ -1988,8 +2015,22 @@ export class WorldSim {
    * `behaviors.ts:429` 就是 `world.placeObj(rt.x + 1, rt.y, ITEM.PLANK)` ——
    * 生物 AI 直接把**物品 id** 写进 obj 层。所以 `PLACE_BLOCK` 的 `itemId`
    * 同时就是 obj id,不需要第二张映射表(内容层里也确实没有那张表)。
+   *
+   * ## `actorId`(可选,★ WS-FND-189)
+   * 给了才发一条「谁放下的」到事件总线(主线第 3 步);**不给 ⇒ 形状与行为与
+   * 接线前逐位相同**(旧世界源假件与旧调用点全部不受影响)。
+   *
+   * ⚠️ 生产接线状态如实记:`actions/material.ts` 的 `PLACE_BLOCK` 今天调的是
+   * 三参形式(`ctx.actorId` 在那一层是现成的)⇒ 线上要等 `net/**` 补第四个实参。
+   * 对照:`breakBlock` 的 `actorId?` **早就有了**(WS-FND-77 为 `gatherMul` 加的),
+   * 所以**采集那一条线上是通的**,建造这一条还差一行。
    */
-  placeBlock(x: number, y: number, objId: number): { ok: true } | { ok: false; reason: string } {
+  placeBlock(
+    x: number,
+    y: number,
+    objId: number,
+    actorId?: string,
+  ): { ok: true } | { ok: false; reason: string } {
     if (!this.inWorld(x, y)) return { ok: false, reason: `坐标 ${x},${y} 在世界外` };
     if (!Number.isInteger(objId) || objId <= 0) return { ok: false, reason: `物件 id 非法:${objId}` };
     const gx = Math.floor(x);
@@ -2004,6 +2045,8 @@ export class WorldSim {
       }
     }
     this.setCell(gx, gy, { obj: objId });
+    /* ★ WS-FND-189:成功点 —— 世界真的多了一个块(三个失败分支都在上面 return 了)。 */
+    if (actorId !== undefined) this.emitMainline(MAINLINE_BUS_KIND.place, actorId, placePayload(actorId, objId));
     return { ok: true };
   }
 
@@ -2036,6 +2079,14 @@ export class WorldSim {
     this.setCell(gx, gy, { obj: 0 });
     /* 只有给了 actor 才把采集乘子带上(不给 ⇒ 回执与接线前**逐位相同**)。 */
     if (typeof actorId === 'string' && actorId.length > 0) {
+      /* ★ WS-FND-189:成功点 —— 那一件**真的被取走了**(失败分支都在上面 return 了)。
+         `count` 取 1:世界侧一次 `breakBlock` 只产出 1 件;「翻倍」(602 的 `gatherMul`)
+         由**动作层**按概率算(`actions/material.ts#gatherCountFor`)—— 世界这边
+         不编件数,与「回执给乘子而不是给件数」是同一条纪律。
+         ⚠️ 边界如实记:「进包了」还是「背包满 ⇒ 落回原地」由动作层决定,世界侧
+         看不到背包(`inventoryDetailOf` 的理由)⇒ 后一种情形也会发出一条 gather,
+         状态机会把「地上有一件自然材料」也算成第 1 步。 */
+      this.emitMainline(MAINLINE_BUS_KIND.gather, actorId, gatherPayload(actorId, obj, 1));
       return { ok: true, objId: obj, gatherMul: this.gatherMulOfPlayer(actorId) };
     }
     return { ok: true, objId: obj };
@@ -2092,6 +2143,72 @@ export class WorldSim {
    */
   materials(): MaterialApi {
     return this;
+  }
+  /* ═══════════ ★ WS-FND-189:主线事件的生产侧 ═══════════
+
+     这一段是**唯一**把「玩家做了什么」送进总线的地方(六个成功点各一条),三条纪律:
+
+     ```text
+     1 只在**成功点**发      判定失败的分支在它之前就 return 了 ⇒ 失败不会漏出一条「好像做了」的事件
+     2 必带 userId           没有归属的事件记不到任何人头上 ⇒ 宁可不发
+     3 只发「事实」不写「第几步」 事件里只写发生的事(itemId / regionId / hpRatio);
+                             「这算第几步」是 `quests/` 的判定,这里不知道也不猜
+     ```
+
+     ⚠️ 事件在**当帧**由 `tick()` 里的 `bus.drain()` 投递(`events/bus.ts` 的契约);
+     本段不做跨帧队列、不自己 drain。 */
+
+  /**
+   * 发一条主线事实。
+   *
+   * `userId` 同时当**负载字段**与**发出者**(`GameEvent.source`):负载字段供订阅方
+   * 分账,`source` 供日志/诊断 —— 二者必须同源,所以只有一个入参。
+   * 空 userId ⇒ **不发**(见上面第 2 条纪律)。
+   */
+  private emitMainline(kind: string, userId: string, payload: MainlineBusPayload): void {
+    if (typeof userId !== 'string' || userId.length === 0) return;
+    this.bus.emit(kind, payload, userId);
+  }
+
+  /**
+   * ★ WS-FND-189:「该玩家**换了区**」—— 只在 `regionAt` 的 id 真的变了时发一条。
+   *
+   * 取整口径与刷怪侧同一份事实源的写法:`regionAt(Math.floor(x), Math.floor(y))`
+   * —— `biomeOfCell` 就在用它(它那里的理由是:刷怪点落在格心,`floor` 得到的
+   * 就是那一格)。
+   *
+   * `after === null`(海上 / 未分区)⇒ **不发**:主线第 4 步认的是 `REGIONS[].id`,
+   * 一个 `null` 只会让状态机多判一次「不认识」。
+   */
+  private emitRegionChange(playerId: string, fromX: number, fromY: number, toX: number, toY: number): void {
+    const before = regionAt(Math.floor(fromX), Math.floor(fromY));
+    const after = regionAt(Math.floor(toX), Math.floor(toY));
+    if (after === null || after === before) return;
+    this.emitMainline(MAINLINE_BUS_KIND.enterRegion, playerId, enterRegionPayload(playerId, after));
+  }
+
+  /**
+   * ★ WS-FND-189:「该玩家合成出了 `itemId`」—— **房间推来的事实**,不是世界自己算的。
+   *
+   * ## 为什么合成必须由房间推(模拟层看不见背包)
+   * 背包账的持有者是**房间**(`net/room.ts` 的 `itemCounts` / `inventoryTotals`),
+   * 模拟层**没有**背包明细 —— `inventoryDetailOf` 返回 `null` 的理由就是这条
+   * (见那里的注释)。而「工具进包」这一瞬在 `sim` 里**不可观测**:
+   * `actions/craft.ts` 全程只碰 `applyInventory`(房间的写口)与两个读口,
+   * **一次都没经过 `sim`**。
+   *
+   * ⇒ 世界侧给出这条**事实入口**(与 `setPlayerAfk` / `setPlayerDozing` 同一形态:
+   * 房间推来的镜像),由**房间在合成成功后**调用。它只转发、不判定:
+   * 「算不算主线第 2 步」由 `quests/mainline.ts` 按内容表的 `category === TOOL` 判。
+   *
+   * ⚠️ 接线状态如实记:本方法今天**还没有生产调用点** —— `net/**` 不在本轮写域
+   * (房间/动作路由由另一条车道负责),所以线上要等那一处补一行
+   * `sim.noteCraftSuccess(ctx.actorId, itemId)`。判据里它是可调的、也是被断言的
+   * (见 `tests/WS-FND-189`),但「线上真的会调」这件事**尚未成立**。
+   */
+  noteCraftSuccess(userId: string, itemId: number): void {
+    if (!Number.isInteger(itemId)) return;
+    this.emitMainline(MAINLINE_BUS_KIND.craft, userId, craftPayload(userId, itemId));
   }
 
   /* ═══════════ ★ WS-FND-182:地形下行读口 ═══════════ */
@@ -3938,6 +4055,13 @@ export class WorldSim {
       for (const p of participants) {
         if (p.distance <= SHARE_RADIUS) {
           this.notePartyEvent({ kind: PARTY_SCORE_EVENT.CREATURE_KILL, source: p.playerId });
+          /* ★ WS-FND-189:主线第 5 步的**唯一**发射点 —— 与上一行**同一条归属口径**
+             (距击杀点 `SHARE_RADIUS` 内)。为什么沿用距离而不是「谁补的刀」:
+             本仓「算谁击杀」只有这一个答案(经验共享与赛局计分都按它,见上面那两段),
+             另立一套会让 HUD 说「击杀 ✓」而这个人一分经验都没拿到。
+             ⚠️ `def.id` 是**内容层 id**(`mob_species`),不是实例 id(`mob_x#3`)——
+             主张机按 `MOB_BY_ID` 判,必须给内容层 id。 */
+          this.emitMainline(MAINLINE_BUS_KIND.kill, p.playerId, killPayload(p.playerId, def.id));
         }
       }
     }
@@ -4315,9 +4439,33 @@ export class WorldSim {
    * 与 `damageMob` 分开:8 个 Boss **不在** `MOB_BY_ID` 里,
    * 走 `damageMob` 会查不到 def 而静默返回 null。
    * 返回 `null` 表示该 Boss 不在场。
+   *
+   * ## `actorId`(可选,★ WS-FND-189)
+   *
+   * 给了才在**这次伤害之后**发一条「Boss 血量比例」的主线事实(主线第 6 步)。
+   * 与 `breakBlock(..., actorId?)` 同一条纪律:不给 ⇒ 与接线前逐位相同。
+   *
+   * ⚠️ 这里**不判阈值**:`hpRatio <= 0.5` 的判定只在
+   * `quests/mainline.ts#BOSS_HP_THRESHOLD` 一处。本条每条伤害都发一次
+   * (含「打了一下但还早」的那种)—— 世界侧只报**事实**(现在是多少),
+   * 「算不算打到一半」由状态机判;在这里再判一次就是两份阈值。
+   *
+   * ⚠️ 接线状态如实记:今天**没有生产调用点**(`net/**` 不在本轮写域),
+   * 线上要等那一处把 `ctx.actorId` 传进来(与 `placeBlock` 同一条待办)。
    */
-  damageBoss(bossId: string, amount: number): { toShield: number; toHp: number } | null {
-    return this.bossRaid.damage(bossId, amount);
+  damageBoss(bossId: string, amount: number, actorId?: string): { toShield: number; toHp: number } | null {
+    const r = this.bossRaid.damage(bossId, amount);
+    if (r === null) return null;
+    if (actorId !== undefined) {
+      const st = this.bossRaid.stateOf(bossId);
+      /* 比值口径与 `bosses/phases.ts:324` 逐字相同(`maxHp === 0 ⇒ 0`),
+         不另写一份「血条怎么算」。 */
+      if (st !== undefined) {
+        const hpRatio = st.maxHp === 0 ? 0 : st.hp / st.maxHp;
+        this.emitMainline(MAINLINE_BUS_KIND.bossProgress, actorId, bossProgressPayload(actorId, bossId, hpRatio));
+      }
+    }
+    return r;
   }
 
   /** 尝试破防(八条沙盒机关破防的唯一入口)。 */
@@ -5133,8 +5281,14 @@ export class WorldSim {
       this.lastMoveRejection = 'NON_FINITE';
       return false;
     }
+    /* ★ WS-FND-189:换区判定要的是**搬家前后**两个位置 —— 这里先留旧坐标,
+       写完之后再比(`emitRegionChange` 内部按 `regionAt` 的 id 比,
+       同一区里来回走一步不发事件)。 */
+    const fromX = b.x;
+    const fromY = b.y;
     b.x = x;
     b.y = y;
+    this.emitRegionChange(playerId, fromX, fromY, x, y);
     /* ★ WS-FND-147:z 的**服务端权威判定**(修前这里是 `if (z !== undefined) b.z = z;`)。
        两段判,依据与代价都写在方法 docblock 的「z 由谁拥有」一节:
        - 空中(`vz !== 0`)或服务端自上次报文以来动过 `b.z` ⇒ **不写**声明值
@@ -5805,13 +5959,22 @@ export class WorldSim {
    */
   private readonly forgeUnlockedIds = new Set<string>();
 
-  /** 移动玩家到指定坐标(测试与传送用)。 */
+  /**
+   * 移动玩家到指定坐标(测试与传送用)。
+   *
+   * ★ WS-FND-189:坐标真变了就按「玩家所在格换区」发一条主线事实 ——
+   * 传送(以及 `importPlayerProfile` 之后的落位)同样算「到了另一个区」,
+   * 与 `applyPlayerMove` 共用同一个判定(`emitRegionChange`)。
+   */
   setPlayerPos(id: string, x: number, y: number): void {
     const b = this.physics.bodies.get(id);
     if (b === undefined) return;
+    const fromX = b.x;
+    const fromY = b.y;
     b.x = x;
     b.y = y;
     this.syncPlayers();
+    this.emitRegionChange(id, fromX, fromY, x, y);
   }
 
   /**

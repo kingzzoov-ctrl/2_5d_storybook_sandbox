@@ -4475,7 +4475,10 @@ test('task-38:taming/modes 需要的动作**权限标签已存在**,缺的只是
     'DROP_ITEM', 'CRAFT', 'USE_ALCHEMY_FURNACE', 'OPEN_CHEST', 'USE_OWN_CHEST', 'SLEEP',
     'START_PARTY', 'SET_ROOM_ACCESS', 'SET_PARTY_MODE', 'KICK_MEMBER', 'SET_MEMBER_ROLE',
     'RESET_WORLD', 'CLOSE_ROOM', 'MODIFY_TOWN', 'PLACE_AUTOMATION', 'WIRE_EDIT', 'BREED_TAME',
-    'USE_ITEM', 'BUY_ITEM'];
+    'USE_ITEM', 'BUY_ITEM',
+    /* ★ WS-FND-188:与 NPC 说话(`net/actions/npc_talk.ts`)。按本表注释的纪律:
+       加动作就在这里加一行 —— 那是**有意的信号**,不是"忘了同步"。 */
+    'NPC_TALK'];
   eq(executable.slice().sort(), declared.slice().sort(),
     '逐条枚举必须**逐个等于** RoomAction 的键集,而不只是数量相等(漏登记/写错名/重复都红)');
 });

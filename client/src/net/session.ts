@@ -32,6 +32,11 @@
 
 import {
   PROTOCOL_VERSION,
+  /* ★ WS-FND-188:NPC 帧的**判据 + 不抛的解码口**。与 `isTerrainFrame` 同一条纪律:
+     判据住在协议层(共享),运输层只做分流与留痕。 */
+  isNpcFrame,
+  tryDecodeNpcFrame,
+  type NpcWireDef,
 } from '../../../shared/net/delta.ts';
 /* ★ WS-FND-182:地形帧的判据(**不**走 `decodePacket` —— 它是另一条通道)。 */
 import { isTerrainFrame } from '../../../shared/net/terrain.ts';
@@ -190,6 +195,20 @@ export interface SessionEvents {
    * 块**先**写进 store,**再**调本回调 ⇒ 回调里 `store.chunks()` 已经能看到新块。
    */
   onTerrain?: (e: TerrainFrameEvent) => void;
+  /**
+   * ★ WS-FND-188:**NPC 表到了**(静态数据,`hello`/`welcome` 之后一次性下发)。
+   *
+   * ## 为什么必须有这个回调(而不是让调用方去猜)
+   * 修前 `server/src/npc/defs.ts` 有 4 个 NPC、`dialogue.talk` 有纯函数、
+   * `npcAt()` 有空间查询 —— 而客户端**一个字段都没收到** ⇒ 玩家看不到、
+   * 也点不到任何一个 NPC,且没有任何东西会红(连"连接是 live、快照照常到"
+   * 都成立,只是世界里没有人)。
+   * ⇒ 与 `onTerrain` 同一理由:把"服务端发了什么"变成调用方**可观测**的一件事。
+   * ## 与 `onTerrain` 的区别
+   * 地形是**分批**、会重复下发的;NPC 表是**一次性**的静态表 ⇒ 每次收到都是**整表**
+   * (不是增量,客户端不需要合并 —— 合并两份静态表只会多出一个漂移点)。
+   */
+  onNpcs?: (npcs: NpcWireDef[]) => void;
   /** 状态机变化(供 UI / 自检)。 */
   onState?: (s: SessionState, detail?: string) => void;
   /** 握手的 welcome 到了。 */
@@ -305,6 +324,21 @@ export interface SessionHandle {
    * (见 `droppedFrames` 的注释)。地形解码失败是**协议内容**问题。
    */
   readonly lastTerrainError: string | null;
+  /**
+   * ★ WS-FND-188:已落地的 **NPC 帧**数(单调)。
+   *
+   * 与 `terrainFrames` 分开计:两条通道是**两件事**(地形分批、NPC 一次性)。
+   * `0` 一直不变 ⇒ `hello`/`welcome` 之后那一帧没到(而屏幕上只会是"世界里没有人")。
+   */
+  readonly npcFrames: number;
+  /**
+   * ★ WS-FND-188:最近一次 **NPC 帧解码失败**的原因(`null` = 没失败过)。
+   *
+   * 与 `lastTerrainError` 同一条取舍(见它的 docblock):坏帧**出声**,但不算
+   * `droppedFrames` —— 那个计数器的语义是「载荷**形态**不对」(Blob / 非字节),
+   * 把"协议内容坏了"混进去会让 `binaryType` 那一类判据失去分辨力。
+   */
+  readonly lastNpcError: string | null;
   /**
    * ★ WS-FND-134(P1):最近一次**服务端拒绝报文**(`null` = 本次连接没被拒过)。
    *
@@ -676,6 +710,11 @@ export function createSession(opts: SessionOptions): SessionHandle {
   let terrainFrames = 0;
   /** 最近一次地形帧解码失败的原因(`null` = 没失败过)。 */
   let lastTerrainError: string | null = null;
+  /* ★ WS-FND-188:NPC 通道的两个读数(见 `SessionHandle.npcFrames` / `lastNpcError`)。 */
+  /** 已落地的 NPC 帧数(单调;`hello`/`welcome` 之后那一帧到了才 +1)。 */
+  let npcFrames = 0;
+  /** 最近一次 NPC 帧解码失败的原因(`null` = 没失败过)。 */
+  let lastNpcError: string | null = null;
 
   const setState = (s: SessionState, detail?: string): void => {
     state = s;
@@ -710,6 +749,31 @@ export function createSession(opts: SessionOptions): SessionHandle {
     }
     terrainFrames += 1;
     opts.events.onTerrain?.({ changed, store: chunkStore });
+  };
+
+  /**
+   * ★ WS-FND-188:落一帧 **NPC 表**(静态数据的一次性下发)。
+   *
+   * ## 两条出口都留痕(与 `applyTerrainFrame` 同纪律)
+   * ```text
+   * 1 好的帧 ⇒ npcFrames += 1 + events.onNpcs(npcs)(渲染层据此摆立牌 / 判"附近有没有人")
+   * 2 坏的帧 ⇒ lastNpcError 写原因 + onDrop(**不抛**,见下)
+   * ```
+   * ⚠️ **不抛**:一条坏帧(版本漂移 / 截断)抛进 socket 的 `message` 回调里,
+   * 后果取决于调用方有没有 try/catch;而"取决于"就是本仓最忌的形态 ——
+   * 漏掉的那一处会让整条连接因为一条可忽略的坏帧而静默停摆。
+   * 坏帧走 `lastNpcError` + `onDrop`(同 `lastTerrainError` 的取舍:
+   * **出声**,但**不**算 `droppedFrames` 那个"载荷形态不对"的计数器)。
+   */
+  const applyNpcFrame = (payload: Uint8Array): void => {
+    const d = tryDecodeNpcFrame(payload);
+    if (d.error !== null) {
+      lastNpcError = d.error;
+      opts.events.onDrop?.(`NPC 帧解码失败:${d.error}`);
+      return;
+    }
+    npcFrames += 1;
+    opts.events.onNpcs?.(d.npcs);
   };
 
   /** 取消待重连(重连已经建立 / 调用方收尾时都要调,否则定时器会再拨一次)。 */
@@ -990,6 +1054,22 @@ export function createSession(opts: SessionOptions): SessionHandle {
         applyTerrainFrame(cls.payload);
         return;
       }
+      /* ── ★ WS-FND-188:NPC 帧**也先分流** ──
+         与地形帧同一条理由、同一位置:它也是二进制帧(opcode 0x2),但不是差量包:
+         ```text
+         差量包:首字节 = PROTOCOL_VERSION(3)          → decodePacket
+         地形帧:首字节 = TERRAIN_FRAME_TAG(0x54)       → decodeTerrainFrame
+         NPC 帧:首字节 = NPC_FRAME_TAG(0x4e)           → decodeNpcFrame
+         ```
+         ⚠️ 判据必须在 `store.apply` **之前**:交给它的话,一条**形态完好**的 NPC 帧
+         会以「协议版本不匹配:78」的形态报出来,而那个原因指向的是**编码器**,
+         不是它真的错在哪(与地形那一处的「症状名 ≠ 成因名」逐字同款)。
+         ⚠️ 与地形不同的是:这一条**不抛**(见 `applyNpcFrame`)——
+            静态表坏一帧不该把整条连接带走。 */
+      if (isNpcFrame(cls.payload)) {
+        applyNpcFrame(cls.payload);
+        return;
+      }
       /* 二进制:store 内部处理「0 字节」与「坏包」两件事,本层不再判断。 */
       const r = store.apply(cls.payload);
       opts.events.onFrame(r, store);
@@ -1011,6 +1091,7 @@ export function createSession(opts: SessionOptions): SessionHandle {
         if (timedOutSocket === sock && lastTimeout !== null) {
           setState('closed', lastTimeout.text);
           scheduleRetry();
+
           return;
         }
         setState('closed', lastReject === null ? undefined : describeReject(lastReject));
@@ -1040,6 +1121,9 @@ export function createSession(opts: SessionOptions): SessionHandle {
     get chunks() { return chunkStore; },
     get terrainFrames() { return terrainFrames; },
     get lastTerrainError() { return lastTerrainError; },
+    /* ★ WS-FND-188:NPC 通道的两个读数(**分开**计 —— 地形分批、NPC 一次性)。 */
+    get npcFrames() { return npcFrames; },
+    get lastNpcError() { return lastNpcError; },
     get state() { return state; },
     get serverContentClaim() { return serverClaim; },
     /* ★ WS-FND-167:超时与退避的四个读数 —— 界面 / 自检脚本都读它们,不靠看日志。 */

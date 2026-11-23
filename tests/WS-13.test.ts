@@ -104,7 +104,36 @@ import {
 import { startWsServer } from '../server/src/net/ws_server.ts';
 import { RoomRuntime } from '../server/src/net/room.ts';
 import { fixedClock } from '../server/src/net/anticheat.ts';
-import { decodePacket, applyPacket, PROTOCOL_VERSION } from '../shared/net/delta.ts';
+import {
+  PROTOCOL_VERSION, applyPacket, decodePacket, isNpcFrame, tryDecodeNpcFrame,
+} from '../shared/net/delta.ts';
+/* ★ WS-FND-188:二进制下行现在有**三种**帧 —— 校验要把 NPC 帧认出来。 */
+import { NPCS } from '../server/src/npc/defs.ts';
+
+/**
+ * 逐帧校验一条下行**二进制**帧(★ WS-FND-188)。
+ *
+ * ## 修前的写法为什么必须改
+ * 修前这里是"每一帧首字节都必须是 `PROTOCOL_VERSION`"。那句话在**地形帧**
+ * (`TERRAIN_FRAME_TAG = 0x54`)进来时就已经不成立了 —— 只是当时的房间桩没实现
+ * `terrainDeltaFor`,所以它**从没红过**;`NPC_TALK` 这一轮给了房间一个真的静态表
+ * (`npcFrame()`),NPC 帧(`0x4e`)在握手那一刻就会到 ⇒ 旧写法**必然**红。
+ * ⇒ 改成按 tag 分类校验。这不是放宽:凡是 NPC 帧,这里要求它**解得开且恰好
+ *    `NPCS.length` 条**(比"首字节等于 3"更强 —— 它顺带把新通道端到端验了一遍)。
+ */
+function checkBinaryFrame(i: number, f: Uint8Array): void {
+  ok(f.byteLength > 0, `第 ${i} 帧不应为 0 字节`);
+  if (isNpcFrame(f)) {
+    const d = tryDecodeNpcFrame(f);
+    eq(d.error, null, `第 ${i} 帧是 NPC 帧 ⇒ 必须解得开(error=${String(d.error)})`);
+    eq(d.npcs.length, NPCS.length, `★ 第 ${i} 帧(NPC 表)必须恰好 ${NPCS.length} 条`);
+    return;
+  }
+  /* 地形帧(0x54)由 `tests/WS-FND-182` 逐字节校验,这里只放行(它也是**不带 tag**的反例)。 */
+  if (f[0] === 0x54) return;
+  eq(f[0], PROTOCOL_VERSION,
+    `第 ${i} 帧首字节应为 PROTOCOL_VERSION(不得加 tag;NPC 帧另有自己的 tag)`);
+}
 
 /* ═══════════════════ 0. 夹具 ═══════════════════ */
 
@@ -911,10 +940,16 @@ async function main(): Promise<void> {
       eq(w.protocolVersion, PROTOCOL_VERSION, 'welcome.protocolVersion');
       eq(w.roomId, 'r-ws13', 'welcome.roomId');
 
-      /* ── ③ 等"首帧 + ≥1 拍广播帧"(旧:`sleep(400)` 顺带等它)──
+      /* ── 3 等"首帧 + ≥1 拍广播帧"(旧:`sleep(400)` 顺带等它)──
          等的是 `>= 2`(两条断言的分水岭);下面 `>0` 与 `>=2` **两条都保留** ——
-         它们红的含义不同(前者 = 一帧都没到;后者 = 广播循环没发)。 */
-      const tBin = await waitConn(() => got.bin.length >= 2, got, WS_BIN_FRAMES_BUDGET_MS);
+         它们红的含义不同(前者 = 一帧都没到;后者 = 广播循环没发)。
+         ★ WS-FND-188:二进制下行现在有**三种**帧(差量包 / 地形帧 `0x54` /
+           NPC 帧 `0x4e`),而 join 那一刻就会发**两条**(首帧快照 + NPC 表)
+           ⇒ 只等 `bin.length >= 2` 会把"广播帧还没来"误判成"广播循环没发"(实测红过)。
+           这里等的是**广播真的发过**(服务端侧事实,与客户端收集顺序无关)。 */
+      const tBin = await waitConn(
+        () => got.bin.length >= 2 && srv.framesSent() > 0, got, WS_BIN_FRAMES_BUDGET_MS,
+      );
       ok(got.bin.length > 0,
         `应收到 ≥1 个二进制帧,实得 ${got.bin.length}`
         + `(${waitedText(tBin, WS_BIN_FRAMES_BUDGET_MS)})`);
@@ -942,11 +977,12 @@ async function main(): Promise<void> {
         '★ 下行首字节应为 PROTOCOL_VERSION(**服务端不加 tag**)');
       /* ★ 广播帧同样不得带 tag —— 这条才真正钉住"下行无 tag"。
          (welcome 的文本帧加不加 tag 客户端**两种都兼容**,故测它测不出问题:
-          这是 I1 那个注入"没牙"的原因。二进制帧没有这种宽容度。) */
-      for (const [i, f] of got.bin.entries()) {
-        eq(f[0], PROTOCOL_VERSION,
-          `第 ${i + 1} 个下行二进制帧首字节应为 PROTOCOL_VERSION(不得加 tag)`);
-      }
+          这是 I1 那个注入"没牙"的原因。二进制帧没有这种宽容度。)
+         ★ WS-FND-188:三种帧各有自己的首字节 ⇒ 逐帧按 tag 分类校验
+         (`checkBinaryFrame`:NPC 帧必须解得开且恰好 `NPCS.length` 条)。 */
+      for (const [i, f] of got.bin.entries()) checkBinaryFrame(i + 1, f);
+      ok(got.bin.some((f) => f[0] === PROTOCOL_VERSION),
+        '★ 至少有一帧是**差量包**(首帧快照)—— 否则"下行无 tag"那条就没人测了');
 
       /* ★★ 真解码 —— 证明收到的是**可用的协议字节**,不只是"非空" */
       const pkt = decodePacket(got.bin[0]!);
@@ -1180,11 +1216,9 @@ async function main(): Promise<void> {
       const tFrame = await waitConn(() => got.bin.length > 0, got, WS_BIN_FRAMES_BUDGET_MS);
       ok(got.bin.length > 0,
         `应收到帧(${waitedText(tFrame, WS_BIN_FRAMES_BUDGET_MS)};${connState(got)})`);
-      /* 逐帧校验:收到的每一帧长度都应 > 0(0 字节帧被服务端跳过) */
-      for (const [i, f] of got.bin.entries()) {
-        ok(f.byteLength > 0, `第 ${i + 1} 帧不应为 0 字节`);
-        eq(f[0], PROTOCOL_VERSION, `第 ${i + 1} 帧首字节`);
-      }
+      /* 逐帧校验:长度都应 > 0(0 字节帧被服务端跳过),且**各按自己的 tag** 合法
+         (★ WS-FND-188:二进制下行有差量包 / 地形帧 / NPC 帧三种)。 */
+      for (const [i, f] of got.bin.entries()) checkBinaryFrame(i + 1, f);
       /* ★ 上行大帧:送一个 70000 字节的协议包 ⇒ 服务端应完整收到
          (经 `lastUplink` 观测 —— 这用的是**服务端**侧的观测,
           不是客户端自报,故能证明真到达了) */

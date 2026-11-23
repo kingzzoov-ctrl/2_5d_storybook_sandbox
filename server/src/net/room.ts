@@ -23,7 +23,14 @@ import {
   PROTOCOL_VERSION,
   /* ★ WS-FND-182:地形下行的差量判据(块版本比较)。 */
   diffChunkVersions,
+  /* ★ WS-FND-188:NPC 帧的编码口(静态 NPC 表的一次性下发;见文件尾的 `npcFrame()`)。
+     与地形帧同一层:判定/编码都在共享协议层,房间只提供**数据**。 */
+  encodeNpcFrame,
+  type NpcWireDef,
 } from '../../../shared/net/delta.ts';
+/* ★ WS-FND-188:静态 NPC 表(`NPCS` 是**唯一**一份)—— 房间只把它投影上线上的形状,
+   不另立第二份名单(两份名单迟早漂,而漂的表现是"某个 NPC 只在一个端存在")。 */
+import { NPCS } from '../npc/defs.ts';
 /* ★ WS-FND-182:地形帧的编码口(单块 1032 字节 = 1024 格 + 8 字节块头)。 */
 import {
   encodeTerrainFrames,
@@ -352,10 +359,21 @@ export const RoomAction = {
   BREED_TAME: 'BREED_TAME',
   USE_ITEM: 'USE_ITEM',
   /* ★ WS-FND-77 A-4:百货店购买(`515 无人自助售货摊` 的字面量
-     「上架……供游客购买」)。此前 `CLOUD_DEPOT` 的购买语义**没有入口**:
+     「上架......供游客购买」)。此前 `CLOUD_DEPOT` 的购买语义**没有入口**:
      `depot.buy` 只有测试在调。加这一条把「买」变成一个可授权、可回执、
      可判定的动作(判序见 `actions/buy_item.ts`)。 */
   BUY_ITEM: 'BUY_ITEM',
+  /* ★ WS-FND-188:**与 NPC 说话**(世界里的那 4 个人此前看不见也点不到)。
+
+     为什么它是一条 `RoomAction` 而不是一条新报文:说话是**玩家意图**,
+     与采集/开箱同一类 —— 它必须走同一条动作路由(权限位 / 单帧预算 /
+     幂等与反作弊 / 回执出口),才能被授权、被限流、被回执。
+     另开一条报文 = 那四件事各写一遍(本仓 1 号病根)。
+
+     ⚠️ `npcId` 由**客户端**报(它认得自己点的是谁),但服务端**不信**它:
+     距离与"附近到底是谁"由 `npcAt()` 在权威坐标上重算
+     (见 `actions/npc_talk.ts` 的判序)—— 客户端报的只用来对账。 */
+  NPC_TALK: 'NPC_TALK',
 } as const;
 export type RoomAction = (typeof RoomAction)[keyof typeof RoomAction];
 
@@ -437,6 +455,10 @@ export const ACTION_PERMISSION: Readonly<Record<RoomAction, keyof RolePermission
   SET_MEMBER_ROLE: 'manage',
   SET_ROOM_ACCESS: 'configure',
   RESET_WORLD: 'destructive',
+  /* ★ WS-FND-188:与 NPC 说话是**基础生存动作**(游客也能问路)。
+     「附近有没有人」「站得够不够近」两件事在动作层用权威坐标判
+     (`actions/npc_talk.ts`),不由权限位表达 —— 权限位只回答「你是谁」。 */
+  NPC_TALK: 'baseline',
   CLOSE_ROOM: 'destructive',
 };
 
@@ -2052,6 +2074,15 @@ export interface ActionPayload {
   orderId?: unknown;
   /** `PLACE_AUTOMATION`:组件种类名(必须在 `wiring` 注册表里)。 */
   kind?: unknown;
+  /**
+   * ★ WS-FND-188:`NPC_TALK`:要跟哪一个说话(`server/src/npc/defs.ts` 的 `NpcDef.id`)。
+   *
+   * ⚠️ 由**客户端**报(它认得自己站在谁旁边),但服务端**不信**它:
+   *   距离与"附近到底是谁"由 `npcAt()` 在**权威坐标**上重算,
+   *   不一致 ⇒ `INVALID`(见 `actions/npc_talk.ts` 的判序)。
+   *   不这么做的后果:站在营地也能隔着半张地图跟农田里的老农对话。
+   */
+  npcId?: unknown;
 }
 
 /**
@@ -6545,6 +6576,49 @@ export class RoomRuntime {
       if (c !== undefined) want.push(c);
     }
     return { frames: encodeTerrainFrames(want), versions };
+  }
+
+  /* ── 4.7 ★ WS-FND-188:静态 NPC 表的**一次性**下发 ── */
+
+  /**
+   * NPC 帧 —— `hello`/`welcome` 之后由运输层调**一次**。
+   *
+   * ## 为什么是一次性的(而不是进每帧快照)
+   * ```text
+   * NPC 是静态数据:坐标写死在设计图里,没有血量/状态/移动
+   * ⇒ 进 20Hz 差量快照 = 每帧白编一份永不变的载荷;
+   *   而且要为此给 shared/types/wire.ts 的字段表加一个 EntityKind
+   *   (冻结层改动 + 所有按 kind 遍历的判据都要跟着动)。
+   * ```
+   * ## 为什么不在这里判"该不该发"
+   * 「什么时候发」是**连接生命周期**的事(`hello`/`welcome` 那一刻),而本方法没有
+   * 连接、也不该有 —— 它只回答"这份表怎么上线"(与 `terrainDeltaFor` 不做时间判断
+   * 是同一条纪律:节流/时机住在运输层,免得长出第二个口径)。
+   *
+   * ## 坐标口径
+   * `NpcDef.home` 是**设计图格坐标**,与 `WorldSim` 的格坐标同一套原点
+   * (`server/src/npc/defs.ts` 的文件头写了为什么)。这里原样送上去:
+   * 客户端用**同一对**数字摆立牌与判距离 —— 两端各换算一次就是"人站在半格外"。
+   */
+  npcFrame(): Uint8Array {
+    const wire: NpcWireDef[] = NPCS.map((n) => {
+      const q = n.quest;
+      return q === undefined
+        ? { id: n.id, name: n.name, x: n.home.x, y: n.home.y }
+        : {
+          id: n.id,
+          name: n.name,
+          x: n.home.x,
+          y: n.home.y,
+          quest: {
+            id: q.id,
+            title: q.title,
+            needItemId: q.needItemId,
+            needCount: q.needCount,
+          },
+        };
+    });
+    return encodeNpcFrame(wire);
   }
 
   /**

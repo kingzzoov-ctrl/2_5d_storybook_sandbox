@@ -346,13 +346,15 @@ test('FND136-9 掉落翻倍概率:共享常量 + raid.ts 不再写裸字面量',
   ok(declared === DROP_DOUBLE_CHANCE, '两处必须同值:一处改、另一处不改就是静默分叉');
 });
 
-test('FND136-10 action_table 的注释与表实况一致(25 条;旧话不许复活)', () => {
+test('FND136-10 action_table 的注释与表实况一致(26 条;旧话不许复活)', () => {
   const tableSrc = readOne('server/src/net/actions/action_table.ts');
   const actual = Object.keys(ACTION_HANDLERS).length;
-  eq(actual, 25, '实况:表里 25 条动作(★ WS-FND-154 补了 GATHER)');
+  /* ★ WS-FND-188:`NPC_TALK` 进来后实况是 26(= 25 + NPC_TALK)。
+     数字与 `tests/WS-FND-154` 的动作总数断言同源,改一处必须改另一处。 */
+  eq(actual, 26, '实况:表里 26 条动作(★ WS-FND-154 补了 GATHER,WS-FND-188 补了 NPC_TALK)');
   eq(
     Object.keys(ACTION_HANDLERS).filter((k) => typeof (ACTION_HANDLERS as unknown as Record<string, unknown>)[k] === 'function').length,
-    25,
+    26,
     '每个键都必须绑到一个处理器函数(没有占位空实现)',
   );
 

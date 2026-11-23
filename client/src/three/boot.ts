@@ -34,6 +34,8 @@ import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../stage/design_world.ts'
 /* ★ w90:`obj` 层与植被的立牌计划(纯函数)。改前 `obj` 层**完全不渲染** —— 见挂载点的长注释。 */
 import { planObjSprites, planVegetationSprites, type ObjSpriteInput } from '../stage/obj_sprites.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
+/* ★ WS-FND-188:NPC 表的**线上形状** —— 类型来自共享协议层(客户端不内置 NPC 名单)。 */
+import { type NpcWireDef } from '../../../shared/net/delta.ts';
 import {
   SPRITE_CELL_WORLD, SPRITE_CENTER_X, SPRITE_CENTER_Y,
   ATLAS_CELL, ATLAS_IMAGE_W, ATLAS_IMAGE_H, ATLAS_PX_PER_CELL,
@@ -78,6 +80,9 @@ import {
   countByKinds,
   planEntitySpritesInto,
   type EntitySpriteSource,
+  /* ★ WS-FND-188:NPC 立牌高度取**同一份**口径(28px = 玩家立牌高)——
+     两份高度常量迟早漂,而漂的表现是"NPC 比人矮一截/高一截",没人会报错。 */
+  SPRITE_HEIGHT_PX,
   type EntitySpriteSpec,
 } from '../stage/entity_sprites.ts';
 import {
@@ -313,6 +318,29 @@ export interface BootHandle {
     next: readonly ChunkInput[],
     dirtyKeys: readonly string[],
   ) => { rebuilt: number; total: number; full: boolean; fallback: boolean };
+  /**
+   * ★ WS-FND-188:**接上服务端下发的 NPC 表**(`hello`/`welcome` 之后一次)。
+   *
+   * ## 为什么是端口 + 注入(而不是本文件自己收帧)
+   * 帧的接收与分流在 `client/src/net/session.ts`(它持有 socket),而本文件不持会话
+   * ⇒ 与 `setPoseSource` / `setPartyModeSink` 同一条手法:装配根(`main.ts`)把两端接上,
+   * 本文件只留「表到了之后怎么画」这一段。
+   *
+   * ## 语义:整表替换,不合并
+   * NPC 表是**静态**的、每次都是整份 ⇒ 合并两份静态表只会多出一个漂移点
+   * (删掉一个 NPC 之后,旧的立牌会永远留在场景里,而不报错)。
+   *
+   * 空数组是**合法**输入 = 这个房间没有 NPC(立牌全摘)。
+   */
+  setNpcs: (npcs: readonly NpcWireDef[]) => void;
+  /**
+   * ★ WS-FND-188:把**一句台词**写到 HUD 那一行(`''` = 清掉)。
+   *
+   * 台词由服务端在 `dialogue.talk` 里选(它按任务状态挑),客户端只显示 ——
+   * 本文件不生成任何台词文案(两份台词表迟早漂,而漂的表现是"玩家读到的这句
+   * 与服务端认为它该听到的那句不同",两端都不报错)。
+   */
+  showTalk: (text: string) => void;
 }
 
 
@@ -380,6 +408,189 @@ export function planTerrainRebuild(
   if (dirtyKeys.length === 0) return { rebuild: [], full: false, fallback: false };
   const dirty = new Set(dirtyKeys);
   return { rebuild: source.filter((c) => dirty.has(c.key)), full: false, fallback: false };
+}
+
+/* ══════════ ★ WS-FND-188:NPC 上屏的**判定**(纯函数)+ 立牌跟块的两条计划 ══════════
+ *
+ * ## 这两块为什么要抽成纯函数(而且就放在本文件里)
+ * 本文件顶层 `import three` 且 `boot()` 里碰 `document` ⇒ 它**内部**在 node 里跑不了;
+ * 而 `planTerrainRebuild` 已经证明「零依赖的判定 + 纯数据入参」这条路可用
+ * (`tests/WS-FND-184` 直接 import 本文件)。⇒ 把「谁在旁边 / 立牌该摘谁、该加谁 /
+ * NPC 摆哪一格」全部抽出来,判据就能喂**真** `ClientChunkStore` 与**真** `NPCS`。
+ *
+ * ## 一个刻意的不对称
+ * `planPropApply` 只回答「哪些 chunk key 该整块摘、哪些该整块加」——
+ * 它**不**看块里的内容(立牌的**内容**由 `planChunkProps` 算)。
+ * 分开的理由:跟块这件事是**表结构**问题(键集),而"一格该出什么立牌"是
+ * 玩法/内容问题;混在一起之后,"改了两格却没摘旧立牌"这类错误就没法单独断言。
+ */
+
+/** 与 NPC 说话用的那一个键(客户端;与 `net/action_target.ACTION_KEYS` 的 `T` 共用)。 */
+export const NPC_TALK_KEY = 't';
+
+/**
+ * 交互半径(格)—— 与 `server/src/npc/defs.ts` 的 `NPC_TALK_RADIUS` **同值**。
+ *
+ * ⚠️ 为什么客户端这里必须**再写一个数**(而不是 import 服务端那个常量):
+ *   客户端包**不许** import 服务端模块(`server/**` 不进浏览器包),而判定又必须在
+ *   两端都成立(客户端决定"按 T 是说话还是用道具",服务端决定"这条报文算不算数")。
+ *   ⇒ 两份数各写一次是**已知代价**;判据 `WS-FND-188` 里有一条**逐值相等**的断言
+ *   (它同时 import 两边),让漂移当场红。
+ */
+export const NPC_TALK_RADIUS_CELLS = 2.5;
+
+/**
+ * NPC 立牌用图集里的**哪一格贴图**(固定一个物品 id)。
+ *
+ * ## 依据(不是随手挑的)
+ * 图集 1280×1152 / 格 64px,`cellIndexFromId` 按物品号段映射;
+ * `docs/ATLAS-SPRITES-EVIDENCE.md` 里**没有**任何 NPC 立绘格(逐格取证只覆盖
+ * 景物/物件)⇒ 只能在物品表里挑一个**人形、立着**的贴图:
+ * 532「拳击测力稻草人靶」= 稻草人(人形躯干 + 头,且本身立在地上)。
+ * ⇒ **临时**用它,如实标注:这是占位,不是"NPC 的美术"。
+ *   正确的收尾是让美术给 NPC 单独一段号段(与 `VEGETATION_IDS` 那条注释同一个结论)。
+ * 判据 `WS-FND-188` 钉住 `cellIndexFromId(532) >= 0`:图集里没这一格会当场红。
+ */
+export const NPC_SPRITE_ITEM_ID = 532;
+
+/** 一条 NPC 立牌计划(纯数据;摆放由装配层做)。 */
+export interface NpcSpritePlan {
+  /** `NpcWireDef.id`(线上 id —— 立牌表按它索引)。 */
+  id: string;
+  name: string;
+  /** 世界格坐标(与 `NpcDef.home` 同一对数字,原样带过来)。 */
+  x: number;
+  y: number;
+  /** 图集 row-major 格号;`-1` = 图集里没有这一格(装配层跳过,不猜邻近格)。 */
+  atlasCell: number;
+  /** 立牌高度(屏幕像素;装配层按 `heightPx / pixelScale` 换算世界单位)。 */
+  heightPx: number;
+  /** 该 NPC 是否有任务(UI 用;台词**不上线**,见 `NpcWireDef`)。 */
+  hasQuest: boolean;
+}
+
+/**
+ * NPC 表 → 立牌计划(纯函数)。
+ *
+ * 高度缺省 28px = `entity_sprites.SPRITE_HEIGHT_PX.player` —— 与玩家立牌**同高**:
+ * 「人比人高」在等轴测下会被读成"另一个物种",而 NPC 与玩家是同一类东西。
+ */
+export function planNpcSprites(
+  npcs: readonly NpcWireDef[],
+  heightPx: number = 28,
+): NpcSpritePlan[] {
+  const cell = cellIndexFromId(NPC_SPRITE_ITEM_ID);
+  return npcs.map((n) => ({
+    id: n.id,
+    name: n.name,
+    x: n.x,
+    y: n.y,
+    atlasCell: cell,
+    heightPx,
+    hasQuest: n.quest !== undefined,
+  }));
+}
+
+/**
+ * 离 `(x, y)` **最近**且在 `radius` 内的 NPC(纯函数)。
+ *
+ * ## 与 `server/src/npc/defs.ts#npcAt` 的口径**逐条对齐**
+ * 半径含边界(`<=`)—— 「恰好 2.5 格」算在范围内:两端不一致时的症状是
+ * "客户端说能说话、服务端说太远",而**两端都不报错**,玩家只看到"按了没反应"。
+ * 平局按声明顺序取前者(确定性,不靠 Map 迭代序)。
+ * 非有限读数 ⇒ `null`(不知道玩家在哪时**不猜** —— 猜出来的位置会让人在出生点
+ * 就能跟农田里的 NPC 说话)。
+ */
+export function nearbyNpc(
+  npcs: readonly NpcWireDef[],
+  x: number,
+  y: number,
+  radius: number = NPC_TALK_RADIUS_CELLS,
+): NpcWireDef | null {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(radius)) return null;
+  let best: NpcWireDef | null = null;
+  let bestD = Infinity;
+  for (const n of npcs) {
+    const d = Math.hypot(x - n.x, y - n.y);
+    if (d <= radius && d < bestD) { best = n; bestD = d; }
+  }
+  return best;
+}
+
+/**
+ * HUD 里那一行「按 T 与 <名字> 说话」。
+ *
+ * 附近没有人 ⇒ **空串**(调用方据此不写这一行 —— 写一行"按 T 与 null 说话"比不写更糟)。
+ * ⚠️ 文案必须同时说清「走开之后 T 还是使用道具」:修前 `T` 是 `USE_ITEM`
+ * (`net/action_target.ACTION_KEYS` 的既有键位),站在 NPC 旁边时它被这条**抢走**。
+ * 不写清楚的话,玩家读到的是"站在镇长面前按 T,道具突然用不了了"。
+ */
+export function npcHintLine(npc: NpcWireDef | null): string {
+  if (npc === null) return '';
+  return `按 ${NPC_TALK_KEY.toUpperCase()} 与「${npc.name}」说话(走开之后这个键仍是使用道具)`;
+}
+
+/**
+ * 把动作回执的 `effect` 拼成 HUD 上那一行台词。
+ *
+ * 服务端回的是 `{ npc, line, ... }`(见 `server/src/net/actions/npc_talk.ts` 的
+ * `effect`):**台词由服务端选**(它按任务状态在 `dialogue.talk` 里挑),客户端只**拼接**,
+ * 不生成第二份台词表 —— 两份台词表迟早漂,而漂的表现是「玩家读到的这句,与服务端
+ * 认为它该听到的那句不同」,两者都不报错。
+ *
+ * 缺 `line`(老服务端 / 别的动作的回执)⇒ 空串,调用方不写这一行。
+ */
+export function npcTalkTextOf(effect: Record<string, unknown> | undefined | null): string {
+  if (effect === undefined || effect === null) return '';
+  const line = effect.line;
+  if (typeof line !== 'string' || line.length === 0) return '';
+  const who = effect.npc;
+  const name = typeof who === 'string' && who.length > 0 ? who : 'NPC';
+  return `${name}:${line}`;
+}
+
+/** 立牌跟块的**表结构**计划(见上面「一个刻意的不对称」)。 */
+export interface PropApplyPlan {
+  /** 要整块摘掉的 chunk key(顺序 = `rebuild` 的顺序,稳定)。 */
+  remove: string[];
+  /** 要整块(重)建立牌的块(顺序 = `rebuild` 的顺序)。 */
+  add: ChunkInput[];
+}
+
+/**
+ * 一次地形下行里,立牌该摘哪些块、建哪些块(**纯函数**)。
+ *
+ * ## 为什么"重建的块一律先摘再建"
+ * 玩家拆了那一块的墙 ⇒ 同一块的立牌列表**变了**(可能变少、也可能换 id)
+ * ⇒ 只"加"会把旧立牌留在场景里(幽灵墙),只"摘"会让它整块消失。
+ * ⇒ 计划里 `add` **总是**包含全部被重建的块;`remove` 只含"当前真的有立牌"的那些
+ * (摘一个不存在的键在装配层是空操作,但把它列进计划会让读数虚高)。
+ */
+export function planPropApply(
+  existingKeys: readonly string[],
+  rebuild: readonly ChunkInput[],
+): PropApplyPlan {
+  const have = new Set(existingKeys);
+  const remove: string[] = [];
+  for (const c of rebuild) if (have.has(c.key)) remove.push(c.key);
+  return { remove, add: [...rebuild] };
+}
+
+/** 立牌总数上限(与装配层**同一个数**;导出是为了让判据能钉住它,不写第二份)。 */
+export const PROP_SPRITE_BUDGET = 600;
+
+/**
+ * 一块地形的**全部**立牌(物件 + 植被),顺序确定性:**先物件、后植被**。
+ *
+ * 顺序是**契约的一部分**:预算吃紧时被截断的正是尾部 ⇒ 「先物件」保证玩家能交互的
+ * 东西(墙/灯/箱/台)在预算不足时**留在屏幕上**,丢掉的只是装饰。
+ */
+export function planChunkProps(
+  chunk: ChunkInput,
+  vegetationIds: readonly number[],
+  seed: number,
+): ObjSpriteInput[] {
+  return [...planObjSprites(chunk), ...planVegetationSprites(chunk, vegetationIds, seed)];
 }
 /**
  * 在 `container` 里启动舞台。
@@ -535,9 +746,73 @@ export function boot(container: HTMLElement): BootHandle {
    *   ③ 给总数封顶(`SPRITE_BUDGET`),超了就不再摆。下一步应换成 InstancedMesh
    *      (现在 6% 密度的植被在 192×192 上会到四位数,靠封顶先控住)。
    */
-  const propSprites: THREE.Sprite[] = [];
-  /** 立牌总数上限。超过就**按遍历顺序截断**(确定性),不随机丢。 */
-  const SPRITE_BUDGET = 600;
+  /**
+   * ══════════ ★ WS-FND-188:立牌**跟块走**(改前它们只按首帧的设计图块算)══════════
+   *
+   * ## 改前是什么样(要修的那一件事)
+   * ```text
+   * 地形:applyTerrainChunks() 会按脏块重建(WS-FND-184 已通)
+   * 立牌:进 boot() 时按 `chunks`(首帧的**设计图占位**)算一次,之后再也没动过
+   * ```
+   * ⇒ 玩家拆掉一堵墙 / 盖起一格台子,地形面跟着变了,**立牌还是首帧那一份**:
+   *   墙拆了但立牌还在(幽灵墙)、新盖的东西一个立牌都没有。而这**不会报错**,
+   *   `propSpriteCount` 也照常有值。
+   *
+   * ## 三条纪律
+   * ```text
+   * 1 按 chunk key 分组保存 —— 整块摘除是 O(该块的立牌数),不是全表重建
+   * 2 摘除只回收**引用**+ scene.remove;材质按图集格**共享** ⇒ 绝不 dispose
+   *   (dispose 共享材质会把其它块的立牌一起变成黑块,而且不报错)
+   * 3 总数仍封顶 PROP_SPRITE_BUDGET,截断按**确定性顺序**(见 buildPropsOf)
+   * ```
+   */
+
+  /**
+   * 图集材质缓存 —— **立牌与 NPC 共用这一份**(按图集格号索引)。
+   *
+   * 为什么要提到这里(而不是留在原来那个 promise 回调里):NPC 立牌要用**同一个**
+   * 格子的材质(532),两份缓存 = 同一格被上传两次纹理(显存 x2),而且
+   * 哪天有人只改了一处,两个东西的观感就会不一致(不报错)。
+   */
+  const propMaterials = new Map<number, THREE.SpriteMaterial>();
+  /** 图集是否就绪(`false` 时只**登记**块,不建 Sprite —— 建了也没有材质)。 */
+  let propAtlasReady = false;
+  /**
+   * `图集格 → 材质`(唯一入口)。
+   *
+   * ⚠️ `cell < 0` = 不在图集内(未知 id)⇒ **必须跳过**:否则会去采样
+   * `offsetRepeatOfCell(-1)`,取到错位的图(不是"什么都不画",是"画了别人的格子")。
+   */
+  const propMaterialOf = (img: HTMLImageElement, cell: number): THREE.SpriteMaterial | null => {
+    if (cell < 0) return null;
+    const hit = propMaterials.get(cell);
+    if (hit !== undefined) return hit;
+    const { offsetU, offsetV, repeatU, repeatV } = offsetRepeatOfCell(cell);
+    const tex = new THREE.Texture(img);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.offset.set(offsetU, offsetV);
+    tex.repeat.set(repeatU, repeatV);
+    tex.needsUpdate = true;
+    const made = new THREE.SpriteMaterial({ map: tex, transparent: true });
+    propMaterials.set(cell, made);
+    return made;
+  };
+
+  /* ── 立牌表:key → 块数据(立牌的**来源**)与 key → 已建的 Sprite ── */
+  const propChunks = new Map<string, ChunkInput>();
+  const propsByChunk = new Map<string, THREE.Sprite[]>();
+  /** 当前屏幕上的立牌总数(预算与 `summary().propSpriteCount` 的**唯一**来源)。 */
+  let propSpriteTotal = 0;
+  /** 因预算被丢掉的立牌数(累计)。> 0 说明"该看见的东西没看见",必须有读数。 */
+  let propDroppedByBudget = 0;
+  /** 真的摘过几次块(累计;`0` 而地形重建过 ⇒ 跟块这条链断了)。 */
+  let propRemovedChunks = 0;
+
+  /** 立牌总数上限(与 `PROP_SPRITE_BUDGET` **同一个数**,不写第二份)。 */
+  const SPRITE_BUDGET = PROP_SPRITE_BUDGET;
   /**
    * 植被用哪几个物品当"树/草"。
    *
@@ -560,48 +835,149 @@ export function boot(container: HTMLElement): BootHandle {
   const VEGETATION_IDS: readonly number[] = [118, 379, 319, 121];
   /** 植被立牌的世界高度(格)。树木要能"盖住人",不然看不出来是树。 */
   const VEG_HEIGHT_WORLD = 2.6;
+  /** 植被哈希的种子 —— 世界级的常量(同一份世界长同样的树)。 */
+  const VEG_SEED = 0x5eed;
+  /** 图集图片本体(材质与 NPC 立牌都要它;`null` = 还没到 / 拿不到)。 */
+  let propAtlasImg: HTMLImageElement | null = null;
+
+  /** 一条立牌计划 + 它属于哪一块(摘除按块走 ⇒ 必须记住来源 key)。 */
+  type PropSpriteInput = ObjSpriteInput & { chunkKey: string };
+  /** 把一条计划变成场景里的 Sprite;预算满了 ⇒ `false`(调用方计数,不静默丢)。 */
+  const addPropSprite = (img: HTMLImageElement, it: PropSpriteInput): boolean => {
+    if (propSpriteTotal >= SPRITE_BUDGET) { propDroppedByBudget += 1; return false; }
+    const material = propMaterialOf(img, it.atlasCell);
+    if (material === null) return false;
+    const sp = new THREE.Sprite(material);
+    /* 格心 = 格索引 + 0.5;z 取自**地形那一格的高程** ⇒ 脚踩在面上,不悬空 */
+    sp.position.set(it.x + 0.5, it.y + 0.5, it.z);
+    const h = it.kind === 'vegetation'
+      ? VEG_HEIGHT_WORLD
+      : (it.heightPx / ATLAS_PX_PER_CELL) * SPRITE_CELL_WORLD;
+    sp.scale.set(h * 0.92, h, 1);
+    sp.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
+    sp.name = `${it.kind}_${it.id}_${it.x}_${it.y}`;
+    scene.add(sp);
+    let list = propsByChunk.get(it.chunkKey);
+    if (list === undefined) { list = []; propsByChunk.set(it.chunkKey, list); }
+    list.push(sp);
+    propSpriteTotal += 1;
+    return true;
+  };
+
+  /**
+   * **摘掉一整块的立牌**(顺序不可换:`scene.remove` 之后才从表里删)。
+   *
+   * ⚠️ 这里**绝不** `material.dispose()`:材质按图集格缓存在 `propMaterials` 里,
+   * 被**多个块**共享。dispose 一个格子的材质会让其它块用同一格的立牌一起变成黑块
+   * (而 three 不会报错)。要释放材质只有一条路:`dispose()` 里统一释放缓存表。
+   */
+  const removePropsForChunk = (key: string): number => {
+    propChunks.delete(key);
+    const list = propsByChunk.get(key);
+    if (list === undefined) return 0;
+    for (const sp of list) scene.remove(sp);
+    propsByChunk.delete(key);
+    propSpriteTotal -= list.length;
+    propRemovedChunks += 1;
+    return list.length;
+  };
+
+  /** 建(或重建)一整块的立牌 —— **先摘后建**,预算按确定性顺序截断。 */
+  const buildPropsOf = (chunk: ChunkInput): number => {
+    removePropsForChunk(chunk.key);
+    propChunks.set(chunk.key, chunk);
+    if (!propAtlasReady || propAtlasImg === null) return 0;
+    const img = propAtlasImg;
+    /* `planChunkProps` 的注释写着为什么是"先物件、后植被" —— 截断丢的是尾部。 */
+    for (const it of planChunkProps(chunk, VEGETATION_IDS, VEG_SEED)) {
+      addPropSprite(img, { ...it, chunkKey: chunk.key });
+    }
+    return propsByChunk.get(chunk.key)?.length ?? 0;
+  };
+
+  /** 登记(或重建)一块 —— `applyTerrainChunks` 与首帧占位共用**这一个**入口。 */
+  const addPropsForChunk = (chunk: ChunkInput): number => buildPropsOf(chunk);
+
+  /* 首帧:按**设计图占位**登记(图集还没到 ⇒ 只登记,不建 Sprite)。 */
+  for (const chunk of chunks) addPropsForChunk(chunk);
   void loadAtlasImage().then((img) => {
     if (img === null) return;
-    const mats = new Map<number, THREE.SpriteMaterial>();
-    const materialOf = (cell: number): THREE.SpriteMaterial | null => {
-      /* ⚠️ `atlasCell < 0` = 不在图集内(未知 id)⇒ **必须跳过**,
-         否则会去采样 `frameRectOfCell(-1)`,取到错位的图。 */
-      if (cell < 0) return null;
-      const hit = mats.get(cell);
-      if (hit !== undefined) return hit;
-      const { offsetU, offsetV, repeatU, repeatV } = offsetRepeatOfCell(cell);
-      const tex = new THREE.Texture(img);
-      tex.magFilter = THREE.NearestFilter;
-      tex.minFilter = THREE.NearestFilter;
-      tex.generateMipmaps = false;
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.offset.set(offsetU, offsetV);
-      tex.repeat.set(repeatU, repeatV);
-      tex.needsUpdate = true;
-      const made = new THREE.SpriteMaterial({ map: tex, transparent: true });
-      mats.set(cell, made);
-      return made;
-    };
-    const add = (it: ObjSpriteInput): void => {
-      if (propSprites.length >= SPRITE_BUDGET) return;
-      const material = materialOf(it.atlasCell);
-      if (material === null) return;
-      const sp = new THREE.Sprite(material);
-      /* 格心 = 格索引 + 0.5;z 取自**地形那一格的高程** ⇒ 脚踩在面上,不悬空 */
-      sp.position.set(it.x + 0.5, it.y + 0.5, it.z);
-      const h = it.kind === 'vegetation'
-        ? VEG_HEIGHT_WORLD
-        : (it.heightPx / ATLAS_PX_PER_CELL) * SPRITE_CELL_WORLD;
-      sp.scale.set(h * 0.92, h, 1);
-      sp.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
-      sp.name = `${it.kind}_${it.id}_${it.x}_${it.y}`;
-      scene.add(sp);
-      propSprites.push(sp);
-    };
-    /* 先物件、后植被:预算吃紧时**保住**玩家能交互的东西(墙/灯/箱/台)。 */
-    for (const chunk of chunks) for (const it of planObjSprites(chunk)) add(it);
-    for (const chunk of chunks) for (const it of planVegetationSprites(chunk, VEGETATION_IDS, 0x5eed)) add(it);
+    propAtlasImg = img;
+    propAtlasReady = true;
+    /* 图集就绪 ⇒ 给**已登记**的块补齐立牌,顺序按 key 升序(**确定性**:
+       预算截断的结果只取决于有哪些块,与"谁先到达"无关)。 */
+    for (const key of [...propChunks.keys()].sort()) {
+      const c = propChunks.get(key);
+      if (c !== undefined) buildPropsOf(c);
+    }
+    refreshNpcSprites();
   });
+
+  /* ══════════ ★ WS-FND-188:NPC 立牌(看得见)+ 说话那两行(能按住) ══════════
+   *
+   * ## 数据来源唯一
+   * `NpcWireDef[]` 由 `main.ts` 从会话的 `onNpcs` 推进来(服务端在 `hello`/`welcome`
+   * 之后发**一次**)⇒ 本文件**不**内置任何 NPC 名单:两份名单迟早漂,而漂的表现是
+   * 「服务器说有 4 个人,屏幕上 3 个」(那是最难查的一类:两边都不报错)。
+   *
+   * ## 贴图:临时用 532 稻草人靶
+   * 依据与"为什么是临时的"写在 `NPC_SPRITE_ITEM_ID` 的 docblock 里。这里只强调一件事:
+   * **没有任何东西**会告诉玩家"这格贴图不对" —— 所以它必须是**一个具名常量 + 一条
+   * 会红的判据**(`WS-FND-188` 钉 `atlasCell >= 0`),而不是散在装配层里的字面量。
+   */
+  /** 服务端下发的 NPC 表(空 = 还没到 / 这个房间没有 NPC)。 */
+  let npcList: readonly NpcWireDef[] = [];
+  /** id → Sprite(与 `propsByChunk` 同一纪律:表即场景的一份索引)。 */
+  const npcSprites = new Map<string, THREE.Sprite>();
+  /** 建 / 删的累计数(自检口径:`moves === 0` 而 `npcCount > 0` ⇒ 表到了但没画)。 */
+  const npcSpriteOps = { spawns: 0, removes: 0 };
+  /** 最近一句台词(HUD 那一行;由 `main.ts` 从动作回执里喂进来)。 */
+  let npcTalkLine = '';
+
+  /** 按当前 NPC 表把立牌对齐(缺的建、多的删;**位置/贴图变了就地改**)。 */
+  function refreshNpcSprites(): void {
+    const plan = planNpcSprites(npcList, SPRITE_HEIGHT_PX.player ?? 28);
+    const seen = new Set<string>();
+    for (const p of plan) {
+      seen.add(p.id);
+      if (p.atlasCell < 0) continue;      /* 图集里没有这一格 ⇒ 跳过,不错位取样 */
+      if (!propAtlasReady || propAtlasImg === null) continue;
+      const material = propMaterialOf(propAtlasImg, p.atlasCell);
+      if (material === null) continue;
+      let sp = npcSprites.get(p.id);
+      if (sp === undefined) {
+        sp = new THREE.Sprite(material);
+        /* 与图集立牌/玩家立牌同一锚点约定(距底 15%)—— 否则脚会陷进地里 */
+        sp.center.set(SPRITE_CENTER_X, SPRITE_CENTER_Y);
+        sp.name = `npc_${p.id}`;
+        scene.add(sp);
+        npcSprites.set(p.id, sp);
+        npcSpriteOps.spawns += 1;
+      }
+      /* NPC 的坐标是**格**;立牌站在格心(+0.5),z 取那一格的高程(`zAt` 表,
+         与玩家/实体立牌同源)⇒ 脚踩在地上,不悬空。 */
+      const z = zAt.get(`${Math.floor(p.x)},${Math.floor(p.y)}`) ?? 0;
+      sp.position.set(p.x + 0.5, p.y + 0.5, z);
+      const h = (p.heightPx / ATLAS_PX_PER_CELL) * SPRITE_CELL_WORLD;
+      sp.scale.set(h * 0.92, h, 1);
+      sp.visible = true;
+    }
+    for (const [id, sp] of npcSprites) {
+      if (seen.has(id)) continue;
+      scene.remove(sp);
+      npcSprites.delete(id);
+      npcSpriteOps.removes += 1;
+    }
+  }
+
+  /** `main.ts` 的端口:NPC 表到了(`session.onNpcs`)。整表替换,不合并。 */
+  const setNpcs = (list: readonly NpcWireDef[]): void => {
+    npcList = [...list];
+    refreshNpcSprites();
+  };
+
+  /** `main.ts` 的端口:把一句台词写到 HUD 那一行(`''` = 清掉)。 */
+  const showTalk = (text: string): void => { npcTalkLine = text; };
   const buildMs = performance.now() - t0;
 
   /* ── 图集立牌(决策 A:保持 TILE_PX=16,装配层缩放 64px 图集)──
@@ -1043,6 +1419,14 @@ export function boot(container: HTMLElement): BootHandle {
       hud.setWorld(worldCells, meshes.size, TERRAIN_SOURCE_DESIGN);
       return { rebuilt: 0, total: meshes.size, full: false, fallback: true };
     }
+    /* ── ★ WS-FND-188:立牌**跟着同一批块走**(计划由 `planPropApply` 算)──
+     *
+     * 复用 `plan.rebuild`(而不是自己再算一次"哪些块脏了"):那就是**第二份口径**,
+     * 两份迟早漂,而漂的表现是"地形换了一半、立牌换了一片"(画面看着像随机,不报错)。
+     * 每次**先摘后建**:拆掉墙之后同块的立牌列表会变,只加会留下幽灵立牌。 */
+    const propPlan = planPropApply([...propChunks.keys()], plan.rebuild);
+    for (const key of propPlan.remove) removePropsForChunk(key);
+    for (const chunk of propPlan.add) addPropsForChunk(chunk);
     for (const chunk of plan.rebuild) {
       removeTerrainMesh(chunk.key);   /* 先摘旧的(含 dispose) */
       addTerrainMesh(chunk);          /* 再建新的 */
@@ -1083,6 +1467,17 @@ export function boot(container: HTMLElement): BootHandle {
     parts.push(`缩放 ${isoCam.zoom}×([ / ])`);
     if (searchMode) parts.push(`搜索 "${invQuery}"(Enter 收下 / Esc 清空)`);
     if (lastMove !== '') parts.push(`拖拽 ${lastMove}`);
+    /* ── ★ WS-FND-188:NPC 那两行 ──
+       「附近有没有人 / 按哪个键」与「最近那一句台词」都是**玩家要读的**东西。
+       判定在纯函数里(`nearbyNpc` / `npcHintLine`),这里只按结果追加 ——
+       写在这里(而不是事件回调里)的理由与 `#hint` 其它行相同:它是**状态的函数**,
+       散进回调后必然有一条路径忘记刷新(那一行就会永远停在上一句话上)。
+       ⚠️ 位置用**权威** `playerGx/playerGy`(与 `main.ts` 的按键判定同一个来源):
+       两边若各用一个位置,会出现"提示写着能说话、按下去被拒"。 */
+    const near = nearbyNpc(npcList, playerGx, playerGy);
+    const npcLine = npcHintLine(near);
+    if (npcLine !== '') parts.push(npcLine);
+    if (npcTalkLine !== '') parts.push(npcTalkLine);
     parts.push('I 背包 · / 搜索 · 拖拽整理背包 · WASD 移动 · 单指拖动视角');
     const text = parts.join(' · ');
     if (text === lastHint) return;
@@ -2427,6 +2822,10 @@ export function boot(container: HTMLElement): BootHandle {
     uiHitAt: (x, y) => uiHitAt(x, y),
     /* ★ WS-FND-184:地形下行 → 建面的入口(`main.ts` 的 `onTerrain` 调它)。 */
     applyTerrainChunks: (next, dirtyKeys) => applyTerrainChunks(next, dirtyKeys),
+    /* ★ WS-FND-188:NPC 表的入口(整表替换)与台词端口(`main.ts` 的两条注入,
+       与 `setPoseSource` / `setPartyModeSink` 同一条手法)。 */
+    setNpcs: (npcs) => { setNpcs(npcs); },
+    showTalk: (text) => { showTalk(text); },
     summary: () => ({
       cells: WORLD_CELLS,
       chunks: meshes.size,
@@ -2443,6 +2842,7 @@ export function boot(container: HTMLElement): BootHandle {
        * ```text
        * terrainSource === 'design' 且 terrainApplyCalls === 0
        *     ⇒ 一帧服务器地形都没到(屏幕上画的是本地设计图);
+
        * terrainApplyCalls > 0 而 terrainRebuilt === 0
        *     ⇒ 帧到了但一块都没重建(键口径对不上 / 脏标记被别处清掉了);
        * terrainDisposed === terrainRebuilt
@@ -2545,8 +2945,41 @@ export function boot(container: HTMLElement): BootHandle {
       spriteCount: sprites.length,
       /* ★ w90:世界里的**东西**摆了几个(obj 立牌 + 植被)。
          没有这个读数,「网页上一棵树都没有」与「摆了 600 个但全被预算截断」
-         在外部读数上**完全一样** —— 而后者正是最该被发现的那种静默。 */
-      propSpriteCount: propSprites.length,
+         在外部读数上**完全一样** —— 而后者正是最该被发现的那种静默。
+         ★ WS-FND-188:下面四个数一起读,才分得清"立牌没跟块"的三种坏法:
+         ```text
+         propChunkCount === 0            ⇒ 立牌表是**空**的(不是"没画,是没登记")
+         propRemovedChunks === 0 而地形重建过 ⇒ 跟块这条链断了(旧立牌留在场景里)
+         propDroppedByBudget > 0          ⇒ 场景里少于计划(预算截断,不是"没有东西")
+         ``` */
+      propSpriteCount: propSpriteTotal,
+      propChunkCount: propChunks.size,
+      propRemovedChunks,
+      propDroppedByBudget,
+      propBudget: SPRITE_BUDGET,
+      /** 立牌表为空 ⇒ **看得见**(改前"空表"与"没接线"在读数上同形)。 */
+      propTableEmpty: propChunks.size === 0,
+      /* ── ★ WS-FND-188:NPC 自检口径(「看得见 + 能对话」两条都要读得出来)──
+       * ```text
+       * npcCount        服务端下发了几个 NPC(0 = 那一帧没到 —— 与"这个世界没有 NPC"不同)
+       * npcSpriteCount  场景里真的有几个 NPC 立牌(0 而 npcCount > 0 ⇒ 表到了但没画)
+       * npcAtlasCell    NPC 用的图集格(-1 = 图集里没有 ⇒ 一个都画不出来,且**不报错**)
+       * nearbyNpcId     离玩家最近的、在半径内的那个(空 = 附近没人)
+       * npcHintLine     HUD 那一行(空 = 附近没人,不是"没接线")
+       * npcTalkLine     最近一句台词(空 = 还没说过话)
+       * ```
+       * ⚠️ 一个数都不报的话,「NPC 上屏了没」只能靠肉眼看画面 —— 而那正是本任务要消灭的形态。 */
+      npcCount: npcList.length,
+      npcSpriteCount: npcSprites.size,
+      npcAtlasCell: cellIndexFromId(NPC_SPRITE_ITEM_ID),
+      npcTextureItemId: NPC_SPRITE_ITEM_ID,
+      npcSpriteOps: { ...npcSpriteOps },
+      nearbyNpcId: (nearbyNpc(npcList, playerGx, playerGy)?.id) ?? null,
+      npcHintLine: npcHintLine(nearbyNpc(npcList, playerGx, playerGy)),
+      npcTalkLine,
+      npcPlacements: planNpcSprites(npcList).map((p) => ({
+        id: p.id, x: p.x + 0.5, y: p.y + 0.5, atlasCell: p.atlasCell,
+      })),
       spriteIds: sprites.map((s) => s.name),
       /* 锚点实测值:必须是 0.15(不是 0.85),差 0.70 会让立牌陷进地里 */
       spriteCenterY: sprites[0]?.center.y ?? null,
@@ -2823,6 +3256,21 @@ export function boot(container: HTMLElement): BootHandle {
         sp.material.dispose();
       }
       entitySprites.clear();
+      /* ★ WS-FND-188:立牌(按块分组)与 NPC 立牌也是场景对象 ⇒ 一并摘干净。
+         ⚠️ **材质只释放一次**:`propMaterials` 是按图集格缓存、被多个立牌共享的
+         —— 逐个 Sprite `material.dispose()` 会在第二个立牌上 dispose 同一份材质
+         (three 报不报错取决于时机,而"黑块"/残留是最常见的表现)。 */
+      for (const list of propsByChunk.values()) for (const sp of list) scene.remove(sp);
+      propsByChunk.clear();
+      propChunks.clear();
+      propSpriteTotal = 0;
+      for (const sp of npcSprites.values()) scene.remove(sp);
+      npcSprites.clear();
+      for (const m of propMaterials.values()) {
+        m.map?.dispose();
+        m.dispose();
+      }
+      propMaterials.clear();
       mat.dispose();
       renderer.dispose();
     },

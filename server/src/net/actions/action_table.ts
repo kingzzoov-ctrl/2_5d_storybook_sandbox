@@ -1,5 +1,7 @@
 /**
- * **动作 → 处理器**的唯一一张表(`RoomAction` **25** 个动作的**执行层归属**)。
+ * **动作 → 处理器**的唯一一张表(`RoomAction` 全部动作的**执行层归属**)。
+ * ⚠️ 计数随 `RoomAction` 走:`NPC_TALK`(WS-FND-188)进来后是 26 个动作
+ *   (其中 24 个各有真实现,`MOVE` / `ATTACK` 仍回 `NOT_IMPLEMENTED`)。
  *
  * ## 为什么是 `Readonly<Record<RoomAction, ActionHandler>>` 而不是手搓 `switch`
  *
@@ -10,9 +12,10 @@
  *
  * ## 文件互斥(为什么每个动作各占一个模块)
  *
- * 25 个动作**全部已登记**;其中 23 个各有真实现(`admin.ts` 5 个 / `material.ts` 4 个 /
- * `gather.ts` 1 个,按**族或动作**分文件,其余 13 个各占一个模块:`craft.ts` / `sleep.ts` / ...)。
- * 余下 2 个 —— `MOVE` / `ATTACK` —— 仍回 `NOT_IMPLEMENTED`(见下方 ★)。
+ * 每个动作**都已登记**;除 `MOVE` / `ATTACK` 外各有真实现(`admin.ts` 5 个 /
+ * `material.ts` 4 个 / `gather.ts` 1 个,按**族或动作**分文件,其余各占一个模块:
+ * `craft.ts` / `sleep.ts` / `npc_talk.ts` / ...)。
+ * `MOVE` / `ATTACK` 两个仍回 `NOT_IMPLEMENTED`(见下方 ★)。
  * ⇒ 改某个动作时**只改它自己那个文件**,本文件与 `room.ts` 一个字都不用动。
  *
  * ## 没有循环 import
@@ -45,9 +48,11 @@ import { breedTame } from './breed_tame.ts';
 import { useItem } from './use_item.ts';
 import { buyItem } from './buy_item.ts';
 import { gather } from './gather.ts';
+/* ★ WS-FND-188:与 NPC 说话(静态 NPC 表 → 立牌 → 对话的最后一环)。 */
+import { npcTalk } from './npc_talk.ts';
 
 /**
- * 25 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
+ * 26 个动作的执行层。键序与 `RoomAction` 的声明序一致(便于逐行对表)。
  *
  * ★ 「接线缺口」的历史清单见 `docs/TASK-96-action-landing-gaps.md`(当时记的 13 处未接线,
  *   现已全部接线);今天仍回 `NOT_IMPLEMENTED` 的只剩 `MOVE` / `ATTACK`,这是**刻意**的
@@ -82,6 +87,9 @@ export const ACTION_HANDLERS: Readonly<Record<RoomAction, ActionHandler>> = {
   USE_ITEM: useItem,
   /* ★ WS-FND-77 A-4:百货店购买(515)。此前 `systems/depot.ts:buy` 只有测试在调。 */
   BUY_ITEM: buyItem,
+  /* ★ WS-FND-188:与 NPC 说话。只读动作(不改世界、不改背包)—— `dialogue.talk`
+     是纯函数,本表只接线;领奖那条写路径(`acceptQuest`)不在本轮。 */
+  NPC_TALK: npcTalk,
 };
 
 /**

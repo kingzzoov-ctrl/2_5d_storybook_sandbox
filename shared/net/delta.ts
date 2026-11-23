@@ -1226,3 +1226,256 @@ export function makeChunkVersionKey(cx: number, cy: number): string {
 
 /** 定点换算再次导出,方便调用方只 import delta.ts。 */
 export { POS_SCALE, quantizePos, dequantizePos };
+
+/* ═══════════════ 8. NPC 帧(静态 NPC 表的**一次性**下发)WS-FND-188 ═══════════════
+ *
+ * ## 为什么 NPC 不走快照通道(而是自己一帧)
+ * ```text
+ * NPC 是**静态数据**(server/src/npc/defs.ts):坐标写死在设计图里、血量/状态都没有
+ * ⇒ 进 20Hz 差量快照 = 每帧白编一份永不变的载荷,而且要给 wire.ts 的字段表
+ *   新增一个 EntityKind(冻结层改动 + 所有按 kind 遍历的判据都要跟着动)。
+ * ```
+ * 而它**又必须**到客户端:接线前 `NPCS` 有数据、`dialogue.talk` 有纯函数、
+ * `npcAt()` 有空间查询 —— 玩家**一个都看不到也点不到**(与 `obj` 立牌接线前同形)。
+ * ⇒ 与地形帧(`shared/net/terrain.ts`)同款:**一次性**、自包含、带首字节 tag。
+ *
+ * ## 帧布局(小端)
+ * ```text
+ * ┌────────┬────────┬───────────┬─────────────────────────────────────────┐
+ * │ tag u8 │ ver u8 │ count u16 │ count × NPC                             │
+ * └────────┴────────┴───────────┴─────────────────────────────────────────┘
+ *   NPC = ┌────────┬────────┬─────────┬─────────┬───────────────┐
+ *         │ str id │ str name │ pos x i32 │ pos y i32 │ u8 hasQuest │
+ *         └────────┴────────┴─────────┴─────────┴───────────────┘
+ *         hasQuest = 1 ⇒ 再跟 ┌ str questId │ str title │ u16 needItemId │ u16 needCount ┐
+ * ```
+ * `str` = **分段** u8 长度前缀 + UTF-8(`ByteWriter.str` / `ByteReader.str`,
+ * 与差量包的 id / `chunkVersions` 同一套编码,长度 ≥255 时自动分段)。
+ * `pos` = 与线上坐标**同一份**定点口径(`POS_SCALE` + i32),不是另立一种浮点写法:
+ * 两套口径的偏差只会在屏幕上表现为「NPC 比地板偏半格」,而那种缺陷不报错。
+ *
+ * ## 为什么带 tag(与地形帧同一条理由)
+ * 两种二进制帧共用同一个 WS opcode(0x2)⇒ 不靠首字节就没有任何东西能把它们分开。
+ * 首字节必须避开 `0x01`(FRAME_TEXT)/`0x02`(FRAME_BINARY)/`0x7b`(`{`)/
+ * `PROTOCOL_VERSION = 3`(裸差量包首字节)⇒ 取 `0x4e`('N')。
+ * ⚠️ **判据必须写在客户端的二进制分支里、在 `store.apply` 之前**(见
+ * `client/src/net/session.ts`)—— 交给解码器的话,一条**形态完好**的 NPC 帧会以
+ * 「协议版本不匹配:78」的形态报出来,而那个原因指向的是**编码器**
+ * (本仓反复记的「症状名 ≠ 成因名」)。
+ *
+ * ## 错误口径(与 `terrain.ts` / 上面的字段口径同规)
+ * ```text
+ * 非空 id / 非有限坐标 / 越界 u16 / hasQuest 不是 0|1  ⇒ **抛错**(不静默截断)
+ * 帧截断 / 尾部有垃圾 / 首字节不是 tag       ⇒ **抛错**(不"尽量解")
+ * ```
+ * 另有**不抛**的一档:`tryDecodeNpcFrame()` —— 运输层用它,坏帧变成
+ * `lastNpcError` 里的一行字,而不是一条把连接打死的异常
+ * (与 `SessionHandle.lastTerrainError` 同一取舍)。
+ */
+
+/**
+ * NPC 帧的首字节 tag。
+ *
+ * `0x4e` = ASCII 'N'(地形帧用 `0x54` 'T')。改动它 = 改线上契约:
+ * 客户端会把它当**差量包**送去解码(报「协议版本不匹配」),而服务端那边看起来一切正常。
+ */
+export const NPC_FRAME_TAG = 0x4e;
+
+/** NPC 帧的线路版本。与 `PROTOCOL_VERSION` **分开**(两者的 bump 理由不同,同地形帧)。 */
+export const NPC_WIRE_VERSION = 1;
+
+/** 帧头:tag u8 + ver u8 + count u16 = 4 字节。 */
+export const NPC_FRAME_HEADER_BYTES = 4;
+
+/** 一帧最多装几个 NPC(`count` 字段是 u16)。 */
+export const NPC_MAX_PER_FRAME = 0xffff;
+
+/** 线上的一条任务追述(**只带 UI 要显示的字段**,不发奖励/账本)。 */
+export interface NpcWireQuest {
+  id: string;
+  title: string;
+  needItemId: number;
+  needCount: number;
+}
+
+/**
+ * 线上的一条 NPC —— 与 `server/src/npc/defs.ts` 的 `NpcDef` **同形状的一个子集**
+ * (`id/name/home.x/home.y/quest`),`lines` 刻意**不上线**:
+ * 台词由服务端按玩家任务状态在 `dialogue.talk()` 里选,**整份下发会让客户端
+ * 手上有第二份台词表** —— 那正是「两端各说各的」的成因。
+ */
+export interface NpcWireDef {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  quest?: NpcWireQuest;
+}
+
+/** 解一帧 NPC 的结果(`decodeNpcFrame` 的返回)。 */
+export interface DecodedNpcFrame {
+  wireVersion: number;
+  npcs: NpcWireDef[];
+  /** 恰好消耗的字节数(尾部有垃圾时**抛错**,不是静默接受)。 */
+  bytesConsumed: number;
+}
+
+/** 一帧字节是不是 NPC 帧(判据 = 首字节 tag + 至少一个帧头)。 */
+export function isNpcFrame(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= NPC_FRAME_HEADER_BYTES && bytes[0] === NPC_FRAME_TAG;
+}
+
+/**
+ * NPC 坐标的**唯一**校验口:与 pos 字段(见上面 §2 的 `toPosInt32`)同规 ——
+ * 非有限值 / 量化后越界一律**抛错**,不钳位(钳位会把越界坐标变成一个
+ * "看起来正常"的位置,而两端都读不出异常)。
+ */
+function npcPosInt32(field: string, v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    throw new Error(`${field} 非法取值:${String(v)}(坐标只接受有限数值 —— 不做静默钳位)`);
+  }
+  const exact = Math.round(v * POS_SCALE);
+  if (exact > POS_INT32_MAX || exact < POS_INT32_MIN) {
+    throw new Error(
+      `NPC 坐标越界:${field}=${v}(量化后 ${exact} 超出 i32 定点 `
+      + `${POS_INT32_MIN}..${POS_INT32_MAX})—— 不做静默钳位`,
+    );
+  }
+  return quantizePos(v);
+}
+
+/** u16 字段的唯一校验口(件数 / 物品 id;越界 ⇒ 抛错,不回绕)。 */
+function npcU16(field: string, v: unknown): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 0xffff) {
+    throw new Error(`${field} 非法取值:${String(v)}(要求 0..65535 的整数 —— 不做静默回绕)`);
+  }
+  return v;
+}
+
+/** 非空字符串字段的唯一校验口(`id` 空串会让"按 id 查 NPC"永远查不到)。 */
+function npcStrId(field: string, v: unknown): string {
+  if (typeof v !== 'string' || v.length === 0) {
+    throw new Error(`${field} 非法取值:${String(v)}(必须是非空字符串)`);
+  }
+  return v;
+}
+
+/**
+ * 编一帧 NPC 表(自包含)。
+ *
+ * 顺序 = 入参顺序 ⇒ 同一份表永远编出逐字节相同的帧(确定性,与 `encodeTerrainFrame` 同规)。
+ * 空表是**合法**的:帧头 + `count = 0`(共 4 字节)—— 客户端据此得到"这个世界没有 NPC"
+ * 这一**明确**结论,而不是"什么都没收到"。
+ */
+export function encodeNpcFrame(npcs: readonly NpcWireDef[]): Uint8Array {
+  if (npcs.length > NPC_MAX_PER_FRAME) {
+    throw new Error(`NPC 帧条数越界:${npcs.length} > ${NPC_MAX_PER_FRAME}(u16 计数)`);
+  }
+  const w = new ByteWriter();
+  w.u8(NPC_FRAME_TAG);
+  w.u8(NPC_WIRE_VERSION);
+  w.u16(npcs.length);
+  for (const n of npcs) {
+    w.str(npcStrId('NPC.id', n.id));
+    /* 名字允许空串(它是 UI 文案,不是键)⇒ 与 `writeField` 的 STR 分支同口径。 */
+    w.str(typeof n.name === 'string' ? n.name : '');
+    w.i32(npcPosInt32('NPC.x', n.x));
+    w.i32(npcPosInt32('NPC.y', n.y));
+    const q = n.quest;
+    if (q === undefined) { w.u8(0); continue; }
+    w.u8(1);
+    w.str(npcStrId('NPC.quest.id', q.id));
+    w.str(typeof q.title === 'string' ? q.title : '');
+    w.u16(npcU16('NPC.quest.needItemId', q.needItemId));
+    w.u16(npcU16('NPC.quest.needCount', q.needCount));
+  }
+  return w.finish();
+}
+
+/**
+ * 解一帧 NPC。尾部有剩余字节 ⇒ **抛错**(与 `decodeTerrainFrame` / `decodePacket` 同规):
+ * 静默接受会让"两帧粘在一起"看起来像"一帧解成功了"。
+ */
+export function decodeNpcFrame(bytes: Uint8Array): DecodedNpcFrame {
+  if (bytes.byteLength < NPC_FRAME_HEADER_BYTES) {
+    throw new Error(
+      `NPC 帧截断:需要 ${NPC_FRAME_HEADER_BYTES} 字节帧头,实得 ${bytes.byteLength} 字节`,
+    );
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const tag = dv.getUint8(0);
+  if (tag !== NPC_FRAME_TAG) {
+    throw new Error(
+      `不是 NPC 帧:首字节 ${tag} ≠ ${NPC_FRAME_TAG}`
+      + '(把它当差量包解会更早报「协议版本不匹配」—— 那是**错的**对象)',
+    );
+  }
+  const wireVersion = dv.getUint8(1);
+  if (wireVersion !== NPC_WIRE_VERSION) {
+    throw new Error(
+      `NPC 帧线路版本不匹配:${wireVersion}(本地 ${NPC_WIRE_VERSION})—— 明确失败,不静默降级`,
+    );
+  }
+  const count = dv.getUint16(2, true);
+  const r = new ByteReader(bytes);
+  r.pos = NPC_FRAME_HEADER_BYTES;
+  const npcs: NpcWireDef[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const id = r.str();
+    const name = r.str();
+    const x = dequantizePos(r.i32());
+    const y = dequantizePos(r.i32());
+    const hasQuest = r.u8();
+    if (hasQuest !== 0 && hasQuest !== 1) {
+      throw new Error(
+        `NPC 帧第 ${i} 条(${id})的 quest 标志非法:${hasQuest}(只接受 0 / 1 `
+        + '—— 其余值会让"有任务"与"没任务"不可区分)',
+      );
+    }
+    const npc: NpcWireDef = { id, name, x, y };
+    if (hasQuest === 1) {
+      npc.quest = {
+        id: r.str(),
+        title: r.str(),
+        needItemId: r.u16(),
+        needCount: r.u16(),
+      };
+    }
+    npcs.push(npc);
+  }
+  if (r.pos !== bytes.length) {
+    throw new Error(
+      `NPC 帧尾部有 ${bytes.length - r.pos} 字节未消耗(解出 ${r.pos}/${bytes.length}B)`,
+    );
+  }
+  return { wireVersion, npcs, bytesConsumed: r.pos };
+}
+
+/** `tryDecodeNpcFrame` 的结果:二选一,**没有第三种形态**(不会返回"半个表")。 */
+export interface NpcFrameTryDecode {
+  /** 解出来的表;`error !== null` 时它是**空表**(不是半份)。 */
+  npcs: NpcWireDef[];
+  /** `null` = 这一帧是好的。 */
+  error: string | null;
+}
+
+/**
+ * **不抛**的解码口 —— 运输层专用。
+ *
+ * ## 为什么运输层不能直接用 `decodeNpcFrame`
+ * 一条坏帧(版本漂移 / 截断)抛进 socket 的 `message` 回调里,后果取决于调用方
+ * 有没有 try/catch —— 而"取决于"就是本仓最忌的形态:漏了的那一处会让**整条连接**
+ * 因为一条可忽略的坏帧而静默停摆。这里把失败变成**一个值**:
+ * 调用方把它写进 `lastNpcError`(可读、可断言),连接照常活着。
+ * 与 `SessionHandle.lastTerrainError` 同一条取舍:坏帧**出声**,但不算"载荷形态不对"。
+ */
+export function tryDecodeNpcFrame(bytes: Uint8Array): NpcFrameTryDecode {
+  if (!(bytes instanceof Uint8Array)) {
+    return { npcs: [], error: `NPC 帧载荷不是 Uint8Array(${typeof bytes})` };
+  }
+  try {
+    return { npcs: decodeNpcFrame(bytes).npcs, error: null };
+  } catch (e) {
+    return { npcs: [], error: (e as Error).message };
+  }
+}

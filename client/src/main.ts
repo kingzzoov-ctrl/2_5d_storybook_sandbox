@@ -19,6 +19,12 @@
  */
 
 import { boot, type BootHandle } from './three/boot.ts';
+/* ★ WS-FND-188:NPC 那三件纯判定(靠近 / HUD 文案 / 台词拼接)全在 `boot.ts` 里,
+   与 `planTerrainRebuild` 同一层(零依赖、node 里可直接断言)。
+   ⚠️ 本文件只做**装配**:接上 `session.onNpcs`、把 `T` 交给 NPC 或道具、把台词写进 HUD。 */
+import { NPC_TALK_KEY, nearbyNpc, npcTalkTextOf } from './three/boot.ts';
+/* NPC 表的**线上形状** —— 与 `boot.setNpcs` 的入参是同一个类型(共享协议层)。 */
+import { type NpcWireDef } from '../../shared/net/delta.ts';
 import {
   CONNECT_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, RECONNECT_FACTOR, RECONNECT_MAX_MS,
   createSession, type SessionHandle,
@@ -196,6 +202,15 @@ function main(): void {
    * 是不是回落"变成**读得出来**的字(`__stageReady` 里也有同一个字符串)。
    */
   let lastTerrainNote: string | null = null;
+  /* ── ★ WS-FND-188:NPC 的三个读数(「看得见 + 能对话」在装配层也要读得出来)──
+   *
+   * `npcList`  服务端那张静态表(`session.onNpcs` → 这里 → `handle.setNpcs`)。
+   *            按键判定与 `boot` 的 HUD 用**同一份**,不存在第二份名单。
+   * `lastNpcNote` 最近一次**表到了**的读数(`null` = 还没到过)。
+   * `lastNpcTalk` 最近一句台词(与 `#hint` 上那行是**同一个字符串**)。 */
+  let npcList: readonly NpcWireDef[] = [];
+  let lastNpcNote: string | null = null;
+  let lastNpcTalk = '';
   /**
    * ★ WS-FND-167:最近一条 `onState` 的 **detail**(状态本身的具名原因)。
    *
@@ -393,6 +408,29 @@ function main(): void {
             + (r.full ? '(首帧整表对齐)' : '')
             + (r.fallback ? '(无块 ⇒ 仍是设计图占位)' : '');
         },
+        /* ═══ ★ WS-FND-188:NPC 表到了 ⇒ **交给 boot 摆立牌**,并留在本文件给按键判定 ═══
+         *
+         * ## 改前是什么样
+         * 服务端根本没有这一帧(`NPCS` 只活在自己那个文件里),客户端也一个字段都没收到
+         * ⇒ 世界里那 4 个人**看不见、点不到**,而没有任何东西会红(连接是 live、
+         * 快照照常到、画面也在动)。
+         *
+         * ## 两件事必须**同时**做(漏一件的表现各不相同)
+         * ```text
+         * handle.setNpcs(npcs)  ⇒ 立牌摆出来(看得见)
+         * npcList = npcs        ⇒ 按 T 时知道身边是谁(点得到)
+         * ```
+         * 只做前者:看得见但按 T 判定用一份空表 ⇒ 永远走 `USE_ITEM`(死键);
+         * 只做后者:按 T 能发,但屏幕上没有人 ⇒ "我在跟谁说话"没人答得上来。
+         *
+         * ⚠️ 用事件里的 `npcs` 而不是去问 `session.lastNpcs`:后者不存在 ——
+         *   静态表是**一次性**的,推送即事实(与地形"分批"不同,见 `session.onNpcs`)。 */
+        onNpcs: (npcs) => {
+          npcList = npcs;
+          handle.setNpcs(npcs);
+          lastNpcNote = `NPC 表到了:${npcs.length} 个`
+            + (npcs.length === 0 ? '(这个世界没有人 —— 不是"帧没到")' : '');
+        },
         /* ★ 第十轮 P3:**拒因不许被 close 盖掉**。修前这里只对 `'failed'` 告警,
            而服务端的拒绝随即把状态推成 `'closed'`(带同一条拒因)⇒ 「为什么被拒」
            只留在一次瞬时 `failed` 上,现场只剩「断了」。⇒ `closed` 带 detail 时也打。
@@ -451,6 +489,19 @@ function main(): void {
           /* ★ 第七轮审计 P2:回执里的**增量**落进明细账本 —— `CRAFT` 的 `have` 就是它。
              被拒的回执(`ok === false`)不落账:它没有改动背包(见 `have_ledger.ts`)。 */
           haveDetail = applyReceiptToHave(haveDetail, { action: r.action, ok: r.ok, effect: r.effect });
+          /* ── ★ WS-FND-188:`NPC_TALK` 的台词回来 ⇒ 显示在 HUD 一行 ──
+           *
+           * 台词**不是**客户端拼的文案,而是服务端按任务状态选的(`dialogue.talk`);
+           * `npcTalkTextOf` 只把 `{npc, line}` 拼成一行(纯函数,判据直接喂 effect)。
+           * ⚠️ 被拒(`ok === false`)时**不**写这一行:那会留下上一句话,
+           *   看起来像"这次也说成功了"(与 `have_ledger` 不落被拒回执同一条纪律)。 */
+          if (r.action === 'NPC_TALK' && r.ok) {
+            const said = npcTalkTextOf(r.effect);
+            if (said !== '') {
+              lastNpcTalk = said;
+              handle.showTalk(said);
+            }
+          }
         },
       },
     });
@@ -679,6 +730,11 @@ function main(): void {
       lastItemId === 0
         ? '热键 1/2/3/4 需要「最近物品」(按 E 或 F 先拿一件)'
         : '热键 1/2/3/4 就绪(1 驯养 · 2 购买 · 3 炼金台 · 4 放自动化件)',
+      /* ── ★ WS-FND-188:NPC 表与最近一句台词(玩家在**状态条**上也能看到)──
+         两个数一起读才分得清「表没到」(`还没收到`)与「表到了但没摆出来」
+         (那个看 `__stageReady().npcSpriteCount`)。 */
+      lastNpcNote === null ? 'NPC 表 (还没收到)' : lastNpcNote,
+      lastNpcTalk === '' ? '台词 (还没说过话)' : `台词 ${lastNpcTalk}`,
     ];
     if (statusEl !== null) {
       statusEl.textContent = lines.join('\n');
@@ -717,6 +773,35 @@ function main(): void {
         lastAction = `输入中 ⇒ ${ev.key} 不触发动作(先按 Enter 结束搜索)`;
       }
       return;
+    }
+    /* ═══ ★ WS-FND-188:`T` 的**一键两义**(与空格=攻击+跳跃同一形态,但这里分成两支) ═══
+     *
+     * ## 为什么与 `USE_ITEM` 共用 `T`
+     * `T` 在 `ACTION_KEYS` 里已经是「使用道具」(既有键位,`WS-FND-138` 的键位表钉着)
+     * ⇒ 新动作**不另占一个键**(占一个字母就会与既有的撞,而撞键的表现是"按了没反应"
+     * 或"一次按键两件事")。改成**按情形分派**:
+     * ```text
+     * 附近 2.5 格内有 NPC(用**权威**坐标判) ⇒ NPC_TALK
+     * 否则                                    ⇒ 原来的 USE_ITEM(这条分支一个字都没改)
+     * ```
+     * ## 为什么用权威位置而不是预测位置
+     * 与 `boot` 的 HUD 那一行同源(`telegraphCenterOf`),两边若各用一个位置,
+     * 就会出现「提示写着能说话、按下去被拒」—— 而那种错两端都不报错。
+     * 拿不到权威位置(`null` = 第一帧还没到)⇒ **不猜**:走原来的 `USE_ITEM`。
+     *
+     * ## 判定与文案
+     * 「够不够近 / 附近是谁」在 `three/boot.ts#nearbyNpc`(纯函数,与
+     * `server/src/npc/defs.ts#npcAt` 同口径);这里只做分派与一句话状态。 */
+    if (ev.key.toLowerCase() === NPC_TALK_KEY && npcList.length > 0) {
+      const center = telegraphCenterOf(handle.store.state, handle.store.localPlayerId);
+      const near = center === null ? null : nearbyNpc(npcList, center.cx, center.cy);
+      if (near !== null) {
+        ev.preventDefault();
+        /* 走**同一条**入口(`ActionEntry` 的三支分流):参数不对 / 未连接 / 发。 */
+        const out = actionEntry.npcTalk({ npcId: near.id });
+        lastAction = `与「${near.name}」说话 ${out.sent ? '→ 已发' : `✗ ${out.status}`}`;
+        return;
+      }
     }
     const spec = ACTION_KEYS[ev.key.toLowerCase()];
     if (spec === undefined) return;
@@ -999,6 +1084,20 @@ function main(): void {
     /* ── ★ WS-FND-167:连接超时 / 退避 / 诊断计数都进**机读口径** ──
        修前这几件事只有 `session` 的内部字段(JS 里读不到)与 `atlasErr`(只在 summary 里)
        ⇒ "到底卡在哪一步、下次什么时候重拨、丢了多少帧"在自检脚本里读不出来。 */
+    /* ── ★ WS-FND-188:NPC 通道也进**机读口径** ──
+       ```text
+       npcFrames       收到并落地的 NPC 帧数(设计上每连接 1;一直 0 ⇒ 那条通道没通)
+       lastNpcError    最近一次 NPC 帧**解码**失败的原因(与地形错误分开计)
+       npcNote         表到了几个(—— 与"这个世界没有 NPC"是两件事)
+       npcCount        表里几个(屏幕上摆了几个看 `summary().npcSpriteCount`)
+       npcTalkLine     最近一句台词(空 = 还没说过话)
+       ```
+       ⚠️ 少了它们,「NPC 到底上屏了没」只能靠肉眼看画面 —— 而那正是本任务要消灭的形态。 */
+    npcFrames: session?.npcFrames ?? 0,
+    lastNpcError: session?.lastNpcError ?? null,
+    npcNote: lastNpcNote,
+    npcCount: npcList.length,
+    npcTalkLine: lastNpcTalk,
     lastStateDetail,
     connectTimeoutMs: CONNECT_TIMEOUT_MS,
     handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
