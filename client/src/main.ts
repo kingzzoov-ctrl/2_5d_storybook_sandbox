@@ -23,6 +23,9 @@ import {
   CONNECT_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS, RECONNECT_FACTOR, RECONNECT_MAX_MS,
   createSession, type SessionHandle,
 } from './net/session.ts';
+/* ★ WS-FND-184:地形块存储 —— 服务端下行的块在客户端这一侧的落点(`net/chunk_store.ts`)。
+   与 `store` 同一纪律:**由本文件持有、传给会话**(理由见下面 `createSession` 的接线点)。 */
+import { ClientChunkStore } from './net/chunk_store.ts';
 import {
   ACTION_KEYS, FACING_DEFAULT, cellInFront, cellUnder, describeActionResult,
   facingLabel, keyHints, nextFacing, type Facing,
@@ -186,6 +189,14 @@ function main(): void {
    */
   let lastReject = '';
   /**
+   * ★ WS-FND-184:最近一次**地形下行**的读数(自检口径;`null` = 还没收到过一帧)。
+   *
+   * 修前地形通道在客户端**零消费者**:`session` 解完块、写进块存储,然后就没有然后了 ——
+   * 屏幕上一直是本地重算的设计图。现在这句话把"这一帧重建了几块 / 是不是首帧对齐 /
+   * 是不是回落"变成**读得出来**的字(`__stageReady` 里也有同一个字符串)。
+   */
+  let lastTerrainNote: string | null = null;
+  /**
    * ★ WS-FND-167:最近一条 `onState` 的 **detail**(状态本身的具名原因)。
    *
    * 修前 `detail` 只在 `failed` / 带拒因的 `closed` 时被 warn 一句,界面上**从不显示**
@@ -317,11 +328,30 @@ function main(): void {
     return out.sent ? out.status : `${out.status}(第 ${String(mode)} 档)`;
   });
 
+  /* ═══ ★ WS-FND-184:地形块存储 —— **本文件持有,再传给会话** ═══
+   *
+   * ## 为什么必须由本文件持有(与会话的 `store` 逐字同一理由)
+   * `boot()` 那一侧的建面读的是它**自己**的 mesh 表,而块字节写进的是**这个**对象
+   * (`session` 只会把块写给它自己的 `opts.chunks`)。若让会话内部自建一个,症状是
+   * 「服务器发了、屏幕上还是本地设计图」—— 而两个存储各自都"正常工作",
+   * 没有任何一处会报错。这正是本仓反复记的「两处都对、合起来不对」。
+   *
+   * ## 为什么单机模式(`?server=off`)也建一个
+   * 它零 DOM、零 three,不连服务器时只是一个空 Map(不订阅、不轮询)
+   * ⇒ 少一条"联机才有"的分支,也少一个"哪天才初始化"的空指针风险。
+   */
+  const chunkStore = new ClientChunkStore();
+
   if (url !== null) {
     session = createSession({
       url,
       /* ★ 复用 boot 的 store —— 别让两个 store 各写各的(见上) */
       store: handle.store,
+      /* ★ WS-FND-184:同一个纪律再走一遍 —— **块存储**也必须用本文件这一个。
+         选项名就是 `SessionOptions.chunks`(见 `session.ts` 的 `opts.chunks ?? new ...`),
+         与类型名 `ClientChunkStore` 不是一回事:写错**选项名** TS 会当场报错,
+         而名字写对、传错**对象**则不会(那才是静默形态)。 */
+      chunks: chunkStore,
       /* ★ WS-FND-113 第 4 处:被动断开 ⇒ 自动重连(主动 `close()` 不重连)。
          没有它,"重连路径"在生产里根本不存在,那一堆复位也就无从触发。
          ★ WS-FND-167:1500 是**退避基数**(不再是固定间隔)—— 间隔按
@@ -338,6 +368,31 @@ function main(): void {
         /* 帧到达:渲染循环自己在读 `handle.store`,这里**不需要**触发重画。
            只把"坏包/空帧"留痕,便于自检脚本读。 */
         onFrame: () => { /* 渲染循环每帧自读 store */ },
+        /* ═══ ★ WS-FND-184:地形块到了 ⇒ **交给 boot 建面**(改前这里没有消费者) ═══
+         *
+         * ## 改前是什么样
+         * `session` 已经解完地形帧、块字节也写进了块存储,然后就**停在那里** ——
+         * 屏幕上的地形一直是 `buildDesignChunks()` 在本地重算的那张设计图。
+         * ⇒ 玩家盖的墙 / 拆的块**一个字节都到不了屏幕**,而没有任何东西会红。
+         *
+         * ## 三行的顺序不能换
+         * ```text
+         * 1 store.dirty()           重建**之前**读(重建完就清,脏标记是消费型的)
+         * 2 applyTerrainChunks()    只重建这些脏块(首帧则整表对齐,见 planTerrainRebuild)
+         * 3 store.clearDirty()      必须在重建**之后** —— 漏了它表现为"每帧重建同一批"
+         * ```
+         * ⚠️ 用事件里的 `store` 而不是外层的 `chunkStore`:两者是**同一个对象**
+         *   (`session` 只会在 `opts.chunks` 缺省时自建),从事件里取等于顺手证明了接线。
+         */
+        onTerrain: ({ store }) => {
+          const dirty = store.dirty();
+          const r = handle.applyTerrainChunks(store.chunks(), dirty);
+          store.clearDirty();
+          lastTerrainNote = `地形 块 ${store.size}(本帧脏 ${dirty.length})`
+            + ` ⇒ 重建 ${r.rebuilt} / 屏上共 ${r.total}`
+            + (r.full ? '(首帧整表对齐)' : '')
+            + (r.fallback ? '(无块 ⇒ 仍是设计图占位)' : '');
+        },
         /* ★ 第十轮 P3:**拒因不许被 close 盖掉**。修前这里只对 `'failed'` 告警,
            而服务端的拒绝随即把状态推成 `'closed'`(带同一条拒因)⇒ 「为什么被拒」
            只留在一次瞬时 `failed` 上,现场只剩「断了」。⇒ `closed` 带 detail 时也打。
@@ -590,6 +645,10 @@ function main(): void {
       ? '诊断 单机(无会话)'
       : `诊断 坏包 ${handle.store.decodeErrors} 空帧 ${handle.store.emptyFrames}`
         + ` 旧帧 ${handle.store.staleFrames} 丢帧 ${session.droppedFrames} 拒收 ${session.rejectedFrames}`
+        /* ★ WS-FND-184:地形帧数也上界面 —— 它是"服务器地形到底到没到"的唯一直接读数;
+           只进 `__stageReady` 的话,现场看图仍然分不清"设计图就这样"与"一帧都没到"。 */
+        + ` 地形帧 ${session.terrainFrames}`
+        + (session.lastTerrainError === null ? '' : ` · 最近地形错误:${session.lastTerrainError}`)
         + (session.lastDropReason === null ? '' : ` · 最近丢帧:${session.lastDropReason}`);
     const lines = [
       sessionLine,
@@ -926,6 +985,17 @@ function main(): void {
        否则只能靠看控制台,而那正是它静默一整轮的原因。 */
     lastReject,
     serverContentClaim: session?.serverContentClaim ?? null,
+    /* ── ★ WS-FND-184:地形下行也进**机读口径** ──
+       三个字段各有分工,少一个就分不清是哪一半坏了:
+       ```text
+       terrainFrames     收到并落地的地形帧数(0 且一直 0 ⇒ 这条通道没通);
+       lastTerrainError  最近一次地形帧**解码**失败的原因(与 `lastDropReason` 分开计);
+       lastTerrainNote   最近一帧重建了几块 / 是不是首帧整表对齐 / 是不是回落。
+       ```
+       ⚠️ 没有它们,"屏幕上那块地形到底来自服务器还是本地设计图"只能靠肉眼看画面。 */
+    terrainFrames: session?.terrainFrames ?? 0,
+    lastTerrainError: session?.lastTerrainError ?? null,
+    lastTerrainNote,
     /* ── ★ WS-FND-167:连接超时 / 退避 / 诊断计数都进**机读口径** ──
        修前这几件事只有 `session` 的内部字段(JS 里读不到)与 `atlasErr`(只在 summary 里)
        ⇒ "到底卡在哪一步、下次什么时候重拨、丢了多少帧"在自检脚本里读不出来。 */

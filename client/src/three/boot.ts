@@ -290,8 +290,97 @@ export interface BootHandle {
    * ⇒ 这里给一个**纯判定**(`ui/panel_hit.uiConsumesPoint`),`main.ts` 先问它。
    */
   uiHitAt: (x: number, y: number) => boolean;
+  /**
+   * ★ WS-FND-184:把**服务器下行的地形**铺上屏幕(改前屏幕上是本地重算的设计图)。
+   *
+   * ## 为什么是"推"而不是让本文件轮询块存储
+   * 块存储住在 `main.ts`(装配根;与它的 `store` 同一纪律),本文件不持它
+   * ⇒ 本文件只在**帧到了**那一刻被调一次(`session` 的 `onTerrain`)。
+   * 反过来让 boot 自己轮询,就需要第二份"哪块脏了"的判定 —— 而那份判定
+   * 与 `ClientChunkStore.dirty()` 迟早会漂移。
+   *
+   * ## 返回值的三个数各有分工
+   * ```text
+   * rebuilt   本次真的重建了几块(0 = 没有新字节 / 回落)
+   * total     屏幕上现在一共几块地形(服务器块 + 还没被替换掉的设计图占位)
+   * full      本次是**首帧整表对齐**(设计图占位整份让位)
+   * fallback  来源是空的 ⇒ 屏幕上仍是设计图占位(已 console.warn 留痕)
+   * ```
+   * ⚠️ `dirtyKeys` 由调用方给(`ClientChunkStore.dirty()`),并且**调用方负责**
+   *    重建完之后 `clearDirty()` —— 脏标记是消费型的(见 chunk_store 的头注释)。
+   */
+  applyTerrainChunks: (
+    next: readonly ChunkInput[],
+    dirtyKeys: readonly string[],
+  ) => { rebuilt: number; total: number; full: boolean; fallback: boolean };
 }
 
+
+/* ═══════ ★ WS-FND-184:服务器下行的地形 → 建面(改前屏幕上画的是本地重算的设计图)═══════
+ *
+ * ## 改前是什么样(这一块要修的那一件事)
+ * ```text
+ * 服务端:w89 起按 `chunkVersions` 下行**真块字节**(1032 B/块,见 shared/net/terrain.ts)
+ * 客户端:session.ts 解完写进 `ClientChunkStore` …… 然后就**停在那里**(零消费者)
+ * 屏幕  :本文件的地形仍是 `buildDesignChunks()` 在本地重算的那张设计图
+ * ```
+ * ⇒ 玩家盖的墙、拆的块、被载具改过的地形**一个字节都到不了屏幕**,
+ *   而没有任何东西会红:连接是 `live`、快照照常到、画面也在动、地形面数也一样。
+ *
+ * ## 三条语义(判据见 `tests/WS-FND-184-terrain-client-wiring.test.ts`)
+ * ```text
+ * 1 设计图是**首帧占位**,不是真相 —— 第一帧服务器块到了 ⇒ **整表对齐**(full);
+ * 2 增量:只重建**脏**块(`ClientChunkStore.dirty()` 给出的 key),
+ *   旧几何必须 `dispose()` —— 块是每帧 8 个地来的,手机几轮就能把显存吃光,而那不报错;
+ * 3 一个块都没收到 ⇒ **保留设计图回落**(拿不到服务器块时世界也要看得见),
+ *   且回落**留痕**(`console.warn` + HUD 那行地形来源)—— 静默回落与"设计图就这样"同形。
+ * ```
+ *
+ * ## 为什么判定抽在这里,而不是写进 `boot()`
+ * `boot()` 顶层 `import three` 且碰 `document` ⇒ node 里加载不了它**内部**的任何东西,
+ * 写进去就没法断言。本函数零依赖(只吃 `ChunkInput[]` 与 key 列表)⇒
+ * 可以用**真的** `ClientChunkStore` 的输出直接喂它(见测试里的 3 块只脏 1 块那条)。
+ */
+
+/** 地形来源的两个取值(自检口径与 HUD 用**同一份**词表,不造第二处)。 */
+export const TERRAIN_SOURCE_SERVER = 'server';
+export const TERRAIN_SOURCE_DESIGN = 'design';
+
+/** 一次地形下行的重建计划。 */
+export interface TerrainRebuildPlan {
+  /** 需要(重)建的块 —— 顺序取来源顺序(稳定序,与写入顺序 / 帧顺序**无关**)。 */
+  rebuild: ChunkInput[];
+  /** 本次是**整表对齐**:屏幕上还一块服务器块都没有,设计图占位必须整份让位。 */
+  full: boolean;
+  /** 来源是空的 ⇒ **保留设计图回落**(不建任何块、不摘任何块)。 */
+  fallback: boolean;
+}
+
+/**
+ * 该建哪些块 —— **纯函数**(喂真 `ClientChunkStore` 的 `chunks()` / `dirty()`)。
+ *
+ * @param source           服务器已落地的全部块(`ClientChunkStore.chunks()`)
+ * @param dirtyKeys        还没被消费的脏 key(`ClientChunkStore.dirty()`)
+ * @param hasServerTerrain 屏幕上当前那块地形**是不是服务器来源**
+ *                         (`false` = 还是设计图占位)
+ */
+export function planTerrainRebuild(
+  source: readonly ChunkInput[],
+  dirtyKeys: readonly string[],
+  hasServerTerrain: boolean,
+): TerrainRebuildPlan {
+  /* 1 一块都没收到 ⇒ 保留设计图占位(拿不到服务器块时世界也要看得见)。
+       已经吃过服务器块之后再遇到空来源(重连时 `reset()`)⇒ **保持现状**:
+       把屏幕换回另一张图比"不动"更糟 —— 看起来像"世界变了",其实只是没人发块。 */
+  if (source.length === 0) return { rebuild: [], full: false, fallback: !hasServerTerrain };
+  /* 2 首帧:屏幕上还是设计图占位 ⇒ **整份**替换。
+       只换脏块会让"设计图的另一半"留在屏幕上,而半张图的世界看起来完全正常。 */
+  if (!hasServerTerrain) return { rebuild: [...source], full: true, fallback: false };
+  /* 3 增量:只重建脏块(`dirtyKeys` 空 = 没有新字节 ⇒ 一块都不动)。 */
+  if (dirtyKeys.length === 0) return { rebuild: [], full: false, fallback: false };
+  const dirty = new Set(dirtyKeys);
+  return { rebuild: source.filter((c) => dirty.has(c.key)), full: false, fallback: false };
+}
 /**
  * 在 `container` 里启动舞台。
  *
@@ -347,9 +436,27 @@ export function boot(container: HTMLElement): BootHandle {
   const worldCells = chunks.length === 0
     ? 0
     : Math.max(...chunks.map((c) => (c.cx + 1) * CHUNK_SIZE));
-  const meshes: THREE.Mesh[] = [];
+  /**
+   * 已建的地形 mesh,**按块 key** 索引(`"cx,cy"` —— 与 `ChunkInput.key` /
+   * `ClientChunkStore` 的键 / `diffChunkVersions` 同一口径)。
+   *
+   * ⚠️ 改前是一个数组。数组只能**整份**重建,而服务器是**增量**下块
+   * (`TERRAIN_CHUNKS_PER_FRAME` = 8 块/帧)⇒ 每帧重建全图在手机上直接卡死,
+   * 而屏幕上只会表现为"走一步卡一下"(看不出成因)。
+   */
+  const meshes = new Map<string, THREE.Mesh>();
+  /** 每块已建 mesh 的读数(刷新总数与 HUD 用;删块时按它减回去)。 */
+  const terrainStats = new Map<string, { cx: number; cy: number; verts: number; faces: number }>();
   let totalVerts = 0;
   let totalFaces = 0;
+  /** 屏幕上那块地形是不是**服务器来源**(`false` = 还是设计图占位)。 */
+  let terrainFromServer = false;
+  /** 地形落地的三个读数(自检口径,见 `summary()`)。 */
+  let terrainApplyCalls = 0;
+  let terrainRebuiltChunks = 0;
+  let terrainDisposedGeoms = 0;
+  /** 回落只 warn 一次:每帧 warn 会把控制台刷满,真正的错误就淹没了。 */
+  let designFallbackWarned = false;
 
   /* 单一材质:所有 chunk 共用,是减少 draw call 的前提。
    *
@@ -364,16 +471,52 @@ export function boot(container: HTMLElement): BootHandle {
    */
   const mat = buildTerrainMaterial();
 
-  for (const chunk of chunks) {
-    /* 顶点由纯逻辑层 `stage/chunk_geometry` 产出,与计数同源 */
+  /**
+   * 建(或重建)一块的地形 mesh 并登记读数。
+   *
+   * 顶点由纯逻辑层 `stage/chunk_geometry` 产出,与计数同源。
+   * ★ 首帧与增量重建**共用这一个函数** —— 两条建面路径迟早会漂移
+   * (`addTerrainMesh` 里忘了登记读数,HUD 的顶点/面数就只增不减)。
+   */
+  const addTerrainMesh = (chunk: ChunkInput): void => {
     const geom = buildChunkGeometry(chunk, 0);
-    totalVerts += geom.getAttribute('position').count;
-    totalFaces += (geom.getIndex()?.count ?? 0) / 6;
+    const verts = geom.getAttribute('position').count;
+    const faces = (geom.getIndex()?.count ?? 0) / 6;
+    totalVerts += verts;
+    totalFaces += faces;
     const mesh = new THREE.Mesh(geom, mat);
     mesh.name = chunk.key;
     scene.add(mesh);
-    meshes.push(mesh);
-  }
+    meshes.set(chunk.key, mesh);
+    terrainStats.set(chunk.key, { cx: chunk.cx, cy: chunk.cy, verts, faces });
+  };
+
+  /**
+   * 摘掉一块的地形 mesh。
+   *
+   * ★ `geometry.dispose()` **不是可选的**:一块 16×16 的新几何会一直留在 GPU 上,
+   *   而增量重建是"每帧最多 8 块"来的 —— 手机几轮就爆,且**不会有任何报错**
+   *   (`renderer.info.memory.geometries` 才是那条线索)。
+   *   反向判据:`tests/WS-FND-184` 里删掉这一行必须红。
+   */
+  const removeTerrainMesh = (key: string): boolean => {
+    const mesh = meshes.get(key);
+    if (mesh === undefined) return false;
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    meshes.delete(key);
+    const st = terrainStats.get(key);
+    if (st !== undefined) {
+      totalVerts -= st.verts;
+      totalFaces -= st.faces;
+      terrainStats.delete(key);
+    }
+    terrainDisposedGeoms += 1;
+    return true;
+  };
+
+  /* 首帧:先按**设计图占位**(一个服务器块都没到时,世界也要看得见 —— 见 `planTerrainRebuild`)。 */
+  for (const chunk of chunks) addTerrainMesh(chunk);
   /* ══════════ ★ w90:世界里的**东西**(obj 立牌 + 植被)══════════
    *
    * ## 改前是什么样
@@ -854,6 +997,61 @@ export function boot(container: HTMLElement): BootHandle {
 
   /* ── HUD ── */
   const hud = makeHud(container, { cells: worldCells, chunks: chunks.length });
+
+  /**
+   * 当前已建 mesh 覆盖的世界边长(格)—— 取所有块里最右 / 最下那条边。
+   *
+   * ★ 为什么不复用上面的 `worldCells`:那个数是**设计图**的规模,而服务器的块范围
+   *   不保证与设计图相等(服务器世界会变)⇒ HUD 那行必须按**现在屏幕上**的块算,
+   *   否则又变成 w85 那次的「标签与实际不符」。
+   */
+  const terrainCellsNow = (): number => {
+    let max = 0;
+    for (const st of terrainStats.values()) {
+      max = Math.max(max, (st.cx + 1) * CHUNK_SIZE, (st.cy + 1) * CHUNK_SIZE);
+    }
+    return max;
+  };
+
+  /**
+   * ★ WS-FND-184:把**服务器下行的地形**铺到屏幕上(`main.ts` 在收到地形帧时调用)。
+   *
+   * ## 三件事,顺序不能换
+   * ```text
+   * 1 计划由纯函数算(`planTerrainRebuild`)—— 判定可单测,装配层不自己发明规则;
+   * 2 每块**先摘旧的(含 dispose)再建新的**(漏 dispose = 显存泄漏,且不报错);
+   * 3 重建完把顶点 / 面数 / 规模同步给 HUD 与 `summary()`(否则屏幕上那行数字是假的)。
+   * ```
+   *
+   * @param next      服务器已落地的全部块(`ClientChunkStore.chunks()`,稳定序)
+   * @param dirtyKeys 还没被消费的脏 key(`ClientChunkStore.dirty()`)
+   *                  —— ⚠️ 调用方必须在**重建之后** `clearDirty()`,否则每帧重建同一批。
+   */
+  const applyTerrainChunks = (
+    next: readonly ChunkInput[],
+    dirtyKeys: readonly string[],
+  ): { rebuilt: number; total: number; full: boolean; fallback: boolean } => {
+    terrainApplyCalls += 1;
+    const plan = planTerrainRebuild(next, dirtyKeys, terrainFromServer);
+    if (plan.fallback) {
+      /* ★ 回落**必须留痕**:静默回落会让「服务器地形没到」与「设计图本来长这样」完全同形。 */
+      if (!designFallbackWarned) {
+        designFallbackWarned = true;
+        console.warn('[terrain] 一帧服务器地形都没有 ⇒ 屏幕上仍是**设计图占位**'
+          + '(不是服务器世界:玩家改过的地形看不到)');
+      }
+      hud.setWorld(worldCells, meshes.size, TERRAIN_SOURCE_DESIGN);
+      return { rebuilt: 0, total: meshes.size, full: false, fallback: true };
+    }
+    for (const chunk of plan.rebuild) {
+      removeTerrainMesh(chunk.key);   /* 先摘旧的(含 dispose) */
+      addTerrainMesh(chunk);          /* 再建新的 */
+    }
+    if (next.length > 0) terrainFromServer = true;
+    terrainRebuiltChunks += plan.rebuild.length;
+    hud.setWorld(terrainCellsNow(), meshes.size, TERRAIN_SOURCE_SERVER);
+    return { rebuilt: plan.rebuild.length, total: meshes.size, full: plan.full, fallback: false };
+  };
 
   /**
    * `#hint`(页面底部那行提示)的**读点**。
@@ -2227,9 +2425,11 @@ export function boot(container: HTMLElement): BootHandle {
     togglePanel: (panel) => { setPanel(panel); },
     closePanel: () => { closePanel(); },
     uiHitAt: (x, y) => uiHitAt(x, y),
+    /* ★ WS-FND-184:地形下行 → 建面的入口(`main.ts` 的 `onTerrain` 调它)。 */
+    applyTerrainChunks: (next, dirtyKeys) => applyTerrainChunks(next, dirtyKeys),
     summary: () => ({
       cells: WORLD_CELLS,
-      chunks: meshes.length,
+      chunks: meshes.size,
       verts: totalVerts,
       faces: Math.round(totalFaces),
       buildMs: Math.round(buildMs * 10) / 10,
@@ -2237,6 +2437,23 @@ export function boot(container: HTMLElement): BootHandle {
       triangles: renderer.info.render.triangles,
       fps: Math.round(fps),
       running: raf !== 0,
+      /* ── ★ WS-FND-184:地形来源与三个重建读数 ──
+       *
+       * 四个数分开读,才分得清三种坏法:
+       * ```text
+       * terrainSource === 'design' 且 terrainApplyCalls === 0
+       *     ⇒ 一帧服务器地形都没到(屏幕上画的是本地设计图);
+       * terrainApplyCalls > 0 而 terrainRebuilt === 0
+       *     ⇒ 帧到了但一块都没重建(键口径对不上 / 脏标记被别处清掉了);
+       * terrainDisposed === terrainRebuilt
+       *     ⇒ 每次重建都真的释放了旧几何(缺 dispose 时它恒 0 —— 就是漏显存的那个形态)。
+       * ```
+       * 没有这四个数,"地形到底来自服务器还是本地"只能靠肉眼看画面。
+       */
+      terrainSource: terrainFromServer ? TERRAIN_SOURCE_SERVER : TERRAIN_SOURCE_DESIGN,
+      terrainApplyCalls,
+      terrainRebuilt: terrainRebuiltChunks,
+      terrainDisposed: terrainDisposedGeoms,
       /* ── task-67 阶段 3:权威位置自检口径 ──
          截图/自检脚本靠这三个字段判断「玩家位置是不是真的来自服务端」,
          而不是只看"画面看起来在动"(那是本地推测,不是权威)。 */
@@ -2590,7 +2807,11 @@ export function boot(container: HTMLElement): BootHandle {
       cv.removeEventListener('pointerdown', onPointerDown);
       ui.dispose();
       audioOut.dispose();
-      for (const m of meshes) m.geometry.dispose();
+      /* ⚠️ `meshes` 是 Map(key → mesh)⇒ 必须走 `values()`;
+         写成 `for (const m of meshes)` 会拿到 `[key, mesh]` 对,`geometry` 就成了 undefined。 */
+      for (const m of meshes.values()) m.geometry.dispose();
+      meshes.clear();
+      terrainStats.clear();
       for (const s of sprites) {
         s.material.map?.dispose();
         s.material.dispose();
@@ -2621,6 +2842,14 @@ function popcount32(mask: number): number {
 
 interface Hud {
   update: (info: THREE.WebGLInfo, verts: number, faces: number, buildMs: number, fps: number) => void;
+  /**
+   * ★ WS-FND-184:地形规模与**来源**会在地形下行**之后**变(`applyTerrainChunks`)。
+   *
+   * 规模那行必须跟着变,否则 HUD 永远写着设计图的「192×192 格 / 144 chunk」——
+   * 与 w85 那次「标签与实际不符」是同一个病(那一轮修过一遍,这里只是把
+   * "地形来源换成服务器"这条新的变化也接上)。
+   */
+  setWorld: (cells: number, chunkCount: number, source: string) => void;
 }
 
 function makeHud(container: HTMLElement, world?: { cells: number; chunks: number }): Hud {
@@ -2639,7 +2868,17 @@ function makeHud(container: HTMLElement, world?: { cells: number; chunks: number
   statsEl.style.cssText = 'color:#8fa6c8;margin-top:3px;';
   wrap.append(fpsEl, statsEl);
   container.appendChild(wrap);
+  /* ★ WS-FND-184:这三个数**可变** —— 地形从设计图占位换成服务器块之后由 `setWorld()`
+     改写,`update()` 读的是同一组变量(一处来源,不造第二份状态)。 */
+  let cells = world?.cells ?? WORLD_CELLS;
+  let chunkCount = world?.chunks ?? WORLD_CHUNKS ** 2;
+  let terrainSource = TERRAIN_SOURCE_DESIGN;
   return {
+    setWorld: (nextCells, nextChunks, nextSource) => {
+      cells = nextCells;
+      chunkCount = nextChunks;
+      terrainSource = nextSource;
+    },
     update: (info, verts, faces, buildMs, fps) => {
       fpsEl.textContent = `FPS ${fps.toFixed(0)}`;
       /* ★ w85:地形规模必须**读真实 chunk 列表**,不许拿 `demo_world` 的常量拼。
@@ -2648,11 +2887,17 @@ function makeHud(container: HTMLElement, world?: { cells: number; chunks: number
          (实测:世界已经是 192×192,UI 仍报「地形 64×64 格 / 16 chunk」)。
          这种「标签与实际不符」不会报错,只会让人以为地图还是小的。
          缺省仍回落到旧常量:`makeHud` 的独立自检调用点不传 `world`。 */
-      const cells = world?.cells ?? WORLD_CELLS;
-      const chunkCount = world?.chunks ?? WORLD_CHUNKS ** 2;
+      /* 上一段注释里的「读真实 chunk 列表」在这里落地:数来自 `world`(启动时)或
+         `setWorld()`(地形下行之后),**不是**常量拼的。 */
+      /* ★ WS-FND-184:来源那一行**如实**只分两档 —— 服务器块**到了**就是 server。
+         ⚠️ 块是分批下的(8 块/帧),所以"来源 = server"的头几帧里,屏幕上**仍混着**
+            还没被替换的设计图占位块。精确数字不在 HUD(它只有两档),而在
+            `__stageReady` 的 `lastTerrainNote`(本帧重建几块)与 `summary()` 的
+            `terrainRebuilt` / `terrainApplyCalls` —— 那里才分得清"到了几块"。 */
       statsEl.textContent = `地形 ${cells}×${cells} 格 / ${chunkCount} chunk\n`
         + `顶点 ${verts.toLocaleString()} / 面 ${Math.round(faces).toLocaleString()}\n`
         + `draw call ${info.render.calls} / 三角形 ${info.render.triangles.toLocaleString()}\n`
+        + `地形来源 ${terrainSource === TERRAIN_SOURCE_SERVER ? '服务器块' : '设计图占位(还没收到服务器块)'}\n`
         + `建面 ${buildMs.toFixed(1)} ms`;
     },
   };

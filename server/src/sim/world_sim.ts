@@ -36,6 +36,9 @@
  */
 
 import { TICK_HZ, DT, SIM_DT, SLOW_DT, BASE_MOVE_SPEED, secondsToTicks } from '../../../shared/types/physics.ts';
+/* ★ WS-FND-185:每格群系。**只读设计意图**(12 个区 → `REGION_BIOME` → 8 个群系键),
+   不读世界本身 —— 与 `regionAt` 同一份事实源,刷怪不会自己发明第二张群系地图。 */
+import { biomeAt } from '../../../shared/world/design.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
 /* ★ WS-FND-164:`encodeRoofRle` / `decodeRoofRle` 是屋顶旁路层的**唯一**编解码器
@@ -598,8 +601,12 @@ export interface WorldSimOptions {
   /** 每帧快帧是否推进生物 FSM。默认 true。 */
   mobs?: boolean;
   /**
-   * 世界群系(键应当是 `BIOME_SPAWN` 的键,否则判定会兜底 MEADOW)。
-   * 默认 `MEADOW`。见 `biomeName` 字段注释:本仓没有每格群系。
+   * **兜底/默认群系**(键应当是 `BIOME_SPAWN` 的键,否则判定会兜底 MEADOW)。
+   * 默认 `MEADOW`。
+   *
+   * ⚠️ ★ WS-FND-185:它**不再是**「整图群系」。每只候选怪的群系按格取 ——
+   * `shared/world/design.ts#biomeAt(x, y)`(12 个区 → 8 个群系键),本字段只在
+   * **那一格不属于任何区**(海上 / 未分区)时兜底。见 `biomeName` 字段注释。
    */
   biome?: string;
   /**
@@ -1175,15 +1182,24 @@ export class WorldSim {
   private readonly wiringOn: boolean;
   private readonly mobsOn: boolean;
   /**
-   * 世界群系。
+   * **兜底 / 默认群系**(★ WS-FND-185 起;此前是「整图一个群系」)。
    *
-   * ⚠️ 本仓**没有「每格/每区块群系」这回事** —— `Biome` 只是
-   * `shared/types/entities.ts` 里的枚举 + 每只怪的归属,地形生成不产出群系。
-   * 于是「刷怪配表按群系分档」这件事此前无处落地:刷怪 tick 里写的是
-   * `biome: 'PLAINS'`,而那个名字**不在 `BIOME_SPAWN` 表里**。
-   * ⇒ 改成一个**显式**的世界群系(默认 MEADOW,创世草甸;
-   * `decideSpawn` 对未知群系本来也兜底到 MEADOW)。将来真做了群系地图,
-   * 把本字段换成「按坐标查询」即可 —— 刷怪逻辑不用动。
+   * ## 现在谁说了算
+   * 每只候选怪的群系由 `tickSpawn` → `trySpawnOne` **按格**取:
+   * ```text
+   * biomeAt(Math.floor(x), Math.floor(y)) ?? this.biomeName
+   * ```
+   * `shared/world/design.ts#biomeAt` 把设计图的 12 个区映射到 `BIOME_SPAWN` 的
+   * 8 个键(`REGION_BIOME`),`null` = 那一格不在任何区里(海上 / 未分区)。
+   *
+   * ## 本字段因此只剩两个用途
+   * 1 **兜底**:落在区外的格用它(默认 `MEADOW`,与 `decideSpawn` 的 `?? MEADOW` 同源);
+   * 2 **速率**:`tickSpawn` 的刷怪预算仍按它取 `spawnsPerCheck()`(整图一个密度的
+   *    已知边界,见那一处的注释 —— 不假装按群系加权)。
+   *
+   * ⚠️ 改前这里写着「本仓没有每格群系」—— 那句话在 `biomeAt` 落地之后就是**假的**
+   * (设计图早就声明了每块地属于哪个群系),留着它会让下一个人继续按「整图一个」
+   * 去推理刷怪。`biomeHistogram()` 是本字段不再等于「整图群系」的读数口。
    */
   biomeName: string;
   /** 刷怪预算的小数累加器(见 `tickSpawn()`)。 */
@@ -9938,11 +9954,19 @@ export class WorldSim {
    * 低于配表,而**没有任何地方会显示这件事**。
    * `spawnBudgetMax` 防的是反面:整张图都被挡住时预算无限累积,
    * 一旦出现空格就瞬间涌出一大群。
+   *
+   * ## ★ WS-FND-185:速率用兜底群系,物种**按格**
+   * `spawnsPerCheck(biome)` 里的 biome 是 `biomeName`(世界的**兜底/默认**群系)——
+   * 即"整图一个密度"仍然是现状;而每只候选怪落在**哪个群系**由 `trySpawnOne`
+   * 逐格问设计图(`biomeAt`)。这是刻意的**最小改动**:本次只改"刷什么物种",
+   * 不改"刷多少"(按格加权密度需要每格一个预算,那是另一件事)。
    */
   private tickSpawn(): number {
-    const biome = this.biomeName;
+    /* ⚠️ 这个 biome 只用于**速率**(见 docblock 的 WS-FND-185 一节),
+       物种落在哪个群系由 `trySpawnOne` 按格查 —— 别把它当成"整图的群系"。 */
+    const rateBiome = this.biomeName;
     this.spawnBudget = Math.min(
-      this.spawnBudget + spawnsPerCheck(biome), this.spawnBudgetMax,
+      this.spawnBudget + spawnsPerCheck(rateBiome), this.spawnBudgetMax,
     );
     let quota = Math.floor(this.spawnBudget);
     if (quota <= 0) return 0;
@@ -9950,7 +9974,7 @@ export class WorldSim {
     let spawned = 0;
     while (quota > 0) {
       quota -= 1;
-      if (this.trySpawnOne(biome)) spawned += 1;
+      if (this.trySpawnOne(rateBiome)) spawned += 1;
       else this.spawnBudget = Math.min(this.spawnBudget + 1, this.spawnBudgetMax);
     }
     return spawned;
@@ -9967,18 +9991,36 @@ export class WorldSim {
    * 配额由 `decideSpawn` 的群系 `softCap`/`hardCap` 与全局上限管,本函数不再自己按物种去重。
    *
    * **本函数仍不假装能一次刷满** —— 每次慢帧只按 `spawnsPerCheck` 试几只。
+   *
+   * ## ★ WS-FND-185:群系**按格**取,不再整图一个
+   *
+   * 修前:群系是**入参**(`tickSpawn` 传的 `this.biomeName`)⇒ 无论怪刷在哪一格,
+   * 候选名单都是同一个 `spawnableMobs(biome)`。设计图里 12 个区的群系从此**无处生效**:
+   * 症状是"全图的怪是同一批",而且**不报错**(`BIOME_SPAWN[biome] ?? MEADOW` 静默兜底)。
+   *
+   * 修后:先掷**坐标**(与修前同一套"格心 +0.5"口径),再用
+   * `biomeAt(Math.floor(x), Math.floor(y)) ?? fallback` 决定这一格的群系,
+   * 最后才从**该格群系**的名单里抽物种。
+   *
+   * ⚠️ 两处刻意的选择:
+   * 1 坐标**先于**物种抽取 —— 抽物种要用坐标算出来的群系,这是唯一可行顺序;
+   * 2 `fallback` 是**世界的兜底群系**(`biomeName`,默认 MEADOW),不是写死的字面量:
+   *   区外(海上 / 未分区)的格仍然听世界的默认值,与 `decideSpawn` 的
+   *   `BIOME_SPAWN[biome] ?? BIOME_SPAWN.MEADOW` 同一条兜底纪律。
    */
-  private trySpawnOne(biome: string): boolean {
-    /* ★ 拆开两层之后不再按物种去重(旧写法:`alive.some(r => r.def.id === d.id)` 被过滤掉)。
-       `runtimes()` 里含尸体(`alive === false`),但实例 id 唯一 ⇒ 不会撞键,故不过滤。 */
-    const roster = spawnableMobs(biome);
-    if (roster.length === 0) return false;
-    if (roster.length === 0) return false;
-    const def = roster[Math.floor(this.rng() * roster.length) % roster.length]!;
+  private trySpawnOne(fallbackBiome: string): boolean {
     /* +0.5:落在**格心**。整数坐标在 `WorldGrid` 上是格的角,
        `blocked()` 查的是格 ⇒ 落在角上会让「刷在墙里/墙外」取决于取整方向。 */
     const x = Math.floor(this.rng() * this.sizeCells) + 0.5;
     const y = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    /* ★ WS-FND-185:这一格属于哪个群系 —— 与只读口 `biomeOfCell()` **同一个函数**,
+       不在这里重写一遍 floor / 兜底(两份推导迟早漂移)。 */
+    const biome = this.biomeOfCell(x, y);
+    /* ★ 拆开两层之后不再按物种去重(旧写法:`alive.some(r => r.def.id === d.id)` 被过滤掉)。
+       `runtimes()` 里含尸体(`alive === false`),但实例 id 唯一 ⇒ 不会撞键,故不过滤。 */
+    const roster = spawnableMobs(biome);
+    if (roster.length === 0) return false;
+    const def = roster[Math.floor(this.rng() * roster.length) % roster.length]!;
     const ctx: SpawnContext = {
       biome,
       x,
@@ -9994,6 +10036,8 @@ export class WorldSim {
     /* 序号**先增后用**:同一物种第二次刷出来是 `mob_sheep#2`,与 #1 各自独立(物理/AOI/账本)。 */
     const ordinal = (this.mobOrdinals.get(def.id) ?? 0) + 1;
     this.mobOrdinals.set(def.id, ordinal);
+    /* ⚠️ 入册用的 biome 必须是**这一格的**群系:收尸时 `reapDeadMobs` 按 `mobBiome`
+       对称扣减,记错会让该群系的计数永不回落(`hardCap` 被尸体的账占满)。 */
     this.addMob(mobInstanceId(def.id, ordinal), biome, x, y);
     return true;
   }
@@ -10031,6 +10075,54 @@ export class WorldSim {
            的 `tameOwnerId = ''`)⇒ 报「野生」。不编一个假主人。 */
         tameOwnerId: '',
       });
+    }
+    return out;
+  }
+
+  /**
+   * ★ WS-FND-185:**某一格属于哪个群系**(刷怪侧的唯一事实源)。
+   *
+   * ```text
+   * biomeAt(floor(x), floor(y)) ?? biomeName
+   * ```
+   *
+   * 「按格」用 `Math.floor` 而不是 `Math.round`:刷怪点落在**格心**(`+0.5`),
+   * `floor` 得到的就是那一格;`WorldGrid` 的整数坐标是格角,取整方向会决定
+   * "刷在区里还是区外"(与 `blocked()` 查格的口径一致)。
+   *
+   * 兜底是**世界的默认群系**(`biomeName`,默认 MEADOW),不是写死的字面量:
+   * 与 `spawner.ts` 的 `BIOME_SPAWN[biome] ?? BIOME_SPAWN.MEADOW` 同一条纪律 ——
+   * 世界显式声明过的默认值优先,没声明才轮到常量。
+   *
+   * ⚠️ 这是**只读**查询(不写世界状态)。判据用它把"这一格该刷什么"与
+   * "实际刷出了什么"分开算,否则两边都调用同一个函数就变成自证。
+   */
+  biomeOfCell(x: number, y: number): string {
+    return biomeAt(Math.floor(x), Math.floor(y)) ?? this.biomeName;
+  }
+
+  /**
+   * ★ WS-FND-185:**存活野生物按群系计数** —— 「怪刷在错的群系」的读数口。
+   *
+   * ## 为什么必须有它
+   * 修前"整图一个群系"这件事**从外部看不见**:快照里的 `wildlife[].mobId` 只说明
+   * "刷出了什么物种",而"这只物种是不是**这一格该有的**"要拿坐标回查设计图才知道。
+   * 于是"所有群系都只刷草甸怪"这种缺陷**没有任何一条现成读数能显示出来** ——
+   * 它只能靠"某个群系的怪一只都没出现过"这种间接推理。
+   *
+   * 群系取自 `mobBiome`(实例 id → 入册时的群系,**与收尸对称扣减用的是同一份记录**),
+   * 所以本读数与 `spawner.state.biomeCounts` 的区别只在于:**只算活着的**。
+   *
+   * ⚠️ 这是**只读投影**,不参与任何判定;不改变世界状态(纯函数语义)。
+   * 返回的键 ⊆ `BIOME_SPAWN` 的 8 个键 + 理论上的兜底值(即 `biomeName`)。
+   */
+  biomeHistogram(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const rt of this.mobHost.runtimes()) {
+      /* 尸体不算:与 `listWildlife()` 同一条口径(否则"打死一片"之后直方图仍不降)。 */
+      if (!rt.alive) continue;
+      const biome = this.mobBiome.get(rt.id) ?? this.biomeName;
+      out[biome] = (out[biome] ?? 0) + 1;
     }
     return out;
   }
