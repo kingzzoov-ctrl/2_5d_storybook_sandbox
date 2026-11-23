@@ -648,6 +648,14 @@ export type WsServerOptions = {
   /** 每帧间隔 ms(默认 `TICK_MS` = 1000 / `TICK_HZ`,与 room.step 外部驱动对齐)。 */
   frameMs?: number;
   onLog?: (msg: string) => void;
+  /**
+   * 动作回执发出**之后**的钩子(可选)。`reply` 向同一条连接再发一帧 JSON;
+   * 连接已关时它什么都不做。用于「先给即时回执、稍后补一条」的异步后续(如 NPC 的 AI 回复)。
+   */
+  onActionDone?: (ev: {
+    userId: string; action: string; payload: Record<string, unknown>;
+    outcome: Record<string, unknown>; reply: (frame: Record<string, unknown>) => void;
+  }) => void;
 
   /**
    * **加入凭证是否必须**(默认 `true`)。
@@ -2064,6 +2072,15 @@ function onAction(c: WsConn, msg: { action?: unknown }): void {
   /* 回执里带 `action`:一个连接可能连着发多个动作,回执必须能对上号
      (否则客户端"我发的是哪个"只能靠猜)。 */
   sendJson(c, { t: 'actionResult', action, ...(out as Record<string, unknown>) });
+  try {
+    opts.onActionDone?.({
+      userId: c.userId, action, payload: msg as Record<string, unknown>,
+      outcome: out as Record<string, unknown>,
+      reply: (frame) => { if (conns.has(c)) sendJson(c, frame); },
+    });
+  } catch (e) {
+    log('action', `onActionDone 抛错(回执已发,不影响连接):${(e as Error).message}`);
+  }
 }
 function onMove(c: WsConn, msg: {
   tick?: unknown; x?: unknown; y?: unknown; z?: unknown;

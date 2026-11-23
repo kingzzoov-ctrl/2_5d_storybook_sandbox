@@ -62,6 +62,8 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_DB_PATH, assemble } from '../server/src/index.ts';
 import { DESIGN_SIZE } from '../shared/world/design.ts';
 import { startWsServer } from '../server/src/net/ws_server.ts';
+import { startGmServer, type AiCallLog } from '../server/src/gm/gm_server.ts';
+import { askNpcAi, loadGmConfig } from '../server/src/npc/ai.ts';
 
 import { DT } from '../shared/types/physics.ts';
 
@@ -86,6 +88,10 @@ const strArg = (name: string, fallback: string): string => {
 };
 
 const WS_PORT = numArg('port', 8791);
+/** GM 端端口(只绑 127.0.0.1;`--gm-port 0` 关闭) */
+const GM_PORT = numArg('gm-port', 8792);
+/** GM 配置文件(NPC 的 AI 端点与人设 prompt) */
+const GM_CONFIG_PATH = '.data/gm-config.json';
 const WEB_PORT = numArg('web-port', 5173);
 /**
  * ★ 2026-11-22(w79):**监听地址**。缺省 `127.0.0.1`(只本机玩,与改前**逐字不变**)。
@@ -224,6 +230,10 @@ async function main(): Promise<void> {
      的口径直接打架,而这种矛盾**不报错**,只会让读日志的人算错时长。 */
   const tickProbe = installTickProbe(assembled.runtime);
 
+  /* GM 配置:文件不存在 ⇒ 默认(AI 关 = 兜底模式)。GM 端保存时就地替换这个引用。 */
+  let gmConfig = loadGmConfig(GM_CONFIG_PATH);
+  const aiLog: Record<string, AiCallLog> = {};
+
   /* ── 2 WS 服务端(32Hz;room.step 推进世界) ── */
   const srv = await startWsServer({
     port: WS_PORT,
@@ -238,11 +248,52 @@ async function main(): Promise<void> {
        `scripts/soak.ts` 各自的调用,它们**不传**这个选项 ⇒ 仍是默认 `true`,一字未动。
        身份仍要**声明**(url 的 `?userId=`)—— 只是不强制它由服务端签发的凭证背书。 */
     requireToken: false,
+    /* NPC 对话的 AI 后续:脚本台词已经随回执发出(兜底),这里只在 AI 答上来时追加一帧
+       同形回执(`effect.line` 换成 AI 那句)⇒ 客户端不需要认识新报文。 */
+    onActionDone: ({ action, outcome, reply }) => {
+      const e = outcome['effect'] as Record<string, unknown> | undefined;
+      if (action !== 'NPC_TALK' || outcome['ok'] !== true || e === undefined) return;
+      const npcId = String(e['npcId']);
+      const scripted = String(e['line']);
+      void askNpcAi(gmConfig, npcId, {
+        scriptedLine: scripted,
+        ...(typeof e['questTitle'] === 'string' ? {
+          questTitle: e['questTitle'], questStatus: String(e['questStatus']),
+          needCount: Number(e['needCount']), have: Number(e['have']),
+        } : {}),
+      }).then((r) => {
+        aiLog[npcId] = { at: Date.now(), ok: r.ok, ms: r.ms, text: r.ok ? r.line : r.reason };
+        if (r.ok) reply({ t: 'actionResult', action, ok: true, kind: 'OK', effect: { ...e, line: r.line, ai: true } });
+      });
+    },
     onLog: (m) => { if (process.env['PLAY_VERBOSE'] === '1') log(`[ws] ${m}`); },
   });
   log(`WS 服务端:ws://${URL_HOST}:${srv.port}/ws`
     + (BIND_ALL ? '(监听 0.0.0.0 = 全部网卡;浏览器请用 <本机IP>)' : ''));
   log('加入凭证:**不强制**(play 模式:身份由客户端声明的 ?userId= 承担)');
+  if (GM_PORT > 0) {
+    await startGmServer({
+      port: GM_PORT,
+      configPath: GM_CONFIG_PATH,
+      getConfig: () => gmConfig,
+      setConfig: (c) => { gmConfig = c; },
+      aiLog: () => aiLog,
+      worldStatus: () => {
+        const st = (assembled.runtime as unknown as { state: {
+          meta: { tick: number };
+          players: { id: string; name: string; level: number; hp: number; maxHp: number; x: number; y: number }[];
+          wildlife: { mobId: string }[];
+        } }).state;
+        const wildlife: Record<string, number> = {};
+        for (const w of st.wildlife) wildlife[w.mobId] = (wildlife[w.mobId] ?? 0) + 1;
+        return {
+          tick: st.meta.tick, wildlife,
+          players: st.players.map((p) => ({ id: p.id, name: p.name, level: p.level, hp: p.hp, maxHp: p.maxHp, x: p.x, y: p.y })),
+        };
+      },
+    });
+    log(`GM 端:http://127.0.0.1:${GM_PORT}/(只绑本机;NPC 的 AI ${gmConfig.ai.enabled ? '已启用' : '未启用 ⇒ 兜底模式'})`);
+  }
 
   /* ── 2a 实测节拍(★ D-26)──
      5 秒后打一行:此时循环已跑过几十帧,读数才有意义。**只打印**,不改世界一步。

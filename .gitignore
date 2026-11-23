@@ -44,3 +44,6 @@ Thumbs.db
 # 环境
 .env
 .env.*
+
+# 运行时数据(存档、GM 配置含 API key)
+.data/
