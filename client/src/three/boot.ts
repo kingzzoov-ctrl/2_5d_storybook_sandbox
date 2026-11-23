@@ -1920,7 +1920,12 @@ export function boot(container: HTMLElement): BootHandle {
    * 边界不是装饰:权威位置**来自网络**,若服务端下发一个越界坐标,不夹紧的相机
    * 就飞到地图外看空白;夹紧后最多偏心 8 格(≈128px,视口半宽约 25 格)。
    */
-  const CAMERA_BOUNDS = { minX: 0, minY: 0, maxX: WORLD_CELLS, maxY: WORLD_CELLS };
+  /* ★ w99:**相机跟随的边界必须用真实世界规模**。
+     改前这里是 `maxX: WORLD_CELLS`(= `demo_world.ts` 的 **64**),而真实世界是 192×192 ——
+     `cameraTargetFor` 会 `clampToBand(player, pad, maxX - pad)`,于是玩家在 96.5 时相机被
+     夹到 **64 − 8 = 56**,离玩家 57 格 ⇒ **画面永远停在别处上空**(实测 `cameraLagCells 57.276`)。
+     这就是「一直是在全图上空俯视、看不到自己周围」的根因。 */
+  const CAMERA_BOUNDS = { minX: 0, minY: 0, maxX: worldCells, maxY: worldCells };
   const CAMERA_OPTS = { bounds: CAMERA_BOUNDS, edgePad: CAMERA_EDGE_PAD };
   /**
    * 相机跟随的**显式覆写**(默认关闭,生产路径永不设置它)。
