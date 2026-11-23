@@ -51,6 +51,7 @@ import {
   duplicatedManagedAttributes,
   parseAttributeDeclarations,
   terrainShaderAttributes,
+  terrainAtlasSamplingGated,
   terrainShaderSamplesTexture,
 } from '../client/src/stage/terrain_vcolor.ts';
 import { VERT_WATER_RIPPLE } from '../client/src/stage/shaders.ts';
@@ -167,7 +168,10 @@ test('1 负对照:自包含源码配 ShaderMaterial 必红,managed 版必绿', (
 
   /* 「坏样本」:自包含源码三名全声明 ⇒ 配 `ShaderMaterial` 就是重定义 */
   const dup = duplicatedManagedAttributes(TERRAIN_VCOLOR_VERT);
-  eq(dup.sort(), ['color', 'normal', 'position'], `自包含源码必须被判为重定义(实测 ${dup.join(',')})`);
+  /* ★ WS-FND-193:`uv` 现在也在「three 会注入」的名单里被**真的声明**了(顶面按 UV
+     采样图集格),所以重定义检测器的期望集合多一项 —— 这是契约变更,不是放宽。 */
+  eq(dup.sort(), ['color', 'normal', 'position', 'uv'],
+    `自包含源码必须被判为重定义(实测 ${dup.join(',')})`);
 
   /* managed 版:three 已注入,源码里一个都不许再声明 */
   eq(duplicatedManagedAttributes(TERRAIN_VCOLOR_VERT_MANAGED), [],
@@ -225,7 +229,11 @@ test('2 颜色真的被消费:几何属性 → 着色器声明 → 片元,且顶
   /* 属性名对齐:几何上的 `color` 就是着色器声明的那一个 */
   const declared = terrainShaderAttributes();
   eq(declared.includes(TERRAIN_COLOR_ATTRIBUTE), true, '顶点着色器必须声明 color 属性');
-  eq(declared.includes('uv'), false, '顶点着色器不得声明 uv(顶点色路径不传图集坐标)');
+  /* ★ WS-FND-193 契约反转:顶面要按 UV 采样地砖格 ⇒ 顶点着色器**必须**声明 uv。
+     旧断言「不得声明 uv」(顶点色路径不传图集坐标)与旧裁决一起作废,理由见
+     `terrain_vcolor.ts` 顶部的「WS-FND-193 契约反转」;采样侧的新判据在
+     `tests/WS-FND-193-terrain-atlas-uv.test.ts`。 */
+  eq(declared.includes('uv'), true, '顶点着色器必须声明 uv(顶面按 UV 取图集格)');
 
   /* ★ 负对照:几何上还有 `aLodMerge`,它**不在**声明里 ——
      证明「属性名对齐」这条检查不是「什么都对得上」 */
@@ -233,10 +241,19 @@ test('2 颜色真的被消费:几何属性 → 着色器声明 → 片元,且顶
   eq(declared.includes('aLodMerge'), false, 'aLodMerge 不该出现在地形顶点着色器里(负对照)');
   eq(THREE_MANAGED_ATTRIBUTES.includes('aLodMerge'), false, 'aLodMerge 也不是 three 注入的(负对照)');
 
-  /* 链路两端:顶点着色器把属性写进 varying,片元把 varying 乘进颜色 */
+  /*
+   * 链路两端:顶点着色器把属性写进 varying,片元把 varying 乘进颜色。
+   *
+   * ★ WS-FND-193 契约反转:`terrainShaderSamplesTexture()` 由 `false` 变 `true`
+   *   (旧断言「顶点色路径不得采样纹理」已作废 —— 它是「弃用纹理图集」那条裁决的
+   *   上半句,反转理由写在 `terrain_vcolor.ts` 顶部)。
+   *   反转**不是**把判据改松:采样必须被 `uAtlasReady` 门控(图集是运行时 fetch 的,
+   *   首帧一定还没有),而顶点色仍是材质基色、仍参与输出。(逐条新判据的主场在
+   *   `tests/WS-FND-193-terrain-atlas-uv.test.ts`。) */
   ok(/vColor\s*=\s*color\s*;/.test(TERRAIN_VCOLOR_VERT), '顶点阶段:vColor = color(属性真的被读)');
   ok(/vColor\s*\*/.test(TERRAIN_VCOLOR_FRAG), '片元阶段:vColor 参与颜色计算(不是死 varying)');
-  eq(terrainShaderSamplesTexture(), false, '顶点色路径不得采样纹理');
+  eq(terrainShaderSamplesTexture(), true, '★ 契约反转:片元必须采样图集(WS-FND-193)');
+  eq(terrainAtlasSamplingGated(), true, '采样必须被 uAtlasReady 门控(图集未到 ⇒ 退回纯顶点色)');
 });
 
 /* ─────────────────── 3 / 注入验证:raw 优先 ─────────────────── */
@@ -337,9 +354,10 @@ test('3 装配:有 RawShaderMaterial 时真的调 raw(注入记账 + 参数检�
     eq(rawParams.vertexColors, true, '注入路径同样走顶点色');
     eq(rawParams.vertexShader, TERRAIN_VCOLOR_VERT, 'raw 路径必须用自包含源码');
     eq(rawParams.fragmentShader, TERRAIN_VCOLOR_FRAG, '片元源码同一份');
-    /* raw 材料 three 不注入 ⇒ 这份源码**必须**自带声明,且每个名字只声明一次 */
-    eq(parseAttributeDeclarations(mat.vertexShader).sort(), ['color', 'normal', 'position'],
-      'raw 源码必须自带三个内建属性的声明(与 raw 材料配对)');
+    /* raw 材料 three 不注入 ⇒ 这份源码**必须**自带声明,且每个名字只声明一次。
+       ★ WS-FND-193 起多一个 `uv`(顶面按 UV 取图集格)—— 期望集合跟着契约走。 */
+    eq(parseAttributeDeclarations(mat.vertexShader).sort(), ['color', 'normal', 'position', 'uv'],
+      'raw 源码必须自带四个属性的声明(与 raw 材料配对)');
     eq(selfDuplicates(mat.vertexShader), [], 'raw 源码不得把同一属性声明两次');
     eq(parseAttributeDeclarations(mat.fragmentShader), [], '片元源码没有属性声明');
   } finally {
@@ -361,8 +379,8 @@ test('4 无 three(兜底)仍可装配,且兜底材质也是 raw', () => {
     '兜底也必须是 raw:否则「three 会注入内建」的前提在无 three 环境里被悄悄当成真,判据放水');
   eq(mat.vertexColors, true, '兜底材质必须走顶点色');
   eq(mat.vertexShader, TERRAIN_VCOLOR_VERT, '兜底用自包含源码(与真机同一条路)');
-  eq(parseAttributeDeclarations(mat.vertexShader).sort(), ['color', 'normal', 'position'],
-    '兜底 raw 源码自带三个内建声明');
+  eq(parseAttributeDeclarations(mat.vertexShader).sort(), ['color', 'normal', 'position', 'uv'],
+    '兜底的 raw 源码自带四个属性声明(WS-FND-193 起含 uv)');
   eq(selfDuplicates(mat.vertexShader), [], '兜底路径不得自重定义');
   /* raw 也不注入矩阵 ⇒ 三个矩阵 uniform 必须由装配层建出来(每帧再上传) */
   ok(mat.uniforms.uProjection !== undefined, 'uProjection 必须存在');

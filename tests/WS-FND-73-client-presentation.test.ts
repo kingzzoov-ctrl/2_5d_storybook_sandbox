@@ -37,6 +37,7 @@ import {
   faceColor,
   terrainShaderAttributes,
   terrainShaderSamplesTexture,
+  terrainAtlasSamplingGated,
   validateVertexColors,
 } from '../client/src/stage/terrain_vcolor.ts';
 import {
@@ -248,14 +249,25 @@ test('2 顶点色:geometry 带 color 属性且不带 uv,着色器不采纹理', 
   eq(TERRAIN_COLOR_COMPONENTS, 3, '锚点:顶点色每顶点 3 分量(RGB),常量值不得漂移');
   eq(color?.itemSize, 3, 'color 属性每顶点 3 分量');
   eq(color?.array.length, emitted.vertexCount * TERRAIN_COLOR_COMPONENTS);
-  /* 「不用纹理图集」的两条硬证据:几何上没有 uv,着色器里没有采样器 */
-  eq(attr(geom, 'uv'), undefined, '顶点色路径不得上传 uv 图集坐标');
-  eq(attr(geom, 'uv2'), undefined, '顶点色路径不得上传 uv2 图集坐标');
-  eq(terrainShaderSamplesTexture(), false, '地形着色器不得出现 sampler2D/texture2D');
-  ok(!/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_FRAG), '片元源码无采样器');
-  ok(!/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_VERT), '顶点源码无采样器');
+  /*
+   * ★ WS-FND-193 契约反转(旧证据「几何上没有 uv + 着色器里没有采样器」**已作废**):
+   *   顶面现在按 UV 采样地砖格(图集是运行时 fetch 的成品资源,地砖 301..330 的格子
+   *   本来就在里面),所以「没有 uv / 没有采样器」这两条不再是「走顶点色」的证据。
+   *   反转的完整理由与新的四条判据写在 `terrain_vcolor.ts` 顶部;逐条主场在
+   *   `tests/WS-FND-193-terrain-atlas-uv.test.ts`。
+   *
+   *   这里保留的是**相容层自己的口径**:`assembleChunkGeometry` 的属性清单仍是
+   *   position / color / normal / aLodMerge / 索引 —— 挂 uv 是装配入口
+   *   (`three/stage_assembly.buildChunkGeometry`)在它之后做的事:相容层是最小装配,
+   *   不替调用方决定「要不要纹理」。
+   */
+  eq(attr(geom, 'uv'), undefined, '相容层 `assembleChunkGeometry` 本身不挂 uv(挂 uv 是装配入口的事)');
+  eq(attr(geom, 'uv2'), undefined, 'uv2 谁都不挂(本仓只用一套 UV)');
+  eq(terrainShaderSamplesTexture(), true, '★ 契约反转:片元必须采样图集(WS-FND-193)');
+  ok(/sampler2D/.test(TERRAIN_VCOLOR_FRAG), '片元源码必须声明 uAtlas 采样器');
+  eq(terrainAtlasSamplingGated(), true, '采样必须被 uAtlasReady 门控(图集未到 ⇒ 退回纯顶点色)');
   eq(terrainShaderAttributes().includes(TERRAIN_COLOR_ATTRIBUTE), true, '顶点着色器必须声明 color 属性');
-  eq(terrainShaderAttributes().includes('uv'), false, '顶点着色器不得声明 uv 属性');
+  eq(terrainShaderAttributes().includes('uv'), true, '★ 契约反转:顶点着色器必须声明 uv(顶面按 UV 取图集格)');
 });
 
 test('2b 顶点色:四层基色互不相同,侧面比顶面暗', () => {

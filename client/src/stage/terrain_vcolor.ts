@@ -38,19 +38,85 @@
  *
  *   1. `colors.length === vertexCount × TERRAIN_COLOR_COMPONENTS`(=3);
  *   2. 每个分量 ∈ [0, 1](越界即 NaN/负值/过曝,GPU 会静默截断而肉眼很难发现);
- *   3. 片元着色器源码**不含** `sampler2D` / `texture2D`(`terrainShaderSamplesTexture() === false`)。
+ *   3. **[WS-FND-193 反转]** 片元源码**必须**含 `sampler2D` + `texture2D`
+ *      (`terrainShaderSamplesTexture() === true`),但采样**必须**被 `uAtlasReady`
+ *      门控(`terrainAtlasSamplingGated() === true`),且 `vColor` 仍参与输出。
+ *      为什么撤、原文为什么立、新的四条判据,见下方「WS-FND-193 契约反转」一节。
  *
  * ## 为什么不写 4 分量(RGBA)
  *
  * 透明由材质/染色 uniform 负责,顶点 alpha 恒为 1 只会多占 33% 带宽。
  * `TERRAIN_COLOR_COMPONENTS` 是**唯一**的分量数事实源:谁都别写死 3。
  */
+/*
+ * ─────────── WS-FND-193:契约反转(顶面采样图集,顶点色**仍是材质基色**)───────────
+ *
+ * ## 原文为什么立(WS-09 U2;其中仍然成立的部分继续有效)
+ *
+ * 立在两件事上:(1) 「加一种地砖 = 重画图集 + 重算 UV + 重传纹理」;
+ * (2) U10 裁决后地砖种类扩到 u16(>64)⇒ 图集网格 64×64 ⇒ 单纹理 4096×4096,
+ * 显存与采样都不可接受。
+ * 这两条**没有被推翻**,所以顶点色路径本身**不许删**:
+ *   · 顶点色今天仍是**材质基色**(`topColorOf`:铺装 > 地表 > 海拔层兜底),
+ *     仍是 `TERRAIN_COLOR_COMPONENTS = 3` 的唯一事实源;
+ *   · 加一种铺装仍然只需在 `FLOOR_TOP_SLOTS` 里加一行,不碰任何纹理。
+ *
+ * ## 现在为什么撤(owner 2026-11-19:「还是一堆色块,需要贴图」)
+ *
+ * 撤掉的只是**原判据 3**(「片元源码不得含采样器」),不是顶点色:
+ *   · (1) 在本仓**不成立**:图集 `atlas_sprites.png` 是**运行时 fetch** 的成品资源
+ *     (`assets/atlas_sprites.json` 的 358 帧),30 张地砖(物品 301..330)的格子
+ *     **本来就在里面**(号段表见 `assembly_math.ATLAS_ID_SEGMENTS`,与
+ *     `shared/contracts/FREEZE.md` 的物品号段逐段吻合)。这次接线**没有重画一像素、
+ *     没有重传一张图**,只多了一个采样器;
+ *   · (2) 是**推测的未来**:当前实测图集是 20×18 = 360 格(`ATLAS_COLS`/`ATLAS_ROWS`)。
+ *     为一个推测的未来放弃当下可见的纹理,换来的是「整张地形的顶面只有 38 种纯色」
+ *     (WS-FND-180 之后材质表去重后的色数)—— 那正是 owner 说的「一堆色块」;
+ *   · 顶点色**不能**替代纹理(反之亦然):顶点色回答「这块地是什么材质」,
+ *     纹理回答「这块地的表面长什么样」。
+ *
+ * ## 新判据(逐条可测;实现在 `terrainShaderSamplesTexture` / `terrainAtlasSamplingGated`)
+ *
+ *   1. `terrainShaderSamplesTexture() === true`:片元源码**必须**含 `sampler2D` +
+ *      `texture2D`。反过来 —— 把采样器删掉现在会红:那是退回纯色块。
+ *   2. `terrainAtlasSamplingGated() === true`:`texture2D` 调用**必须**被
+ *      `if (uAtlasReady > 0.5 ...)` 包住。图集是**运行时 fetch** 的,首帧一定还没有;
+ *      无门控的无条件采样这一帧拿到的是**未绑定纹理** ⇒ 地形整片变黑,且不报错。
+ *      ⇒ 门控是「图集没到 ⇒ 退回纯顶点色」这条退化路径的**唯一**实现点。
+ *   3. 顶点色三件套**一条都没放宽**:分量数仍是 3、值域仍是 [0,1]、长度仍等于
+ *      `顶点数 × 3`(`validateVertexColors`),且 `vColor` 仍参与片元输出。
+ *   4. 只对**顶面**采样(`vNormal.z > 0.5`):侧面是地层剖面,与「表面铺了什么」无关
+ *      —— 与「侧面只按海拔层着色」是同一句语义(见 `topColorOf`)。
+ *
+ * ## 乘法口径(为什么是 `vColor * tex * 2.0`)
+ *
+ * 图素当**明暗调制图**用。乘 2 不是随手写的:图集中间调约 0.5,乘 2 后 ≈ 1.0
+ * ⇒ 中灰图素处的地面亮度**等于改前的纯顶点色**(不整体变暗/变亮),亮图素提亮、
+ * 暗图素压暗:纹理是「加在材质色上的细节」,材质语义仍由顶点色表达。
+ *
+ * 纹理**不设** `colorSpace = SRGBColorSpace`(与 `boot.ts` 的立牌路径刻意相反):
+ * 立牌图是**成品色**,必须解码;这里图素是**乘数**,要与顶点色(同一空间)相乘,
+ * 解码成线性会把整片地形压暗约 2.2 次方。设置点见
+ * `three/stage_assembly.ts#bindTerrainAtlas`。
+ */
+
+import { cellIndexFromId } from './assembly_math.ts';
 
 /** 顶点色分量数(RGB)。唯一事实源 —— 装配层与判据都读它。 */
 export const TERRAIN_COLOR_COMPONENTS = 3;
 
 /** 顶点色在几何上的属性名 */
 export const TERRAIN_COLOR_ATTRIBUTE = 'color';
+
+/**
+ * 图集 UV 在几何上的属性名(WS-FND-193)。
+ *
+ * ★ 与 `TERRAIN_COLOR_ATTRIBUTE` 同一做法:名字只此一处事实源 —— 装配层
+ *   (`three/stage_assembly.buildChunkGeometry`)与判据都读它,谁都不写第二份字面量。
+ *   ⚠️ 这个名字**必须**是 `uv`:three 在非 raw 路径注入的内建属性就叫 `uv`
+ *   (`THREE_MANAGED_ATTRIBUTES` 里有它),改名会让 raw / managed 两条路对不上。
+ */
+export const TERRAIN_UV_ATTRIBUTE = 'uv';
 
 /** 一个顶点的颜色(0..1 线性空间) */
 export interface FaceColor {
@@ -190,6 +256,72 @@ export const FLOOR_TOP_RGB: readonly (FaceColor | null)[] = (() => {
   return arr;
 })();
 
+/* ═══════════ WS-FND-193:材质 → 图集格(顶面到底采样哪一格地砖)═══════════
+ *
+ * ## 为什么必须过 `cellIndexFromId`,不能自己算
+ *
+ * 图集是 358 帧的**成品图**,不是按 `BaseFluid` / 槽位号排的:帧名是 `id_101..id_858`
+ * (跨度 758,缺 400 个 ID,压缩成 13 段)。地砖那一段是 `301..330`,它的**首格号是
+ * 103** —— 若按 `id - 101` 算会得到 200,贴出来的图整体错位(实测:那会落到
+ * 「整蛊玩具」段)。⇒ 从槽位到格号**必须**走 `assembly_math.cellIndexFromId`;
+ * 本文件**不写**第二份号段表(重复迟早漂,漂的表现是「地砖贴错图」,而颜色仍然
+ * 是对的 —— 那种缺陷只有眼睛能发现)。
+ *
+ * ## 兜底:为什么是「一格兜底」而不是「退回纯顶点色」(二选一,这里选前者)
+ *
+ * 三种情况拿不到格子:
+ *   1. `floor = 0`(裸地)—— 图集里**没有**按 `BaseFluid` 出的地面帧
+ *      (101-130 段是自然**物件**:原木/浮石/木板,不是草地/沙地/岩石);
+ *   2. 槽位 31..63 = UGC 像素地毯变体 —— 美术来自**服务器生成的像素纹理**,
+ *      不在 `atlas_sprites.png` 里;
+ *   3. 任何算不出格号的坏值(非整数 / 越界 / 未知 id)。
+ * 这三者统一走 `TERRAIN_ATLAS_FALLBACK_CELL`(一格**低饱和**铺装)。
+ * 为什么不退回纯顶点色:**同一个 chunk 里既有贴图面也有纯色面,接缝会形成一圈比
+ * 色块更难看的纯色边框**;统一兜底 ⇒ 整片地形都有纹理,材质语义仍由顶点色表达。
+ * 兜底格**必须导出**:判据要断言它的具体格号(见 `tests/WS-FND-193`)。
+ */
+
+/** 地砖**物品 ID** 与铺装槽位的关系:槽位 = 物品 ID − `FLOOR_ID_BASE` */
+export const FLOOR_ID_BASE = 300;
+
+/** 图集里有美术的**最大**铺装槽位(= 地砖 330);31..63 是 UGC 变体,图集里没有 */
+const FLOOR_PAVED_SLOT_MAX = FLOOR_TOP_SLOTS.length - 1;
+
+/**
+ * 兜底用的地砖物品 ID = **302 鹅卵石径**。
+ *
+ * 为什么是它:兜底要盖住草地/金沙/岩石/水/熔岩等**所有**底色,所以必须**低饱和**,
+ * 否则「乘上去」会把材质色带偏(拿红砖当兜底 ⇒ 草地变红草)。
+ * 鹅卵石径是图集地砖里最中性的一张;乘 2.0 后中灰图素 ≈ 原色,材质语义仍由顶点色定。
+ */
+export const TERRAIN_ATLAS_FALLBACK_ID = 302;
+
+/** 兜底格号 = `cellIndexFromId(302)` = **104**(列 4 行 5);判据把它钉成字面量 */
+export const TERRAIN_ATLAS_FALLBACK_CELL: number = cellIndexFromId(TERRAIN_ATLAS_FALLBACK_ID);
+
+/** 铺装槽位 → 图集格号;**没有格子(≤0 / UGC 变体 / 越界 / 坏值)⇒ `-1`** */
+export function terrainAtlasCellForFloorSlot(slot: number): number {
+  if (!Number.isInteger(slot) || slot < 1 || slot > FLOOR_PAVED_SLOT_MAX) return -1;
+  return cellIndexFromId(FLOOR_ID_BASE + slot);
+}
+
+/**
+ * 一个顶面的**图集格号** —— 顶面贴图的唯一算法源。
+ *
+ * ★ 与 `topColorOf` 的优先级**必须一致**(铺装优先;`base` 没有地面帧 ⇒ 兜底):
+ *   颜色说「红砖广场」而纹理贴「球场草皮」就是两条口径漂了,而这种漂在画面上只
+ *   表现为「颜色和图案对不上」,长度/值域判据一条都查不出来。
+ * ★ 不抛:坏值(`NaN` / 非整数 / 未知 id)一律兜底(与 `topColorOf` 同族语义)。
+ *   `base` 目前不参与选格(见上面的兜底说明),参数保留是为了与 `topColorOf` 同形 ——
+ *   图集哪天补了地面帧,只改本函数体,不改任何调用点。
+ */
+export function terrainAtlasCellOf(base: number, floorSlot: number): number {
+  void base;
+  const paved = terrainAtlasCellForFloorSlot(floorSlot);
+  if (paved >= 0) return paved;
+  return TERRAIN_ATLAS_FALLBACK_CELL;
+}
+
 /** 顶面亮度因子(朝上,受光最多) */
 export const TOP_FACE_SHADE = 1;
 
@@ -326,7 +458,7 @@ export function validateVertexColors(colors: Float32Array, vertexCount: number):
   return null;
 }
 
-/* ───────────────────────── 顶点色着色器(无纹理) ───────────────────────── */
+/* ────────── 顶点色着色器(材质基色;**顶面另采样图集**,见 WS-FND-193)────────── */
 
 /**
  * three 在**非 raw**(`ShaderMaterial`)路径里**自动注入**的顶点属性。
@@ -344,7 +476,8 @@ export const THREE_MANAGED_ATTRIBUTES: readonly string[] = ['position', 'normal'
  * 顶点着色器(**自包含**版:配 `RawShaderMaterial`)。
  *
  * 只用 `position` / `normal` / `color` 三个属性;矩阵 uniform 与仓内既有 shader
- * 保持一致(`uProjection` / `uView` / `uModel`)。
+ * 用四个属性:`position` / `normal` / `color`(材质基色)+ `uv`(**图集格坐标**,
+ * WS-FND-193);矩阵 uniform 与仓内既有 shader
  *
  * ★ 为什么 `precision` 与三个 `attribute` 都必须写在这里:`RawShaderMaterial`
  *   **不做任何注入**(连默认浮点精度都没有)。three 只在 `ShaderMaterial` 路径上
@@ -357,23 +490,28 @@ precision highp float;
 attribute vec3 position;
 attribute vec3 normal;
 attribute vec3 color;
+attribute vec2 uv;
 uniform mat4 uProjection;
 uniform mat4 uView;
 uniform mat4 uModel;
 varying vec3 vColor;
 varying vec3 vNormal;
+varying vec2 vUv;
 void main() {
   vColor = color;
   vNormal = normal;
+  vUv = uv;
   gl_Position = uProjection * uView * uModel * vec4(position, 1.0);
 }
 `;
 
 /**
- * 片元着色器:顶点色 × 固定光向的兰伯特近似。
+ * 片元着色器:顶点色(**材质基色**)× 图集图素(明暗调制)× 固定光向的兰伯特近似。
  *
- * ★ 硬约束:**不出现任何采样器**。写了 `uAlbedo` 就等于回到纹理图集,
- *   而 U2 裁决的全部收益(加地砖不改图集、不重传纹理)会当场消失。
+ * ★ WS-FND-193 新契约(旧契约「不出现任何采样器」已**撤**,理由见文件顶部):
+ *   必须采样 `uAtlas`,但**必须**被 `uAtlasReady` 门控 —— 图集是运行时 fetch 的,
+ *   首帧一定还没有;无门控的无条件采样在那一帧拿到未绑定纹理 ⇒ 整片变黑。
+ *   只对顶面采样(侧面是地层剖面,与「表面铺了什么」无关)。
  *
  * `precision` 显式写出:配 `RawShaderMaterial` 时 three 不注入默认精度。
  * 非 raw 路径上 three 也会注入一行同样的声明 —— 重复设定默认精度是**合法**的
@@ -382,23 +520,68 @@ void main() {
 export const TERRAIN_VCOLOR_FRAG = `
 precision highp float;
 uniform float uAmbient;
+uniform sampler2D uAtlas;
+uniform float uAtlasReady;
 varying vec3 vColor;
 varying vec3 vNormal;
+varying vec2 vUv;
 const vec3 LIGHT_DIR = vec3(0.4082482, -0.4082482, 0.8164965);
 void main() {
+  /*
+   * 顶点色仍是**材质基色**(WS-FND-180);图集图素是加在它上面的**明暗细节**:
+   * 乘 2.0 让中灰图素 ≈ 原色(见文件顶部的「乘法口径」)。
+   * uAtlasReady = 0(首帧 / 图集 fetch 失败)⇒ 这一支不执行,输出就是纯顶点色。
+   */
+  vec3 albedo = vColor;
+  if (uAtlasReady > 0.5 && vNormal.z > 0.5) {
+    vec3 tex = texture2D(uAtlas, vUv).rgb;
+    albedo = clamp(vColor * tex * 2.0, 0.0, 1.0);
+  }
   float ndl = max(dot(normalize(vNormal), LIGHT_DIR), 0.0);
-  vec3 lit = vColor * (uAmbient + (1.0 - uAmbient) * ndl);
+  vec3 lit = albedo * (uAmbient + (1.0 - uAmbient) * ndl);
   gl_FragColor = vec4(clamp(lit, 0.0, 1.0), 1.0);
 }
 `;
 
 /**
- * 顶点色着色器是否仍在采样纹理。**必须恒为 `false`** ——
+ * 顶点色着色器是否在采样纹理。**WS-FND-193 起必须恒为 `true`** ——
  * 判据拿它当断言,而不是拿「有没有 `uAlbedo` 字样」(别名会绕过那种检查)。
+ *
+ * ★ 这条在 WS-09 U2 里是 `false`(「顶点色路径不得采样纹理」),WS-FND-193 反转:
+ *   顶面现在按 UV 采样地砖格,纹理是「材质色上的明暗细节」,不是替代材质色。
+ *   反转的完整理由与新的四条判据写在文件顶部。谁要把它改回「不许采样」,
+ *   先回答「那地形靠什么摆脱纯色块」。
  */
 export function terrainShaderSamplesTexture(): boolean {
   const both = `${TERRAIN_VCOLOR_VERT}\n${TERRAIN_VCOLOR_FRAG}`;
   return /sampler2D|samplerCube|texture2D|textureCube/.test(both);
+}
+
+/**
+ * 采样是否被 `uAtlasReady` **门控**(= 图集没到就退回纯顶点色)。
+ *
+ * ## 为什么必须与「有没有采样器」分开断言
+ *
+ * 「片元里有 sampler2D」只说明源码**声明**了采样器,不说明采样会被门控 ——
+ * 无条件采样在首帧(图集还在 fetch)拿到的是未绑定纹理 ⇒ 地形整片变黑,
+ * 不抛异常、不报错。所以**门的存在**必须单独可测。
+ *
+ * ## 判定口径(文本级;写清楚是为了改动时同步)
+ *
+ * 找到门控那一行(`if (uAtlasReady > 0.5`)与它所在块的收尾 `}`,
+ * 要求 `texture2D(...)` 出现在这两者**之间**。删掉 `if`(只留采样)⇒ 找不到门 ⇒ `false`。
+ * ⚠️ 改门控写法(例如换成 `if (uAtlasReady > 0.0)`)必须同步改这里的字符串与
+ *    `tests/WS-FND-193` —— 那是**契约变更**,不是把判据改松。
+ *
+ * 默认参数就是产品源码;传参只为让判据拿「坏样本」跑同一个检测器(负对照)。
+ */
+export function terrainAtlasSamplingGated(src: string = TERRAIN_VCOLOR_FRAG): boolean {
+  const guardAt = src.indexOf('if (uAtlasReady > 0.5');
+  if (guardAt < 0) return false;
+  const guardEnd = src.indexOf('}', guardAt);
+  if (guardEnd < 0) return false;
+  const sampleAt = src.indexOf('texture2D(');
+  return sampleAt > guardAt && sampleAt < guardEnd;
 }
 
 /**
@@ -460,7 +643,7 @@ export function stripAttributeDeclarations(src: string, names: readonly string[]
 export const TERRAIN_VCOLOR_VERT_MANAGED: string =
   stripAttributeDeclarations(TERRAIN_VCOLOR_VERT, THREE_MANAGED_ATTRIBUTES);
 
-/** 顶点色着色器声明的属性名(判据用:必须含 color,且不含 uv) */
+/** 顶点色着色器声明的属性名(判据用:必须含 color **与 uv** —— uv 是图集格坐标,WS-FND-193) */
 export function terrainShaderAttributes(): string[] {
   return parseAttributeDeclarations(TERRAIN_VCOLOR_VERT);
 }

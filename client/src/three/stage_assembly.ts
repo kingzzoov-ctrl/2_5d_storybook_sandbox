@@ -30,6 +30,7 @@ import {
 } from '../stage/iso_camera.ts';
 import { type ChunkInput, buildChunkQuads } from '../stage/tile_mesh.ts';
 import { emitChunkGeometry, validateChunkGeometry } from '../stage/chunk_geometry.ts';
+import { TERRAIN_UV_ATTRIBUTE } from '../stage/terrain_vcolor.ts';
 import { SHADER_PROGRAMS, SHADER_UNIFORMS, type ShaderName } from '../stage/shaders.ts';
 import type { ParticlePool } from '../stage/particles.ts';
 import { AURA_ANCHORS, ICON_SIZE, type WeaponTextureBundle } from '../stage/entity_sprites.ts';
@@ -121,22 +122,95 @@ export function buildChunkGeometry(chunk: ChunkInput, lod: number): THREE.Buffer
   }
   const drift = crossCheckExactFaces(chunk, lod);
   if (drift !== null) throw new Error(`buildChunkGeometry: ${drift}`);
-  return assembleChunkGeometry(emitted, lod) as unknown as THREE.BufferGeometry;
+  /*
+   * ★ WS-FND-193:把图集 UV 真的挂上几何。
+   *
+   * 相容层(`three/compat.assembleChunkGeometry`)的属性清单是 position/color/normal/
+   * aLodMerge/索引 —— 它按「顶点色无纹理」那条旧裁决写的,**没有 uv**;而顶面现在
+   * 要按 UV 采样地砖格 ⇒ 缺这一行的表现是「有颜色、没纹理」:不抛、不报错,与
+   * WS-FND-89 那个「几何上的 color 属性没有任何读者」的缺陷同型。
+   */
+  const geom = assembleChunkGeometry(emitted, lod) as unknown as THREE.BufferGeometry;
+  geom.setAttribute(TERRAIN_UV_ATTRIBUTE, new THREE.BufferAttribute(emitted.uvs, 2));
+  return geom;
 }
 
 /**
- * 地形材质:顶点色(无纹理图集)。
+ * 地形材质:顶点色(材质基色)× 图集图素(明暗调制)。
  *
  * 返回的 `vertexColors === true`、**是 raw 材料**(three 不注入内建 `attribute`,
- * 源码自带宽高)且片元源码不含采样器 —— 与 `stage/terrain_vcolor.ts` 的判据同一份
- * 源码,不存在"测试查 A、渲染跑 B"。
+ * 源码自带宽高)、片元**采样**图集且采样被 `uAtlasReady` 门控 —— 与
+ * `stage/terrain_vcolor.ts` 的判据同一份源码,不存在"测试查 A、渲染跑 B"。
  *
  * ★ WS-FND-89:这个函数此前**零生产调用点**(`boot.ts` 直接 `new MeshLambertMaterial`),
  *   于是几何上的 `color` 属性没有任何读者、真机恒为一块单色,而所有顶点色判据全绿。
  *   现在 `boot.ts` 的地形材质就是它(见 `boot.ts` 里 `buildTerrainMaterial()` 那行)。
+ *
+ * ★ WS-FND-193:两个图集 uniform(`uAtlas` / `uAtlasReady`)在这里建好并置成
+ *   「未就绪」,纹理由 `bindTerrainAtlas()` 在运行时拿到图集后填进来 ⇒
+ *   图集没到的那一帧着色器走纯顶点色分支,**不会黑屏**。
  */
 export function buildTerrainMaterial(): THREE.ShaderMaterial {
-  return assembleTerrainMaterial() as unknown as THREE.ShaderMaterial;
+  const mat = assembleTerrainMaterial() as unknown as THREE.ShaderMaterial;
+  /*
+   * ★ WS-FND-193:图集 uniform 的默认值必须是「**未就绪**」。
+   *
+   * 图集是运行时 fetch 的(`boot.ts` 的 `loadAtlasImage()`),首帧一定还没有纹理;
+   * 若默认 `uAtlasReady = 1`,着色器会去采样一张**未绑定**纹理 ⇒ 地形整片变黑,
+   * 不抛异常、不报错(只有眼睛能发现的缺陷)。
+   * ⇒ 0 = 「退回纯顶点色」;只有 `bindTerrainAtlas()` 真拿到 image 才置 1。
+   *
+   * ⚠️ 这里放的是 three 的 uniform **对象本身**(`{ value }`),不是快照:three 在
+   *    程序首次渲染时按对象身份缓存 uniform 上传清单(`WebGLUniforms.seqWithValue`),
+   *    所以后续换纹理**只能改 `.value`**,不能换对象(见 `bindTerrainAtlas`)。
+   */
+  mat.uniforms.uAtlas = { value: null };
+  mat.uniforms.uAtlasReady = { value: 0 };
+  return mat;
+}
+
+/**
+ * 把 `loadAtlasImage()` 拿到的图片装成地形材质的图集纹理 —— **图集接线的唯一入口**。
+ *
+ * ## 调用点(`boot.ts` 里要加的那一行)
+ *
+ * ```ts
+ * const mat = buildTerrainMaterial();
+ * void loadAtlasImage().then((img) => { bindTerrainAtlas(mat, img); });
+ * ```
+ *
+ * ## 为什么 `img === null` 时不抛,而是返回 null
+ *
+ * `loadAtlasImage()` 在资源缺失时 **resolve(null)**(见它的注释:没有图集时场景仍要
+ * 能跑)。那时保持 `uAtlasReady = 0` ⇒ 地形退回纯顶点色 —— 这是**降级**,不是错误:
+ * 把「资源缺失」升级成「白屏/黑地形」只会让排查更难。
+ *
+ * ## 三个纹理参数为什么这么取
+ *
+ *   1. `NearestFilter` + `generateMipmaps = false`:像素画风;双线性/多级渐远会把
+ *      屏幕上只有 16px 一格的地砖糊成色斑;
+ *   2. `colorSpace` **不设** `SRGBColorSpace`(与 `boot.ts` 的立牌路径刻意相反):
+ *      立牌图是**成品色**,必须解码;这里图素是**乘数**(`vColor * tex * 2.0`),
+ *      与顶点色在同一空间相乘 —— 设成 sRGB 会把整片地形压暗约 2.2 次方;
+ *   3. `flipY` 保持默认 `true`:图集 UV 由 `assembly_math.frameToUv` 按「图像左上角
+ *      原点 + flipY」算出(`v = 1 - y/H`),两边必须同一假设。
+ */
+export function bindTerrainAtlas(
+  material: THREE.ShaderMaterial,
+  img: HTMLImageElement | null,
+): THREE.Texture | null {
+  if (img === null) return null;
+  const tex = new THREE.Texture(img);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.needsUpdate = true;
+  const u = material.uniforms;
+  /* 只改 `.value`:uniform 对象身份被 three 缓存,换对象等于这次接线没生效 */
+  if (u.uAtlas !== undefined) u.uAtlas.value = tex; else u.uAtlas = { value: tex };
+  if (u.uAtlasReady !== undefined) u.uAtlasReady.value = 1; else u.uAtlasReady = { value: 1 };
+  return tex;
 }
 
 /**

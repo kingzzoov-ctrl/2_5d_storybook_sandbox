@@ -22,6 +22,11 @@
  *   (`terrain_vcolor.topColorOf`:铺装 > 地表 > 海拔层兜底),侧面按海拔层(`faceColor`)。
  *   材质只取合并块的**主导格**(`dominantMaterialGrid`),与块 z 的挑格口径逐字相同;
  *   LOD0 时主导格 = 该格自己,逐格精确。
+ * - **顶面 UV 的图集口径**(WS-FND-193):顶面 4 个顶点的 UV 是**该合并块主导格**的
+ *   图集格矩形(`terrain_vcolor.terrainAtlasCellOf` → `assembly_math.offsetRepeatOfCell`),
+ *   与顶面颜色**取同一格**,所以「颜色说红砖、纹理贴草皮」这种口径漂移不存在;
+ *   侧面**不采样**(见 `terrain_vcolor.TERRAIN_VCOLOR_FRAG`:只对 `vNormal.z > 0.5` 采样),
+ *   它的 UV 仍是本地面坐标。
  *
  * ## 坐标约定(与 `iso_camera.ts` 的 35° 正交投影对齐)
  *
@@ -45,7 +50,9 @@
  * ```
  * 索引 `[0,1,2, 2,1,3]`(两三角形,与 `assembly_math.quadIndexBuffer` 一致)。
  *
- * 侧面:从块的四邻低处起建,朝向该方向;UV 的 v 轴对应高度,便于贴侧壁纹理。
+ * 顶面 UV(WS-FND-193):4 个顶点 = 该块**主导格**那一格的图集矩形的四个角
+ * (整块共用一格 ⇒ 不跨格混采);侧面 UV 仍是本地面坐标,且**侧面不采样纹理**
+ * (顶面/侧面的判定在片元里按法线做,见 `terrain_vcolor.TERRAIN_VCOLOR_FRAG`)。
  */
 
 import { unpackTile } from '../../../shared/types/tile.ts';
@@ -67,16 +74,28 @@ import {
   TERRAIN_COLOR_COMPONENTS,
   elevLayerOfZ,
   faceColor,
+  terrainAtlasCellOf,
   topColorOf,
   validateVertexColors,
   writeVertexColor,
 } from './terrain_vcolor.ts';
 
+import { offsetRepeatOfCell } from './assembly_math.ts';
+
 /** 一个 Chunk 的完整几何数据(引擎中立) */
 export interface ChunkGeometry {
   /** 顶点位置,每顶点 3 个 float(x, y, z) */
   positions: Float32Array;
-  /** 顶点 UV,每顶点 2 个 float(u, v)∈[0,1] */
+  /**
+   * 顶点 UV,每顶点 2 个 float(u, v)∈[0,1]。
+   *
+   * ★ WS-FND-193:**顶面**的 UV 是**图集格矩形**(该合并块主导格那一格),由片元的
+   *   `texture2D(uAtlas, vUv)` 采样 ⇒ 地形顶面有纹理,而不是一块纯色。
+   *   长度仍恒等于 `顶点数 × 2`。
+   * ★ **侧面**的 UV 仍是本地面坐标(u ∈ {0,1},v = 0/1 表示底/顶):片元只对顶面
+   *   采样(侧面是地层剖面,与「表面铺了什么」无关)⇒ 侧面 UV 不进采样。留着它是
+   *   为了让「UV 已写出」这条既有判据与调试读数继续成立。
+   */
   uvs: Float32Array;
   /** 顶点法线,每顶点 3 个 float */
   normals: Float32Array;
@@ -326,10 +345,21 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     const cellX = chunkOriginX + c.bx * merge;
     const cellY = chunkOriginY + c.by * merge;
     const z = c.z;
-    /* UV:用格坐标对 CHUNK_SIZE 取模,保证相邻块纹理连续 */
-    const u0 = (c.bx * merge) / CHUNK_SIZE;
-    const v0 = (c.by * merge) / CHUNK_SIZE;
-    const du = merge / CHUNK_SIZE;
+    /*
+     * UV(WS-FND-193):**图集格矩形**,不再是块内相对坐标。
+     *
+     * 取该合并块**主导格**的材质(与顶面颜色同一格,见 `dominantMaterialGrid`),
+     * 经 `terrainAtlasCellOf` 得到图集格号,再由 `assembly_math.offsetRepeatOfCell`
+     * 算出 offset/repeat —— 4 个顶点写的就是同一个矩形的四个角。
+     *
+     * ★ 为什么整块共用**一格**而不是逐格铺:图集是**共用一张纹理**,格与格之间不能
+     *   用 RepeatWrapping(采样越界会串到邻格的地砖上,而那是画面上最难查的错),
+     *   所以「一格里铺满整块」是唯一能保证不串色的做法。代价见下面的 LOD 注记。
+     * ★ LOD>0 的已知近似:一个合并块里可能混着多种地砖,这里按主导格**一格到底**
+     *   (与「块 z 取最高格」「顶面色取主导格材质」同一条近似口径)⇒ merge = 2/4/8 时
+     *   图案被**放大**同样倍数。判据不查这一点(它是设计取舍,不是缺陷)。
+     */
+    const atlasRect = offsetRepeatOfCell(terrainAtlasCellOf(c.base, c.floor));
 
     /*
      * 颜色(WS-FND-180):
@@ -343,14 +373,14 @@ export function emitChunkGeometry(chunk: ChunkInput, lod: number, ctx?: EdgeCont
     const topColor = topColorOf(elev, c.base, c.floor);
     const sideColor = faceColor(elev, false);
 
-    /* ── 顶面(法线 +Z)── */
+    /* ── 顶面(法线 +Z;UV = 主导格的图集格矩形,WS-FND-193)── */
     for (const [dx, dy] of TOP_CORNERS) {
       pushVertex(
         cellX + dx * merge,
         cellY + dy * merge,
         z,
-        u0 + dx * du,
-        v0 + dy * du,
+        atlasRect.offsetU + dx * atlasRect.repeatU,
+        atlasRect.offsetV + dy * atlasRect.repeatV,
         0, 0, 1,
         topColor.r, topColor.g, topColor.b,
       );
