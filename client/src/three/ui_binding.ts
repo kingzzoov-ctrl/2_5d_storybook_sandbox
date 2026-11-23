@@ -804,7 +804,10 @@ export class UiOverlay {
        世界侧自动开工(食堂 + 三工位 + 站格),客户端只**如实报**这三条:
        `✓` 已知满足 / `✗` 已知不满足 / `?` **拿不到权威值**。
        未知单独计数,不并进"没满足" —— 假装 0 会让玩家反复拆了重建。 */
-    if (s.rush.total > 0) {
+    /* 急行清单与键位条属于诊断面板:浏览器里默认收起(`main.ts` 写 `__debugHud`),
+       非浏览器环境没有这个开关 ⇒ 照常画。 */
+    const debugHud = (globalThis as { __debugHud?: boolean }).__debugHud !== false;
+    if (debugHud && s.rush.total > 0) {
       const w = 380;
       const h = 22 + s.rush.total * 15 + (s.rush.note === '' ? 0 : 14);
       const box: PanelRect = { x: 16, y: this.h - h - 44, w, h };
@@ -834,7 +837,7 @@ export class UiOverlay {
     /* 组合键提示条 */
     ctx.fillStyle = C.dim;
     ctx.font = FONT;
-    ctx.fillText(s.keysHint, 16, this.h - 22);
+    if (debugHud) ctx.fillText(s.keysHint, 16, this.h - 22);
     ctx.restore();
   }
 

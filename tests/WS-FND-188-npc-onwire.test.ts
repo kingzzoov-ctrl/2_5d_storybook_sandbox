@@ -37,6 +37,7 @@
  * `node tests/WS-FND-188-npc-onwire.test.ts`
  */
 
+import { characterAtlasId } from '../client/src/stage/entity_sprites.ts';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -417,7 +418,9 @@ test('FND188-9 NPC 立牌计划非空、atlasCell ≥ 0、高度与玩家同档�
   eq(plan.length, 4, '4 个 NPC ⇒ 4 条立牌计划');
   for (const p of plan) {
     ok(p.atlasCell >= 0, `★ ${p.id} 的 atlasCell 必须 ≥ 0(=-1 会一个都画不出来,且**不报错**)`);
-    eq(p.atlasCell, cellIndexFromId(NPC_SPRITE_ITEM_ID), '贴图格来自 `cellIndexFromId`(不手算下标)');
+    /* NPC 用图集的角色帧(801..806,按 id 稳定取);532 稻草人只在取不到时兜底。 */
+    eq(p.atlasCell, cellIndexFromId(characterAtlasId(p.id)), '贴图格 = 该 NPC 的角色帧(来自 `cellIndexFromId`,不手算下标)');
+    ok(p.atlasCell !== cellIndexFromId(NPC_SPRITE_ITEM_ID), 'NPC 不再是稻草人');
     eq(p.heightPx, SPRITE_HEIGHT_PX.player, '高度与玩家立牌**同档**(人比人高会被读成另一个物种)');
   }
   ok(ITEM_BY_ID.has(NPC_SPRITE_ITEM_ID),

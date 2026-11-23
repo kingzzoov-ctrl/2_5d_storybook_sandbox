@@ -17,6 +17,7 @@
  */
 
 import type { VisualStyle } from '../../../shared/types/alchemy.ts';
+import { MOB_LIST } from '../../../shared/constants/mobs.ts';
 
 /** 纹理边长(像素) */
 export const ICON_SIZE = 16;
@@ -669,4 +670,33 @@ export function countByKinds(specs: readonly EntitySpriteSpec[]): { player: numb
     else pet += 1;
   }
   return { player, mob, pet };
+}
+/* ───────────────────── 实体 → 图集帧 ───────────────────── */
+
+/** 图集「六大专精角色」号段起点(801..806)。 */
+export const CHARACTER_ATLAS_ID_BASE = 801;
+/** 角色帧数。 */
+export const CHARACTER_ATLAS_COUNT = 6;
+/** 图集「野生动物」号段起点(811..834),顺序与 `MOB_LIST` 逐项一致。 */
+export const MOB_ATLAS_ID_BASE = 811;
+
+const MOB_ATLAS_ID = new Map<string, number>(MOB_LIST.map((m, i) => [m.id, MOB_ATLAS_ID_BASE + i]));
+
+/**
+ * 某个玩家/NPC 用哪张角色帧:按 id 的稳定哈希在 6 张里取一张,
+ * 同一个人在所有客户端上长得一样,不同的人大概率不同。
+ */
+export function characterAtlasId(entityId: string): number {
+  let h = 0;
+  for (let i = 0; i < entityId.length; i += 1) h = (h * 31 + entityId.charCodeAt(i)) >>> 0;
+  return CHARACTER_ATLAS_ID_BASE + (h % CHARACTER_ATLAS_COUNT);
+}
+
+/**
+ * 实体立牌的图集 id。未知物种返回 `-1`(调用方退回色块,不错位取样)。
+ * `label` 对生物是物种 id(`mob_boar`),见 `planEntitySpritesInto`。
+ */
+export function entityAtlasId(kind: EntitySpriteSpec['kind'], label: string, entityId: string): number {
+  if (kind === 'player') return characterAtlasId(entityId);
+  return MOB_ATLAS_ID.get(label) ?? -1;
 }

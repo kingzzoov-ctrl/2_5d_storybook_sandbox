@@ -771,6 +771,8 @@ export type WsRoomLike = {
   readonly id: string;
   step(prevSnapshot: unknown): Uint8Array;
   snapshotFor(userId: string): Uint8Array;
+  /** 入场首帧(整房全量,可选)—— 见 `RoomRuntime.joinSnapshotFor`;缺它退回 `snapshotFor`。 */
+  joinSnapshotFor?(userId: string): Uint8Array;
   /**
    * ★ WS-FND-182:**一步地形下行**(可选)—— 见 `RoomRuntime.terrainDeltaFor`。
    *
@@ -1934,7 +1936,8 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1) */
     /* 首次快照:用 room 的 encodeFull 出口 ⇒ **裸字节**(契约 §12.1)。
        包头那 4 字节 ack 也按**本连接**填(此刻通常 = 0 ⇒ 「还没有 ack」)。 */
-    sendBinary(c, withAckedSeq(opts.room.snapshotFor(claimed), c.ackedSeq));
+    sendBinary(c, withAckedSeq(
+      (opts.room.joinSnapshotFor?.(claimed) ?? opts.room.snapshotFor(claimed)), c.ackedSeq));
     /* ★ WS-FND-182:地形**紧跟首帧快照**下发(此刻基线为空 ⇒ 这一轮算出的是**全量**)。
        ⚠️ 不在这里一次发完:一场 192×192 的世界是 148 KB,一次写进 socket 会让
           `socket.write` 连续返回 false ⇒ 刚握手的人被背压判据踢掉。

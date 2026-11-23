@@ -6514,6 +6514,21 @@ export class RoomRuntime {
     return encodeFull(this.visibleStateFor(userId), this.state.meta.tick).bytes;
   }
 
+  /**
+   * **入场首帧**:整房全量(不按 AOI 裁)。
+   *
+   * 逐帧广播 `step(prev)` 是**整房**差量、所有连接共用一份;首帧若按 AOI 裁,
+   * 视距外的实体在客户端没有基线,之后只收到「动过的字段」⇒ 物种 id 与血量恒为空
+   * (屏幕上是一堆 0/0 的无名方块)。首帧必须与差量是同一个范围。
+   * `snapshotFor` 的 AOI 口径保留给落盘/重连一致性用;要把 AOI 真做到线上,
+   * 得先让差量也按连接裁,那时两处一起改。
+   * 席位判据与 `snapshotFor` 相同:不在成员表里 ⇒ 空包。
+   */
+  joinSnapshotFor(userId: string): Uint8Array {
+    if (!this.members.has(userId)) return new Uint8Array(0);
+    return encodeFull(this.state, this.state.meta.tick).bytes;
+  }
+
   /* ── 4.6 ★ WS-FND-182:地形下行 ── */
 
   /**

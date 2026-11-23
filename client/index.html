@@ -72,6 +72,24 @@
     padding: 8px 12px; border-radius: 10px; pointer-events: none;
     border: 1px solid #7f9dc9;
   }
+  /* 诊断面板默认收起(` 键或 ?debug=1 打开,开关在 main.ts)。
+     收起 = 移出视口而不是 display:none:读屏器与 Tab 仍然到得了(WS-FND-167 的要求不变)。 */
+  body:not(.debug) #status,
+  body:not(.debug) #hint,
+  body:not(.debug) #a11y_panels {
+    position: fixed !important; left: 0 !important; top: 0 !important;
+    right: auto !important; bottom: auto !important; transform: none !important;
+    width: 1px !important; height: 1px !important; max-width: 1px !important;
+    padding: 0 !important; border: 0 !important; overflow: hidden !important;
+    clip-path: inset(50%) !important; white-space: nowrap !important;
+  }
+  /* 窄屏:右上角那排按钮占满一行 ⇒ 玩家卡片与目标卡片让到它下面。 */
+  @media (max-width: 640px) {
+    #gh_me { top: 62px !important; }
+    #gh_target { top: 62px !important; left: auto !important; right: 10px !important; transform: none !important; }
+  }
+  body:not(.debug) #hud,
+  body:not(.debug) #bootstatus { display: none !important; }
 </style>
 </head>
 <body>

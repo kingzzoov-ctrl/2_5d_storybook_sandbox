@@ -84,6 +84,7 @@ import {
      两份高度常量迟早漂,而漂的表现是"NPC 比人矮一截/高一截",没人会报错。 */
   SPRITE_HEIGHT_PX,
   type EntitySpriteSpec,
+  characterAtlasId, entityAtlasId,
 } from '../stage/entity_sprites.ts';
 import {
   type RecipeTree,
@@ -209,6 +210,11 @@ const FPS_WINDOW_MS = 500;
  * 由构建/部署时拷到站点根。这里用相对 URL 从页面同目录取。
  */
 const ATLAS_URL = 'atlas_sprites.png';
+
+/** 角色(玩家/NPC)立牌边长,世界单位:图集帧四周有留白,2.4 格边长时人物本体约一格半高。 */
+const CHARACTER_SIZE_WORLD = SPRITE_CELL_WORLD * 2.4;
+/** 野生动物立牌边长。 */
+const MOB_SIZE_WORLD = SPRITE_CELL_WORLD * 2.0;
 
 /** 模块级缓存:整页只加载一次图集(3 个以上精灵共享同一 Image) */
 let atlasImagePromise: Promise<HTMLImageElement | null> | null = null;
@@ -479,16 +485,20 @@ export function planNpcSprites(
   npcs: readonly NpcWireDef[],
   heightPx: number = 28,
 ): NpcSpritePlan[] {
-  const cell = cellIndexFromId(NPC_SPRITE_ITEM_ID);
-  return npcs.map((n) => ({
+  const fallback = cellIndexFromId(NPC_SPRITE_ITEM_ID);
+  return npcs.map((n) => {
+    /* 图集有六张角色帧 ⇒ NPC 是人不是稻草人;取不到才退回 532。 */
+    const own = cellIndexFromId(characterAtlasId(n.id));
+    return {
     id: n.id,
     name: n.name,
     x: n.x,
     y: n.y,
-    atlasCell: cell,
+    atlasCell: own >= 0 ? own : fallback,
     heightPx,
     hasQuest: n.quest !== undefined,
-  }));
+    };
+  });
 }
 
 /**
@@ -958,8 +968,7 @@ export function boot(container: HTMLElement): BootHandle {
          与玩家/实体立牌同源)⇒ 脚踩在地上,不悬空。 */
       const z = zAt.get(`${Math.floor(p.x)},${Math.floor(p.y)}`) ?? 0;
       sp.position.set(p.x + 0.5, p.y + 0.5, z);
-      const h = (p.heightPx / ATLAS_PX_PER_CELL) * SPRITE_CELL_WORLD;
-      sp.scale.set(h * 0.92, h, 1);
+      sp.scale.set(CHARACTER_SIZE_WORLD, CHARACTER_SIZE_WORLD, 1);
       sp.visible = true;
     }
     for (const [id, sp] of npcSprites) {
@@ -1292,6 +1301,17 @@ export function boot(container: HTMLElement): BootHandle {
         scene.add(sp);
         entitySprites.set(spec.key, sp);
         entitySpriteOps.spawns += 1;
+      }
+      /* 图集到了之后把色块换成真正的形象(只换一次;未知物种保持色块)。 */
+      if (sp.userData.skinned !== true && propAtlasReady && propAtlasImg !== null) {
+        const skin = propMaterialOf(propAtlasImg, cellIndexFromId(entityAtlasId(spec.kind, spec.label, spec.entityId)));
+        if (skin !== null) {
+          sp.material.dispose();
+          sp.material = skin;
+          const size = spec.kind === 'player' ? CHARACTER_SIZE_WORLD : MOB_SIZE_WORLD;
+          sp.scale.set(size, size, 1);
+        }
+        sp.userData.skinned = true;
       }
       sp.position.set(mount.sprite.x, mount.sprite.y, mount.sprite.z);
       sp.visible = base.visible;
@@ -2685,6 +2705,17 @@ export function boot(container: HTMLElement): BootHandle {
     const cell = { gx: mount.sprite.x, gy: mount.sprite.y, gz: mount.sprite.z, visible: base.visible };
     playerMarker.position.set(cell.gx, cell.gy, cell.gz);
     playerMarker.visible = cell.visible;
+    /* 本地玩家同样换成角色帧(需要图集与自己的 id 都到位)。 */
+    if (playerMarker.userData.skinned !== true && propAtlasReady && propAtlasImg !== null
+      && authority.localPlayerId !== '') {
+      const skin = propMaterialOf(propAtlasImg, cellIndexFromId(characterAtlasId(authority.localPlayerId)));
+      if (skin !== null) {
+        playerMarker.material.dispose();
+        playerMarker.material = skin;
+        playerMarker.scale.set(CHARACTER_SIZE_WORLD, CHARACTER_SIZE_WORLD, 1);
+      }
+      playerMarker.userData.skinned = true;
+    }
     /* ── ★ 第七轮审计 P1:野生 / 远端玩家的立牌,每帧按**同一份**权威快照对齐 ──
      *
      * 修前 `RoomState.wildlife` / 其他 `players` 在屏幕上**零输出**(只有本地 marker

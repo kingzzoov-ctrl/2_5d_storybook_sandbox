@@ -23,6 +23,8 @@ import { boot, type BootHandle } from './three/boot.ts';
    与 `planTerrainRebuild` 同一层(零依赖、node 里可直接断言)。
    ⚠️ 本文件只做**装配**:接上 `session.onNpcs`、把 `T` 交给 NPC 或道具、把台词写进 HUD。 */
 import { NPC_TALK_KEY, nearbyNpc, npcTalkTextOf } from './three/boot.ts';
+import { createGameHud } from './ui/game_hud.ts';
+import { MOB_BY_ID } from '../../shared/constants/mobs.ts';
 /* NPC 表的**线上形状** —— 与 `boot.setNpcs` 的入参是同一个类型(共享协议层)。 */
 import { type NpcWireDef } from '../../shared/net/delta.ts';
 import {
@@ -148,6 +150,9 @@ function serverUrlFromLocation(userId: string): string | null {
      拒连接(`net/identity.ts` 的头注释写了为什么走地址而不是 hello)。 */
   return withUserId(`ws://${window.location.hostname || '127.0.0.1'}:8791/ws`, userId);
 }
+
+/** 目标血条只在这个距离(格)内显示:更远的怪与玩家当下无关。 */
+const TARGET_SHOW_RANGE = 10;
 
 function main(): void {
   const root = document.getElementById('app');
@@ -531,6 +536,37 @@ function main(): void {
   const bootStatusEl = document.getElementById('bootstatus');
   const hintEl = document.getElementById('hint');
   const a11y = createA11yMirror();
+  /* ── 玩家 HUD 与诊断面板的开关 ──
+     诊断面板(#status / #hint / #hud / 镜像面板 / 画布上的急行清单与键位条)默认收起:
+     它们是给排障用的,盖住半个屏幕时玩家看不到世界。` 键或 `?debug=1` 打开。
+     收起用的是 `body.debug` 这个类(样式在 index.html),元素与文本照常更新。 */
+  /* 排障钩子:控制台里直接读权威快照(与 `__spriteDebug` 同类,只读)。 */
+  (window as unknown as { __store?: unknown }).__store = handle.store;
+  const gameHud = createGameHud();
+  /** 与最近的 NPC 说话(键盘 T 与提示卡点击共用;够不够近用权威位置判)。 */
+  const talkToNearbyNpc = (): boolean => {
+    if (npcList.length === 0) return false;
+    const center = telegraphCenterOf(handle.store.state, handle.store.localPlayerId);
+    const near = center === null ? null : nearbyNpc(npcList, center.cx, center.cy);
+    if (near === null) return false;
+    /* 走**同一条**入口(`ActionEntry` 的三支分流):参数不对 / 未连接 / 发。 */
+    const out = actionEntry.npcTalk({ npcId: near.id });
+    lastAction = `与「${near.name}」说话 ${out.sent ? '→ 已发' : `✗ ${out.status}`}`;
+    return true;
+  };
+  gameHud.mount(root, () => { talkToNearbyNpc(); });
+  const setDebugHud = (on: boolean): void => {
+    document.body.classList.toggle('debug', on);
+    (globalThis as { __debugHud?: boolean }).__debugHud = on;
+  };
+  setDebugHud(new URLSearchParams(window.location.search).get('debug') === '1');
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key === '`') setDebugHud(!document.body.classList.contains('debug'));
+  });
+  /** 飘字来源的上一次取值(哪一条变了就飘哪一条)。 */
+  const toastSeen = { talk: '', action: '', hit: '' };
+  let toastText = '';
+  let toastPrimed = false;
   /* 挂到 `#app`(与摇杆同一层):`position:fixed` 的镜像面板不参与画布布局。 */
   a11y.mount(root);
   /** 第一份权威数据(或单机)是不是已经到了 —— 隐藏"加载中"的唯一判据。 */
@@ -601,7 +637,7 @@ function main(): void {
    * 面板容器也算)加上触摸条自己的命中(`hitTouchBar`) ⇒ 与事件注册顺序无关。
    */
   function pointerConsumedByUi(x: number, y: number): boolean {
-    return touchBar.hitAt(x, y) !== null || handle.uiHitAt(x, y);
+    return touchBar.hitAt(x, y) !== null || handle.uiHitAt(x, y) || gameHud.hitAt(x, y);
   }
 
   /**
@@ -740,6 +776,34 @@ function main(): void {
       statusEl.textContent = lines.join('\n');
       statusEl.classList.toggle('bad', st !== 'live');
     }
+    /* ── 玩家 HUD:血条 / 目标 / 情境提示 / 飘字(全部取自上面同一批读数)── */
+    {
+      const meState = playerId === null
+        ? undefined
+        : handle.store.state.players.find((p) => p.id === playerId);
+      const cur = { talk: lastNpcTalk, action: actionEntry.status, hit: lastHit };
+      if (!toastPrimed) {
+        toastPrimed = true;                       /* 开局那几句占位文案不飘 */
+      } else if (cur.talk !== toastSeen.talk) toastText = cur.talk;
+      else if (cur.action !== toastSeen.action) toastText = cur.action;
+      else if (cur.hit !== toastSeen.hit) toastText = cur.hit;
+      toastSeen.talk = cur.talk; toastSeen.action = cur.action; toastSeen.hit = cur.hit;
+      const npcNear = nearbyNpc(npcList, pos.x, pos.y);
+      gameHud.update({
+        me: meState === undefined ? null : {
+          /* 没起过名的玩家,服务端拿 userId 当名字;那串字符不该上血条。 */
+          name: meState.name === '' || meState.name === meState.id ? '旅人' : meState.name,
+          level: meState.level, hp: meState.hp, maxHp: meState.maxHp,
+        },
+        target: near === null || near.d > TARGET_SHOW_RANGE ? null : {
+          name: MOB_BY_ID.get(near.mobId)?.name ?? near.mobId, hp: near.hp, maxHp: near.maxHp,
+        },
+        prompt: npcNear === null ? '' : `按 ${NPC_TALK_KEY.toUpperCase()} 与「${npcNear.name}」说话`,
+        toast: toastText,
+        online: st === 'live',
+        offlineText: session === null ? '单机模式' : '连接中…',
+      }, nowMs());
+    }
     /* ★ WS-FND-167:a11y —— 同一份文本按面板归档(读屏器 / Tab 到 `#a11y_panels` 时念)。
        `panel` 那块给的是"当前面板 + 站在哪",`hint` 那块直接取 `#hint` 的文本(一处文案)。 */
     a11y.update({
@@ -756,24 +820,12 @@ function main(): void {
      ⚠️ 目标格的判定**不在**这里:它住在 `net/action_target.ts`(纯函数、有断言,
         见 `tests/WS-FND-22`)。本文件只做"读键 → 调它 → 发报文 → 显示回执"。
         ——判定留在不可测的入口里,就是本仓反复记的那种"改坏了没人知道"。 */
+  /* NPC 对话单独一条**捕获阶段**监听。
+     `T` 不在 `ACTION_KEYS` 里(它属于 `ENTRY_KEYS`)⇒ 写在下面那条监听里时,
+     会先被 `keyGuard.handles` 挡回去,对话永远发不出;同时动作入口那条监听
+     会把同一次按键当成「使用道具」。捕获阶段先于两者执行,命中后截断传播。 */
   window.addEventListener('keydown', (ev) => {
-    /* ── ★ 第七轮审计 P2:搜索态下**动作键必须让路** ──
-     *
-     * 修前这条监听不知道 `boot.ts` 有个搜索框 ⇒ 在背包搜索里打 "e":
-     * ```
-     * 查询串多一个 e(对) + 一条 BREAK_BLOCK 发出(错)
-     * ```
-     * 两条监听各自都"工作正常",所以没有任何断言会红。
-     * 判定在 `net/key_guard.ts`(纯函数、可在 node 里断言),来源是 `handle.textInputActive()`
-     * —— `boot` 的 keydown 监听比本监听先注册,同一次按键里它已经更新过 `searchMode`。 */
-    keyGuard.setTextInput(handle.textInputActive());
-    if (!keyGuard.handles(ev.key)) {
-      /* 只报"被文本输入挡掉"的那一类(非动作键本来就该静默返回,两种原因必须分开) */
-      if (keyGuard.blockedByTextInput(ev.key)) {
-        lastAction = `输入中 ⇒ ${ev.key} 不触发动作(先按 Enter 结束搜索)`;
-      }
-      return;
-    }
+    if (handle.textInputActive()) return;
     /* ═══ ★ WS-FND-188:`T` 的**一键两义**(与空格=攻击+跳跃同一形态,但这里分成两支) ═══
      *
      * ## 为什么与 `USE_ITEM` 共用 `T`
@@ -792,16 +844,30 @@ function main(): void {
      * ## 判定与文案
      * 「够不够近 / 附近是谁」在 `three/boot.ts#nearbyNpc`(纯函数,与
      * `server/src/npc/defs.ts#npcAt` 同口径);这里只做分派与一句话状态。 */
-    if (ev.key.toLowerCase() === NPC_TALK_KEY && npcList.length > 0) {
-      const center = telegraphCenterOf(handle.store.state, handle.store.localPlayerId);
-      const near = center === null ? null : nearbyNpc(npcList, center.cx, center.cy);
-      if (near !== null) {
-        ev.preventDefault();
-        /* 走**同一条**入口(`ActionEntry` 的三支分流):参数不对 / 未连接 / 发。 */
-        const out = actionEntry.npcTalk({ npcId: near.id });
-        lastAction = `与「${near.name}」说话 ${out.sent ? '→ 已发' : `✗ ${out.status}`}`;
-        return;
+    if (ev.key.toLowerCase() === NPC_TALK_KEY && talkToNearbyNpc()) {
+      ev.preventDefault();
+      /* 这一下已经归 NPC:别的监听(动作入口的 `T` = 使用道具)不该再处理它。 */
+      ev.stopImmediatePropagation();
+    }
+  }, true);
+
+  window.addEventListener('keydown', (ev) => {
+    /* ── ★ 第七轮审计 P2:搜索态下**动作键必须让路** ──
+     *
+     * 修前这条监听不知道 `boot.ts` 有个搜索框 ⇒ 在背包搜索里打 "e":
+     * ```
+     * 查询串多一个 e(对) + 一条 BREAK_BLOCK 发出(错)
+     * ```
+     * 两条监听各自都"工作正常",所以没有任何断言会红。
+     * 判定在 `net/key_guard.ts`(纯函数、可在 node 里断言),来源是 `handle.textInputActive()`
+     * —— `boot` 的 keydown 监听比本监听先注册,同一次按键里它已经更新过 `searchMode`。 */
+    keyGuard.setTextInput(handle.textInputActive());
+    if (!keyGuard.handles(ev.key)) {
+      /* 只报"被文本输入挡掉"的那一类(非动作键本来就该静默返回,两种原因必须分开) */
+      if (keyGuard.blockedByTextInput(ev.key)) {
+        lastAction = `输入中 ⇒ ${ev.key} 不触发动作(先按 Enter 结束搜索)`;
       }
+      return;
     }
     const spec = ACTION_KEYS[ev.key.toLowerCase()];
     if (spec === undefined) return;
