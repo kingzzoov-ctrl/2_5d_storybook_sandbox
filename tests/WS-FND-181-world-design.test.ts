@@ -41,6 +41,7 @@
 
 import {
   applyWorldDesign, REGIONS, DESIGN_SIZE, DESIGN_CENTER, regionAt, coastRadius,
+  REGION_BIOME, BIOME_KEYS, biomeAt,
   floorSlotOfId as sharedSlotOfId, floorIdOfSlot as sharedIdOfSlot, type DesignWriter,
 } from '../shared/world/design.ts';
 import {
@@ -83,8 +84,8 @@ const at = (x: number, y: number) => unpackTile(tiles[y * size + x]!);
 /* ─────────── 1 十一个区都真的存在 ─────────── */
 
 test('FND181-1 11 个区都盖了格(没有一个空区)', () => {
-  eq(REGIONS.length, 11, '`REGIONS` 的区数');
-  eq(rep.regions.length, 11, '报告里的区数');
+  eq(REGIONS.length, 12, '`REGIONS` 的区数');
+  eq(rep.regions.length, 12, '报告里的区数');
   for (const r of rep.regions) {
     ok(r.cells > 0, `区 ${r.id}(${r.name})格数应为正,实际 ${r.cells}`);
   }
@@ -369,4 +370,43 @@ test('FND181-15 装配层把设计图的出生原点接到房间上', () => {
   const colyseus = readFileSync(new URL('../server/src/net/room.colyseus.ts', import.meta.url), 'utf8');
   ok(colyseus.includes('spawnOrigin: undefined,'), 'B 路 rtOpts 必须显式列出同一个键');
 });
+/* ─────────── 17 群系:八大群系必须**全部**落到地图上 ─────────── */
+
+test('FND181-17 八大群系全被用到,且每个区的群系键都合法', () => {
+  /* 为什么这条重要:`spawner.ts` 里是 `BIOME_SPAWN[biome] ?? BIOME_SPAWN.MEADOW`
+     ⇒ 群系键写错**不会报错**,只是那块地按草甸刷怪。
+     而"某个群系的野生物永远不出现"在屏幕上完全看不出来(少几只怪不算异常)。 */
+  const used = new Set(Object.values(REGION_BIOME));
+  for (const key of BIOME_KEYS) {
+    ok(used.has(key), `群系 ${key} 必须至少有一个区用它,否则它的野生物永不出现`);
+  }
+  eq(REGION_BIOME.dunes, 'DESSERT', '沙丘区必须落在沙漠群系上(否则 DESSERT 没人用)');
+  for (const r of REGIONS) {
+    const b = REGION_BIOME[r.id];
+    ok(b !== undefined, `区 ${r.id} 必须有群系`);
+    ok(BIOME_KEYS.includes(b ?? ''), `区 ${r.id} 的群系 ${b} 必须在 BIOME_KEYS 里`);
+  }
+  /* 反向:群系表不许有多余的键(写错 id 的键会静默失效)。 */
+  eq(Object.keys(REGION_BIOME).length, REGIONS.length, '群系表的键数必须等于区数');
+});
+
+test('FND181-18 biomeAt 与 regionAt/REGION_BIOME 一致', () => {
+  const probes: readonly { x: number; y: number; region: string; biome: string }[] = [
+    { x: DESIGN_CENTER, y: DESIGN_CENTER, region: 'camp', biome: 'MEADOW' },
+    { x: 128, y: 64, region: 'grove', biome: 'SAKURA' },
+    { x: 64, y: 128, region: 'mine', biome: 'CAVERN' },
+    { x: 128, y: 128, region: 'ruins', biome: 'RUINS' },
+    { x: 145, y: 74, region: 'lake', biome: 'OASIS' },
+    { x: 97, y: 152, region: 'dunes', biome: 'DESSERT' },
+    { x: 80, y: 48, region: 'highland', biome: 'SKYSEA' },
+    { x: 38, y: 93, region: 'marsh', biome: 'VALLEY' },
+  ];
+  for (const p of probes) {
+    eq(regionAt(p.x, p.y), p.region, `regionAt(${p.x},${p.y})`);
+    eq(biomeAt(p.x, p.y), p.biome, `biomeAt(${p.x},${p.y})`);
+  }
+  /* 海上(不属于任何区)⇒ `null`,让调用方走自己的兜底 */
+  eq(biomeAt(2, 2), null, '开阔海面不属于任何群系');
+});
+
 report('WS-FND-181');

@@ -185,8 +185,35 @@ export const REGIONS: readonly RegionSpec[] = [
     id: 'highland', name: '高地', base: BaseFluid.ROCK, floorItemId: 0, elev: Elevation.GROUND,
     intent: '视野点:北侧抬高的岩台,爬上去能一眼看到营地与环路。',
   },
+  {
+    id: 'dunes', name: '沙丘', base: BaseFluid.GOLD_SAND, floorItemId: 0, elev: Elevation.GROUND,
+    intent: '沙漠群系:金沙丘,挖琉璃石英砂的地方,也是沙蝎的地盘。',
+  },
 ];
 
+
+// 每个区的**群系**(键 = `REGIONS[].id`)。键必须与 `server/src/mobs/spawner.ts#BIOME_SPAWN`
+// 的键**逐字**一致 —— 写错不会报错,spawner 会 `?? MEADOW` 静默兜底,症状是「全图的怪变成同一批」。
+export const REGION_BIOME: Readonly<Record<string, string>> = {
+  camp: 'MEADOW',
+  meadow: 'MEADOW',
+  grove: 'SAKURA',
+  farm: 'VALLEY',
+  mine: 'CAVERN',
+  ruins: 'RUINS',
+  lake: 'OASIS',
+  spring: 'OASIS',
+  dunes: 'DESSERT',
+  track: 'MEADOW',
+  marsh: 'VALLEY',
+  highland: 'SKYSEA',
+};
+
+// 八个群系的键(与 `BIOME_SPAWN` 逐字一致)。判据 `WS-FND-181` 断言**每个键都被用到** ——
+// 否则那个群系的野生物永远不会出现在世界上,而"少了几只怪"没人会发现。
+export const BIOME_KEYS: readonly string[] = [
+  'MEADOW', 'VALLEY', 'SAKURA', 'CAVERN', 'OASIS', 'DESSERT', 'SKYSEA', 'RUINS',
+];
 /* ═══════════════════════ 3. 写入接口(窄接口,便于单测) ═══════════════════════ */
 
 /**
@@ -421,6 +448,9 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
   for (const y of [131, 135, 139]) {
     for (let x = 80; x <= 106; x += 1) put(x, y, { base: BaseFluid.SHALLOW_WATER, elev: Elevation.GROUND });
   }
+  // 沙丘(南偏东):金沙丘。**沙漠群系**的落点 —— 不给它一块地,`DESSERT` 的野生物
+  // 就永远不会出现在世界上(24 种野生物里有几只只属于沙漠)。
+  rect('dunes', 86, 146, 108, 158, spec('dunes'));
   /* 湖(东北偏东):深蓝水面;湖心偏北一团温泉眼(青白);一条 3 格宽木栈道横跨湖面。
      ⚠️ 湖心刻意**不在中轴**上:主路沿 y=96 横穿,压在中轴上会把温泉眼整条盖掉
      (实测:温泉眼格数 49 → 被路盖成路面)。 */
@@ -558,6 +588,19 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
  * (后画的优先),所以 `regionAt(68,68)` 返回 `'meadow'`,而那一格实际铺的是
  * 星光夜路砖。要「现在是什么」就去读世界本身。
  */
+/**
+ * 世界格坐标 → **群系键**(`BIOME_SPAWN` 的键)。未落在任何区 ⇒ `null`。
+ *
+ * 调用方(刷怪)对 `null` 的处置应当是 `?? 'MEADOW'` —— 与 `spawner.ts` 既有的兜底同源。
+ * 本函数**只读设计意图**(`regionAt` + `REGION_BIOME`),不读世界:想知道"这一格现在
+ * 到底铺了什么",去读世界本身。
+ */
+export function biomeAt(x: number, y: number): string | null {
+  const id = regionAt(x, y);
+  if (id === null) return null;
+  return REGION_BIOME[id] ?? null;
+}
+
 export function regionAt(x: number, y: number): string | null {
   const r = (cx: number, cy: number, rad: number): boolean => Math.hypot(x - cx, y - cy) <= rad;
   const inRect = (x0: number, y0: number, x1: number, y1: number): boolean =>
@@ -569,6 +612,7 @@ export function regionAt(x: number, y: number): string | null {
   if (inRect(DESIGN_CENTER - 12, DESIGN_CENTER - 12, DESIGN_CENTER + 11, DESIGN_CENTER + 11)) return 'camp';
   if (r(138, 66, 4)) return 'spring';
   if (r(138, 74, 12)) return 'lake';
+  if (inRect(86, 146, 108, 158)) return 'dunes';
   if (inRect(118, 118, 138, 138)) return 'ruins';
   if (inRect(80, 128, 106, 140)) return 'farm';
   if (r(64, 128, 14)) return 'mine';
