@@ -114,7 +114,9 @@ test('FND181-2 出生点是广场中心大理石,且与地面同高(不抬高)',
 test('FND181-3 每个区的代表格与声明一致', () => {
   /* 有抬高层的区(矿丘/高地)代表格取**台下沿**(丘心是 CLIFF,`spec.elev` 说的是外环)。 */
   const probes: readonly { id: string; x: number; y: number }[] = [
-    { id: 'camp', x: 88, y: 88 },
+    /* ⚠️ 探针点避开 x=88:那一列是 `TOWN_STREET_X` 铺的鹅卵石街(w98 起),
+       营地不再整块是红砖 —— 代表格要取**没有被街压过**的砖面。 */
+    { id: 'camp', x: 86, y: 88 },
     { id: 'meadow', x: 64, y: 64 },
     { id: 'grove', x: 128, y: 64 },
     { id: 'farm', x: 100, y: 130 },

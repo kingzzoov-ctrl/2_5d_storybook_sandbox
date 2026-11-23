@@ -40,6 +40,9 @@
  */
 
 import { BaseFluid, Elevation, type TileFields } from '../types/tile.ts';
+/* ★ w98:城镇平面图(纯函数,只产出 obj 层)。判定在 `town.ts` + `WS-FND-191`(16 条),
+   这里只把它的结果**盖进世界** —— 改前这条数据没有生产调用点,世界上没有任何房子。 */
+import { planTown } from './town.ts';
 
 /* ═══════════ 地砖「槽位 ↔ 物品 id」换算(本文件自持一份)═══════════
  *
@@ -112,6 +115,13 @@ export const RING_OUTER = 40;
 
 /** 道路允许的最长跨海栈桥长度(格)。超过就不再铺 —— 免得把路画到海对面。 */
 export const PIER_MAX = 14;
+
+/**
+ * 城镇主街的**纵轴 x**(格)。与 `shared/world/town.ts#planTown` 里那条街同一条
+ * (它按 `dx = −8` 相对中心排房屋)⇒ 这里也写成相对量,别写死 88。
+ * 判据 `WS-FND-191` 会断言街轴那一列**没有立牌**(否则街心被房子堵住)。
+ */
+export const TOWN_STREET_X = DESIGN_CENTER - 8;
 
 /* ═══════════════════════ 2. 区域表(设计本体) ═══════════════════════ */
 
@@ -540,6 +550,18 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
     { x: DESIGN_CENTER + campHalf - 1, y: DESIGN_CENTER + campHalf - 1, obj: 352, why: '角柱' },
   ];
   for (const l of LANDMARKS) landmark(l.x, l.y, l.obj);
+
+  /* ── 4.6b ★ w98:**城镇**(6 座房子 + 一条街 + 市场角)──
+     数据在 `shared/world/town.ts#planTown()`(16 条判据守结构:墙圈 3×4 / 圈上恰一门 /
+     窗在门对面 / 内圈屋顶 / 与上面那 13 个地标**零交集**)。这里只做两件事:铺街、立牌。
+     ⚠️ 城镇必须盖在 `LANDMARKS` **之后** —— 反过来房子会把纪念碑/篝火压掉。 */
+  for (let y = DESIGN_CENTER - campHalf; y <= DESIGN_CENTER + campHalf - 1; y += 1) {
+    /* 街轴 x = 88(`planTown` 的 dx = −8 就是这条街);铺鹅卵石径,让它在地面上读得出是"街"。 */
+    put(TOWN_STREET_X, y, { floor: floorSlotOfId(302) });
+  }
+  for (const p of planTown({ center: { x: DESIGN_CENTER, y: DESIGN_CENTER }, half: campHalf })) {
+    landmark(p.x, p.y, p.obj);
+  }
   /* 路灯(522):沿环路与主路每 12 格一盏 —— 灯本身也「驱怪」(items.ts note),
      于是主干道从「一条路」变成「一条有灯的路」。 */
   for (let y = 1; y < size - 1; y += 1) {
