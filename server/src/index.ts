@@ -113,6 +113,8 @@ import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
 import { setTownRadiusProvider } from './mobs/spawner.ts';
+/* ★ w97:主线订阅器 —— 见下方装配处那条长注释(为什么必须有人调、以及 rebuildWorld 的缺口)。 */
+import { attachMainline } from './quests/mainline_wiring.ts';
 import { townSafeRadiusProvider } from './net/actions/modify_town.ts';
 import { RoomRuntime, type RoomRuntimeOptions, type WorldSaveHost } from './net/room.ts';
 import { AccessMode, archiveWorldSnapshot, createUser, getUser } from './db/repo.ts';
@@ -448,6 +450,14 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
   if (deps.design === true) applyWorldDesign(sim, { size: sim.sizeCells });
   sim.restoreWorldFromDb(archiveDb, roomId);
   wireHost(sim, roomId);
+
+  /* ★ w97:**主线订阅**。`world_sim` 在六个成功点(采集/合成/放置/换区/击杀/Boss)把事件发到
+     自己的 `bus` 上,这里把状态机挂上去 —— 不挂的话 `applyEvent` 永远不被调用,
+     主线会**静静停在第一步**(没有任何报错,玩家也看不出)。
+     ⚠️ 已知缺口:`WorldSim.rebuildWorld()` 会 `new EventBus()`(换代),
+     那一刻订阅会随之消失 ⇒ 重置/读档之后主线不再推进。补齐的做法是在 `rebuildWorld`
+     里重新 `attachMainline(this.bus)` —— 那需要 `world_sim` 反向持有订阅器,属下一刀。 */
+  attachMainline(sim.bus);
   return sim;
 }
 
