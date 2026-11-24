@@ -768,7 +768,12 @@ function connect(url: string, userId?: string): {
     });
     ws.addEventListener('message', ((ev: { data: unknown }) => {
       const d = ev.data;
-      if (typeof d === 'string') { got.welcome = JSON.parse(d) as Record<string, unknown>; return; }
+      if (typeof d === 'string') {
+        /* 握手后的文本帧不止欢迎帧(紧跟着还有背包帧)⇒ 只收 `t:'welcome'` 那一条。 */
+        const j = JSON.parse(d) as Record<string, unknown>;
+        if (j.t === 'welcome') got.welcome = j;
+        return;
+      }
       if (d instanceof ArrayBuffer) { got.bin.push(new Uint8Array(d)); return; }
       if (ArrayBuffer.isView(d)) {
         got.bin.push(new Uint8Array((d as ArrayBufferView).buffer,

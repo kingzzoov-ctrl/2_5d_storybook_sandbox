@@ -19,6 +19,7 @@
  *    而不是在当前快照上恰好为绿。
  * 4 **不复制实现的数**:期望值取内容表 / 冻结层常量字面量,或直接由被测函数给出。
  */
+import { carryItemCapacity } from '../server/src/combat/progression.ts';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
@@ -364,18 +365,19 @@ test('FND148-6 ★★ 其余 5 条天赋未接:台账 + 反向扫描 + 注入;�
     '★ 世界侧调用点从未传 reviveTimeMul ⇒ 急救快手在生产里恒不生效(与台账 UNWIRED 一致)');
 });
 
-test('FND148-7 ★★ carrySlots **已接**(WS-FND-152 反转):档案改到 99 ⇒ 房间容量 99;复原 ⇒ 8', () => {
+test('FND148-7 ★★ carrySlots **已接**(WS-FND-152 反转):档案改到 99 格 ⇒ 房间容量跟着变;复原 ⇒ 回到 8 格', () => {
   /* ★ 2026-11-19(owner 裁定「全接」/ WS-FND-152):本条此前钉的是「档案改成 99,
      房间容量仍是 8」—— 那条**不是**目标行为,而是「`net/room.ts#carryCapacityOf`
      内联了 `8 + (lv-1)`」这件事实的写照。容量闸现在读世界源的 `carrySlotsOf`
      (档案字段),没有世界源才回落到 `progression.carryCapacityOfLevel`(同一出处)。
      ⇒ 判据按新口径反转:**改档案必须真的改容量**(否则「接线」是空话)。 */
   const r = room({ players: ['p1'] });
-  eq(r.rt.carryCapacityOf('p1'), 8, '前置:lv1 无档案 ⇒ 容量闸 = 8(等级派生)');
+  /* 容量按**总件数**判:负重格 × `ITEMS_PER_CARRY_SLOT`(Lv.1 = 8 格)。 */
+  eq(r.rt.carryCapacityOf('p1'), carryItemCapacity(8), '前置:lv1 无档案 ⇒ 容量闸 = 8 格(等级派生)');
   r.sim.progressOf('p1').carrySlots = 99;
-  eq(r.rt.carryCapacityOf('p1'), 99, '★ 档案 carrySlots=99 ⇒ 容量闸 99(该字段**有**读者)');
+  eq(r.rt.carryCapacityOf('p1'), carryItemCapacity(99), '★ 档案 carrySlots=99 ⇒ 容量闸 99 格(该字段**有**读者)');
   r.sim.progressOf('p1').carrySlots = 8;
-  eq(r.rt.carryCapacityOf('p1'), 8, '★ 复原(负对照):容量跟着回到 8,不是只读一次的快照');
+  eq(r.rt.carryCapacityOf('p1'), carryItemCapacity(8), '★ 复原(负对照):容量跟着回到 8 格,不是只读一次的快照');
   const row = PROGRESS_FIELD_WIRING.find((x) => x.field === 'carrySlots');
   eq(row?.status, 'WIRED', '台账把 carrySlots 记为 WIRED(与上面的行为一致)');
   ok(String(SOURCES.get('server/src/net/room.ts')).includes('carryCapacityOf('),

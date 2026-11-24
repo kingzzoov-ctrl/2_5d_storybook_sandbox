@@ -160,10 +160,14 @@ function makeRoom(where: RoomKind, asGuest = false): Fixture {
 
 /** 塞东西进背包 —— 走**生产同一条路**:先 `grantItemSource` 再 `applyInventory`。 */
 function seed(fx: Fixture, itemId: number, n: number): void {
-  const src = `seed:${fx.actor}:${itemId}:${n}`;
-  fx.rt.grantItemSource(fx.actor, src);
-  const r = fx.rt.applyInventory(fx.actor, { ops: [{ itemId, delta: n, source: src }] });
-  ok(r.allowed, `前置:应能塞进 ${n} 件 ${itemId}(被拒说明容量/守恒层先坏了)`);
+  /* 单帧净变化有上限(`MAX_ITEM_DELTA_PER_TICK`)⇒ 分批塞,每批一张新凭证。 */
+  for (let left = n, i = 0; left > 0; left -= 40, i += 1) {
+    const part = Math.min(40, left);
+    const src = `seed:${fx.actor}:${itemId}:${n}:${i}`;
+    fx.rt.grantItemSource(fx.actor, src);
+    const r = fx.rt.applyInventory(fx.actor, { ops: [{ itemId, delta: part, source: src }] });
+    ok(r.allowed, `前置:应能塞进 ${part} 件 ${itemId}(被拒说明容量/守恒层先坏了)`);
+  }
 }
 
 /**
@@ -283,15 +287,16 @@ test('FND31-3 材料不够 ⇒ INVALID,一个材料都不扣(不出现"扣了一
 
 test('FND31-4 产物收不下 ⇒ 材料**退回**,东西不被吞', () => {
   const fx = makeRoom('LAB');
-  /* 一级容量 = 8(见 `RoomRuntime.carryCapacityOf`);塞满到 8,
-     再炼一个 output=3 的产物:7 + 3 = 10 > 8 ⇒ 必然溢出。 */
-  seed(fx, SAND, 8);
-  eq(totalOf(fx), 8, '前置:背包正好到容量上界');
+  /* 容量取自 `RoomRuntime.carryCapacityOf`;塞满到上界,
+     再炼一个 output=3 的产物:(cap-1) + 3 > cap ⇒ 必然溢出。 */
+  const cap = fx.rt.carryCapacityOf(fx.actor);
+  seed(fx, SAND, cap);
+  eq(totalOf(fx), cap, '前置:背包正好到容量上界');
   const calls = spyInventory(fx);
 
   const made = outputOf(BOTTLE);
   ok(made >= 2, '前提:本用例挑的产物必须一次出多件,否则溢不出来');
-  const r = disp(fx, { itemId: BOTTLE, have: { [SAND]: 8 } });
+  const r = disp(fx, { itemId: BOTTLE, have: { [SAND]: cap } });
   eq(r.ok, false, '收不下时不能报成功');
   eq(r.kind, 'INVALID', '★ 应是 INVALID');
   ok(typeof r.reason === 'string' && r.reason.includes('退回'),
@@ -309,7 +314,7 @@ test('FND31-4 产物收不下 ⇒ 材料**退回**,东西不被吞', () => {
     '退回是正 delta ⇒ 同样必须带凭证');
 
   /* 最关键的一条:总量回到原值。 */
-  eq(totalOf(fx), 8, '★ 材料退回来了("扣了东西却没给出产物"会在这里露出来)');
+  eq(totalOf(fx), cap, '★ 材料退回来了("扣了东西却没给出产物"会在这里露出来)');
   eq(deltaOf(calls[1], BOTTLE), made, '产物那一批确实是 +产物(只是被拒了)');
 });
 

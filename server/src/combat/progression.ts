@@ -483,6 +483,19 @@ function recompute(p: PlayerProgress): PlayerProgress {
  * 两份数今天恰好相等,所以**没有一条判据能看出它们已经分开**。
  * ⇒ 算式只留在这里,房间侧改调本函数(判据:`tests/WS-FND-152`)。
  */
+/**
+ * 一个负重格装几件。背包容量闸按**总件数**判,口径 = 负重格 × 本常量。
+ *
+ * 负重格数(Lv.1 = 8,每级 +1)来自冻结层;一格只算一件时,新玩家带着起始包
+ * 只剩 1 件余量,采集、合成、交任务(一次要 8~10 件)全都走不通。
+ */
+export const ITEMS_PER_CARRY_SLOT = 20;
+
+/** 负重格数 → 背包能装的总件数。 */
+export function carryItemCapacity(slots: number): number {
+  return Math.max(0, Math.trunc(slots)) * ITEMS_PER_CARRY_SLOT;
+}
+
 export function carryCapacityOfLevel(level: number): number {
   const lv = Number.isFinite(level)
     ? Math.max(1, Math.min(MAX_LEVEL, Math.trunc(level)))

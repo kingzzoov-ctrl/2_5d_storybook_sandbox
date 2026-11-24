@@ -32,6 +32,7 @@
  *
  * 运行:`node tests/WS-FND-129-inventory-integrity.test.ts`
  */
+import { carryItemCapacity, ITEMS_PER_CARRY_SLOT } from '../server/src/combat/progression.ts';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -186,15 +187,17 @@ test('FND129-1 ★★ db 模式:连发 20 次 +1 会**累到容量上限**(修�
 
   let allowed = 0;
   const codes: (string | undefined)[] = [];
-  for (let i = 0; i < 20; i += 1) {
+  const cap = rt.carryCapacityOf('p1');
+  for (let i = 0; i < cap + 12; i += 1) {
     const r = tryProduce(rt, 'p1', LOG);
     if (r.allowed) allowed += 1;
     else codes.push(r.rejectCode);
   }
 
-  eq(allowed, 8, '★ 只有前 8 件进得来(Lv1 容量 8 + (1-1))——修前基准恒 0 ⇒ 20 件**全部**放行');
-  eq(codes[0], InventoryReject.OVERFLOW, '★ 第 9 次起按 OVERFLOW 拒(不是 BURST/别的抢先)');
-  eq(rt.authoritativeItemTotal('p1'), 8, '★ 权威总量停在容量上限(修前会是 20)');
+  eq(cap, carryItemCapacity(8), '前提:Lv1 = 8 个负重格');
+  eq(allowed, cap, '★ 只有前 cap 件进得来 —— 修前基准恒 0 ⇒ 多出来的 12 件也**全部**放行');
+  eq(codes[0], InventoryReject.OVERFLOW, '★ 超出的第一次起按 OVERFLOW 拒(不是 BURST/别的抢先)');
+  eq(rt.authoritativeItemTotal('p1'), cap, '★ 权威总量停在容量上限(修前会是 cap + 12)');
   eq(totalItemsOf(db, 'p1'), 0, 'db 侧仍没有行 ⇒ 修的是**基准来源**,不是「偷偷写库」');
 });
 
@@ -220,21 +223,22 @@ test('FND129-2 ★★ 注入验证:db 里**已落盘**的件数真的占容量(�
   const withDb = makeRoom({ db });
   eq(withDb.rt.authoritativeItemTotal('p1'), 5, '★ 基准 = 已落盘 5 + 本房间账 0');
 
+  const cap = withDb.rt.carryCapacityOf('p1');
   let allowedWithDb = 0;
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < cap; i += 1) {
     if (tryProduce(withDb.rt, 'p1', LOG).allowed) allowedWithDb += 1;
   }
-  eq(allowedWithDb, 3, '★ 库里的 5 件占着容量 ⇒ 只塞得进 3 件(5+3=8)');
-  eq(withDb.rt.authoritativeItemTotal('p1'), 8, '两账同源:总量 = 库 5 + 房 3');
+  eq(allowedWithDb, cap - 5, '★ 库里的 5 件占着容量 ⇒ 只塞得进 cap-5 件');
+  eq(withDb.rt.authoritativeItemTotal('p1'), cap, '两账同源:总量 = 库 5 + 房 (cap-5)');
 
   /* 负对照:同一个世界、同一批 ops,库里**没有**那 5 件 ⇒ 8 件全进得来。
      若上面那 3 件不是「库里 5 件」造成的,这一条会与它相同。 */
   const noDb = makeRoom();
   let allowedNoDb = 0;
-  for (let i = 0; i < 8; i += 1) {
+  for (let i = 0; i < cap; i += 1) {
     if (tryProduce(noDb.rt, 'p1', LOG).allowed) allowedNoDb += 1;
   }
-  eq(allowedNoDb, 8, '负对照:没有已落盘基线 ⇒ 满 8 件才停');
+  eq(allowedNoDb, cap, '负对照:没有已落盘基线 ⇒ cap 件全进得来');
 });
 
 test('FND129-3 ★★ 坏 quantity 行(NaN)不得让容量闸失效(比较对 NaN 恒 false)', () => {
@@ -442,36 +446,37 @@ test('FND129-12 ★ 接线判据:`registerChest` 有**生产调用点**(修前�
 test('FND129-13 ★★ 存到件数上界后拒,且那 1 件**不被吞**;取出方向不判上界', () => {
   /* 怎么变红:删掉 `inChest + count > CHEST_MAX_ITEMS` 那一段 ⇒ 第 5/6 行红。 */
   eq(CHEST_SLOTS, 24, '档数上界:内容层 513 的「24 格存储空间」');
-  eq(CHEST_MAX_ITEMS, 192, '★ 件数上界 = 24 档 × 8(Lv1 背包容量 8 + (1-1))');
+  eq(CHEST_MAX_ITEMS, 24 * ITEMS_PER_CARRY_SLOT, '★ 件数上界 = 24 档 × 每格件数(一档与背包一格装得一样多)');
 
   const { rt, sim, roomId } = makeRoom();
   sim.setCell(CX, CY, { obj: STORAGE_CHEST });
 
-  /* 背包容量 8 ⇒ 每轮「塞 8 存 8」,24 轮把箱子填到 191。 */
+  /* 每轮「塞 n 存 n」(n ≤ 40:单帧净变化有上限),把箱子填到上界差 1 件。 */
+  const MAX = CHEST_MAX_ITEMS;
   let stored = 0;
-  while (stored < 191) {
-    const n = Math.min(8, 191 - stored);
+  while (stored < MAX - 1) {
+    const n = Math.min(40, MAX - 1 - stored);
     seed(rt, 'p1', LOG, n);
     const r = chestAct(rt, RoomAction.OPEN_CHEST, LOG, n);
     ok(r.ok, `前置:存 ${n} 件应成功(kind=${r.kind} reason=${r.reason ?? '-'})`);
     stored += n;
   }
-  eq(chestTotal(roomId), 191, '前提:箱里 191 件');
+  eq(chestTotal(roomId), MAX - 1, '前提:箱里差 1 件到上界');
 
   seed(rt, 'p1', LOG, 1);
-  eq(chestAct(rt, RoomAction.OPEN_CHEST, LOG, 1).ok, true, '边界值 192 **本身合法**(≤ 上界)');
-  eq(chestTotal(roomId), 192, '箱里 192 件');
+  eq(chestAct(rt, RoomAction.OPEN_CHEST, LOG, 1).ok, true, '边界值**本身合法**(≤ 上界)');
+  eq(chestTotal(roomId), MAX, '箱里正好到上界');
 
   seed(rt, 'p1', LOG, 1);
   const over = chestAct(rt, RoomAction.OPEN_CHEST, LOG, 1);
-  eq(over.ok, false, '★ 192 + 1 > 上界 ⇒ 拒(修前同一 itemId 可无限堆)');
+  eq(over.ok, false, '★ 上界 + 1 ⇒ 拒(修前同一 itemId 可无限堆)');
   eq(over.kind, 'INVALID', '归因 INVALID');
-  eq(chestTotal(roomId), 192, '★ 容器没变');
+  eq(chestTotal(roomId), MAX, '★ 容器没变');
   eq(rt.authoritativeItemCount('p1', LOG), 1, '★ 那 1 件**没被吞**(判在扣背包之前 ⇒ 零副作用)');
 
   const take = chestAct(rt, RoomAction.OPEN_CHEST, LOG, -1);
   eq(take.ok, true, '负对照:取出方向**不**判件数上界(满了仍取得出来)');
-  eq(chestTotal(roomId), 191, '取走后 191');
+  eq(chestTotal(roomId), MAX - 1, '取走后差 1 件到上界');
 });
 
 test('FND129-14 ★ 负对照:档数上界与件数上界**正交**(同一 itemId 不占新档)', () => {

@@ -52,7 +52,7 @@ import {
   nextComboState,
 } from '../server/src/combat/damage.ts';
 import { applyForgeTierBonus, forgeTierBonusOf } from '../server/src/combat/weapons.ts';
-import { carryCapacityOfLevel, PROGRESS_FIELD_WIRING } from '../server/src/combat/progression.ts';
+import { carryCapacityOfLevel, carryItemCapacity, PROGRESS_FIELD_WIRING } from '../server/src/combat/progression.ts';
 import {
   COMBAT_WIRING_LEDGER,
   WIRING_STATUS,
@@ -359,11 +359,11 @@ test('FND152-10 ★ 容量闸读档案:carrySlots 改到 99 ⇒ 房间容量 99;
   rt.join({ userId: 'p1' });
   const sim = a.host as unknown as WorldSim;
 
-  eq(rt.carryCapacityOf('p1'), 8, '★ 无档案 ⇒ 等级 1 的容量 8(等级派生的同一口径)');
+  eq(rt.carryCapacityOf('p1'), carryItemCapacity(8), '★ 无档案 ⇒ 等级 1 的容量 8 格(等级派生的同一口径)');
   sim.progressOf('p1').carrySlots = 99;
-  eq(rt.carryCapacityOf('p1'), 99, '★ 改档案 ⇒ 容量真的变(修前恒 8)');
+  eq(rt.carryCapacityOf('p1'), carryItemCapacity(99), '★ 改档案 ⇒ 容量真的变(修前恒 8 格)');
   sim.progressOf('p1').carrySlots = 8;
-  eq(rt.carryCapacityOf('p1'), 8, '复原 ⇒ 回到 8');
+  eq(rt.carryCapacityOf('p1'), carryItemCapacity(8), '复原 ⇒ 回到 8 格');
 
   /* 等级派生与冻结层同源:Lv.30 ⇒ 8 + 29 = 37。 */
   eq(carryCapacityOfLevel(30), 37, '★ carryCapacityOfLevel(30) = 37(与 statsAtLevel 同源)');

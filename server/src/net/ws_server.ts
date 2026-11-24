@@ -591,6 +591,8 @@ export type WsConn = {
    * 握手时清空(`{}`)= 全量重发,那正是重连该有的语义。
    */
   terrainKnown: Record<string, number>;
+  /** 上次下发的背包指纹(内容没变就不重发);握手时为空串 ⇒ 首次必发。 */
+  inventorySig: string;
   /**
    * ★ WS-FND-182:**待发的地形帧队列**(本轮没发完的)。
    *
@@ -779,6 +781,8 @@ export type WsRoomLike = {
   readonly id: string;
   step(prevSnapshot: unknown): Uint8Array;
   snapshotFor(userId: string): Uint8Array;
+  /** 某玩家的背包明细与容量(可选)—— 见 `RoomRuntime.inventoryOf`;缺它就不下发背包。 */
+  inventoryOf?(userId: string): { items: Record<number, number>; capacity: number } | null;
   /** 入场首帧(整房全量,可选)—— 见 `RoomRuntime.joinSnapshotFor`;缺它退回 `snapshotFor`。 */
   joinSnapshotFor?(userId: string): Uint8Array;
   /**
@@ -1528,6 +1532,30 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     return sent;
   };
 
+  /**
+   * 背包下发:内容与上次不同才发一帧 `{t:'inventory', items, capacity}`。
+   *
+   * 背包会在动作之外变(击杀掉落、任务奖励、起始包)⇒ 除了握手与动作回执之后各推一次,
+   * 广播循环还按地形那条节拍兜底比对一次。比对用整份 JSON 当指纹:一个人最多几十种物品。
+   */
+  const pushInventory = (c: WsConn): boolean => {
+    const read = opts.room.inventoryOf;
+    if (typeof read !== 'function' || c.userId === null) return false;
+    let inv: { items: Record<number, number>; capacity: number } | null;
+    try {
+      inv = read.call(opts.room, c.userId);
+    } catch (e) {
+      log('action', `inventoryOf 抛错(本次不下发背包):${(e as Error).message}`);
+      return false;
+    }
+    if (inv === null) return false;
+    const sig = JSON.stringify(inv);
+    if (sig === c.inventorySig) return false;
+    c.inventorySig = sig;
+    sendJson(c, { t: 'inventory', items: inv.items, capacity: inv.capacity });
+    return true;
+  };
+
   /* ══════════ ★ WS-FND-188:NPC 表的**一次性**下发 ══════════
    *
    * ## 时机:握手成功那一刻,恰好一次
@@ -1611,7 +1639,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
       /* ★ WS-FND-161:握手成功才进广播集(`onHello` 置 true);背压计数从 0 起。 */
       /* ★ WS-FND-161:握手成功才进广播集(`onHello` 置 true);背压计数从 0 起。
          ★ WS-FND-182:地形基线与待发队列也从空起 ⇒ 握手后是**全量**地形。 */
-      inRoom: false, writeStalls: 0, terrainKnown: {}, terrainPending: [],
+      inRoom: false, writeStalls: 0, terrainKnown: {}, terrainPending: [], inventorySig: '',
     };
     conns.add(conn);
     log('conn', `upgrade ok,conns=${conns.size}${conn.urlUserId ? `,urlUserId=${conn.urlUserId}` : ''}`);
@@ -1956,6 +1984,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
        顺序上它是最后一步:在此之前客户端还没有 `playerId`(welcome)、
        也没有世界(首帧快照)—— 静态数据早到只能等着,而顺序错时**没有任何东西会红**。 */
     pushNpcFrame(c);
+    pushInventory(c);
   }
 
 /**
@@ -2072,6 +2101,7 @@ function onAction(c: WsConn, msg: { action?: unknown }): void {
   /* 回执里带 `action`:一个连接可能连着发多个动作,回执必须能对上号
      (否则客户端"我发的是哪个"只能靠猜)。 */
   sendJson(c, { t: 'actionResult', action, ...(out as Record<string, unknown>) });
+  pushInventory(c);
   try {
     opts.onActionDone?.({
       userId: c.userId, action, payload: msg as Record<string, unknown>,
@@ -2202,6 +2232,7 @@ function onMove(c: WsConn, msg: {
       for (const c of conns) {
         if (!isBroadcastTarget(c)) continue;
         pushTerrain(c, TERRAIN_FRAMES_PER_WINDOW);
+        pushInventory(c);
       }
     }
     /* ★★★ 基准快照**无条件**更新 —— 这一行是引导期的关键。

@@ -60,6 +60,7 @@
  *   两条都 `INVALID`,但把距离放在前面 ⇒ 「不是箱子」这条事实不会**先**泄露给
  *   站得老远的调用方(`OPEN_CHEST` 的只读回执会报箱内档数)。
  */
+import { ITEMS_PER_CARRY_SLOT } from '../../combat/progression.ts';
 import { ITEM_LIST } from '../../../../shared/constants/items.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import { bindItemSource, missingItemReadPort, ownedItemCount, unbindItemSource } from './item_source.ts';
@@ -107,13 +108,14 @@ export const CHEST_SLOTS = 24;
  * 可以一直往里堆(实测:24 档 × 每档 N 件,**无上界**),箱子于是变成一件
  * 「不会满的仓库」—— 与「容器有容量」这句话相抵。
  *
- * 取值 = `CHEST_SLOTS × 8`(= 192),8 是 **Lv1 背包容量**
+ * 取值 = `CHEST_SLOTS × ITEMS_PER_CARRY_SLOT`(一档与背包一格装得一样多;下面这句是改前的口径)
+ * 旧值 = `CHEST_SLOTS × 8`(= 192),8 是 **Lv1 背包容量**
  * (`carrySlots = 8 + (level-1)`,见 `net/room.ts:carryCapacityOf` 与
  * `combat/progression.ts:statsAtLevel`)—— 口径是「一格箱子至多装下
  * **一个新手背包**的量」。与 `CHEST_REACH` 同一处境:仓库里**没有**现成的
  * 「容器件数上界」,本常量就是那条裁决的落点;将来若内容层给出出处,改这一个数即可。
  */
-export const CHEST_MAX_ITEMS = CHEST_SLOTS * 8;
+export const CHEST_MAX_ITEMS = CHEST_SLOTS * ITEMS_PER_CARRY_SLOT;
 
 /**
  * 箱子**交互半径**(格)。

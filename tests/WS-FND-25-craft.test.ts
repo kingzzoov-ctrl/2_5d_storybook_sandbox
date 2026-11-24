@@ -76,10 +76,14 @@ function makeRoom(asGuest = false): Room {
  * 不走后门(不直接改总量):那样测出来的闭环是假的。
  */
 function seed(rt: Room['rt'], itemId: number, n: number): void {
-  const src = `seed:${itemId}:${n}`;
-  rt.grantItemSource('p1', src);
-  const r = rt.applyInventory('p1', { ops: [{ itemId, delta: n, source: src }] });
-  ok(r.allowed, `测试前置:应能塞进 ${n} 件 ${itemId}(被拒说明容量/守恒层先坏了)`);
+  /* 单帧净变化有上限(`MAX_ITEM_DELTA_PER_TICK`)⇒ 分批塞,每批一张新凭证。 */
+  for (let left = n, i = 0; left > 0; left -= 40, i += 1) {
+    const part = Math.min(40, left);
+    const src = `seed:${itemId}:${n}:${i}`;
+    rt.grantItemSource('p1', src);
+    const r = rt.applyInventory('p1', { ops: [{ itemId, delta: part, source: src }] });
+    ok(r.allowed, `测试前置:应能塞进 ${part} 件 ${itemId}(被拒说明容量/守恒层先坏了)`);
+  }
 }
 
 /** 权威总量(房间的方法,不是 host —— `host` 没有这个读数)。 */

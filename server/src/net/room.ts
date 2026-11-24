@@ -104,7 +104,7 @@ import { PARTY_MODES } from '../../../shared/constants/bosses.ts';
 /* ★ WS-FND-152:背包容量槽数的**唯一出处**(与冻结层 `statsAtLevel` 同源)。
    修前本文件内联 `8 + (lv-1)` —— 那是同一条规则的第二份实现,改冻结层/改档案都不会
    让容量动一位,而两份数恰好相等 ⇒ 没有判据看得出它们已经分开。 */
-import { carryCapacityOfLevel } from '../combat/progression.ts';
+import { carryCapacityOfLevel, carryItemCapacity } from '../combat/progression.ts';
 /* ★ WS-FND-163(A3):快照的**范围裁剪**半径 = 既有 AOI 唤醒半径(32 格,
    `server/src/mobs/aoi.ts`)。不新造一个数:同一个「多远算近」的语义在
    攻击结算(`OUT_OF_AOI`)与生物唤醒上都用它,再造一份就是第二份口径。
@@ -4866,10 +4866,21 @@ export class RoomRuntime {
   carryCapacityOf(userId: string): number {
     const fromWorld = this.worldSaveHost?.carrySlotsOf?.(userId) ?? null;
     if (fromWorld !== null && Number.isFinite(fromWorld) && fromWorld > 0) {
-      return Math.trunc(fromWorld);
+      return carryItemCapacity(fromWorld);
     }
     const lv = this.state.players.find((p) => p.id === userId)?.level ?? 1;
-    return carryCapacityOfLevel(lv);
+    return carryItemCapacity(carryCapacityOfLevel(lv));
+  }
+
+  /**
+   * 某个玩家的背包明细(物品 id → 件数)与容量,给运输层下发用。
+   * 不在成员表里 ⇒ `null`(不给外人看别人的包)。
+   */
+  inventoryOf(userId: string): { items: Record<number, number>; capacity: number } | null {
+    if (!this.members.has(userId)) return null;
+    const items: Record<number, number> = {};
+    for (const id of this.authoritativeItemIds(userId)) items[id] = this.authoritativeItemCount(userId, id);
+    return { items, capacity: this.carryCapacityOf(userId) };
   }
 
   /** 本地总量记账(仅 `db === null` 时参与计算;有库时以库为准)。 */

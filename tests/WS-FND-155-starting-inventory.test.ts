@@ -38,6 +38,7 @@
  *
  * 运行:`node tests/WS-FND-155-starting-inventory.test.ts`
  */
+import { carryItemCapacity, ITEMS_PER_CARRY_SLOT } from '../server/src/combat/progression.ts';
 import { test, ok, eq, report } from '../shared/testing/harness.ts';
 import { assemble } from '../server/src/index.ts';
 import { RoomAction } from '../server/src/net/room.ts';
@@ -227,15 +228,21 @@ test('FND155-5 ★★ 容量不足 ⇒ 按优先级截断,回执逐条如实,发
   /* 变红条件:不算容量 / 超了就整项丢 / 截断不写回执 ⇒ 断言 3、6、7 之一红。
      容量走**生产读口**(档案 carrySlots ⇒ `carryCapacityOf`),不注入假值。 */
   const f = makeRoom();
-  f.sim.progressOf('u_a').carrySlots = 3;      /* 只装得下 3 件 */
+  f.sim.progressOf('u_a').carrySlots = 3;      /* 3 个负重格 */
   f.rt.join({ userId: 'u_a' });
 
-  const rep = lastReport(f.rt);
-  eq(rep.capacity, 3, '★ 容量取**实得**档案值(3),不是内联的 8');
-  eq(rep.verdict, 'GRANTED', '★ 截断之后照发(不是「装不下就整包不发」)');
+  const live = lastReport(f.rt);
+  eq(live.capacity, carryItemCapacity(3), '★ 容量取**实得**档案值(3 格 × 每格件数),不是内联的 8 格');
+  eq(live.verdict, 'GRANTED', '★ 照发');
+  ok(live.total <= live.capacity, '★★ 发出去的件数 ≤ 容量(与容量闸一致)');
+  eq(f.rt.authoritativeItemTotal('u_a'), live.total, '★★ 回执与账一致');
+
+  /* 截断规则本身:一格装 20 件之后,生产读口给不出「装不下 7 件」的容量
+     (最小是 1 格 = 20 件)⇒ 截断钉在同一个计划函数上(`join` 调的就是它)。 */
+  const rep = planStartingInventory(3);
+  eq(rep.ok, true, '★ 截断之后照发(不是「装不下就整包不发」)');
   eq(rep.total, 3, '★ 只发 3 件');
-  ok(rep.total <= rep.capacity, '★★ 发出去的件数 ≤ 容量(与容量闸一致)');
-  eq(f.rt.authoritativeItemTotal('u_a'), 3, '★★ 账里就是 3 件 —— 回执与账一致');
+  ok(rep.total <= rep.capacity, '★★ 计划件数 ≤ 容量');
   eq(asPairs(rep.granted), ['101x2', '106x1'], '★★ 按**优先级(表序)**截断:先保表头,末项只发一半');
   eq(asPairs(rep.truncated), ['106x1', '118x2', '201x1'], '★★ 丢掉的逐条如实列出(不静默)');
   const grantSum = rep.granted.reduce((n, e) => n + e.count, 0);

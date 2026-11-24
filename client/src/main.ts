@@ -256,6 +256,10 @@ function main(): void {
    * 于是 `craftRequest` 必判"需要 have"⇒ 按 N 永远发不出去(死键)。
    */
   let haveDetail: HaveDetail = {};
+  /** 服务端下发的背包(按物品 id 升序)、总件数容量、以及「明细是否已由服务端接管」。 */
+  let bag: { id: number; count: number }[] = [];
+  let bagCapacity = 0;
+  let bagFromServer = false;
   /**
    * ★ 第七轮审计 P2:动作键守卫(搜索框里打字时让路)。
    * 每次按键前用 `handle.textInputActive()` 同步一次 —— 那一头是 `boot.ts` 的 `searchMode`。
@@ -483,17 +487,31 @@ function main(): void {
              翻出**带动作名**的一句话。四条失败分类在那里是**四句不同的话**,
              而 `action_target.ts` 的键位表里没有这五个动作(它只管建造/拆/丢/捡)
              ⇒ 少这一路,被拒就又是"按了没反应"。 */
+        /* 背包以服务端为准:收到明细后,手持物品由玩家在快捷栏上选,
+           选中的那件没了才自动换成包里第一件。 */
+        onInventory: (inv) => {
+          bag = Object.entries(inv.items)
+            .map(([k, v]) => ({ id: Number(k), count: v }))
+            .filter((b) => Number.isInteger(b.id) && b.id > 0 && b.count > 0)
+            .sort((a, b) => a.id - b.id);
+          bagCapacity = inv.capacity;
+          bagFromServer = true;
+          haveDetail = Object.fromEntries(bag.map((b) => [String(b.id), b.count]));
+          if (!bag.some((b) => b.id === lastItemId)) lastItemId = bag[0]?.id ?? 0;
+        },
         onActionResult: (r) => {
           lastAction = describeActionResult(r);
           actionEntry.onActionResult(r);
           const e = r.effect;
-          if (e !== undefined) {
+          if (e !== undefined && !bagFromServer) {
             const id = e.objId ?? e.itemId;
             if (typeof id === 'number' && Number.isFinite(id)) lastItemId = id;
           }
           /* ★ 第七轮审计 P2:回执里的**增量**落进明细账本 —— `CRAFT` 的 `have` 就是它。
              被拒的回执(`ok === false`)不落账:它没有改动背包(见 `have_ledger.ts`)。 */
-          haveDetail = applyReceiptToHave(haveDetail, { action: r.action, ok: r.ok, effect: r.effect });
+          if (!bagFromServer) {
+            haveDetail = applyReceiptToHave(haveDetail, { action: r.action, ok: r.ok, effect: r.effect });
+          }
           /* ── ★ WS-FND-188:`NPC_TALK` 的台词回来 ⇒ 显示在 HUD 一行 ──
            *
            * 台词**不是**客户端拼的文案,而是服务端按任务状态选的(`dialogue.talk`);
@@ -554,7 +572,10 @@ function main(): void {
     lastAction = `与「${near.name}」说话 ${out.sent ? '→ 已发' : `✗ ${out.status}`}`;
     return true;
   };
-  gameHud.mount(root, () => { talkToNearbyNpc(); });
+  gameHud.mount(root, {
+    onPrompt: () => { talkToNearbyNpc(); },
+    onSelectItem: (id) => { lastItemId = id; },
+  });
   const setDebugHud = (on: boolean): void => {
     document.body.classList.toggle('debug', on);
     (globalThis as { __debugHud?: boolean }).__debugHud = on;
@@ -800,6 +821,7 @@ function main(): void {
         },
         prompt: npcNear === null ? '' : `按 ${NPC_TALK_KEY.toUpperCase()} 与「${npcNear.name}」说话`,
         toast: toastText,
+        bag, bagCapacity, heldItemId: lastItemId,
         online: st === 'live',
         offlineText: session === null ? '单机模式' : '连接中…',
       }, nowMs());

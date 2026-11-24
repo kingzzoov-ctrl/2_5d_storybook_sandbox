@@ -157,7 +157,14 @@ export function describeReject(r: RejectFrame): string {
 }
 
 /** 下行**文本**报文的三种形态 —— `t` 是判别式(修前只认前两种)。 */
-type DownlinkText = WelcomeFrame | ActionResultFrame | RejectFrame;
+type DownlinkText = WelcomeFrame | ActionResultFrame | RejectFrame | InventoryFrame;
+
+/** 背包下行(服务端 `t:'inventory'`):物品 id → 件数,加总件数容量。内容变了才会发。 */
+export interface InventoryFrame {
+  t: 'inventory';
+  items: Record<string, number>;
+  capacity: number;
+}
 
 export type SessionState = 'idle' | 'connecting' | 'live' | 'closed' | 'failed';
 
@@ -226,6 +233,8 @@ export interface SessionEvents {
    *   而那正是本仓反复记的静默形态。
    */
   onActionResult?: (r: ActionResultFrame) => void;
+  /** 背包明细到了(进场一次,之后每次变化一次)。 */
+  onInventory?: (inv: InventoryFrame) => void;
   /**
    * ★ WS-FND-134(P1):服务端**拒绝报文**到了(`{t:'reject', code?, reason?}`)。
    *
@@ -1008,6 +1017,8 @@ export function createSession(opts: SessionOptions): SessionHandle {
                ⚠️ 这里**只**加动作回执,不加 `attackResult`:攻击的反馈走
                   快照里那只怪的血量下降(见 `main.ts` 的 HUD 注释)—— 一条真值来源。 */
             opts.events.onActionResult?.(w);
+          } else if (w.t === 'inventory') {
+            opts.events.onInventory?.(w);
           } else if (w.t === 'reject') {
             /* ★ WS-FND-134(P1):**服务端拒绝报文**。三处同时暴露(状态 / 字段 /
                回调)—— 任一处单独存在时,"为什么被拒"都可能在现场丢失

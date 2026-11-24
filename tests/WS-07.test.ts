@@ -14,6 +14,7 @@
  * 运行:`node tests/WS-07.test.ts` 或 `node scripts/verify.ts --only WS-07`
  */
 
+import { carryItemCapacity, ITEMS_PER_CARRY_SLOT } from '../server/src/combat/progression.ts';
 import { test, ok, eq, near, includes, inRange, report } from '../shared/testing/harness.ts';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -3650,16 +3651,17 @@ test('CR-14 U1 装配层:容量由等级派生,超容量报 OVERFLOW', () => {
   (rt.state.players as { id: string; level: number }[]).push({ id: 'atk', level: 1 } as never);
 
   /* capacity 必须是服务端按等级算出的值,而不是某个可传入的量 */
-  eq(rt.carryCapacityOf('atk'), 8, 'Lv1 容量应为 8(8 + (L-1))');
+  const capLv1 = carryItemCapacity(8);
+  eq(rt.carryCapacityOf('atk'), capLv1, 'Lv1 容量应为 8 个负重格(8 + (L-1))× 每格件数');
 
   rt.grantItemSource('atk', 'drop:lot');
   let last: { allowed: boolean; rejectCode?: string } = { allowed: true };
-  for (let i = 0; i < 12 && last.allowed; i += 1) {
+  for (let i = 0; i < capLv1 / 8 + 4 && last.allowed; i += 1) {
     last = rt.applyInventory('atk', { ops: [{ itemId: 400, delta: 8, source: 'drop:lot' }] });
   }
   eq(last.allowed, false, '超容量应被拒');
   eq(last.rejectCode, InventoryReject.OVERFLOW, '拒因应为 OVERFLOW');
-  eq(rt.authoritativeItemTotal('atk'), 8, '服务端总量应停在容量上限');
+  eq(rt.authoritativeItemTotal('atk'), capLv1, '服务端总量应停在容量上限');
 });
 
 test('CR-14 U1 装配层:NEGATIVE 分支可达(旧版因 beforeTotal 反推而恒不可达)', () => {
@@ -4716,7 +4718,7 @@ test('K1 host 为 null 时整个契约**整段跳过**:不报错、不假装、�
   /* 3 等级:投影不执行 ⇒ 保持 schema 默认值 1(而不是被猜成别的) */
   const p = rt.state.players.find((x) => x.id === 'p1')!;
   eq(p.level, 1, 'host=null ⇒ 等级投影整段跳过,保持默认 1(不猜)');
-  eq(rt.carryCapacityOf('p1'), 8, '容量按 level=1 ⇒ 8(与接线前一致,没有静默变化)');
+  eq(rt.carryCapacityOf('p1'), carryItemCapacity(8), '容量按 level=1 ⇒ 8 个负重格');
 });
 
 test('K2 装配位存在:`host` 可经**构造参**注入(此前只能事后赋值)', () => {
@@ -4751,7 +4753,7 @@ test('K3 权威等级经 host 投影到 state.players[].level(两侧扫描)', ()
     rt.step();
     const expectLv = Math.max(1, Math.min(30, input));
     eq(p.level, expectLv, `权威 ${input} ⇒ 投影等级 ${expectLv}`);
-    eq(rt.carryCapacityOf('p1'), expectCap, `权威 ${input} ⇒ 容量 ${expectCap}`);
+    eq(rt.carryCapacityOf('p1'), carryItemCapacity(expectCap), `权威 ${input} ⇒ 容量 ${expectCap} 格`);
   }
   /* 封顶两侧:30 与 31 **必须同为 37** —— 若只扫单点,「封顶」与
      「线性增长」在这次测里不可区分。 */
