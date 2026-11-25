@@ -260,9 +260,9 @@ test('FND181-9 createHost 在 restoreWorldFromDb 之前盖图', () => {
 
 test('FND181-10 play.ts 的 --world design 真的透传', () => {
   const src = readFileSync(new URL('../scripts/play.ts', import.meta.url), 'utf8');
-  ok(/strArg\('world', 'plain'\)/.test(src), '`--world` 的缺省必须是 plain(与改前一致)');
+  ok(/strArg\('world', 'overworld'\)/.test(src), '`--world` 的缺省是主世界(设计图要显式 `--world design`)');
   ok(src.includes('design: WORLD_KEY === \'design\''), 'assemble 必须收到 design 开关');
-  ok(src.includes('WORLD_KEY === \'design\' ? DESIGN_SIZE : 96'),
+  ok(src.includes('WORLD_KEY === \'design\' ? DESIGN_SIZE : 96)'),
     'design 模式的边长缺省必须是 DESIGN_SIZE(192,手放区坐标的尺度)');
 });
 

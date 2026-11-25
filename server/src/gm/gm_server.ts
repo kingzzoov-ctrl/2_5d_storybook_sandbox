@@ -6,7 +6,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { NPCS } from '../npc/defs.ts';
+import { activeNpcs } from '../npc/defs.ts';
 import {
   askNpcAi, defaultGmConfig, normalizeGmConfig, saveGmConfig, type GmConfig,
 } from '../npc/ai.ts';
@@ -65,7 +65,7 @@ export function startGmServer(opts: GmServerOptions): Promise<{ server: Server; 
         } else if (route === 'GET /api/config') {
           json(res, 200, {
             config: opts.getConfig(),
-            npcs: NPCS.map((n) => ({ id: n.id, name: n.name, lines: n.lines, quest: n.quest?.title ?? null })),
+            npcs: activeNpcs().map((n) => ({ id: n.id, name: n.name, lines: n.lines, quest: n.quest?.title ?? null })),
             configPath: opts.configPath,
           });
         } else if (route === 'PUT /api/config') {
@@ -87,7 +87,7 @@ export function startGmServer(opts: GmServerOptions): Promise<{ server: Server; 
           const body = JSON.parse(await readBody(req)) as { npcId?: string; config?: unknown };
           const cfg = normalizeGmConfig(body.config ?? opts.getConfig());
           cfg.ai.enabled = true;
-          const npc = NPCS.find((n) => n.id === body.npcId);
+          const npc = activeNpcs().find((n) => n.id === body.npcId);
           if (npc === undefined) { json(res, 400, { ok: false, reason: '没有这个 NPC' }); return; }
           if (cfg.npcs[npc.id] !== undefined) cfg.npcs[npc.id]!.enabled = true;
           const r = await askNpcAi(cfg, npc.id, {

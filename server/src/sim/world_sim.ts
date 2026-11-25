@@ -39,6 +39,11 @@ import { TICK_HZ, DT, SIM_DT, SLOW_DT, BASE_MOVE_SPEED, secondsToTicks } from '.
 /* ★ WS-FND-185:每格群系。**只读设计意图**(12 个区 → `REGION_BIOME` → 8 个群系键),
    不读世界本身 —— 与 `regionAt` 同一份事实源,刷怪不会自己发明第二张群系地图。 */
 import { biomeAt, regionAt } from '../../../shared/world/design.ts';
+import { ITEM_BY_ID as CONTENT_ITEM_BY_ID } from '../../../shared/constants/items.ts';
+import { ItemCategory as ContentCategory } from '../../../shared/types/entities.ts';
+import {
+  canEnter, groundZOf, isDeepWater, isSolidObj, slideMove, type CellView,
+} from '../../../shared/world/passable.ts';
 import { unpackTile, type WireColor } from '../../../shared/types/tile.ts';
 import { WorldGrid } from '../world/grid.ts';
 /* ★ WS-FND-164:`encodeRoofRle` / `decodeRoofRle` 是屋顶旁路层的**唯一**编解码器
@@ -609,6 +614,11 @@ export interface MaterialApi {
   takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean;
   /** 把物品放到地面(背包 → 世界)。 */
   dropItem(x: number, y: number, itemId: number, count: number): void;
+  /**
+   * 这一格上的物件是不是世界**原生**的(生成器摆的、还没被换过)。可选:
+   * 没有原生地图的世界不实现它,调用方按「不是」处理。
+   */
+  nativeAt?(x: number, y: number): boolean;
 }
 
 
@@ -636,6 +646,30 @@ export interface WorldSimOptions {
    * **那一格不属于任何区**(海上 / 未分区)时兜底。见 `biomeName` 字段注释。
    */
   biome?: string;
+  /**
+   * 世界地图的读口(主世界由装配层注入;缺省 = 设计图那一套):
+   * 一格属于哪个区 / 哪个群系(海上或未分区 ⇒ `null`)。
+   */
+  regionAt?: (x: number, y: number) => string | null;
+  biomeAt?: (x: number, y: number) => string | null;
+  /** 城镇中心 = 安全区圆心。缺省 = 世界正中。 */
+  townCenter?: { x: number; y: number };
+  /**
+   * 地形碰撞:玩家位移贴着墙 / 树 / 深水 / 陡坎滑行,生物同样过不去(规则见
+   * `shared/world/passable.ts`)。缺省关 —— 关着时 `applyPlayerMove` 是无条件搬家。
+   */
+  collision?: boolean;
+  /**
+   * 围着玩家刷怪、远离所有玩家的怪自动离场。缺省关(= 全图均匀撒点、从不离场)。
+   * 大世界必须开:否则几十只怪摊在几十万格里,玩家一只都遇不到。
+   */
+  spawnNearPlayers?: boolean;
+  /**
+   * 自然资源再生:某格被采走的物件若等于 `nativeObjAt` 给出的原生物件,
+   * `regrowSec` 秒后长回来。两个都给才生效。
+   */
+  regrowSec?: number;
+  nativeObjAt?: (x: number, y: number) => number;
   /**
    * 世界种子的**身份**(不是随机流本身)。
    *
@@ -1229,6 +1263,19 @@ export class WorldSim {
    * 去推理刷怪。`biomeHistogram()` 是本字段不再等于「整图群系」的读数口。
    */
   biomeName: string;
+  private readonly regionLookup: (x: number, y: number) => string | null;
+  private readonly biomeLookup: (x: number, y: number) => string | null;
+  private readonly townCenterPos: { x: number; y: number } | null;
+  private readonly collisionOn: boolean;
+  private readonly spawnNearPlayers: boolean;
+  private readonly regrowFrames: number;
+  private readonly nativeObjAt: ((x: number, y: number) => number) | null;
+  /** 待再生的资源格(按到期帧升序:延迟是常数,先采的先到期)。 */
+  private readonly regrowQueue: { x: number; y: number; obj: number; due: number }[] = [];
+  /** 累计长回来几件(自检读数)。 */
+  regrownCount = 0;
+  /** 因远离所有玩家而离场的生物数(累计)。 */
+  despawnedFarMobs = 0;
   /** 刷怪预算的小数累加器(见 `tickSpawn()`)。 */
   private spawnBudget = 0;
   /** 预算上界(只/慢帧):防「整图被挡」时累积成一次雪崩。 */
@@ -1860,6 +1907,15 @@ export class WorldSim {
     this.wiringOn = opts.wiring !== false;
     this.mobsOn = opts.mobs !== false;
     this.biomeName = opts.biome ?? 'MEADOW';
+    this.regionLookup = opts.regionAt ?? regionAt;
+    this.biomeLookup = opts.biomeAt ?? biomeAt;
+    this.townCenterPos = opts.townCenter ?? null;
+    this.collisionOn = opts.collision === true;
+    this.spawnNearPlayers = opts.spawnNearPlayers === true;
+    this.nativeObjAt = opts.nativeObjAt ?? null;
+    this.regrowFrames = this.nativeObjAt !== null && Number.isFinite(opts.regrowSec) && (opts.regrowSec as number) > 0
+      ? secondsToTicks(opts.regrowSec as number)
+      : 0;
     this.roomId = opts.roomId ?? '';
     this.spawnBudgetMax = 4;
     /* ★ 种子**身份**先落位:`rng` 的默认值由它派生(没给 `seed` ⇒ 0x5eed,
@@ -1948,7 +2004,17 @@ export class WorldSim {
          * 的注释 + 两个 AI —— 那是冻结层变更,须走 CR。
          */
         if (x < 0 || y < 0 || x >= this.sizeCells || y >= this.sizeCells) return true;
-        return this.grid.objIdAt(Math.floor(x), Math.floor(y)) !== 0;
+        const obj = this.grid.objIdAt(Math.floor(x), Math.floor(y));
+        /* 开了地形碰撞:只有挡路的物件才挡(草丛、花、作物可以踩过去)。 */
+        return this.collisionOn ? isSolidObj(obj) : obj !== 0;
+      },
+      enterable: (fx, fy, tx, ty) => {
+        if (!this.collisionOn) return true;
+        const to = this.cellView(Math.floor(tx), Math.floor(ty));
+        if (to === null) return false;
+        const from = this.cellView(Math.floor(fx), Math.floor(fy));
+        /* 生物不跳:身体高度就是脚下那一层。 */
+        return canEnter(from, to, from === null ? 0 : Math.max(0, groundZOf(from)));
       },
       players: () => this.mobPlayers,
       groundItems: () => this.mobGround,
@@ -1992,6 +2058,13 @@ export class WorldSim {
      ⚠️ 「判能不能」必须在这里、而不是房间层:房间拿不到 `grid` 与
         `physics.bodies`(私有),它只有 `WorldSaveHost` 这一层结构化接口
         ⇒ 判定与写入同处一地,否则又变成"两份实现"。 */
+
+  /** 通行判定要读的那一格(世界外 ⇒ `null`)。 */
+  private cellView(cx: number, cy: number): CellView | null {
+    if (cx < 0 || cy < 0 || cx >= this.sizeCells || cy >= this.sizeCells) return null;
+    const f = this.grid.fieldsAt(cx, cy);
+    return { elev: f.elev, base: f.base, floor: f.floor, obj: f.obj };
+  }
 
   /** 该点是否在世界内(格坐标)。 */
   private inWorld(x: number, y: number): boolean {
@@ -2076,7 +2149,15 @@ export class WorldSim {
     const gy = Math.floor(y);
     const obj = this.grid.objIdAt(gx, gy);
     if (obj === 0) return { ok: false, reason: '这一格没有物件' };
+    /* 世界自带的建筑、家具与地标拆不掉(镇子、营地、祭坛);自然资源照常可采,玩家自己放的照常可拆。 */
+    if (this.nativeObjAt !== null && this.nativeObjAt(gx, gy) === obj
+      && CONTENT_ITEM_BY_ID.get(obj)?.category !== ContentCategory.NATURAL) {
+      return { ok: false, reason: '这是岛上原本就有的东西,拆不掉' };
+    }
     this.setCell(gx, gy, { obj: 0 });
+    if (this.regrowFrames > 0 && this.nativeObjAt !== null && this.nativeObjAt(gx, gy) === obj) {
+      this.regrowQueue.push({ x: gx, y: gy, obj, due: this.frameCount + this.regrowFrames });
+    }
     /* 只有给了 actor 才把采集乘子带上(不给 ⇒ 回执与接线前**逐位相同**)。 */
     if (typeof actorId === 'string' && actorId.length > 0) {
       /* ★ WS-FND-189:成功点 —— 那一件**真的被取走了**(失败分支都在上面 return 了)。
@@ -2144,6 +2225,14 @@ export class WorldSim {
   materials(): MaterialApi {
     return this;
   }
+
+  nativeAt(x: number, y: number): boolean {
+    if (this.nativeObjAt === null || !this.inWorld(x, y)) return false;
+    const gx = Math.floor(x);
+    const gy = Math.floor(y);
+    const obj = this.grid.objIdAt(gx, gy);
+    return obj !== 0 && this.nativeObjAt(gx, gy) === obj;
+  }
   /* ═══════════ ★ WS-FND-189:主线事件的生产侧 ═══════════
 
      这一段是**唯一**把「玩家做了什么」送进总线的地方(六个成功点各一条),三条纪律:
@@ -2181,8 +2270,8 @@ export class WorldSim {
    * 一个 `null` 只会让状态机多判一次「不认识」。
    */
   private emitRegionChange(playerId: string, fromX: number, fromY: number, toX: number, toY: number): void {
-    const before = regionAt(Math.floor(fromX), Math.floor(fromY));
-    const after = regionAt(Math.floor(toX), Math.floor(toY));
+    const before = this.regionLookup(Math.floor(fromX), Math.floor(fromY));
+    const after = this.regionLookup(Math.floor(toX), Math.floor(toY));
     if (after === null || after === before) return;
     this.emitMainline(MAINLINE_BUS_KIND.enterRegion, playerId, enterRegionPayload(playerId, after));
   }
@@ -4675,7 +4764,7 @@ export class WorldSim {
    * ⚠️ 它**不是**判定本身,只是一份诊断记录:真值来源仍是
    * `VitalsSystem.downed`(见方法内注释)。
    */
-  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | 'STUNNED' | null = null;
+  lastMoveRejection: 'NOT_A_PLAYER' | 'NO_BODY' | 'NON_FINITE' | 'DOWNED' | 'KNOCKBACK' | 'TRAPPED' | 'STUNNED' | 'BLOCKED' | null = null;
   /**
    * ★ WS-FND-147:最近一次 `applyPlayerMove` 对 **z 的裁决**(`null` = 报文没带 z)。
    *
@@ -5286,9 +5375,22 @@ export class WorldSim {
        同一区里来回走一步不发事件)。 */
     const fromX = b.x;
     const fromY = b.y;
-    b.x = x;
-    b.y = y;
-    this.emitRegionChange(playerId, fromX, fromY, x, y);
+    if (this.collisionOn) {
+      /* 贴着障碍滑到走不动为止;落点与申报不同 ⇒ 这一包按「世界拒收」回执,
+         房间据此把基准锚回权威位置(客户端用同一份规则预测,正常情况下两边一致)。 */
+      const s = slideMove(fromX, fromY, x, y, b.radius, b.z, (cx, cy) => this.cellView(cx, cy));
+      b.x = s.x;
+      b.y = s.y;
+      this.emitRegionChange(playerId, fromX, fromY, s.x, s.y);
+      if (Math.abs(s.x - x) > 1e-6 || Math.abs(s.y - y) > 1e-6) {
+        this.lastMoveRejection = 'BLOCKED';
+        return false;
+      }
+    } else {
+      b.x = x;
+      b.y = y;
+      this.emitRegionChange(playerId, fromX, fromY, x, y);
+    }
     /* ★ WS-FND-147:z 的**服务端权威判定**(修前这里是 `if (z !== undefined) b.z = z;`)。
        两段判,依据与代价都写在方法 docblock 的「z 由谁拥有」一节:
        - 空中(`vz !== 0`)或服务端自上次报文以来动过 `b.z` ⇒ **不写**声明值
@@ -9461,7 +9563,8 @@ export class WorldSim {
     for (const pid of this.vitals.ids()) {
       const cell = this.playerCellOf(pid);
       if (cell === null) continue;
-      if (cells.some((c) => c.x === cell.x && c.y === cell.y)) { actorAtStation = true; break; }
+      /* 工位是实心家具(站不上去)⇒ 「在工位上」= 站在它那一格或紧挨着的八格里。 */
+      if (cells.some((c) => Math.abs(c.x - cell.x) <= 1 && Math.abs(c.y - cell.y) <= 1)) { actorAtStation = true; break; }
     }
     const gate = gateRushStart({
       /* 上面已 `if (this.rushRun !== null) return;` ⇒ 此刻必然是没开工。 */
@@ -10090,8 +10193,14 @@ export class WorldSim {
     return {
       objAt: (x: number, y: number) => this.grid.objIdAt(x, y),
       floorAt: (x: number, y: number) => this.grid.floorIdAt(x, y),
-      blocked: (x: number, y: number) => this.grid.objIdAt(x, y) !== 0,
-      townCenter: () => ({ x: (this.sizeCells / 2) | 0, y: (this.sizeCells / 2) | 0 }),
+      blocked: (x: number, y: number) => {
+        if (this.grid.objIdAt(x, y) !== 0) return true;
+        /* 开了地形碰撞的世界:海里、深水里、未分区的格子也不刷(刷出来就卡在水里)。 */
+        if (!this.collisionOn) return false;
+        const c = this.cellView(Math.floor(x), Math.floor(y));
+        return c === null || isDeepWater(c) || this.regionLookup(Math.floor(x), Math.floor(y)) === null;
+      },
+      townCenter: () => this.townCenterPos ?? ({ x: (this.sizeCells / 2) | 0, y: (this.sizeCells / 2) | 0 }),
       /* ★ WS-FND-153:夜行门的**输入就是世界钟**(`isNightNow()` ⇒ `dayNight()`),
          不是任何"恒 false"的默认值 —— 这里一旦断开,NOCTURNAL 生物就永不刷新,
          而且白天/夜里都刷不出来的现象与"这个群系没有夜行怪"不可区分。 */
@@ -10174,8 +10283,20 @@ export class WorldSim {
   private trySpawnOne(fallbackBiome: string): boolean {
     /* +0.5:落在**格心**。整数坐标在 `WorldGrid` 上是格的角,
        `blocked()` 查的是格 ⇒ 落在角上会让「刷在墙里/墙外」取决于取整方向。 */
-    const x = Math.floor(this.rng() * this.sizeCells) + 0.5;
-    const y = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    let x = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    let y = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    if (this.spawnNearPlayers) {
+      /* 围着某个玩家的环带撒点:近处留白(不在眼皮底下凭空冒出来),远处封顶。 */
+      const ids = [...this.playerIds];
+      if (ids.length === 0) return false;
+      const p = this.physics.bodies.get(ids[Math.floor(this.rng() * ids.length) % ids.length]!);
+      if (p === undefined) return false;
+      const ang = this.rng() * Math.PI * 2;
+      const dist = WorldSim.SPAWN_RING_MIN + this.rng() * (WorldSim.SPAWN_RING_MAX - WorldSim.SPAWN_RING_MIN);
+      x = Math.floor(p.x + Math.cos(ang) * dist) + 0.5;
+      y = Math.floor(p.y + Math.sin(ang) * dist) + 0.5;
+      if (!this.inWorld(x, y)) return false;
+    }
     /* ★ WS-FND-185:这一格属于哪个群系 —— 与只读口 `biomeOfCell()` **同一个函数**,
        不在这里重写一遍 floor / 兜底(两份推导迟早漂移)。 */
     const biome = this.biomeOfCell(x, y);
@@ -10221,6 +10342,47 @@ export class WorldSim {
    * 实际没有任何含义**的状态码。⇒ 保持 wire 默认值 0,并在 `docs` 里
    * 记为待办,而不是编一个。
    */
+  /** 围着玩家刷怪的环带(格)与离场距离。 */
+  static readonly SPAWN_RING_MIN = 13;
+  static readonly SPAWN_RING_MAX = 34;
+  static readonly DESPAWN_DISTANCE = 80;
+
+  /** 离所有玩家都超过 `DESPAWN_DISTANCE` 的生物离场(标成已死,由帧末收尸统一清表,不结算击杀)。 */
+  private despawnFarMobs(): void {
+    if (this.playerIds.size === 0) return;
+    const pts: { x: number; y: number }[] = [];
+    for (const id of this.playerIds) {
+      const b = this.physics.bodies.get(id);
+      if (b !== undefined) pts.push({ x: b.x, y: b.y });
+    }
+    if (pts.length === 0) return;
+    for (const rt of this.mobHost.runtimes()) {
+      if (!rt.alive) continue;
+      let near = false;
+      for (const p of pts) {
+        if (Math.hypot(rt.x - p.x, rt.y - p.y) <= WorldSim.DESPAWN_DISTANCE) { near = true; break; }
+      }
+      if (near) continue;
+      rt.alive = false;
+      this.despawnedFarMobs += 1;
+    }
+  }
+
+  /** 到期的资源格长回来;那一格被占着(有物件或站着人)就再等 10 秒。 */
+  private tickRegrow(): void {
+    const q = this.regrowQueue;
+    while (q.length > 0 && q[0]!.due <= this.frameCount) {
+      const e = q.shift()!;
+      const occupied = this.grid.objIdAt(e.x, e.y) !== 0 || this.physics.occupantsAt(e.x, e.y).length > 0;
+      if (occupied) {
+        q.push({ ...e, due: this.frameCount + secondsToTicks(10) });
+        continue;
+      }
+      this.setCell(e.x, e.y, { obj: e.obj });
+      this.regrownCount += 1;
+    }
+  }
+
   listWildlife(): WildlifeState[] {
     const out: WildlifeState[] = [];
     for (const rt of this.mobHost.runtimes()) {
@@ -10261,7 +10423,7 @@ export class WorldSim {
    * "实际刷出了什么"分开算,否则两边都调用同一个函数就变成自证。
    */
   biomeOfCell(x: number, y: number): string {
-    return biomeAt(Math.floor(x), Math.floor(y)) ?? this.biomeName;
+    return this.biomeLookup(Math.floor(x), Math.floor(y)) ?? this.biomeName;
   }
 
   /**
@@ -11609,7 +11771,9 @@ export class WorldSim {
                 从来**没有任何代码**。
            ⇒ 现在交给 `tickSpawn()` 真的造(它自己管密度与去重)。 */
         spawned = this.tickSpawn();
+        if (this.spawnNearPlayers) this.despawnFarMobs();
       }
+      this.tickRegrow();
     }
 
     /* ── ★ WS-FND-135(P1):收尸(帧末)──

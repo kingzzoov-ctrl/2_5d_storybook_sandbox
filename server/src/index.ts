@@ -109,6 +109,11 @@ import type { WorldArchiveRequest, WorldArchiveReceipt, WorldArchiveSink } from 
    ⚠️ 文件在 `shared/**` 而不是 `server/**`:客户端要画**同一张图**
    (`client/src/stage/design_world.ts`),而客户端不许 import server。 */
 import { applyWorldDesign, DESIGN_CENTER } from '../../shared/world/design.ts';
+import {
+  overworld, overworldCell, REGION_DEFS, REGION_SEA, SPAWN_POINT, TOWN_RADIUS, WORLD_CENTER, WORLD_SIZE,
+} from '../../shared/world/overworld.ts';
+import { setActiveNpcs } from './npc/defs.ts';
+import { OVERWORLD_NPCS } from './npc/overworld_npcs.ts';
 import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
@@ -151,6 +156,9 @@ import { dirname } from 'node:path';
 export const DEFAULT_DB_PATH = '.data/world.db';
 
 /** 装配一次世界 + 运行时所需的全部外部依赖。 */
+/** 主世界里自然资源被采走后多久长回来(秒)。 */
+export const OVERWORLD_REGROW_SEC = 120;
+
 export interface AssembleDeps {
   /** 房间 id(落盘时用作主键)。 */
   roomId?: string;
@@ -232,6 +240,12 @@ export interface AssembleDeps {
    * 「每次开服都把玩家动过的地图推平」—— 那种缺陷只在**重启之后**才看得见。
    */
   design?: boolean;
+  /**
+   * 主世界(`shared/world/overworld.ts`,512×512 的晨曦群岛)。给了它:
+   * 边长固定为 512,地形碰撞、围绕玩家刷怪、资源再生一并打开,NPC 名册换成主世界那 19 位,
+   * 出生点在镇广场。与 `design` 互斥(两个都给以本项为准)。
+   */
+  overworld?: boolean;
   biome?: string;
   /** 房间名与准入方式,与 `NetPersistRoom.onCreate` 的同名字段一一对应。 */
   name?: string;
@@ -402,9 +416,27 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
      (`seed: deps.worldSeed`),世界内部不再第二份推导。
      ★ 加 `biome` 的理由:本仓没有每格群系,「世界群系」只能是一个**显式选择**,
        而它是刷怪配表的键 ⇒ 不透传就等于让刷怪永远只走兜底。 */
+  const ow = deps.overworld === true ? overworld() : null;
+  const regionIdAt = (x: number, y: number): string | null => {
+    if (ow === null || x < 0 || y < 0 || x >= ow.size || y >= ow.size) return null;
+    const r = ow.region[y * ow.size + x]!;
+    return r === REGION_SEA ? null : REGION_DEFS[r]!.id;
+  };
   const sim = new WorldSim({
     /* 键**总是出现**(与房间侧 rtOpts 同一纪律:不靠条件展开省键)。 */
-    sizeCells: deps.sizeCells,
+    sizeCells: ow === null ? deps.sizeCells : WORLD_SIZE,
+    ...(ow === null ? {} : {
+      regionAt: regionIdAt,
+      biomeAt: (x: number, y: number): string | null => {
+        const r = ow.region[y * ow.size + x];
+        return r === undefined || r === REGION_SEA || x < 0 || y < 0 || x >= ow.size ? null : REGION_DEFS[r]!.biome;
+      },
+      townCenter: { x: WORLD_CENTER, y: WORLD_CENTER },
+      collision: true,
+      spawnNearPlayers: true,
+      regrowSec: OVERWORLD_REGROW_SEC,
+      nativeObjAt: (x: number, y: number): number => overworldCell(ow, x, y)?.obj ?? 0,
+    }),
     rng: deps.rng,
     combatRng: deps.combatRng,
     /* ★ 2026-11-14:`mobs` 透传。此前这里只传 sizeCells/rng/combatRng ⇒
@@ -447,9 +479,20 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
    * `archiveDb` 是「本房间正在用的那个库」(名字来自 D-06,值 = `db ?? deps.db`)。 */
   /* ★ 2026-11-26(w85):设计图 —— **必须**在 `restoreWorldFromDb` 之前盖。
      理由见 `AssembleDeps.design` 的注释(读档只覆盖库里有的块)。 */
-  if (deps.design === true) applyWorldDesign(sim, { size: sim.sizeCells });
+  if (ow !== null) {
+    /* 主世界整张铺上去(与设计图同一条顺序纪律:先铺图,再读档,存档里改过的块才盖得住它)。 */
+    for (let y = 0; y < ow.size; y += 1) {
+      for (let x = 0; x < ow.size; x += 1) {
+        const c = overworldCell(ow, x, y)!;
+        sim.setCell(x, y, { elev: c.elev, base: c.base, floor: c.floor, obj: c.obj });
+      }
+    }
+    setActiveNpcs(OVERWORLD_NPCS);
+  } else if (deps.design === true) applyWorldDesign(sim, { size: sim.sizeCells });
   sim.restoreWorldFromDb(archiveDb, roomId);
   wireHost(sim, roomId);
+  /* 主世界的镇子比小地图大:安全区至少盖住整个镇区(房主把半径调得更大时以他的为准)。 */
+  if (ow !== null) setTownRadiusProvider((id) => Math.max(TOWN_RADIUS, townSafeRadiusProvider(id)));
 
   /* ★ w97:**主线订阅**。`world_sim` 在六个成功点(采集/合成/放置/换区/击杀/Boss)把事件发到
      自己的 `bus` 上,这里把状态机挂上去 —— 不挂的话 `applyEvent` 永远不被调用,
@@ -507,6 +550,8 @@ export function assemble(deps: AssembleDeps = {}): Assembled {
        ⇒ `spawnPoint()` 与改前逐字相同。⚠️ 这个键**必须**与
        `room.colyseus.ts` 的 rtOpts 键集一致(FND9-9 守两侧)。 */
     spawnOrigin: deps.design === true ? { x: DESIGN_CENTER, y: DESIGN_CENTER } : undefined,
+    /* 主世界的出生点在镇广场(键写在后面 ⇒ 覆盖上一行;两个开关都没给时两行都是 undefined)。 */
+    ...(deps.overworld === true ? { spawnOrigin: { x: SPAWN_POINT.x, y: SPAWN_POINT.y } } : {}),
     /* ★ 本行就是第 9 例的修复点:host **在此被真正赋给**运行时契约字段。
        此前全仓 `server/src/**` 里没有任何地方做这件事。
        房间侧对应行是 `host: resolveRoomHost(this.deps)` —— 同一个 seam,

@@ -54,7 +54,7 @@
  * 拿不到权威位置(`INVALID`)/ 太远(`INVALID`)/ 缺工具(`INVALID`)/ 缺按件读口
  * (`NOT_IMPLEMENTED`,fail-closed —— 不退回「信客户端」)。
  */
-import { ITEM_BY_ID, ITEM_LIST } from '../../../../shared/constants/items.ts';
+import { ITEM_BY_ID } from '../../../../shared/constants/items.ts';
 import { ItemCategory } from '../../../../shared/types/entities.ts';
 import { ItemSourcePurpose } from '../anticheat.ts';
 import {
@@ -86,19 +86,8 @@ export const GATHER_RADIUS = 3;
 export const GATHERABLE_CATEGORY = ItemCategory.NATURAL;
 
 /**
- * **工具族词条** —— 从生产工具表(§3.3)的条目标签**算出来**。
- *
- * 为什么要算而不是手抄:「哪些词条是工具族」本身就是内容表的性质(§3.3 的 18 件
- * 各带自己的词条),抄一份迟早与内容表漂(新加一件斧头,抄来的集合不会变)。
- */
-export const TOOL_TAGS: readonly string[] = [
-  ...new Set(ITEM_LIST.filter((i) => i.category === ItemCategory.TOOL).flatMap((i) => i.tags)),
-].sort();
-
-/**
- * 某一格的物件是不是**可采集物**(内容表判定)。
- *
- * 返回 `name` 只为回执/理由可读(玩家读得到「暖松原木」而不是「101」)。
+ * 这件物件能不能采:只认内容表 §3.1 的自然资源。
+ * 表外编号、非自然资源一律拒(不认「编号空投」)。
  */
 export function gatherableOf(objId: number): { ok: true; name: string } | { ok: false; reason: string } {
   const def = ITEM_BY_ID.get(objId);
@@ -112,31 +101,39 @@ export function gatherableOf(objId: number): { ok: true; name: string } | { ok: 
   return { ok: true, name: def.name };
 }
 
+/** 一类采集工具:带着其中任一件,就能采 `resources` 里的东西。 */
+export interface GatherToolRule {
+  label: string;
+  tools: readonly number[];
+  resources: readonly number[];
+}
+
 /**
- * 该资源要求的**工具族词条**;`null` = **徒手可采**。
+ * 采集要什么工具。没列在这里的自然资源徒手可采(浆果、草、蘑菇、作物、卵石、沙…)。
  *
- * 判据:资源的 `tags` 与 `TOOL_TAGS` 的**第一个交集**(内容表顺序,确定性)。
+ * 斧砍树、镐敲矿、铲挖黏土 —— 按「玩家觉得理所当然」排,不从词条推导:
+ * 词条交集会得出「割草要捕虫网、挖矿要炒菜铲、采蜂蜜要一张食谱」这类结论,
+ * 而且新玩家的第一把镐要 3 块石头,石头又要镐才能采(起始包只给 2 块)。
  */
-export function toolTagFor(objId: number): string | null {
-  const tags = ITEM_BY_ID.get(objId)?.tags;
-  if (tags === undefined) return null;
-  for (const t of tags) if (TOOL_TAGS.includes(t)) return t;
+export const GATHER_TOOL_RULES: readonly GatherToolRule[] = [
+  { label: '斧', tools: [201, 202], resources: [101, 102, 103, 104, 105] },
+  { label: '镐', tools: [203, 204], resources: [109, 110, 111, 112, 113, 114, 115, 116] },
+  { label: '铲', tools: [205], resources: [107] },
+];
+
+/** 采这件东西要哪类工具(`null` = 徒手)。 */
+export function gatherToolFor(objId: number): GatherToolRule | null {
+  for (const r of GATHER_TOOL_RULES) if (r.resources.includes(objId)) return r;
   return null;
 }
 
-/** 该玩家**持有**一件带 `tag` 的**工具**(按件权威账;`null` = 读口缺失)。 */
-function ownsToolTagged(ctx: ActionContext, tag: string): boolean | null {
+/** 背包里有没有这类工具(`null` = 拿不到按件读口)。 */
+function ownsToolOf(ctx: ActionContext, rule: GatherToolRule): boolean | null {
   const ids = ownedItemIds(ctx);
   if (ids === null) return null;
-  for (const id of ids) {
-    const def = ITEM_BY_ID.get(id);
-    if (def === undefined) continue;
-    if (def.category === ItemCategory.TOOL && def.tags.includes(tag)) return true;
-  }
-  return false;
+  return rule.tools.some((t) => ids.includes(t));
 }
 
-/** 从 payload 里取一个有限数;不是数或缺失 ⇒ `null`(调用方显式拒绝)。 */
 function numField(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
@@ -176,19 +173,19 @@ export const gather: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   }
 
   /* ── 3 工具前置(内容表派生的词条族;读口缺失 ⇒ fail-closed,不假装有工具)── */
-  const toolTag = toolTagFor(objId);
-  if (toolTag !== null) {
-    const hasTool = ownsToolTagged(ctx, toolTag);
+  const tool = gatherToolFor(objId);
+  if (tool !== null) {
+    const hasTool = ownsToolOf(ctx, tool);
     if (hasTool === null) return missingItemReadPort(ctx);
     if (!hasTool) {
+      const names = tool.tools.map((t) => ITEM_BY_ID.get(t)?.name ?? `#${t}`).join(' / ');
       return {
         ok: false, kind: 'INVALID',
-        reason: `采「${kind.name}」需要一件带『${toolTag}』词条的工具(背包里没有 ⇒ 零副作用)`,
+        reason: `采「${kind.name}」要一把${tool.label}(${names}),背包里没有`,
       };
     }
   }
 
-  /* ═══════════ 判定全部通过:从这里开始才动世界 / 背包 ═══════════ */
   /* 扣减 = 格上那一件消失;世界源同时把 `gatherMul`(602 的 1.20)归属回来。 */
   const r = mat.breakBlock(x, y, ctx.actorId);
   if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
@@ -207,7 +204,7 @@ export const gather: ActionHandler = (ctx: ActionContext): ActionOutcome => {
     x, y, objId: r.objId, gained: gain.allowed ? count : 0,
   };
   if (r.gatherMul !== undefined && r.gatherMul !== 1) effect.gatherMul = r.gatherMul;
-  if (toolTag !== null) effect.tool = toolTag;
+  if (tool !== null) effect.tool = tool.label;
   if (gain.allowed) return { ok: true, kind: 'OK', effect };
 
   /* 背包收不下 ⇒ 凭证显式撤销 + 落回**原地**(不凭空销毁)。 */

@@ -70,6 +70,11 @@ import type { EventBus, EventPayload } from '../events/bus.ts';
 export interface MobHostWorld {
   /** 该格是否可站立(非实心、有支撑)。 */
   probe(x: number, y: number): boolean;
+  /**
+   * 从一点迈到另一点行不行(可选;高差与深水要知道「从哪来」,`probe` 单点答不了)。
+   * 缺它 ⇒ 只按 `probe` 判,与此前一致。
+   */
+  enterable?(fromX: number, fromY: number, toX: number, toY: number): boolean;
   /** 当前玩家列表(只读)。 */
   players(): readonly WorldPlayer[];
   /** 地面掉落物。 */
@@ -769,13 +774,22 @@ export class MobHost implements MobWorld {
    */
   sweepClampT(x0: number, y0: number, x1: number, y1: number): number {
     const dist = Math.hypot(x1 - x0, y1 - y0);
-    if (dist <= PROBE_SWEEP_STEP) return this.probe(x1, y1) ? 0 : 1;
+    const enterable = this.world.enterable;
+    const blocked = (fx: number, fy: number, tx: number, ty: number): boolean =>
+      this.probe(tx, ty) || (enterable !== undefined && !enterable.call(this.world, fx, fy, tx, ty));
+    if (dist <= PROBE_SWEEP_STEP) return blocked(x0, y0, x1, y1) ? 0 : 1;
     const steps = Math.ceil(dist / PROBE_SWEEP_STEP);
     let lastFree = 0;
+    let px = x0;
+    let py = y0;
     for (let i = 1; i <= steps; i += 1) {
       const t = i / steps;
-      if (this.probe(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) break;
+      const nx = x0 + (x1 - x0) * t;
+      const ny = y0 + (y1 - y0) * t;
+      if (blocked(px, py, nx, ny)) break;
       lastFree = t;
+      px = nx;
+      py = ny;
     }
     return lastFree;
   }

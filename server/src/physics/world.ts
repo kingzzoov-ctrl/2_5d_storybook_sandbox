@@ -33,6 +33,7 @@ import {
   floorSlotOfId,
   muOfSlot,
 } from '../world/chunk.ts';
+import { isSolidObj } from '../../../shared/world/passable.ts';
 
 /* ═══════════════════════ 0. 质量守卫 ═══════════════════════ */
 
@@ -819,11 +820,9 @@ export class PhysicsWorld {
     return floorIdOfSlot(this.terrain.floorSlotAt(Math.floor(x), Math.floor(y)));
   }
 
-  /** 该格是否阻挡水平移动:OBJ 351~371 视为实心墙。 */
+  /** 该格是否阻挡水平移动(墙、树、岩石、家具…;规则在 `shared/world/passable.ts`,与客户端预测同一份)。 */
   isSolidCell(cx: number, cy: number): boolean {
-    const o = this.terrain.objIdAt(cx, cy);
-    if (o === 0) return false;
-    return o >= 351 && o <= 371;
+    return isSolidObj(this.terrain.objIdAt(cx, cy));
   }
 
   /**

@@ -54,8 +54,9 @@
  */
 
 import { NPC_TALK_RADIUS, npcAt, npcById } from '../../npc/defs.ts';
-import { talk, type NpcPlayerState, type QuestStatus } from '../../npc/dialogue.ts';
-import { authoritativeStock, missingItemReadPort } from './item_source.ts';
+import { acceptQuest, talk, type NpcPlayerState, type QuestStatus } from '../../npc/dialogue.ts';
+import { ItemSourcePurpose } from '../anticheat.ts';
+import { authoritativeStock, bindItemSource, missingItemReadPort, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
 
@@ -165,12 +166,56 @@ export const npcTalk: ActionHandler = (ctx: ActionContext): ActionOutcome => {
   const said = talk(requested, state);
   const distance = Math.hypot(at.x - near.home.x, at.y - near.home.y);
 
+  /* ── 6b 说话即推进差事 ──
+     第一次搭话 = 接下(台词是开价那句);之后东西带够了再搭话 = 交差:
+     扣掉要的东西、发谢礼、封账。裁决仍是 `dialogue.acceptQuest`(纯函数),
+     这里只把它的结论落到背包与账本上。`questStatus` 报的是**这次说话之前**的状态,
+     `questNow` 是之后的。 */
+  let line = said.line;
+  let questNow: QuestStatus | undefined;
+  const extra: Record<string, string | number | boolean> = {};
+  const quest = near.quest;
+  if (quest !== undefined) {
+    const step = acceptQuest(requested, state);
+    questNow = ledger.quests[quest.id] ?? 'available';
+    if (step.outcome === 'ACCEPTED') {
+      setNpcTalkLedger(roomId, ctx.actorId, { inventory: {}, quests: step.state.quests });
+      questNow = 'accepted';
+      extra.accepted = true;
+    } else if (step.outcome === 'COMPLETED' && step.awarded !== null) {
+      const spend = ctx.applyInventory(ctx.actorId, { ops: [{ itemId: quest.needItemId, delta: -quest.needCount }] });
+      if (spend.allowed) {
+        const src = bindItemSource(ctx, step.awarded.itemId, ItemSourcePurpose.QUEST_REWARD);
+        const gain = ctx.applyInventory(ctx.actorId, {
+          ops: [{ itemId: step.awarded.itemId, delta: step.awarded.count, source: src }],
+        });
+        if (gain.allowed) {
+          setNpcTalkLedger(roomId, ctx.actorId, { inventory: {}, quests: step.state.quests });
+          questNow = 'completed';
+          line = talk(requested, { inventory: stock, quests: step.state.quests }).line;
+          extra.turnedIn = true;
+          extra.rewardItemId = step.awarded.itemId;
+          extra.rewardCount = step.awarded.count;
+        } else {
+          /* 谢礼收不下 ⇒ 把交上去的东西退回来,差事不封账(腾出地方再来)。 */
+          unbindItemSource(ctx, src);
+          const back = bindItemSource(ctx, quest.needItemId, ItemSourcePurpose.QUEST_REFUND);
+          const refund = ctx.applyInventory(ctx.actorId, {
+            ops: [{ itemId: quest.needItemId, delta: quest.needCount, source: back }],
+          });
+          if (!refund.allowed) unbindItemSource(ctx, back);
+          extra.note = '背包装不下谢礼,先腾点地方再来交';
+        }
+      }
+    }
+  }
+
   /* 回执全是**标量**(`EffectRecord` 的 JSON 值域;见 `ActionOutcome.effect` 的说明):
      `line` 就是客户端 HUD 要显示的那一句话,不在这里拼 UI 文案。 */
   const effect: Record<string, string | number | boolean> = {
     npcId: near.id,
     npc: near.name,
-    line: said.line,
+    line,
     x: near.home.x,
     y: near.home.y,
     distance: Math.round(distance * 1000) / 1000,
@@ -182,7 +227,9 @@ export const npcTalk: ActionHandler = (ctx: ActionContext): ActionOutcome => {
       needItemId: near.quest.needItemId,
       needCount: near.quest.needCount,
       have: stock[near.quest.needItemId] ?? 0,
+      ...(questNow === undefined ? {} : { questNow }),
     }),
+    ...extra,
   };
   return { ok: true, kind: 'OK', effect };
 };

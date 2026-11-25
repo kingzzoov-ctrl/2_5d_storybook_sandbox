@@ -30,7 +30,7 @@ import {
 } from '../../../shared/net/delta.ts';
 /* ★ WS-FND-188:静态 NPC 表(`NPCS` 是**唯一**一份)—— 房间只把它投影上线上的形状,
    不另立第二份名单(两份名单迟早漂,而漂的表现是"某个 NPC 只在一个端存在")。 */
-import { NPCS } from '../npc/defs.ts';
+import { activeNpcs } from '../npc/defs.ts';
 /* ★ WS-FND-182:地形帧的编码口(单块 1032 字节 = 1024 格 + 8 字节块头)。 */
 import {
   encodeTerrainFrames,
@@ -1221,6 +1221,8 @@ export interface WorldSaveHost {
     consumeGroundItem(itemId: number, count: number, nearX?: number, nearY?: number, radius?: number): number;
     takeGroundItemNear(x: number, y: number, itemId: number, radius: number): boolean;
     dropItem(x: number, y: number, itemId: number, count: number): void;
+    /** 这一格上的物件是不是世界原生的(可选;见 `WorldSim.nativeAt`)。 */
+    nativeAt?(x: number, y: number): boolean;
   };
   /**
    * 玩家的**权威等级**(来自进度档案 `progression`,不是网络投影)。
@@ -6627,7 +6629,7 @@ export class RoomRuntime {
    * 客户端用**同一对**数字摆立牌与判距离 —— 两端各换算一次就是"人站在半格外"。
    */
   npcFrame(): Uint8Array {
-    const wire: NpcWireDef[] = NPCS.map((n) => {
+    const wire: NpcWireDef[] = activeNpcs().map((n) => {
       const q = n.quest;
       return q === undefined
         ? { id: n.id, name: n.name, x: n.home.x, y: n.home.y }

@@ -1166,6 +1166,10 @@ export const ItemSourcePurpose = {
   PLACE_REFUND: 'place-refund',
   /** 产物收不下时退回材料 */
   CRAFT_REFUND: 'craft-refund',
+  /** 交差事的谢礼 */
+  QUEST_REWARD: 'quest-reward',
+  /** 谢礼收不下时退回交上去的东西 */
+  QUEST_REFUND: 'quest-refund',
 } as const;
 export type ItemSourcePurpose = (typeof ItemSourcePurpose)[keyof typeof ItemSourcePurpose];
 

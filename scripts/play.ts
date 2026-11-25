@@ -61,6 +61,7 @@ import { fileURLToPath } from 'node:url';
 
 import { DEFAULT_DB_PATH, assemble } from '../server/src/index.ts';
 import { DESIGN_SIZE } from '../shared/world/design.ts';
+import { WORLD_SIZE } from '../shared/world/overworld.ts';
 import { startWsServer } from '../server/src/net/ws_server.ts';
 import { startGmServer, type AiCallLog } from '../server/src/gm/gm_server.ts';
 import { askNpcAi, loadGmConfig } from '../server/src/npc/ai.ts';
@@ -117,9 +118,9 @@ const URL_HOST = BIND_ALL ? '<本机IP/公网IP>' : HOST;
  * **手放坐标**的,拿 96 去盖会把区挤在一起、甚至叠到海里 —— 那种图看着就是坏的,
  * 但它不会报错。显式传 `--size` 可以覆盖(那就是「换边框」)。
  */
-const WORLD_KEY = strArg('world', 'plain');
+const WORLD_KEY = strArg('world', 'overworld');
 /** 世界边长(格)。96 只够「走两步」;**设计图需要 192**。 */
-const WORLD_CELLS = numArg('size', WORLD_KEY === 'design' ? DESIGN_SIZE : 96);
+const WORLD_CELLS = numArg('size', WORLD_KEY === 'overworld' ? WORLD_SIZE : WORLD_KEY === 'design' ? DESIGN_SIZE : 96);
 
 /* ── 存档目标(★ 2026-11-20 owner 裁定:自动保存)──
    `--memory` = 显式内存模式:`--db` 与默认路径都不生效,进程退出即丢。
@@ -178,6 +179,7 @@ async function main(): Promise<void> {
     sizeCells: WORLD_CELLS,
     mobs: true,
     design: WORLD_KEY === 'design',
+    overworld: WORLD_KEY === 'overworld',
     /* ★ 两种模式**互斥且显式**:内存模式给 `memory: true`,否则给文件路径。
        不给路径又不给 `--memory` ⇒ 走 `DEFAULT_DB_PATH`(而不是悄悄不落盘)。 */
     ...(DB_TARGET === null ? { memory: true } : { dbPath: DB_TARGET }),
@@ -212,7 +214,7 @@ async function main(): Promise<void> {
     log('  ' + mobs.slice(0, 8).map((m) => `${m.mobId}(${m.hp}/${m.maxHp})`).join(' · ')
       + (mobs.length > 8 ? ` … 共 ${mobs.length} 只` : ''));
   }
-  log(`世界来源:${WORLD_KEY === 'design' ? `设计图(${DESIGN_SIZE}×${DESIGN_SIZE} 手放区域)` : '空世界(--world plain,与改前一致)'}`);
+  log(`世界来源:${WORLD_KEY === 'overworld' ? `主世界 晨曦群岛(${WORLD_SIZE}×${WORLD_SIZE})` : WORLD_KEY === 'design' ? `设计图(${DESIGN_SIZE}×${DESIGN_SIZE} 手放区域)` : '空世界(--world plain)'}`);
   log(`房间 ${assembled.runtime.id} 就绪;host=${assembled.host === null ? 'null(异常)' : '已装配'}`);
 
   /* ── 1c 实测节拍探针(★ D-26:帧数即时间)──

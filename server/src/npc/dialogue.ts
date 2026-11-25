@@ -41,7 +41,7 @@
  * `status/have/canAccept/canTurnIn` —— UI 不需要再算一遍门槛。
  */
 
-import { NPCS, npcById, type NpcDef, type NpcQuest } from './defs.ts';
+import { activeNpcs, npcById, type NpcDef, type NpcQuest } from './defs.ts';
 
 /** 任务在**某个玩家账本**里的状态。 */
 export type QuestStatus = 'available' | 'accepted' | 'completed';
@@ -246,7 +246,7 @@ export interface QuestProgressRow {
  */
 export function progressOf(state: NpcPlayerState): QuestProgressRow[] {
   const out: QuestProgressRow[] = [];
-  for (const npc of NPCS) {
+  for (const npc of activeNpcs()) {
     const quest = npc.quest;
     if (quest === undefined) continue;
     const status = questStatusOf(state, quest.id);

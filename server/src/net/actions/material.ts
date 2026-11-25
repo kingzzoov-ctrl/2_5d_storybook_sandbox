@@ -33,6 +33,7 @@ import { ItemSourcePurpose } from '../anticheat.ts';
 import { bindItemSource, missingItemReadPort, ownedItemCount, unbindItemSource } from './item_source.ts';
 import type { ActionOutcome } from '../room.ts';
 import type { ActionContext, ActionHandler } from './types.ts';
+import { gather, gatherableOf } from './gather.ts';
 
 /**
  * 拾取半径(格)。
@@ -167,6 +168,10 @@ export const breakBlock: ActionHandler = (ctx: ActionContext): ActionOutcome => 
   /* ★ WS-FND-77(W 线 `gatherMul`):把**发起者**交给物质层 ——
      采集乘子(602「伐木与采矿速度 +20%」)只有知道是谁在采集才归属得出去。
      不传时的旧行为由 `MaterialApi.breakBlock` 的可选参数保证(回执不多键)。 */
+  /* 面前是世界原生的自然资源(树 / 矿 / 作物)⇒ 走采集,用同一套距离与工具判定:
+     否则「拆除」就是一条隔着半张地图、不带工具也能采的后门。
+     玩家自己放下的东西不在此列,照常拆。 */
+  if (mat.nativeAt?.(x, y) === true && gatherableOf(mat.blockAt(x, y)).ok) return gather(ctx);
   const r = mat.breakBlock(x, y, ctx.actorId);
   if (!r.ok) return { ok: false, kind: 'INVALID', reason: r.reason };
   /* ★ CR-27(P-04):件数放大在此结算 —— 世界源只给**乘子**(`gatherMul`,1 = 中性),

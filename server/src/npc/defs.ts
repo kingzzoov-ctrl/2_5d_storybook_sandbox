@@ -55,6 +55,8 @@ export interface NpcDef {
    * 所以单一台词会让"领了任务"与"没领"在屏幕上长得一样。
    */
   lines: readonly string[];
+  /** 接 AI 端点时给模型的人设(缺省用 `ai.ts` 里按 id 登记的那份)。 */
+  persona?: string;
   quest?: NpcQuest;
 }
 
@@ -132,12 +134,26 @@ export const NPCS: readonly NpcDef[] = [
   },
 ];
 
+/**
+ * 当前世界在用的名册。缺省是上面那四位(设计图);主世界装配时换成它自己的那一份。
+ * 一个进程只跑一个世界,所以名册是进程级的;下面所有按 id / 按位置的查找都读它。
+ */
+let active: readonly NpcDef[] = NPCS;
+
+export function activeNpcs(): readonly NpcDef[] {
+  return active;
+}
+
+export function setActiveNpcs(list: readonly NpcDef[]): void {
+  active = list;
+}
+
 /** `npcAt()` 的默认交互半径(格)。2.5 ≈ 「站在它旁边」。 */
 export const NPC_TALK_RADIUS = 2.5;
 
 /** 按 id 查 NPC(未知 id ⇒ `null`,不抛)。 */
 export function npcById(id: string): NpcDef | null {
-  for (const n of NPCS) if (n.id === id) return n;
+  for (const n of active) if (n.id === id) return n;
   return null;
 }
 
@@ -151,7 +167,7 @@ export function npcAt(x: number, y: number, radius: number = NPC_TALK_RADIUS): N
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(radius)) return null;
   let best: NpcDef | null = null;
   let bestD = Infinity;
-  for (const n of NPCS) {
+  for (const n of active) {
     const d = Math.hypot(x - n.home.x, y - n.home.y);
     if (d <= radius && d < bestD) {
       best = n;
@@ -164,7 +180,7 @@ export function npcAt(x: number, y: number, radius: number = NPC_TALK_RADIUS): N
 /** 落在矩形(含边界)里的 NPC —— 宿主投影快照时的只读入口。 */
 export function npcsIn(bounds: { x0: number; y0: number; x1: number; y1: number }): NpcDef[] {
   const { x0, y0, x1, y1 } = bounds;
-  return NPCS.filter((n) => n.home.x >= x0 && n.home.x <= x1 && n.home.y >= y0 && n.home.y <= y1);
+  return active.filter((n) => n.home.x >= x0 && n.home.x <= x1 && n.home.y >= y0 && n.home.y <= y1);
 }
 
 /**
@@ -175,13 +191,13 @@ export function npcsIn(bounds: { x0: number; y0: number; x1: number; y1: number 
  */
 export function allQuests(): readonly NpcQuest[] {
   const out: NpcQuest[] = [];
-  for (const n of NPCS) if (n.quest !== undefined) out.push(n.quest);
+  for (const n of active) if (n.quest !== undefined) out.push(n.quest);
   return out;
 }
 
 /** 按任务 id 查 `{ npc, quest }`(未知 id ⇒ `null`)。 */
 export function questById(questId: string): { npc: NpcDef; quest: NpcQuest } | null {
-  for (const n of NPCS) {
+  for (const n of active) {
     if (n.quest !== undefined && n.quest.id === questId) return { npc: n, quest: n.quest };
   }
   return null;

@@ -33,10 +33,10 @@ import { ACTION_HANDLERS, lookupActionHandler } from '../server/src/net/actions/
 import {
   GATHER_RADIUS,
   GATHERABLE_CATEGORY,
-  TOOL_TAGS,
+  GATHER_TOOL_RULES,
   gather,
   gatherableOf,
-  toolTagFor,
+  gatherToolFor,
 } from '../server/src/net/actions/gather.ts';
 import { gatherCountFor, gatherRollFor } from '../server/src/net/actions/material.ts';
 import { ITEM_BY_ID } from '../shared/constants/items.ts';
@@ -101,20 +101,28 @@ test('FND154-2 ★ 可采集物 = 内容表 §3.1(NATURAL);非自然资源 / 表
 
 /* ═══════════════ 3. 工具族词条也从内容表派生 ═══════════════ */
 
-test('FND154-3 ★ 工具族词条 = 工具表(§3.3)条目 tags 的并集;资源按词条交集要工具', () => {
-  /* 期望值从**内容表**算(与实现同源但不同写法:这里是「§3.3 条目的 tags」,实现是同一件事 —— 
-     故再补一条人工锚点,避免「同义反复」)。 */
-  const expected = new Set<string>();
-  for (const i of ITEM_BY_ID.values()) if (i.category === ItemCategory.TOOL) for (const t of i.tags) expected.add(t);
-  eq([...TOOL_TAGS].sort(), [...expected].sort(), '工具族词条集必须等于 §3.3 条目的词条并集');
-  ok(TOOL_TAGS.includes('木材') && TOOL_TAGS.includes('石材'), '人工锚点:木材 / 石材在工具族里');
-
-  eq(toolTagFor(LOG), '木材', '暖松原木要一件带『木材』的工具(201 斧)');
-  eq(toolTagFor(STONE), '石材', '云母圆石要一件带『石材』的工具(203 镐)');
-  eq(toolTagFor(BERRY), null, '★ 露水甜莓的 tags 与工具族无交集 ⇒ **徒手**可采');
-  /* 负对照:工具族词条**不是**随便一个词条 —— 资源的非工具词条不会被当成要求。 */
-  ok(toolTagFor(BERRY) === null && ITEM_BY_ID.get(BERRY)!.tags.includes('水果'),
-    '★ 负对照:「水果」不是工具族词条(否则浆果也要工具)');
+test('FND154-3 ★ 采集工具表:斧砍树 / 镐敲矿 / 铲挖土,其余徒手;表里每一项都在内容表里', () => {
+  /* 规则是一张显式的表(不从词条推导:词条交集会得出「割草要捕虫网、挖矿要炒菜铲」)。 */
+  const seen = new Set<number>();
+  for (const r of GATHER_TOOL_RULES) {
+    ok(r.tools.length > 0 && r.resources.length > 0, `${r.label}:工具与资源都不能为空`);
+    for (const t of r.tools) eq(ITEM_BY_ID.get(t)?.category, ItemCategory.TOOL, `${r.label} 的工具 #${t} 必须是内容表里的工具`);
+    for (const id of r.resources) {
+      eq(ITEM_BY_ID.get(id)?.category, ItemCategory.NATURAL, `${r.label} 管的 #${id} 必须是自然资源`);
+      ok(!seen.has(id), `★ #${id} 只归一类工具管(归两类就不知道该报缺哪一把)`);
+      seen.add(id);
+    }
+  }
+  eq(gatherToolFor(LOG)?.label, '斧', '暖松原木要斧');
+  ok(gatherToolFor(LOG)!.tools.includes(AXE), '起始包里的 201 石刃斧就能砍');
+  eq(gatherToolFor(113)?.label, '镐', '寒铁矿石要镐');
+  eq(gatherToolFor(107)?.label, '铲', '河畔红黏土要铲');
+  eq(gatherToolFor(BERRY), null, '★ 露水甜莓徒手可采');
+  eq(gatherToolFor(118), null, '★ 柔韧风草徒手可采(旧规则要一张捕虫网)');
+  /* ★ 第一把镐(203)的配方 = 101×2 + 106×3;起始包只有 2 块石头 ⇒ 石头必须徒手能捡,
+     否则「要镐才能采石头、要石头才能造镐」是死循环。 */
+  eq(gatherToolFor(STONE), null, '★ 云母圆石徒手可捡(镐的配方要它)');
+  eq(ITEM_BY_ID.get(203)?.recipe?.[STONE], 3, '人工锚点:203 的配方确实要 3 块圆石');
 });
 
 /* ═══════════════════════ 手搓 ctx(动作层判定面)═══════════════════════ */
@@ -359,7 +367,7 @@ test('FND154-7 ★ 缺工具 ⇒ 拒;「有同词条但不是工具」同样拒;
   const bare = makeRig({ cells: { '1,0': LOG } });
   const noTool = gatherAt(bare, 1, 0);
   eq(noTool.kind, 'INVALID', '★ 没有工具必须拒');
-  ok((noTool.reason ?? '').includes('木材'), `拒因要点名缺哪一族工具(实测:${noTool.reason ?? '-'})`);
+  ok((noTool.reason ?? '').includes('斧'), `拒因要点名缺哪一类工具(实测:${noTool.reason ?? '-'})`);
   eq(bare.cells.get('1,0'), LOG, '★ 零副作用:那一件还在');
   eq(bare.counts.size, 0, '★ 零副作用:背包没动');
 
@@ -374,7 +382,7 @@ test('FND154-7 ★ 缺工具 ⇒ 拒;「有同词条但不是工具」同样拒;
   const withAxe = makeRig({ cells: { '1,0': LOG }, owns: { [AXE]: 1 } });
   const okOut = gatherAt(withAxe, 1, 0);
   eq(okOut.kind, 'OK', `★ 负对照:有斧头就该采得到(实测 ${okOut.reason ?? '-'})`);
-  eq(okOut.effect?.tool, '木材', '回执如实带上是哪一族工具放行的');
+  eq(okOut.effect?.tool, '斧', '回执如实带上是哪一类工具放行的');
   eq(withAxe.counts.get(LOG), 1, '原木进背包');
 
   /* 徒手资源(露水甜莓)不需要任何工具 —— 正例,防止「工具闸被写成恒真要求」。 */

@@ -11,7 +11,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { NPCS, type NpcDef } from './defs.ts';
+import { activeNpcs, type NpcDef } from './defs.ts';
 
 /** 一个端点的连接参数(OpenAI 兼容)。 */
 export interface AiEndpoint {
@@ -49,9 +49,10 @@ export interface GmConfig {
 
 export const DEFAULT_WORLD_PROMPT = [
   '你在扮演一款 2.5D 绘本风多人沙盒游戏里的一位岛民。',
-  '世界:一座漂在云海上的岛。中央是红砖广场与篝火,南边是农田,西南是矿丘与萤光溶洞,',
-  '东南是发条遗迹,北面有绯樱高地和温泉,东边是星沙绿洲,再远处有甜点奇境和浮空云海。',
-  '岛上有八个群系、二十四种野生动物,每个群系深处睡着一只巨大的 Boss。',
+  '世界:一座叫「晨曦群岛」的大岛。正中是晨曦镇 —— 红砖广场、许愿喷泉、工坊街和集市;镇子四周是晨曦草甸。',
+  '从镇子出发:西边是金秋河谷(麦田与桃林),西北是翠竹林,北边是绯樱高地(樱花与温泉),东北是浮空云海,',
+  '东边是星沙绿洲(沙漠与湖),东南是发条遗迹,南边是甜点奇境(糖果树与巧克力池),西南是被群山围住的萤光溶洞。',
+  '一圈环路连着八处营地;每个地方最深处有一座远古共鸣祭坛,献上祭品会唤醒那里的巨大 Boss。',
   '玩家是刚上岛的旅人,可以采集、合成、盖房子、打猎、驯养动物,也爱互相恶作剧。',
   '',
   '说话规则:',
@@ -61,7 +62,7 @@ export const DEFAULT_WORLD_PROMPT = [
   '4. 「当前事实」里写的任务状态和数量是真的,不要说出与它矛盾的数字,也不要许诺事实里没有的奖励。',
 ].join('\n');
 
-/** 四位岛民的人设(键 = `NpcDef.id`)。 */
+/** 设计图那四位岛民的人设(键 = `NpcDef.id`);主世界的居民把人设写在各自的 `NpcDef.persona` 里。 */
 export const DEFAULT_NPC_PROMPTS: Readonly<Record<string, string>> = {
   npc_mayor: [
     '你是镇长·阿岭,五十来岁,红砖广场篝火边的常客。',
@@ -91,10 +92,10 @@ export const DEFAULT_NPC_PROMPTS: Readonly<Record<string, string>> = {
 
 export function defaultGmConfig(): GmConfig {
   const npcs: Record<string, NpcAiConfig> = {};
-  for (const n of NPCS) {
+  for (const n of activeNpcs()) {
     npcs[n.id] = {
       enabled: true,
-      prompt: DEFAULT_NPC_PROMPTS[n.id] ?? `你是${n.name},岛上的一位居民。`,
+      prompt: n.persona ?? DEFAULT_NPC_PROMPTS[n.id] ?? `你是${n.name},岛上的一位居民。`,
       endpoint: {},
     };
   }
@@ -136,7 +137,7 @@ export function normalizeGmConfig(raw: unknown): GmConfig {
     },
     npcs: {},
   };
-  for (const n of NPCS) {
+  for (const n of activeNpcs()) {
     const one = r.npcs?.[n.id] ?? {};
     const oep = (one['endpoint'] ?? {}) as Record<string, unknown>;
     const endpoint: Partial<AiEndpoint> = {};
@@ -237,7 +238,7 @@ export async function askNpcAi(
 ): Promise<AiReply> {
   const t0 = Date.now();
   const fail = (reason: string): AiReply => ({ ok: false, reason, ms: Date.now() - t0 });
-  const npc = NPCS.find((n) => n.id === npcId);
+  const npc = activeNpcs().find((n) => n.id === npcId);
   if (npc === undefined) return fail('没有这个 NPC');
   if (!cfg.ai.enabled) return fail('AI 总开关关闭');
   if (cfg.npcs[npcId]?.enabled !== true) return fail('该 NPC 的 AI 关闭');
