@@ -224,6 +224,275 @@ export const REGION_BIOME: Readonly<Record<string, string>> = {
 export const BIOME_KEYS: readonly string[] = [
   'MEADOW', 'VALLEY', 'SAKURA', 'CAVERN', 'OASIS', 'DESSERT', 'SKYSEA', 'RUINS',
 ];
+
+/* ═══════ 2b. 起伏:台地 / 丘陵 / 崖壁 / 河谷(手放,不是噪声)═══════
+ *
+ * ## 为什么必须有这一节(改前 = 一片平板)
+ *
+ * 改前逐格实测(192×192,盖完图之后数格):
+ *
+ * ```text
+ * DEEP 18104 / GROUND 18384 / PLATFORM 298 / CLIFF 78
+ * ⇒ 陆地 18760 格里只有 376 格(2.0%)不是平地 —— 起伏只集中在高地与矿丘两处。
+ * ```
+ *
+ * 也就是说「地面」98% 是同一层 z = 0 的平板。owner 说的「看起来依旧不是一个
+ * 世界」有一半是**这个**(另一半是顶面贴图)。
+ *
+ * ## 口径(与判据 `WS-FND-194` 同源,写在这里因为口径就是规格)
+ *
+ *   - 台地/丘陵 = `PLATFORM`(z = +1);
+ *   - 崖壁      = `CLIFF`(z = +2);
+ *   - 河谷/河床 = `DEEP`(z = −1),两侧各一格沙洲(可走的缓坡,不是墙)。
+ *
+ * ⚠️ **崖壁只做扇形/单面,从不围满一圈**:`CLIFF` 在连通性判据里是**墙**
+ * (`WS-FND-181` FND181-6 与 `WS-FND-194` 第 3 条都把它当墙)⇒ 围满一圈等于把那
+ * 块地封死:玩家走不上去、判据当场变红。这不是"顺手",是**必须留的通行口**。
+ *
+ * 角度约定:**0 = +x(东),π/2 = +y(本仓 y 轴朝下 ⇒ 南)**,`from..to` 逆时针。
+ */
+
+/** 台地/丘陵:一个圆台面 + 可选的**扇形崖壁**。 */
+export interface MoundSpec {
+  id: string;
+  name: string;
+  /** 台面圆心(格)。 */
+  cx: number;
+  cy: number;
+  /** 台面半径(格)。 */
+  r: number;
+  /** 台面地表材质(`BaseFluid`)。 */
+  base: number;
+  /** 台面地砖物品 id(0 = 裸地)。 */
+  floorItemId: number;
+  /** 崖壁扇区:`from`..`to`(弧度)+ `inner`(崖壁内半径,一般 r−2..r−3)。 */
+  cliff?: { from: number; to: number; inner: number };
+  /** 设计意图(一句话)。 */
+  intent: string;
+}
+
+/**
+ * 8 处台地/丘陵。位置全部**手放**,并且逐条避开三样东西:
+ *
+ *   1. 营地 84..108(出生点必须与地面同高 —— 见文件头);
+ *   2. `WS-FND-181` FND181-3 / FND181-6 的**探针格**(代表格语义不许被抬高改掉);
+ *   3. 主路的十字带(全场 x∈[94,97] 与 y∈[94,97]:主路会把它压回 GROUND)。
+ *
+ * 高地(80,48)与矿丘(64,128)改前就有台地;这里给草原/竹林/沼泽/沙丘各加抬升,
+ * 农田与遗迹是矩形台地(见 `TERRACES`)。
+ */
+export const MOUNDS: readonly MoundSpec[] = [
+  {
+    id: 'meadow-mesa', name: '草原台地', cx: 74, cy: 74, r: 13,
+    base: BaseFluid.GRASS, floorItemId: 0,
+    cliff: { from: -2.50, to: -1.40, inner: 10 },
+    intent: '草原里的一台:出营地北墙就能爬上去,台上能一眼看回广场。崖壁在北面(远处),上坡口朝营地。',
+  },
+  {
+    id: 'meadow-knoll', name: '草原矮丘', cx: 46, cy: 54, r: 7,
+    base: BaseFluid.GRASS, floorItemId: 0,
+    intent: '西北开阔草地上的矮丘:给「往西北走半天都是平的」那段路一个起伏。',
+  },
+  {
+    id: 'grove-mesa', name: '竹丘', cx: 120, cy: 54, r: 10,
+    base: BaseFluid.GRASS, floorItemId: 312,
+    cliff: { from: 0.45, to: 1.55, inner: 7 },
+    intent: '竹林(深绿草皮 312)抬起的一台:西北是缓坡,东南面是竹崖 —— 竹林不再是一块平色块。',
+  },
+  {
+    id: 'marsh-mesa', name: '泥沼台地', cx: 34, cy: 99, r: 6,
+    base: BaseFluid.DIRT, floorItemId: 316,
+    cliff: { from: 2.40, to: 3.40, inner: 4 },
+    intent: '沼泽里的一块干台(紫泥 316):西面朝海是泥崖,东面坡道走得上去 —— 沼泽里的一处落脚点。',
+  },
+  {
+    id: 'dunes-crest', name: '沙丘主峰', cx: 89, cy: 151, r: 7,
+    base: BaseFluid.GOLD_SAND, floorItemId: 0,
+    cliff: { from: 1.20, to: 2.20, inner: 5 },
+    intent: '沙漠的沙丘主峰:南面被风削成沙崖,北面是缓坡 ⇒ 沙丘有正面也有背面。',
+  },
+  {
+    id: 'dunes-crest-2', name: '沙丘副峰', cx: 105, cy: 154, r: 6,
+    base: BaseFluid.GOLD_SAND, floorItemId: 0,
+    intent: '主峰东侧的小沙丘:两峰之间留一道可走的风口,不是一堵沙墙。',
+  },
+  {
+    id: 'east-ridge', name: '东岭', cx: 117, cy: 80, r: 8,
+    base: BaseFluid.ROCK, floorItemId: 0,
+    cliff: { from: -0.40, to: 0.95, inner: 6 },
+    intent: '营地与湖之间的岩岭:登上去能同时看到广场与湖面,东面是岩壁挡住直接下山。',
+  },
+  {
+    id: 'south-ridge', name: '矿丘北岭', cx: 85, cy: 120, r: 8,
+    base: BaseFluid.ROCK, floorItemId: 0,
+    cliff: { from: -2.00, to: -0.85, inner: 5 },
+    intent: '矿丘与农田之间的岩岭:把西南角从「两块孤岛」连成一片台地;北面岩壁,南面接农田。',
+  },
+];
+
+/** 梯田/台基:矩形抬升。`bands` = 行带,**带与带之间留沟**(农田的灌溉渠就是这么留下的)。 */
+export interface TerraceSpec {
+  id: string;
+  name: string;
+  /** 列范围(含)。 */
+  x0: number;
+  x1: number;
+  /** 行带 `[y0, y1][]`(含);带与带之间的行**不动**(⇒ 沟渠还在原位)。 */
+  bands: readonly (readonly [number, number])[];
+  base: number;
+  floorItemId: number;
+  /** 把**第一行 / 最后一行**做成崖壁(挡土墙);缺省 = 整块都是台面。 */
+  cliffRow?: 'first' | 'last';
+  intent: string;
+}
+
+export const TERRACES: readonly TerraceSpec[] = [
+  {
+    id: 'farm-terrace', name: '农田梯田',
+    x0: 80, x1: 106,
+    /* 三条畦面:132..134 / 136..138 / 140;131、135、139 是**留出来**的灌溉渠(浅水)。 */
+    bands: [[132, 134], [136, 138], [140, 140]],
+    base: BaseFluid.DIRT, floorItemId: 301,
+    intent: '农田抬成三级畦面,灌溉渠留在低处 ⇒ 从田埂上看得出一层一层,而不是一块土色。',
+  },
+  {
+    id: 'ruins-terrace', name: '遗迹台基',
+    x0: 119, x1: 137,
+    bands: [[131, 138]],
+    base: BaseFluid.ROCK, floorItemId: 306,
+    cliffRow: 'last',
+    intent: '遗迹广场的南半抬成一层台基(大理石 306),最南一行是挡土崖 —— 祭坛与传送砖留在台下,台基不压它们。',
+  },
+];
+
+/** 海岸崖壁:沿一段极角把沙滩整条抬成 `CLIFF`(临海崖)。段与段之间**留通行口**。 */
+export interface SeaCliffSpec {
+  id: string;
+  name: string;
+  /** 极角区间(弧度,世界中心为原点;0 = 东,π/2 = 南)。 */
+  from: number;
+  to: number;
+  base: number;
+  /** 自海岸线向内的宽度(格,≤ `BEACH_BAND`)。 */
+  width: number;
+  intent: string;
+}
+
+/**
+ * 三段海岸崖壁。**故意避开四个主路方向**(0 / ±π/2 / π)⇒ 每一段沙滩都还留着
+ * 一条从主路下来的通行口,海岸仍然是可以下去的地方(栈桥的陆地侧不会被堵)。
+ */
+export const SEA_CLIFFS: readonly SeaCliffSpec[] = [
+  {
+    id: 'ne-sea-cliff', name: '东北海岸崖', from: -1.15, to: -0.35,
+    base: BaseFluid.ROCK, width: 5,
+    intent: '东北岸:崖顶能俯瞰海面,沙滩在这里变成岩岸 —— 海岸线本身有高低了。',
+  },
+  {
+    id: 'se-sea-cliff', name: '东南海岸崖', from: 0.35, to: 1.15,
+    base: BaseFluid.ROCK, width: 5,
+    intent: '东南岸:遗迹与沙丘之间的岩岸,把「去东南角」变成一段有落差的路。',
+  },
+  {
+    id: 'sw-sea-cliff', name: '西南海岸崖', from: 2.05, to: 2.80,
+    base: BaseFluid.ROCK, width: 5,
+    intent: '西南岸:矿丘背后的岩岸 —— 从丘顶看下去,海是掉下去的而不是平平铺开的。',
+  },
+];
+
+/* ── 河谷:手放的轴对齐折线(便于判据逐格断言「连续」)── */
+
+/**
+ * 河谷中心线的折线顶点(格)。**每段只沿一个轴走** —— 这样「河道连续」可以逐格断言:
+ * 沿折线每次前进 1 格,那一格必须仍是河床(`WS-FND-194` 第 4 条)。
+ *
+ * 走向(手放,不是随机):自西岸海面 (20,112) 上陆 → 沿 y = 112 东流(营地南墙以南 4 格)
+ * → 在 x = 110 北折(营地东墙以东 2 格)→ 东折到 x = 118 → 沿 x = 118 北上到 y = 84
+ * → 东折进湖 (136,84):**河口**。
+ *
+ * ⚠️ 河道宽 3 格(±1)、沙洲再各 1 格(±2)⇒ **每一格河床都必须满足 x ≥ 109 或 y ≥ 109**
+ * (营地是 84..107 的方块,`inCamp` 会把切进去的河格挡掉)。实测:早先把纵向段放在
+ * x = 100,河道从营地东南角穿过去,被挡掉 4 格 ⇒ 河道断点,`WS-FND-194` 第 4 条当场变红。
+ * 这也是为什么 `riverCenterline()` 必须**逐格**断言 —— 靠肉眼看折线看不出这 4 格。
+ */
+export const RIVER_PATH: readonly { x: number; y: number }[] = [
+  { x: 20, y: 112 },
+  { x: 110, y: 112 },
+  { x: 110, y: 106 },
+  { x: 118, y: 106 },
+  { x: 118, y: 84 },
+  { x: 136, y: 84 },
+];
+
+/** 河床半宽(格)⇒ 河道宽 2×1+1 = 3 格。 */
+export const RIVER_HALF_WIDTH = 1;
+/** 河岸沙洲半宽(格):2 格以内减掉河床 = 沙洲带。 */
+export const RIVER_BANK_WIDTH = 2;
+/** 桥面地砖(= 跨海栈桥同一种水上浮木 310;`walkable` 口径里「水面 + 有铺装」可走)。 */
+export const RIVER_BRIDGE_FLOOR_ID = 310;
+
+/**
+ * 河谷中心线上的**每一格**(1 格宽)。轴对齐 ⇒ 逐格步进不会跳格。
+ * 这就是「河道连续」的机检口径:沿它走一遍,每一格都必须是河床。
+ */
+export function riverCenterline(): { x: number; y: number }[] {
+  const out: { x: number; y: number }[] = [{ ...RIVER_PATH[0]! }];
+  for (let i = 1; i < RIVER_PATH.length; i += 1) {
+    const a = RIVER_PATH[i - 1]!;
+    const b = RIVER_PATH[i]!;
+    const dx = Math.sign(b.x - a.x);
+    const dy = Math.sign(b.y - a.y);
+    if (dx !== 0 && dy !== 0) throw new Error('RIVER_PATH 每段必须轴对齐(只沿一个轴走)');
+    if (dx === 0 && dy === 0) continue;
+    let x = a.x;
+    let y = a.y;
+    while (x !== b.x || y !== b.y) {
+      x += dx;
+      y += dy;
+      out.push({ x, y });
+    }
+  }
+  return out;
+}
+
+/** 河床(宽 `2*RIVER_HALF_WIDTH+1` 格,含折角处补齐的格)。 */
+export function riverChannelCells(): { x: number; y: number }[] {
+  return bandAroundCenterline(RIVER_HALF_WIDTH);
+}
+
+/** 河岸沙洲(宽 `2*RIVER_BANK_WIDTH+1` 格**减掉**河床)。 */
+export function riverBankCells(): { x: number; y: number }[] {
+  const bed = new Set(bandAroundCenterline(RIVER_HALF_WIDTH).map((p) => p.y * 4096 + p.x));
+  return bandAroundCenterline(RIVER_BANK_WIDTH).filter((p) => !bed.has(p.y * 4096 + p.x));
+}
+
+/**
+ * 中心线两侧 `half` 格的地带。
+ *
+ * ⚠️ 折角格要**两个轴的偏移都发一遍**(只发一个轴会在拐角漏掉斜角格 ——
+ * 那种漏格在截图上是「河中间一小块岸」,在判据上就是河道断点)。
+ */
+function bandAroundCenterline(half: number): { x: number; y: number }[] {
+  const line = riverCenterline();
+  const seen = new Set<number>();
+  const out: { x: number; y: number }[] = [];
+  const push = (x: number, y: number): void => {
+    const key = y * 4096 + x;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ x, y });
+  };
+  for (let i = 0; i < line.length; i += 1) {
+    const p = line[i]!;
+    const next = line[Math.min(i + 1, line.length - 1)]!;
+    const prev = line[Math.max(i - 1, 0)]!;
+    const dx = next.x - p.x + (p.x - prev.x);
+    const dy = next.y - p.y + (p.y - prev.y);
+    if (dx !== 0) for (let k = -half; k <= half; k += 1) push(p.x, p.y + k);
+    if (dy !== 0) for (let k = -half; k <= half; k += 1) push(p.x + k, p.y);
+  }
+  return out;
+}
 /* ═══════════════════════ 3. 写入接口(窄接口,便于单测) ═══════════════════════ */
 
 /**
@@ -263,6 +532,17 @@ export interface DesignReport {
   regions: RegionCount[];
   /** 用了哪些地砖物品 id(判据用它证明「地表不止一种」)。 */
   floorItemIds: number[];
+  /**
+   * ★ w99(起伏):台地格数 / 崖壁格数 / 河床格数 / 桥上格数。
+   *
+   * ⚠️ 与 `landCells` 等既有字段同一口径 —— 它们是**盖章时写入的格数**
+   * (短时间内可以被后一遍覆盖,例如主路会把台地压回 GROUND)。
+   * 判据要「最终落到世界上的格数」时,从 writer 读回来数(WORKBOOK `WS-FND-194`)。
+   */
+  platformCells: number;
+  cliffCells: number;
+  riverCells: number;
+  bridgeCells: number;
 }
 
 /** 报告里的 `floorItemIds` 按数值升序去重。 */
@@ -318,6 +598,11 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
   let roadCells = 0;
   let pierCells = 0;
   let landmarkCells = 0;
+  /* ★ w99:起伏/河谷的记账(与既有字段同一口径:盖章时写入的格数)。 */
+  let platformCells = 0;
+  let cliffCells = 0;
+  let riverCells = 0;
+  let bridgeCells = 0;
   const perRegion = new Map<string, number>();
   const floorIds = new Set<number>();
 
@@ -401,6 +686,10 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
         if (!inRange(x, y)) continue;
         if (Math.hypot(x - cx, y - cy) > rad) continue;
         if (!isLand(x, y)) continue;
+        /* ★ w99:区自带的抬升层(高地/矿丘的中环与丘心)也要记账 —— 否则
+           `platformCells` 只算新加的台地,与逐格读回的量级对不上。 */
+        if (spec.elev === Elevation.PLATFORM) platformCells += 1;
+        else if (spec.elev === Elevation.CLIFF) cliffCells += 1;
         put(x, y, { elev: spec.elev, base: spec.base, floor: slot });
         markRegion(id);
       }
@@ -411,6 +700,8 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
     for (let y = y0; y <= y1; y += 1) {
       for (let x = x0; x <= x1; x += 1) {
         if (!inRange(x, y) || !isLand(x, y)) continue;
+        if (spec.elev === Elevation.PLATFORM) platformCells += 1;
+        else if (spec.elev === Elevation.CLIFF) cliffCells += 1;
         put(x, y, { elev: spec.elev, base: spec.base, floor: slot });
         markRegion(id);
       }
@@ -490,6 +781,82 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
     }
   }
 
+  /* ── 4.4b 台地与丘陵(PLATFORM)+ 扇形崖壁(CLIFF)──
+     顺序理由:在 11 个区**之后** ⇒ 台地盖过区表面(与高地/矿丘同一做法);
+     在道路与河谷**之前** ⇒ 主路会从台上切出一条可走的通道,河谷会从台上切出河谷。 */
+  /**
+   * 角度是否落在 `[from, to]`(逆时针,跨度必须 < 2π)。折到 [0, 2π) 再比 ⇒ 负角也认。
+   */
+  const inArc = (a: number, from: number, to: number): boolean => {
+    const span = to - from;
+    const rel = (((a - from) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    return rel <= span;
+  };
+  const mound = (m: MoundSpec): void => {
+    const slot = m.floorItemId === 0 ? 0 : floorSlotOfId(m.floorItemId);
+    for (let y = m.cy - m.r; y <= m.cy + m.r; y += 1) {
+      for (let x = m.cx - m.r; x <= m.cx + m.r; x += 1) {
+        if (!inRange(x, y) || !isLand(x, y)) continue;
+        const d = Math.hypot(x - m.cx, y - m.cy);
+        if (d > m.r) continue;
+        const c = m.cliff;
+        const walled = c !== undefined && d >= c.inner
+          && inArc(Math.atan2(y - m.cy, x - m.cx), c.from, c.to);
+        put(x, y, {
+          elev: walled ? Elevation.CLIFF : Elevation.PLATFORM,
+          base: m.base,
+          floor: slot,
+        });
+        if (walled) cliffCells += 1;
+        else platformCells += 1;
+      }
+    }
+  };
+  for (const m of MOUNDS) mound(m);
+
+  /* ── 4.4c 梯田 / 台基(矩形抬升)──
+     `bands` 的行带之间**不动** ⇒ 农田那三条灌溉渠(131/135/139)留在低处。 */
+  const terrace = (t: TerraceSpec): void => {
+    const slot = t.floorItemId === 0 ? 0 : floorSlotOfId(t.floorItemId);
+    for (let bi = 0; bi < t.bands.length; bi += 1) {
+      const band = t.bands[bi]!;
+      for (let y = band[0]; y <= band[1]; y += 1) {
+        for (let x = t.x0; x <= t.x1; x += 1) {
+          if (!inRange(x, y) || !isLand(x, y)) continue;
+          const wall = (t.cliffRow === 'last' && bi === t.bands.length - 1 && y === band[1])
+            || (t.cliffRow === 'first' && bi === 0 && y === band[0]);
+          put(x, y, {
+            elev: wall ? Elevation.CLIFF : Elevation.PLATFORM,
+            base: t.base,
+            floor: slot,
+          });
+          if (wall) cliffCells += 1;
+          else platformCells += 1;
+        }
+      }
+    }
+  };
+  for (const t of TERRACES) terrace(t);
+
+  /* ── 4.4d 海岸崖壁:沿几段极角把沙滩整条抬成 CLIFF(临海崖)──
+     段与段之间**留通行口**(角度刻意避开 0/±π/2/π 四个主路方向)⇒ 海岸仍然
+     下得去,栈桥的陆地侧也不会被崖壁堵住。 */
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      if (!isLand(x, y)) continue;
+      const { r, th } = radiusOf(x, y);
+      const coast = coastRadius(th);
+      if (r <= coast - BEACH_BAND) continue;
+      for (const sc of SEA_CLIFFS) {
+        if (r < coast - sc.width) continue;
+        if (!inArc(th, sc.from, sc.to)) continue;
+        put(x, y, { elev: Elevation.CLIFF, base: sc.base, floor: 0 });
+        cliffCells += 1;
+        break;
+      }
+    }
+  }
+
   /* ── 4.5 道路:环路(半径 38~40)+ 四条主路 ──
      地砖 309「萤光星光夜路砖」:它自带「夜间发光并阻止野怪刷新」(items.ts note)
      ⇒ 用主干道把 11 个区串起来,同时给玩家一条**夜里也安全**的动线。 */
@@ -519,6 +886,48 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
   for (const p of pierTargets) {
     put(p.x, p.y, { elev: Elevation.DEEP, base: BaseFluid.SHALLOW_WATER, floor: floorSlotOfId(310) });
     pierCells += 1;
+  }
+
+  /* ── 4.5b 河谷:沿手放折线挖一条**连续**低洼带 ──
+     为什么放在道路**之后**:道路(4.5)会把河道上的路面压回 GROUND ⇒ 河道出现断点
+     (`WS-FND-194` 第 4 条要的就是这种断点)。所以这里在道路之后再挖一遍,
+     并把「被道路压过的河格」补成**木桥**(310)—— 桥面 `elev = DEEP` 且 `floor != 0`,
+     在连通性口径里**可走**(与跨海栈桥同一条规则)⇒ 环路与四条主路不会断。
+     河岸(2 格内的沙洲)是 `GROUND` 缓坡:它**不是墙**,只是把河谷的界线画出来。 */
+  /** 是不是主路格(环路带 / 十字带,营地除外)。桥与河岸都按它让路。 */
+  const isRoadCell = (x: number, y: number): boolean => {
+    if (inCamp(x, y)) return false;
+    const { r } = radiusOf(x, y);
+    if (r >= RING_INNER && r <= RING_OUTER) return true;
+    return Math.abs(x + 0.5 - c) <= 1.5 || Math.abs(y + 0.5 - c) <= 1.5;
+  };
+  /* 营地 + 1 格外扩:河岸沙洲**不许**盖到广场那圈石径(它落在 83/84/107/108 上)。
+     河道本身不走这里(见 `RIVER_PATH` 的 ⚠️),所以这不是「挡河道」而是「挡沙洲」。 */
+  const nearCamp = (x: number, y: number): boolean =>
+    x >= DESIGN_CENTER - campHalf - 1 && x <= DESIGN_CENTER + campHalf
+    && y >= DESIGN_CENTER - campHalf - 1 && y <= DESIGN_CENTER + campHalf;
+  const riverChannel = riverChannelCells();
+  for (const p of riverChannel) {
+    if (!inRange(p.x, p.y) || inCamp(p.x, p.y)) continue;
+    put(p.x, p.y, { elev: Elevation.DEEP, base: BaseFluid.SHALLOW_WATER, floor: 0 });
+    riverCells += 1;
+  }
+  /* 桥:河道上凡是主路经过的格 ⇒ 木桥(可走)。主路因此从桥上过河,不是被河切断。 */
+  for (const p of riverChannel) {
+    if (!inRange(p.x, p.y) || inCamp(p.x, p.y)) continue;
+    if (!isLand(p.x, p.y) || !isRoadCell(p.x, p.y)) continue;
+    put(p.x, p.y, {
+      elev: Elevation.DEEP,
+      base: BaseFluid.SHALLOW_WATER,
+      floor: floorSlotOfId(RIVER_BRIDGE_FLOOR_ID),
+    });
+    bridgeCells += 1;
+  }
+  /* 河岸沙洲:只在陆地上,且**不压任何主路格**(压了会在地面上留一段断头的路面)。 */
+  for (const p of riverBankCells()) {
+    if (!inRange(p.x, p.y) || nearCamp(p.x, p.y)) continue;
+    if (!isLand(p.x, p.y) || isRoadCell(p.x, p.y)) continue;
+    put(p.x, p.y, { elev: Elevation.GROUND, base: BaseFluid.GOLD_SAND, floor: 0 });
   }
 
   /* ── 4.6 地标(OBJ 层):不是装饰,是**玩法点** ──
@@ -600,6 +1009,10 @@ export function applyWorldDesign(w: DesignWriter, opts: { size?: number } = {}):
     spawn: { x: DESIGN_CENTER, y: DESIGN_CENTER },
     regions: regionOrder,
     floorItemIds: sortedUnique([...floorIds]),
+    platformCells,
+    cliffCells,
+    riverCells,
+    bridgeCells,
   };
 }
 

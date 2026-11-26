@@ -16,7 +16,7 @@
  * | 2 | 铺装 > 地表 > 海拔层:同一格 `floorSlot = 5` 必须**盖掉** `base` | 两个色必须**不同**;不同 `base` 必须不同色 |
  * | 3 | 非法 `base`/`floorSlot`/`NaN` 不抛异常、不产生 NaN、分量 ∈ [0,1],且**走回落** | 合法输入必须**不**等于回落色(否则「回落」与「恒返回同一个值」不可区分) |
  * | 4 | 真几何:同海拔、不同 `base` ⇒ 顶点色里出现**两种**顶面色;再加 `floor: 5` ⇒ 第三种 | 把顶面改回 `faceColor(层, true)` 这条必红(实测见提交说明) |
- * | 5 | 片元着色器**仍不采样纹理**;分量数仍是 3 | 源码里注掉一次乘法/加一个 `sampler2D` 必须被同一条检测器抓到 |
+ * | 5 | 片元**采样图集**且采样被 `uAtlasReady` 门控;分量数仍是 3 | 加一个 `sampler2D` 不再算缺陷,但**拿掉门控**必须被同一条检测器抓到(WS-FND-193 契约反转) |
  * | 6 | 侧面暗档与顶面材质表**无共同色**(两条着色路径可判定) | 手动往材质表塞一个暗档 ⇒ 同一口径必须报 1 处重叠 |
  *
  * 运行:`node tests/WS-FND-180-terrain-material-palette.test.ts`
@@ -36,6 +36,7 @@ import {
   faceColor,
   lodPaletteOf,
   terrainShaderSamplesTexture,
+  terrainAtlasSamplingGated,
   topColorOf,
   topMaterialPaletteOf,
   type FaceColor,
@@ -227,18 +228,34 @@ test('4 真几何(emitChunkGeometry):同海拔不同 base ⇒ 两种顶面色;�
     '负对照:沙色 ≠ 层 1 的亮档(否则新口径与旧口径区分不开)');
 });
 
-/* ─────────────────── 5 / 着色器仍不采样纹理 ─────────────────── */
+/* ─────────────────── 5 / 采样图集 + 门控(WS-FND-193 契约反转)─────────────────── */
 
-test('5 片元着色器仍不采样纹理;分量数仍是 3(材质色不改顶点布局)', () => {
-  eq(terrainShaderSamplesTexture(), false, '顶点色路径不得出现 sampler2D / texture2D');
+test('5 片元采样图集且被 uAtlasReady 门控;分量数仍是 3(材质色不改顶点布局)', () => {
+  /*
+   * ★ 本条在 WS-FND-193 之前是「片元着色器**仍不采样纹理**」。
+   *   反转的理由写在 `terrain_vcolor.ts` 顶部的「WS-FND-193 契约反转」一节
+   *   (owner:「还是一堆色块,需要贴图」;图集本来就是运行时 fetch 的成品资源,
+   *   地砖 301..330 的格子在里面 —— 不重画、不重传,只多一个采样器)。
+   *   反转后**没有**被放宽的两件事:顶点色仍是材质基色(仍是 3 分量、仍参与输出),
+   *   且采样必须被门控(图集未到 ⇒ 退回纯顶点色,不许黑屏)。
+   */
+  eq(terrainShaderSamplesTexture(), true, '★ 契约反转:片元必须出现 sampler2D / texture2D');
   eq(TERRAIN_COLOR_COMPONENTS, 3, '锚点:每顶点 3 分量(材质色进来的前提是不动布局)');
-  ok(!/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_FRAG), '片元源码无采样器');
-  ok(!/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_VERT), '顶点源码无采样器');
+  ok(/sampler2D/.test(TERRAIN_VCOLOR_FRAG), '片元源码必须声明 uAtlas 采样器');
+  ok(/texture2D/.test(TERRAIN_VCOLOR_FRAG), '片元源码必须真的采样(texture2D)');
+  ok(!/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_VERT), '顶点源码仍不采样(uv 只是传参)');
+  eq(terrainAtlasSamplingGated(), true, '★ 采样必须被 uAtlasReady 门控(无门控的首帧会整片变黑)');
+  ok(/vColor\s*\*/.test(TERRAIN_VCOLOR_FRAG), '顶点色仍参与输出(不是被纹理顶掉)');
 
-  /* ★ 负对照:同一检测器对「加了采样器」的源码必须为真 —— 证明 `false` 不是因为正则写错 */
-  const tainted = `${TERRAIN_VCOLOR_FRAG}\nuniform sampler2D uAlbedo;`;
-  ok(/sampler2D|texture2D|textureCube/.test(tainted), '负对照:注入 sampler2D 后同一检测器必须报真');
-  ok(/sampler2D|texture2D|textureCube/.test(TERRAIN_VCOLOR_FRAG) === false, '被污染的样本必须与产品源码可区分');
+  /*
+   * ★ 负对照(这条自证检测器有牙齿,不靠外部注入):
+   *   把产品源码里那一行门控**拿掉**(正是「删掉 uAtlasReady 分支」那个坏改法),
+   *   同一检测器必须从真变假 —— 否则上面那个 `true` 恒真、什么也没守住。
+   */
+  const unguarded = TERRAIN_VCOLOR_FRAG.split('if (uAtlasReady > 0.5 && vNormal.z > 0.5) {').join('{');
+  eq(unguarded === TERRAIN_VCOLOR_FRAG, false, '负对照样本必须真的变了(替换命中)');
+  eq(terrainAtlasSamplingGated(unguarded), false, '负对照:拿掉门控后同一检测器必须报假');
+  eq(terrainAtlasSamplingGated(), true, '产品源码仍报真(检测器不是恒假)');
 });
 
 /* ─────────────────── 6 / 两张表不重叠 ─────────────────── */

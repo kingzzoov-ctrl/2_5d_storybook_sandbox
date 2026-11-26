@@ -26,6 +26,9 @@ import {
   buildOrthographicCamera,
   buildTerrainMaterial,
   syncTerrainCamera,
+  /* ★ w100:把图集绑到地形材质上(shader 里的 `uAtlas`/`uAtlasReady`)。
+     不调它 ⇒ 地形永远走"纯顶点色"退化路径,贴图一辈子不出现,且**不报错**。 */
+  bindTerrainAtlas,
 } from './stage_assembly.ts';
 import { makeDemoWorld, WORLD_CELLS, WORLD_CHUNKS } from '../stage/demo_world.ts';
 /* ★ w85:画**设计过的世界** —— 与服务器同一张图(`shared/world/design.ts`)。 */
@@ -691,6 +694,9 @@ export function boot(container: HTMLElement): BootHandle {
    *   raw 材料 three 不注入矩阵,漏掉那一行地形会整片消失。
    */
   const mat = buildTerrainMaterial();
+  /* ★ w100:图集就绪后**绑一次** ⇒ 地形顶面开始采样地砖格(改前只有纯顶点色)。
+     `img === null`(fetch 失败)时 `bindTerrainAtlas` 保持"未就绪"⇒ 退回纯顶点色,**不黑屏**。 */
+  void loadAtlasImage().then((img) => { bindTerrainAtlas(mat, img); });
 
   /**
    * 建(或重建)一块的地形 mesh 并登记读数。
