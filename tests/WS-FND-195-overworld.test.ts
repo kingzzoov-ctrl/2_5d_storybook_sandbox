@@ -169,7 +169,7 @@ function world() {
   return { rt: a.runtime, sim };
 }
 function run(rt: ReturnType<typeof world>['rt'], seconds: number): void {
-  let prev: unknown = null;
+  let prev: ReturnType<typeof rt.cloneState> | null = null;
   for (let i = 0; i < 32 * seconds; i += 1) { rt.step(prev); prev = rt.cloneState(); }
 }
 /** 离 (x,y) 最近的、满足条件的格(在 `r` 格内找)。 */
