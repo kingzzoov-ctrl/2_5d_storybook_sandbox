@@ -216,6 +216,8 @@ const FPS_WINDOW_MS = 500;
 const ATLAS_URL = 'atlas_sprites.png';
 
 /** 角色(玩家/NPC)立牌边长,世界单位:图集帧四周有留白,2.4 格边长时人物本体约一格半高。 */
+/** 触屏设备的默认缩放档(必须是 `ZOOM_LEVELS` 里的一档)。 */
+const TOUCH_DEFAULT_ZOOM = 1.5;
 const CHARACTER_SIZE_WORLD = SPRITE_CELL_WORLD * 2.4;
 /** 野生动物立牌边长。 */
 const MOB_SIZE_WORLD = SPRITE_CELL_WORLD * 2.0;
@@ -631,6 +633,12 @@ export function boot(container: HTMLElement): BootHandle {
      ★ w85:世界换成**设计图**(192×192,营地在中点)⇒ 焦点必须跟世界边长走 */
   isoCam.focusX = DESIGN_WORLD_CELLS / 2;
   isoCam.focusY = DESIGN_WORLD_CELLS / 2;
+  /* 触屏(手指为主输入)默认放大一档:一格只有 16px,390 宽的屏上一次看到太多格子,
+     角色只有几十像素高、辨认吃力。键盘设备保持 1×;玩家仍可用 [ ] 调档。
+     没有 matchMedia(node 断言环境)⇒ 按键盘设备处理。 */
+  if (typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches) {
+    isoCam.zoom = TOUCH_DEFAULT_ZOOM;
+  }
   const camera = buildOrthographicCamera(isoCam);
 
   /* ── 光:两盏方向光 + 环境光。等轴测下方向光比点光稳定 ── */
