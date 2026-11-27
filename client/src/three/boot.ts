@@ -914,7 +914,11 @@ export function boot(container: HTMLElement): BootHandle {
     if (!propAtlasReady || propAtlasImg === null) return 0;
     const img = propAtlasImg;
     /* `planChunkProps` 的注释写着为什么是"先物件、后植被" —— 截断丢的是尾部。 */
-    for (const it of planChunkProps(chunk, VEGETATION_IDS, VEG_SEED)) {
+    /* 服务器地形到了之后,草 / 浆果 / 树都是服务端按群系摆的真资源(可采、会再生);
+       客户端再随机撒一遍装饰植被,就是在真资源旁边多画一批采不到的假东西,还白占预算。
+       ⇒ 只在设计图占位阶段(还没有服务器地形)才撒。 */
+    const decorIds = terrainFromServer ? [] : VEGETATION_IDS;
+    for (const it of planChunkProps(chunk, decorIds, VEG_SEED)) {
       addPropSprite(img, { ...it, chunkKey: chunk.key });
     }
     return propsByChunk.get(chunk.key)?.length ?? 0;
@@ -1484,6 +1488,9 @@ export function boot(container: HTMLElement): BootHandle {
      * 复用 `plan.rebuild`(而不是自己再算一次"哪些块脏了"):那就是**第二份口径**,
      * 两份迟早漂,而漂的表现是"地形换了一半、立牌换了一片"(画面看着像随机,不报错)。
      * 每次**先摘后建**:拆掉墙之后同块的立牌列表会变,只加会留下幽灵立牌。 */
+    /* 先置「地形来自服务器」,再重建立牌:`buildPropsOf` 据此决定要不要撒装饰植被,
+       放在后面的话第一批服务器地形落地时还会撒一次假植被。 */
+    if (next.length > 0) terrainFromServer = true;
     const propPlan = planPropApply([...propChunks.keys()], plan.rebuild);
     for (const key of propPlan.remove) removePropsForChunk(key);
     for (const chunk of propPlan.add) addPropsForChunk(chunk);
