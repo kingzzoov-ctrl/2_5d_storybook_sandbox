@@ -6573,7 +6573,7 @@ export class RoomRuntime {
    * ## ⚠️ 基线(known)由**调用方**持有,而且是**每连接**一份
    * 断线重连 ⇒ 新连接从 `{}` 起 ⇒ 全量重发一遍(那正是想要的:块没到就是没到)。
    */
-  terrainDeltaFor(known: Record<string, number>): TerrainDelta {
+  terrainDeltaFor(known: Record<string, number>, forUserId?: string): TerrainDelta {
     const host = this.worldSaveHost;
     /* 没有世界源 / 老世界源没实现这个读口 ⇒ 空结果(与 `levelOf` 同一 null 契约:
        不报错、也不假装发过)。 */
@@ -6602,6 +6602,16 @@ export class RoomRuntime {
          也不发一块身份不明的字节。这一条不抛错:它是"读口在两段之间变了"
          那类竞态(真发生时 `versions` 也已经是新的,下一轮会补上)。 */
       if (c !== undefined) want.push(c);
+    }
+    /* 给了玩家 ⇒ 从他脚下那一块向外、由近到远发:进场时脚下与四周先到,
+       否则按 (cy,cx) 行序发,玩家要等整张图下发完(512 世界十几秒)才看得到周围。
+       没给玩家 / 拿不到位置 ⇒ 保持原来的行序(与此前逐字相同)。 */
+    const at = forUserId === undefined ? null : this.hostPositionOf(forUserId);
+    if (at !== null) {
+      const fx = Math.floor(at.x / 16);
+      const fy = Math.floor(at.y / 16);
+      want.sort((a, b) => Math.hypot(a.cx - fx, a.cy - fy) - Math.hypot(b.cx - fx, b.cy - fy)
+        || a.cy - b.cy || a.cx - b.cx);
     }
     return { frames: encodeTerrainFrames(want), versions };
   }

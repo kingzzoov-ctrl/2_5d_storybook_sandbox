@@ -804,7 +804,7 @@ export type WsRoomLike = {
    *    就等于把「什么都没做」写成契约(与 `applyMove` / `isSeated` 同一取舍)。
    *    没实现 ⇒ 地形通道**整段不发**(既不发也不报错),差量快照通道逐字不变。
    */
-  terrainDeltaFor?(known: Record<string, number>): {
+  terrainDeltaFor?(known: Record<string, number>, forUserId?: string): {
     frames: Uint8Array[];
     versions: Record<string, number>;
   };
@@ -1504,7 +1504,7 @@ export async function startWsServer(opts: WsServerOptions): Promise<WsServerHand
     if (c.terrainPending.length === 0) {
       let out: { frames: Uint8Array[]; versions: Record<string, number> };
       try {
-        out = delta.call(opts.room, c.terrainKnown);
+        out = delta.call(opts.room, c.terrainKnown, c.userId ?? undefined);
       } catch (e) {
         /* 与 `step` 抛错同一取舍:地形这一条**断了**不该拖垮快照通道 ⇒
            计数 + 日志 + 本轮不发(不关连接)。 */
