@@ -434,6 +434,8 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
       townCenter: { x: WORLD_CENTER, y: WORLD_CENTER },
       collision: true,
       spawnNearPlayers: true,
+      soloRespawnSec: 5,
+      respawnPoint: { x: SPAWN_POINT.x + 0.5, y: SPAWN_POINT.y + 0.5 },
       regrowSec: OVERWORLD_REGROW_SEC,
       nativeObjAt: (x: number, y: number): number => overworldCell(ow, x, y)?.obj ?? 0,
     }),

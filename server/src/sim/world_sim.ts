@@ -399,7 +399,7 @@ import { COMBAT_WIRING_LEDGER, type CombatWiringRow } from '../combat/wiring_led
    会被孤儿门禁判红,而它回答的正是「本世界跑的这套东西里哪些还是占位」。
    ⚠️ 纯数据 + 纯函数,**不改变任何结算**(见该文件头「这个文件不做什么」)。 */
 import { WORLD_DEBTS, type WorldDebtRow } from './world_debts.ts';
-import { statsAtLevel } from '../../../shared/types/entities.ts';
+import { statsAtLevel, REVIVE_HP_RATIO } from '../../../shared/types/entities.ts';
 import {
   createDowned,
   /* ★ 第六轮 P1:幽灵期动作权限的唯一规则(ghostControl.canAttack)。 */
@@ -411,6 +411,7 @@ import {
   featherRevive,
   bubbleGunHit,
   TOUCH_RADIUS,
+  MANUAL_REVIVE_INVULN,
   type DownedState,
   type EquipmentSnapshot,
   type ReviveResult,
@@ -664,6 +665,14 @@ export interface WorldSimOptions {
    * 大世界必须开:否则几十只怪摊在几十万格里,玩家一只都遇不到。
    */
   spawnNearPlayers?: boolean;
+  /**
+   * 独自倒地的自动复活:倒地满这么多秒、且没有队友在救 ⇒ 送回 `respawnPoint` 并按半血复活。
+   * 缺省 0 = 关(倒地只能等队友或复活旗,单人会永久卡死 —— 既有判据按这个行为写的)。
+   * 单人可玩的世界(主世界)必须开。
+   */
+  soloRespawnSec?: number;
+  /** 自动复活的落点(格坐标);缺省 = 世界正中。 */
+  respawnPoint?: { x: number; y: number };
   /**
    * 自然资源再生:某格被采走的物件若等于 `nativeObjAt` 给出的原生物件,
    * `regrowSec` 秒后长回来。两个都给才生效。
@@ -1268,6 +1277,10 @@ export class WorldSim {
   private readonly townCenterPos: { x: number; y: number } | null;
   private readonly collisionOn: boolean;
   private readonly spawnNearPlayers: boolean;
+  private readonly soloRespawnSec: number;
+  private readonly respawnPoint: { x: number; y: number } | null;
+  /** 累计自动复活了几次(自检读数)。 */
+  soloRespawns = 0;
   private readonly regrowFrames: number;
   private readonly nativeObjAt: ((x: number, y: number) => number) | null;
   /** 待再生的资源格(按到期帧升序:延迟是常数,先采的先到期)。 */
@@ -1912,6 +1925,9 @@ export class WorldSim {
     this.townCenterPos = opts.townCenter ?? null;
     this.collisionOn = opts.collision === true;
     this.spawnNearPlayers = opts.spawnNearPlayers === true;
+    this.soloRespawnSec = Number.isFinite(opts.soloRespawnSec) && (opts.soloRespawnSec as number) > 0
+      ? (opts.soloRespawnSec as number) : 0;
+    this.respawnPoint = opts.respawnPoint ?? null;
     this.nativeObjAt = opts.nativeObjAt ?? null;
     this.regrowFrames = this.nativeObjAt !== null && Number.isFinite(opts.regrowSec) && (opts.regrowSec as number) > 0
       ? secondsToTicks(opts.regrowSec as number)
@@ -4411,6 +4427,17 @@ export class WorldSim {
            ⇒ 必须把结果里的秒数**转写进活的那一套**。 */
         this.vitals.revive(id, out.result.hpAfter, out.result.invulnSec);
         this.downedStates.delete(id);
+        continue;
+      }
+      /* 独自倒地的出路:满 `soloRespawnSec` 秒、没人在救(进度为 0)⇒ 回重生点半血复活。
+         和队友救援 / 复活旗互不抢:它们一旦推进了 `reviveProgress`,这里就让路。 */
+      if (this.soloRespawnSec > 0 && d.downedSec >= this.soloRespawnSec && d.reviveProgress === 0) {
+        const at = this.respawnPoint ?? { x: this.sizeCells / 2, y: this.sizeCells / 2 };
+        this.setPlayerPos(id, at.x, at.y);
+        const vv = this.vitals.get(id);
+        this.vitals.revive(id, vv === null ? undefined : vv.maxHp * REVIVE_HP_RATIO, MANUAL_REVIVE_INVULN);
+        this.downedStates.delete(id);
+        this.soloRespawns += 1;
         continue;
       }
       this.downedStates.set(id, d);
