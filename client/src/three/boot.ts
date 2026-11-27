@@ -36,6 +36,7 @@ import { CHUNK_SIZE, ELEV_TO_Z, type ChunkInput } from '../stage/tile_mesh.ts';
 import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../stage/design_world.ts';
 /* ★ w90:`obj` 层与植被的立牌计划(纯函数)。改前 `obj` 层**完全不渲染** —— 见挂载点的长注释。 */
 import { planObjSprites, planVegetationSprites, type ObjSpriteInput } from '../stage/obj_sprites.ts';
+import { isBuildingObj, planBuildingBoxes } from '../stage/building_boxes.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
 /* ★ WS-FND-188:NPC 表的**线上形状** —— 类型来自共享协议层(客户端不内置 NPC 名单)。 */
 import { type NpcWireDef } from '../../../shared/net/delta.ts';
@@ -705,6 +706,31 @@ export function boot(container: HTMLElement): BootHandle {
    * ★ 首帧与增量重建**共用这一个函数** —— 两条建面路径迟早会漂移
    * (`addTerrainMesh` 里忘了登记读数,HUD 的顶点/面数就只增不减)。
    */
+  /* 建筑实心盒子:墙 / 门窗 / 屋顶画成有体积的方块(见 `stage/building_boxes.ts`),
+     每块地形一个 mesh,与地形 mesh 同生同灭。 */
+  const buildingMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  const buildingMeshes = new Map<string, THREE.Mesh>();
+  const addBuildingMesh = (chunk: ChunkInput): void => {
+    const b = planBuildingBoxes(chunk);
+    if (b.faceCount === 0) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(b.positions, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(b.normals, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(b.colors, 3));
+    g.setIndex(new THREE.BufferAttribute(b.indices, 1));
+    const m = new THREE.Mesh(g, buildingMat);
+    m.name = `building_${chunk.key}`;
+    scene.add(m);
+    buildingMeshes.set(chunk.key, m);
+  };
+  const removeBuildingMesh = (key: string): void => {
+    const m = buildingMeshes.get(key);
+    if (m === undefined) return;
+    scene.remove(m);
+    m.geometry.dispose();
+    buildingMeshes.delete(key);
+  };
+
   const addTerrainMesh = (chunk: ChunkInput): void => {
     const geom = buildChunkGeometry(chunk, 0);
     const verts = geom.getAttribute('position').count;
@@ -716,6 +742,7 @@ export function boot(container: HTMLElement): BootHandle {
     scene.add(mesh);
     meshes.set(chunk.key, mesh);
     terrainStats.set(chunk.key, { cx: chunk.cx, cy: chunk.cy, verts, faces });
+    addBuildingMesh(chunk);
   };
 
   /**
@@ -729,6 +756,7 @@ export function boot(container: HTMLElement): BootHandle {
   const removeTerrainMesh = (key: string): boolean => {
     const mesh = meshes.get(key);
     if (mesh === undefined) return false;
+    removeBuildingMesh(key);
     scene.remove(mesh);
     mesh.geometry.dispose();
     meshes.delete(key);
@@ -864,6 +892,8 @@ export function boot(container: HTMLElement): BootHandle {
   type PropSpriteInput = ObjSpriteInput & { chunkKey: string };
   /** 把一条计划变成场景里的 Sprite;预算满了 ⇒ `false`(调用方计数,不静默丢)。 */
   const addPropSprite = (img: HTMLImageElement, it: PropSpriteInput): boolean => {
+    /* 墙 / 门窗 / 屋顶已是实心盒子(`addBuildingMesh`),不再画成平的立牌,也不占立牌预算。 */
+    if (it.kind === 'obj' && isBuildingObj(it.id)) return false;
     if (propSpriteTotal >= SPRITE_BUDGET) { propDroppedByBudget += 1; return false; }
     if (it.kind === 'vegetation' && propVegTotal >= VEG_SPRITE_CAP) { propDroppedByBudget += 1; return false; }
     const material = propMaterialOf(img, it.atlasCell);
