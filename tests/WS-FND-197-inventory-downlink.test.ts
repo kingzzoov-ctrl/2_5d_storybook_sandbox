@@ -1,12 +1,12 @@
 /**
- * WS-FND-194 · 背包下行与容量口径。
+ * WS-FND-197 · 背包下行与容量口径。
  *
  * 守三件事:
  * 1 新玩家进场收到的背包**就是起始包**(不是整张物品表);
  * 2 背包变了客户端会再收到一帧,没变就不重发;
  * 3 容量 = 负重格 × `ITEMS_PER_CARRY_SLOT`(起始包之外还装得下一趟采集)。
  *
- * 运行:`node tests/WS-FND-194-inventory-downlink.test.ts`
+ * 运行:`node tests/WS-FND-197-inventory-downlink.test.ts`
  */
 import { eq, ok, report, results, test } from '../shared/testing/harness.ts';
 import { assemble } from '../server/src/index.ts';
@@ -96,4 +96,4 @@ await atest('FND194-3 真连接:进场收到起始包;背包变了再收一帧,�
   }
 });
 
-report('WS-FND-194');
+report('WS-FND-197');
