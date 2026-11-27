@@ -989,6 +989,76 @@ export function boot(container: HTMLElement): BootHandle {
   let npcTalkLine = '';
 
   /** 按当前 NPC 表把立牌对齐(缺的建、多的删;**位置/贴图变了就地改**)。 */
+  /**
+   * 头顶名牌:玩家 / 其他玩家 / NPC 站在一起时分得出谁是谁。
+   *
+   * 用 DOM 标签而不是精灵子节点:立牌没有旋转,局部 y 轴不是屏幕的「上」,挂子节点会偏;
+   * DOM 标签每帧用相机把头顶位置投影到屏幕,字永远是正的、清晰的,也不占 draw call。
+   * 头顶 = 立牌位置沿**相机的上方向**抬 `0.85 × 立牌边长`(图集锚点距底 15%)。
+   */
+  const nameplateLayer = document.createElement('div');
+  nameplateLayer.id = 'nameplates';
+  nameplateLayer.style.cssText = 'position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:15;';
+  container.appendChild(nameplateLayer);
+  const nameplates = new Map<string, HTMLDivElement>();
+  const npVec = new THREE.Vector3();
+  const npUp = new THREE.Vector3();
+  const npHead = new THREE.Vector3();
+  const NAMEPLATE_STYLE = {
+    me: 'color:#fff8ec;background:rgba(62,39,35,.78);border-color:#ffd166;',
+    player: 'color:#e8f6ff;background:rgba(30,70,110,.78);border-color:#9bd3ff;',
+    npc: 'color:#fff8ec;background:rgba(62,39,35,.78);border-color:#f6d9a8;',
+  } as const;
+  const nameplateSeen = new Set<string>();
+  const placeNameplate = (
+    key: string, text: string, kind: keyof typeof NAMEPLATE_STYLE, sp: THREE.Sprite,
+  ): void => {
+    if (!sp.visible || text === '') return;
+    npUp.setFromMatrixColumn(camera.matrixWorld, 1);
+    npHead.copy(sp.position).addScaledVector(npUp, sp.scale.y * 0.85);
+    npVec.copy(npHead).project(camera);
+    const x = ((npVec.x + 1) / 2) * window.innerWidth;
+    const y = ((1 - npVec.y) / 2) * window.innerHeight;
+    if (!(x > -80 && x < window.innerWidth + 80 && y > -30 && y < window.innerHeight + 30)) return;
+    let el = nameplates.get(key);
+    if (el === undefined) {
+      el = document.createElement('div');
+      el.style.cssText = 'position:absolute;left:0;top:0;padding:1px 7px;border:1.5px solid;'
+        + 'border-radius:9px;font:700 12px/1.35 -apple-system,"Noto Sans SC",sans-serif;'
+        + 'white-space:nowrap;will-change:transform;' + NAMEPLATE_STYLE[kind];
+      el.textContent = text;
+      nameplateLayer.appendChild(el);
+      nameplates.set(key, el);
+    } else if (el.textContent !== text) {
+      el.textContent = text;
+    }
+    el.style.transform = `translate(${Math.round(x)}px,${Math.round(y)}px) translate(-50%,-100%)`;
+    el.style.display = 'block';
+    nameplateSeen.add(key);
+  };
+  const updateNameplates = (): void => {
+    camera.updateMatrixWorld();
+    nameplateSeen.clear();
+    placeNameplate('me', '你', 'me', playerMarker);
+    for (const n of npcList) {
+      const sp = npcSprites.get(n.id);
+      if (sp !== undefined) placeNameplate(`npc:${n.id}`, n.quest !== undefined ? `❗ ${n.name}` : n.name, 'npc', sp);
+    }
+    for (const [key, sp] of entitySprites) {
+      if (!key.startsWith('player:')) continue;
+      const id = key.slice('player:'.length);
+      const who = authority.state.players.find((q) => q.id === id);
+      const nm = who === undefined || who.name === '' || who.name === who.id ? '旅人' : who.name;
+      placeNameplate(key, nm, 'player', sp);
+    }
+    /* 这一帧没摆的(走出屏幕 / 离场 / 隐藏)⇒ 摘掉标签,免得 DOM 越积越多。 */
+    for (const [key, el] of nameplates) {
+      if (nameplateSeen.has(key)) continue;
+      el.remove();
+      nameplates.delete(key);
+    }
+  };
+
   function refreshNpcSprites(): void {
     const plan = planNpcSprites(npcList, SPRITE_HEIGHT_PX.player ?? 28);
     const seen = new Set<string>();
@@ -2879,6 +2949,7 @@ export function boot(container: HTMLElement): BootHandle {
      * 因此这里无条件调一次 —— O(1),与 `renderer.render` 同一帧、紧挨着它。
      */
     syncTerrainCamera(mat, camera);
+    updateNameplates();
     renderer.render(scene, camera);
 
     /* ── 覆盖层:把上面各模块的状态画出来 ── */
