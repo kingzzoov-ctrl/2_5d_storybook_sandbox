@@ -139,7 +139,7 @@ export const NPC_SPOTS: Readonly<Record<string, { x: number; y: number }>> = (()
     return { x: o.x + dx, y: o.y + dy };
   };
   return {
-    npc_mayor: { x: C + 2, y: C + 5 },
+    npc_mayor: { x: C + 4, y: C + 8 },   /* 离出生点(C, C+4)四格:睁眼不叠在一起,走几步就到 */
     npc_carpenter: { x: C - 13, y: C - 4 },
     npc_smith: { x: C - 15, y: C + 4 },
     npc_cook: { x: C + 15, y: C - 4 },
