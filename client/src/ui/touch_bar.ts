@@ -38,6 +38,8 @@ export interface TouchButton {
   label: string;
   /** 无障碍名(读屏用;也是判据里"这个按钮干什么"的可读证据) */
   aria: string;
+  /** 按钮底部的小字名称(可选;`label` 仍是 1 个字,新玩家看不懂单字时靠它) */
+  caption?: string;
 }
 
 /** 触屏最小可点尺寸(iOS HIG 的 44pt 档位) */
@@ -78,13 +80,14 @@ export function touchButtons(): TouchButton[] {
     panels.push(p);
   }
   return [
-    { id: 'attack', label: '攻', aria: '攻击' },
+    { id: 'attack', label: '攻', aria: '攻击', caption: '攻击' },
     ...panels.map((p): TouchButton => ({
       id: `panel:${p}`,
       label: shortLabelOf(p),
       aria: `打开${PANEL_LABEL[p] ?? String(p)}面板`,
+      caption: (PANEL_LABEL[p] ?? String(p)).replace(/[((].*$/, ''),
     })),
-    { id: 'close', label: '关', aria: '关闭面板' },
+    { id: 'close', label: '关', aria: '关闭面板', caption: '关闭' },
   ];
 }
 
@@ -238,6 +241,14 @@ export class TouchBar {
       const btn = doc.createElement('div');
       btn.style.cssText = S_BUTTON_BASE;
       btn.textContent = b.label;
+      if (b.caption !== undefined && b.caption !== '') {
+        /* 小字名称作为子元素贴在按钮底部,不碰 `textContent` 里的单字标签。 */
+        const cap = doc.createElement('span');
+        cap.textContent = b.caption;
+        cap.style.cssText = 'position:absolute;left:0;right:0;bottom:2px;text-align:center;'
+          + 'font-size:9px;line-height:1;opacity:.85;pointer-events:none;white-space:nowrap;overflow:hidden;';
+        btn.appendChild(cap);
+      }
       btn.setAttribute('role', 'button');
       btn.setAttribute('aria-label', b.aria);
       btn.dataset.touchId = b.id;
