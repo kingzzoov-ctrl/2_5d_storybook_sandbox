@@ -200,7 +200,56 @@ export function bindTerrainAtlas(
   img: HTMLImageElement | null,
 ): THREE.Texture | null {
   if (img === null) return null;
-  const tex = new THREE.Texture(img);
+  /* 图集里的地砖是等轴测菱形精灵,四角是透明的。地形着色器只取 `.rgb`
+     (`vColor * tex * 2.0`),透明像素的 rgb 是 0 ⇒ 乘出来是黑的,铺满地面就是
+     「红黑 / 黑白棋盘」和满地噪点。
+     加载时把每一格的透明部分用这一格不透明像素的平均色填实(按 alpha 混合,半透明边也平滑过渡),
+     格布局不变 ⇒ `assembly_math` 算的 UV 仍有效;着色器与兜底格都不动。
+     整格都透明 ⇒ 填中灰(乘 2.0 后恰好是顶点色原样)。
+     没有 `document`(node 里的断言)或读像素失败 ⇒ 退回原图,与此前一致。 */
+  let source: HTMLImageElement | HTMLCanvasElement = img;
+  try {
+    const cv = document.createElement('canvas');
+    cv.width = img.width;
+    cv.height = img.height;
+    const ctx = cv.getContext('2d');
+    if (ctx !== null) {
+      ctx.drawImage(img, 0, 0);
+      const image = ctx.getImageData(0, 0, cv.width, cv.height);
+      const d = image.data;
+      const CELL = 64;
+      for (let cy = 0; cy + CELL <= cv.height; cy += CELL) {
+        for (let cx = 0; cx + CELL <= cv.width; cx += CELL) {
+          let r = 0; let g = 0; let b = 0; let n = 0;
+          for (let y = cy; y < cy + CELL; y += 1) {
+            for (let x = cx; x < cx + CELL; x += 1) {
+              const i = (y * cv.width + x) * 4;
+              if (d[i + 3]! < 200) continue;
+              r += d[i]!; g += d[i + 1]!; b += d[i + 2]!; n += 1;
+            }
+          }
+          const ar = n > 0 ? r / n : 128;
+          const ag = n > 0 ? g / n : 128;
+          const ab = n > 0 ? b / n : 128;
+          for (let y = cy; y < cy + CELL; y += 1) {
+            for (let x = cx; x < cx + CELL; x += 1) {
+              const i = (y * cv.width + x) * 4;
+              const a = d[i + 3]! / 255;
+              d[i] = d[i]! * a + ar * (1 - a);
+              d[i + 1] = d[i + 1]! * a + ag * (1 - a);
+              d[i + 2] = d[i + 2]! * a + ab * (1 - a);
+              d[i + 3] = 255;
+            }
+          }
+        }
+      }
+      ctx.putImageData(image, 0, 0);
+      source = cv;
+    }
+  } catch {
+    source = img;
+  }
+  const tex = new THREE.Texture(source);
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
   tex.generateMipmaps = false;
