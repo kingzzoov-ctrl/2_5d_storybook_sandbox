@@ -679,8 +679,10 @@ function main(): void {
     if (session === null) { lastHit = `未联机,打不了(${source})`; return; }
     const w = nearestWildlife(predictor.pos);
     if (w === null) { lastHit = '附近没有怪'; return; }
-    session.sendAttack({ mobId: w.mobId });
-    lastHit = `已发攻击(${source}) → ${w.mobId}(${w.d.toFixed(1)} 格)`;
+    /* 服务端按**实例 id**(`mob_sheep#1`)找目标;发物种 id(`mob_sheep`)会得到 NO_TARGET_MOB,
+       攻击静默落空(实测:触屏「攻」24 回合一下没打中)。 */
+    session.sendAttack({ mobId: w.id });
+    lastHit = `已发攻击(${source}) → ${w.id}(${w.d.toFixed(1)} 格)`;
   }
   /**
    * 攻击的**指针入口**(★ WS-FND-166)。
