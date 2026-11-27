@@ -231,13 +231,23 @@ export function bindTerrainAtlas(
           const ar = n > 0 ? r / n : 128;
           const ag = n > 0 ? g / n : 128;
           const ab = n > 0 ? b / n : 128;
+          /* 着色器是 `vColor * tex * 2.0`:顶点色已是材质色,图素只该提供明暗。
+             图素自带的色相会被再乘一遍(红砖变得过饱和)⇒ 每格把平均亮度归一到中灰(128),
+             并去掉 85% 的色相,只留明暗纹理。 */
+          const meanL = 0.299 * ar + 0.587 * ag + 0.114 * ab;
+          const k = meanL > 1 ? 128 / meanL : 1;
           for (let y = cy; y < cy + CELL; y += 1) {
             for (let x = cx; x < cx + CELL; x += 1) {
               const i = (y * cv.width + x) * 4;
               const a = d[i + 3]! / 255;
-              d[i] = d[i]! * a + ar * (1 - a);
-              d[i + 1] = d[i + 1]! * a + ag * (1 - a);
-              d[i + 2] = d[i + 2]! * a + ab * (1 - a);
+              const pr = d[i]! * a + ar * (1 - a);
+              const pg = d[i + 1]! * a + ag * (1 - a);
+              const pb = d[i + 2]! * a + ab * (1 - a);
+              /* 先按 alpha 填实透明角,再把亮度归一到中灰并只留 15% 色相。 */
+              const lum = (0.299 * pr + 0.587 * pg + 0.114 * pb) * k;
+              d[i] = Math.min(255, Math.max(0, lum * 0.85 + pr * k * 0.15));
+              d[i + 1] = Math.min(255, Math.max(0, lum * 0.85 + pg * k * 0.15));
+              d[i + 2] = Math.min(255, Math.max(0, lum * 0.85 + pb * k * 0.15));
               d[i + 3] = 255;
             }
           }
