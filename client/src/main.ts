@@ -1044,7 +1044,7 @@ function main(): void {
      `setPoseSource`)。权威还没到(`seeded === false`)⇒ 返回 `null`,
      渲染退回权威兜底 —— 即**没有预测时与接线前逐字段相同**。 */
   handle.setPoseSource(() => (seeded ? predictor.poseView() : null));
-  const inputLoop: ReturnType<typeof setInterval> = setInterval(() => {
+  const inputStep = (): void => {
     /* 摇杆推了就用摇杆,否则回落到 WASD —— 优先级只写在这一处(`mergeCmd`)。 */
     const cmd = mergeCmd(input.nextCmd(), stick.vector());
     /* ★ WS-FND-113 第 1 处:`frozen` / `mu` / `speedMul` 必须**从权威状态推**出来,
@@ -1154,6 +1154,20 @@ function main(): void {
       }
     }
     paintStatus(p, near);
+  };
+  /* 输入循环按**真实时间**补 tick:`setInterval` 在主线程被渲染占满时会被推迟,
+     只跑一次的话走路速度就跟着帧率掉(实测 11 FPS ⇒ 0.73 格/秒,基础移速 4.5)。
+     落后了几个 tick 就连跑几个(每个 tick 各发一个移动包 ⇒ 服务端 `MAX_MOVE_CATCHUP_TICKS = 1`
+     与速度窗口的口径不变),一次最多补 `INPUT_CATCHUP_MAX` 个,免得卡顿之后突发一串包。 */
+  const INPUT_CATCHUP_MAX = 3;
+  let inputDueAt = performance.now();
+  const inputLoop: ReturnType<typeof setInterval> = setInterval(() => {
+    const now = performance.now();
+    const behind = Math.floor((now - inputDueAt) / (DT * 1000));
+    const n = Math.max(1, Math.min(INPUT_CATCHUP_MAX, behind + 1));
+    /* 落后超过补偿上限的部分直接放弃(不追赶):追不上说明机器太慢,继续追只会更卡。 */
+    inputDueAt = behind + 1 > INPUT_CATCHUP_MAX ? now : inputDueAt + n * DT * 1000;
+    for (let i = 0; i < n; i += 1) inputStep();
   }, DT * 1000);
 
   window.__stageReady = () => ({
