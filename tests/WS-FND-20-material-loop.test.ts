@@ -220,6 +220,33 @@ test('FND20-8 附近没有就拒绝(拾取不能凭空产出)', () => {
   eq(total.authoritativeItemTotal('p1'), 2, '★ 背包不变(不能凭空 +1)');
 });
 
+/* ───────────────────────── 8b ───────────────────────── */
+
+test('FND20-8b 拾取不给 itemId ⇒ 捡离玩家最近的一件;给了就只捡那一种;地上没东西仍拒', () => {
+  const { rt, sim, total, at } = makeRoom();
+  seed(rt, LOG, 4);
+  disp(rt, RoomAction.DROP_ITEM, { itemId: LOG, count: 2 });
+  eq(total.authoritativeItemTotal('p1'), 2, '前置:丢完剩 2');
+
+  const r = disp(rt, RoomAction.PICKUP_ITEM, {});
+  eq(r.ok, true, `★ 不给 itemId 也能捡(kind=${r.kind} reason=${r.reason ?? '-'})`);
+  eq(r.effect?.itemId, LOG, '回执带回实际捡起的物品 id');
+  eq(total.authoritativeItemTotal('p1'), 3, '背包 +1');
+  const pile = sim.materials().groundItemsNear(at.x, at.y, 2).find((g) => g.itemId === LOG);
+  eq(pile?.count, 1, '地面那堆 -1');
+
+  const wrong = disp(rt, RoomAction.PICKUP_ITEM, { itemId: 999 });
+  eq(wrong.ok, false, '★ 给了 itemId 就只捡那一种:地上没有 ⇒ 拒');
+  const bad = disp(rt, RoomAction.PICKUP_ITEM, { itemId: 'x' });
+  eq(bad.ok, false, 'itemId 不是数字 ⇒ 拒(不退化成捡最近一件)');
+  eq(total.authoritativeItemTotal('p1'), 3, '两次拒绝都没动背包');
+
+  disp(rt, RoomAction.PICKUP_ITEM, {});
+  const empty = disp(rt, RoomAction.PICKUP_ITEM, {});
+  eq(empty.ok, false, '★ 地上捡空了 ⇒ 拒(不能凭空产出)');
+  eq(total.authoritativeItemTotal('p1'), 4, '总共捡回 2 件');
+});
+
 /* ───────────────────────── 9 ───────────────────────── */
 
 test('FND20-9 越权:GUEST 做不了建造,且分类是 PERMISSION', () => {

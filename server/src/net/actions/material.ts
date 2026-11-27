@@ -248,14 +248,22 @@ export const dropItem: ActionHandler = (ctx: ActionContext) => {
 export const pickupItem: ActionHandler = (ctx: ActionContext) => {
   const gate = ctx.authorize(ctx.actorId, ctx.action);
   if (!gate.allowed) return { ok: false, kind: 'PERMISSION', reason: gate.reason };
-  const itemId = numField(ctx.payload.itemId);
-  if (itemId === null) return { ok: false, kind: 'INVALID', reason: '需要 itemId(数字)' };
+  /* itemId 可省:不给 ⇒ 捡离玩家最近的一件(客户端看不到地面物品,没法替玩家填它);
+     给了就必须是数字,并且只捡这一种。 */
+  const given = numField(ctx.payload.itemId);
+  if (ctx.payload.itemId !== undefined && given === null) {
+    return { ok: false, kind: 'INVALID', reason: 'itemId 必须是数字' };
+  }
   const mat = ctx.materialsOf();
   if (mat === null) {
     return { ok: false, kind: 'NOT_IMPLEMENTED', reason: '世界源没有物质层' };
   }
   const at = ctx.hostPositionOf(ctx.actorId);
   if (at === null) return { ok: false, kind: 'INVALID', reason: '拿不到该玩家的权威位置(不在世界里)' };
+  const itemId = given ?? mat.groundItemsNear(at.x, at.y, PICKUP_RADIUS)[0]?.itemId;
+  if (itemId === undefined) {
+    return { ok: false, kind: 'INVALID', reason: `附近 ${PICKUP_RADIUS} 格内没有可捡的东西` };
+  }
   /* **先扣地面**:没扣到就不要动背包 —— 反过来会造出
      "背包 +1 而地上那件还在"的复制品。 */
   if (!mat.takeGroundItemNear(at.x, at.y, itemId, PICKUP_RADIUS)) {

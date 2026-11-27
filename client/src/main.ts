@@ -917,7 +917,10 @@ function main(): void {
        一件都没有时**如实说**,不发一个注定被拒的报文。 */
     const needItem = spec.action === 'PLACE_BLOCK' || spec.action === 'DROP_ITEM'
       || spec.action === 'PICKUP_ITEM';
-    if (needItem && lastItemId === 0) {
+    /* 拾取不带 itemId、也不要求「最近物品」:服务端捡离玩家最近的那一件
+       (地面物品不在客户端状态里,客户端没法替玩家填它)。 */
+    const isPickup = spec.action === 'PICKUP_ITEM';
+    if (needItem && !isPickup && lastItemId === 0) {
       /* ★ 第十轮 P1:**新玩家的第一步就卡在这里。**
          开局从未碰过任何物品 ⇒ `lastItemId === 0` ⇒ Q/E/G/F 与 N/T(以及四个热键)
          全部被拒。修前那句话只说「先按 E 拆一块或按 F 捡一件」—— 没写清
@@ -932,7 +935,7 @@ function main(): void {
       action: spec.action,
       x: cell.x,
       y: cell.y,
-      ...(needItem ? { itemId: lastItemId } : {}),
+      ...(needItem && !isPickup ? { itemId: lastItemId } : {}),
       ...(spec.action === 'DROP_ITEM' ? { count: 1 } : {}),
     });
     /* 格坐标与朝向一起报:`facing` 修前恒向下,而"格坐标"看起来永远正常 ——
