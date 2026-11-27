@@ -37,6 +37,7 @@ import { buildDesignChunks, DESIGN_WORLD_CELLS } from '../stage/design_world.ts'
 /* ★ w90:`obj` 层与植被的立牌计划(纯函数)。改前 `obj` 层**完全不渲染** —— 见挂载点的长注释。 */
 import { planObjSprites, planVegetationSprites, type ObjSpriteInput } from '../stage/obj_sprites.ts';
 import { isBuildingObj, planBuildingBoxes } from '../stage/building_boxes.ts';
+import { adaptPixelRatio } from '../stage/adaptive_quality.ts';
 import { packTile, unpackTile } from '../../../shared/types/tile.ts';
 /* ★ WS-FND-188:NPC 表的**线上形状** —— 类型来自共享协议层(客户端不内置 NPC 名单)。 */
 import { type NpcWireDef } from '../../../shared/net/delta.ts';
@@ -2790,6 +2791,7 @@ export function boot(container: HTMLElement): BootHandle {
   let frames = 0;
   let raf = 0;
   let fps = 0;
+  let qualityLowStreak = 0;
 
   const tick = (now: number): void => {
     const dt = Math.min(100, now - last);
@@ -3036,6 +3038,13 @@ export function boot(container: HTMLElement): BootHandle {
     acc += dt;
     if (acc >= FPS_WINDOW_MS) {
       fps = (frames * 1000) / acc;
+      /* 帧率持续偏低 ⇒ 渲染分辨率降一档(瓶颈是像素填充,见 `stage/adaptive_quality.ts`)。 */
+      const q = adaptPixelRatio(renderer.getPixelRatio(), fps, qualityLowStreak);
+      qualityLowStreak = q.lowStreak;
+      if (q.ratio !== renderer.getPixelRatio()) {
+        renderer.setPixelRatio(q.ratio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
       hud.update(renderer.info, totalVerts, totalFaces, buildMs, fps);
       frames = 0;
       acc = 0;
