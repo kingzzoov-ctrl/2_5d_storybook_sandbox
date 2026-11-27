@@ -824,6 +824,10 @@ export function boot(container: HTMLElement): BootHandle {
   let propSpriteTotal = 0;
   /** 因预算被丢掉的立牌数(累计)。> 0 说明"该看见的东西没看见",必须有读数。 */
   let propDroppedByBudget = 0;
+  /** 当前屏幕上的**植被**立牌数(装饰;物件才是玩法点,植被只能用预算的一小部分)。 */
+  let propVegTotal = 0;
+  /** 植被立牌上限:总预算的四分之一。否则离玩家最近的几个块里的草丛会把名额吃光,镇上的房子和摊位排不上。 */
+  const VEG_SPRITE_CAP = Math.floor(PROP_SPRITE_BUDGET / 4);
   /** 真的摘过几次块(累计;`0` 而地形重建过 ⇒ 跟块这条链断了)。 */
   let propRemovedChunks = 0;
 
@@ -861,6 +865,7 @@ export function boot(container: HTMLElement): BootHandle {
   /** 把一条计划变成场景里的 Sprite;预算满了 ⇒ `false`(调用方计数,不静默丢)。 */
   const addPropSprite = (img: HTMLImageElement, it: PropSpriteInput): boolean => {
     if (propSpriteTotal >= SPRITE_BUDGET) { propDroppedByBudget += 1; return false; }
+    if (it.kind === 'vegetation' && propVegTotal >= VEG_SPRITE_CAP) { propDroppedByBudget += 1; return false; }
     const material = propMaterialOf(img, it.atlasCell);
     if (material === null) return false;
     const sp = new THREE.Sprite(material);
@@ -877,6 +882,7 @@ export function boot(container: HTMLElement): BootHandle {
     if (list === undefined) { list = []; propsByChunk.set(it.chunkKey, list); }
     list.push(sp);
     propSpriteTotal += 1;
+    if (it.kind === 'vegetation') propVegTotal += 1;
     return true;
   };
 
@@ -891,7 +897,10 @@ export function boot(container: HTMLElement): BootHandle {
     propChunks.delete(key);
     const list = propsByChunk.get(key);
     if (list === undefined) return 0;
-    for (const sp of list) scene.remove(sp);
+    for (const sp of list) {
+      scene.remove(sp);
+      if (sp.name.startsWith('vegetation_')) propVegTotal -= 1;
+    }
     propsByChunk.delete(key);
     propSpriteTotal -= list.length;
     propRemovedChunks += 1;
@@ -913,6 +922,31 @@ export function boot(container: HTMLElement): BootHandle {
 
   /** 登记(或重建)一块 —— `applyTerrainChunks` 与首帧占位共用**这一个**入口。 */
   const addPropsForChunk = (chunk: ChunkInput): number => buildPropsOf(chunk);
+
+  /**
+   * 立牌预算按**离焦点块的距离**分配(总数仍封顶 `PROP_SPRITE_BUDGET`)。
+   *
+   * 修前预算按块 key 字典序用掉,与玩家在哪无关:主世界约 2 万个物件、预算 600,
+   * 出生点所在的镇子排在后面 ⇒ 被丢光,画面里只有野地。现在先全摘、再从近到远建,
+   * 预算满了之后的块只登记来源(不规划、不建),玩家换块或地形更新后重排一次。
+   */
+  let propFocusKey = '';
+  let propFocusDirty = true;
+  let propRebalanceAtMs = 0;
+  const rebalancePropsAround = (fcx: number, fcy: number): void => {
+    const all = [...propChunks.values()];
+    for (const c of all) removePropsForChunk(c.key);
+    const dist = (c: ChunkInput): number => Math.hypot(c.cx - fcx, c.cy - fcy);
+    all.sort((a, b) => dist(a) - dist(b) || (a.key < b.key ? -1 : 1));
+    for (const c of all) {
+      if (propSpriteTotal >= SPRITE_BUDGET) {
+        propChunks.set(c.key, c);
+        propDroppedByBudget += 1;
+        continue;
+      }
+      buildPropsOf(c);
+    }
+  };
 
   /* 首帧:按**设计图占位**登记(图集还没到 ⇒ 只登记,不建 Sprite)。 */
   for (const chunk of chunks) addPropsForChunk(chunk);
@@ -1453,6 +1487,7 @@ export function boot(container: HTMLElement): BootHandle {
     const propPlan = planPropApply([...propChunks.keys()], plan.rebuild);
     for (const key of propPlan.remove) removePropsForChunk(key);
     for (const chunk of propPlan.add) addPropsForChunk(chunk);
+    propFocusDirty = true;   /* 块变了 ⇒ 预算分配要按玩家位置重排(主循环里节流执行) */
     for (const chunk of plan.rebuild) {
       removeTerrainMesh(chunk.key);   /* 先摘旧的(含 dispose) */
       addTerrainMesh(chunk);          /* 再建新的 */
@@ -1460,6 +1495,13 @@ export function boot(container: HTMLElement): BootHandle {
     if (next.length > 0) terrainFromServer = true;
     terrainRebuiltChunks += plan.rebuild.length;
     hud.setWorld(terrainCellsNow(), meshes.size, TERRAIN_SOURCE_SERVER);
+    /* 相机跟随的边界跟着服务器地形的真实范围走:`CAMERA_BOUNDS` 启动时按本地设计图(192)
+       建,而服务器世界可以更大(主世界 512)⇒ 不更新就会把相机夹在 192-8,
+       玩家在镇里时画面停在镇子西北的野地上空。 */
+    {
+      const cells = terrainCellsNow();
+      if (cells > 0) { CAMERA_BOUNDS.maxX = cells; CAMERA_BOUNDS.maxY = cells; }
+    }
     return { rebuilt: plan.rebuild.length, total: meshes.size, full: plan.full, fallback: false };
   };
 
@@ -2665,6 +2707,20 @@ export function boot(container: HTMLElement): BootHandle {
      *  它**不是**绝对高程,见 `net/height_placement.ts` 的语义取证)。
      */
     playerGz = localPlayerZOf(authority.state, authority.localPlayerId);
+
+    /* 立牌预算跟着玩家走:换了块、或地形有更新,就重排(最多每 500ms 一次,避免地形帧连发时反复重建)。 */
+    if (authoritySeen && propAtlasReady) {
+      const fcx = Math.floor(playerGx / CHUNK_SIZE);
+      const fcy = Math.floor(playerGy / CHUNK_SIZE);
+      const key = `${fcx},${fcy}`;
+      const now = performance.now();
+      if ((key !== propFocusKey || propFocusDirty) && now - propRebalanceAtMs >= 500) {
+        propFocusKey = key;
+        propFocusDirty = false;
+        propRebalanceAtMs = now;
+        rebalancePropsAround(fcx, fcy);
+      }
+    }
 
     /* ── task-83 + ★ WS-FND-48:把玩家画出来,并让它跟着 32Hz 快照动 ──
      *
