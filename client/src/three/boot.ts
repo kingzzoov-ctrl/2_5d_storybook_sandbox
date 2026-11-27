@@ -1042,6 +1042,8 @@ export function boot(container: HTMLElement): BootHandle {
     npc: 'color:#fff8ec;background:rgba(62,39,35,.78);border-color:#f6d9a8;',
   } as const;
   const nameplateSeen = new Set<string>();
+  /** 本帧牌子允许出现的最低屏幕 y(快捷栏上沿);没有快捷栏 ⇒ 屏幕底。 */
+  let nameplateBottomLimit = Number.POSITIVE_INFINITY;
   /** 本帧要摆的牌子;摆完统一做一次「防重叠 + 夹进屏幕」。 */
   const nameplateQueue: { el: HTMLDivElement; x: number; y: number; me: boolean }[] = [];
   const placeNameplate = (
@@ -1055,6 +1057,9 @@ export function boot(container: HTMLElement): BootHandle {
     const x = ((npVec.x + 1) / 2) * window.innerWidth;
     const y = ((1 - npVec.y) / 2) * window.innerHeight;
     if (!(x > -80 && x < window.innerWidth + 80 && y > -30 && y < window.innerHeight + 30)) return;
+    /* 落在底部快捷栏后面的牌子不画:否则名字被快捷栏盖掉一半,比不画更糟。
+       快捷栏的位置取自 DOM 实时读数(它的高度随屏宽变),每帧最多读一次。 */
+    if (y > nameplateBottomLimit) return;
     let el = nameplates.get(key);
     if (el === undefined) {
       el = document.createElement('div');
@@ -1075,6 +1080,8 @@ export function boot(container: HTMLElement): BootHandle {
     camera.updateMatrixWorld();
     nameplateSeen.clear();
     nameplateQueue.length = 0;
+    const hotbarEl = document.getElementById('gh_hotbar');
+    nameplateBottomLimit = hotbarEl === null ? Number.POSITIVE_INFINITY : hotbarEl.getBoundingClientRect().top - 4;
     placeNameplate('me', '你', 'me', playerMarker);
     for (const n of npcList) {
       const sp = npcSprites.get(n.id);
