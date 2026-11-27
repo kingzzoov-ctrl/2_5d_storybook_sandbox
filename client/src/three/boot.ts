@@ -1001,6 +1001,8 @@ export function boot(container: HTMLElement): BootHandle {
   nameplateLayer.style.cssText = 'position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:15;';
   container.appendChild(nameplateLayer);
   const nameplates = new Map<string, HTMLDivElement>();
+  /** 头顶位置 = 立牌边长 × 本系数(沿相机上方向)。0.85 是整帧顶端;人物只占下半部分,取 0.55。 */
+  const NAMEPLATE_HEAD_RATIO = 0.55;
   const npVec = new THREE.Vector3();
   const npUp = new THREE.Vector3();
   const npHead = new THREE.Vector3();
@@ -1010,12 +1012,15 @@ export function boot(container: HTMLElement): BootHandle {
     npc: 'color:#fff8ec;background:rgba(62,39,35,.78);border-color:#f6d9a8;',
   } as const;
   const nameplateSeen = new Set<string>();
+  /** 本帧要摆的牌子;摆完统一做一次「防重叠 + 夹进屏幕」。 */
+  const nameplateQueue: { el: HTMLDivElement; x: number; y: number; me: boolean }[] = [];
   const placeNameplate = (
     key: string, text: string, kind: keyof typeof NAMEPLATE_STYLE, sp: THREE.Sprite,
   ): void => {
     if (!sp.visible || text === '') return;
     npUp.setFromMatrixColumn(camera.matrixWorld, 1);
-    npHead.copy(sp.position).addScaledVector(npUp, sp.scale.y * 0.85);
+    /* 图集帧上下有留白,人物本体只占下半部分:按整帧顶端(0.85)算会让牌子飘在空地里。 */
+    npHead.copy(sp.position).addScaledVector(npUp, sp.scale.y * NAMEPLATE_HEAD_RATIO);
     npVec.copy(npHead).project(camera);
     const x = ((npVec.x + 1) / 2) * window.innerWidth;
     const y = ((1 - npVec.y) / 2) * window.innerHeight;
@@ -1032,13 +1037,14 @@ export function boot(container: HTMLElement): BootHandle {
     } else if (el.textContent !== text) {
       el.textContent = text;
     }
-    el.style.transform = `translate(${Math.round(x)}px,${Math.round(y)}px) translate(-50%,-100%)`;
     el.style.display = 'block';
     nameplateSeen.add(key);
+    nameplateQueue.push({ el, x, y, me: kind === 'me' });
   };
   const updateNameplates = (): void => {
     camera.updateMatrixWorld();
     nameplateSeen.clear();
+    nameplateQueue.length = 0;
     placeNameplate('me', '你', 'me', playerMarker);
     for (const n of npcList) {
       const sp = npcSprites.get(n.id);
@@ -1050,6 +1056,24 @@ export function boot(container: HTMLElement): BootHandle {
       const who = authority.state.players.find((q) => q.id === id);
       const nm = who === undefined || who.name === '' || who.name === who.id ? '旅人' : who.name;
       placeNameplate(key, nm, 'player', sp);
+    }
+    /* 防重叠 + 夹进屏幕:「你」先摆、位置不动;其余的牌子压到已摆的牌子上就往上错开一格,
+       横向夹进屏幕内(靠边的 NPC 不会被切掉半个字)。 */
+    nameplateQueue.sort((a, b) => Number(b.me) - Number(a.me));
+    const placed: { l: number; r: number; t: number; b: number }[] = [];
+    for (const q of nameplateQueue) {
+      const w = q.el.offsetWidth || 60;
+      const h = q.el.offsetHeight || 18;
+      const cx = Math.min(Math.max(q.x, w / 2 + 4), window.innerWidth - w / 2 - 4);
+      let y = q.y;
+      for (let tries = 0; tries < 8; tries += 1) {
+        const hit = placed.some((r) => cx - w / 2 < r.r && cx + w / 2 > r.l && y - h < r.b && y > r.t);
+        if (!hit) break;
+        y -= h + 2;
+      }
+      q.el.style.zIndex = q.me ? '2' : '1';
+      q.el.style.transform = `translate(${Math.round(cx)}px,${Math.round(y)}px) translate(-50%,-100%)`;
+      placed.push({ l: cx - w / 2, r: cx + w / 2, t: y - h, b: y });
     }
     /* 这一帧没摆的(走出屏幕 / 离场 / 隐藏)⇒ 摘掉标签,免得 DOM 越积越多。 */
     for (const [key, el] of nameplates) {
