@@ -579,6 +579,12 @@ function main(): void {
   gameHud.mount(root, {
     onPrompt: () => { talkToNearbyNpc(); },
     onSelectItem: (id) => { lastItemId = id; },
+    /* 触屏才有互动按钮:派发与键盘相同的 keydown,走既有的动作键位链路(不另写一套)。 */
+    ...(coarsePointer ? {
+      onAction: (key: 'e' | 'f') => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+      },
+    } : {}),
   });
   const setDebugHud = (on: boolean): void => {
     document.body.classList.toggle('debug', on);

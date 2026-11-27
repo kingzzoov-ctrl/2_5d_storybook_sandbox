@@ -48,6 +48,8 @@ export interface GameHudEvents {
   onPrompt?: () => void;
   /** 快捷栏某一格被点(传物品 id) */
   onSelectItem?: (itemId: number) => void;
+  /** 触屏互动按钮被点(传对应的键名 `e` 采集 / `f` 拾取);不给 ⇒ 不显示按钮(键盘设备) */
+  onAction?: (key: 'e' | 'f') => void;
 }
 
 /** 快捷栏格数。 */
@@ -101,6 +103,7 @@ export function createGameHud(): GameHud {
     target: HTMLElement; targetName: HTMLElement; targetFill: HTMLElement;
     prompt: HTMLElement; toast: HTMLElement;
     hotbar: HTMLElement; bagText: HTMLElement; heldText: HTMLElement;
+    actionBtns: HTMLElement[];
   } | null = null;
   let hotbarSig = '';
   let onSelect: ((itemId: number) => void) | undefined;
@@ -152,7 +155,31 @@ export function createGameHud(): GameHud {
         + 'background:rgba(62,39,35,.82);border:2px solid #f6d9a8;', bar);
       const bagText = mk('font-size:11px;opacity:.9;text-shadow:0 1px 2px #3e2723;', bar);
 
-      els = { meName, meFill, meText, target, targetName, targetFill, prompt, toast, hotbar, bagText, heldText };
+      /* 触屏互动按钮:手机没有 E / F 键,不加的话砍不了树、捡不了掉落。
+         点下去由调用方派发同一个键盘事件 ⇒ 与键盘走同一条动作链路。 */
+      const actionBtns: HTMLElement[] = [];
+      const onAction = events?.onAction;
+      if (onAction !== undefined) {
+        const defs: readonly { key: 'e' | 'f'; text: string; bottom: number }[] = [
+          { key: 'e', text: '采集', bottom: 104 },
+          { key: 'f', text: '拾取', bottom: 172 },
+        ];
+        for (const d of defs) {
+          const b = mk(`position:absolute;right:12px;bottom:${d.bottom}px;width:56px;height:56px;`
+            + 'border-radius:50%;display:flex;align-items:center;justify-content:center;'
+            + 'font-size:15px;font-weight:800;background:rgba(255,248,236,.94);color:#3e2723;'
+            + 'border:3px solid #3e2723;box-shadow:0 3px 0 rgba(62,39,35,.5);'
+            + 'pointer-events:auto;cursor:pointer;-webkit-user-select:none;user-select:none;', layer);
+          b.textContent = d.text;
+          b.setAttribute('role', 'button');
+          b.setAttribute('aria-label', d.text);
+          b.dataset.actionKey = d.key;
+          b.addEventListener('pointerdown', (ev) => { ev.preventDefault(); ev.stopPropagation(); onAction(d.key); });
+          actionBtns.push(b);
+        }
+      }
+
+      els = { meName, meFill, meText, target, targetName, targetFill, prompt, toast, hotbar, bagText, heldText, actionBtns };
     },
 
     hitAt(x, y): boolean {
@@ -161,7 +188,8 @@ export function createGameHud(): GameHud {
         const r = el.getBoundingClientRect();
         return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
       };
-      return (els.prompt.style.display !== 'none' && inside(els.prompt)) || inside(els.hotbar);
+      return (els.prompt.style.display !== 'none' && inside(els.prompt)) || inside(els.hotbar)
+        || els.actionBtns.some(inside);
     },
 
     update(view, nowMs): void {
