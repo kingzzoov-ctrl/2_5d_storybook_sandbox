@@ -52,8 +52,24 @@ export interface GameHudEvents {
 
 /** 快捷栏格数。 */
 export const HOTBAR_SLOTS = 8;
-/** 快捷栏一格的边长(CSS 像素)。 */
-const HOTBAR_CELL_PX = 46;
+/** 快捷栏一格的最大边长(CSS 像素);窄屏按屏宽缩小,见 `hotbarCellPx`。 */
+const HOTBAR_CELL_MAX_PX = 46;
+/** 快捷栏格子的最小边长:再小图标就看不清了。 */
+const HOTBAR_CELL_MIN_PX = 30;
+/** 快捷栏格间距 / 外框内边距+边框 / 两侧留白(CSS 像素),与下面的样式串同一份数。 */
+const HOTBAR_GAP_PX = 4;
+const HOTBAR_FRAME_PX = 14;
+const HOTBAR_SIDE_MARGIN_PX = 12;
+
+/**
+ * 按屏宽算快捷栏一格的边长:8 格 + 7 道间距 + 外框 + 两侧留白必须塞进屏宽。
+ * 390 宽的手机算出 40(固定 46 会超出 ~30px,最后一格被屏幕边缘截掉)。
+ */
+export function hotbarCellPx(viewportW: number): number {
+  if (!Number.isFinite(viewportW) || viewportW <= 0) return HOTBAR_CELL_MAX_PX;
+  const room = viewportW - 2 * HOTBAR_SIDE_MARGIN_PX - HOTBAR_FRAME_PX - (HOTBAR_SLOTS - 1) * HOTBAR_GAP_PX;
+  return Math.max(HOTBAR_CELL_MIN_PX, Math.min(HOTBAR_CELL_MAX_PX, Math.floor(room / HOTBAR_SLOTS)));
+}
 
 /** 物品图标的内联样式(图集里没有这件 ⇒ 空串,格子只显示底色)。 */
 export function itemIconStyle(itemId: number, px: number): string {
@@ -132,7 +148,7 @@ export function createGameHud(): GameHud {
         + 'display:flex;flex-direction:column;align-items:center;gap:3px;pointer-events:auto;', layer);
       bar.id = 'gh_hotbar';
       const heldText = mk('font-size:12px;font-weight:700;text-shadow:0 1px 2px #3e2723,0 0 4px #3e2723;', bar);
-      const hotbar = mk('display:flex;gap:4px;padding:5px;border-radius:12px;'
+      const hotbar = mk(`display:flex;gap:${HOTBAR_GAP_PX}px;padding:5px;border-radius:12px;`
         + 'background:rgba(62,39,35,.82);border:2px solid #f6d9a8;', bar);
       const bagText = mk('font-size:11px;opacity:.9;text-shadow:0 1px 2px #3e2723;', bar);
 
@@ -169,7 +185,8 @@ export function createGameHud(): GameHud {
       }
 
       /* 快捷栏只在内容变了的时候重建(每帧重建会吞掉点击)。 */
-      const sig = `${view.heldItemId}|${view.bagCapacity}|${view.bag.map((b) => `${b.id}x${b.count}`).join(',')}`;
+      const cellPx = hotbarCellPx(els.hotbar.ownerDocument.defaultView?.innerWidth ?? 0);
+      const sig = `${cellPx}|${view.heldItemId}|${view.bagCapacity}|${view.bag.map((b) => `${b.id}x${b.count}`).join(',')}`;
       if (sig !== hotbarSig) {
         hotbarSig = sig;
         const doc = els.hotbar.ownerDocument;
@@ -178,13 +195,13 @@ export function createGameHud(): GameHud {
           const it = view.bag[i];
           const cell = doc.createElement('div');
           const on = it !== undefined && it.id === view.heldItemId;
-          cell.style.cssText = `position:relative;width:${HOTBAR_CELL_PX}px;height:${HOTBAR_CELL_PX}px;`
+          cell.style.cssText = `position:relative;width:${cellPx}px;height:${cellPx}px;`
             + `border-radius:8px;background:rgba(255,248,236,${on ? '.95' : '.16'});`
             + `border:2px solid ${on ? '#ffd166' : 'rgba(246,217,168,.45)'};`
             + (on ? 'box-shadow:0 0 0 2px #3e2723;' : '') + (it === undefined ? '' : 'cursor:pointer;');
           if (it !== undefined) {
             const icon = doc.createElement('div');
-            icon.style.cssText = `position:absolute;inset:0;${itemIconStyle(it.id, HOTBAR_CELL_PX - 4)}`;
+            icon.style.cssText = `position:absolute;inset:0;${itemIconStyle(it.id, cellPx - 4)}`;
             cell.appendChild(icon);
             if (it.count > 1) {
               const n = doc.createElement('div');
