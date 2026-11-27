@@ -560,6 +560,10 @@ function main(): void {
      收起用的是 `body.debug` 这个类(样式在 index.html),元素与文本照常更新。 */
   /* 排障钩子:控制台里直接读权威快照(与 `__spriteDebug` 同类,只读)。 */
   (window as unknown as { __store?: unknown }).__store = handle.store;
+  /* 主输入是触屏(手指)时,提示卡写「点这里」而不是「按 T」:手机上没有 T 键。
+     `matchMedia` 不存在(node 断言环境)⇒ 按键盘设备处理。 */
+  const coarsePointer = typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: coarse)').matches;
   const gameHud = createGameHud();
   /** 与最近的 NPC 说话(键盘 T 与提示卡点击共用;够不够近用权威位置判)。 */
   const talkToNearbyNpc = (): boolean => {
@@ -819,7 +823,9 @@ function main(): void {
         target: near === null || near.d > TARGET_SHOW_RANGE ? null : {
           name: MOB_BY_ID.get(near.mobId)?.name ?? near.mobId, hp: near.hp, maxHp: near.maxHp,
         },
-        prompt: npcNear === null ? '' : `按 ${NPC_TALK_KEY.toUpperCase()} 与「${npcNear.name}」说话`,
+        prompt: npcNear === null ? '' : (coarsePointer
+          ? `点这里与「${npcNear.name}」说话`
+          : `按 ${NPC_TALK_KEY.toUpperCase()} 与「${npcNear.name}」说话`),
         toast: toastText,
         bag, bagCapacity, heldItemId: lastItemId,
         online: st === 'live',
