@@ -3,7 +3,7 @@
  *
  * 守的是「这张大地图是能玩的」:
  * 生成确定;每个场地从出生点**走得到**(不靠跳);NPC 站位是空地;
- * 墙 / 树 / 深水 / 陡坎挡路而草丛不挡;装配出来的世界出生在镇广场、围着玩家刷怪、
+ * 墙 / 树 / 深水 / 陡坎挡路而草丛不挡;装配出来的世界出生在镇广场、怪住在营地里、
  * 资源采走会长回来、镇子的建筑拆不掉、带着材料跟 NPC 说话能交差。
  *
  * 运行:`node tests/WS-FND-195-overworld.test.ts`
@@ -15,6 +15,7 @@ import {
 import { canEnter, isDeepWater, isSolidObj, slideMove, type CellView } from '../shared/world/passable.ts';
 import { Landmark } from '../shared/world/landmarks.ts';
 import { BIOME_SPAWN } from '../server/src/mobs/spawner.ts';
+import { CAMP_WAKE_DIST, planCamps } from '../server/src/mobs/camps.ts';
 import { assemble } from '../server/src/index.ts';
 import { RoomAction } from '../server/src/net/room.ts';
 import { NPCS, activeNpcs, missingItemIds, setActiveNpcs } from '../server/src/npc/defs.ts';
@@ -188,7 +189,7 @@ function findNear(x0: number, y0: number, r: number, want: (c: CellView, x: numb
   return best;
 }
 
-test('FND195-7 ★ 装配:出生在镇广场、只带起始包、名册换成主世界、镇里不刷怪而镇外围着玩家刷', () => {
+test('FND195-7 ★ 装配:出生在镇广场、只带起始包、名册换成主世界、镇里不刷怪而镇外的怪住在营地里', () => {
   const { rt, sim } = world();
   try {
     eq(activeNpcs().length, 19, '名册换成主世界的 19 位');
@@ -196,17 +197,26 @@ test('FND195-7 ★ 装配:出生在镇广场、只带起始包、名册换成主
     eq([Math.floor(p.x), Math.floor(p.y)], [SPAWN_POINT.x, SPAWN_POINT.y], '出生点 = 镇广场');
     eq(rt.inventoryOf('p1')!.items, { 101: 2, 106: 2, 118: 2, 201: 1 }, '只有起始包');
     run(rt, 45);
-    eq(rt.state.wildlife.length, 0, '★ 人在镇里 ⇒ 安全区,一只怪都不刷');
-    sim.setPlayerPos('p1', 316.5, 256.5);
+    eq(rt.state.wildlife.length, 0, '★ 人在镇里 ⇒ 一只怪都不刷(出生点唤醒不了任何营地)');
+    /* 走到草甸一处营地边上:醒着的只有它,刷出来的怪 = 它的名单,而且都在它的圈里。 */
+    const at = { x: 316.5, y: 256.5 };
+    sim.setPlayerPos('p1', at.x, at.y);
     run(rt, 90);
-    const near = rt.state.wildlife.filter((w) => Math.hypot(w.x - 316.5, w.y - 256.5) <= 40).length;
-    ok(near >= 5, `★ 走到镇外 ⇒ 身边 40 格内有怪(实得 ${near} 只)`);
-    eq(rt.state.wildlife.length, near, '全部刷在玩家身边(不撒到地图另一头)');
+    const awake = planCamps(ow).filter((c) => Math.hypot(c.x - at.x, c.y - at.y) <= CAMP_WAKE_DIST);
+    ok(awake.length >= 1, `前置:这个位置至少唤醒一处营地(实得 ${awake.length})`);
+    const want = awake.flatMap((c) => c.roster.flatMap((r) => Array<string>(r.count).fill(r.mobId))).sort();
+    eq(rt.state.wildlife.map((w) => w.mobId).sort(), want, '★ 刷出的怪 = 醒着的营地的名单(种类与只数)');
+    for (const w of rt.state.wildlife) {
+      ok(
+        awake.some((c) => Math.hypot(w.x - c.x, w.y - c.y) <= c.radius + 1 && c.roster.some((r) => r.mobId === w.mobId)),
+        `★ ${w.id} 在自己营地的圈里(${w.x.toFixed(1)},${w.y.toFixed(1)})`,
+      );
+    }
     /* 走远 ⇒ 原来那批离场。 */
     sim.setPlayerPos('p1', 150.5, 262.5);
     run(rt, 20);
-    eq(rt.state.wildlife.filter((w) => Math.hypot(w.x - 316.5, w.y - 256.5) <= 40).length, 0, '★ 走远之后旧地方的怪离场');
-    ok(sim.despawnedFarMobs >= near, `离场有计数(实得 ${sim.despawnedFarMobs})`);
+    eq(rt.state.wildlife.filter((w) => Math.hypot(w.x - at.x, w.y - at.y) <= 40).length, 0, '★ 走远之后旧地方的怪离场');
+    ok(sim.despawnedFarMobs >= want.length, `离场有计数(实得 ${sim.despawnedFarMobs})`);
   } finally {
     setActiveNpcs(NPCS);
   }

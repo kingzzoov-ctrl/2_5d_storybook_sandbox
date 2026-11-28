@@ -4,6 +4,7 @@
  *   IDLE_GRAZE              → 在出生点 4 格内挑无阻挡点慢走 3~5 秒
  *   ALERT_FLEE_OR_CHASE     → 单位向量 + 左偏 45° / 右偏 45° 探针避障(只读 3 次地形数组)
  *   TELEGRAPH_ATTACK        → 0.8~1.5s 预警几何,到期后一次性结算区域伤害
+ *   拴绳(leash,可选)      → 追击中离家超过拴绳就放弃、直走回家;回家途中无视玩家(IDLE_GRAZE 的一段,不是第四个状态)
  *
  * 全部逻辑为纯函数 + 少量可变状态,单次 tick 实测 < 0.01ms(见 tests/WS-04.test.ts 计时断言)。
  */
@@ -109,6 +110,12 @@ export interface FsmConfig {
   attackRadius: number;
   /** 预警几何生成器。 */
   makeTelegraph: (self: MobFsm, target: Vec2) => WarnGeom;
+  /**
+   * 拴绳(格):追击中离**家**超过它就放弃、直走回家(回家途中无视玩家,走进 `GRAZE_RADIUS` 才恢复索敌)。
+   * 缺省 = 不拴,与旧行为一致,所有没传它的调用方不受影响。
+   * 必须 > `GRAZE_RADIUS`:否则怪一出门就算到家、到家又索敌,来回抖 ⇒ 构造时按 `GRAZE_RADIUS + 1` 垫底。
+   */
+  leash?: number;
 }
 
 export interface TelegraphState {
@@ -150,6 +157,14 @@ export class MobFsm {
   attackCd = 0;
   /** 启用避障:测「无寻路」成本时置 false。 */
   avoid = true;
+  /** 拴绳(格):追击中离家超过它就放弃、回家。`Infinity` = 不拴。见 `FsmConfig.leash`。 */
+  readonly leash: number;
+  /**
+   * 正在回家:无视玩家,直到走进 `GRAZE_RADIUS`(见 `tickGraze`)。不变量:`homing` ⇒ 状态是 IDLE_GRAZE。
+   * ⚠️ 没有「回家超时」:45° 探针不寻路,撞上整面墙会原地打转,但这样的怪只是站着(既不索敌也不攻击),
+   *   不伤人;玩家走远它就被离场清掉。再加一套计时只会多一份状态。
+   */
+  homing = false;
   private readonly makeTelegraph: (self: MobFsm, target: Vec2) => WarnGeom;
   private readonly rng: () => number;
 
@@ -162,6 +177,10 @@ export class MobFsm {
     this.speed = cfg.speed;
     this.aggroRadius = cfg.aggroRadius;
     this.attackRadius = cfg.attackRadius;
+    /* 拴绳垫底 `GRAZE_RADIUS + 1`:再短,怪一出门就算「离家太远」、一进门又算「到家」,会在门口来回抖。
+       缺省 / NaN / 负数 / Infinity ⇒ 不拴。 */
+    this.leash = cfg.leash !== undefined && Number.isFinite(cfg.leash) && cfg.leash > 0
+      ? Math.max(cfg.leash, GRAZE_RADIUS + 1) : Infinity;
     this.makeTelegraph = cfg.makeTelegraph;
     this.rng = rng;
     this.grazeTarget = { x: cfg.homeX, y: cfg.homeY };
@@ -189,6 +208,8 @@ export class MobFsm {
       this.resetGraze();
     }
     if (next !== MobFsmState.TELEGRAPH_ATTACK) this.telegraph = null;
+    /* 离开闲逛态(被打 / 被控制 / 重新索敌)⇒ 不再是「回家中」。仍在拴绳之外就由 `tickAlert` 开头重新判回家。 */
+    if (next !== MobFsmState.IDLE_GRAZE) this.homing = false;
   }
 
   /** 进入预警攻击态。 */
@@ -223,6 +244,9 @@ export class MobFsm {
   }
 
   private tickGraze(target: Vec2 | null, probe: (px: number, py: number) => boolean, dt: number): WarnGeom | null {
+    /* 回家途中:走进家门才算到,到了当帧就能重新看见玩家(下面的索敌判定紧跟着跑)。 */
+    if (this.homing && Math.hypot(this.x - this.homeX, this.y - this.homeY) <= GRAZE_RADIUS) this.homing = false;
+    if (this.homing) return this.walkHome(probe, dt);
     if (target) {
       const d = Math.hypot(target.x - this.x, target.y - this.y);
       if (d <= this.aggroRadius) {
@@ -255,7 +279,34 @@ export class MobFsm {
     return null;
   }
 
+  /**
+   * 回家(放弃追击之后):直走向家,同样 45° 避障、每步只读 3 次地形;不索敌、不闲逛,速度同追击。
+   * 「到家」的判定(走进 `GRAZE_RADIUS`)在 `tickGraze` 开头 —— 本函数只管迈步。
+   */
+  private walkHome(probe: (px: number, py: number) => boolean, dt: number): WarnGeom | null {
+    const dx = this.homeX - this.x;
+    const dy = this.homeY - this.y;
+    const steer = this.avoid
+      ? steer45(dx, dy, this.x, this.y, probe)
+      : { dir: unit(dx, dy), turn: 0 as const, reads: 0, blocked: { forward: false, left: false, right: false } };
+    this.totalProbeReads += steer.reads;
+    this.lastSteer = steer;
+    const v = this.speed * CHASE_SPEED_MUL;
+    this.vx = steer.dir.x * v;
+    this.vy = steer.dir.y * v;
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    return null;
+  }
+
   private tickAlert(target: Vec2 | null, probe: (px: number, py: number) => boolean, dt: number): WarnGeom | null {
+    /* 拴绳:离家太远就放弃,直走回家。放在一切判定之前 —— 追击、逃跑(受惊的温顺怪也不许跑出营地)、
+       预警结算后的下一帧一视同仁。已经在回家路上的怪不会走到这里(`tickGraze` 先拦)。 */
+    if (Math.hypot(this.x - this.homeX, this.y - this.homeY) > this.leash) {
+      this.homing = true;
+      this.setState(MobFsmState.IDLE_GRAZE);
+      return null;
+    }
     if (!target) {
       this.setState(MobFsmState.IDLE_GRAZE);
       return null;

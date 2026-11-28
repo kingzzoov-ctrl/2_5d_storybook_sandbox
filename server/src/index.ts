@@ -118,6 +118,7 @@ import { addScore, partyStateOf } from './net/actions/start_party.ts';
 import { scoreOfPartyEvent } from './party/scoring.ts';
 import { sleepStateOf } from './net/actions/sleep.ts';
 import { setTownRadiusProvider } from './mobs/spawner.ts';
+import { planCamps } from './mobs/camps.ts';
 /* ★ w97:主线订阅器 —— 见下方装配处那条长注释(为什么必须有人调、以及 rebuildWorld 的缺口)。 */
 import { attachMainline } from './quests/mainline_wiring.ts';
 import { townSafeRadiusProvider } from './net/actions/modify_town.ts';
@@ -433,7 +434,10 @@ export function createHost(deps: AssembleDeps = {}, db: DbLike | null = null): W
       },
       townCenter: { x: WORLD_CENTER, y: WORLD_CENTER },
       collision: true,
-      spawnNearPlayers: true,
+      /* 野怪住在营地里:玩家走近才刷、打死隔一阵才补、走远整营撤场(见 `mobs/camps.ts`)。
+         取代此前「围着玩家 13..34 格现刷」—— 那样怪没有地盘,一级玩家刚出镇就被围殴
+         (2026-11-27 真浏览器实测倒地复活 4 次,一只绵羊都没打到)。 */
+      camps: planCamps(ow),
       soloRespawnSec: 5,
       respawnPoint: { x: SPAWN_POINT.x + 0.5, y: SPAWN_POINT.y + 0.5 },
       regrowSec: OVERWORLD_REGROW_SEC,

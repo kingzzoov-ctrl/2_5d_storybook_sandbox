@@ -325,7 +325,7 @@ export class MobHost implements MobWorld {
    * 判据是「AI 有没有写位置」而非「AI 属于哪一类」——
    * 新增 AI 无需注册,改某个 AI 的移动也不会悄悄失效。
    */
-  addMob(id: string, def: MobDef, x: number, y: number, opts: { anchorX?: number; anchorY?: number; hp?: number } = {}): MobRuntime {
+  addMob(id: string, def: MobDef, x: number, y: number, opts: { anchorX?: number; anchorY?: number; hp?: number; leash?: number } = {}): MobRuntime {
     const hp = opts.hp ?? def.hp;
     const existed = this.mobs.get(id);
     const anchorX = opts.anchorX ?? x;
@@ -339,6 +339,8 @@ export class MobHost implements MobWorld {
       {
         homeX: anchorX,
         homeY: anchorY,
+        /* 拴绳:营地怪追人追到离家这么远就放弃、回家(`fsm.ts` 的 `FsmConfig.leash`);缺省不拴。 */
+        leash: opts.leash,
         speed: BASE_MOVE_SPEED,
         /* 感知/攻击半径:取手册区间中值。敌对生物感知更远(要扑过来),
            温顺生物感知近(受惊才跑)。 */

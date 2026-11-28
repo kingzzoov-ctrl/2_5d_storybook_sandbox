@@ -94,6 +94,7 @@ import { PhysicsWorld, safeMass, type StepReport } from '../physics/world.ts';
 import { CarrySystem, CarryReject, JUMP_VZ, type CarryActor, type ChainNode, type ThrowResult } from '../physics/carry.ts';
 import { AoiManager, AOI_WAKE_DISTANCE, type AoiPlayer } from '../mobs/aoi.ts';
 import { MobSpawner, spawnableMobs, spawnsPerCheck, mobInstanceId, mobDefOf, mobSpeciesId, MOB_INSTANCE_SEP, type SpawnContext, type SpawnWorld } from '../mobs/spawner.ts';
+import { CAMP_RESPAWN_SEC, CAMP_SPAWN_MIN_PLAYER_DIST, CAMP_SPAWN_TRIES, CAMP_WAKE_DIST, campSeatsOf, type CampSeat, type MobCamp } from '../mobs/camps.ts';
 import { rollMobDrops, type MobDropResult } from '../mobs/drops.ts';
 import type { WildlifeState } from '../../../shared/types/wire.ts';
 /* ★ WS-FND-123:`TelegraphShape` 是**线上几何词表**(0=无 1=圆 2=扇 3=矩 4=环)。
@@ -661,10 +662,14 @@ export interface WorldSimOptions {
    */
   collision?: boolean;
   /**
-   * 围着玩家刷怪、远离所有玩家的怪自动离场。缺省关(= 全图均匀撒点、从不离场)。
-   * 大世界必须开:否则几十只怪摊在几十万格里,玩家一只都遇不到。
+   * 野怪营地(见 `mobs/camps.ts`):怪住在营地里 —— 玩家走近才刷、打死隔一阵才补,
+   * 离所有玩家 `DESPAWN_DISTANCE` 格以外的怪自动离场。给了(哪怕是空数组)⇒ 刷怪**只**由营地驱动,
+   * 不再全图撒点。缺省 = 全图均匀撒点、从不离场(小世界与既有判据的口径)。
+   * 大世界必须给:否则几十只怪摊在几十万格里,玩家一只都遇不到。
+   * (取代了此前的 `spawnNearPlayers`「围着玩家 13..34 格现刷」:那样怪没有地盘,
+   * 一级玩家刚走出镇子就被围殴 —— 2026-11-27 真浏览器实测倒地复活 4 次。)
    */
-  spawnNearPlayers?: boolean;
+  camps?: readonly MobCamp[];
   /**
    * 独自倒地的自动复活:倒地满这么多秒、且没有队友在救 ⇒ 送回 `respawnPoint` 并按半血复活。
    * 缺省 0 = 关(倒地只能等队友或复活旗,单人会永久卡死 —— 既有判据按这个行为写的)。
@@ -1276,7 +1281,10 @@ export class WorldSim {
   private readonly biomeLookup: (x: number, y: number) => string | null;
   private readonly townCenterPos: { x: number; y: number } | null;
   private readonly collisionOn: boolean;
-  private readonly spawnNearPlayers: boolean;
+  /** 野怪营地;`null` = 不用营地(全图均匀撒点,见 `WorldSimOptions.camps`)。 */
+  private readonly campList: readonly MobCamp[] | null;
+  /** 各营地的名额(下标与 `campList` 一一对应);世界重置时重建(名额上的怪属于旧世界)。 */
+  private campSeats: CampSeat[][];
   private readonly soloRespawnSec: number;
   private readonly respawnPoint: { x: number; y: number } | null;
   /** 累计自动复活了几次(自检读数)。 */
@@ -1924,7 +1932,8 @@ export class WorldSim {
     this.biomeLookup = opts.biomeAt ?? biomeAt;
     this.townCenterPos = opts.townCenter ?? null;
     this.collisionOn = opts.collision === true;
-    this.spawnNearPlayers = opts.spawnNearPlayers === true;
+    this.campList = opts.camps ?? null;
+    this.campSeats = campSeatsOf(this.campList);
     this.soloRespawnSec = Number.isFinite(opts.soloRespawnSec) && (opts.soloRespawnSec as number) > 0
       ? (opts.soloRespawnSec as number) : 0;
     this.respawnPoint = opts.respawnPoint ?? null;
@@ -7757,6 +7766,8 @@ export class WorldSim {
     this.mobBiome.clear();
     this.deadMobs.clear();
     this.spawnBudget = 0;
+    /* 营地名额上的怪属于旧世界 ⇒ 全部清空重建(留着 id 只会让名额永远「被占着」)。 */
+    this.campSeats = campSeatsOf(this.campList);
     this.lastMobTicks = [];
     this.mobErrors = 0;
     this.lastBossTick = { ticked: 0, phaseSwitched: [], stunEnded: [] };
@@ -8049,8 +8060,11 @@ export class WorldSim {
    * **不再结算经验**,见 `bumpMobOrdinal` 的 docblock)。
    *
    * @returns `'CREATED'` = 新建;`'REPLACED'` = 覆盖了同 id 的已有刚体。
+   * @param home 营地怪的「家」与拴绳(见 `mobs/camps.ts`):缺省 = 家就是落点、不拴(既有调用方的口径)。
    */
-  addMob(id: string, biome: string, x: number, y: number): 'CREATED' | 'REPLACED' {
+  addMob(
+    id: string, biome: string, x: number, y: number, home?: { x: number; y: number; leash?: number },
+  ): 'CREATED' | 'REPLACED' {
     const hadBody = this.physics.bodies.has(id);
     this.physics.spawn(id, { x, y, z: 0 });
     /* ★ 格位唯一(WS-FND-130 P2):与 `addPlayer` 同一条口径 —— 落点与**别的**刚体
@@ -8066,7 +8080,7 @@ export class WorldSim {
     /* 登记到宿主 —— 漏了这一步的表现是「AOI 唤醒了它,但宿主不认识,
        于是安静地跳过」:生物不动、不报错,像世界空了。 */
     const def = mobDefOf(id);
-    if (def) this.mobHost.addMob(id, def, x, y, { anchorX: x, anchorY: y });
+    if (def) this.mobHost.addMob(id, def, x, y, { anchorX: home?.x ?? x, anchorY: home?.y ?? y, leash: home?.leash });
     else this.unknownMobs.push(id);
     if (hadBody) {
       this.mobAddDuplicates += 1;
@@ -10310,20 +10324,8 @@ export class WorldSim {
   private trySpawnOne(fallbackBiome: string): boolean {
     /* +0.5:落在**格心**。整数坐标在 `WorldGrid` 上是格的角,
        `blocked()` 查的是格 ⇒ 落在角上会让「刷在墙里/墙外」取决于取整方向。 */
-    let x = Math.floor(this.rng() * this.sizeCells) + 0.5;
-    let y = Math.floor(this.rng() * this.sizeCells) + 0.5;
-    if (this.spawnNearPlayers) {
-      /* 围着某个玩家的环带撒点:近处留白(不在眼皮底下凭空冒出来),远处封顶。 */
-      const ids = [...this.playerIds];
-      if (ids.length === 0) return false;
-      const p = this.physics.bodies.get(ids[Math.floor(this.rng() * ids.length) % ids.length]!);
-      if (p === undefined) return false;
-      const ang = this.rng() * Math.PI * 2;
-      const dist = WorldSim.SPAWN_RING_MIN + this.rng() * (WorldSim.SPAWN_RING_MAX - WorldSim.SPAWN_RING_MIN);
-      x = Math.floor(p.x + Math.cos(ang) * dist) + 0.5;
-      y = Math.floor(p.y + Math.sin(ang) * dist) + 0.5;
-      if (!this.inWorld(x, y)) return false;
-    }
+    const x = Math.floor(this.rng() * this.sizeCells) + 0.5;
+    const y = Math.floor(this.rng() * this.sizeCells) + 0.5;
     /* ★ WS-FND-185:这一格属于哪个群系 —— 与只读口 `biomeOfCell()` **同一个函数**,
        不在这里重写一遍 floor / 兜底(两份推导迟早漂移)。 */
     const biome = this.biomeOfCell(x, y);
@@ -10354,34 +10356,16 @@ export class WorldSim {
   }
 
   /**
-   * 当前**存活**生物的快照 —— 房间把它投影进 `state.wildlife` 用。
-   *
-   * ## 为什么必须有这个口(2026-11-14 实测)
-   * 房间手里只有 `WorldSaveHost`(结构化接口,刻意不 import 模拟层类型),
-   * 所以它**没法自己遍历 `mobHost`**。而 `upsertWildlife()` 在 `net/schema.ts`
-   * 里躺着、全仓**没有任何调用点**(`git grep -n addWildlife` = 0 处)
-   * ⇒ 客户端快照里恒为 `wildlife: []`,即使世界里真有怪也看不见。
-   *
-   * ## `fsm` 为什么不从 `rt.fsm` 抄
-   * `rt.fsm` 是 `MobFsm` **对象**,而 `WildlifeState.fsm` 是 wire 上的 `uint8`
-   * (默认值见 `net/schema.ts` 的 `fsm: 0`);两者之间**没有定义过映射表**。
-   * 硬塞一个编号(比如按枚举顺序数)会让客户端拿到一个**看起来合法、
-   * 实际没有任何含义**的状态码。⇒ 保持 wire 默认值 0,并在 `docs` 里
-   * 记为待办,而不是编一个。
+   * 离场距离(格):生物离所有玩家都超过它就撤场。
+   * 必须大于营地唤醒距离加最长拴绳(`tests/WS-FND-201` 钉着):开着的营地里的怪永远不会被撤场,
+   * 玩家在营地边缘来回走,整营也不会反复撤场 / 重刷。
    */
-  /** 围着玩家刷怪的环带(格)与离场距离。 */
-  static readonly SPAWN_RING_MIN = 13;
-  static readonly SPAWN_RING_MAX = 34;
   static readonly DESPAWN_DISTANCE = 80;
 
   /** 离所有玩家都超过 `DESPAWN_DISTANCE` 的生物离场(标成已死,由帧末收尸统一清表,不结算击杀)。 */
   private despawnFarMobs(): void {
     if (this.playerIds.size === 0) return;
-    const pts: { x: number; y: number }[] = [];
-    for (const id of this.playerIds) {
-      const b = this.physics.bodies.get(id);
-      if (b !== undefined) pts.push({ x: b.x, y: b.y });
-    }
+    const pts = this.playerPoints();
     if (pts.length === 0) return;
     for (const rt of this.mobHost.runtimes()) {
       if (!rt.alive) continue;
@@ -10392,6 +10376,8 @@ export class WorldSim {
       if (near) continue;
       rt.alive = false;
       this.despawnedFarMobs += 1;
+      /* 营地的名额立刻空出来:撤场不是死亡,玩家回来时整营立刻满员,不罚补员等待。 */
+      this.releaseCampSeat(rt.id);
     }
   }
 
@@ -10410,6 +10396,126 @@ export class WorldSim {
     }
   }
 
+  /** 所有在场玩家的位置(刷怪 / 离场按它们判远近)。 */
+  private playerPoints(): { x: number; y: number }[] {
+    const pts: { x: number; y: number }[] = [];
+    for (const id of this.playerIds) {
+      const b = this.physics.bodies.get(id);
+      if (b !== undefined) pts.push({ x: b.x, y: b.y });
+    }
+    return pts;
+  }
+
+  /**
+   * 慢帧 2Hz 营地补员(`campList !== null` 时取代 `tickSpawn`)。
+   *
+   * ## 一个名额的一生(`CampSeat`)
+   * ```text
+   * 空(id = null,readyAt ≤ 现在) ──玩家走进唤醒距离、落点合格──▶ 占着一只活怪
+   * 占着的怪死了(打死 / 被别的原因收走) ──▶ 空,隔 CAMP_RESPAWN_SEC 秒才补
+   * 占着的怪因离所有玩家太远被撤场        ──▶ 空,立刻可补(撤场不是死亡,不罚等待)
+   * ```
+   *
+   * ## 为什么补员走 `canSpawn` 而不是自己判
+   * 安全区、群系上限、全局上限、阻挡、光照抑制、夜行门是 `decideSpawn` 的既有规则(WS-04 / WS-FND-153),
+   * 营地只决定「刷在哪、刷什么」,不绕过这些闸:镇子被 `MODIFY_TOWN` 扩大后压住营地的格子,
+   * 那一格照样刷不出来。⚠️ 上限用的是**真实计数**(与 `trySpawnOne` 同口径):`MobSpawner.add` 在
+   * 超限时拒绝记账而 `addMob` 照样登记,会让收尸时扣到别的怪的额度(WS-FND-140 P2)。
+   *
+   * 返回本拍真的刷出几只。
+   */
+  private tickCamps(): number {
+    const camps = this.campList;
+    if (camps === null) return 0;
+    const pts = this.playerPoints();
+    const world = this.spawnWorld();
+    const retryDelay = secondsToTicks(CAMP_RESPAWN_SEC);
+    let spawned = 0;
+    camps.forEach((camp, ci) => {
+      const seats = this.campSeats[ci]!;
+      /* 回收:占着名额的怪已经不在了(死了 / 已被收走)⇒ 空出来,隔一阵再补。 */
+      for (const seat of seats) {
+        if (seat.id === null) continue;
+        const rt = this.mobHost.runtimeOf(seat.id);
+        if (rt !== null && rt.alive) continue;
+        seat.id = null;
+        seat.readyAt = this.frameCount + retryDelay;
+      }
+      /* 补员:没人走近就不开张(省钱,也让「出生点唤醒不了任何营地」由几何保证)。 */
+      if (!pts.some((p) => Math.hypot(p.x - camp.x, p.y - camp.y) <= CAMP_WAKE_DIST)) return;
+      for (const seat of seats) {
+        if (seat.id !== null || seat.readyAt > this.frameCount) continue;
+        const id = this.trySpawnCampMob(camp, seat.mobId, pts, world);
+        if (id === null) continue;
+        seat.id = id;
+        spawned += 1;
+      }
+    });
+    return spawned;
+  }
+
+  /** 在营地的落脚格里给一个名额试着刷一只(最多试 `CAMP_SPAWN_TRIES` 个落点);成功返回实例 id。 */
+  private trySpawnCampMob(
+    camp: MobCamp, speciesId: string, pts: readonly { x: number; y: number }[], world: SpawnWorld,
+  ): string | null {
+    const def = mobDefOf(speciesId);
+    if (def === undefined || camp.cells.length === 0) return null;
+    for (let t = 0; t < CAMP_SPAWN_TRIES; t += 1) {
+      const [cx, cy] = camp.cells[Math.floor(this.rng() * camp.cells.length) % camp.cells.length]!;
+      /* 落在格心(+0.5),与 `trySpawnOne` 同一口径。 */
+      const x = cx + 0.5;
+      const y = cy + 0.5;
+      /* 不在眼皮底下凭空冒出来,也不压在别的刚体(玩家 / 别的怪)同一格上。 */
+      if (pts.some((p) => Math.hypot(p.x - x, p.y - y) < CAMP_SPAWN_MIN_PLAYER_DIST)) continue;
+      if (this.physics.occupantsAt(cx, cy).length > 0) continue;
+      const ctx: SpawnContext = {
+        biome: camp.biome,
+        x,
+        y,
+        biomeCount: this.spawner.state.biomeCounts.get(camp.biome) ?? 0,
+        globalCount: this.spawner.state.globalCount,
+        mobId: def.id,
+      };
+      /* `roll` 必须新取:软上限阻尼用它(理由见 `trySpawnOne` 同处注释)。 */
+      if (!this.spawner.canSpawn(ctx, world, this.rng())) continue;
+      /* 序号先增后用、单调、永不复用(与 `trySpawnOne` 同一条纪律:复用会让击杀账吞掉经验)。 */
+      const ordinal = (this.mobOrdinals.get(def.id) ?? 0) + 1;
+      this.mobOrdinals.set(def.id, ordinal);
+      const id = mobInstanceId(def.id, ordinal);
+      this.addMob(id, camp.biome, x, y, { x: camp.x, y: camp.y, leash: camp.leash });
+      return id;
+    }
+    return null;
+  }
+
+  /** 名额上的怪被撤场(不是死亡):名额立刻空出来,不罚补员等待。 */
+  private releaseCampSeat(mobId: string): void {
+    for (const seats of this.campSeats) {
+      for (const seat of seats) {
+        if (seat.id !== mobId) continue;
+        seat.id = null;
+        seat.readyAt = 0;
+        return;
+      }
+    }
+  }
+
+  /**
+   * 当前**存活**生物的快照 —— 房间把它投影进 `state.wildlife` 用。
+   *
+   * ## 为什么必须有这个口(2026-11-14 实测)
+   * 房间手里只有 `WorldSaveHost`(结构化接口,刻意不 import 模拟层类型),
+   * 所以它**没法自己遍历 `mobHost`**。而 `upsertWildlife()` 在 `net/schema.ts`
+   * 里躺着、全仓**没有任何调用点**(`git grep -n addWildlife` = 0 处)
+   * ⇒ 客户端快照里恒为 `wildlife: []`,即使世界里真有怪也看不见。
+   *
+   * ## `fsm` 为什么不从 `rt.fsm` 抄
+   * `rt.fsm` 是 `MobFsm` **对象**,而 `WildlifeState.fsm` 是 wire 上的 `uint8`
+   * (默认值见 `net/schema.ts` 的 `fsm: 0`);两者之间**没有定义过映射表**。
+   * 硬塞一个编号(比如按枚举顺序数)会让客户端拿到一个**看起来合法、
+   * 实际没有任何含义**的状态码。⇒ 保持 wire 默认值 0,并在 `docs` 里
+   * 记为待办,而不是编一个。
+   */
   listWildlife(): WildlifeState[] {
     const out: WildlifeState[] = [];
     for (const rt of this.mobHost.runtimes()) {
@@ -11797,8 +11903,13 @@ export class WorldSim {
                 第二个消费者,所以「判定说该刷」与「世界里多了一只」之间
                 从来**没有任何代码**。
            ⇒ 现在交给 `tickSpawn()` 真的造(它自己管密度与去重)。 */
-        spawned = this.tickSpawn();
-        if (this.spawnNearPlayers) this.despawnFarMobs();
+        /* 有营地 ⇒ 刷怪只由营地驱动(取代全图 / 围着玩家撒点),并撤掉离所有玩家太远的怪。 */
+        if (this.campList !== null) {
+          spawned = this.tickCamps();
+          this.despawnFarMobs();
+        } else {
+          spawned = this.tickSpawn();
+        }
       }
       this.tickRegrow();
     }
