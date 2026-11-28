@@ -46,6 +46,7 @@ import { fileURLToPath } from 'node:url';
 
 import { assemble, createHost, createServer } from '../server/src/index.ts';
 import { RoomRuntime, type WorldSaveHost } from '../server/src/net/room.ts';
+import { carryItemCapacity } from '../server/src/combat/progression.ts';
 import { AccessMode } from '../server/src/db/repo.ts';
 import { isEntryLoadExempt, entryLoadExemptCount } from '../scripts/entry_load_exempt.ts';
 
@@ -124,20 +125,20 @@ test('FND9-5 等级投影经生产装配路径生效:level 30 ⇒ capacity 37', 
 
   /* 入场时是 Lv1 —— 先钉住起点,避免「一开始就 37」的假绿。 */
   eq(runtime.state.players[0]?.level, 1, '入场时投影应为 Lv1');
-  eq(runtime.carryCapacityOf('p1'), 8, 'Lv1 容量应为 8(8 + (L-1))');
+  eq(runtime.carryCapacityOf('p1'), carryItemCapacity(8), 'Lv1 容量应为 8 个负重格(8 + (L-1))');
 
   setAuthoritativeLevel(host, 'p1', 30);
   runtime.step();
 
   eq(runtime.state.players[0]?.level, 30, 'step 后投影应更新为 30');
-  eq(runtime.carryCapacityOf('p1'), 37, 'Lv30 容量应为 37(8 + 29)');
+  eq(runtime.carryCapacityOf('p1'), carryItemCapacity(37), 'Lv30 容量应为 37 个负重格(8 + 29)');
 });
 
 test('FND9-6 等级投影两侧扫描:封顶与下界都正确(不是只扫一个点)', () => {
   /* 本仓教训:某常量从 600 改成 2/10/…/599 时套件全绿,只有改到 601+ 才红。
      ⇒ 「封顶」必须扫**两侧**,否则「恰好落在某一侧」的实现也能通过。 */
   const cases: [number, number, number][] = [
-    /* [权威等级, 期望投影等级, 期望容量] */
+    /* [权威等级, 期望投影等级, 期望负重格数] */
     [1, 1, 8],
     [10, 10, 17],
     [20, 20, 27],
@@ -151,7 +152,7 @@ test('FND9-6 等级投影两侧扫描:封顶与下界都正确(不是只扫一�
     setAuthoritativeLevel(host, 'p1', input);
     runtime.step();
     eq(runtime.state.players[0]?.level, expectLevel, `权威 level=${input} 应投影为 ${expectLevel}`);
-    eq(runtime.carryCapacityOf('p1'), expectCap, `权威 level=${input} 应得容量 ${expectCap}`);
+    eq(runtime.carryCapacityOf('p1'), carryItemCapacity(expectCap), `权威 level=${input} 应得容量 ${expectCap} 个负重格`);
   }
 });
 
@@ -176,7 +177,7 @@ test('FND9-7 负对照:省略 host 的运行时等级恒为 1、容量恒为 8(�
   rt.join({ userId: 'p1', passwordHash: null, asGuest: true });
   for (let i = 0; i < 5; i += 1) rt.step();
   eq(rt.state.players[0]?.level, 1, '没有 host ⇒ 等级投影整段跳过 ⇒ 恒为 1');
-  eq(rt.carryCapacityOf('p1'), 8, '没有 host ⇒ 容量恒为 8(与「未接线」完全一样)');
+  eq(rt.carryCapacityOf('p1'), carryItemCapacity(8), '没有 host ⇒ 容量恒为 8 个负重格(与「未接线」完全一样)');
 });
 
 /* ═══════════ 5. 落盘路径也真的会执行(不只等级投影) ═══════════ */
